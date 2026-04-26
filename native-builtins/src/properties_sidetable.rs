@@ -43,7 +43,7 @@ use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
 use rustjvm_native_api::registry::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{error::MethodCallResult, ObjectRef, Value};
+use rustjvm_types::{error::MethodCallResult, ArrayElementType, ObjectRef, Value};
 
 /// Per-object property cap.  10_000 keys * 64 KiB max value = 640 MiB
 /// per object, but in practice `.properties` files are tiny.  This
@@ -327,6 +327,116 @@ fn native_properties_load(
     Ok(None)
 }
 
+/// Downgrade a Rust `String` whose code points represent ISO-8859-1
+/// characters (as produced by reading a Reader chunk-by-chunk) into
+/// the `u8` byte sequence that `parse_properties` expects.  Each
+/// `char` < 256 round-trips losslessly; anything above the Latin-1
+/// range collapses to `b'?'`, mirroring the `b as char` decoding side
+/// in `parse_properties` (which only emits chars in 0..=255).
+///
+/// Kept as a pure helper so it can be unit-tested without a full
+/// `NativeContext`.
+fn iso_8859_1_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp < 256 {
+            out.push(cp as u8);
+        } else {
+            out.push(b'?');
+        }
+    }
+    out
+}
+
+/// Native `Properties.load(Reader)` — RKC16N.1.  jboss-modules'
+/// `org.jboss.modules.Main.<clinit>` reads `version.properties`
+/// through a `BufferedReader` and calls this overload directly, so a
+/// missing native here is a hard linkage error before `main` runs.
+///
+/// Strategy: pull the Reader's contents into a `String` 4 KiB at a
+/// time via `Reader.read([CII)I` (the same loop shape every JDK
+/// `BufferedReader` tolerates), then downgrade the accumulated text
+/// to ISO-8859-1 bytes and reuse `parse_properties` / `put_kv` — the
+/// same back-half as the InputStream overload.  We deliberately do
+/// not call `Reader.close()` (the caller owns the stream lifecycle,
+/// matching real JDK `Properties.load(Reader)`).
+fn native_properties_load_reader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let reader = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+
+    // Scratch buffer for `Reader.read(char[], 0, len)`.  4 KiB is
+    // the size every JDK BufferedReader uses internally, so this
+    // matches the shape callers expect and avoids tiny chunked reads.
+    const CHUNK: usize = 4096;
+    let buf = ctx.new_array(ArrayElementType::Char, CHUNK);
+
+    // Cap accumulated text at 2 * MAX_LOAD_BYTES chars.  In ISO-8859-1
+    // each char re-encodes to one byte, so this matches the byte cap
+    // applied to the InputStream path while leaving headroom for any
+    // multi-byte chars that get downgraded to `?`.
+    let char_cap = MAX_LOAD_BYTES.saturating_mul(2);
+    let mut accumulated = String::new();
+
+    loop {
+        let res = ctx.invoke_virtual(
+            reader,
+            "read",
+            "([CII)I",
+            &[Value::Object(Some(buf)), Value::Int(0), Value::Int(CHUNK as i32)],
+        )?;
+        let n = match res {
+            Some(Value::Int(n)) => n,
+            // Anything else (None, non-int) means the read protocol
+            // misbehaved — treat as EOF rather than looping forever.
+            _ => break,
+        };
+        if n <= 0 {
+            // n == -1 is EOF; n == 0 is also a valid early exit per
+            // the Reader contract on a non-blocking but exhausted
+            // source.  Either way, stop.
+            break;
+        }
+        let n = n as usize;
+        let n = n.min(CHUNK);
+        for i in 0..n {
+            if accumulated.len() >= char_cap {
+                break;
+            }
+            if let Value::Int(c) = ctx.get_array_element(buf, i) {
+                // Java chars are unsigned 16-bit code units.  Mask
+                // before widening so a sign-extended negative `int`
+                // doesn't yield an out-of-range code point.
+                let cu = (c as u32) & 0xFFFF;
+                if let Some(ch) = char::from_u32(cu) {
+                    accumulated.push(ch);
+                }
+            }
+        }
+        if accumulated.len() >= char_cap {
+            break;
+        }
+    }
+
+    let bytes = iso_8859_1_bytes(&accumulated);
+    if bytes.len() > MAX_LOAD_BYTES {
+        return Ok(None);
+    }
+    for (k, v) in parse_properties(&bytes) {
+        put_kv(this, &k, &v);
+    }
+    Ok(None)
+}
+
 /// Native `Properties.getProperty(String)` — checks the side-table
 /// first, then falls back to the VM's system-property store.
 /// Returns null when the key is unknown.
@@ -480,6 +590,14 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "(Ljava/io/InputStream;)V",
         native_properties_load,
     );
+    // RKC16N.1 — jboss-modules' Main.<clinit> reads version.properties
+    // through a BufferedReader and calls the Reader overload directly.
+    registry.register(
+        "java/util/Properties",
+        "load",
+        "(Ljava/io/Reader;)V",
+        native_properties_load_reader,
+    );
     registry.register(
         "java/util/Properties",
         "getProperty",
@@ -630,6 +748,31 @@ mod tests {
     fn unescape_unicode() {
         assert_eq!(unescape("\\u0041"), "A");
         assert_eq!(unescape("\\u00e9"), "\u{00e9}");
+    }
+
+    #[test]
+    fn iso_8859_1_bytes_round_trips_latin1_and_collapses_above() {
+        // ASCII: identity.
+        assert_eq!(iso_8859_1_bytes("abc=1"), b"abc=1".to_vec());
+        // 'é' is U+00E9 — fits in Latin-1 and survives as 0xE9.
+        assert_eq!(iso_8859_1_bytes("é"), vec![0xE9]);
+        // 'Ω' is U+03A9 — outside Latin-1, must collapse to '?'.
+        assert_eq!(iso_8859_1_bytes("Ω"), vec![b'?']);
+        // Mixed: ASCII + Latin-1 + above-Latin-1 in one string.
+        assert_eq!(iso_8859_1_bytes("kéΩ"), vec![b'k', 0xE9, b'?']);
+        // The downgraded byte sequence for a Latin-1 line must
+        // round-trip through `parse_properties` cleanly.
+        let mut bytes = iso_8859_1_bytes("name=café\n");
+        // Trailing newline preserved.
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        bytes.push(0); // sanity: ensure Vec is mutable / well-formed
+        bytes.pop();
+        let parsed = parse_properties(&iso_8859_1_bytes("name=café\n"));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "name");
+        // `parse_properties` decodes 0xE9 back to U+00E9, so the
+        // value reads as "café" again.
+        assert_eq!(parsed[0].1, "café");
     }
 
     #[test]
