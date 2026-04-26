@@ -65,6 +65,8 @@ pub mod wildfly_core;
 // T19.1's MSC container + a process-wide binding store.
 pub mod wildfly_naming;
 pub mod service_loader;
+// WP7.1 — DriverManager + ServiceLoader registration for JDBC SPI.
+pub mod jdbc;
 #[cfg(feature = "experimental-serialization")]
 pub mod serialization;
 #[cfg(feature = "experimental-aot")]
@@ -2923,6 +2925,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `ManagementFactory.getPlatformMBeanServer()`.
     jmx_openmbean::register_jmx_openmbean_natives(registry);
 
+    // WP7.1 — wire the proper `ServiceLoader` natives so JDBC drivers
+    // declared in `META-INF/services/java.sql.Driver` are reachable to
+    // `DriverManager.getConnection`. Registered LAST so it overrides any
+    // earlier stub registrations of the same triples.
+    jdbc::register_jdbc_driver_natives(registry);
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }
@@ -5653,6 +5661,13 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // win. The singleton path is the ONLY path that returns a stable
     // ObjectRef for the KC26 ClassCastException fix.
     logmanager::register_logmanager_natives(registry);
+
+    // WP7.1 — re-register the classpath-walking ServiceLoader natives in
+    // synthetic-JDK mode so `register_phase53_service_loader` /
+    // `register_p63_service_loader` (which install empty-iterator stubs)
+    // do not silently win over the proper SPI implementation. Mirrors
+    // the unconditional registration in `register_essential_natives`.
+    jdbc::register_jdbc_driver_natives(registry);
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered synthetic overrides");
