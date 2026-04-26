@@ -3,6 +3,33 @@
 Keycloak 16.1.1 (WildFly / JBoss-Modules) under current `target/release/rustjvm.exe`
 on Windows 11, JDK 25.0.2 (Adoptium) for boot classpath, default flags.
 
+## Live status (2026-04-26, Session 94 — third iteration; RKC16N.1/3/5/8 + recon hacks landed)
+
+After RKC16N.8 landed (`Class.desiredAssertionStatus()Z` + `System.initPhase1()V` stubs):
+
+```
+target/release/rustjvm.exe --java-home "C:/.../jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+→ no NoSuchMethodError warnings. Single failure:
+```
+linkage error: verification error in org/jboss/modules/Module.getResources:
+ at bytecode offset 294: expected ObjectRef("java/util/Collection") on stack,
+ found ObjectRef("java/util/List")
+```
+
+That is **RVERIF.2** (subtype widening). Agent dispatched. With `--noverify`,
+KC16 progresses to `org.jboss.modules.Module.<clinit>` NPE (RKC16N.9, follow-up).
+
+`-version` (full clean run, no diagnostic warnings):
+```
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+JBoss Modules version 2.0.0.Final
+```
+
 ## Live status (2026-04-26, Session 94 — second iteration with recon hacks landed)
 
 After Session 94 first-iteration work (Properties.load(Reader) stub +
