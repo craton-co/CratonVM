@@ -197,8 +197,18 @@ impl VType {
             // reference types." When the target is an interface, any
             // reference type is assignable to it at verify time — runtime
             // checkcast / invokeinterface enforce the actual type.
+            //
+            // RVERIF.2: also consult `is_known_jdk_interface` so that the
+            // relaxation fires even when `parent` is loaded as a synthetic
+            // stub that lacks the INTERFACE access flag. Without this,
+            // assignments like `List` → `Collection` are rejected when both
+            // are stubbed (the stub heuristic flags them as PUBLIC|SUPER,
+            // not INTERFACE) and `is_subclass` returns false because the
+            // stub's `interfaces` array is empty.
             (VType::ObjectRef(child), VType::ObjectRef(parent)) => {
-                hierarchy.is_subclass(child, parent) || hierarchy.is_interface(parent)
+                hierarchy.is_subclass(child, parent)
+                    || hierarchy.is_interface(parent)
+                    || is_known_jdk_interface(parent)
             }
 
             // Array to Object: all arrays are subclasses of java/lang/Object.
@@ -210,6 +220,7 @@ impl VType {
                     || parent == "java/io/Serializable"
                     || parent == "java/lang/Cloneable"
                     || hierarchy.is_interface(parent)
+                    || is_known_jdk_interface(parent)
             }
 
             // Array covariance for reference arrays
@@ -303,7 +314,12 @@ fn array_is_assignable(
         (Some(b'L'), Some(b'L')) => {
             let child_class = &child_elem[1..child_elem.len() - 1];
             let parent_class = &parent_elem[1..parent_elem.len() - 1];
+            // RVERIF.2: same JDK-interface relaxation as the scalar
+            // ObjectRef arm (covers e.g. `[List` -> `[Collection` when
+            // both element types are loaded as flag-less stubs).
             hierarchy.is_subclass(child_class, parent_class)
+                || hierarchy.is_interface(parent_class)
+                || is_known_jdk_interface(parent_class)
         }
         // Both nested arrays
         (Some(b'['), Some(b'[')) => array_is_assignable(child_elem, parent_elem, hierarchy),
@@ -344,6 +360,182 @@ fn merge_arrays(a: &str, b: &str, hierarchy: &dyn ClassHierarchy) -> VType {
         // Otherwise → Object (arrays of different primitive types, etc.)
         _ => VType::ObjectRef("java/lang/Object".to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// RVERIF.2 — name-based JDK interface fallback
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `name` is a well-known JDK interface.
+///
+/// Per JVMS §4.10.1.2 the bytecode verifier does not distinguish interface
+/// types from `java.lang.Object`: any reference is assignable to any
+/// interface at verify time, with runtime checkcast / invokeinterface
+/// enforcing the actual type.
+///
+/// Our [`ClassHierarchy::is_interface`] consults the `INTERFACE` access
+/// flag on the loaded class, which works for real classfiles. However our
+/// synthetic-stub generator (used when a JDK class is referenced before
+/// its `.class` file is read) flags every stub as `PUBLIC | SUPER` unless
+/// the name happens to match the heuristic `name.contains('$') ||
+/// name.ends_with("able")`. That heuristic mis-classifies many JDK
+/// interfaces (`Collection`, `List`, `Map`, `Set`, `Iterator`, ...) as
+/// classes — which then makes assignments like `List` → `Collection`
+/// fail verification when both are stubbed.
+///
+/// This static name table is the verifier's safety net. It is consulted
+/// only as the last branch of the assignability check, after the loaded
+/// hierarchy and the `INTERFACE` flag have already said "no". Adding a
+/// name here cannot accept any assignment that JVMS would reject — the
+/// entries are all genuinely interfaces in the JDK.
+pub(crate) fn is_known_jdk_interface(name: &str) -> bool {
+    matches!(
+        name,
+        // java.lang
+        "java/lang/CharSequence"
+        | "java/lang/Comparable"
+        | "java/lang/Iterable"
+        | "java/lang/Readable"
+        | "java/lang/Appendable"
+        | "java/lang/AutoCloseable"
+        | "java/lang/Runnable"
+        | "java/lang/Cloneable"
+        | "java/lang/constant/Constable"
+        | "java/lang/constant/ConstantDesc"
+        | "java/lang/reflect/AnnotatedElement"
+        | "java/lang/reflect/GenericDeclaration"
+        | "java/lang/reflect/Member"
+        | "java/lang/reflect/Type"
+        | "java/lang/reflect/InvocationHandler"
+        | "java/lang/annotation/Annotation"
+        // java.io
+        | "java/io/Serializable"
+        | "java/io/Closeable"
+        | "java/io/Flushable"
+        | "java/io/Externalizable"
+        | "java/io/DataInput"
+        | "java/io/DataOutput"
+        | "java/io/ObjectInput"
+        | "java/io/ObjectOutput"
+        | "java/io/ObjectStreamConstants"
+        // java.util — collection framework
+        | "java/util/Collection"
+        | "java/util/List"
+        | "java/util/Set"
+        | "java/util/Map"
+        | "java/util/Map$Entry"
+        | "java/util/SortedMap"
+        | "java/util/SortedSet"
+        | "java/util/NavigableMap"
+        | "java/util/NavigableSet"
+        | "java/util/SequencedCollection"
+        | "java/util/SequencedMap"
+        | "java/util/SequencedSet"
+        | "java/util/Queue"
+        | "java/util/Deque"
+        | "java/util/Iterator"
+        | "java/util/ListIterator"
+        | "java/util/Enumeration"
+        | "java/util/Comparator"
+        | "java/util/RandomAccess"
+        | "java/util/EventListener"
+        | "java/util/Spliterator"
+        // java.util.concurrent
+        | "java/util/concurrent/BlockingQueue"
+        | "java/util/concurrent/BlockingDeque"
+        | "java/util/concurrent/ConcurrentMap"
+        | "java/util/concurrent/ConcurrentNavigableMap"
+        | "java/util/concurrent/Callable"
+        | "java/util/concurrent/Future"
+        | "java/util/concurrent/Executor"
+        | "java/util/concurrent/ExecutorService"
+        | "java/util/concurrent/ScheduledExecutorService"
+        | "java/util/concurrent/CompletionStage"
+        | "java/util/concurrent/CompletionService"
+        | "java/util/concurrent/RunnableFuture"
+        | "java/util/concurrent/RunnableScheduledFuture"
+        // java.util.function
+        | "java/util/function/Function"
+        | "java/util/function/BiFunction"
+        | "java/util/function/Consumer"
+        | "java/util/function/BiConsumer"
+        | "java/util/function/Predicate"
+        | "java/util/function/BiPredicate"
+        | "java/util/function/Supplier"
+        | "java/util/function/UnaryOperator"
+        | "java/util/function/BinaryOperator"
+        | "java/util/function/IntFunction"
+        | "java/util/function/IntPredicate"
+        | "java/util/function/IntConsumer"
+        | "java/util/function/IntSupplier"
+        | "java/util/function/IntUnaryOperator"
+        | "java/util/function/IntBinaryOperator"
+        | "java/util/function/IntToLongFunction"
+        | "java/util/function/IntToDoubleFunction"
+        | "java/util/function/LongFunction"
+        | "java/util/function/LongPredicate"
+        | "java/util/function/LongConsumer"
+        | "java/util/function/LongSupplier"
+        | "java/util/function/LongUnaryOperator"
+        | "java/util/function/LongBinaryOperator"
+        | "java/util/function/LongToIntFunction"
+        | "java/util/function/LongToDoubleFunction"
+        | "java/util/function/DoubleFunction"
+        | "java/util/function/DoublePredicate"
+        | "java/util/function/DoubleConsumer"
+        | "java/util/function/DoubleSupplier"
+        | "java/util/function/DoubleUnaryOperator"
+        | "java/util/function/DoubleBinaryOperator"
+        | "java/util/function/DoubleToIntFunction"
+        | "java/util/function/DoubleToLongFunction"
+        | "java/util/function/ToIntFunction"
+        | "java/util/function/ToLongFunction"
+        | "java/util/function/ToDoubleFunction"
+        | "java/util/function/ToIntBiFunction"
+        | "java/util/function/ToLongBiFunction"
+        | "java/util/function/ToDoubleBiFunction"
+        | "java/util/function/ObjIntConsumer"
+        | "java/util/function/ObjLongConsumer"
+        | "java/util/function/ObjDoubleConsumer"
+        | "java/util/function/BooleanSupplier"
+        // java.util.stream
+        | "java/util/stream/BaseStream"
+        | "java/util/stream/Stream"
+        | "java/util/stream/IntStream"
+        | "java/util/stream/LongStream"
+        | "java/util/stream/DoubleStream"
+        | "java/util/stream/Collector"
+        // java.lang.invoke
+        | "java/lang/invoke/MethodHandleInfo"
+        // java.security
+        | "java/security/Principal"
+        | "java/security/PrivilegedAction"
+        | "java/security/PrivilegedExceptionAction"
+        // java.net
+        | "java/net/SocketOption"
+        | "java/net/SocketImplFactory"
+        // java.nio
+        | "java/nio/channels/Channel"
+        | "java/nio/channels/ReadableByteChannel"
+        | "java/nio/channels/WritableByteChannel"
+        | "java/nio/channels/ByteChannel"
+        | "java/nio/channels/SeekableByteChannel"
+        | "java/nio/channels/InterruptibleChannel"
+        | "java/nio/channels/AsynchronousChannel"
+        | "java/nio/file/Path"
+        | "java/nio/file/Watchable"
+        // java.time
+        | "java/time/temporal/Temporal"
+        | "java/time/temporal/TemporalAccessor"
+        | "java/time/temporal/TemporalAdjuster"
+        | "java/time/temporal/TemporalAmount"
+        | "java/time/temporal/TemporalField"
+        | "java/time/temporal/TemporalUnit"
+        | "java/time/chrono/Chronology"
+        | "java/time/chrono/ChronoLocalDate"
+        | "java/time/chrono/ChronoLocalDateTime"
+        | "java/time/chrono/ChronoZonedDateTime"
+    )
 }
 
 /// Parse a method descriptor's return type into a VType.
@@ -746,6 +938,97 @@ mod tests {
         let arr = VType::ArrayRef("[I".to_string());
         let iface = VType::ObjectRef("my/pkg/IFoo".to_string());
         assert!(arr.is_assignable_to(&iface, &h));
+    }
+
+    // --- RVERIF.2: known-JDK-interface fallback ----------------------------
+    //
+    // When a JDK interface is loaded as a synthetic stub (because its real
+    // .class wasn't yet read at verify time), the stub heuristic can flag
+    // it as PUBLIC|SUPER instead of INTERFACE — which makes the existing
+    // `is_interface(parent)` relaxation miss and breaks legitimate
+    // List → Collection / ArrayList → Iterable assignments. The
+    // `is_known_jdk_interface` static table is the verifier's safety net
+    // for those cases.
+
+    /// Hierarchy that mimics the failure mode: classes are loaded but
+    /// `is_subclass` does not see the interface relationship and
+    /// `is_interface` returns `false` for everything (because the stub
+    /// access flags are wrong).
+    struct StubHierarchyMissingInterfaceFlag;
+    impl ClassHierarchy for StubHierarchyMissingInterfaceFlag {
+        fn is_subclass(&self, c: &str, p: &str) -> bool {
+            // Same class or anything-to-Object only.
+            c == p || p == "java/lang/Object"
+        }
+        fn common_superclass(&self, _a: &str, _b: &str) -> String {
+            "java/lang/Object".to_string()
+        }
+        fn is_interface(&self, _name: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn list_assignable_to_collection_via_jdk_table() {
+        // RVERIF.2 regression: this is the canonical case from
+        // org/jboss/modules/Module.getResources at bytecode offset 294 —
+        // `Collections.enumeration(Collection)` invoked with a List on
+        // the stack. With a stub-only hierarchy that has neither the
+        // subclass relationship nor the INTERFACE flag, the verifier
+        // must still accept the assignment because Collection is a
+        // well-known JDK interface.
+        let h = StubHierarchyMissingInterfaceFlag;
+        let list = VType::ObjectRef("java/util/List".to_string());
+        let collection = VType::ObjectRef("java/util/Collection".to_string());
+
+        // Sanity: the hierarchy genuinely cannot prove the relationship.
+        assert!(!h.is_subclass("java/util/List", "java/util/Collection"));
+        assert!(!h.is_interface("java/util/Collection"));
+
+        // Yet the verifier accepts the assignment.
+        assert!(
+            list.is_assignable_to(&collection, &h),
+            "List must be assignable to Collection (JDK-interface fallback)"
+        );
+    }
+
+    #[test]
+    fn arraylist_assignable_to_iterable_via_jdk_table() {
+        // Concrete class to interface, both via JDK fallback.
+        let h = StubHierarchyMissingInterfaceFlag;
+        let al = VType::ObjectRef("java/util/ArrayList".to_string());
+        let iter = VType::ObjectRef("java/lang/Iterable".to_string());
+        assert!(al.is_assignable_to(&iter, &h));
+    }
+
+    #[test]
+    fn unknown_class_not_assignable_to_unknown_class() {
+        // Negative control: the JDK fallback must NOT accept arbitrary
+        // class-to-class assignments. Only known JDK interfaces relax
+        // the check.
+        let h = StubHierarchyMissingInterfaceFlag;
+        let foo = VType::ObjectRef("com/example/Foo".to_string());
+        let bar = VType::ObjectRef("com/example/Bar".to_string());
+        assert!(!foo.is_assignable_to(&bar, &h));
+    }
+
+    #[test]
+    fn known_jdk_interface_recognises_collection_framework() {
+        // Spot-check that the table covers the names that
+        // Module.getResources / Collections / Stream APIs rely on.
+        assert!(is_known_jdk_interface("java/util/Collection"));
+        assert!(is_known_jdk_interface("java/util/List"));
+        assert!(is_known_jdk_interface("java/util/Map"));
+        assert!(is_known_jdk_interface("java/util/Set"));
+        assert!(is_known_jdk_interface("java/util/Iterator"));
+        assert!(is_known_jdk_interface("java/util/Enumeration"));
+        assert!(is_known_jdk_interface("java/lang/Iterable"));
+        assert!(is_known_jdk_interface("java/util/function/Function"));
+        assert!(is_known_jdk_interface("java/util/stream/Stream"));
+        // Negative: a concrete class must NOT be in the table.
+        assert!(!is_known_jdk_interface("java/util/ArrayList"));
+        assert!(!is_known_jdk_interface("java/lang/Object"));
+        assert!(!is_known_jdk_interface("java/lang/String"));
     }
 
     // --- merge ---
