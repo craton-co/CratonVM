@@ -475,19 +475,18 @@ fn jdbc_core_types_load_and_reflect() {
     );
 }
 
-/// Reflection-deep probe — best effort under the synthetic-stub path.
+/// Reflection-deep probe — hard assertion after WP2.1-narrow closed the
+/// synthetic-stub gap (see commit log). The synthetic-method declaration
+/// table in `native-builtins/src/lang_class.rs::synthetic_jdk_method_decls`
+/// now surfaces the JDBC SPI methods to `Class.getDeclaredMethods()`, so
+/// the end-to-end bytecode dispatch path lands a non-empty array of
+/// `Method` objects with valid `getName()` and `toString()` results.
 ///
-/// The acceptance bar for "non-empty `getDeclaredMethods`" is pinned on
-/// the Rust side via `class_get_declared_methods_native_registered`
-/// (the registry-side assertion). If the bytecode-resolution layer can
-/// dispatch `Class.getDeclaredMethods` end-to-end on a synthetic
-/// `java/sql/Connection` stub, this probe returns 1; otherwise the
-/// fixture catches the throwable and returns 0, and we log a SKIP.
-///
-/// Mirrors the WP7.1 pattern where
-/// `jdbc_driver_natives_export_service_loader` is the load-bearing
-/// pin and the end-to-end Java probe is best-effort under the
-/// `Class.forName(String)` baseline gap.
+/// The Rust-side registry assertion in
+/// `class_get_declared_methods_native_registered` remains the
+/// load-bearing anchor for "the native is reachable at all"; this probe
+/// pins the additional invariant that real bytecode can drive that
+/// native through the synthetic Connection stub.
 #[test]
 fn connection_methods_carry_signatures() {
     if !fixture_compiled() {
@@ -499,24 +498,21 @@ fn connection_methods_carry_signatures() {
 
     match run_probe("connection_methods_have_signatures") {
         Ok(1) => {}
-        Ok(0) => eprintln!(
-            "WP7.2 best-effort: connection_methods_have_signatures returned 0 — \
-             baseline `Class.getDeclaredMethods` synthetic-stub gap. \
-             Registry-side reachability still pinned by \
-             `class_get_declared_methods_native_registered`."
-        ),
         Ok(other) => panic!(
-            "Connection method-signature probe returned unexpected {other}"
+            "WP7.2: connection_methods_have_signatures returned {other} \
+             (expected 1) — `Connection.class.getDeclaredMethods()` regressed; \
+             check `synthetic_jdk_method_decls(\"java/sql/Connection\")`."
         ),
-        Err(e) => eprintln!(
-            "WP7.2 best-effort: connection_methods_have_signatures errored: {e} — \
-             treating as synthetic-stub gap, see registry pin."
+        Err(e) => panic!(
+            "WP7.2: connection_methods_have_signatures errored: {e}"
         ),
     }
 }
 
-/// Reflection-deep probe — best effort, same rationale as
-/// `connection_methods_carry_signatures`.
+/// Reflection-deep probe — hard assertion, same rationale as
+/// `connection_methods_carry_signatures`. Pins that
+/// `ResultSet.class.getDeclaredMethods()` surfaces a `next()Z` whose
+/// reflective return type round-trips through Method.getReturnType().
 #[test]
 fn result_set_next_reflects_with_boolean_return() {
     if !fixture_compiled() {
@@ -528,17 +524,13 @@ fn result_set_next_reflects_with_boolean_return() {
 
     match run_probe("resultSet_next_is_boolean") {
         Ok(1) => {}
-        Ok(0) => eprintln!(
-            "WP7.2 best-effort: resultSet_next_is_boolean returned 0 — \
-             `Class.getDeclaredMethods` synthetic-stub gap. \
-             Registry side still pinned."
-        ),
         Ok(other) => panic!(
-            "resultSet_next_is_boolean probe returned unexpected {other}"
+            "WP7.2: resultSet_next_is_boolean returned {other} (expected 1) — \
+             `ResultSet.class.getDeclaredMethods()` regressed; \
+             check `synthetic_jdk_method_decls(\"java/sql/ResultSet\")`."
         ),
-        Err(e) => eprintln!(
-            "WP7.2 best-effort: resultSet_next_is_boolean errored: {e} — \
-             treating as synthetic-stub gap."
+        Err(e) => panic!(
+            "WP7.2: resultSet_next_is_boolean errored: {e}"
         ),
     }
 }
