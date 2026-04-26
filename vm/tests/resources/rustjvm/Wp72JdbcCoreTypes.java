@@ -6,6 +6,7 @@ import java.sql.DatabaseMetaData;
 import java.sql.Driver;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 
 /**
@@ -82,6 +83,20 @@ public class Wp72JdbcCoreTypes {
 
     public static int databaseMetaData_loads() {
         return classLoadsAndNames(DatabaseMetaData.class, "java.sql.DatabaseMetaData");
+    }
+
+    /**
+     * Transitive reachability probe — {@link SQLException} is the
+     * declared exception type on every public method of the six core
+     * SPI types (e.g., {@code Connection.createStatement() throws
+     * SQLException}). For "Connection... DatabaseMetaData all load and
+     * reflect properly" to hold, the Method-object reflection path must
+     * be able to materialize SQLException from the declared exception
+     * table — which means SQLException itself must be loadable. This
+     * probe pins that transitive dependency at the LDC layer.
+     */
+    public static int sqlException_loads() {
+        return classLoadsAndNames(SQLException.class, "java.sql.SQLException");
     }
 
     /**
@@ -206,6 +221,7 @@ public class Wp72JdbcCoreTypes {
             ResultSet.class,
             Driver.class,
             DatabaseMetaData.class,
+            SQLException.class,
         };
         for (int i = 0; i < all.length; i++) {
             if (all[i] == null) return 0;
