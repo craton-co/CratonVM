@@ -1070,6 +1070,20 @@ impl SharedVm {
             heap.enable_gc_logging();
         }
 
+        // WP8.5 — wire HotSpot-style unified logging (`-Xlog:...`).
+        // The full JEP 158/271 parser lives in
+        // `vm/src/runtime/unified_logging.rs`; the wiring step is to
+        // initialize the global logger at VM startup so subsequent
+        // `log_unified()` / `gc_info()` calls in GC and class-load
+        // hot paths actually emit. A failed parse is logged through
+        // tracing but does not abort startup — HotSpot's behaviour for
+        // a malformed `-Xlog` spec is to print a warning and continue.
+        if let Some(spec) = config.xlog_spec.as_deref() {
+            if let Err(e) = crate::runtime::unified_logging::init_unified_logging(spec) {
+                tracing::warn!("invalid -Xlog spec {:?}: {}", spec, e);
+            }
+        }
+
         // Initialize AOT runtime if enabled
         #[cfg(feature = "experimental-aot")]
         {

@@ -1,0 +1,45 @@
+﻿{
+  "$schema_version": 1,
+  "generated_at": "2026-04-26T00:00:00Z",
+  "rustjvm_version": "unknown",
+  "fixture": {
+    "mode": "placeholder",
+    "placeholder_source": "bench/springboot3/fixture/Main.java",
+    "real_source_expected_at": "$SPRING_PETCLINIC_JAR (TODO wire in stage.{sh,ps1})",
+    "notes": "Placeholder fixture for Spring Boot 3 (Petclinic). Probes JDK Proxy newProxyInstance. Once a real distribution is staged in stage.{sh,ps1}, swap the placeholder for the real boot path and update this baseline."
+  },
+  "steps": [
+    {
+      "name": "stage",
+      "rc": 0,
+      "notes": "javac --release 21 of fixture/Main.java. Depends only on JDK 21+ javac on PATH or JAVA_HOME."
+    },
+    {
+      "name": "run",
+      "rc": 1,
+      "notes": "rust-jvm currently throws NullPointerException on the 2nd System.out.println (WP0.1 blocker, session 93). Placeholder Main.java triggers this intentionally. Once WP0.1 lands rc flips to 0 and the expected_stderr_contains list shrinks; expected_stdout_contains gains 'springboot3_fixture: ok'."
+    }
+  ],
+  "expected_stderr_contains": [
+    "NullPointerException",
+    "Cannot invoke write on null"
+  ],
+  "expected_stderr_forbidden": [
+    "panicked at",
+    "RUST_BACKTRACE",
+    "abort",
+    "STATUS_ACCESS_VIOLATION"
+  ],
+  "expected_stdout_contains": [
+    "springboot3_fixture: starting baseline smoke"
+  ],
+  "expected_final_rc": 1,
+  "known_blockers": [
+    {
+      "id": "WP0.1",
+      "summary": "Two consecutive System.out.println NPE on 2nd write ('Cannot invoke write on null')",
+      "see": "memory/finding_println_regression.md; docs/wildfly-ejbca-roadmap.md WP0.1"
+    }
+  ],
+  "update_policy": "Update this file any time a WP lands that changes expected_final_rc or the expected_stderr_* sets. diff-baseline.{sh,ps1} compares a fresh run against these fields. A 'baseline match' result is mandatory for CI green; a mismatch either indicates a regression (bad) or an unshipped fix (update this file in the same PR)."
+}

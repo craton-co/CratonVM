@@ -797,6 +797,18 @@ pub trait NativeContext {
         Vec::new()
     }
 
+    /// Return the raw bytes of every classpath entry that contains a
+    /// resource with the given name. Parallel to [`find_all_resource_urls`]
+    /// but returns content rather than URLs — used by Rust-native resource
+    /// enumeration paths (e.g. `ServiceLoader` provider discovery in
+    /// `native-builtins/src/service_loader.rs`) that bypass the JDK's
+    /// `URL.openStream` / `BufferedReader` chain.
+    /// Default implementation returns an empty vector so test mocks compile.
+    fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
+        let _ = name;
+        Vec::new()
+    }
+
     /// Find the filesystem path of the classpath entry that holds a given
     /// class (for `Class.getProtectionDomain().getCodeSource().getLocation()`).
     /// Returns a `file:`-scheme-ready absolute path (directory has trailing

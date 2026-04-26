@@ -103,16 +103,20 @@ fn build_service_loader(
 /// `NoSuchMethodError` at bytecode resolution before the proper natives
 /// are reached. The WP7.1 commit (`245e996`) confirms this and works
 /// around the gap in `jdbc.rs::collect_driver_providers` by walking the
-/// classpath directly via `NativeContext::find_all_resource_urls` /
-/// `find_resource` — the same primitives the VM's classloader uses to
-/// answer `Class.getResource` natively. WP1.8-narrow ports that
-/// approach back into the proper iterator so
-/// `ServiceLoader.load(Class).iterator()` works end-to-end without
-/// re-entering the broken JDK Reader chain.
+/// classpath directly.
 ///
-/// Functionally identical to the prior implementation when the JDK
-/// chain works (lex-sorted, dedup'd FQNs from every classpath match);
-/// strictly more robust when it doesn't.
+/// **Hybrid resolution (session 94 merge):** the WP1.8-narrow approach
+/// (parsing `find_all_resource_urls` URL strings inline) and the
+/// Wave 8 closure approach (a layered `find_all_resource_bytes` helper
+/// across `ClassPath` / `ClassManager` / `NativeContext` / `Vm`) target
+/// the same goal. The hybrid keeps WP1.8-narrow's structure and tests
+/// but routes byte fetching through the layered helper — the URL-string
+/// detour and the inline `read_resource_bytes` jar-cracker disappear,
+/// leaving classpath-flavour handling owned by `class_path.rs` where
+/// every classpath consumer (jdbc, here, anywhere else later) sees a
+/// uniform implementation. Functionally identical to the prior
+/// implementation when the JDK chain works (lex-sorted, dedup'd FQNs
+/// from every classpath match); strictly more robust when it doesn't.
 fn discover_providers(
     ctx: &mut dyn NativeContext,
     sl: rustjvm_types::ObjectRef,
@@ -145,63 +149,30 @@ fn discover_providers(
     }
     let resource = format!("META-INF/services/{}", service_name);
 
-    // Walk the classpath directly. `find_all_resource_urls` returns a
-    // URL string per match: `file:/<dir>/<entry>` for plain dirs,
-    // `jar:file:/<jar>!/META-INF/services/<spi>` for JAR entries, and
-    // (rarely) `classpath:<entry>` for VM-synthetic resources. Each
-    // scheme is decoded back to bytes inline below.
-    let urls = ctx.find_all_resource_urls(&resource);
+    // Fetch every classpath match's bytes in one call. The layered
+    // `find_all_resource_bytes` helper walks Directory / JarFile /
+    // NestedJar / JmodFile / JImageFile entries; classpath-flavour
+    // handling lives in `class_path.rs` so we do not need a local
+    // jar-cracker here.
     let mut providers: Vec<String> = Vec::new();
-    if !urls.is_empty() {
-        for url in urls {
-            if let Some(bytes) = read_resource_bytes(ctx, &url, &resource) {
-                parse_provider_lines(&bytes, &mut providers);
-            }
+    let descriptors = ctx.find_all_resource_bytes(&resource);
+    for bytes in &descriptors {
+        parse_provider_lines(bytes, &mut providers);
+    }
+
+    // Test mocks may stub `find_resource` without populating the
+    // bytes list (the trait's default `find_all_resource_bytes` impl
+    // returns empty); honour the single-resource fallback so a
+    // fixture pointing at one descriptor still walks.
+    if descriptors.is_empty() {
+        if let Some(bytes) = ctx.find_resource(&resource) {
+            parse_provider_lines(&bytes, &mut providers);
         }
-    } else if let Some(bytes) = ctx.find_resource(&resource) {
-        // Test mocks may stub `find_resource` without populating the
-        // URL list; honour the single-resource fallback so a fixture
-        // pointing at one descriptor still walks.
-        parse_provider_lines(&bytes, &mut providers);
     }
 
     providers.sort();
     providers.dedup();
     Ok(providers)
-}
-
-/// Read raw bytes for a classpath URL. Mirrors the helper in
-/// `jdbc.rs::read_url_bytes` (kept duplicated here to keep
-/// `service_loader.rs` self-contained — both files are owned by Wave 1
-/// / Wave 7 and the helper is small).
-fn read_resource_bytes(
-    ctx: &mut dyn NativeContext,
-    url: &str,
-    resource: &str,
-) -> Option<Vec<u8>> {
-    if let Some(rest) = url.strip_prefix("jar:file:") {
-        let rest = rest.trim_start_matches('/');
-        let (jar_path, entry) = match rest.find("!/") {
-            Some(i) => (&rest[..i], &rest[i + 2..]),
-            None => return None,
-        };
-        let jar_bytes = std::fs::read(jar_path).ok()?;
-        let cursor = std::io::Cursor::new(jar_bytes);
-        let mut zip = zip::ZipArchive::new(cursor).ok()?;
-        let mut f = zip.by_name(entry).ok()?;
-        use std::io::Read;
-        let mut buf = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut buf).ok()?;
-        Some(buf)
-    } else if let Some(rest) = url.strip_prefix("file:") {
-        let path = rest.trim_start_matches('/');
-        std::fs::read(path).or_else(|_| std::fs::read(rest)).ok()
-    } else if let Some(name) = url.strip_prefix("classpath:") {
-        ctx.find_resource(name.trim_start_matches('/'))
-    } else {
-        // Unknown scheme — last-resort resource lookup.
-        ctx.find_resource(resource)
-    }
 }
 
 /// Tokenize a `META-INF/services/<spi>` descriptor. Each non-comment,
