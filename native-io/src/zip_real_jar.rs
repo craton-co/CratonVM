@@ -1,0 +1,697 @@
+//! RA.7 — real-mode `java.util.jar.JarFile` + `java.util.zip.ZipFile`
+//! natives.
+//!
+//! Approach: each `new JarFile(...)` opens the underlying zip via the
+//! `zip` crate and stashes the owned `ZipArchive` in a global handle
+//! table, keyed by a monotonically-increasing i64. The Java object
+//! stores the handle in its `path` / native handle slot; subsequent
+//! `getEntry(String)`, `entries()`, and `getInputStream(ZipEntry)`
+//! calls look up the archive by handle.
+//!
+//! `ZipEntry` is represented with two stable synthetic slots that
+//! any of our natives can introspect:
+//!   slot 0: String name
+//!   slot 1: Long method (DEFLATED=8 / STORED=0)
+//!   slot 2: Long size (uncompressed)
+//!   slot 3: Long compressedSize
+//!   slot 4: Long crc32
+//!
+//! `getInputStream(ZipEntry)` returns a `java.io.ByteArrayInputStream`
+//! populated with the inflated bytes — this sidesteps the need for
+//! a streaming Java `Inflater` bridge for the typical JarFile use
+//! case (reading MANIFEST.MF, META-INF/services/* , class bytes).
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Cursor, Read};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use parking_lot::Mutex;
+
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+
+/// Owned jar state per open handle.
+struct JarState {
+    path: PathBuf,
+    archive: zip::ZipArchive<File>,
+    /// Lookup cache: name → entry index inside the archive. Rebuilt on
+    /// first access to avoid paying the cost for jars that only read
+    /// one manifest entry.
+    name_index: Option<HashMap<String, usize>>,
+}
+
+fn jar_table() -> &'static Mutex<HashMap<i64, JarState>> {
+    static T: OnceLock<Mutex<HashMap<i64, JarState>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_handle() -> i64 {
+    static COUNTER: AtomicI64 = AtomicI64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// JarFile field helpers
+// ---------------------------------------------------------------------------
+
+/// RA.7: `java.util.jar.JarFile` (and its parent `java.util.zip.ZipFile`)
+/// declare a private long field `jzfile` that the real JDK uses as an
+/// opaque handle into its C-side zlib state. We repurpose that slot to
+/// hold our Rust-side `i64` handle so subsequent natives can find the
+/// backing `JarState`. Dual-write also keeps a synthetic slot 1 for
+/// backwards compat with any earlier code that hardcoded it.
+fn set_jar_handle(ctx: &mut dyn NativeContext, this: ObjectRef, handle: i64) {
+    ctx.set_field_by_name(this, "jzfile", Value::Long(handle));
+    ctx.set_field(this, 1, Value::Long(handle));
+}
+
+fn get_jar_handle(ctx: &dyn NativeContext, this: ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(this, "jzfile") {
+        if v != 0 {
+            return v;
+        }
+    }
+    match ctx.get_field(this, 1) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => 0,
+    }
+}
+
+fn read_file_abs_path(ctx: &mut dyn NativeContext, file_obj: ObjectRef) -> Option<String> {
+    let path_val = ctx
+        .invoke(
+            "java/io/File",
+            "getAbsolutePath",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(file_obj))],
+        )
+        .ok()??;
+    match path_val {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+fn extract_string_arg(ctx: &dyn NativeContext, v: Value) -> Option<String> {
+    match v {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Natives
+// ---------------------------------------------------------------------------
+
+/// `JarFile.<init>(File)` — open the jar and stash the handle.
+fn native_jarfile_init_file(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let file_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "JarFile.<init>(File): file is null".to_string(),
+            }));
+        }
+    };
+    let path = read_file_abs_path(ctx, file_obj).ok_or_else(|| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: "JarFile.<init>(File): file.getAbsolutePath returned null".to_string(),
+        })
+    })?;
+    open_and_register(ctx, this, &path)
+}
+
+/// `JarFile.<init>(String)` — open the jar by path.
+fn native_jarfile_init_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if name.is_empty() {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: "JarFile.<init>(String): null or empty name".to_string(),
+        }));
+    }
+    open_and_register(ctx, this, &name)
+}
+
+fn native_jarfile_init_string_verify(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // The boolean `verify` flag is accepted but we don't currently
+    // validate signatures. JBoss Modules' bootstrap jars aren't signed.
+    native_jarfile_init_string(ctx, args)
+}
+
+fn native_jarfile_init_file_verify(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_jarfile_init_file(ctx, args)
+}
+
+fn open_and_register(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path_str: &str,
+) -> MethodCallResult {
+    let file = File::open(path_str).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("JarFile: cannot open `{path_str}`: {e}"),
+        })
+    })?;
+    let archive = zip::ZipArchive::new(file).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("JarFile: `{path_str}` is not a valid zip: {e}"),
+        })
+    })?;
+    let state = JarState {
+        path: PathBuf::from(path_str),
+        archive,
+        name_index: None,
+    };
+    let handle = next_handle();
+    jar_table().lock().insert(handle, state);
+    set_jar_handle(ctx, this, handle);
+    // Also store the name on the parent ZipFile's `name` field if present.
+    let name_str = ctx.create_string(path_str);
+    ctx.set_field_by_name(this, "name", Value::Object(Some(name_str)));
+    Ok(None)
+}
+
+/// `JarFile.getEntry(String)` / `ZipFile.getEntry(String)` → `ZipEntry`.
+fn native_jarfile_get_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let handle = get_jar_handle(ctx, this);
+    let mut table = jar_table().lock();
+    let state = match table.get_mut(&handle) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    if state.name_index.is_none() {
+        let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
+        for i in 0..state.archive.len() {
+            if let Ok(f) = state.archive.by_index(i) {
+                idx.insert(f.name().to_string(), i);
+            }
+        }
+        state.name_index = Some(idx);
+    }
+    let idx = match state.name_index.as_ref().and_then(|m| m.get(&name)) {
+        Some(i) => *i,
+        None => {
+            // Try with trailing slash (directory semantics) before
+            // giving up — matches JDK ZipFile behavior.
+            let alt = format!("{name}/");
+            match state.name_index.as_ref().and_then(|m| m.get(&alt)) {
+                Some(i) => *i,
+                None => return Ok(Some(Value::Object(None))),
+            }
+        }
+    };
+
+    // Materialize the entry metadata.
+    let entry = state.archive.by_index(idx).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("ZipArchive::by_index({idx}) failed: {e}"),
+        })
+    })?;
+    let entry_name = entry.name().to_string();
+    let size = entry.size() as i64;
+    let csize = entry.compressed_size() as i64;
+    let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+    let method: i64 = match entry.compression() {
+        zip::CompressionMethod::Stored => 0,
+        _ => 8,
+    };
+    drop(entry);
+    drop(table);
+
+    Ok(Some(Value::Object(Some(alloc_zip_entry(
+        ctx, &entry_name, method, size, csize, crc,
+    )))))
+}
+
+fn alloc_zip_entry(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    method: i64,
+    size: i64,
+    csize: i64,
+    crc: i64,
+) -> ObjectRef {
+    let entry = match ctx.ensure_class_initialized("java/util/zip/ZipEntry") {
+        Ok(cid) => {
+            let real = ctx.class_num_total_fields(cid);
+            ctx.alloc_object(cid, real.max(6))
+        }
+        Err(_) => ctx.alloc_object(ClassId::new(0), 6),
+    };
+    // Synthetic slots 0..4
+    let name_str = ctx.create_string(name);
+    ctx.set_field(entry, 0, Value::Object(Some(name_str)));
+    ctx.set_field(entry, 1, Value::Long(method));
+    ctx.set_field(entry, 2, Value::Long(size));
+    ctx.set_field(entry, 3, Value::Long(csize));
+    ctx.set_field(entry, 4, Value::Long(crc));
+    // Dual-write real JDK field names.
+    ctx.set_field_by_name(entry, "name", Value::Object(Some(name_str)));
+    ctx.set_field_by_name(entry, "method", Value::Int(method as i32));
+    ctx.set_field_by_name(entry, "size", Value::Long(size));
+    ctx.set_field_by_name(entry, "csize", Value::Long(csize));
+    ctx.set_field_by_name(entry, "crc", Value::Long(crc));
+    entry
+}
+
+fn read_zip_entry_name(ctx: &dyn NativeContext, entry: ObjectRef) -> Option<String> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(entry, "name") {
+        if let Some(t) = ctx.read_string(s) {
+            return Some(t);
+        }
+    }
+    match ctx.get_field(entry, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// `JarFile.getInputStream(ZipEntry)` → `ByteArrayInputStream` with the
+/// inflated entry bytes.
+fn native_jarfile_get_input_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let entry = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = read_zip_entry_name(ctx, entry).unwrap_or_default();
+    if name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    let bytes = {
+        let handle = get_jar_handle(ctx, this);
+        let mut table = jar_table().lock();
+        let state = match table.get_mut(&handle) {
+            Some(s) => s,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let idx = match state.name_index.as_ref().and_then(|m| m.get(&name)) {
+            Some(i) => *i,
+            None => {
+                // Lazy fill.
+                let mut idx: HashMap<String, usize> =
+                    HashMap::with_capacity(state.archive.len());
+                for i in 0..state.archive.len() {
+                    if let Ok(f) = state.archive.by_index(i) {
+                        idx.insert(f.name().to_string(), i);
+                    }
+                }
+                let got = idx.get(&name).copied();
+                state.name_index = Some(idx);
+                match got {
+                    Some(i) => i,
+                    None => return Ok(Some(Value::Object(None))),
+                }
+            }
+        };
+        let mut zf = state.archive.by_index(idx).map_err(|e| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!(
+                    "JarFile.getInputStream({name}): by_index({idx}) failed: {e}"
+                ),
+            })
+        })?;
+        let mut buf: Vec<u8> = Vec::with_capacity(zf.size() as usize);
+        zf.read_to_end(&mut buf).map_err(|e| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("JarFile.getInputStream({name}): read failed: {e}"),
+            })
+        })?;
+        buf
+    };
+
+    let bais = build_byte_array_input_stream(ctx, &bytes)?;
+    Ok(Some(Value::Object(Some(bais))))
+}
+
+fn build_byte_array_input_stream(
+    ctx: &mut dyn NativeContext,
+    data: &[u8],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let array = ctx.new_array(ArrayElementType::Byte, data.len());
+    for (i, b) in data.iter().enumerate() {
+        ctx.set_array_element(array, i, Value::Int(*b as i8 as i32));
+    }
+    let bais_class = "java/io/ByteArrayInputStream";
+    let cid = ctx.ensure_class_initialized(bais_class).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("{bais_class}: class initialization failed"),
+        })
+    })?;
+    // Construct via <init>([B) — the standard BAIS ctor.
+    let obj = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
+    ctx.invoke(
+        bais_class,
+        "<init>",
+        "([B)V",
+        &[Value::Object(Some(obj)), Value::Object(Some(array))],
+    )?;
+    Ok(obj)
+}
+
+/// `ZipFile.entries()` / `JarFile.entries()` → `Enumeration<ZipEntry>`.
+/// Returns a synthetic `java.util.Enumeration` backed by a Rust Vec
+/// snapshot of the archive's entries.
+fn native_jarfile_entries(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let handle = get_jar_handle(ctx, this);
+    let entries: Vec<(String, i64, i64, i64, i64)> = {
+        let mut table = jar_table().lock();
+        let state = match table.get_mut(&handle) {
+            Some(s) => s,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let mut v = Vec::with_capacity(state.archive.len());
+        for i in 0..state.archive.len() {
+            if let Ok(f) = state.archive.by_index(i) {
+                let method: i64 = match f.compression() {
+                    zip::CompressionMethod::Stored => 0,
+                    _ => 8,
+                };
+                v.push((
+                    f.name().to_string(),
+                    method,
+                    f.size() as i64,
+                    f.compressed_size() as i64,
+                    f.crc32() as i64 & 0xFFFF_FFFFi64,
+                ));
+            }
+        }
+        v
+    };
+
+    // Build a java.util.ArrayList containing ZipEntry objects, then
+    // return `list.elements()` — an Enumeration view.
+    let al_class = "java/util/ArrayList";
+    let al_cid = ctx
+        .ensure_class_initialized(al_class)
+        .map_err(|_| MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("{al_class}: not loaded"),
+        }))?;
+    let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
+    for (name, method, size, csize, crc) in entries {
+        let ze = alloc_zip_entry(ctx, &name, method, size, csize, crc);
+        ctx.invoke(
+            al_class,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(Some(ze))],
+        )?;
+    }
+    // Collections.enumeration(list)
+    let en = ctx.invoke(
+        "java/util/Collections",
+        "enumeration",
+        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
+        &[Value::Object(Some(list))],
+    )?;
+    Ok(en)
+}
+
+/// `JarFile.getManifest()` → `java.util.jar.Manifest` loaded from
+/// `META-INF/MANIFEST.MF`, or null if absent.
+fn native_jarfile_get_manifest(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let handle = get_jar_handle(ctx, this);
+    let mf_bytes = {
+        let mut table = jar_table().lock();
+        let state = match table.get_mut(&handle) {
+            Some(s) => s,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let idx_opt = state
+            .archive
+            .file_names()
+            .enumerate()
+            .find(|(_, n)| n.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
+            .map(|(i, _)| i);
+        let Some(idx) = idx_opt else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let mut zf = state.archive.by_index(idx).map_err(|e| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("manifest read by_index({idx}): {e}"),
+            })
+        })?;
+        let mut buf = Vec::with_capacity(zf.size() as usize);
+        zf.read_to_end(&mut buf).map_err(|e| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("manifest read body: {e}"),
+            })
+        })?;
+        buf
+    };
+
+    // Feed the bytes to a fresh Manifest via new Manifest(InputStream).
+    let bais = build_byte_array_input_stream(ctx, &mf_bytes)?;
+    let mf_class = "java/util/jar/Manifest";
+    let mf_cid = ctx.ensure_class_initialized(mf_class).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("{mf_class}: not loaded"),
+        })
+    })?;
+    let mf_obj = ctx.alloc_object(mf_cid, ctx.class_num_total_fields(mf_cid).max(2));
+    ctx.invoke(
+        mf_class,
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+        &[Value::Object(Some(mf_obj)), Value::Object(Some(bais))],
+    )?;
+    Ok(Some(Value::Object(Some(mf_obj))))
+}
+
+/// `JarFile.close()` — drop the archive and remove the handle.
+fn native_jarfile_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let handle = get_jar_handle(ctx, this);
+    jar_table().lock().remove(&handle);
+    set_jar_handle(ctx, this, 0);
+    Ok(None)
+}
+
+/// `ZipFile.getName()` — returns the absolute path we opened under.
+fn native_jarfile_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let handle = get_jar_handle(ctx, this);
+    let path = {
+        let table = jar_table().lock();
+        match table.get(&handle) {
+            Some(s) => s.path.to_string_lossy().into_owned(),
+            None => String::new(),
+        }
+    };
+    if path.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let s = ctx.create_string(&path);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+/// `ZipFile.size()` — number of entries.
+fn native_jarfile_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let handle = get_jar_handle(ctx, this);
+    let n = {
+        let table = jar_table().lock();
+        match table.get(&handle) {
+            Some(s) => s.archive.len() as i32,
+            None => 0,
+        }
+    };
+    Ok(Some(Value::Int(n)))
+}
+
+// Hold the unused-value-warning silencer for extract_string_arg.
+#[allow(dead_code)]
+fn _extract_string_arg_unused(_ctx: &dyn NativeContext, _v: Value) -> Option<String> {
+    extract_string_arg(_ctx, _v)
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
+    let jf = "java/util/jar/JarFile";
+    let zf = "java/util/zip/ZipFile";
+
+    for cls in [jf, zf] {
+        r.register(cls, "<init>", "(Ljava/io/File;)V", native_jarfile_init_file);
+        r.register(
+            cls,
+            "<init>",
+            "(Ljava/io/File;Z)V",
+            native_jarfile_init_file_verify,
+        );
+        r.register(cls, "<init>", "(Ljava/lang/String;)V", native_jarfile_init_string);
+        r.register(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;Z)V",
+            native_jarfile_init_string_verify,
+        );
+        r.register(
+            cls,
+            "getEntry",
+            "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
+            native_jarfile_get_entry,
+        );
+        r.register(
+            cls,
+            "getInputStream",
+            "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+            native_jarfile_get_input_stream,
+        );
+        r.register(
+            cls,
+            "entries",
+            "()Ljava/util/Enumeration;",
+            native_jarfile_entries,
+        );
+        r.register(cls, "close", "()V", native_jarfile_close);
+        r.register(cls, "getName", "()Ljava/lang/String;", native_jarfile_get_name);
+        r.register(cls, "size", "()I", native_jarfile_size);
+    }
+
+    // JarFile-specific: getManifest
+    r.register(
+        jf,
+        "getManifest",
+        "()Ljava/util/jar/Manifest;",
+        native_jarfile_get_manifest,
+    );
+    r.register(
+        jf,
+        "getJarEntry",
+        "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+        native_jarfile_get_entry,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use zip::write::SimpleFileOptions;
+
+    fn make_test_jar() -> NamedTempFile {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = tmp.reopen().unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+        zw.write_all(b"Manifest-Version: 1.0\r\n\r\n").unwrap();
+        zw.start_file("hello.txt", opts).unwrap();
+        zw.write_all(b"hello jar world").unwrap();
+        zw.finish().unwrap();
+        tmp
+    }
+
+    #[test]
+    fn open_jar_and_list_entries() {
+        let tmp = make_test_jar();
+        let archive = zip::ZipArchive::new(File::open(tmp.path()).unwrap()).unwrap();
+        // 2 entries expected (manifest + hello.txt)
+        assert_eq!(archive.len(), 2);
+    }
+
+    #[test]
+    fn read_manifest_content_from_zip() {
+        let tmp = make_test_jar();
+        let mut archive = zip::ZipArchive::new(File::open(tmp.path()).unwrap()).unwrap();
+        let mut mf = archive.by_name("META-INF/MANIFEST.MF").unwrap();
+        let mut s = String::new();
+        mf.read_to_string(&mut s).unwrap();
+        assert!(s.starts_with("Manifest-Version: 1.0"));
+    }
+
+    #[test]
+    fn handle_allocator_is_monotonic() {
+        let h1 = next_handle();
+        let h2 = next_handle();
+        assert!(h2 > h1);
+    }
+
+    #[test]
+    fn cursor_readback_preserves_bytes() {
+        let data = b"test-bytes";
+        let mut c = Cursor::new(data.to_vec());
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).unwrap();
+        assert_eq!(&out, data);
+    }
+}

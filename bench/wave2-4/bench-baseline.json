@@ -1,0 +1,138 @@
+{
+  "$schema_version": 1,
+  "generated_at": "2026-04-25T00:00:00Z",
+  "rustjvm_version": "unknown",
+  "wp": "WP2.4-D",
+  "fixture": {
+    "mode": "real-or-skip",
+    "real_sources": {
+      "instrument_probe": "apps/instrument_probe/{Target,RetransformAgent,Main}.java + META-INF/MANIFEST.MF",
+      "jacoco_probe":     "apps/jacoco_probe/{Target,Main}.java + jacocoagent.jar",
+      "mockito_probe":    "apps/mockito_probe/{SomeInterface,Main}.java + mockito-core.jar + byte-buddy{,-agent}.jar + objenesis.jar"
+    },
+    "notes": "instrument_probe is the PRIMARY regression test for WP2.4: it builds its own agent.jar from a hand-rolled `ClassFileTransformer` that scans for `bipush 42` (0x10 0x2a) inside the Target classfile bytes and patches the operand to 99. No external jars required. jacoco_probe and mockito_probe additionally exercise WP2.4 against real-world agents — they skip-with-clear-message when the matching jar is absent."
+  },
+  "probes": {
+    "instrument": {
+      "real_jar_search": [],
+      "main_class": "Main",
+      "javaagent_arg": "-javaagent:bench/wave2-4/staged-instrument/agent.jar",
+      "expected_final_rc": 1,
+      "expected_stderr_contains": [
+        "InstrumentationImpl.isRetransformClassesSupported0",
+        "javaagent premain aborted VM"
+      ],
+      "expected_stdout_contains": [
+        "agent: premain entered"
+      ],
+      "expected_stderr_forbidden": [
+        "panicked at",
+        "RUST_BACKTRACE",
+        "STATUS_ACCESS_VIOLATION"
+      ],
+      "notes": "Today's reality (2026-04-25): rust-jvm's `agent_loader` (sibling 2.4-C) successfully parses `-javaagent:agent.jar`, locates the manifest, finds RetransformAgent, and invokes its premain. The premain enters and prints `agent: premain entered` to stdout. It then queries `inst.isRetransformClassesSupported()` which dispatches to a missing native `sun/instrument/InstrumentationImpl.isRetransformClassesSupported0(J)Z`. UnsatisfiedLinkError aborts the agent's premain. After 2.4-A wires the InstrumentationImpl native surface (isRetransformClassesSupported0, retransformClasses0, redefineClasses0, getAllLoadedClasses0, isModifiableClass0), the transformer registration + retransform path should fire; expected_final_rc flips to 0 and stdout gains `before=99 / after=99 / OK`."
+    },
+    "jacoco": {
+      "real_jar_search": [
+        "$JACOCO_AGENT_JAR (env)",
+        "C:/craton/ejbca-ce/lib/coverage/jacocoagent.jar",
+        "$USERPROFILE/.m2/repository/org/jacoco/org.jacoco.agent/*/org.jacoco.agent-*-runtime.jar"
+      ],
+      "main_class": "Main",
+      "javaagent_arg": "-javaagent:bench/wave2-4/staged-jacoco/jacocoagent.jar=destfile=<destfile>",
+      "expected_final_rc": 0,
+      "expected_stderr_contains": [
+        "javaagent: premain of `org.jacoco.agent.rt",
+        "java/lang/NullPointerException"
+      ],
+      "expected_stdout_contains": [
+        "m1(1)=4",
+        "m1(-2)=-2",
+        "m2(5,3)=25",
+        "OK"
+      ],
+      "expected_stderr_forbidden": [
+        "panicked at",
+        "RUST_BACKTRACE",
+        "STATUS_ACCESS_VIOLATION"
+      ],
+      "expected_jacoco_exec_present": true,
+      "expected_jacoco_exec_nonempty": false,
+      "expected_jacoco_magic_ok": false,
+      "notes": "rc=0 today — main() runs to completion because rust-jvm's agent_loader catches the JaCoCo premain NPE and continues (without the transformer registered). The `jacoco.exec` file gets created (0-byte placeholder) but contains NO coverage data because the transformer never installed. Once 2.4-A's full Instrumentation surface lands AND 2.4-B's class_manager retransform path is wired, JaCoCo's premain completes, the rewriter installs, and `jacoco.exec` after main() exits should be >300 bytes and start with 0x01 0xC0 0xC0 (JaCoCo execdata magic). At that point flip expected_jacoco_exec_nonempty + expected_jacoco_magic_ok to true and clear the expected_stderr_contains entries."
+    },
+    "mockito": {
+      "real_jar_search": [
+        "$MOCKITO_JAR (env), $BYTEBUDDY_JAR, $BYTEBUDDY_AGENT_JAR, $OBJENESIS_JAR",
+        "$USERPROFILE/.m2/repository/org/mockito/mockito-core/*/mockito-core-*.jar",
+        "$USERPROFILE/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar",
+        "$USERPROFILE/.m2/repository/net/bytebuddy/byte-buddy-agent/*/byte-buddy-agent-*.jar",
+        "$USERPROFILE/.m2/repository/org/objenesis/objenesis/*/objenesis-*.jar"
+      ],
+      "main_class": "Main",
+      "javaagent_arg": "-javaagent:bench/wave2-4/staged-mockito/byte-buddy-agent.jar",
+      "expected_final_rc": 1,
+      "expected_stderr_contains": [
+        "Could not initialize plugin: interface org.mockito.plugins.MockMaker",
+        "Mockito is unable to load the default implementation"
+      ],
+      "expected_stdout_contains": [],
+      "expected_stderr_forbidden": [
+        "panicked at",
+        "RUST_BACKTRACE",
+        "STATUS_ACCESS_VIOLATION"
+      ],
+      "notes": "Mockito's MockMaker SPI bootstrap (org.mockito.plugins.MockMaker) walks ByteBuddy's class loader chain, which trips the same NPE inside net.bytebuddy.utility.dispatcher.JavaDispatcher.<clinit> documented in WP2.3 (bench/wave2-3 baseline). On top of that, even when ByteBuddy clinit succeeds, the inline MockMaker needs runtime class redefinition via the Instrumentation API — that's exactly the WP2.4-A surface. So Mockito requires BOTH WP2.3 (defineClass family) AND WP2.4 (Instrumentation.retransformClasses) to land before this probe flips. expected_final_rc remains 1 until then. After: clear the expected_stderr_contains entries and add `mock-class=`, `default-int=0`, `stubbed-int=42`, and `OK` to expected_stdout_contains."
+    }
+  },
+  "steps": [
+    {
+      "name": "stage-instrument",
+      "rc": 0,
+      "notes": "javac --release 21 of Target/RetransformAgent/Main; jar cfm agent.jar with Premain-Class."
+    },
+    {
+      "name": "stage-jacoco",
+      "rc": 0,
+      "notes": "javac --release 21 of Target+Main. Locates jacocoagent.jar at C:/craton/ejbca-ce/lib/coverage/jacocoagent.jar on the dev workstation. SKIP if absent."
+    },
+    {
+      "name": "stage-mockito",
+      "rc": 0,
+      "notes": "javac --release 21 of SomeInterface+Main with mockito-core + byte-buddy{,-agent} + objenesis on cp. SKIP if any of the four jars missing. Auto-discovered jars on dev workstation: mockito-core 4.0.0/4.5.1/5.11.0/5.13.0, byte-buddy 1.12.12/1.12.17/1.12.23/1.14.19, objenesis 1.2/3.2/3.3."
+    },
+    {
+      "name": "run",
+      "rc": 1,
+      "notes": "rust-jvm runs all three probes. Per-probe rc / meta is pinned in summary.json. The harness itself exits 0; future agents diff summary.json against this baseline to detect drift."
+    }
+  ],
+  "known_blockers": [
+    {
+      "id": "WP2.4-A",
+      "owner": "agent 2.4-A",
+      "summary": "vm/src/runtime/instrument.rs must register the full sun/instrument/InstrumentationImpl native surface (isRetransformClassesSupported0, retransformClasses0, redefineClasses0, getAllLoadedClasses0, isModifiableClass0, getObjectSize0). Today only an in-process bridge exists (rustjvm.Instrument). Premain calls into the java.lang.instrument.Instrumentation API which is implemented as sun.instrument.InstrumentationImpl in OpenJDK; that bridge needs the natives wired.",
+      "see": "docs/wildfly-ejbca-roadmap.md WP2.4"
+    },
+    {
+      "id": "WP2.4-B",
+      "owner": "agent 2.4-B",
+      "summary": "classloading/src/class_manager.rs must support full bytecode redefinition: retransformClasses must re-run the transformer chain on already-loaded classes, parse the new bytes, swap the method table in place, invalidate vtable / itable / JIT caches.",
+      "see": "docs/wildfly-ejbca-roadmap.md WP2.4"
+    },
+    {
+      "id": "WP2.4-C",
+      "owner": "agent 2.4-C",
+      "summary": "vm-cli/src/main.rs + vm/src/runtime/agent_loader.rs already parse `-javaagent:foo.jar` and dispatch premain (verified today: instrument_probe stdout shows 'agent: premain entered'). Remaining gap: agent_loader must also pass the actual Instrumentation reference to premain (currently fails on the InstrumentationImpl <init>(JLjava/lang/String;ZZ)V signature).",
+      "see": "docs/wildfly-ejbca-roadmap.md WP2.4"
+    },
+    {
+      "id": "WP2.3-*",
+      "owner": "siblings 2.3-A/B/C (Wave 2 prerequisite)",
+      "summary": "Mockito + ByteBuddy bootstrap fails inside ByteBuddy's JavaDispatcher.<clinit> with NPE on Method[] arraylength. Same blocker family already documented in bench/wave2-3/bench-baseline.json. mockito_probe will only flip after WP2.3 is green AND WP2.4 is green.",
+      "see": "bench/wave2-3/bench-baseline.json"
+    }
+  ],
+  "definition_of_pass": "Per-probe pass criteria:\n - instrument: rc=0; stdout contains 'agent: premain entered', 'agent: addTransformer done', 'agent: retransformClasses done', 'before=99', 'after=99', 'OK'.\n - jacoco: rc=0; stdout already passes today; after WP2.4-A/B land the jacoco.exec file must be >300 bytes and start with the magic 0x01 0xC0 0xC0.\n - mockito: rc=0; stdout contains 'mock-class=', 'default-int=0', 'stubbed-int=42', 'stubbed-string=hi-foo', 'OK'.\n\nWhen all three flip, clear the per-probe `expected_stderr_contains[]` arrays and add OK to `expected_stdout_contains[]`.",
+  "update_policy": "Update this file in lockstep with each 2.4-A/B/C landing. Bump `generated_at`. The diff-baseline tool (TBD — for now humans inspect summary.json + last-run-*.meta.json by hand) compares post-run artifacts against the per-probe expected_* sets."
+}

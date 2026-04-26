@@ -1,0 +1,5 @@
+ignoring `rustjvm_vm::runtime::exceptions=debug `: error parsing level filter: expected one of "off", "error", "warn", "info", "debug", "trace", or a number 0-5
+[wp61-trace] registered Provider.getEngineName at registration time. find=true
+[wp61-trace] invokestatic Provider.getEngineName cls="java/security/Provider" method="getEngineName" desc="(Ljava/lang/String;)Ljava/lang/String;" direct_native=true
+[wp61-trace] provider_get_engine_name CALLED args.len=1
+Exception in thread "main" java/lang/InternalError: cannot create instance of org.bouncycastle.jcajce.provider.digest.GOST3411$Mappings : java.lang.NullPointerException: Cannot invoke get on null

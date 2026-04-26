@@ -1,0 +1,518 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
+
+/// Unique identifier for an event type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EventTypeId(pub u32);
+
+/// Describes a field in an event
+#[derive(Debug, Clone)]
+pub struct EventField {
+    pub name: String,
+    pub type_name: String, // "long", "string", "boolean", "float", "double", "int"
+    pub description: String,
+}
+
+impl EventField {
+    pub fn new(name: &str, type_name: &str, description: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            description: description.to_string(),
+        }
+    }
+}
+
+/// Describes an event type (metadata)
+#[derive(Debug, Clone)]
+pub struct EventType {
+    pub id: EventTypeId,
+    pub name: String,
+    pub category: Vec<String>,
+    pub description: String,
+    pub fields: Vec<EventField>,
+    pub has_thread: bool,
+    pub has_stacktrace: bool,
+    pub period: EventPeriod,
+    pub threshold: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EventPeriod {
+    /// Instant event
+    None,
+    /// Duration event
+    BeginEnd,
+    /// Periodic per chunk
+    EveryChunk,
+    /// Periodic per second
+    EverySecond,
+}
+
+/// A single recorded event instance
+#[derive(Debug, Clone)]
+pub struct EventInstance {
+    pub type_id: EventTypeId,
+    pub start_time: u64,  // nanos since epoch
+    pub end_time: u64,    // nanos since epoch (== start_time for instant events)
+    pub thread_id: u64,
+    pub fields: Vec<EventValue>,
+}
+
+/// Event field values.
+///
+/// `String` variant uses `Arc<str>` to allow cheap cloning and sharing across
+/// multiple recordings without per-recording heap allocation.
+#[derive(Debug, Clone)]
+pub enum EventValue {
+    Long(i64),
+    Int(i32),
+    Float(f32),
+    Double(f64),
+    Boolean(bool),
+    String(Arc<str>),
+    Null,
+}
+
+impl EventValue {
+    /// Convenience constructor for string values from a `&str`.
+    pub fn from_str(s: &str) -> Self {
+        EventValue::String(Arc::from(s))
+    }
+}
+
+/// Registry of all known event types.
+/// T10.9.B: FxHashMap — event type IDs and names are internal JFR definitions.
+pub struct EventTypeRegistry {
+    types: FxHashMap<EventTypeId, EventType>,
+    name_to_id: FxHashMap<String, EventTypeId>,
+    next_id: u32,
+}
+
+impl EventTypeRegistry {
+    pub fn new() -> Self {
+        Self {
+            types: FxHashMap::default(),
+            name_to_id: FxHashMap::default(),
+            next_id: 1,
+        }
+    }
+
+    /// Register a new event type. The `id` field of the passed `EventType` is
+    /// overwritten with the auto-assigned id.
+    pub fn register(&mut self, mut event_type: EventType) -> EventTypeId {
+        let id = EventTypeId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).expect("event type ID overflow");
+        event_type.id = id;
+        self.name_to_id.insert(event_type.name.clone(), id);
+        self.types.insert(id, event_type);
+        id
+    }
+
+    pub fn get(&self, id: EventTypeId) -> Option<&EventType> {
+        self.types.get(&id)
+    }
+
+    pub fn find_by_name(&self, name: &str) -> Option<EventTypeId> {
+        self.name_to_id.get(name).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.types.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+    }
+
+    /// Returns an iterator over all registered event types.
+    pub fn iter(&self) -> impl Iterator<Item = (&EventTypeId, &EventType)> {
+        self.types.iter()
+    }
+}
+
+impl Default for EventTypeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- EventTypeId ---
+
+    #[test]
+    fn test_event_type_id_equality() {
+        assert_eq!(EventTypeId(1), EventTypeId(1));
+        assert_ne!(EventTypeId(1), EventTypeId(2));
+    }
+
+    #[test]
+    fn test_event_type_id_clone_copy() {
+        let id = EventTypeId(42);
+        let id2 = id; // Copy
+        let id3 = id.clone();
+        assert_eq!(id, id2);
+        assert_eq!(id, id3);
+    }
+
+    #[test]
+    fn test_event_type_id_hash() {
+        let mut map = HashMap::new();
+        map.insert(EventTypeId(1), "one");
+        map.insert(EventTypeId(2), "two");
+        assert_eq!(map.get(&EventTypeId(1)), Some(&"one"));
+        assert_eq!(map.get(&EventTypeId(2)), Some(&"two"));
+        assert_eq!(map.get(&EventTypeId(3)), None);
+    }
+
+    #[test]
+    fn test_event_type_id_debug() {
+        let id = EventTypeId(7);
+        let dbg = format!("{:?}", id);
+        assert!(dbg.contains("7"));
+    }
+
+    // --- EventField ---
+
+    #[test]
+    fn test_event_field_new() {
+        let f = EventField::new("count", "int", "Item count");
+        assert_eq!(f.name, "count");
+        assert_eq!(f.type_name, "int");
+        assert_eq!(f.description, "Item count");
+    }
+
+    #[test]
+    fn test_event_field_clone() {
+        let f = EventField::new("name", "string", "Name field");
+        let f2 = f.clone();
+        assert_eq!(f.name, f2.name);
+        assert_eq!(f.type_name, f2.type_name);
+        assert_eq!(f.description, f2.description);
+    }
+
+    #[test]
+    fn test_event_field_debug() {
+        let f = EventField::new("x", "long", "desc");
+        let dbg = format!("{:?}", f);
+        assert!(dbg.contains("x"));
+        assert!(dbg.contains("long"));
+    }
+
+    // --- EventType ---
+
+    fn make_event_type(name: &str) -> EventType {
+        EventType {
+            id: EventTypeId(0),
+            name: name.to_string(),
+            category: vec!["Test".into()],
+            description: "Test event".into(),
+            fields: vec![
+                EventField::new("field1", "int", "First field"),
+            ],
+            has_thread: true,
+            has_stacktrace: false,
+            period: EventPeriod::None,
+            threshold: None,
+        }
+    }
+
+    #[test]
+    fn test_event_type_fields() {
+        let et = make_event_type("test.Foo");
+        assert_eq!(et.name, "test.Foo");
+        assert_eq!(et.category.len(), 1);
+        assert_eq!(et.fields.len(), 1);
+        assert!(et.has_thread);
+        assert!(!et.has_stacktrace);
+        assert!(et.threshold.is_none());
+    }
+
+    #[test]
+    fn test_event_type_with_threshold() {
+        let et = EventType {
+            threshold: Some(std::time::Duration::from_millis(10)),
+            ..make_event_type("test.Slow")
+        };
+        assert_eq!(et.threshold.unwrap(), std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_event_type_clone() {
+        let et = make_event_type("test.Clone");
+        let et2 = et.clone();
+        assert_eq!(et.name, et2.name);
+        assert_eq!(et.fields.len(), et2.fields.len());
+    }
+
+    // --- EventPeriod ---
+
+    #[test]
+    fn test_event_period_variants() {
+        let _ = EventPeriod::None;
+        let _ = EventPeriod::BeginEnd;
+        let _ = EventPeriod::EveryChunk;
+        let _ = EventPeriod::EverySecond;
+    }
+
+    #[test]
+    fn test_event_period_debug() {
+        let p = EventPeriod::BeginEnd;
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("BeginEnd"));
+    }
+
+    #[test]
+    fn test_event_period_clone() {
+        let p = EventPeriod::EverySecond;
+        let p2 = p.clone();
+        let dbg1 = format!("{:?}", p);
+        let dbg2 = format!("{:?}", p2);
+        assert_eq!(dbg1, dbg2);
+    }
+
+    // --- EventInstance ---
+
+    #[test]
+    fn test_event_instance_construction() {
+        let evt = EventInstance {
+            type_id: EventTypeId(5),
+            start_time: 1000,
+            end_time: 2000,
+            thread_id: 42,
+            fields: vec![EventValue::Int(10)],
+        };
+        assert_eq!(evt.type_id, EventTypeId(5));
+        assert_eq!(evt.start_time, 1000);
+        assert_eq!(evt.end_time, 2000);
+        assert_eq!(evt.thread_id, 42);
+        assert_eq!(evt.fields.len(), 1);
+    }
+
+    #[test]
+    fn test_event_instance_instant_event() {
+        let evt = EventInstance {
+            type_id: EventTypeId(1),
+            start_time: 5000,
+            end_time: 5000, // instant event: start == end
+            thread_id: 1,
+            fields: vec![],
+        };
+        assert_eq!(evt.start_time, evt.end_time);
+    }
+
+    #[test]
+    fn test_event_instance_clone() {
+        let evt = EventInstance {
+            type_id: EventTypeId(1),
+            start_time: 100,
+            end_time: 200,
+            thread_id: 1,
+            fields: vec![EventValue::String(Arc::from("test"))],
+        };
+        let evt2 = evt.clone();
+        assert_eq!(evt.type_id, evt2.type_id);
+        assert_eq!(evt.fields.len(), evt2.fields.len());
+    }
+
+    // --- EventValue ---
+
+    #[test]
+    fn test_event_value_long() {
+        let v = EventValue::Long(i64::MAX);
+        assert!(matches!(v, EventValue::Long(x) if x == i64::MAX));
+    }
+
+    #[test]
+    fn test_event_value_int() {
+        let v = EventValue::Int(-42);
+        assert!(matches!(v, EventValue::Int(-42)));
+    }
+
+    #[test]
+    fn test_event_value_float() {
+        let v = EventValue::Float(3.25);
+        assert!(matches!(v, EventValue::Float(x) if (x - 3.25).abs() < 0.001));
+    }
+
+    #[test]
+    fn test_event_value_double() {
+        let v = EventValue::Double(2.5);
+        assert!(matches!(v, EventValue::Double(x) if (x - 2.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_event_value_boolean() {
+        assert!(matches!(EventValue::Boolean(true), EventValue::Boolean(true)));
+        assert!(matches!(EventValue::Boolean(false), EventValue::Boolean(false)));
+    }
+
+    #[test]
+    fn test_event_value_string() {
+        let v = EventValue::String(Arc::from("hello world"));
+        assert!(matches!(&v, EventValue::String(s) if &**s == "hello world"));
+    }
+
+    #[test]
+    fn test_event_value_null() {
+        assert!(matches!(EventValue::Null, EventValue::Null));
+    }
+
+    #[test]
+    fn test_event_value_clone() {
+        let v = EventValue::String(Arc::from("clone me"));
+        let v2 = v.clone();
+        match (&v, &v2) {
+            (EventValue::String(a), EventValue::String(b)) => assert_eq!(&**a, &**b),
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn test_event_value_string_arc_sharing() {
+        let s: Arc<str> = Arc::from("shared");
+        let v1 = EventValue::String(Arc::clone(&s));
+        let v2 = EventValue::String(Arc::clone(&s));
+        match (&v1, &v2) {
+            (EventValue::String(a), EventValue::String(b)) => assert!(Arc::ptr_eq(a, b)),
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn test_event_value_from_str() {
+        let v = EventValue::from_str("hello");
+        assert!(matches!(&v, EventValue::String(s) if &**s == "hello"));
+    }
+
+    #[test]
+    fn test_event_value_debug() {
+        let v = EventValue::Int(99);
+        let dbg = format!("{:?}", v);
+        assert!(dbg.contains("99"));
+    }
+
+    // --- EventTypeRegistry ---
+
+    #[test]
+    fn test_registry_new_is_empty() {
+        let reg = EventTypeRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_default_is_empty() {
+        let reg = EventTypeRegistry::default();
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn test_registry_register_assigns_id() {
+        let mut reg = EventTypeRegistry::new();
+        let id1 = reg.register(make_event_type("first"));
+        let id2 = reg.register(make_event_type("second"));
+        assert_ne!(id1, id2);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn test_registry_register_overwrites_id_field() {
+        let mut reg = EventTypeRegistry::new();
+        let id = reg.register(EventType {
+            id: EventTypeId(999), // should be overwritten
+            name: "test".into(),
+            category: vec![],
+            description: "".into(),
+            fields: vec![],
+            has_thread: false,
+            has_stacktrace: false,
+            period: EventPeriod::None,
+            threshold: None,
+        });
+        let stored = reg.get(id).unwrap();
+        assert_eq!(stored.id, id);
+        assert_ne!(stored.id, EventTypeId(999));
+    }
+
+    #[test]
+    fn test_registry_get_returns_correct_type() {
+        let mut reg = EventTypeRegistry::new();
+        let id = reg.register(make_event_type("myType"));
+        let et = reg.get(id).unwrap();
+        assert_eq!(et.name, "myType");
+    }
+
+    #[test]
+    fn test_registry_get_missing_returns_none() {
+        let reg = EventTypeRegistry::new();
+        assert!(reg.get(EventTypeId(100)).is_none());
+    }
+
+    #[test]
+    fn test_registry_find_by_name() {
+        let mut reg = EventTypeRegistry::new();
+        let id = reg.register(make_event_type("jdk.GC"));
+        assert_eq!(reg.find_by_name("jdk.GC"), Some(id));
+        assert_eq!(reg.find_by_name("jdk.Missing"), None);
+    }
+
+    #[test]
+    fn test_registry_iter() {
+        let mut reg = EventTypeRegistry::new();
+        reg.register(make_event_type("a"));
+        reg.register(make_event_type("b"));
+        reg.register(make_event_type("c"));
+        let names: Vec<&str> = reg.iter().map(|(_, et)| et.name.as_str()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    #[test]
+    fn test_registry_ids_auto_increment() {
+        let mut reg = EventTypeRegistry::new();
+        let id1 = reg.register(make_event_type("x"));
+        let id2 = reg.register(make_event_type("y"));
+        let id3 = reg.register(make_event_type("z"));
+        // IDs should be sequential starting from 1
+        assert_eq!(id1, EventTypeId(1));
+        assert_eq!(id2, EventTypeId(2));
+        assert_eq!(id3, EventTypeId(3));
+    }
+
+    #[test]
+    fn test_registry_multiple_categories() {
+        let mut reg = EventTypeRegistry::new();
+        let et = EventType {
+            category: vec!["JVM".into(), "GC".into(), "Collector".into()],
+            ..make_event_type("gc.event")
+        };
+        let id = reg.register(et);
+        let stored = reg.get(id).unwrap();
+        assert_eq!(stored.category.len(), 3);
+    }
+
+    #[test]
+    fn test_registry_checked_add_does_not_wrap() {
+        let mut reg = EventTypeRegistry::new();
+        // Register a few events and verify IDs increment properly
+        let id1 = reg.register(make_event_type("event.a"));
+        let id2 = reg.register(make_event_type("event.b"));
+        assert_eq!(id1.0 + 1, id2.0);
+    }
+
+    #[test]
+    fn test_registry_lookup_by_name() {
+        let mut reg = EventTypeRegistry::new();
+        let id = reg.register(make_event_type("jdk.ThreadStart"));
+        assert_eq!(reg.find_by_name("jdk.ThreadStart"), Some(id));
+        assert_eq!(reg.find_by_name("jdk.Missing"), None);
+    }
+}

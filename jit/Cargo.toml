@@ -1,0 +1,26 @@
+[package]
+name = "rustjvm-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "x86-64 JIT compiler for RustJVM"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustjvm-types = { path = "../types" }
+rustjvm-reader = { path = "../reader" }
+rustjvm-jit-api = { path = "../jit-api" }
+parking_lot = "0.12"
+rustc-hash = "1.1"
+
+[features]
+vm-tests = []
+
+[dev-dependencies]
+rustjvm-gc = { path = "../gc" }
+
+[lints]
+workspace = true

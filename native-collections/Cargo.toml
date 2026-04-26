@@ -1,0 +1,21 @@
+[package]
+name = "rustjvm-native-collections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Java collections native methods for RustJVM"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+synthetic-jdk = []
+
+[dependencies]
+rustjvm-types = { path = "../types" }
+rustjvm-native-api = { path = "../native-api" }
+
+[lints]
+workspace = true

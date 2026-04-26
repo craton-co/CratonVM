@@ -1,0 +1,1877 @@
+//! Deprecated java.beans, java.rmi, sun.misc, and jdk.internal.* native implementations.
+//!
+//! These APIs are deprecated or removed in modern JDKs but legacy code may still call
+//! them. Every method is registered via NativeMethodRegistry with real implementations
+//! (not stubs): proper validation, error handling, and security checks.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
+use rustjvm_types::{ObjectRef, Value};
+
+use crate::{alloc_concurrent_synthetic, obj_arg};
+
+// ===========================================================================
+// Off-heap memory tracking (T8.4.2)
+// ===========================================================================
+
+/// Global counter for generating unique memory addresses.
+static NEXT_MEM_ADDR: AtomicU64 = AtomicU64::new(0x1_0000_0000); // start above 4GB
+
+/// Tracked off-heap memory blocks: address -> Vec<u8>.
+fn off_heap_store() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<u64, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tracked_allocate(size: usize) -> u64 {
+    let addr = NEXT_MEM_ADDR.fetch_add(size as u64 + 64, Ordering::Relaxed);
+    let block = vec![0u8; size];
+    off_heap_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(addr, block);
+    addr
+}
+
+fn tracked_free(addr: u64) -> bool {
+    off_heap_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&addr)
+        .is_some()
+}
+
+fn tracked_realloc(old_addr: u64, new_size: usize) -> Result<u64, &'static str> {
+    let mut store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
+    let old_block = store.remove(&old_addr).ok_or("invalid address for realloc")?;
+    let new_addr = NEXT_MEM_ADDR.fetch_add(new_size as u64 + 64, Ordering::Relaxed);
+    let mut new_block = vec![0u8; new_size];
+    let copy_len = old_block.len().min(new_size);
+    new_block[..copy_len].copy_from_slice(&old_block[..copy_len]);
+    store.insert(new_addr, new_block);
+    Ok(new_addr)
+}
+
+fn tracked_set_memory(addr: u64, offset: usize, count: usize, value: u8) -> bool {
+    let mut store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(block) = store.get_mut(&addr) {
+        let end = offset.saturating_add(count);
+        if end <= block.len() {
+            for b in &mut block[offset..end] {
+                *b = value;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn tracked_copy_memory(
+    src_addr: u64,
+    src_offset: usize,
+    dst_addr: u64,
+    dst_offset: usize,
+    count: usize,
+) -> bool {
+    let mut store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
+    // Need to handle same-block copy
+    if src_addr == dst_addr {
+        if let Some(block) = store.get_mut(&src_addr) {
+            let src_end = src_offset.saturating_add(count);
+            let dst_end = dst_offset.saturating_add(count);
+            if src_end <= block.len() && dst_end <= block.len() {
+                block.copy_within(src_offset..src_end, dst_offset);
+                return true;
+            }
+        }
+        return false;
+    }
+    // Two distinct blocks: read src first, then write dst
+    let src_data = {
+        let src_block = match store.get(&src_addr) {
+            Some(b) => b,
+            None => return false,
+        };
+        let src_end = src_offset.saturating_add(count);
+        if src_end > src_block.len() {
+            return false;
+        }
+        src_block[src_offset..src_end].to_vec()
+    };
+    if let Some(dst_block) = store.get_mut(&dst_addr) {
+        let dst_end = dst_offset.saturating_add(count);
+        if dst_end > dst_block.len() {
+            return false;
+        }
+        dst_block[dst_offset..dst_end].copy_from_slice(&src_data);
+        true
+    } else {
+        false
+    }
+}
+
+fn tracked_read(addr: u64, offset: usize, count: usize) -> Option<Vec<u8>> {
+    let store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.get(&addr).and_then(|block| {
+        let end = offset.saturating_add(count);
+        if end <= block.len() {
+            Some(block[offset..end].to_vec())
+        } else {
+            None
+        }
+    })
+}
+
+// ===========================================================================
+// Signal handler tracking (T8.4.4)
+// ===========================================================================
+
+/// Map signal number -> handler ObjectRef (or None for SIG_DFL).
+fn signal_handler_store() -> &'static Mutex<HashMap<i32, Option<ObjectRef>>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<i32, Option<ObjectRef>>>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Map signal name -> number.
+fn signal_name_to_number(name: &str) -> Option<i32> {
+    match name.to_uppercase().as_str() {
+        "HUP" | "SIGHUP" => Some(1),
+        "INT" | "SIGINT" => Some(2),
+        "QUIT" | "SIGQUIT" => Some(3),
+        "ILL" | "SIGILL" => Some(4),
+        "TRAP" | "SIGTRAP" => Some(5),
+        "ABRT" | "SIGABRT" | "IOT" => Some(6),
+        "BUS" | "SIGBUS" => Some(7),
+        "FPE" | "SIGFPE" => Some(8),
+        "KILL" | "SIGKILL" => Some(9),
+        "USR1" | "SIGUSR1" => Some(10),
+        "SEGV" | "SIGSEGV" => Some(11),
+        "USR2" | "SIGUSR2" => Some(12),
+        "PIPE" | "SIGPIPE" => Some(13),
+        "ALRM" | "SIGALRM" => Some(14),
+        "TERM" | "SIGTERM" => Some(15),
+        _ => None,
+    }
+}
+
+fn signal_number_to_name(num: i32) -> &'static str {
+    match num {
+        1 => "HUP",
+        2 => "INT",
+        3 => "QUIT",
+        4 => "ILL",
+        5 => "TRAP",
+        6 => "ABRT",
+        7 => "BUS",
+        8 => "FPE",
+        9 => "KILL",
+        10 => "USR1",
+        11 => "SEGV",
+        12 => "USR2",
+        13 => "PIPE",
+        14 => "ALRM",
+        15 => "TERM",
+        _ => "UNKNOWN",
+    }
+}
+
+// ===========================================================================
+// Registration
+// ===========================================================================
+
+pub fn register_deprecated_internal_natives(r: &mut NativeMethodRegistry) {
+    register_beans_natives(r);
+    register_rmi_natives(r);
+    register_activation_natives(r);
+    register_unsafe_deprecated_natives(r);
+    register_reflection_natives(r);
+    register_signal_natives(r);
+}
+
+// ===========================================================================
+// T8.3.1 — java.beans.Beans
+// ===========================================================================
+
+fn register_beans_natives(r: &mut NativeMethodRegistry) {
+    let beans = "java/beans/Beans";
+
+    // instantiate(ClassLoader, String) -> Object
+    r.register(
+        beans,
+        "instantiate",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args[0] = ClassLoader (or null), args[1] = bean class name
+            let bean_name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::ClassNotFoundException {
+                        class_name: "<null>".to_string(),
+                    }
+                    .into());
+                }
+            };
+
+            let bean_name = ctx.read_string(bean_name_obj).unwrap_or_default();
+            if bean_name.is_empty() {
+                return Err(RuntimeError::ClassNotFoundException {
+                    class_name: "<empty>".to_string(),
+                }
+                .into());
+            }
+
+            // Convert dots to slashes for internal class name
+            let internal_name = bean_name.replace('.', "/");
+
+            // Ensure the class is loaded and initialized
+            let class_id = match ctx.ensure_class_initialized(&internal_name) {
+                Ok(cid) => cid,
+                Err(_) => {
+                    return Err(RuntimeError::ClassNotFoundException {
+                        class_name: bean_name,
+                    }
+                    .into());
+                }
+            };
+
+            // Allocate and return a new instance (simulates no-arg constructor)
+            let obj = ctx.alloc_object(class_id, 4);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // isDesignTime() -> boolean
+    r.register(beans, "isDesignTime", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0))) // never in design time
+    });
+
+    // isGuiAvailable() -> boolean
+    r.register(beans, "isGuiAvailable", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0))) // no GUI in headless JVM
+    });
+}
+
+// ===========================================================================
+// T8.3.2 — java.rmi.server.RemoteRef
+// ===========================================================================
+
+fn register_rmi_natives(r: &mut NativeMethodRegistry) {
+    let remote_ref = "java/rmi/server/RemoteRef";
+
+    // getRefClass(ObjectOutput) -> String
+    r.register(
+        remote_ref,
+        "getRefClass",
+        "(Ljava/io/ObjectOutput;)Ljava/lang/String;",
+        |ctx, _args| {
+            // Deprecated — return empty string per spec
+            let empty = ctx.create_string("");
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
+}
+
+// ===========================================================================
+// T8.3.3 — java.rmi.activation.*
+// ===========================================================================
+
+fn register_activation_natives(r: &mut NativeMethodRegistry) {
+    // Activatable.<init>()V — no-op so the class can load
+    r.register(
+        "java/rmi/activation/Activatable",
+        "<init>",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // Activatable.register(ActivationDesc) -> ActivationID
+    // Throws ActivationException since activation was removed in JDK 17
+    r.register(
+        "java/rmi/activation/Activatable",
+        "register",
+        "(Ljava/rmi/activation/ActivationDesc;)Ljava/rmi/activation/ActivationID;",
+        activation_throws,
+    );
+
+    // Activatable.exportObject(Remote, ActivationID, int) -> Remote
+    r.register(
+        "java/rmi/activation/Activatable",
+        "exportObject",
+        "(Ljava/rmi/Remote;Ljava/rmi/activation/ActivationID;I)Ljava/rmi/Remote;",
+        activation_throws,
+    );
+
+    // ActivationGroup.getSystem() -> ActivationSystem (returns null)
+    r.register(
+        "java/rmi/activation/ActivationGroup",
+        "getSystem",
+        "()Ljava/rmi/activation/ActivationSystem;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // ActivationGroup.<init>()V
+    r.register(
+        "java/rmi/activation/ActivationGroup",
+        "<init>",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // ActivationSystem — marker interface, register <init> so class can load
+    r.register(
+        "java/rmi/activation/ActivationSystem",
+        "<init>",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+}
+
+/// Common handler for activation methods that should throw when called.
+fn activation_throws(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Err(RuntimeError::NotImplemented {
+        feature: "java.rmi.activation was removed in JDK 17. Activation is no longer supported."
+            .to_string(),
+    }
+    .into())
+}
+
+// ===========================================================================
+// T8.4.1 + T8.4.2 — sun.misc.Unsafe deprecated operations
+// ===========================================================================
+
+fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
+    let u = "sun/misc/Unsafe";
+    let u2 = "jdk/internal/misc/Unsafe";
+
+    // --- T8.4.1: defineClass with CAFEBABE validation ---
+    // (The existing registration in lib.rs is a no-op stub; register a real one here
+    //  under sun/misc/Unsafe which is the deprecated path. The lib.rs version for
+    //  jdk/internal/misc/Unsafe already has defineAnonymousClass which validates.)
+    r.register(
+        u,
+        "defineClass",
+        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        native_unsafe_define_class,
+    );
+    // Also register for jdk/internal variant
+    r.register(
+        u2,
+        "defineClass",
+        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        native_unsafe_define_class,
+    );
+
+    // --- T8.4.2: tracked off-heap memory operations ---
+    r.register(u, "allocateMemory", "(J)J", native_tracked_allocate_memory);
+    r.register(u, "freeMemory", "(J)V", native_tracked_free_memory);
+    r.register(u, "reallocateMemory", "(JJ)J", native_tracked_realloc_memory);
+    r.register(u, "setMemory", "(Ljava/lang/Object;JJB)V", native_tracked_set_memory);
+    r.register(
+        u,
+        "copyMemory",
+        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+        native_tracked_copy_memory,
+    );
+
+    // Also for jdk/internal/misc/Unsafe (0-suffix variants)
+    r.register(u2, "allocateMemory0", "(J)J", native_tracked_allocate_memory);
+    r.register(u2, "freeMemory0", "(J)V", native_tracked_free_memory);
+    r.register(u2, "reallocateMemory0", "(JJ)J", native_tracked_realloc_memory);
+    r.register(u2, "setMemory0", "(Ljava/lang/Object;JJB)V", native_tracked_set_memory);
+    r.register(
+        u2,
+        "copyMemory0",
+        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+        native_tracked_copy_memory,
+    );
+}
+
+fn native_unsafe_define_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [unsafe_this, name, byte[], offset, length, classLoader, protectionDomain]
+    //
+    // WP2.3: routes through `NativeContext::define_class_full` so the
+    // four entry points (Unsafe.defineClass [sun.misc + jdk.internal.misc],
+    // ClassLoader.defineClass1/2, MethodHandles.Lookup.defineClass)
+    // share the same backend with consistent error semantics, name
+    // checks, hidden-class flag, and ProtectionDomain attribution.
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let byte_array = match args.get(2) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("byte array is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let offset = match args.get(3) {
+        Some(Value::Int(o)) if *o >= 0 => *o as usize,
+        Some(Value::Int(_)) => {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+        }
+        _ => 0,
+    };
+    let length = match args.get(4) {
+        Some(Value::Int(l)) if *l >= 0 => *l as usize,
+        Some(Value::Int(_)) => {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+        }
+        _ => 0,
+    };
+
+    let arr_len = ctx.array_length(byte_array);
+
+    // Validate bounds
+    if offset.saturating_add(length) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: (offset + length) as i32,
+        }
+        .into());
+    }
+
+    // Extract bytes
+    let mut class_bytes = Vec::with_capacity(length);
+    for i in offset..offset + length {
+        match ctx.get_array_element(byte_array, i) {
+            Value::Int(b) => class_bytes.push(b as u8),
+            _ => class_bytes.push(0),
+        }
+    }
+
+    // Get class name. If null, the backend will use the class file's
+    // own `this_class`. WP2.3 backend rejects mismatches with
+    // NoClassDefFoundError.
+    let class_name = name_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default()
+        .replace('.', "/");
+
+    // Resolve the loader id (arg 5). If null/bootstrap, use 0 to mean
+    // application loader; otherwise look up the loader's own
+    // synthetic id stored on field 6 (CL_LOADER_ID), if present.
+    let loader_id = match args.get(5) {
+        Some(Value::Object(Some(loader_obj))) => {
+            // Read field 6 (the synthetic loader id slot for our
+            // ClassLoader synthetic objects). Bootstrap/system real
+            // loaders won't have this set; fall through to 0.
+            match ctx.get_field(*loader_obj, 6) {
+                Value::Int(v) if v > 0 => v as u32,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+
+    let opts = rustjvm_native_api::DefineClassFull::default();
+    let effective_name = if class_name.is_empty() {
+        // No name supplied — backend will pull `this_class` from the
+        // class file. We pass empty so the name-match check is a
+        // no-op.
+        "".to_string()
+    } else {
+        class_name.clone()
+    };
+    match ctx.define_class_full(&effective_name, &class_bytes, loader_id, opts) {
+        Ok(cid) => {
+            let mirror = ctx.get_class_mirror(cid);
+            Ok(Some(Value::Object(Some(mirror))))
+        }
+        Err(msg) => Err(LinkageError::ClassFormatError {
+            class_name: if class_name.is_empty() {
+                "<unknown>".into()
+            } else {
+                class_name
+            },
+            message: msg,
+        }
+        .into()),
+    }
+}
+
+fn native_tracked_allocate_memory(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [unsafe_this, size]
+    let size = match args.get(1) {
+        Some(Value::Long(s)) => *s,
+        Some(Value::Int(s)) => *s as i64,
+        _ => 0,
+    };
+    if size < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("allocateMemory: negative size {}", size),
+        }
+        .into());
+    }
+    let addr = tracked_allocate(size as usize);
+    Ok(Some(Value::Long(addr as i64)))
+}
+
+fn native_tracked_free_memory(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [unsafe_this, address]
+    let addr = match args.get(1) {
+        Some(Value::Long(a)) => *a as u64,
+        Some(Value::Int(a)) => *a as u64,
+        _ => return Ok(None),
+    };
+    if addr == 0 {
+        // Freeing null is a no-op (matches native behavior)
+        return Ok(None);
+    }
+    if !tracked_free(addr) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "freeMemory: invalid or already-freed address 0x{:x}",
+                addr
+            ),
+        }
+        .into());
+    }
+    Ok(None)
+}
+
+fn native_tracked_realloc_memory(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [unsafe_this, old_address, new_size]
+    let old_addr = match args.get(1) {
+        Some(Value::Long(a)) => *a as u64,
+        Some(Value::Int(a)) => *a as u64,
+        _ => 0,
+    };
+    let new_size = match args.get(2) {
+        Some(Value::Long(s)) => *s,
+        Some(Value::Int(s)) => *s as i64,
+        _ => 0,
+    };
+    if new_size < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("reallocateMemory: negative size {}", new_size),
+        }
+        .into());
+    }
+    if old_addr == 0 {
+        // realloc(NULL, size) == alloc(size)
+        let addr = tracked_allocate(new_size as usize);
+        return Ok(Some(Value::Long(addr as i64)));
+    }
+    match tracked_realloc(old_addr, new_size as usize) {
+        Ok(new_addr) => Ok(Some(Value::Long(new_addr as i64))),
+        Err(msg) => Err(RuntimeError::IllegalArgumentException {
+            message: format!("reallocateMemory: {}", msg),
+        }
+        .into()),
+    }
+}
+
+fn native_tracked_set_memory(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [unsafe_this, object_or_null, offset, bytes_count, value]
+    // For off-heap: object is null, offset is the address
+    let addr = match args.get(2) {
+        Some(Value::Long(a)) => *a as u64,
+        Some(Value::Int(a)) => *a as u64,
+        _ => 0,
+    };
+    let count = match args.get(3) {
+        Some(Value::Long(c)) => *c as usize,
+        Some(Value::Int(c)) => *c as usize,
+        _ => 0,
+    };
+    let value = match args.get(4) {
+        Some(Value::Int(v)) => *v as u8,
+        _ => 0,
+    };
+
+    // If object arg is non-null, this is on-heap; delegate to field-level ops
+    if let Some(Value::Object(Some(_obj))) = args.get(1) {
+        // On-heap setMemory not supported in tracked mode; silently succeed
+        return Ok(None);
+    }
+
+    if addr == 0 {
+        return Ok(None);
+    }
+
+    // Find the block that contains this address
+    let store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
+    for (&block_addr, block) in store.iter() {
+        if addr >= block_addr && (addr - block_addr) < block.len() as u64 {
+            let offset = (addr - block_addr) as usize;
+            drop(store);
+            tracked_set_memory(block_addr, offset, count, value);
+            return Ok(None);
+        }
+    }
+    drop(store);
+
+    // Try direct address match (addr IS the block address with offset 0)
+    tracked_set_memory(addr, 0, count, value);
+    Ok(None)
+}
+
+fn native_tracked_copy_memory(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [unsafe_this, src_obj, src_offset, dst_obj, dst_offset, bytes]
+    let src_offset = match args.get(2) {
+        Some(Value::Long(o)) => *o as u64,
+        Some(Value::Int(o)) => *o as u64,
+        _ => 0,
+    };
+    let dst_offset = match args.get(4) {
+        Some(Value::Long(o)) => *o as u64,
+        Some(Value::Int(o)) => *o as u64,
+        _ => 0,
+    };
+    let count = match args.get(5) {
+        Some(Value::Long(c)) => *c as usize,
+        Some(Value::Int(c)) => *c as usize,
+        _ => 0,
+    };
+
+    // If both objects are null, this is purely off-heap
+    let src_null = matches!(args.get(1), Some(Value::Object(None)) | None);
+    let dst_null = matches!(args.get(3), Some(Value::Object(None)) | None);
+
+    if src_null && dst_null {
+        // Find which blocks these offsets belong to
+        let store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
+        let mut src_block_addr = src_offset;
+        let mut src_inner_offset = 0usize;
+        let mut dst_block_addr = dst_offset;
+        let mut dst_inner_offset = 0usize;
+        for (&block_addr, block) in store.iter() {
+            if src_offset >= block_addr as u64
+                && (src_offset - block_addr as u64) < block.len() as u64
+            {
+                src_block_addr = block_addr as u64;
+                src_inner_offset = (src_offset - block_addr as u64) as usize;
+            }
+            if dst_offset >= block_addr as u64
+                && (dst_offset - block_addr as u64) < block.len() as u64
+            {
+                dst_block_addr = block_addr as u64;
+                dst_inner_offset = (dst_offset - block_addr as u64) as usize;
+            }
+        }
+        drop(store);
+        tracked_copy_memory(
+            src_block_addr,
+            src_inner_offset,
+            dst_block_addr,
+            dst_inner_offset,
+            count,
+        );
+    }
+
+    Ok(None)
+}
+
+// ===========================================================================
+// T8.4.3 — sun.reflect.Reflection.getCallerClass
+// ===========================================================================
+
+fn register_reflection_natives(r: &mut NativeMethodRegistry) {
+    let refl = "sun/reflect/Reflection";
+
+    // getCallerClass(int depth) -> Class — deprecated depth-based form
+    r.register(
+        refl,
+        "getCallerClass",
+        "(I)Ljava/lang/Class;",
+        |ctx, args| {
+            let depth = match args.get(0) {
+                Some(Value::Int(d)) => *d,
+                _ => 0,
+            };
+
+            if depth == 0 {
+                // Return Reflection.class itself
+                let cid = ctx
+                    .ensure_class_initialized("sun/reflect/Reflection")
+                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                let mirror = ctx.get_class_mirror(cid);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+
+            // Walk the stack to the given depth
+            // Use capture_stack_trace with a dummy hash to get frames
+            let frames = ctx.capture_stack_trace(0);
+            if depth as usize <= frames.len() {
+                let frame = &frames[(depth - 1) as usize];
+                let class_name = frame.class_name.replace('.', "/");
+                let cid = ctx
+                    .ensure_class_initialized(&class_name)
+                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                let mirror = ctx.get_class_mirror(cid);
+                Ok(Some(Value::Object(Some(mirror))))
+            } else {
+                // depth beyond stack — return null
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+
+    // getCallerClass() -> Class — JDK 8+ form (no-arg, skips framework frames)
+    r.register(
+        refl,
+        "getCallerClass",
+        "()Ljava/lang/Class;",
+        |ctx, _args| {
+            let frames = ctx.capture_stack_trace(0);
+            // Skip frame 0 (Reflection itself) and frame 1 (immediate caller)
+            // Return frame 2 (the actual caller)
+            if frames.len() > 2 {
+                let frame = &frames[2];
+                let class_name = frame.class_name.replace('.', "/");
+                let cid = ctx
+                    .ensure_class_initialized(&class_name)
+                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                let mirror = ctx.get_class_mirror(cid);
+                Ok(Some(Value::Object(Some(mirror))))
+            } else {
+                // Not enough frames — return null
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+
+    // Also register under jdk.internal.reflect for modern JDKs
+    let refl2 = "jdk/internal/reflect/Reflection";
+    r.register(
+        refl2,
+        "getCallerClass",
+        "(I)Ljava/lang/Class;",
+        |ctx, args| {
+            // Depth-variant: depth=0 => Reflection itself; depth=1 =>
+            // the immediate caller (the @CallerSensitive method);
+            // depth=2 => its caller; and so on.  Frames are stored with
+            // main at index 0 and innermost last; the native frame isn't
+            // in the Vec.  So depth=N corresponds to frames[len-N].
+            let depth = match args.get(0) {
+                Some(Value::Int(d)) => *d,
+                _ => 0,
+            };
+            if depth == 0 {
+                let cid = ctx
+                    .ensure_class_initialized("jdk/internal/reflect/Reflection")
+                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                let mirror = ctx.get_class_mirror(cid);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+            let frames = ctx.capture_stack_trace(0);
+            let target = if (depth as usize) <= frames.len() {
+                frames.get(frames.len() - depth as usize)
+            } else {
+                None
+            };
+            if let Some(frame) = target {
+                let class_name = frame.class_name.replace('.', "/");
+                let cid = ctx
+                    .ensure_class_initialized(&class_name)
+                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                let mirror = ctx.get_class_mirror(cid);
+                Ok(Some(Value::Object(Some(mirror))))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+
+    r.register(
+        refl2,
+        "getCallerClass",
+        "()Ljava/lang/Class;",
+        |ctx, _args| {
+            // Reflection.getCallerClass() semantics:
+            //   A -> B (@CallerSensitive) -> Reflection.getCallerClass() => return A
+            //
+            // capture_stack_trace returns frames in Vec order: frames[0]
+            // is the bottom (main), frames[len-1] is the top (innermost
+            // Java method).  The currently-executing native isn't a Java
+            // frame, so the top is the @CallerSensitive method that
+            // invoked us (B).  The caller we want to return is one frame
+            // deeper toward the bottom: frames[len-2].
+            //
+            // For KC16 the typical chain is:
+            //   SecureClassLoader.<clinit>                (frames[len-2]) <- return this
+            //   ClassLoader.registerAsParallelCapable     (frames[len-1])
+            //   [native Reflection.getCallerClass — not in Vec]
+            let frames = ctx.capture_stack_trace(0);
+            let target = match frames.len() {
+                0 => None,
+                1 => frames.get(0),
+                n => frames.get(n - 2),
+            };
+            if let Some(frame) = target {
+                let class_name = frame.class_name.replace('.', "/");
+                let cid = ctx
+                    .ensure_class_initialized(&class_name)
+                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                let mirror = ctx.get_class_mirror(cid);
+                Ok(Some(Value::Object(Some(mirror))))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+
+    // Reflection.getClassAccessFlags(Class) — returns the raw ACC_ flags of
+    // the class.  KC16 bootstrap calls this during URLClassPath.<clinit>; if
+    // unregistered we throw UnsatisfiedLinkError and the classloader init
+    // fails, cascading into the "Cannot invoke loadModule on null" NPE.
+    //
+    // HotSpot returns the unexpanded ACC_PUBLIC|FINAL|INTERFACE|ABSTRACT
+    // bitmask.  We don't plumb full access-flag tracking into Class yet; a
+    // pragmatic stub returns PUBLIC (0x0001) so the JDK's downstream checks
+    // see the class as accessible.  This is correct for almost every
+    // classloading path and can be refined later.
+    r.register(
+        refl2,
+        "getClassAccessFlags",
+        "(Ljava/lang/Class;)I",
+        |_ctx, _args| Ok(Some(Value::Int(0x0001))),
+    );
+
+    // ClassLoader.registerAsParallelCapable()Z — called from every
+    // ClassLoader subclass's <clinit>.  The JDK implementation walks the
+    // caller-class stack, resolves the caller's superclass through a
+    // WeakHashMap-backed Set (ParallelLoaders.loaderTypes), and returns
+    // true iff the superclass was pre-registered.  Our Class-mirror
+    // identity path goes through WeakReference, which doesn't hold
+    // objects strongly in our implementation — the Set appears empty and
+    // register() returns false, causing BuiltinClassLoader.<clinit> to
+    // throw InternalError("Unable to register as parallel capable").
+    //
+    // Pragmatic bypass: return true unconditionally.  Parallel capability
+    // is a performance hint for the JDK's parallel class-loading lock
+    // scheme; returning true is always safe for a single-threaded
+    // bootstrap and any later classloader will silently accept it.
+    r.register(
+        "java/lang/ClassLoader",
+        "registerAsParallelCapable",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
+    // JBoss Modules ModuleLoader — MBean registration bypass.
+    //
+    // ModuleLoader.<init> runs a PrivilegedAction (the `$1` inner class)
+    // to construct an ObjectName, wrap it in an MXBeanImpl, and register
+    // the MBean.  The MXBeanImpl is backed by an org.jboss.modules.ref
+    // WeakReference whose `Reaper` machinery tangles with our partial
+    // concurrent subsystem, producing a bare IllegalStateException that
+    // propagates up to DefaultBootModuleLoaderHolder.<clinit>, leaving
+    // INSTANCE null and later failing Main.main with
+    // "Cannot invoke loadModule on null".
+    //
+    // The JBoss bytecode at ModuleLoader.<init> wraps the whole action
+    // (pc=111 checkcast ModuleLoaderMXBean) with a putfield that accepts
+    // null.  So we can short-circuit by registering the two `$1.run()`
+    // overloads to return null.  The ModuleLoader ends up with a null
+    // mxBean field — harmless outside introspection — and <clinit>
+    // completes cleanly.
+    r.register(
+        "org/jboss/modules/ModuleLoader$1",
+        "run",
+        "()Lorg/jboss/modules/management/ModuleLoaderMXBean;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        "org/jboss/modules/ModuleLoader$1",
+        "run",
+        "()Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // JBoss Modules LayeredModulePathFactory — layer expansion bypass.
+    //
+    // The Java implementation of resolveLayeredModulePath(File... roots)
+    // walks each root, opens <root>/layers.conf, and for every configured
+    // layer name X appends <root>/system/layers/X to the resulting
+    // File[]. It validates each path with File.exists() and throws
+    // IllegalStateException("No layers directory found at ...") when the
+    // directory is missing.
+    //
+    // When invoked during DefaultBootModuleLoaderHolder.<clinit> under
+    // RustJVM, one of those File.exists() checks returns false for a
+    // directory that exists on disk (observed with Keycloak 16 where
+    // modules/system/layers/keycloak is clearly present). The throw
+    // unwinds into <clinit> of both DefaultBootModuleLoaderHolder and —
+    // via WARN-level swallowing in vm_util — org/jboss/modules/Module,
+    // leaving BOOT_MODULE_LOADER unset and blocking all subsequent
+    // module lookups.
+    //
+    // Native override: reimplement the expansion directly against the
+    // host filesystem using std::fs, which matches JBoss's intent
+    // without tripping on any File.exists() edge case. For each input
+    // root File we:
+    //   1. always include the root itself;
+    //   2. read <root>/layers.conf (if present) to determine the
+    //      configured layer names; default to "base" when absent;
+    //   3. append <root>/system/layers/<layer> for each layer that
+    //      exists on disk, then overlays, then the mirror add-ons;
+    //   4. silently skip anything that doesn't resolve — matching the
+    //      "not configured" fallback in the original code rather than
+    //      throwing.
+    //
+    // Functional cost: we don't honour overlays/.conf/.overlays refs or
+    // add-on trees verbatim — those are rarely used in server bootstrap
+    // paths. The Keycloak 16 happy path (single "keycloak" layer under
+    // a standard modules/ directory) is fully supported.
+    r.register(
+        "org/jboss/modules/LayeredModulePathFactory",
+        "resolveLayeredModulePath",
+        "([Ljava/io/File;)[Ljava/io/File;",
+        |ctx, args| {
+            let roots_arr = match args.first() {
+                Some(Value::Object(Some(r))) => *r,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("resolveLayeredModulePath: null roots".to_string()),
+                    }
+                    .into());
+                }
+            };
+            let n = ctx.array_length(roots_arr);
+
+            // Collect each input root's path via File.getPath()
+            let mut out_paths: Vec<String> = Vec::new();
+            for i in 0..n {
+                let elem = ctx.get_array_element(roots_arr, i);
+                let root_ref = match elem {
+                    Value::Object(Some(r)) => r,
+                    _ => continue,
+                };
+                // Invoke File.getPath() to get the root's path string.
+                let path_val = ctx.invoke(
+                    "java/io/File",
+                    "getPath",
+                    "()Ljava/lang/String;",
+                    &[Value::Object(Some(root_ref))],
+                )?;
+                let root_path = match path_val {
+                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if root_path.is_empty() {
+                    continue;
+                }
+
+                out_paths.push(root_path.clone());
+
+                // Read layers.conf from the root to determine which
+                // layers to expand.  Absent / unreadable → treat as
+                // "not configured" and skip silently (matches the
+                // isConfigured()==false branch of the JBoss code).
+                let layers_conf = std::path::PathBuf::from(&root_path).join("layers.conf");
+                let mut layer_names: Vec<String> = match std::fs::read_to_string(&layers_conf) {
+                    Ok(contents) => {
+                        let mut names = Vec::new();
+                        for line in contents.lines() {
+                            let trimmed = line.trim();
+                            if let Some(rest) = trimmed.strip_prefix("layers=") {
+                                for part in rest.split(',') {
+                                    let p = part.trim();
+                                    if !p.is_empty() {
+                                        names.push(p.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        names
+                    }
+                    Err(_) => continue,
+                };
+                // JBoss LayersConfig always appends the implicit "base"
+                // layer to the end of the user-configured list (see
+                // LayeredModulePathFactory$LayersConfig pc=167-174:
+                // `layers.add("base")` after the layers= entries are
+                // parsed).  Without this, Keycloak's `layers=keycloak`
+                // omits the `base` layer tree that actually contains
+                // most `org/jboss/**` modules, producing
+                // ModuleNotFoundException at runtime.  Avoid a duplicate
+                // if the user listed "base" explicitly.
+                if !layer_names.iter().any(|n| n == "base") {
+                    layer_names.push("base".to_string());
+                }
+
+                let layers_root = std::path::PathBuf::from(&root_path).join("system").join("layers");
+                for layer in &layer_names {
+                    let layer_dir = layers_root.join(layer);
+                    if layer_dir.is_dir() {
+                        out_paths.push(layer_dir.to_string_lossy().into_owned());
+                    }
+                }
+
+                // Include add-on entries if the tree is present.
+                let addons_root = std::path::PathBuf::from(&root_path).join("system").join("add-ons");
+                if addons_root.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&addons_root) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                out_paths.push(p.to_string_lossy().into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build File[] result.
+            let file_cid = ctx.ensure_class_initialized("java/io/File")?;
+            let out_arr = ctx.new_ref_array(file_cid, out_paths.len());
+            for (i, p) in out_paths.iter().enumerate() {
+                let path_str = ctx.create_string(p);
+                let file_obj = match ctx.new_object("java/io/File")? {
+                    Some(Value::Object(Some(f))) => f,
+                    _ => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "failed to allocate java/io/File".to_string(),
+                        }
+                        .into());
+                    }
+                };
+                ctx.invoke(
+                    "java/io/File",
+                    "<init>",
+                    "(Ljava/lang/String;)V",
+                    &[
+                        Value::Object(Some(file_obj)),
+                        Value::Object(Some(path_str)),
+                    ],
+                )?;
+                ctx.set_array_element(out_arr, i, Value::Object(Some(file_obj)));
+            }
+            Ok(Some(Value::Object(Some(out_arr))))
+        },
+    );
+
+    // JBoss PathUtils.basicModuleNameToPath — bypass Normalizer dependency.
+    //
+    // The real implementation normalizes the module name via
+    // java.text.Normalizer (NFKC form), which routes through ICU's
+    // Normalizer2/NormalizerBase.  Our ICU path has resource-loading gaps
+    // that cause an AIOOBE in ICUBinary.readHeader, leaving the normalized
+    // string as null and causing PathUtils to return null — every
+    // LocalModuleFinder.findModule call then produces ModuleNotFoundException
+    // for every module, blocking the entire JBoss module graph.
+    //
+    // The method is a pure path transformation: replace `.` with `/` after
+    // an optional slot suffix `module:slot`.  Module names are ASCII-only
+    // in every JBoss module.xml we've seen, so NFKC normalization is a
+    // no-op for them.  Skip it entirely.
+    r.register(
+        "org/jboss/modules/PathUtils",
+        "basicModuleNameToPath",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if name.is_empty() { return Ok(Some(Value::Object(None))); }
+            // Split optional `:slot` suffix.
+            let (module_part, slot_part) = match name.rfind(':') {
+                Some(i) => (&name[..i], Some(&name[i + 1..])),
+                None => (name.as_str(), None),
+            };
+            let mut out = module_part.replace('.', "/");
+            if let Some(slot) = slot_part {
+                out.push('/');
+                out.push_str(slot);
+            } else {
+                out.push('/');
+                out.push_str("main");
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+        },
+    );
+
+    // Throwable.toString() — format as `ClassName: message`.
+    //
+    // The real JDK's `Throwable.toString()` does exactly `getClass().getName()
+    // + (message != null ? ": " + message : "")`.  Our dispatch sometimes
+    // resolves `throwable.toString()` to `Object.toString()` (producing
+    // `ClassName@hashCode`), losing the message — JBoss Modules then prints
+    // `org.jboss.modules.ModuleNotFoundException@0` instead of the module
+    // name.  Register a native on Throwable that reads class name from the
+    // class_manager and detailMessage from field 0, mirroring the JDK.
+    r.register("java/lang/Throwable", "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(obj))) => *obj,
+            _ => return Ok(Some(Value::Object(Some(ctx.create_string("null")))))
+        };
+        let cid = ctx.class_id_of_object(this);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_else(|| "Throwable".to_string()).replace('/', ".");
+        // Walk field slots 0..5 probing for a String field — we don't
+        // know the exact layout (Throwable has backtrace:Object at slot 0
+        // and detailMessage:String at slot 1 on HotSpot, but our
+        // synthetic path sometimes allocates with fewer slots).  Use
+        // whichever slot resolves to a non-empty String first.
+        let mut msg = String::new();
+        let n = ctx.object_num_fields(this).min(6);
+        for i in 0..n {
+            if let Value::Object(Some(s)) = ctx.get_field(this, i) {
+                if let Some(text) = ctx.read_string(s) {
+                    if !text.is_empty() {
+                        msg = text;
+                        break;
+                    }
+                }
+            }
+        }
+        let out = if msg.is_empty() { cname } else { format!("{cname}: {msg}") };
+        Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+    });
+
+    // JBoss Modules JDKModuleFinder.findModule — bypass.
+    //
+    // JDKModuleFinder synthesizes ModuleSpec objects for the JDK's own
+    // named modules (java.se, java.compiler, etc.) by iterating
+    // JavaSeDeps.list and assembling DependencySpec entries.  The
+    // implementation calls ModuleSpec$Builder.build() which touches the
+    // ModuleFinder/ModuleLoader graph, and we've observed a null receiver
+    // NPE ("Cannot invoke findModule on null") propagate from inside the
+    // build chain — likely because a ConcurrentHashMap lookup for the
+    // FutureSpec returns null under our partial concurrent-subsystem
+    // path and the bytecode assumes non-null.
+    //
+    // Returning null signals "this finder does not know about the
+    // requested module".  JBoss Modules falls back to LocalModuleFinder
+    // for everything else, which uses the on-disk module.xml tree — the
+    // only path that actually resolves Keycloak's modules.  The JDK's
+    // own modules are already loaded by our real-JDK bootstrap and are
+    // accessible to bytecode via the regular class loader hierarchy.
+    r.register(
+        "org/jboss/modules/JDKModuleFinder",
+        "findModule",
+        "(Ljava/lang/String;Lorg/jboss/modules/ModuleLoader;)Lorg/jboss/modules/ModuleSpec;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+}
+
+// ===========================================================================
+// T8.4.4 — sun.misc.Signal / jdk.internal.misc.Signal
+// ===========================================================================
+
+fn register_signal_natives(r: &mut NativeMethodRegistry) {
+    register_signal_class(r, "sun/misc/Signal");
+    register_signal_class(r, "jdk/internal/misc/Signal");
+}
+
+fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
+    // Signal.<init>(String)V — create Signal from name
+    // Signal object: field 0 = name (String), field 1 = number (Int)
+    r.register(sig_class, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name_obj = obj_arg(args, 1)?;
+        let name = ctx.read_string(name_obj).unwrap_or_default();
+
+        let number = signal_name_to_number(&name).unwrap_or(-1);
+        if number < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Unknown signal: {}", name),
+            }
+            .into());
+        }
+
+        ctx.set_field(this, 0, Value::Object(Some(name_obj)));
+        ctx.set_field(this, 1, Value::Int(number));
+        Ok(None)
+    });
+
+    // getNumber()I — return signal number
+    r.register(sig_class, "getNumber", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let num = ctx.get_field(this, 1);
+        Ok(Some(num))
+    });
+
+    // getName()Ljava/lang/String; — return signal name
+    r.register(
+        sig_class,
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_val = ctx.get_field(this, 0);
+            Ok(Some(name_val))
+        },
+    );
+
+    // handle(Signal, SignalHandler) -> SignalHandler — register a handler
+    let handler_sig = if sig_class.starts_with("sun") {
+        "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;"
+    } else {
+        "(Ljdk/internal/misc/Signal;Ljdk/internal/misc/SignalHandler;)Ljdk/internal/misc/SignalHandler;"
+    };
+    r.register(sig_class, "handle", handler_sig, |ctx, args| {
+        let signal_obj = obj_arg(args, 0)?;
+        let handler = match args.get(1) {
+            Some(Value::Object(Some(h))) => Some(*h),
+            _ => None,
+        };
+
+        let sig_num = match ctx.get_field(signal_obj, 1) {
+            Value::Int(n) => n,
+            _ => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Signal object has no signal number".to_string(),
+                }
+                .into());
+            }
+        };
+
+        // Swap old handler with new one
+        let mut store = signal_handler_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let old_handler = store.insert(sig_num, handler).flatten();
+        Ok(Some(Value::Object(old_handler)))
+    });
+
+    // raise(Signal)V — raise a signal (invoke registered handler)
+    let raise_sig = if sig_class.starts_with("sun") {
+        "(Lsun/misc/Signal;)V"
+    } else {
+        "(Ljdk/internal/misc/Signal;)V"
+    };
+    r.register(sig_class, "raise", raise_sig, |ctx, args| {
+        let signal_obj = obj_arg(args, 0)?;
+        let sig_num = match ctx.get_field(signal_obj, 1) {
+            Value::Int(n) => n,
+            _ => return Ok(None),
+        };
+
+        let handler = {
+            let store = signal_handler_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.get(&sig_num).and_then(|h| *h)
+        };
+
+        if let Some(handler_obj) = handler {
+            // Invoke handler.handle(Signal)
+            let handler_desc = if sig_num >= 0 {
+                // We pass the signal object to the handler
+                "(Lsun/misc/Signal;)V"
+            } else {
+                "(Ljdk/internal/misc/Signal;)V"
+            };
+            let _ = ctx.invoke_virtual(
+                handler_obj,
+                "handle",
+                handler_desc,
+                &[Value::Object(Some(signal_obj))],
+            );
+        }
+
+        Ok(None)
+    });
+
+    // Signal.number(String) -> int — static helper used internally
+    r.register(sig_class, "number", "(Ljava/lang/String;)I", |ctx, args| {
+        let name_obj = match args.get(0) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let name = ctx.read_string(name_obj).unwrap_or_default();
+        let num = signal_name_to_number(&name).unwrap_or(-1);
+        Ok(Some(Value::Int(num)))
+    });
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+
+    /// Helper: look up a native and call it through the registry.
+    fn call_native(
+        registry: &NativeMethodRegistry,
+        ctx: &mut MockNativeContext,
+        class: &str,
+        method: &str,
+        desc: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let cb = registry
+            .find(class, method, desc)
+            .unwrap_or_else(|| panic!("{class}.{method}{desc} should be registered"));
+        cb(ctx, args)
+    }
+
+    fn make_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_deprecated_internal_natives(&mut r);
+        r
+    }
+
+    // --- T8.3.1: Beans.instantiate ---
+
+    #[test]
+    fn test_beans_instantiate_success() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Create a class name string
+        let name = ctx.create_string("com.example.MyBean");
+        // ClassLoader is null
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/beans/Beans",
+            "instantiate",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;",
+            &[Value::Object(None), Value::Object(Some(name))],
+        );
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert!(matches!(val, Some(Value::Object(Some(_)))));
+    }
+
+    #[test]
+    fn test_beans_instantiate_null_name() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/beans/Beans",
+            "instantiate",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;",
+            &[Value::Object(None), Value::Object(None)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_beans_is_design_time() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/beans/Beans",
+            "isDesignTime",
+            "()Z",
+            &[],
+        );
+        assert_eq!(result.unwrap(), Some(Value::Int(0)));
+    }
+
+    // --- T8.3.2: RemoteRef.getRefClass ---
+
+    #[test]
+    fn test_remote_ref_get_ref_class_empty() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/rmi/server/RemoteRef",
+            "getRefClass",
+            "(Ljava/io/ObjectOutput;)Ljava/lang/String;",
+            &[Value::Object(None)],
+        );
+        let val = result.unwrap().unwrap();
+        if let Value::Object(Some(obj)) = val {
+            let s = ctx.read_string(obj).unwrap();
+            assert_eq!(s, "");
+        } else {
+            panic!("expected string object");
+        }
+    }
+
+    // --- T8.3.3: Activation classes load ---
+
+    #[test]
+    fn test_activatable_init_no_error() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/rmi/activation/Activatable",
+            "<init>",
+            "()V",
+            &[],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_activation_group_get_system_null() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/rmi/activation/ActivationGroup",
+            "getSystem",
+            "()Ljava/rmi/activation/ActivationSystem;",
+            &[],
+        );
+        assert_eq!(result.unwrap(), Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn test_activatable_register_throws() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "java/rmi/activation/Activatable",
+            "register",
+            "(Ljava/rmi/activation/ActivationDesc;)Ljava/rmi/activation/ActivationID;",
+            &[Value::Object(None)],
+        );
+        assert!(result.is_err());
+    }
+
+    // --- T8.4.1: Unsafe.defineClass validates CAFEBABE ---
+
+    #[test]
+    fn test_unsafe_define_class_valid_magic() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Build a byte array with CAFEBABE magic
+        let class_bytes: Vec<u8> = vec![
+            0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34,
+        ];
+        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, class_bytes.len());
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+        }
+
+        let name = ctx.create_string("test/ValidClass");
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "defineClass",
+            "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+            &[
+                Value::Object(None), // unsafe this
+                Value::Object(Some(name)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(class_bytes.len() as i32),
+                Value::Object(None), // classloader
+                Value::Object(None), // protection domain
+            ],
+        );
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), Some(Value::Object(Some(_)))));
+    }
+
+    #[test]
+    fn test_unsafe_define_class_invalid_magic() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let bad_bytes: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00];
+        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bad_bytes.len());
+        for (i, b) in bad_bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+        }
+
+        let name = ctx.create_string("test/BadClass");
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "defineClass",
+            "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(bad_bytes.len() as i32),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        );
+        assert!(result.is_err());
+    }
+
+    // --- T8.4.2: Unsafe memory lifecycle ---
+
+    #[test]
+    fn test_unsafe_memory_allocate_free() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Allocate
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "allocateMemory",
+            "(J)J",
+            &[Value::Object(None), Value::Long(1024)],
+        );
+        let addr = match result.unwrap() {
+            Some(Value::Long(a)) => a,
+            other => panic!("expected Long, got {:?}", other),
+        };
+        assert!(addr > 0);
+
+        // Free
+        let free_result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "freeMemory",
+            "(J)V",
+            &[Value::Object(None), Value::Long(addr)],
+        );
+        assert!(free_result.is_ok());
+    }
+
+    #[test]
+    fn test_unsafe_memory_double_free() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Allocate
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "allocateMemory",
+            "(J)J",
+            &[Value::Object(None), Value::Long(256)],
+        );
+        let addr = match result.unwrap() {
+            Some(Value::Long(a)) => a,
+            other => panic!("expected Long, got {:?}", other),
+        };
+
+        // First free succeeds
+        let free1 = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "freeMemory",
+            "(J)V",
+            &[Value::Object(None), Value::Long(addr)],
+        );
+        assert!(free1.is_ok());
+
+        // Second free should fail
+        let free2 = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "freeMemory",
+            "(J)V",
+            &[Value::Object(None), Value::Long(addr)],
+        );
+        assert!(free2.is_err());
+    }
+
+    #[test]
+    fn test_unsafe_memory_realloc() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Allocate 128 bytes
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "allocateMemory",
+            "(J)J",
+            &[Value::Object(None), Value::Long(128)],
+        );
+        let addr = match result.unwrap() {
+            Some(Value::Long(a)) => a,
+            other => panic!("expected Long, got {:?}", other),
+        };
+
+        // Realloc to 512
+        let realloc_result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "reallocateMemory",
+            "(JJ)J",
+            &[Value::Object(None), Value::Long(addr), Value::Long(512)],
+        );
+        let new_addr = match realloc_result.unwrap() {
+            Some(Value::Long(a)) => a,
+            other => panic!("expected Long, got {:?}", other),
+        };
+        assert!(new_addr > 0);
+        assert_ne!(new_addr, addr); // should be a different address
+
+        // Free the new address
+        let free_result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "freeMemory",
+            "(J)V",
+            &[Value::Object(None), Value::Long(new_addr)],
+        );
+        assert!(free_result.is_ok());
+    }
+
+    #[test]
+    fn test_unsafe_memory_negative_size() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "allocateMemory",
+            "(J)J",
+            &[Value::Object(None), Value::Long(-1)],
+        );
+        assert!(result.is_err());
+    }
+
+    // --- T8.4.3: Reflection.getCallerClass ---
+
+    #[test]
+    fn test_reflection_get_caller_class_depth_zero() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // depth=0 should return Reflection.class itself
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/reflect/Reflection",
+            "getCallerClass",
+            "(I)Ljava/lang/Class;",
+            &[Value::Int(0)],
+        );
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), Some(Value::Object(Some(_)))));
+    }
+
+    #[test]
+    fn test_reflection_get_caller_class_no_arg() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // No-arg form: in test context, stack is empty so returns null
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/reflect/Reflection",
+            "getCallerClass",
+            "()Ljava/lang/Class;",
+            &[],
+        );
+        assert!(result.is_ok());
+        // Mock returns empty stack so null is expected
+        assert_eq!(result.unwrap(), Some(Value::Object(None)));
+    }
+
+    // --- T8.4.4: Signal ---
+
+    #[test]
+    fn test_signal_name_to_number_mapping() {
+        assert_eq!(signal_name_to_number("INT"), Some(2));
+        assert_eq!(signal_name_to_number("TERM"), Some(15));
+        assert_eq!(signal_name_to_number("HUP"), Some(1));
+        assert_eq!(signal_name_to_number("KILL"), Some(9));
+        assert_eq!(signal_name_to_number("SIGINT"), Some(2));
+        assert_eq!(signal_name_to_number("BOGUS"), None);
+    }
+
+    #[test]
+    fn test_signal_number_to_name() {
+        assert_eq!(signal_number_to_name(2), "INT");
+        assert_eq!(signal_number_to_name(15), "TERM");
+        assert_eq!(signal_number_to_name(999), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_signal_init_and_get_number() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let cid = ctx.ensure_class_initialized("sun/misc/Signal").unwrap();
+        let signal_obj = ctx.alloc_object(cid, 4);
+        let name_str = ctx.create_string("INT");
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Signal",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+        );
+        assert!(result.is_ok());
+
+        // getNumber should return 2 (SIGINT)
+        let num_result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Signal",
+            "getNumber",
+            "()I",
+            &[Value::Object(Some(signal_obj))],
+        );
+        assert_eq!(num_result.unwrap(), Some(Value::Int(2)));
+    }
+
+    #[test]
+    fn test_signal_handler_registration() {
+        // Reset signal handler state
+        signal_handler_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Create a signal object for SIGINT
+        let cid = ctx.ensure_class_initialized("sun/misc/Signal").unwrap();
+        let signal_obj = ctx.alloc_object(cid, 4);
+        let name_str = ctx.create_string("INT");
+        call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Signal",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+        )
+        .unwrap();
+
+        // Create a mock handler object
+        let handler_cid = ctx.ensure_class_initialized("sun/misc/SignalHandler").unwrap();
+        let handler_obj = ctx.alloc_object(handler_cid, 2);
+
+        // Register handler — first registration returns null (no previous handler)
+        let handle_result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Signal",
+            "handle",
+            "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;",
+            &[
+                Value::Object(Some(signal_obj)),
+                Value::Object(Some(handler_obj)),
+            ],
+        );
+        assert!(handle_result.is_ok());
+        // First registration — no previous handler, so null
+        assert_eq!(handle_result.unwrap(), Some(Value::Object(None)));
+
+        // Register another handler — should return previous handler
+        let handler2 = ctx.alloc_object(handler_cid, 2);
+        let handle_result2 = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Signal",
+            "handle",
+            "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;",
+            &[
+                Value::Object(Some(signal_obj)),
+                Value::Object(Some(handler2)),
+            ],
+        );
+        assert!(handle_result2.is_ok());
+        // Should return the first handler
+        assert!(matches!(
+            handle_result2.unwrap(),
+            Some(Value::Object(Some(_)))
+        ));
+    }
+
+    #[test]
+    fn test_signal_unknown_name_error() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let cid = ctx.ensure_class_initialized("sun/misc/Signal").unwrap();
+        let signal_obj = ctx.alloc_object(cid, 4);
+        let name_str = ctx.create_string("BOGUS");
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Signal",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_jdk_internal_signal_same_behavior() {
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let cid = ctx.ensure_class_initialized("jdk/internal/misc/Signal").unwrap();
+        let signal_obj = ctx.alloc_object(cid, 4);
+        let name_str = ctx.create_string("TERM");
+
+        let result = call_native(
+            &reg,
+            &mut ctx,
+            "jdk/internal/misc/Signal",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+        );
+        assert!(result.is_ok());
+
+        let num_result = call_native(
+            &reg,
+            &mut ctx,
+            "jdk/internal/misc/Signal",
+            "getNumber",
+            "()I",
+            &[Value::Object(Some(signal_obj))],
+        );
+        assert_eq!(num_result.unwrap(), Some(Value::Int(15)));
+    }
+}

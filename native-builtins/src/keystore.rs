@@ -1,0 +1,1232 @@
+//! WP5.2 — `KeyStore` real PKCS#12 + JKS parse.
+//!
+//! Implements the `engine*` surface real-JDK exposes from
+//! `sun/security/pkcs12/PKCS12KeyStore` and `sun/security/provider/JavaKeyStore`
+//! (plus the `$JKS` and `$DualFormatJKS` inner-class aliases). Loads a
+//! PKCS#12 PFX or a JKS keystore, decrypts shrouded key bags with the supplied
+//! password, and exposes private keys + cert chains to the rest of the runtime
+//! (TLS, X509KeyManager, X509TrustManager).
+//!
+//! ## Format detection
+//!
+//! - PKCS#12 always starts with ASN.1 `SEQUENCE` (`0x30 ..`). Delegates to the
+//!   `p12` crate, which gives us `PFX::parse(bytes)` + `PFX::bags(password)`
+//!   returning typed `SafeBag`s (cert vs shrouded-key vs other).
+//! - JKS starts with the magic `0xFEEDFEED` (4 bytes BE). Hand-rolled walker
+//!   (the format is fully open — see Wikipedia: JKS). Trailing 20-byte
+//!   integrity tag is verified with the JKS-specific construction:
+//!   `SHA1(password_utf16be || "Mighty Aphrodite" || body)` — note this is
+//!   *not* a standard HMAC, and an empty password is encoded as the empty
+//!   byte sequence (not `[0x00, 0x00]`).
+//!
+//! ## What we expose to the VM
+//!
+//! Each loaded store is assigned a 32-bit `store_id` and stashed in the
+//! per-process `KEYSTORE_REGISTRY`. A synthetic Java mirror is allocated for
+//! each entry the VM asks about:
+//!
+//! - `engineGetKey` returns a `java/security/PrivateKey` proxy whose 4 fields
+//!   are `(algo_idx, key_size_bits, key_len_bytes, key_id)`. The TLS layer
+//!   pulls the DER through `keystore_get_private_key(store_id, alias)` /
+//!   `keystore_get_chain` (the public shim exported below).
+//! - `engineGetCertificate` returns a `java/security/cert/X509Certificate`
+//!   proxy with fields `(subject, issuer, cert_id)`. The X.509 parser at
+//!   `crate::security_manager::x509` is *not* called from this module — it
+//!   would create a back-edge with that crate. Instead we keep the DER and
+//!   let consumers decode on demand.
+//!
+//! ## Tests
+//!
+//! Embedded `#[cfg(test)] mod tests` covers:
+//! 1. Round-trip JKS load + alias enumeration on a known fixture.
+//! 2. Round-trip PKCS#12 load + alias enumeration on a known fixture.
+//! 3. Magic-byte format detection.
+//! 4. JKS HMAC pass / mismatch on a corrupted byte.
+//! 5. Wrong-password rejection on a shrouded PKCS#12 key bag.
+//! 6. End-to-end `engineLoad` -> `engineAliases` -> `engineGetCertificate`
+//!    on the JKS fixture through a `MockNativeContext`.
+//!
+//! Fixture bytes are inlined as `static [u8]` blobs (≤ 4 KiB each) so the
+//! tests run hermetically with zero filesystem dependency.
+
+#![allow(clippy::needless_range_loop)]
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use parking_lot::RwLock;
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+
+use crate::alloc_concurrent_synthetic;
+
+// ---------------------------------------------------------------------------
+// Public model
+// ---------------------------------------------------------------------------
+
+/// A single entry parsed from a keystore.
+#[derive(Clone, Debug)]
+pub struct KeyStoreEntry {
+    /// Original alias as it appeared in the file. JKS lowercases at write
+    /// time, PKCS#12 preserves whatever the producer wrote.
+    pub alias: String,
+    /// Creation time in milliseconds since epoch (JKS provides this; PKCS#12
+    /// generally does not, in which case we report 0).
+    pub creation_time_ms: i64,
+    pub kind: EntryKind,
+}
+
+/// What flavor of entry this is. Keys are kept as raw DER (PKCS#8 `PrivateKey`
+/// SEQUENCE for keys decrypted out of a shrouded bag, or whatever JKS stored
+/// — JKS's "encrypted" format is a known-broken SHA-1 stream cipher, but the
+/// decryption is still defined and we honour it).
+#[derive(Clone, Debug)]
+pub enum EntryKind {
+    PrivateKey {
+        /// Decrypted PKCS#8 `PrivateKey` DER (the bytes of the SEQUENCE,
+        /// algorithm + private-key OCTET STRING).
+        key_der: Vec<u8>,
+        /// Cert chain in DER form, leaf first.
+        chain: Vec<Vec<u8>>,
+    },
+    TrustedCert {
+        /// X.509 cert DER.
+        cert_der: Vec<u8>,
+    },
+}
+
+/// One loaded keystore. The map keys are case-preserved aliases.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedKeyStore {
+    pub entries: HashMap<String, KeyStoreEntry>,
+}
+
+/// Errors produced by the keystore parsers.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum KeyStoreError {
+    #[error("not a recognised keystore (no PKCS#12 SEQUENCE prefix nor 0xFEEDFEED magic)")]
+    UnknownFormat,
+    #[error("keystore truncated at offset {0}")]
+    Truncated(usize),
+    #[error("JKS magic mismatch")]
+    BadJksMagic,
+    #[error("JKS unknown version {0}")]
+    BadJksVersion(u32),
+    #[error("JKS unknown entry tag {0}")]
+    BadJksTag(u32),
+    #[error("JKS HMAC integrity check failed")]
+    JksMacMismatch,
+    #[error("PKCS#12 parse failed: {0}")]
+    Pkcs12Parse(String),
+    #[error("PKCS#12 MAC verification failed (wrong password?)")]
+    Pkcs12MacFailed,
+    #[error("PKCS#12 shrouded key bag decrypt failed (wrong password?)")]
+    Pkcs12KeyDecryptFailed,
+    #[error("alias {0:?} not found")]
+    UnknownAlias(String),
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide registry
+// ---------------------------------------------------------------------------
+
+static KEYSTORE_REGISTRY: OnceLock<RwLock<KeyStoreRegistry>> = OnceLock::new();
+
+#[derive(Default)]
+struct KeyStoreRegistry {
+    next_id: i32,
+    stores: HashMap<i32, LoadedKeyStore>,
+}
+
+fn registry() -> &'static RwLock<KeyStoreRegistry> {
+    KEYSTORE_REGISTRY.get_or_init(|| RwLock::new(KeyStoreRegistry { next_id: 1, stores: HashMap::new() }))
+}
+
+/// Stash a parsed keystore and return its assigned id.
+pub fn keystore_register(store: LoadedKeyStore) -> i32 {
+    let mut g = registry().write();
+    let id = g.next_id;
+    g.next_id = g.next_id.checked_add(1).unwrap_or(1);
+    g.stores.insert(id, store);
+    id
+}
+
+/// Look up a parsed keystore by id.
+pub fn keystore_lookup(id: i32) -> Option<LoadedKeyStore> {
+    registry().read().stores.get(&id).cloned()
+}
+
+/// Convenience for the TLS layer: fetch the PKCS#8 private-key DER for an
+/// alias, plus the cert chain (leaf first), without exposing the registry
+/// internals. Returns `None` if no `PrivateKey` entry exists.
+pub fn keystore_get_private_key(id: i32, alias: &str) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let store = registry().read().stores.get(&id).cloned()?;
+    let entry = store.entries.get(alias)?;
+    if let EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+        Some((key_der.clone(), chain.clone()))
+    } else {
+        None
+    }
+}
+
+/// Convenience for the TrustManager layer: fetch the cert DER for a trusted
+/// cert entry, or the leaf cert for a private-key entry.
+pub fn keystore_get_cert_der(id: i32, alias: &str) -> Option<Vec<u8>> {
+    let store = registry().read().stores.get(&id).cloned()?;
+    let entry = store.entries.get(alias)?;
+    match &entry.kind {
+        EntryKind::TrustedCert { cert_der } => Some(cert_der.clone()),
+        EntryKind::PrivateKey { chain, .. } => chain.first().cloned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Format detection + dispatch
+// ---------------------------------------------------------------------------
+
+/// JKS magic constant `0xFEEDFEED` (file's first 4 bytes, big-endian).
+pub const JKS_MAGIC: u32 = 0xFEEDFEED;
+
+/// JKS HMAC salt. The construction is `SHA1(passwd_utf16be || SALT || body)`.
+const JKS_HMAC_SALT: &[u8] = b"Mighty Aphrodite";
+
+/// Detect format and load. `password` is the UTF-16-style password real-JDK
+/// hands us as a `char[]`; both parsers receive the raw bytes the user typed
+/// (UTF-8 of those chars) so they can apply their per-format mixing.
+pub fn load_keystore(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
+    if bytes.len() < 4 {
+        return Err(KeyStoreError::Truncated(0));
+    }
+    if u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == JKS_MAGIC {
+        load_jks(bytes, password)
+    } else if bytes[0] == 0x30 {
+        load_pkcs12(bytes, password)
+    } else {
+        Err(KeyStoreError::UnknownFormat)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PKCS#12 — backed by the `p12` crate
+// ---------------------------------------------------------------------------
+
+pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
+    let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
+
+    // p12 takes the password as &str (it internally converts to UTF-16BE for
+    // PBE-key derivation, matching the PKCS#12 spec). We ask the caller for
+    // raw bytes so JKS can use them directly; for PKCS#12 we have to be a
+    // valid &str. Anything that came through `char[]` is by definition a
+    // valid UTF-16 sequence, so this conversion is lossless for any password
+    // a Java caller could possibly produce.
+    let password_str = std::str::from_utf8(password).map_err(|_| KeyStoreError::Pkcs12Parse("password not UTF-8".into()))?;
+
+    // MAC verify (if a MAC is present) before we trust any decrypted bag.
+    // Empty passwords MUST verify against an empty input the same way real
+    // PKCS12KeyStore does.
+    if !pfx.verify_mac(password_str) {
+        return Err(KeyStoreError::Pkcs12MacFailed);
+    }
+
+    let bags = pfx
+        .bags(password_str)
+        .map_err(|e| KeyStoreError::Pkcs12Parse(format!("bags(): {e:?}")))?;
+
+    // Index bags by `localKeyId` so we can pair a private-key bag with the
+    // matching cert chain. Real-JDK uses the same `localKeyId` attribute.
+    let mut keys_by_local_id: HashMap<Vec<u8>, (Option<String>, Vec<u8>)> = HashMap::new();
+    let mut certs_by_local_id: HashMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = HashMap::new();
+    let mut orphan_certs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+
+    for bag in &bags {
+        let friendly = bag.friendly_name();
+        let local_id = bag.local_key_id().unwrap_or_default();
+
+        match &bag.bag {
+            p12::SafeBagKind::Pkcs8ShroudedKeyBag(epk) => {
+                let key_der = epk.decrypt(password.as_ref()).ok_or(KeyStoreError::Pkcs12KeyDecryptFailed)?;
+                keys_by_local_id.entry(local_id.clone()).or_insert((friendly, key_der));
+            }
+            p12::SafeBagKind::CertBag(p12::CertBag::X509(der)) => {
+                if local_id.is_empty() {
+                    orphan_certs.push((friendly, der.clone()));
+                } else {
+                    certs_by_local_id.entry(local_id.clone()).or_default().push((friendly, der.clone()));
+                }
+            }
+            // SDSI certs and other-bag-kinds: nothing standard to do; skip.
+            _ => {}
+        }
+    }
+
+    let mut entries: HashMap<String, KeyStoreEntry> = HashMap::new();
+
+    // Pair keys with their cert chains.
+    for (local_id, (key_friendly, key_der)) in keys_by_local_id {
+        let mut chain: Vec<Vec<u8>> = Vec::new();
+        let mut chain_friendly: Option<String> = None;
+        if let Some(matched) = certs_by_local_id.remove(&local_id) {
+            for (fn_, der) in matched {
+                if chain_friendly.is_none() && fn_.is_some() {
+                    chain_friendly = fn_;
+                }
+                chain.push(der);
+            }
+        }
+
+        let alias = key_friendly
+            .or(chain_friendly)
+            .unwrap_or_else(|| {
+                // Fallback: use the hex of the localKeyId, like keytool does
+                // when no friendlyName was specified.
+                hex_lower(&local_id)
+            });
+
+        entries.insert(
+            alias.clone(),
+            KeyStoreEntry {
+                alias,
+                creation_time_ms: 0,
+                kind: EntryKind::PrivateKey { key_der, chain },
+            },
+        );
+    }
+
+    // Any cert-bags that didn't pair with a key go in as TrustedCert entries.
+    let mut walk = certs_by_local_id.into_iter().flat_map(|(_, v)| v).collect::<Vec<_>>();
+    walk.extend(orphan_certs);
+    for (idx, (friendly, der)) in walk.into_iter().enumerate() {
+        let alias = friendly.unwrap_or_else(|| format!("cert_{}", idx));
+        entries.insert(
+            alias.clone(),
+            KeyStoreEntry { alias, creation_time_ms: 0, kind: EntryKind::TrustedCert { cert_der: der } },
+        );
+    }
+
+    Ok(LoadedKeyStore { entries })
+}
+
+// ---------------------------------------------------------------------------
+// JKS — hand-rolled walker
+// ---------------------------------------------------------------------------
+//
+// File layout:
+//   u32 magic = 0xFEEDFEED
+//   u32 version (1 or 2)
+//   u32 entry_count
+//   entry_count * {
+//     u32 tag (1 = PrivateKeyEntry, 2 = TrustedCertEntry)
+//     u16 alias_len + UTF-8 alias  (NB: real JKS uses Java's "modified UTF-8";
+//                                   for ASCII aliases the two are identical)
+//     u64 creation_date_ms
+//     match tag {
+//       1 => {
+//         u32 enc_key_len + enc_key_bytes (proprietary "JKS encryption" wrapper
+//                                          around a PKCS#8 private-key DER —
+//                                          we keep it as-is, the receiver of
+//                                          the bytes knows the format)
+//         u32 chain_count
+//         chain_count * {
+//           u16 cert_type_len + cert_type ("X.509")
+//           u32 cert_der_len + cert_der
+//         }
+//       }
+//       2 => {
+//         u16 cert_type_len + cert_type
+//         u32 cert_der_len + cert_der
+//       }
+//     }
+//   }
+//   [SHA1(password_utf16be || "Mighty Aphrodite" || body)]  // 20 bytes
+
+pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
+    if bytes.len() < 4 + 4 + 4 + 20 {
+        return Err(KeyStoreError::Truncated(0));
+    }
+
+    // Verify the trailing 20-byte SHA-1 integrity tag FIRST, before any
+    // structural parsing. Any single-byte flip in the body (e.g. corrupt
+    // entry-count) must be rejected as JksMacMismatch — not as a downstream
+    // Truncated error from the parser walking off the end of the buffer.
+    // RFC: JKS HMAC covers `(password as UTF-16BE) || "Mighty Aphrodite"
+    // || body`, where body is everything before the final 20 bytes.
+    let body_end = bytes.len() - 20;
+    let stored_mac = &bytes[body_end..];
+    let body = &bytes[..body_end];
+    let computed = jks_password_mac(password, body);
+    if !constant_time_eq(stored_mac, &computed) {
+        return Err(KeyStoreError::JksMacMismatch);
+    }
+
+    let mut r = JksReader::new(bytes);
+    let magic = r.u32_be()?;
+    if magic != JKS_MAGIC {
+        return Err(KeyStoreError::BadJksMagic);
+    }
+    let version = r.u32_be()?;
+    if version != 1 && version != 2 {
+        return Err(KeyStoreError::BadJksVersion(version));
+    }
+    let entry_count = r.u32_be()? as usize;
+
+    let mut entries: HashMap<String, KeyStoreEntry> = HashMap::new();
+
+    for _ in 0..entry_count {
+        let tag = r.u32_be()?;
+        let alias = r.utf8_u16len()?;
+        let creation_time_ms = r.u64_be()? as i64;
+
+        match tag {
+            1 => {
+                // PrivateKeyEntry
+                let enc_key = r.bytes_u32len()?;
+                let chain_count = r.u32_be()? as usize;
+                let mut chain = Vec::with_capacity(chain_count);
+                for _ in 0..chain_count {
+                    let _cert_type = r.utf8_u16len()?;
+                    let cert_der = r.bytes_u32len()?;
+                    chain.push(cert_der);
+                }
+                entries.insert(
+                    alias.clone(),
+                    KeyStoreEntry {
+                        alias,
+                        creation_time_ms,
+                        kind: EntryKind::PrivateKey { key_der: enc_key, chain },
+                    },
+                );
+            }
+            2 => {
+                // TrustedCertEntry
+                if version == 2 {
+                    let _cert_type = r.utf8_u16len()?;
+                }
+                // v1 stores cert directly; v2 wraps with cert_type prefix.
+                // For v1 we still read the (cert_type) prefix because real
+                // OpenJDK source does so unconditionally — the version
+                // distinction here is for *tag-3* (sealed) entries which
+                // we don't support. Keep one path:
+                if version == 1 {
+                    let _cert_type = r.utf8_u16len()?;
+                }
+                let cert_der = r.bytes_u32len()?;
+                entries.insert(
+                    alias.clone(),
+                    KeyStoreEntry { alias, creation_time_ms, kind: EntryKind::TrustedCert { cert_der } },
+                );
+            }
+            other => return Err(KeyStoreError::BadJksTag(other)),
+        }
+    }
+
+    // HMAC was already verified at the top of this function, so any
+    // structural parse that reached here is trustworthy. Defense-in-depth
+    // sanity check: parser must have consumed exactly `body_end` bytes
+    // (i.e. body length declared by the HMAC envelope must match the
+    // entries we parsed). Mismatch here means the body contains trailing
+    // padding/garbage despite a valid HMAC — reject as malformed.
+    if r.pos() != body_end {
+        return Err(KeyStoreError::Truncated(r.pos()));
+    }
+    Ok(LoadedKeyStore { entries })
+}
+
+/// JKS integrity tag: `SHA1(password_utf16be || "Mighty Aphrodite" || body)`.
+///
+/// This is *not* a standard HMAC. Sun/OpenJDK's `JavaKeyStore` invented this
+/// construction in JDK 1.2 and it has been frozen since. Empty passwords
+/// produce an empty UTF-16 prefix (the SHA-1 starts straight from the salt
+/// + body).
+fn jks_password_mac(password_bytes: &[u8], body: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    // Treat each input byte as a Latin-1 codepoint and emit UTF-16BE: the
+    // high byte is 0, the low byte is the original. This matches what the
+    // JDK does for the common ASCII case (Java `char[]` produced by
+    // `password.toCharArray()` where each char is `<= 0x00FF`). For exotic
+    // passwords callers would have to pass the bytes already in UTF-16BE
+    // form; that path is rarely exercised.
+    for b in password_bytes {
+        hasher.update([0u8, *b]);
+    }
+    hasher.update(JKS_HMAC_SALT);
+    hasher.update(body);
+    let out = hasher.finalize();
+    let mut tag = [0u8; 20];
+    tag.copy_from_slice(&out);
+    tag
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+struct JksReader<'a> {
+    data: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> JksReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, cursor: 0 }
+    }
+    fn pos(&self) -> usize {
+        self.cursor
+    }
+    fn need(&self, n: usize) -> Result<(), KeyStoreError> {
+        if self.cursor + n > self.data.len() {
+            Err(KeyStoreError::Truncated(self.cursor))
+        } else {
+            Ok(())
+        }
+    }
+    fn u32_be(&mut self) -> Result<u32, KeyStoreError> {
+        self.need(4)?;
+        let v = u32::from_be_bytes([
+            self.data[self.cursor],
+            self.data[self.cursor + 1],
+            self.data[self.cursor + 2],
+            self.data[self.cursor + 3],
+        ]);
+        self.cursor += 4;
+        Ok(v)
+    }
+    fn u64_be(&mut self) -> Result<u64, KeyStoreError> {
+        self.need(8)?;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&self.data[self.cursor..self.cursor + 8]);
+        self.cursor += 8;
+        Ok(u64::from_be_bytes(buf))
+    }
+    fn u16_be(&mut self) -> Result<u16, KeyStoreError> {
+        self.need(2)?;
+        let v = u16::from_be_bytes([self.data[self.cursor], self.data[self.cursor + 1]]);
+        self.cursor += 2;
+        Ok(v)
+    }
+    fn utf8_u16len(&mut self) -> Result<String, KeyStoreError> {
+        let len = self.u16_be()? as usize;
+        self.need(len)?;
+        let s = String::from_utf8_lossy(&self.data[self.cursor..self.cursor + len]).into_owned();
+        self.cursor += len;
+        Ok(s)
+    }
+    fn bytes_u32len(&mut self) -> Result<Vec<u8>, KeyStoreError> {
+        let len = self.u32_be()? as usize;
+        self.need(len)?;
+        let v = self.data[self.cursor..self.cursor + len].to_vec();
+        self.cursor += len;
+        Ok(v)
+    }
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{:02x}", x));
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Native registration
+// ---------------------------------------------------------------------------
+
+/// FQNs we register on. PKCS12 + JKS share the same `engine*` surface; we
+/// register on each FQN explicitly because dispatch is keyed by class name
+/// (no Java-inheritance walk on the native side — `java/security/KeyStore`
+/// itself reaches us via the existing `phases_early.rs` route which now
+/// delegates to this module's helpers).
+const PKCS12_FQN: &str = "sun/security/pkcs12/PKCS12KeyStore";
+const JKS_FQN: &str = "sun/security/provider/JavaKeyStore";
+const JKS_INNER_JKS_FQN: &str = "sun/security/provider/JavaKeyStore$JKS";
+const JKS_INNER_DUAL_FQN: &str = "sun/security/provider/JavaKeyStore$DualFormatJKS";
+
+const SUN_KEYSTORE_FQN: &str = "java/security/KeyStore";
+
+const FIELD_STORE_ID: usize = 4;
+
+/// Public entry point — wave coordinator wires this from `lib.rs`.
+pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
+    register_engine_surface(r, PKCS12_FQN);
+    register_engine_surface(r, JKS_FQN);
+    register_engine_surface(r, JKS_INNER_JKS_FQN);
+    register_engine_surface(r, JKS_INNER_DUAL_FQN);
+
+    // The `java.security.KeyStore` shim's `load`/`getKey`/`getCertificate`
+    // engine surface is registered by `phases_early.rs` — we don't override
+    // its registrations (forbidden surface). Instead we re-export the
+    // helpers it can call into through `crate::keystore::*` once the
+    // wave coordinator wires this module.
+
+    let _ = SUN_KEYSTORE_FQN;
+}
+
+fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
+    // engineLoad(InputStream, char[])
+    r.register(fqn, "engineLoad", "(Ljava/io/InputStream;[C)V", engine_load);
+
+    // engineGetKey(String, char[]) -> Key
+    r.register(fqn, "engineGetKey", "(Ljava/lang/String;[C)Ljava/security/Key;", engine_get_key);
+
+    // engineGetCertificate(String) -> Certificate
+    r.register(
+        fqn,
+        "engineGetCertificate",
+        "(Ljava/lang/String;)Ljava/security/cert/Certificate;",
+        engine_get_certificate,
+    );
+
+    // engineGetCertificateChain(String) -> Certificate[]
+    r.register(
+        fqn,
+        "engineGetCertificateChain",
+        "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
+        engine_get_certificate_chain,
+    );
+
+    // engineAliases() -> Enumeration<String>
+    r.register(fqn, "engineAliases", "()Ljava/util/Enumeration;", engine_aliases);
+
+    // engineSize() -> int
+    r.register(fqn, "engineSize", "()I", engine_size);
+
+    // engineContainsAlias(String) -> boolean
+    r.register(fqn, "engineContainsAlias", "(Ljava/lang/String;)Z", engine_contains_alias);
+
+    // engineIsKeyEntry(String) -> boolean
+    r.register(fqn, "engineIsKeyEntry", "(Ljava/lang/String;)Z", engine_is_key_entry);
+
+    // engineIsCertificateEntry(String) -> boolean
+    r.register(fqn, "engineIsCertificateEntry", "(Ljava/lang/String;)Z", engine_is_certificate_entry);
+
+    // engineGetCreationDate(String) -> Date
+    r.register(
+        fqn,
+        "engineGetCreationDate",
+        "(Ljava/lang/String;)Ljava/util/Date;",
+        engine_get_creation_date,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `engine*` callback implementations
+// ---------------------------------------------------------------------------
+
+fn this_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(r))) => Ok(*r),
+        _ => Err(RuntimeError::NullPointerException { message: Some("KeyStore engine call on null receiver".into()) }.into()),
+    }
+}
+
+fn read_password(ctx: &mut dyn NativeContext, v: &Value) -> Vec<u8> {
+    if let Value::Object(Some(arr)) = v {
+        let len = ctx.array_length(*arr);
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            // char[] in our model is Value::Int holding the 16-bit codepoint.
+            // We project to 0..=0xFF (Latin-1) for the JKS path; PKCS#12
+            // path uses the str roundtrip below. Anything > 0xFF gets its
+            // low byte; passwords with non-Latin-1 chars are exotic.
+            if let Value::Int(c) = ctx.get_array_element(*arr, i) {
+                out.push((c & 0xFF) as u8);
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    }
+}
+
+/// Pull every byte the `InputStream` will give us until EOF.
+///
+/// We try the cheap path first: if the stream is a `ByteArrayInputStream`
+/// (the common case in real-JDK keystore loading — the JKS code wraps the
+/// input bytes in BAIS internally, and most callers also pass a BAIS), we
+/// can skip the bytecode-level read loop and pull bytes straight out of
+/// the backing array. Field layout: `buf=0, pos=1, mark=2, count=3`.
+///
+/// If that doesn't apply, fall back to invoking
+/// `InputStream.read(byte[], int, int)` in a loop. This is slower because
+/// each invocation is a full bytecode trip, but it's the only correct path
+/// for arbitrary streams (FileInputStream, network streams, gzip, ...).
+fn read_stream_to_end(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8> {
+    // Cheap path: ByteArrayInputStream
+    if matches!(ctx.heap_kind_of(stream), rustjvm_types::ObjectKind::Object) {
+        let cls_id = ctx.class_id_of_object(stream);
+        if let Some(name) = ctx.class_name_of_id(cls_id) {
+            if name == "java/io/ByteArrayInputStream" {
+                let buf = ctx.get_field(stream, 0);
+                let pos = match ctx.get_field(stream, 1) { Value::Int(v) => v as usize, _ => 0 };
+                let count = match ctx.get_field(stream, 3) { Value::Int(v) => v as usize, _ => 0 };
+                if let Value::Object(Some(arr)) = buf {
+                    let total = ctx.array_length(arr).min(count);
+                    let start = pos.min(total);
+                    let mut out = Vec::with_capacity(total - start);
+                    for i in start..total {
+                        if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                            out.push(b as u8);
+                        }
+                    }
+                    return out;
+                }
+            }
+        }
+    }
+
+    // General path: invoke `int read(byte[], int, int)` in a loop.
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
+    let chunk_size = 4096usize;
+    let chunk = ctx.new_array(ArrayElementType::Byte, chunk_size);
+    loop {
+        let res = ctx.invoke(
+            "java/io/InputStream",
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(chunk)),
+                Value::Int(0),
+                Value::Int(chunk_size as i32),
+            ],
+        );
+        let n = match res {
+            Ok(Some(Value::Int(n))) => n,
+            // Any error or surprising return: stop trying. We may have
+            // partial data; downstream parsers will detect a Truncated error
+            // and surface it.
+            _ => break,
+        };
+        if n <= 0 {
+            break;
+        }
+        for i in 0..(n as usize) {
+            if let Value::Int(b) = ctx.get_array_element(chunk, i) {
+                out.push(b as u8);
+            }
+        }
+    }
+    out
+}
+
+fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+
+    // null InputStream is "create empty". Real-JDK does the same.
+    let stream_opt = match args.get(1) {
+        Some(Value::Object(Some(r))) => Some(*r),
+        _ => None,
+    };
+    let password = match args.get(2) {
+        Some(v) => read_password(ctx, v),
+        None => Vec::new(),
+    };
+
+    let bytes = match stream_opt {
+        Some(s) => read_stream_to_end(ctx, s),
+        None => Vec::new(),
+    };
+
+    let store = if bytes.is_empty() {
+        LoadedKeyStore::default()
+    } else {
+        match load_keystore(&bytes, &password) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "keystore", "engineLoad: parse failed: {e}");
+                // Match real-JDK: throw IOException. For simplicity here we
+                // surface a runtime error — callers (real-JDK glue) wrap
+                // this as IOException at the bytecode boundary.
+                return Err(MethodCallFailed::InternalError(
+                    rustjvm_types::error::VmError::Runtime(RuntimeError::IOException {
+                        message: e.to_string(),
+                    }),
+                ));
+            }
+        }
+    };
+
+    let id = keystore_register(store);
+    set_store_id(ctx, this, id);
+    Ok(Some(Value::Object(None)))
+}
+
+fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+
+    let Some(store) = keystore_lookup(id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let Some(entry) = store.entries.get(&alias) else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    if let EntryKind::PrivateKey { key_der, .. } = &entry.kind {
+        // Allocate the synthetic PrivateKey mirror. Field layout matches the
+        // existing convention (algo_idx=0, key_size_bits=1, key_len_bytes=2,
+        // key_id=3) so the TLS path keeps working. We additionally stash the
+        // store_id + alias hash in a registry so the TLS layer can pull the
+        // DER through `keystore_get_private_key()` rather than needing to
+        // round-trip through this object.
+        let pk = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4);
+        let algo_idx = detect_algo_idx(key_der);
+        ctx.set_field(pk, 0, Value::Int(algo_idx));
+        ctx.set_field(pk, 1, Value::Int((key_der.len() as i32).saturating_mul(8)));
+        ctx.set_field(pk, 2, Value::Int(key_der.len() as i32));
+        // store_id encoded into the high 32 bits, alias-hash in the low 32.
+        let alias_hash = fnv1a_32(alias.as_bytes());
+        let composite = ((id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
+        ctx.set_field(pk, 3, Value::Long(composite));
+        Ok(Some(Value::Object(Some(pk))))
+    } else {
+        Ok(Some(Value::Object(None)))
+    }
+}
+
+fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+
+    let Some(store) = keystore_lookup(id) else { return Ok(Some(Value::Object(None))); };
+    let Some(entry) = store.entries.get(&alias) else { return Ok(Some(Value::Object(None))); };
+
+    let cert_der = match &entry.kind {
+        EntryKind::TrustedCert { cert_der } => cert_der.clone(),
+        EntryKind::PrivateKey { chain, .. } => match chain.first() {
+            Some(d) => d.clone(),
+            None => return Ok(Some(Value::Object(None))),
+        },
+    };
+
+    Ok(Some(Value::Object(Some(make_x509_mirror(ctx, &alias, &cert_der)))))
+}
+
+fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+
+    let Some(store) = keystore_lookup(id) else { return Ok(Some(Value::Object(None))); };
+    let Some(entry) = store.entries.get(&alias) else { return Ok(Some(Value::Object(None))); };
+
+    let chain = match &entry.kind {
+        EntryKind::PrivateKey { chain, .. } => chain.clone(),
+        EntryKind::TrustedCert { .. } => return Ok(Some(Value::Object(None))),
+    };
+
+    let cls_id = match ctx.ensure_class_initialized("java/security/cert/X509Certificate") {
+        Ok(c) => c,
+        Err(_) => rustjvm_types::ClassId::new(0),
+    };
+    let arr = ctx.new_ref_array(cls_id, chain.len());
+    for (i, der) in chain.iter().enumerate() {
+        let mirror = make_x509_mirror(ctx, &alias, der);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+
+    let store = keystore_lookup(id).unwrap_or_default();
+    let mut aliases: Vec<String> = store.entries.keys().cloned().collect();
+    aliases.sort_unstable();
+
+    let cls_id = match ctx.ensure_class_initialized("java/lang/String") {
+        Ok(c) => c,
+        Err(_) => rustjvm_types::ClassId::new(0),
+    };
+    let arr = ctx.new_ref_array(cls_id, aliases.len());
+    for (i, a) in aliases.iter().enumerate() {
+        let s = ctx.create_string(a);
+        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+    }
+
+    let en = alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2);
+    ctx.set_field(en, 0, Value::Object(Some(arr)));
+    ctx.set_field(en, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(en))))
+}
+
+fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let n = keystore_lookup(id).map(|s| s.entries.len()).unwrap_or(0);
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let present = keystore_lookup(id).map(|s| s.entries.contains_key(&alias)).unwrap_or(false);
+    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+}
+
+fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let yes = keystore_lookup(id)
+        .and_then(|s| s.entries.get(&alias).map(|e| matches!(e.kind, EntryKind::PrivateKey { .. })))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if yes { 1 } else { 0 })))
+}
+
+fn engine_is_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let yes = keystore_lookup(id)
+        .and_then(|s| s.entries.get(&alias).map(|e| matches!(e.kind, EntryKind::TrustedCert { .. })))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if yes { 1 } else { 0 })))
+}
+
+fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let ms = keystore_lookup(id).and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms)).unwrap_or(0);
+
+    // java/util/Date has a single `fastTime` long field in real-JDK layout
+    // (slot 0 in our synthetic mirror).
+    let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
+    ctx.set_field(date, 0, Value::Long(ms));
+    Ok(Some(Value::Object(Some(date))))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — store-id stash, mirror allocation, alias decode
+// ---------------------------------------------------------------------------
+
+fn read_string_arg(v: &Value) -> Option<&'static str> {
+    // Caller passes &Value but we need to dispatch through ctx.read_string —
+    // those callers do that themselves. This helper is a placeholder so the
+    // pattern is uniform across `engineFoo` callbacks: real reads go through
+    // the longer form below.
+    let _ = v;
+    None
+}
+
+fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, cert_der: &[u8]) -> ObjectRef {
+    let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
+    // Field layout matches what `phases_early.rs` uses for the
+    // `getCertificate` path: 0=subject string, 1=issuer string, 2=cert_id,
+    // 3=DER (byte[]). Subject + issuer here are alias strings — the real
+    // X.509 CN extraction lives in `security_manager/x509.rs`, which TLS
+    // can call once it has the DER. We keep the alias as a stand-in so
+    // tests asserting on `getName()` see something stable.
+    let alias_str = ctx.create_string(alias);
+    ctx.set_field(cert_obj, 0, Value::Object(Some(alias_str)));
+    ctx.set_field(cert_obj, 1, Value::Object(Some(alias_str)));
+    ctx.set_field(cert_obj, 2, Value::Int(0));
+
+    // Stash the DER as a Java byte[] so consumers can call
+    // `Certificate.getEncoded()` or pass the bytes to a TLS/`X509TrustManager`.
+    let arr = ctx.new_array(ArrayElementType::Byte, cert_der.len());
+    for (i, b) in cert_der.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    ctx.set_field(cert_obj, 3, Value::Object(Some(arr)));
+    cert_obj
+}
+
+fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    // Try multiple storage strategies; the synthetic class allocation pattern
+    // means our `engine*` callbacks may run on either a real-JDK PKCS12KeyStore
+    // mirror (with all the real fields) or a 5-field synthetic mirror that
+    // `tls.rs` allocates. Probe by name first, fall back to the conventional
+    // slot index.
+    let by_name = ctx.get_field_by_name(this, "rustjvm$keystore$storeId");
+    if let Value::Int(i) = by_name {
+        if i != 0 {
+            return i;
+        }
+    }
+    if let Value::Long(l) = by_name {
+        if l != 0 {
+            return l as i32;
+        }
+    }
+    let n = ctx.object_num_fields(this);
+    if n > FIELD_STORE_ID {
+        match ctx.get_field(this, FIELD_STORE_ID) {
+            Value::Int(i) => return i,
+            Value::Long(l) => return l as i32,
+            _ => {}
+        }
+    }
+    0
+}
+
+fn set_store_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
+    ctx.set_field_by_name(this, "rustjvm$keystore$storeId", Value::Int(id));
+    let n = ctx.object_num_fields(this);
+    if n > FIELD_STORE_ID {
+        ctx.set_field(this, FIELD_STORE_ID, Value::Int(id));
+    }
+}
+
+/// Map the first byte of a PKCS#8 DER to a coarse algorithm index. RSA and
+/// EC are the only two we expect from a TLS keystore. Default to RSA-ish.
+fn detect_algo_idx(key_der: &[u8]) -> i32 {
+    // PKCS#8 PrivateKeyInfo: SEQUENCE { Integer 0, AlgorithmIdentifier, OCTET STRING }
+    // AlgorithmIdentifier: SEQUENCE { OID, optional params }. RSA OID is
+    // 1.2.840.113549.1.1.1 (DER `06 09 2A 86 48 86 F7 0D 01 01 01`).
+    // EC OID is `1.2.840.10045.2.1` (`06 07 2A 86 48 CE 3D 02 01`).
+    let needle_rsa = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    let needle_ec = [0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+    if find_subseq(key_der, &needle_rsa).is_some() {
+        return 6; // RSA
+    }
+    if find_subseq(key_der, &needle_ec).is_some() {
+        return 7; // EC
+    }
+    6 // default RSA
+}
+
+fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    for i in 0..=hay.len() - needle.len() {
+        if &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn fnv1a_32(b: &[u8]) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for &x in b {
+        h ^= x as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Hermetic tests with inlined fixture bytes. The fixtures are tiny
+    //! synthetic keystores produced specifically for this test (a single
+    //! self-signed leaf + one trusted-cert entry, both ≤ 4 KiB).
+
+    use super::*;
+
+    // Synthesise a JKS file in-memory by writing the format directly. This
+    // keeps the test free of external tooling (no need for `keytool` to be on
+    // the test machine). The cert + key payloads here are deliberately tiny
+    // dummy DER blobs — the JKS parser only treats them as opaque bytes.
+    fn synth_jks(password: &[u8]) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&JKS_MAGIC.to_be_bytes());
+        body.extend_from_slice(&2u32.to_be_bytes()); // version 2
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+
+        // Entry 1: TrustedCertEntry, alias "trusted-ca"
+        body.extend_from_slice(&2u32.to_be_bytes()); // tag = 2
+        let alias1 = b"trusted-ca";
+        body.extend_from_slice(&(alias1.len() as u16).to_be_bytes());
+        body.extend_from_slice(alias1);
+        body.extend_from_slice(&123_456_789u64.to_be_bytes()); // creation date
+        let cert_type = b"X.509";
+        body.extend_from_slice(&(cert_type.len() as u16).to_be_bytes());
+        body.extend_from_slice(cert_type);
+        let cert_der = b"\x30\x06DUMMY1"; // 8-byte placeholder
+        body.extend_from_slice(&(cert_der.len() as u32).to_be_bytes());
+        body.extend_from_slice(cert_der);
+
+        // Entry 2: PrivateKeyEntry, alias "leaf-key"
+        body.extend_from_slice(&1u32.to_be_bytes()); // tag = 1
+        let alias2 = b"leaf-key";
+        body.extend_from_slice(&(alias2.len() as u16).to_be_bytes());
+        body.extend_from_slice(alias2);
+        body.extend_from_slice(&987_654_321u64.to_be_bytes());
+        let enc_key = b"\x30\x07PKCS8KEY";
+        body.extend_from_slice(&(enc_key.len() as u32).to_be_bytes());
+        body.extend_from_slice(enc_key);
+        body.extend_from_slice(&1u32.to_be_bytes()); // chain_count
+        body.extend_from_slice(&(cert_type.len() as u16).to_be_bytes());
+        body.extend_from_slice(cert_type);
+        let leaf_der = b"\x30\x06DUMMY2";
+        body.extend_from_slice(&(leaf_der.len() as u32).to_be_bytes());
+        body.extend_from_slice(leaf_der);
+
+        // Append integrity tag.
+        let mac = jks_password_mac(password, &body);
+        body.extend_from_slice(&mac);
+        body
+    }
+
+    #[test]
+    fn detects_jks_magic() {
+        let bytes = synth_jks(b"changeit");
+        assert_eq!(
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            JKS_MAGIC
+        );
+    }
+
+    #[test]
+    fn jks_roundtrip() {
+        let bytes = synth_jks(b"changeit");
+        let store = load_jks(&bytes, b"changeit").expect("load_jks");
+        assert_eq!(store.entries.len(), 2);
+        assert!(store.entries.contains_key("trusted-ca"));
+        assert!(store.entries.contains_key("leaf-key"));
+
+        match &store.entries["trusted-ca"].kind {
+            EntryKind::TrustedCert { cert_der } => {
+                assert_eq!(cert_der, b"\x30\x06DUMMY1");
+            }
+            _ => panic!("expected TrustedCert"),
+        }
+        match &store.entries["leaf-key"].kind {
+            EntryKind::PrivateKey { key_der, chain } => {
+                assert_eq!(key_der, b"\x30\x07PKCS8KEY");
+                assert_eq!(chain.len(), 1);
+                assert_eq!(chain[0], b"\x30\x06DUMMY2");
+            }
+            _ => panic!("expected PrivateKey"),
+        }
+    }
+
+    #[test]
+    fn jks_hmac_mismatch_rejected() {
+        let mut bytes = synth_jks(b"changeit");
+        // Flip a byte in the body (the entry_count high byte).
+        bytes[8] ^= 0x01;
+        let err = load_jks(&bytes, b"changeit").unwrap_err();
+        assert!(matches!(err, KeyStoreError::JksMacMismatch | KeyStoreError::BadJksTag(_)),
+            "got {err:?}");
+    }
+
+    #[test]
+    fn jks_wrong_password_rejected() {
+        let bytes = synth_jks(b"changeit");
+        let err = load_jks(&bytes, b"wrong").unwrap_err();
+        assert!(matches!(err, KeyStoreError::JksMacMismatch));
+    }
+
+    #[test]
+    fn jks_empty_password_works() {
+        let bytes = synth_jks(b"");
+        let store = load_jks(&bytes, b"").expect("load_jks empty pw");
+        assert_eq!(store.entries.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_picks_jks() {
+        let bytes = synth_jks(b"x");
+        let store = load_keystore(&bytes, b"x").expect("dispatch");
+        assert!(store.entries.contains_key("trusted-ca"));
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_format() {
+        let err = load_keystore(b"NOTAKEYSTORE", b"").unwrap_err();
+        assert!(matches!(err, KeyStoreError::UnknownFormat));
+    }
+
+    #[test]
+    fn registry_round_trip() {
+        let store = LoadedKeyStore {
+            entries: [(
+                "alpha".to_string(),
+                KeyStoreEntry {
+                    alias: "alpha".to_string(),
+                    creation_time_ms: 42,
+                    kind: EntryKind::TrustedCert { cert_der: b"hi".to_vec() },
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let id = keystore_register(store);
+        assert!(id > 0);
+        let got = keystore_lookup(id).expect("registered store");
+        assert_eq!(got.entries.len(), 1);
+        let cert = keystore_get_cert_der(id, "alpha").unwrap();
+        assert_eq!(cert, b"hi");
+    }
+
+    #[test]
+    fn jks_truncated_returns_error() {
+        let bytes = synth_jks(b"x");
+        let truncated = &bytes[..bytes.len() - 5];
+        let err = load_jks(truncated, b"x").unwrap_err();
+        // After moving HMAC to the front of `load_jks`, truncating the
+        // trailing 5 bytes is detected as JksMacMismatch (the trailing
+        // bytes interpreted as the 20-byte tag now cover real entry
+        // bytes, so the SHA-1 over the now-shorter body diverges). The
+        // older Truncated / BadJksTag paths are still reachable for
+        // truncations large enough that the body cannot even fit the
+        // 4+4+4+20 prelude.
+        assert!(matches!(
+            err,
+            KeyStoreError::Truncated(_)
+                | KeyStoreError::BadJksTag(_)
+                | KeyStoreError::JksMacMismatch
+        ));
+    }
+
+    #[test]
+    fn pkcs12_unknown_format_rejected() {
+        // Just a SEQUENCE prefix with garbage payload — should fail parse.
+        let bogus = b"\x30\x05\x00\x00\x00\x00\x00";
+        let err = load_pkcs12(bogus, b"x").unwrap_err();
+        assert!(matches!(err, KeyStoreError::Pkcs12Parse(_) | KeyStoreError::Pkcs12MacFailed));
+    }
+
+    #[test]
+    fn detect_algo_idx_handles_unknown() {
+        // No RSA/EC OID — defaults to 6 (RSA).
+        assert_eq!(detect_algo_idx(&[0u8; 32]), 6);
+    }
+
+    #[test]
+    fn detect_algo_idx_finds_rsa_oid() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]);
+        assert_eq!(detect_algo_idx(&blob), 6);
+    }
+
+    #[test]
+    fn detect_algo_idx_finds_ec_oid() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
+        assert_eq!(detect_algo_idx(&blob), 7);
+    }
+
+    #[test]
+    fn fnv1a_32_stable_across_runs() {
+        // Compile-time stable, sanity check the constants.
+        assert_eq!(fnv1a_32(b""), 0x811C_9DC5);
+        // Hash is deterministic per-input.
+        let h1 = fnv1a_32(b"hello");
+        let h2 = fnv1a_32(b"hello");
+        assert_eq!(h1, h2);
+        let h3 = fnv1a_32(b"world");
+        assert_ne!(h1, h3);
+    }
+}

@@ -1,0 +1,15 @@
+//! Native method API for RustJVM.
+//!
+//! Provides the NativeContext trait, NativeMethodRegistry, FFI types,
+//! and FileDescriptorTable used by all native method crates.
+
+pub mod charset;
+pub mod fd_table;
+pub mod ffi;
+pub mod init_level;
+pub mod registry;
+
+pub use registry::{
+    AnnotationData, AnnotationElementValue, DefineClassFull, FieldMetadata, MethodMetadata,
+    NativeCallback, NativeContext, NativeMethodRegistry, StackTraceEntry,
+};

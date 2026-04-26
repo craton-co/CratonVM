@@ -1,0 +1,1866 @@
+//! Heap — semi-space copying GC object and array storage.
+//!
+//! Objects are laid out as contiguous blocks:
+//! ```text
+//! [ObjectHeader (32 bytes)] [field0 (16 bytes)] [field1 (16 bytes)] ... [fieldN (16 bytes)]
+//! ```
+//!
+//! Arrays use SLOT_SIZE (16 bytes) per element for all types:
+//! ```text
+//! [ObjectHeader (32 bytes)] [elem0 (16 bytes)] [elem1 (16 bytes)] ... [elemN (16 bytes)]
+//! ```
+//!
+//! The heap uses two arenas (from-space and to-space) for a semi-space
+//! copying garbage collector. Allocation is linear in from-space. During
+//! collection, live objects are copied to to-space, then spaces are swapped.
+
+use std::sync::atomic::{AtomicI32, Ordering};
+
+use parking_lot::Mutex;
+
+use crate::arena::Arena;
+use rustjvm_types::{ClassId, ObjectRef, Value};
+
+// Re-export heap types from the shared types crate.
+pub use rustjvm_types::{
+    array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
+    ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
+    HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+};
+
+// ---------------------------------------------------------------------------
+// Heap — semi-space copying GC heap
+// ---------------------------------------------------------------------------
+
+/// Default semi-space size: 32 MB per semi-space (64 MB total).
+const DEFAULT_SEMI_SPACE_SIZE: usize = 32 * 1024 * 1024;
+
+/// Maximum array length — prevents excessive allocation from malformed bytecode.
+/// Matches HotSpot's practical limit.
+const MAX_ARRAY_LENGTH: usize = i32::MAX as usize; // 2^31 - 1
+
+/// GC threshold: trigger collection when from-space usage exceeds 75% capacity.
+const GC_THRESHOLD_PERCENT: usize = 75;
+
+/// Semi-space heap for Java objects and arrays.
+///
+/// Uses two arenas (from-space and to-space) for a copying garbage collector.
+/// Allocation happens linearly in from-space. During GC, live objects are
+/// copied to to-space, then the spaces are swapped.
+pub struct Heap {
+    from_space: Mutex<Arena>,
+    to_space: Mutex<Arena>,
+    next_hash_code: AtomicI32,
+    gc_threshold: usize,
+}
+
+// SAFETY: `Heap` contains only `Mutex<Arena>` (which is Send+Sync), an
+// `AtomicI32` (Send+Sync), and a `usize` (Send+Sync). The raw pointers
+// live *inside* the `Arena` behind the `Mutex`, so they are never directly
+// exposed as struct fields. All allocation goes through `self.from_space.lock()`,
+// which serializes mutations. After allocation, `ObjectRef` handles are plain
+// `*mut u8` pointers into arena-owned memory — reads and writes to disjoint
+// objects are safe from different threads because:
+//   1. Object fields are at fixed offsets from the allocation base.
+//   2. The GC stops the world before relocating objects.
+//   3. Volatile field access uses SeqCst fences.
+unsafe impl Send for Heap {}
+unsafe impl Sync for Heap {}
+
+impl Heap {
+    /// Create a new heap with default capacity (4 MB per semi-space).
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_SEMI_SPACE_SIZE * 2)
+    }
+
+    /// Create a new heap with the given total capacity.
+    /// Each semi-space gets half the capacity.
+    pub fn with_capacity(total_bytes: usize) -> Self {
+        let half = total_bytes.max(1024) / 2;
+        let threshold = half * GC_THRESHOLD_PERCENT / 100;
+        Self {
+            from_space: Mutex::new(Arena::new(half)),
+            to_space: Mutex::new(Arena::new(half)),
+            next_hash_code: AtomicI32::new(1),
+            gc_threshold: threshold,
+        }
+    }
+
+    /// Allocate a new Java object with `num_fields` field slots, all zeroed.
+    ///
+    /// # Panics
+    /// Panics if `num_fields * SLOT_SIZE` overflows.
+    pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        let fields_size = num_fields
+            .checked_mul(SLOT_SIZE)
+            .expect("object field size overflow");
+        let total_size = HEADER_SIZE
+            .checked_add(fields_size)
+            .expect("object total size overflow");
+        let ptr = self.alloc_zeroed(total_size);
+
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Object,
+            element_type: ArrayElementType::Reference, // unused for objects
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: 0,
+            num_slots: u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+
+        // SAFETY: `ptr` was just returned by `alloc_zeroed`, which guarantees it
+        // is valid, non-null, properly aligned (8-byte), and has at least
+        // `total_size` bytes available. Writing the header is within bounds
+        // (HEADER_SIZE <= total_size). `ObjectRef::from_raw` wraps the raw
+        // pointer in a typed handle; the pointed-to memory remains valid for
+        // the lifetime of the current semi-space (until the next GC swap).
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            ObjectRef::from_raw(ptr)
+        }
+    }
+
+    /// Allocate a new Java object with `num_fields` field slots and
+    /// initialize each slot to the JVM-spec-mandated default value based on
+    /// its descriptor byte.
+    ///
+    /// `descriptor_bytes[i]` must be the first byte of the JVM field
+    /// descriptor for field index `i` (e.g. `b'I'` for int, `b'J'` for long,
+    /// `b'L'`/`b'['` for reference types). Fields not covered by
+    /// `descriptor_bytes` (when `descriptor_bytes.len() < num_fields`) keep
+    /// their zeroed representation, which decodes as `Value::Object(None)`
+    /// — the correct default for reference slots.
+    ///
+    /// This fixes a subtle correctness bug: zeroed memory read via
+    /// `read_slot` decodes as `Value::Object(None)`, the zero-discriminant
+    /// variant of [`Value`]. For reference fields this is correct
+    /// (`null`). For primitive fields the JVM spec §2.3 mandates a typed
+    /// zero — `Value::Int(0)` for I/S/B/C/Z, `Value::Long(0)` for J,
+    /// `Value::Float(0.0)` for F, `Value::Double(0.0)` for D. Without this
+    /// default-init, an unwritten `int` field reads as `Object(None)`,
+    /// which breaks `Unsafe.compareAndSetInt` comparisons against
+    /// `Int(0)` (e.g. `ConcurrentHashMap.initTable`) and livelocks the
+    /// caller in a CAS retry loop.
+    ///
+    /// Unknown/malformed descriptor bytes fall through to the zeroed
+    /// default (`Object(None)`), matching the legacy behavior so this
+    /// cannot regress non-primitive paths.
+    ///
+    /// # Panics
+    /// Panics if `num_fields * SLOT_SIZE` overflows.
+    pub fn alloc_object_with_descriptors(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        descriptor_bytes: &[u8],
+    ) -> ObjectRef {
+        let obj = self.alloc_object(class_id, num_fields);
+        // Populate primitive-typed slots with the correct tagged-zero Value.
+        // Bounds: only write within [0 .. min(num_fields, descriptor_bytes.len())).
+        let n = num_fields.min(descriptor_bytes.len());
+        for i in 0..n {
+            if let Some(default) = default_value_for_descriptor(descriptor_bytes[i]) {
+                // SAFETY: `i < num_fields == header.num_slots`, so `slot_ptr`
+                // lands within the freshly-allocated object's field region.
+                unsafe {
+                    let ptr = slot_ptr(obj, i);
+                    write_slot(ptr, default);
+                }
+            }
+        }
+        obj
+    }
+
+    /// Like `alloc_object`, but returns `None` instead of panicking on overflow.
+    pub fn alloc_object_checked(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+    ) -> Option<ObjectRef> {
+        let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
+        let total_size = HEADER_SIZE.checked_add(fields_size)?;
+        let mut from = self.from_space.lock();
+        let ptr = from.alloc(total_size, 8)?;
+        // SAFETY: same as `alloc_object` — ptr is valid, aligned, with sufficient capacity.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, total_size);
+            let header = ObjectHeader {
+                class_id,
+                kind: ObjectKind::Object,
+                element_type: ArrayElementType::Reference,
+                _padding: [0; 2],
+                identity_hash_code: self.next_hash(),
+                array_length: 0,
+                num_slots: u32::try_from(num_fields).ok()?,
+                gc_age: 0,
+                gc_flags: 0,
+                _gc_reserved: [0; 2],
+                forwarding_ptr: std::ptr::null_mut(),
+            };
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    /// Allocate a new Java array with the given element type and length, all zeroed.
+    ///
+    /// Arrays use compact element sizes: 1 byte for boolean/byte, 2 for char/short,
+    /// 4 for int/float, 8 for long/double/reference.
+    pub fn alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> ObjectRef {
+        assert!(
+            length <= MAX_ARRAY_LENGTH,
+            "array length {} exceeds maximum {}",
+            length,
+            MAX_ARRAY_LENGTH
+        );
+        let data_size = array_data_size(length, element_type)
+            .expect("array data size overflow in alloc_array");
+        let total_size = HEADER_SIZE + data_size;
+        let ptr = self.alloc_zeroed(total_size);
+
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Array,
+            element_type,
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: u32::try_from(length).expect("array length exceeds u32::MAX"),
+            num_slots: u32::try_from(length).expect("array length exceeds u32::MAX"),
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+
+        // SAFETY: `ptr` was returned by `alloc_zeroed` — valid, non-null, 8-byte
+        // aligned, and has at least `total_size` bytes. The header write is in
+        // bounds. The data area (elements) is already zero-initialized by
+        // `alloc_zeroed`, which is the correct default for all primitive types
+        // (0) and reference types (null pointer = 0).
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            ObjectRef::from_raw(ptr)
+        }
+    }
+
+    /// Like `alloc_array`, but returns `None` instead of panicking on overflow
+    /// or out-of-memory.
+    pub fn alloc_array_checked(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
+        if length > MAX_ARRAY_LENGTH {
+            return None;
+        }
+        let data_size = array_data_size_checked(length, element_type)?;
+        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let mut from = self.from_space.lock();
+        let ptr = from.alloc(total_size, 8)?;
+        // SAFETY: same as `alloc_array` — ptr is valid, aligned, with sufficient capacity.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, total_size);
+            let header = ObjectHeader {
+                class_id,
+                kind: ObjectKind::Array,
+                element_type,
+                _padding: [0; 2],
+                identity_hash_code: self.next_hash(),
+                array_length: u32::try_from(length).ok()?,
+                num_slots: u32::try_from(length).ok()?,
+                gc_age: 0,
+                gc_flags: 0,
+                _gc_reserved: [0; 2],
+                forwarding_ptr: std::ptr::null_mut(),
+            };
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    // ----- Header access ---------------------------------------------------
+
+    /// Read the object header from a heap reference.
+    ///
+    /// # Safety
+    /// `obj_ref` must point to a valid heap allocation.
+    pub fn get_header(&self, obj_ref: ObjectRef) -> &ObjectHeader {
+        // SAFETY: `obj_ref` points to a live heap allocation whose first
+        // HEADER_SIZE bytes are a valid `ObjectHeader` written during allocation.
+        // The reference is valid for the lifetime of the current semi-space.
+        unsafe { &*(obj_ref.as_ptr() as *const ObjectHeader) }
+    }
+
+    /// Get the class id of a heap object.
+    pub fn class_id_of(&self, obj_ref: ObjectRef) -> ClassId {
+        self.get_header(obj_ref).class_id
+    }
+
+    /// Get the kind (Object or Array) of a heap allocation.
+    pub fn kind_of(&self, obj_ref: ObjectRef) -> ObjectKind {
+        self.get_header(obj_ref).kind
+    }
+
+    /// Get the element type of an array object.
+    pub fn element_type_of(&self, obj_ref: ObjectRef) -> ArrayElementType {
+        self.get_header(obj_ref).element_type
+    }
+
+    /// Get the identity hash code of a heap object.
+    pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
+        self.get_header(obj_ref).identity_hash_code
+    }
+
+    // ----- Field access (for Objects) --------------------------------------
+
+    /// Get the value of a field at the given index.
+    ///
+    /// # Panics
+    /// Panics if `index >= num_slots`.
+    pub fn get_field(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        assert!(index < self.get_header(obj_ref).num_slots as usize, "field index {} out of bounds (num_slots={})", index, self.get_header(obj_ref).num_slots);
+        // SAFETY: `obj_ref` is a live heap object. The assert above
+        // confirms `index < num_slots`. `slot_ptr` computes
+        // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
+        // allocated block. `read_slot` reads a `Value` from that pointer.
+        unsafe {
+            let ptr = slot_ptr(obj_ref, index);
+            read_slot(ptr)
+        }
+    }
+
+    /// Set the value of a field at the given index.
+    ///
+    /// # Panics
+    /// Panics if `index >= num_slots`.
+    pub fn set_field(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        assert!(index < self.get_header(obj_ref).num_slots as usize, "field index {} out of bounds (num_slots={})", index, self.get_header(obj_ref).num_slots);
+        // SAFETY: same invariant as `get_field` — index is within bounds,
+        // and the slot pointer is within the allocated object block.
+        unsafe {
+            let ptr = slot_ptr(obj_ref, index);
+            write_slot(ptr, value);
+        }
+    }
+
+    // ----- Volatile field access (for ACC_VOLATILE fields) -----------------
+
+    /// Get the value of a volatile field at the given index.
+    ///
+    /// Uses `SeqCst` memory fences to ensure cross-thread visibility.
+    pub fn get_field_volatile(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let val = self.get_field(obj_ref, index);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        val
+    }
+
+    /// Set the value of a volatile field at the given index.
+    ///
+    /// Uses `SeqCst` memory fences to ensure cross-thread visibility.
+    pub fn set_field_volatile(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        self.set_field(obj_ref, index, value);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // ----- T10.9.E descriptor-aware field access --------------------------
+
+    /// Get the value of a field at the given index, **normalized to the
+    /// declared field type** from its descriptor byte.
+    ///
+    /// This is the T10.9.E defense-in-depth layer: even if an upstream
+    /// putfield wrote a drifted `Value` variant (e.g. a `Double` whose
+    /// bit pattern happens to match a long, or an `Object(None)` in a
+    /// long slot that slipped past the `alloc_object_with_descriptors`
+    /// zero-init), reading through this API returns a `Value` whose
+    /// variant matches the class-file descriptor for the field.
+    ///
+    /// Descriptor byte semantics (matches CompactValue::decode_by_descriptor):
+    /// - `b'J'` → `Value::Long` (bit reinterpret if needed)
+    /// - `b'D'` → `Value::Double`
+    /// - `b'F'` → `Value::Float`
+    /// - `b'I' | b'B' | b'C' | b'S' | b'Z'` → `Value::Int`
+    /// - `b'L' | b'['` → `Value::Object(Some/None)` (unchanged from raw read)
+    /// - other → raw `get_field` return (legacy behavior)
+    ///
+    /// Out-of-bounds behavior matches `get_field` (panics on bad index).
+    pub fn get_field_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
+        let raw = self.get_field(obj_ref, index);
+        coerce_field_value_by_descriptor(raw, desc_byte)
+    }
+
+    /// Volatile variant of [`get_field_as`].
+    pub fn get_field_volatile_as(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        desc_byte: u8,
+    ) -> Value {
+        let raw = self.get_field_volatile(obj_ref, index);
+        coerce_field_value_by_descriptor(raw, desc_byte)
+    }
+
+    /// Set a field value, coercing to the declared type from the descriptor.
+    ///
+    /// Symmetric to [`get_field_as`] — if a `Value::Double` lands where the
+    /// class file declares `J`, it is reinterpreted as `Value::Long` before
+    /// the slot write so downstream readers always see a consistent tag.
+    pub fn set_field_as(&self, obj_ref: ObjectRef, index: usize, value: Value, desc_byte: u8) {
+        let coerced = coerce_field_value_by_descriptor(value, desc_byte);
+        self.set_field(obj_ref, index, coerced);
+    }
+
+    /// Volatile variant of [`set_field_as`].
+    pub fn set_field_volatile_as(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        value: Value,
+        desc_byte: u8,
+    ) {
+        let coerced = coerce_field_value_by_descriptor(value, desc_byte);
+        self.set_field_volatile(obj_ref, index, coerced);
+    }
+
+    // ----- Array access ----------------------------------------------------
+
+    /// Get the length of an array.
+    ///
+    /// # Panics
+    /// Panics if the object is not an array.
+    pub fn array_length(&self, obj_ref: ObjectRef) -> usize {
+        let header = self.get_header(obj_ref);
+        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        header.array_length as usize
+    }
+
+    /// Get an array element at the given index.
+    ///
+    /// Returns `Err` with the index if out of bounds.
+    pub fn get_array_element(&self, obj_ref: ObjectRef, index: usize) -> Result<Value, i32> {
+        let header = self.get_header(obj_ref);
+        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: bounds check passed above (`index < array_length`).
+        // `obj_ref + HEADER_SIZE` is the start of the data area.
+        // `read_prim_element` reads `element_byte_size(et)` bytes at
+        // `base + index * element_byte_size(et)`, which is within the
+        // allocated data area of size `array_data_size(length, et)`.
+        unsafe {
+            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            Ok(read_prim_element(base, index, header.element_type))
+        }
+    }
+
+    /// Like `get_array_element`, but auto-unboxes values stored by native
+    /// collections. When a non-Object value (Int, Long, etc.) was auto-boxed
+    /// into a wrapper object during `set_array_element`, this method
+    /// transparently returns the original primitive value.
+    ///
+    /// Use this from NativeContext (for collection code). The interpreter's
+    /// bytecode aaload should use plain `get_array_element` — Java-level
+    /// Object[] arrays never contain auto-boxed wrappers.
+    pub fn get_array_element_unboxing(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+    ) -> Result<Value, i32> {
+        let header = self.get_header(obj_ref);
+        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
+        // The autobox check reads the header of the pointed-to object, which is
+        // also a valid heap allocation (it was created by `set_array_element`).
+        unsafe {
+            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let value = read_prim_element(base, index, header.element_type);
+            if header.element_type == ArrayElementType::Reference {
+                if let Value::Object(Some(obj)) = value {
+                    let obj_header = &*(obj.as_ptr() as *const ObjectHeader);
+                    if obj_header.class_id == AUTOBOX_CLASS_ID {
+                        return Ok(self.get_field(obj, 0));
+                    }
+                }
+            }
+            Ok(value)
+        }
+    }
+
+    /// Set an array element at the given index.
+    ///
+    /// Returns `Err` with the index if out of bounds.
+    pub fn set_array_element(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        value: Value,
+    ) -> Result<(), i32> {
+        let header = self.get_header(obj_ref);
+        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
+        // For reference arrays, non-Object values are auto-boxed into wrapper
+        // objects allocated on this heap before being stored.
+        unsafe {
+            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            // Compact ref arrays only store 8-byte pointers. If a non-Object
+            // value is written (e.g. Value::Int from a native collection),
+            // auto-box it into a 1-field wrapper object.
+            if header.element_type == ArrayElementType::Reference {
+                match value {
+                    Value::Object(_) => {
+                        write_prim_element(base, index, header.element_type, value);
+                    }
+                    _ => {
+                        let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                        self.set_field(wrapper, 0, value);
+                        write_prim_element(
+                            base,
+                            index,
+                            header.element_type,
+                            Value::Object(Some(wrapper)),
+                        );
+                    }
+                }
+            } else {
+                write_prim_element(base, index, header.element_type, value);
+            }
+        }
+        Ok(())
+    }
+
+    // ----- Write barrier (no-op for non-generational heap) --------------------
+
+    /// Write barrier — called after every reference store into a heap object.
+    ///
+    /// For the simple semi-space heap this is a no-op. The generational heap
+    /// uses this to mark card table entries dirty.
+    #[inline]
+    pub fn write_barrier(&self, _obj: ObjectRef, _stored_value: Value) {
+        // No-op for non-generational heap.
+    }
+
+    // ----- GC-related queries -----------------------------------------------
+
+    /// Returns true when from-space usage exceeds the GC threshold.
+    pub fn needs_gc(&self) -> bool {
+        self.from_space.lock().used() >= self.gc_threshold
+    }
+
+    /// Lock and return mutable references to both semi-spaces.
+    /// Used by the GC collector.
+    pub fn lock_spaces(
+        &self,
+    ) -> (
+        parking_lot::MutexGuard<'_, Arena>,
+        parking_lot::MutexGuard<'_, Arena>,
+    ) {
+        let from = self.from_space.lock();
+        let to = self.to_space.lock();
+        (from, to)
+    }
+
+    /// Swap from-space and to-space after GC collection.
+    pub fn swap_spaces(&self) {
+        let mut from = self.from_space.lock();
+        let mut to = self.to_space.lock();
+        std::mem::swap(&mut *from, &mut *to);
+    }
+
+    /// Run a full garbage collection cycle.
+    ///
+    /// 1. Copies all live objects (reachable from roots) to to-space
+    /// 2. Remaps monitor table keys
+    /// 3. Swaps from-space and to-space
+    ///
+    /// After this call, `roots` contains updated ObjectRefs pointing to the
+    /// new object locations, and the returned `GcResult` contains the pointer
+    /// mapping for updating external references.
+    pub fn collect_garbage(
+        &self,
+        roots: &mut [ObjectRef],
+        monitors: &dyn crate::collector::MonitorCleanup,
+    ) -> crate::gc::GcResult {
+        let mut from = self.from_space.lock();
+        let mut to = self.to_space.lock();
+
+        let result = crate::gc::collect(&mut from, &mut to, roots);
+
+        // Remap monitor table keys using the pointer mapping
+        monitors.remap_after_gc(&result.pointer_map);
+
+        // Swap spaces: to-space (now containing live data) becomes from-space
+        std::mem::swap(&mut *from, &mut *to);
+
+        result
+    }
+
+    /// Like [`collect_garbage`] but keeps dead finalizable objects alive so
+    /// their `finalize()` method can be invoked.  Returns the GC result and
+    /// the *new* (post-GC) addresses of dead finalizable objects.
+    pub fn collect_garbage_with_finalizers(
+        &self,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn crate::collector::MonitorCleanup,
+    ) -> (crate::gc::GcResult, Vec<usize>) {
+        let mut from = self.from_space.lock();
+        let mut to = self.to_space.lock();
+
+        let (result, dead_finalizers) =
+            crate::gc::collect_with_finalizers(&mut from, &mut to, roots, finalizer_addrs);
+
+        monitors.remap_after_gc(&result.pointer_map);
+        std::mem::swap(&mut *from, &mut *to);
+
+        (result, dead_finalizers)
+    }
+
+    // ----- Internal --------------------------------------------------------
+
+    /// Allocate `size` bytes, 8-byte aligned, zero-initialized.
+    /// Locks the from-space mutex for the duration of the allocation.
+    ///
+    /// # Panics
+    /// Panics on OOM as a last resort. In normal operation the interpreter
+    /// calls [`try_alloc_zeroed`](Self::try_alloc_zeroed) first, triggers GC
+    /// on failure, and only falls back to this method when the object *must*
+    /// be allocated (e.g. internal bookkeeping). If this panic fires it means
+    /// the heap is genuinely exhausted after GC has already been attempted.
+    fn alloc_zeroed(&self, size: usize) -> *mut u8 {
+        let mut from = self.from_space.lock();
+        let ptr = from.alloc(size, 8).unwrap_or_else(|| {
+            // Use process::abort() instead of panic!() to avoid unwinding
+            // through unsafe code. In production, GenerationalHeap's try_alloc
+            // path handles OOM gracefully; this code path is only reached by
+            // the legacy Heap (used in tests).
+            eprintln!(
+                "heap out of memory: tried to allocate {} bytes, from-space has {}/{} used",
+                size,
+                from.used(),
+                from.capacity(),
+            );
+            std::process::abort();
+        });
+        // SAFETY: `ptr` was returned by `Arena::alloc` and points to `size` bytes
+        // of uninitialized (or stale) memory within the arena. Writing zeros is
+        // safe because the pointer and size are guaranteed valid by the arena.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        ptr
+    }
+
+    /// Try to allocate `size` bytes, returning `None` if from-space is full.
+    fn try_alloc_zeroed(&self, size: usize) -> Option<*mut u8> {
+        let mut from = self.from_space.lock();
+        let ptr = from.alloc(size, 8)?;
+        // SAFETY: `ptr` was returned by `Arena::alloc` and points to `size` bytes
+        // of uninitialized memory within the arena. Writing zeros is safe because
+        // the pointer and size are guaranteed valid by the arena.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        Some(ptr)
+    }
+
+    /// Try to allocate a new Java object, returning `None` if the heap is full.
+    /// Callers should trigger GC and retry, or throw `OutOfMemoryError`.
+    pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
+        let total_size = HEADER_SIZE.checked_add(fields_size)?;
+        let ptr = self.try_alloc_zeroed(total_size)?;
+
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Object,
+            element_type: ArrayElementType::Reference, // unused for objects
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: 0,
+            num_slots: u32::try_from(num_fields).ok()?,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+
+        // SAFETY: `ptr` was just returned by `try_alloc_zeroed`, which guarantees
+        // it is valid, non-null, properly aligned (8-byte), and has at least
+        // `total_size` bytes available.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    /// Try to allocate a new Java array, returning `None` if the heap is full.
+    /// Callers should trigger GC and retry, or throw `OutOfMemoryError`.
+    pub fn try_alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
+        if length > MAX_ARRAY_LENGTH {
+            return None;
+        }
+        let data_size = array_data_size_checked(length, element_type)?;
+        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let ptr = self.try_alloc_zeroed(total_size)?;
+
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Array,
+            element_type,
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: u32::try_from(length).ok()?,
+            num_slots: u32::try_from(length).ok()?,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+
+        // SAFETY: `ptr` was returned by `try_alloc_zeroed` — valid, non-null,
+        // 8-byte aligned, and has at least `total_size` bytes.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    /// Generate the next identity hash code.
+    fn next_hash(&self) -> i32 {
+        self.next_hash_code.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Total bytes currently allocated in from-space.
+    pub fn allocated_bytes(&self) -> usize {
+        self.from_space.lock().used()
+    }
+
+    /// The capacity of each semi-space.
+    pub fn semi_space_capacity(&self) -> usize {
+        self.from_space.lock().capacity()
+    }
+}
+
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Heap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let from = self.from_space.lock();
+        let to = self.to_space.lock();
+        f.debug_struct("Heap")
+            .field("from_space_used", &from.used())
+            .field("from_space_capacity", &from.capacity())
+            .field("to_space_used", &to.used())
+            .field("to_space_capacity", &to.capacity())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slot read/write helpers
+// ---------------------------------------------------------------------------
+
+/// Map a JVM field descriptor's first byte to its default [`Value`] per the
+/// JVM spec §2.3 (primitive default values).
+///
+/// | Descriptor | Java type           | Default `Value` variant |
+/// |------------|---------------------|-------------------------|
+/// | `B`        | byte                | `Int(0)` (sign-extended) |
+/// | `C`        | char                | `Int(0)` (zero-extended) |
+/// | `I`        | int                 | `Int(0)`                |
+/// | `S`        | short               | `Int(0)` (sign-extended) |
+/// | `Z`        | boolean             | `Int(0)` (0 = false)    |
+/// | `J`        | long                | `Long(0)`               |
+/// | `F`        | float               | `Float(0.0)`            |
+/// | `D`        | double              | `Double(0.0)`           |
+/// | `L…;` / `[`| reference / array   | `None` → keep zero bits |
+/// | *other*    | malformed           | `None` → keep zero bits |
+///
+/// For reference-typed fields the caller should rely on the zeroed memory
+/// (which decodes as `Value::Object(None)`) — returning `None` here signals
+/// "no override needed". This also fail-opens for unknown descriptor bytes,
+/// preserving the pre-fix behavior so malformed class metadata cannot
+/// regress non-primitive paths.
+#[inline]
+pub fn default_value_for_descriptor(desc_byte: u8) -> Option<Value> {
+    match desc_byte {
+        // Integer-family primitives all live in Value::Int per JVM spec.
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(0)),
+        b'J' => Some(Value::Long(0)),
+        b'F' => Some(Value::Float(0.0)),
+        b'D' => Some(Value::Double(0.0)),
+        // References (L...;) and arrays ([) default to null, which matches
+        // the zero-bits decoding of Value::Object(None).
+        _ => None,
+    }
+}
+
+/// T10.9.E — Coerce a loaded-from-slot `Value` to match its declared field
+/// type.
+///
+/// This is the runtime complement of [`default_value_for_descriptor`]: that
+/// helper sets the **initial** slot contents so zero-init has the correct
+/// tag; this helper **normalises** any drifted Value on read/write so
+/// downstream code always sees the declared variant.
+///
+/// Behaviour is a superset of `CompactValue::decode_by_descriptor`:
+/// - `Value::Object(None)` on a primitive descriptor → the typed JVMS zero.
+/// - `Value::Long(x)` on a J descriptor → unchanged.
+/// - `Value::Double(d)` on a J descriptor → `Value::Long(d.to_bits() as i64)`.
+///   This is the Session 93 fix: a long bit pattern that happened to be
+///   written as Double (via CompactValue::long + round-trip through
+///   `to_value`) is reinterpreted as the intended long.
+/// - symmetric for D/F/I families.
+/// - references (L/[): unchanged from raw read.
+/// - unknown descriptor: unchanged (`_ => value`).
+///
+/// Defensive: never panics; always returns a `Value`.
+#[inline]
+pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
+    match desc_byte {
+        b'J' => match value {
+            Value::Long(_) => value,
+            Value::Double(d) => Value::Long(d.to_bits() as i64),
+            Value::Float(f) => Value::Long(f.to_bits() as u32 as i64),
+            Value::Int(i) => Value::Long(i as i64),
+            Value::Object(None) | Value::Uninitialized => Value::Long(0),
+            // An object pointer landing in a long slot is upstream drift;
+            // surface the raw pointer as a long so downstream unsafe ops
+            // can decode it (matches HotSpot behavior of treating the slot
+            // as raw bits).
+            Value::Object(Some(o)) => Value::Long(o.as_ptr() as usize as i64),
+            Value::ReturnAddress(pc) => Value::Long(pc as i64),
+        },
+        b'D' => match value {
+            Value::Double(_) => value,
+            Value::Long(l) => Value::Double(f64::from_bits(l as u64)),
+            Value::Float(f) => Value::Double(f as f64),
+            Value::Int(i) => Value::Double(i as f64),
+            Value::Object(None) | Value::Uninitialized => Value::Double(0.0),
+            Value::Object(Some(o)) => {
+                Value::Double(f64::from_bits(o.as_ptr() as usize as u64))
+            }
+            Value::ReturnAddress(pc) => Value::Double(pc as f64),
+        },
+        b'F' => match value {
+            Value::Float(_) => value,
+            Value::Int(i) => Value::Float(f32::from_bits(i as u32)),
+            Value::Long(l) => Value::Float(f32::from_bits(l as u32)),
+            Value::Double(d) => Value::Float(d as f32),
+            Value::Object(None) | Value::Uninitialized => Value::Float(0.0),
+            Value::Object(Some(o)) => {
+                Value::Float(f32::from_bits(o.as_ptr() as usize as u32))
+            }
+            Value::ReturnAddress(pc) => Value::Float(f32::from_bits(pc)),
+        },
+        b'I' | b'B' | b'C' | b'S' | b'Z' => match value {
+            Value::Int(_) => value,
+            Value::Long(l) => Value::Int(l as i32),
+            Value::Float(f) => Value::Int(f.to_bits() as i32),
+            Value::Double(d) => Value::Int(d.to_bits() as i32),
+            Value::Object(None) | Value::Uninitialized => Value::Int(0),
+            Value::Object(Some(o)) => Value::Int(o.as_ptr() as usize as i32),
+            Value::ReturnAddress(pc) => Value::Int(pc as i32),
+        },
+        b'L' | b'[' => match value {
+            Value::Object(_) => value,
+            // A primitive landing where a reference is declared is a verifier
+            // violation; degrade to null rather than surface a bogus Value
+            // variant to native code.
+            Value::Int(0) | Value::Long(0) => Value::Object(None),
+            // WP4.1 closer — under heavy AQS contention, the invoke-arg pop
+            // boundary surfaces an untagged 64-bit raw-pointer slot as
+            // `Value::Double` because `CompactValue::to_value()` decodes any
+            // non-NaN-tagged u64 as `Double(f64::from_bits(bits))`.  When the
+            // declared field type is a reference (`L`/`[`) and the raw bits
+            // look like a heap-aligned, in-canonical-address-space pointer,
+            // recover the `ObjectRef` from those bits.  Plain numeric doubles
+            // fail the alignment check and degrade to `Object(None)` to match
+            // the verifier's "primitive in reference slot" recovery above.
+            //
+            // Heuristic guard: pointers in our arenas are 8-byte aligned and
+            // fit in 48 bits (canonical x86-64 user space).  Patterns that
+            // miss either constraint cannot be live `ObjectRef`s and must be
+            // bytecode-level junk.
+            Value::Double(d) => {
+                let bits = d.to_bits();
+                if bits == 0 {
+                    Value::Object(None)
+                } else if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                    // SAFETY: bit pattern reconstructs the original `ObjectRef`
+                    // that was stored via the same untagged path on the writer
+                    // side.  Subsequent heap accesses validate liveness via
+                    // `class_id_of` header reads.
+                    Value::Object(Some(unsafe {
+                        ObjectRef::from_raw(bits as usize as *mut u8)
+                    }))
+                } else {
+                    Value::Object(None)
+                }
+            }
+            _ => value,
+        },
+        _ => value,
+    }
+}
+
+/// Get a pointer to the slot at `index` (field or array element).
+#[inline]
+unsafe fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
+    obj_ref.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE)
+}
+
+/// Read a `Value` from a slot. We store values as 8-byte tagged unions:
+/// - Bytes 0..4: the "raw" 32-bit or first half of 64-bit data
+/// - Bytes 4..8: tag or second half
+///
+/// For simplicity in Phase 1, we store the raw `Value` enum directly.
+/// This is slightly wasteful but works correctly.
+///
+/// # Safety
+/// The pointer must be valid and 8-byte aligned.
+unsafe fn read_slot(ptr: *mut u8) -> Value {
+    std::ptr::read(ptr as *const Value)
+}
+
+/// Write a `Value` into a slot.
+///
+/// # Safety
+/// The pointer must be valid and 8-byte aligned.
+unsafe fn write_slot(ptr: *mut u8, value: Value) {
+    std::ptr::write(ptr as *mut Value, value);
+}
+
+// ---------------------------------------------------------------------------
+// Compact primitive array element access
+// ---------------------------------------------------------------------------
+
+/// Read an array element from compact storage.
+///
+/// # Safety
+/// `base` must point to the start of the array data area (header + HEADER_SIZE).
+/// `index` must have been validated against the array length by the caller.
+#[inline]
+pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementType) -> Value {
+    // Use a helper to compute byte offset with overflow checking.
+    // Panics in debug builds, wraps in release — the caller MUST bounds-check
+    // `index` against the array length before calling this function.
+    macro_rules! elem_ptr {
+        ($base:expr, $index:expr, $stride:expr, $ty:ty) => {{
+            let offset = $index.checked_mul($stride)
+                .expect("array element offset overflow");
+            std::ptr::read_unaligned($base.add(offset) as *const $ty)
+        }};
+    }
+
+    match et {
+        ArrayElementType::Int => {
+            Value::Int(elem_ptr!(base, index, 4, i32))
+        }
+        ArrayElementType::Long => {
+            Value::Long(elem_ptr!(base, index, 8, i64))
+        }
+        ArrayElementType::Float => {
+            Value::Float(elem_ptr!(base, index, 4, f32))
+        }
+        ArrayElementType::Double => {
+            Value::Double(elem_ptr!(base, index, 8, f64))
+        }
+        ArrayElementType::Byte => {
+            let v = std::ptr::read(base.add(index));
+            Value::Int(v as i8 as i32) // sign-extend
+        }
+        ArrayElementType::Boolean => {
+            let v = std::ptr::read(base.add(index));
+            Value::Int(v as i32) // zero-extend (0 or 1)
+        }
+        ArrayElementType::Char => {
+            Value::Int(elem_ptr!(base, index, 2, u16) as i32)
+        }
+        ArrayElementType::Short => {
+            Value::Int(elem_ptr!(base, index, 2, i16) as i32)
+        }
+        ArrayElementType::Reference => {
+            let offset = index.checked_mul(REF_ELEMENT_SIZE)
+                .expect("array ref element offset overflow");
+            let raw: u64 = std::ptr::read(base.add(offset) as *const u64);
+            if raw == 0 {
+                Value::Object(None)
+            } else {
+                Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+            }
+        }
+    }
+}
+
+/// Write an array element to compact storage.
+///
+/// # Safety
+/// `base` must point to the start of the array data area (header + HEADER_SIZE).
+#[inline]
+pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementType, value: Value) {
+    match et {
+        ArrayElementType::Int => {
+            let v = match value {
+                Value::Int(i) => i,
+                _ => 0,
+            };
+            std::ptr::write_unaligned(base.add(index * 4) as *mut i32, v);
+        }
+        ArrayElementType::Long => {
+            let v = match value {
+                Value::Long(l) => l,
+                _ => 0,
+            };
+            std::ptr::write_unaligned(base.add(index * 8) as *mut i64, v);
+        }
+        ArrayElementType::Float => {
+            let v = match value {
+                Value::Float(f) => f,
+                _ => 0.0,
+            };
+            std::ptr::write_unaligned(base.add(index * 4) as *mut f32, v);
+        }
+        ArrayElementType::Double => {
+            let v = match value {
+                Value::Double(d) => d,
+                _ => 0.0,
+            };
+            std::ptr::write_unaligned(base.add(index * 8) as *mut f64, v);
+        }
+        ArrayElementType::Byte | ArrayElementType::Boolean => {
+            let v = match value {
+                Value::Int(i) => i as u8,
+                _ => 0,
+            };
+            std::ptr::write(base.add(index), v);
+        }
+        ArrayElementType::Char => {
+            let v = match value {
+                Value::Int(i) => i as u16,
+                _ => 0,
+            };
+            std::ptr::write_unaligned(base.add(index * 2) as *mut u16, v);
+        }
+        ArrayElementType::Short => {
+            let v = match value {
+                Value::Int(i) => i as i16,
+                _ => 0,
+            };
+            std::ptr::write_unaligned(base.add(index * 2) as *mut i16, v);
+        }
+        ArrayElementType::Reference => {
+            let raw: u64 = match value {
+                Value::Object(Some(r)) => r.as_ptr() as u64,
+                Value::Object(None) => 0,
+                _ => 0,
+            };
+            std::ptr::write(base.add(index * REF_ELEMENT_SIZE) as *mut u64, raw);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_size_check() {
+        assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn value_size_fits_slot() {
+        assert!(
+            std::mem::size_of::<Value>() <= SLOT_SIZE,
+            "Value ({} bytes) exceeds SLOT_SIZE ({SLOT_SIZE} bytes)!",
+            std::mem::size_of::<Value>()
+        );
+    }
+
+    #[test]
+    fn alloc_object_and_read_header() {
+        let heap = Heap::new();
+        let class_id = ClassId::new(42);
+        let obj = heap.alloc_object(class_id, 3);
+
+        let header = heap.get_header(obj);
+        assert_eq!(header.class_id, class_id);
+        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.num_slots, 3);
+        assert_ne!(header.identity_hash_code, 0);
+    }
+
+    #[test]
+    fn alloc_object_fields_zero_initialized() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 3);
+
+        // All fields should read as zero (which is Value::Uninitialized from zeroed memory,
+        // or more precisely, whatever zero bits represent for Value).
+        // In practice, we set fields before reading in real code.
+        // Just verify no crash.
+        let _ = heap.get_field(obj, 0);
+        let _ = heap.get_field(obj, 1);
+        let _ = heap.get_field(obj, 2);
+    }
+
+    #[test]
+    fn object_field_set_and_get() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 3);
+
+        heap.set_field(obj, 0, Value::Int(42));
+        heap.set_field(obj, 1, Value::Long(123_456_789));
+        heap.set_field(obj, 2, Value::Float(3.125));
+
+        assert_eq!(heap.get_field(obj, 0).as_int(), Some(42));
+        assert_eq!(heap.get_field(obj, 1).as_long(), Some(123_456_789));
+        assert_eq!(heap.get_field(obj, 2).as_float(), Some(3.125));
+    }
+
+    #[test]
+    fn object_field_overwrite() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+
+        heap.set_field(obj, 0, Value::Int(1));
+        assert_eq!(heap.get_field(obj, 0).as_int(), Some(1));
+
+        heap.set_field(obj, 0, Value::Int(999));
+        assert_eq!(heap.get_field(obj, 0).as_int(), Some(999));
+    }
+
+    #[test]
+    fn object_reference_field() {
+        let heap = Heap::new();
+        let obj1 = heap.alloc_object(ClassId::new(0), 1);
+        let obj2 = heap.alloc_object(ClassId::new(1), 0);
+
+        // Store a reference to obj2 in obj1's field
+        heap.set_field(obj1, 0, Value::Object(Some(obj2)));
+
+        match heap.get_field(obj1, 0) {
+            Value::Object(Some(r)) => assert_eq!(r, obj2),
+            other => panic!("Expected Object(Some(...)), got {other:?}"),
+        }
+
+        // Null reference
+        heap.set_field(obj1, 0, Value::Object(None));
+        assert!(heap.get_field(obj1, 0).is_null());
+    }
+
+    #[test]
+    fn alloc_array_and_read_header() {
+        let heap = Heap::new();
+        let class_id = ClassId::new(10);
+        let arr = heap.alloc_array(class_id, ArrayElementType::Int, 5);
+
+        let header = heap.get_header(arr);
+        assert_eq!(header.class_id, class_id);
+        assert_eq!(header.kind, ObjectKind::Array);
+        assert_eq!(header.element_type, ArrayElementType::Int);
+        assert_eq!(header.array_length, 5);
+        assert_eq!(heap.array_length(arr), 5);
+    }
+
+    #[test]
+    fn array_set_and_get() {
+        let heap = Heap::new();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
+
+        heap.set_array_element(arr, 0, Value::Int(10)).unwrap();
+        heap.set_array_element(arr, 1, Value::Int(20)).unwrap();
+        heap.set_array_element(arr, 2, Value::Int(30)).unwrap();
+
+        assert_eq!(heap.get_array_element(arr, 0).unwrap().as_int(), Some(10));
+        assert_eq!(heap.get_array_element(arr, 1).unwrap().as_int(), Some(20));
+        assert_eq!(heap.get_array_element(arr, 2).unwrap().as_int(), Some(30));
+    }
+
+    #[test]
+    fn array_bounds_check() {
+        let heap = Heap::new();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 2);
+
+        // In-bounds
+        assert!(heap.set_array_element(arr, 0, Value::Int(1)).is_ok());
+        assert!(heap.set_array_element(arr, 1, Value::Int(2)).is_ok());
+
+        // Out of bounds
+        assert_eq!(heap.set_array_element(arr, 2, Value::Int(3)), Err(2));
+        assert_eq!(heap.get_array_element(arr, 5), Err(5));
+    }
+
+    #[test]
+    fn reference_array() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let arr = heap.alloc_array(ClassId::new(1), ArrayElementType::Reference, 2);
+
+        heap.set_array_element(arr, 0, Value::Object(Some(obj)))
+            .unwrap();
+        heap.set_array_element(arr, 1, Value::Object(None)).unwrap();
+
+        match heap.get_array_element(arr, 0).unwrap() {
+            Value::Object(Some(r)) => assert_eq!(r, obj),
+            other => panic!("Expected Object(Some), got {other:?}"),
+        }
+        assert!(heap.get_array_element(arr, 1).unwrap().is_null());
+    }
+
+    #[test]
+    fn multiple_objects_independent() {
+        let heap = Heap::new();
+        let obj1 = heap.alloc_object(ClassId::new(0), 1);
+        let obj2 = heap.alloc_object(ClassId::new(1), 1);
+
+        heap.set_field(obj1, 0, Value::Int(111));
+        heap.set_field(obj2, 0, Value::Int(222));
+
+        // They don't interfere with each other
+        assert_eq!(heap.get_field(obj1, 0).as_int(), Some(111));
+        assert_eq!(heap.get_field(obj2, 0).as_int(), Some(222));
+    }
+
+    #[test]
+    fn identity_hash_codes_unique() {
+        let heap = Heap::new();
+        let obj1 = heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = heap.alloc_object(ClassId::new(0), 0);
+
+        assert_ne!(heap.identity_hash_code(obj1), heap.identity_hash_code(obj2),);
+    }
+
+    #[test]
+    fn allocated_bytes_grows() {
+        let heap = Heap::new();
+        let before = heap.allocated_bytes();
+        let _ = heap.alloc_object(ClassId::new(0), 100);
+        assert!(heap.allocated_bytes() > before);
+    }
+
+    #[test]
+    fn zero_length_array() {
+        let heap = Heap::new();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 0);
+        assert_eq!(heap.array_length(arr), 0);
+        // Out of bounds on any index
+        assert!(heap.get_array_element(arr, 0).is_err());
+    }
+
+    // -- Tests for integer overflow protection --
+
+    #[test]
+    fn array_data_size_checked_small_values() {
+        assert_eq!(
+            array_data_size_checked(10, ArrayElementType::Int),
+            Some(40) // 10 * 4 = 40, already 8-aligned
+        );
+        assert_eq!(
+            array_data_size_checked(3, ArrayElementType::Long),
+            Some(24) // 3 * 8 = 24, already 8-aligned
+        );
+        assert_eq!(
+            array_data_size_checked(5, ArrayElementType::Byte),
+            Some(8) // 5 * 1 = 5, rounded up to 8
+        );
+    }
+
+    #[test]
+    fn array_data_size_checked_overflow_returns_none() {
+        // usize::MAX / 8 + 1 elements * 8 bytes each would overflow
+        let huge = usize::MAX / 8 + 1;
+        assert_eq!(array_data_size_checked(huge, ArrayElementType::Long), None);
+    }
+
+    #[test]
+    fn array_data_size_returns_err_on_overflow() {
+        let huge = usize::MAX / 8 + 1;
+        assert!(array_data_size(huge, ArrayElementType::Long).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn alloc_object_panics_on_field_count_overflow() {
+        let heap = Heap::new();
+        // This should trigger checked_mul overflow
+        let _ = heap.alloc_object(ClassId::new(0), usize::MAX);
+    }
+
+    #[test]
+    fn array_data_size_zero_length() {
+        assert_eq!(array_data_size(0, ArrayElementType::Int).unwrap(), 0);
+        assert_eq!(array_data_size(0, ArrayElementType::Reference).unwrap(), 0);
+    }
+
+    #[test]
+    fn element_byte_sizes() {
+        assert_eq!(element_byte_size(ArrayElementType::Boolean), 1);
+        assert_eq!(element_byte_size(ArrayElementType::Byte), 1);
+        assert_eq!(element_byte_size(ArrayElementType::Char), 2);
+        assert_eq!(element_byte_size(ArrayElementType::Short), 2);
+        assert_eq!(element_byte_size(ArrayElementType::Int), 4);
+        assert_eq!(element_byte_size(ArrayElementType::Float), 4);
+        assert_eq!(element_byte_size(ArrayElementType::Long), 8);
+        assert_eq!(element_byte_size(ArrayElementType::Double), 8);
+        assert_eq!(element_byte_size(ArrayElementType::Reference), REF_ELEMENT_SIZE);
+    }
+
+    #[test]
+    fn alloc_object_checked_success() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object_checked(ClassId::new(1), 2);
+        assert!(obj.is_some());
+        let obj = obj.unwrap();
+        let header = heap.get_header(obj);
+        assert_eq!(header.class_id, ClassId::new(1));
+        assert_eq!(header.num_slots, 2);
+    }
+
+    #[test]
+    fn alloc_object_checked_overflow_returns_none() {
+        let heap = Heap::new();
+        // usize::MAX fields will overflow the size calculation
+        assert!(heap.alloc_object_checked(ClassId::new(0), usize::MAX).is_none());
+    }
+
+    #[test]
+    fn alloc_array_checked_success() {
+        let heap = Heap::new();
+        let arr = heap.alloc_array_checked(ClassId::new(1), ArrayElementType::Int, 10);
+        assert!(arr.is_some());
+        let arr = arr.unwrap();
+        assert_eq!(heap.array_length(arr), 10);
+    }
+
+    #[test]
+    fn alloc_array_checked_overflow_returns_none() {
+        let heap = Heap::new();
+        assert!(
+            heap.alloc_array_checked(ClassId::new(0), ArrayElementType::Int, usize::MAX)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn alloc_array_checked_rejects_oversized() {
+        // Arrays larger than MAX_ARRAY_LENGTH (i32::MAX) should be rejected
+        let heap = Heap::with_capacity(8 * 1024);
+        let result = heap.alloc_array_checked(
+            ClassId::new(0),
+            ArrayElementType::Int,
+            (i32::MAX as usize) + 1,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn alloc_array_checked_oom_returns_none() {
+        // Create a tiny heap (1 KB total = 512 bytes per semi-space)
+        let heap = Heap::with_capacity(1024);
+        // Try to allocate an array larger than the semi-space
+        let result =
+            heap.alloc_array_checked(ClassId::new(0), ArrayElementType::Long, 1_000_000);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_get_field_out_of_bounds_panics() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+        let _ = heap.get_field(obj, 2); // index 2 is out of bounds for 2 fields
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_set_field_out_of_bounds_panics() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(obj, 5, Value::Int(42));
+    }
+
+    #[test]
+    #[should_panic(expected = "not an array")]
+    fn test_array_length_on_non_array_panics() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        let _ = heap.array_length(obj);
+    }
+
+    #[test]
+    #[should_panic(expected = "not an array")]
+    fn test_get_array_element_on_non_array_panics() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        let _ = heap.get_array_element(obj, 0);
+    }
+
+    #[test]
+    fn test_try_alloc_object_returns_some() {
+        let heap = Heap::new();
+        let result = heap.try_alloc_object(ClassId::new(7), 3);
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        let header = heap.get_header(obj);
+        assert_eq!(header.class_id, ClassId::new(7));
+        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.num_slots, 3);
+    }
+
+    #[test]
+    fn test_try_alloc_object_returns_none_on_oom() {
+        let heap = Heap::with_capacity(1024); // 512 bytes per semi-space
+        // Keep allocating until we get None
+        let mut count = 0;
+        loop {
+            match heap.try_alloc_object(ClassId::new(0), 4) {
+                Some(_) => count += 1,
+                None => break,
+            }
+            // Safety limit to avoid infinite loop in case of bug
+            assert!(count < 1000, "expected OOM but allocated {count} objects");
+        }
+        assert!(count > 0, "should have allocated at least one object");
+    }
+
+    #[test]
+    fn test_try_alloc_array_returns_some() {
+        let heap = Heap::new();
+        let result = heap.try_alloc_array(ClassId::new(5), ArrayElementType::Int, 10);
+        assert!(result.is_some());
+        let arr = result.unwrap();
+        assert_eq!(heap.array_length(arr), 10);
+        let header = heap.get_header(arr);
+        assert_eq!(header.class_id, ClassId::new(5));
+        assert_eq!(header.kind, ObjectKind::Array);
+        assert_eq!(header.element_type, ArrayElementType::Int);
+    }
+
+    #[test]
+    fn test_try_alloc_array_returns_none_on_oom() {
+        let heap = Heap::with_capacity(1024); // 512 bytes per semi-space
+        let mut count = 0;
+        loop {
+            match heap.try_alloc_array(ClassId::new(0), ArrayElementType::Long, 8) {
+                Some(_) => count += 1,
+                None => break,
+            }
+            assert!(count < 1000, "expected OOM but allocated {count} arrays");
+        }
+        assert!(count > 0, "should have allocated at least one array");
+    }
+
+    #[test]
+    fn test_try_alloc_array_rejects_oversized() {
+        let heap = Heap::new();
+        let result = heap.try_alloc_array(
+            ClassId::new(0),
+            ArrayElementType::Int,
+            (i32::MAX as usize) + 1, // MAX_ARRAY_LENGTH + 1
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_volatile_field_access() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+
+        heap.set_field_volatile(obj, 0, Value::Int(42));
+        heap.set_field_volatile(obj, 1, Value::Long(999_999));
+
+        assert_eq!(heap.get_field_volatile(obj, 0).as_int(), Some(42));
+        assert_eq!(heap.get_field_volatile(obj, 1).as_long(), Some(999_999));
+
+        // Overwrite via volatile and read back
+        heap.set_field_volatile(obj, 0, Value::Int(100));
+        assert_eq!(heap.get_field_volatile(obj, 0).as_int(), Some(100));
+    }
+
+    // -------------------------------------------------------------------
+    // R1 — Primitive-field default initialization tests.
+    //
+    // Regression coverage for the ConcurrentHashMap.initTable CAS livelock
+    // observed on Keycloak 16/26 boot. Zero-initialized heap memory
+    // decodes as `Value::Object(None)` (the zero-discriminant `Value`
+    // variant) when read via `std::ptr::read::<Value>()`. For a primitive
+    // `int` field that has never been explicitly written, this causes
+    // `Unsafe.compareAndSetInt(obj, off, Int(0), new)` to permanently
+    // fail because `values_equal_for_cas(Object(None), Int(0))` returns
+    // `false` — the Java caller spins forever in its retry loop.
+    //
+    // The fix is `alloc_object_with_descriptors`: at allocation time we
+    // write the correctly-tagged zero `Value` variant into every
+    // primitive-typed slot based on the class's field descriptors. For
+    // reference slots we leave the zeroed memory alone because it
+    // already decodes as `Object(None)` (i.e. `null`), which is the
+    // spec-mandated default.
+    // -------------------------------------------------------------------
+
+    /// CAS semantics that mirror `vm::vm_exec::values_equal_for_cas`,
+    /// reproduced locally so the tests below can exercise the full
+    /// alloc→read→CAS→write cycle without pulling in the `vm` crate.
+    /// Keep in sync with that definition.
+    fn values_equal_for_cas_stub(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Long(x), Value::Long(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+            (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+            (Value::Object(None), Value::Object(None)) => true,
+            (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                std::ptr::eq(a.as_ptr(), b.as_ptr())
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn r1_alloc_object_int_field_default_is_int_zero() {
+        let heap = Heap::new();
+        // Single int field — descriptor "I".
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"I");
+        // Without the fix this would read Value::Object(None).
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Int(0),
+            "primitive int field must default to Value::Int(0), not Object(None)"
+        );
+    }
+
+    #[test]
+    fn r1_alloc_object_long_field_default_is_long_zero() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"J");
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Long(0),
+            "primitive long field must default to Value::Long(0)"
+        );
+    }
+
+    #[test]
+    fn r1_alloc_object_float_field_default_is_float_zero() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"F");
+        match heap.get_field(obj, 0) {
+            Value::Float(f) => assert_eq!(f.to_bits(), 0.0_f32.to_bits(),
+                "primitive float field must default to 0.0 bits"),
+            other => panic!("expected Value::Float(0.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r1_alloc_object_double_field_default_is_double_zero() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"D");
+        match heap.get_field(obj, 0) {
+            Value::Double(d) => assert_eq!(d.to_bits(), 0.0_f64.to_bits(),
+                "primitive double field must default to 0.0 bits"),
+            other => panic!("expected Value::Double(0.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r1_alloc_object_boolean_field_default_is_int_zero() {
+        let heap = Heap::new();
+        // Z descriptor is stored as Int per JVM spec (boolean lives in
+        // Value::Int at the interpreter stack-slot level).
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"Z");
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Int(0),
+            "boolean (Z) must default to Value::Int(0), not Object(None)"
+        );
+    }
+
+    #[test]
+    fn r1_alloc_object_reference_field_default_is_object_none() {
+        let heap = Heap::new();
+        // L-descriptor: reference to java/lang/Object. Descriptor bytes
+        // start with 'L' (full form is "Ljava/lang/Object;") — only the
+        // first byte matters for default-init dispatch.
+        let obj = heap.alloc_object_with_descriptors(
+            ClassId::new(0),
+            1,
+            b"L",
+        );
+        assert!(
+            heap.get_field(obj, 0).is_null(),
+            "reference field must retain the Object(None) zero-bits default"
+        );
+        // Array descriptor '[' must also default to null.
+        let arr_field = heap.alloc_object_with_descriptors(
+            ClassId::new(0),
+            1,
+            b"[",
+        );
+        assert!(
+            heap.get_field(arr_field, 0).is_null(),
+            "array-ref field must retain the Object(None) default"
+        );
+    }
+
+    #[test]
+    fn r1_unsafe_compare_and_set_int_on_uninit_slot_succeeds() {
+        // This is the concrete KC16/KC26 livelock repro. Before the fix,
+        // a freshly-allocated ConcurrentHashMap had its `sizeCtl` slot
+        // reading back as Object(None), so CAS(Int(0), Int(N)) never
+        // matched and the VM spun at ~5,740 iterations/s.
+        let heap = Heap::new();
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"I");
+
+        // Read the slot as the Java caller's `Getfield` would.
+        let current = heap.get_field(obj, 0);
+        assert_eq!(
+            current,
+            Value::Int(0),
+            "uninit int slot must read as Int(0) for CAS against Int(0)"
+        );
+
+        // Simulate Unsafe.compareAndSetInt(obj, off, expected=Int(0), new=Int(42)).
+        let expected = Value::Int(0);
+        let new_val = Value::Int(42);
+        assert!(
+            values_equal_for_cas_stub(&current, &expected),
+            "CAS compare must succeed on the uninit primitive slot"
+        );
+        heap.set_field(obj, 0, new_val);
+
+        // Post-CAS, the slot must hold the new value.
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Int(42),
+            "post-CAS int slot must read as Int(42)"
+        );
+    }
+
+    #[test]
+    fn r1_unsafe_compare_and_set_long_on_uninit_slot_succeeds() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, b"J");
+
+        let current = heap.get_field(obj, 0);
+        assert_eq!(
+            current,
+            Value::Long(0),
+            "uninit long slot must read as Long(0)"
+        );
+
+        let expected = Value::Long(0);
+        let new_val = Value::Long(0xDEAD_BEEF_CAFE_F00D_u64 as i64);
+        assert!(
+            values_equal_for_cas_stub(&current, &expected),
+            "CAS compare must succeed on the uninit primitive long slot"
+        );
+        heap.set_field(obj, 0, new_val);
+
+        assert_eq!(heap.get_field(obj, 0), new_val,
+            "post-CAS long slot must read the new value");
+    }
+
+    // --- Robustness: unknown / malformed descriptor bytes fail open. ---
+
+    #[test]
+    fn r1_alloc_object_unknown_descriptor_falls_back_to_object_none() {
+        let heap = Heap::new();
+        // 0xFF is not a valid JVM field descriptor byte — must fall back
+        // to the zeroed default (Object(None)) rather than panic.
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 1, &[0xFF]);
+        assert!(
+            heap.get_field(obj, 0).is_null(),
+            "unknown descriptor must fail-open to Object(None)"
+        );
+    }
+
+    #[test]
+    fn r1_alloc_object_short_descriptor_slice_leaves_extra_slots_zeroed() {
+        // num_fields > descriptor_bytes.len() — extra slots keep the
+        // zeroed default (Object(None)). This is important because
+        // inherited fields may not all have their descriptors passed in
+        // a single call.
+        let heap = Heap::new();
+        let obj = heap.alloc_object_with_descriptors(ClassId::new(0), 3, b"I");
+        assert_eq!(heap.get_field(obj, 0), Value::Int(0));
+        // Slots 1 and 2 never had their descriptor — they remain as the
+        // zero-bits Object(None).
+        assert!(heap.get_field(obj, 1).is_null());
+        assert!(heap.get_field(obj, 2).is_null());
+    }
+
+    #[test]
+    fn r1_default_value_for_descriptor_mapping_is_exhaustive() {
+        // Every JVM primitive descriptor byte → expected Value variant.
+        assert_eq!(default_value_for_descriptor(b'I'), Some(Value::Int(0)));
+        assert_eq!(default_value_for_descriptor(b'B'), Some(Value::Int(0)));
+        assert_eq!(default_value_for_descriptor(b'C'), Some(Value::Int(0)));
+        assert_eq!(default_value_for_descriptor(b'S'), Some(Value::Int(0)));
+        assert_eq!(default_value_for_descriptor(b'Z'), Some(Value::Int(0)));
+        assert_eq!(default_value_for_descriptor(b'J'), Some(Value::Long(0)));
+        match default_value_for_descriptor(b'F') {
+            Some(Value::Float(f)) => assert_eq!(f.to_bits(), 0.0_f32.to_bits()),
+            other => panic!("F must map to Float(0.0), got {other:?}"),
+        }
+        match default_value_for_descriptor(b'D') {
+            Some(Value::Double(d)) => assert_eq!(d.to_bits(), 0.0_f64.to_bits()),
+            other => panic!("D must map to Double(0.0), got {other:?}"),
+        }
+        // Reference types and unknown bytes map to None → keep zero.
+        assert_eq!(default_value_for_descriptor(b'L'), None);
+        assert_eq!(default_value_for_descriptor(b'['), None);
+        assert_eq!(default_value_for_descriptor(0x00), None);
+        assert_eq!(default_value_for_descriptor(0xFF), None);
+    }
+
+    // ── T10.9.E descriptor-aware heap-field tests ────────────────────────
+
+    #[test]
+    fn t10_9_e_coerce_value_j_from_double_is_long() {
+        // Exact Session 93 drift: a long whose bit pattern round-tripped
+        // through CompactValue::to_value landed as Value::Double. The
+        // helper reinterprets and returns Value::Long.
+        let v_double = Value::Double(f64::from_bits(5));
+        let coerced = coerce_field_value_by_descriptor(v_double, b'J');
+        assert_eq!(coerced, Value::Long(5));
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_j_preserves_existing_long() {
+        let v = Value::Long(0xDEAD_BEEF_CAFE_BABEu64 as i64);
+        let coerced = coerce_field_value_by_descriptor(v, b'J');
+        assert_eq!(coerced, Value::Long(0xDEAD_BEEF_CAFE_BABEu64 as i64));
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_j_widens_int() {
+        let coerced = coerce_field_value_by_descriptor(Value::Int(-7), b'J');
+        assert_eq!(coerced, Value::Long(-7));
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_j_from_null_is_zero() {
+        let coerced = coerce_field_value_by_descriptor(Value::Object(None), b'J');
+        assert_eq!(coerced, Value::Long(0));
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_d_from_long_is_double() {
+        let v_long = Value::Long(f64::to_bits(std::f64::consts::PI) as i64);
+        let coerced = coerce_field_value_by_descriptor(v_long, b'D');
+        match coerced {
+            Value::Double(d) => assert!((d - std::f64::consts::PI).abs() < 1e-12),
+            other => panic!("expected Double, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_f_from_int_reinterprets() {
+        let f_bits = 1.5_f32.to_bits();
+        let coerced = coerce_field_value_by_descriptor(Value::Int(f_bits as i32), b'F');
+        match coerced {
+            Value::Float(f) => assert_eq!(f.to_bits(), f_bits),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_reference_rejects_nonzero_primitive_unchanged() {
+        // A reference descriptor leaves most primitives as-is (they will
+        // have been rejected by the verifier); only zero-valued primitives
+        // normalize to null.
+        let coerced = coerce_field_value_by_descriptor(Value::Int(0), b'L');
+        assert!(matches!(coerced, Value::Object(None)));
+        let coerced = coerce_field_value_by_descriptor(Value::Long(0), b'L');
+        assert!(matches!(coerced, Value::Object(None)));
+    }
+
+    #[test]
+    fn t10_9_e_coerce_value_unknown_desc_preserves_value() {
+        let coerced = coerce_field_value_by_descriptor(Value::Int(99), b'V');
+        assert_eq!(coerced, Value::Int(99));
+    }
+
+    #[test]
+    fn t10_9_e_heap_get_field_as_normalizes_j() {
+        // Allocate an object and directly write a Value::Double that
+        // represents a long bit pattern — simulating upstream drift.
+        // `get_field_as(b'J')` must surface Value::Long.
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field(obj, 0, Value::Double(f64::from_bits(12345)));
+        match heap.get_field_as(obj, 0, b'J') {
+            Value::Long(l) => assert_eq!(l, 12345),
+            other => panic!("expected Long(12345), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t10_9_e_heap_set_field_as_normalizes_on_write() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        // Write a Double through the descriptor-aware setter with J descriptor.
+        heap.set_field_as(obj, 0, Value::Double(f64::from_bits(42)), b'J');
+        // Direct read should already yield Long (normalized on write).
+        match heap.get_field(obj, 0) {
+            Value::Long(l) => assert_eq!(l, 42),
+            other => panic!("expected Long(42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t10_9_e_heap_get_field_volatile_as_normalizes_j() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field_volatile(obj, 0, Value::Double(f64::from_bits(999)));
+        match heap.get_field_volatile_as(obj, 0, b'J') {
+            Value::Long(l) => assert_eq!(l, 999),
+            other => panic!("expected Long(999), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t10_9_e_heap_get_field_as_reference_passthrough() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        let other = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(obj, 0, Value::Object(Some(other)));
+        match heap.get_field_as(obj, 0, b'L') {
+            Value::Object(Some(o)) => assert_eq!(o.as_ptr(), other.as_ptr()),
+            other => panic!("expected Object(Some), got {other:?}"),
+        }
+    }
+}

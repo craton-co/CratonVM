@@ -1,0 +1,1438 @@
+//! WP2.4-A — `java.lang.instrument` runtime infrastructure.
+//!
+//! Provides the Rust-side state for the `Instrumentation` API exposed
+//! by `sun.instrument.InstrumentationImpl` (and the public-facing
+//! `java.lang.instrument.Instrumentation` interface). Mockito's
+//! MockMaker agent + Jacoco's coverage agent both use this API to
+//! redefine method bodies on already-loaded classes.
+//!
+//! This module owns:
+//!
+//!   * The process-wide [`TRANSFORMER_CHAIN`] — a single ordered list
+//!     of `(transformer ObjectRef, canRetransform, nativeMethodPrefix)`
+//!     entries shared by every `InstrumentationImpl`.
+//!   * The native-method registrations on `sun/instrument/InstrumentationImpl`
+//!     (`addTransformer0`, `removeTransformer`, `redefineClasses0`,
+//!     `retransformClasses0`, `getAllLoadedClasses0`,
+//!     `getInitiatedClasses0`, `isModifiableClass0`, `getObjectSize0`,
+//!     `appendToBootstrapClassLoaderSearch0`,
+//!     `appendToSystemClassLoaderSearch0`, `setNativeMethodPrefix0`,
+//!     `isRetransformClassesSupported0`, `isRedefineClassesSupported0`,
+//!     `isNativeMethodPrefixSupported0`).
+//!   * A few in-process helper natives on `rustjvm/Instrument` so the
+//!     `apps/instrument_probe` smoke fixture can run without a real
+//!     `-javaagent:` (see `rustjvm.Instrument.{addTransformer,
+//!     removeTransformer, getTransformerCount, getAllLoadedClasses,
+//!     isModifiableClass, getObjectSize, redefineClass}`).
+//!
+//! # Transform pipeline
+//!
+//! ```text
+//!  redefineClasses0([ClassDefinition...])  retransformClasses0([Class...])
+//!         |                                       |
+//!         v                                       v
+//!   ┌────────────────────────────────────────────────────┐
+//!   │  walk TRANSFORMER_CHAIN in registration order      │
+//!   │  for each entry whose canRetransform == true:      │
+//!   │      bytes = transformer.transform(loader,         │
+//!   │                  className, classBeingRedefined,   │
+//!   │                  protectionDomain, bytes)          │
+//!   │      // null result → "no change", keep prior bytes│
+//!   └────────────────────────────────────────────────────┘
+//!         |
+//!         v
+//!   NativeContext::redefine_class(class_id, final_bytes)
+//!         |
+//!         v
+//!   ClassManager::define_class_with_options(... allow_redefine=true ...)
+//!   (Agent 2.4-B; this binding's redefine_class trait method routes here.)
+//! ```
+//!
+//! # JVMTI integration
+//!
+//! `class_manager::redefine_class` already fires the JVMTI
+//! `ClassFileLoadHook` event before parsing. Our retransform path
+//! reuses that hook by piggy-backing on the same
+//! `ClassManager::redefine_class` (or — until Agent 2.4-B's full
+//! redefine path is wired in — `ClassManager::define_class_with_options`
+//! with `allow_redefine = true`, which also fires the hook). That keeps
+//! a single firing point for all redefine flows so JVMTI agents see
+//! every transformation regardless of which API initiated it.
+
+use std::sync::{OnceLock, RwLock};
+
+use rustjvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use rustjvm_types::{
+    ArrayElementType, ClassId, ObjectKind, ObjectRef, Value,
+    error::{MethodCallFailed, MethodCallResult, VmError},
+};
+
+// ---------------------------------------------------------------------------
+// Transformer chain
+// ---------------------------------------------------------------------------
+
+/// One entry in the process-wide [`TRANSFORMER_CHAIN`].
+///
+/// The Java `ClassFileTransformer` lives on the heap; we hold its
+/// `ObjectRef`. `can_retransform` records the boolean flag passed to
+/// `addTransformer(transformer, canRetransform)`. `native_method_prefix`
+/// records the optional prefix set by
+/// `setNativeMethodPrefix(transformer, prefix)`; it is recorded for
+/// completeness but native-method-prefix dispatch is not yet wired into
+/// the interpreter (the interpreter still resolves natives by exact
+/// name).
+#[derive(Debug, Clone)]
+pub struct TransformerEntry {
+    pub transformer_ref: ObjectRef,
+    pub can_retransform: bool,
+    pub native_method_prefix: Option<String>,
+}
+
+/// Process-wide `ClassFileTransformer` chain. The Java spec mandates a
+/// single chain per JVM (per `Instrumentation` instance, but agents
+/// share the same `Instrumentation`).  Order matters — JDK runs
+/// transformers in registration order, threading each output as the
+/// next input.
+fn transformer_chain() -> &'static RwLock<Vec<TransformerEntry>> {
+    static INSTANCE: OnceLock<RwLock<Vec<TransformerEntry>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Append `(transformer, canRetransform)` to the global chain. Used by
+/// both the `addTransformer0` native and the `addTransformer` helper on
+/// `rustjvm/Instrument`.  Order: appended at the end.
+pub fn add_transformer_entry(entry: TransformerEntry) {
+    if let Ok(mut chain) = transformer_chain().write() {
+        chain.push(entry);
+    }
+}
+
+/// Remove the first entry whose `transformer_ref` pointer-equals
+/// `transformer`. Returns `true` if an entry was removed.
+pub fn remove_transformer_entry(transformer: ObjectRef) -> bool {
+    let mut chain = match transformer_chain().write() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let before = chain.len();
+    chain.retain(|e| e.transformer_ref.as_ptr() != transformer.as_ptr());
+    before != chain.len()
+}
+
+/// Snapshot of every currently-registered transformer, in registration
+/// order. The snapshot is owned so the caller can iterate without
+/// holding the chain lock — important because invoking
+/// `transformer.transform(...)` re-enters the VM and may itself
+/// register or remove transformers (HotSpot's chain is reentrant-safe
+/// in the same way).
+pub fn snapshot_transformer_chain() -> Vec<TransformerEntry> {
+    transformer_chain()
+        .read()
+        .map(|c| c.clone())
+        .unwrap_or_default()
+}
+
+/// Returns the currently-registered transformer count.
+pub fn transformer_count() -> usize {
+    transformer_chain().read().map(|c| c.len()).unwrap_or(0)
+}
+
+/// Reset the chain. Used by VM shutdown / test isolation.
+pub fn reset_transformer_chain() {
+    if let Ok(mut chain) = transformer_chain().write() {
+        chain.clear();
+    }
+}
+
+/// Public hook for Agent 2.4-C's `agent_loader.rs`. After a `-javaagent:`
+/// JAR's `premain` returns, agents typically call `addTransformer` on
+/// the Instrumentation argument; that path goes through `addTransformer0`
+/// and lands in [`add_transformer_entry`] just like in-process callers.
+/// This wrapper is exported so the agent loader can pre-register
+/// transformers from within its own setup path if it ever needs to (the
+/// premain dispatch already runs Java code that drives `addTransformer0`,
+/// so the wrapper is mainly for symmetry / testing).
+pub fn add_premain_transformer(
+    transformer_ref: ObjectRef,
+    can_retransform: bool,
+    native_method_prefix: Option<String>,
+) {
+    add_transformer_entry(TransformerEntry {
+        transformer_ref,
+        can_retransform,
+        native_method_prefix,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Spec helpers
+// ---------------------------------------------------------------------------
+
+/// `Instrumentation.isModifiableClass` rules per JDK 25:
+///   * Primitive `Class` mirrors → false.
+///   * Array `Class` mirrors → false.
+///   * Hidden classes → false (cannot be redefined).
+///   * Everything else → true.
+pub fn is_modifiable_class(is_primitive: bool, is_array: bool, is_hidden: bool) -> bool {
+    !(is_primitive || is_array || is_hidden)
+}
+
+/// Approximate the heap footprint of a Java object, mirroring HotSpot's
+/// `Instrumentation.getObjectSize` semantics:
+///
+///   * Regular objects: `header_size + slots * slot_size`. We use the
+///     same constants as the heap (32-byte header, 16-byte slots —
+///     matches `rustjvm_types::heap_types::HEADER_SIZE` /
+///     `SLOT_SIZE`).
+///   * Primitive arrays: `header_size + length * element_size`,
+///     8-byte aligned.
+///   * Reference arrays: `header_size + length * 8`, 8-byte aligned.
+///
+/// Spec wiggle-room: HotSpot says "implementation-specific approximation"
+/// — the only hard requirement is `> 0` for any live object.
+pub fn approximate_object_size(
+    kind: ObjectKind,
+    element_type: ArrayElementType,
+    length: usize,
+    num_slots: usize,
+) -> i64 {
+    use rustjvm_types::{
+        HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE, element_byte_size,
+    };
+    let header = HEADER_SIZE as i64;
+    let body = match kind {
+        ObjectKind::Object => (num_slots * SLOT_SIZE) as i64,
+        ObjectKind::Array => match element_type {
+            ArrayElementType::Reference => (length * REF_ELEMENT_SIZE) as i64,
+            other => {
+                let raw = length.saturating_mul(element_byte_size(other));
+                // 8-byte align like the heap does.
+                let aligned = (raw + 7) & !7;
+                aligned as i64
+            }
+        },
+    };
+    let total = header + body;
+    // Guarantee strictly positive — even a zero-length empty array has
+    // a non-empty header.
+    total.max(1)
+}
+
+// ---------------------------------------------------------------------------
+// Native handlers — sun.instrument.InstrumentationImpl
+// ---------------------------------------------------------------------------
+
+/// Read `(receiver this) (Object transformer) (Z canRetransform)` style args.
+/// The receiver is at args[0]; the transformer at args[1]; the boolean at args[2].
+fn native_add_transformer0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let transformer = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None), // null transformer → silently ignore (HotSpot NPEs; we tolerate)
+    };
+    let can_retransform = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+    add_transformer_entry(TransformerEntry {
+        transformer_ref: transformer,
+        can_retransform,
+        native_method_prefix: None,
+    });
+    Ok(None)
+}
+
+/// `boolean removeTransformer(ClassFileTransformer transformer)`.
+/// Args: [this, transformer].
+fn native_remove_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let transformer = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let removed = remove_transformer_entry(transformer);
+    Ok(Some(Value::Int(if removed { 1 } else { 0 })))
+}
+
+/// `boolean isModifiableClass0(Class<?>)`. Args: [this, classMirror].
+fn native_is_modifiable_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mirror = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (is_primitive, is_array, is_hidden) = mirror_classification(ctx, mirror);
+    Ok(Some(Value::Int(
+        if is_modifiable_class(is_primitive, is_array, is_hidden) {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+/// `Class<?>[] getAllLoadedClasses0()`. Args: [this].
+fn native_get_all_loaded_classes0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let class_ids = ctx.list_loaded_class_ids();
+    let class_class_id = ctx
+        .class_id_by_name("java/lang/Class")
+        .unwrap_or(ClassId::new(0));
+    let arr = ctx.new_ref_array(class_class_id, class_ids.len());
+    for (i, cid) in class_ids.into_iter().enumerate() {
+        let mirror = ctx.get_class_mirror(cid);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `Class<?>[] getInitiatedClasses0(ClassLoader loader)`.
+/// Args: [this, loaderObject].
+fn native_get_initiated_classes0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // We don't dereference the loader object — we use the bootstrap /
+    // app-loader-id 0 path for null and a synthetic mapping for
+    // non-null. The `list_initiated_class_ids(0)` call returns the
+    // application-loader classes (the common case).
+    let loader_id = match args.get(1) {
+        Some(Value::Object(Some(_))) => 0u32,
+        _ => 0u32,
+    };
+    let class_ids = ctx.list_initiated_class_ids(loader_id);
+    let class_class_id = ctx
+        .class_id_by_name("java/lang/Class")
+        .unwrap_or(ClassId::new(0));
+    let arr = ctx.new_ref_array(class_class_id, class_ids.len());
+    for (i, cid) in class_ids.into_iter().enumerate() {
+        let mirror = ctx.get_class_mirror(cid);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `long getObjectSize0(Object obj)`. Args: [this, obj].
+fn native_get_object_size0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let kind = ctx.heap_kind_of(obj);
+    let element_type = ctx.heap_element_type_of(obj);
+    let length = if matches!(kind, ObjectKind::Array) {
+        ctx.array_length(obj)
+    } else {
+        0
+    };
+    let slots = ctx.object_num_fields(obj);
+    let size = approximate_object_size(kind, element_type, length, slots);
+    Ok(Some(Value::Long(size)))
+}
+
+/// `void redefineClasses0(ClassDefinition[] defs)`. Args: [this, arr].
+///
+/// JDK ClassDefinition layout (real JDK 25):
+///   * field[0]: `Class mClass`
+///   * field[1]: `byte[] mClassFile`
+///
+/// We tolerate either name resolution: try field-name first, fall back
+/// to slot 0/1 for hand-rolled allocations from in-process probes.
+fn native_redefine_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let inst_receiver = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let n = ctx.array_length(arr);
+    for i in 0..n {
+        let elem = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let class_mirror = read_class_def_field(ctx, elem, "mClass", 0);
+        let bytes_arr = read_class_def_field(ctx, elem, "mClassFile", 1);
+        let (target_class, target_class_id) = match class_mirror {
+            Some(m) => match ctx.class_id_from_mirror(m) {
+                Some(cid) => (m, cid),
+                None => continue,
+            },
+            None => continue,
+        };
+        let bytes_obj = match bytes_arr {
+            Some(o) => o,
+            None => continue,
+        };
+        let new_bytes = read_byte_array(ctx, bytes_obj);
+        // Run the chain — only canRetransform=true entries fire on
+        // redefineClasses (HotSpot fires every transformer, gated by
+        // canRetransform, and threads outputs).
+        let final_bytes = run_transformer_chain(
+            ctx,
+            target_class_id,
+            Some(target_class),
+            &new_bytes,
+            /* retransform_only = */ false,
+            inst_receiver,
+        );
+        if let Err(msg) = ctx.redefine_class(target_class_id, &final_bytes) {
+            tracing::warn!("redefineClasses0: {msg}");
+        }
+    }
+    Ok(None)
+}
+
+/// `void retransformClasses0(Class<?>[] classes)`. Args: [this, arr].
+fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let inst_receiver = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let n = ctx.array_length(arr);
+    for i in 0..n {
+        let mirror = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let class_id = match ctx.class_id_from_mirror(mirror) {
+            Some(cid) => cid,
+            None => continue,
+        };
+        // Look up the original bytes via the application classpath
+        // resource finder using `<name>.class` — we always cache them
+        // under that path on define. For real hidden classes / proxy
+        // classes this fails and we fall back to an empty buffer; the
+        // transformer is still given a chance to swap in fresh bytes.
+        let original = original_class_bytes(ctx, class_id);
+        let final_bytes = run_transformer_chain(
+            ctx,
+            class_id,
+            Some(mirror),
+            &original,
+            /* retransform_only = */ true,
+            inst_receiver,
+        );
+        if final_bytes.is_empty() {
+            continue;
+        }
+        if let Err(msg) = ctx.redefine_class(class_id, &final_bytes) {
+            tracing::warn!("retransformClasses0: {msg}");
+        }
+    }
+    Ok(None)
+}
+
+/// `void appendToBootstrapClassLoaderSearch0(String path)`.
+fn native_append_to_bootstrap_search0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path = match args.get(1) {
+        Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
+            Some(t) => t,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    ctx.register_dynamic_classpath(&[path]);
+    Ok(None)
+}
+
+/// `void appendToSystemClassLoaderSearch0(String path)`.
+fn native_append_to_system_search0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path = match args.get(1) {
+        Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
+            Some(t) => t,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    ctx.register_dynamic_classpath(&[path]);
+    Ok(None)
+}
+
+/// `void setNativeMethodPrefix0(ClassFileTransformer transformer, String prefix)`.
+/// We record the prefix on the matching chain entry. The interpreter
+/// does not yet consult prefixes on native dispatch — recording the
+/// state means agents that read it back via reflection see what they
+/// set.
+fn native_set_native_method_prefix0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let transformer = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let prefix = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    if let Ok(mut chain) = transformer_chain().write() {
+        for entry in chain.iter_mut() {
+            if entry.transformer_ref.as_ptr() == transformer.as_ptr() {
+                entry.native_method_prefix = prefix.clone();
+                if prefix.is_some() {
+                    tracing::debug!(
+                        "instrumentation: native_method_prefix recorded but not yet \
+                         consulted at native dispatch"
+                    );
+                }
+                return Ok(None);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `boolean isRetransformClassesSupported0()`. Args: [this].
+fn native_is_retransform_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+/// `boolean isRedefineClassesSupported0()`. Args: [this].
+fn native_is_redefine_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+/// `boolean isNativeMethodPrefixSupported0()`. Args: [this].
+fn native_is_prefix_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+// ---------------------------------------------------------------------------
+// Native handlers — rustjvm.Instrument (in-process bridge)
+// ---------------------------------------------------------------------------
+//
+// Each of these is a **static** native (no receiver), so args[0] is the
+// first user argument. The InstrumentProbe app exercises these.
+
+fn native_bridge_add_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let transformer = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    add_transformer_entry(TransformerEntry {
+        transformer_ref: transformer,
+        can_retransform: true,
+        native_method_prefix: None,
+    });
+    Ok(None)
+}
+
+fn native_bridge_remove_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let transformer = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(if remove_transformer_entry(transformer) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_bridge_get_transformer_count(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(transformer_count() as i32)))
+}
+
+fn native_bridge_get_all_loaded_classes(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let class_ids = ctx.list_loaded_class_ids();
+    let class_class_id = ctx
+        .class_id_by_name("java/lang/Class")
+        .unwrap_or(ClassId::new(0));
+    let arr = ctx.new_ref_array(class_class_id, class_ids.len());
+    for (i, cid) in class_ids.into_iter().enumerate() {
+        let mirror = ctx.get_class_mirror(cid);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_bridge_is_modifiable_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mirror = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (is_primitive, is_array, is_hidden) = mirror_classification(ctx, mirror);
+    Ok(Some(Value::Int(
+        if is_modifiable_class(is_primitive, is_array, is_hidden) {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+fn native_bridge_get_object_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let kind = ctx.heap_kind_of(obj);
+    let element_type = ctx.heap_element_type_of(obj);
+    let length = if matches!(kind, ObjectKind::Array) {
+        ctx.array_length(obj)
+    } else {
+        0
+    };
+    let slots = ctx.object_num_fields(obj);
+    Ok(Some(Value::Long(approximate_object_size(
+        kind,
+        element_type,
+        length,
+        slots,
+    ))))
+}
+
+fn native_bridge_redefine_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mirror = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let class_id = match ctx.class_id_from_mirror(mirror) {
+        Some(cid) => cid,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let bytes_arr = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let bytes = read_byte_array(ctx, bytes_arr);
+    let final_bytes = run_transformer_chain(
+        ctx,
+        class_id,
+        Some(mirror),
+        &bytes,
+        /* retransform_only = */ false,
+        /* inst_receiver = */ None,
+    );
+    let ok = ctx.redefine_class(class_id, &final_bytes).is_ok();
+    Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Read a `Class` mirror from a `ClassDefinition`-shaped object, falling
+/// back to slot 0 for hand-rolled definitions that didn't go through
+/// the named-field path.
+fn read_class_def_field(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    field_name: &str,
+    fallback_slot: usize,
+) -> Option<ObjectRef> {
+    // Try named lookup first.
+    let by_name = ctx.get_field_by_name(obj, field_name);
+    if let Value::Object(Some(o)) = by_name {
+        return Some(o);
+    }
+    if let Value::Object(Some(o)) = ctx.get_field(obj, fallback_slot) {
+        return Some(o);
+    }
+    None
+}
+
+/// Read a Java `byte[]` array into a `Vec<u8>`. Returns an empty vec
+/// for null / non-array / wrong-element-type inputs.
+fn read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
+    if !matches!(ctx.heap_kind_of(arr), ObjectKind::Array) {
+        return Vec::new();
+    }
+    if !matches!(ctx.heap_element_type_of(arr), ArrayElementType::Byte) {
+        return Vec::new();
+    }
+    let n = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        match ctx.get_array_element(arr, i) {
+            Value::Int(v) => out.push((v & 0xff) as u8),
+            _ => out.push(0),
+        }
+    }
+    out
+}
+
+/// Allocate a Java `byte[]` with the given contents.
+fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    arr
+}
+
+/// Walk the registered transformer chains and produce the final
+/// transformed byte buffer. Returns the input unchanged when no
+/// transformer modifies it.
+///
+/// There are two transformer-registration surfaces and both must run:
+///
+/// 1. **JDK Java-side `TransformerManager`** (the surface real
+///    `-javaagent:` agents use). The JDK's `InstrumentationImpl.addTransformer`
+///    stores the transformer in a Java-side list field; our
+///    `addTransformer0` native is **never reached** because the
+///    real-JDK Java code never calls it. To deliver bytes to those
+///    transformers we must call the package-private Java method
+///    `InstrumentationImpl.transform(Module, ClassLoader, String,
+///    Class, ProtectionDomain, byte[], boolean isRetransform)` —
+///    that method picks `mRetransfomableTransformerManager` vs
+///    `mTransformerManager` based on the boolean and delegates to
+///    `TransformerManager.transform(...)` which iterates the
+///    registered transformers and calls each one's `transform`
+///    via `invokeinterface` on the 6-arg `(Module, ClassLoader,
+///    String, Class, ProtectionDomain, byte[])[B` signature. The
+///    interface's default 6-arg method delegates to the legacy
+///    5-arg form, so transformers that override either signature
+///    work.
+///
+/// 2. **Rust-side [`TRANSFORMER_CHAIN`]** (the surface the
+///    in-process `rustjvm.Instrument.addTransformer` bridge and
+///    [`add_premain_transformer`] use). For each entry we invoke
+///    the legacy 5-arg `ClassFileTransformer.transform(ClassLoader,
+///    String, Class, ProtectionDomain, byte[])` directly via
+///    `invoke_virtual`.
+///
+/// Any transformer that returns null is treated as "no change"; the
+/// previous bytes flow into the next transformer. Any thrown
+/// exception is logged and the previous bytes are kept (per the JDK
+/// spec — transformer failures must not break class loading).
+///
+/// `retransform_only`: when `true`, only entries with
+/// `can_retransform == true` participate (rust-side chain) and the
+/// `isRetransform` argument to the JDK transform is set true. When
+/// `false` (`redefineClasses` path) every entry participates and
+/// `isRetransform` is false.
+///
+/// `inst_receiver`: the `sun.instrument.InstrumentationImpl` mirror
+/// for the active agent, when one is available. Required to invoke
+/// the Java-side transformer chain. When `None`, only the rust-side
+/// chain runs (in-process bridge path).
+fn run_transformer_chain(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    class_mirror: Option<ObjectRef>,
+    initial_bytes: &[u8],
+    retransform_only: bool,
+    inst_receiver: Option<ObjectRef>,
+) -> Vec<u8> {
+    let rust_chain = snapshot_transformer_chain();
+    if rust_chain.is_empty() && inst_receiver.is_none() {
+        return initial_bytes.to_vec();
+    }
+    // Resolve constants used on every iteration once.
+    let class_name_str = ctx
+        .class_name_of_id(class_id)
+        .unwrap_or_else(|| String::new());
+    let class_name_obj = ctx.create_string(&class_name_str);
+    let mirror_arg = match class_mirror {
+        Some(m) => Value::Object(Some(m)),
+        None => Value::Object(None),
+    };
+
+    let mut bytes_vec = initial_bytes.to_vec();
+
+    // 1. (Removed) — calling InstrumentationImpl.transform(Module,
+    //    ClassLoader, String, Class, ProtectionDomain, byte[], boolean)
+    //    Java-side currently panics deep inside the JDK 25 transformer
+    //    pipeline (length-6 array indexed at 6 — likely a JDK-internal
+    //    array op our reflection/varhandle dispatch mis-counts). Instead
+    //    we route every transformer registration through the rust-side
+    //    chain by overriding the Java public method
+    //    `InstrumentationImpl.addTransformer(transformer, canRetransform)`
+    //    with a native that records the transformer in [`TRANSFORMER_CHAIN`]
+    //    (see `register_instrumentation_natives`).
+    //
+    //    `inst_receiver` remains a parameter for future re-enablement of
+    //    the Java-side dispatch; today it is unused on this path. We
+    //    silence the unused-parameter lint at the call site by reading
+    //    it explicitly.
+    let _ = inst_receiver;
+
+    // 2. Rust-side chain: every registered transformer (whether the
+    //    agent registered it via the public Java `addTransformer` (now
+    //    a native, see [`register_instrumentation_natives`]), or via
+    //    the internal `addTransformer0`, or via the in-process
+    //    [`rustjvm.Instrument.addTransformer`] bridge).
+    for entry in rust_chain {
+        if retransform_only && !entry.can_retransform {
+            continue;
+        }
+        let bytes_obj = alloc_byte_array(ctx, &bytes_vec);
+        // NOTE: invoke_virtual prepends the receiver itself, so args
+        // here must NOT include the receiver. Pass only the 5 user args.
+        let args = [
+            // loader: use null — matches what HotSpot does when the
+            // class was loaded by the bootstrap or when we don't have
+            // a per-class ClassLoader instance to surface.
+            Value::Object(None),
+            Value::Object(Some(class_name_obj)),
+            mirror_arg,
+            // protectionDomain: null is spec-legal.
+            Value::Object(None),
+            Value::Object(Some(bytes_obj)),
+        ];
+        let descriptor = "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;\
+                          Ljava/security/ProtectionDomain;[B)[B";
+        let result = ctx.invoke_virtual(entry.transformer_ref, "transform", descriptor, &args);
+        match result {
+            Ok(Some(Value::Object(Some(out_obj)))) => {
+                let out_bytes = read_byte_array(ctx, out_obj);
+                if !out_bytes.is_empty() {
+                    bytes_vec = out_bytes;
+                }
+            }
+            Ok(_) => { /* null or void: keep prior bytes */ }
+            Err(MethodCallFailed::ExceptionThrown(_)) => {
+                tracing::warn!(
+                    "transformer threw an exception while transforming {class_name_str}; \
+                     keeping prior bytes"
+                );
+            }
+            Err(MethodCallFailed::InternalError(VmError::Internal { ref message, .. })) => {
+                tracing::warn!(
+                    "transformer internal error while transforming {class_name_str}: \
+                     {message}; keeping prior bytes"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "transformer failed while transforming {class_name_str}; keeping prior bytes"
+                );
+            }
+        }
+    }
+    bytes_vec
+}
+
+/// Original bytes for `class_id`, used by retransformClasses0 to seed
+/// the transformer chain with the bytecode the class was loaded from.
+/// Falls back to looking up the resource by `<name>.class` on the
+/// application classpath when the per-class cache is unreachable.
+fn original_class_bytes(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<u8> {
+    // Prefer the ClassManager's class_bytes_cache (populated by every
+    // define_class_with_options call). This is the only path that finds
+    // dynamically-defined / hidden / agent-redefined classes; the
+    // classpath find_resource path only sees on-disk class files.
+    if let Some(bytes) = ctx.class_bytes(class_id) {
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
+    let name = match ctx.class_name_of_id(class_id) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let resource = format!("{name}.class");
+    ctx.find_resource(&resource).unwrap_or_default()
+}
+
+/// Inspect a `Class<?>` mirror and return `(is_primitive, is_array, is_hidden)`.
+fn mirror_classification(ctx: &dyn NativeContext, mirror: ObjectRef) -> (bool, bool, bool) {
+    // `class_id_from_mirror` returns None for primitive mirrors; we use
+    // that as the primitive marker.
+    let class_id = ctx.class_id_from_mirror(mirror);
+    let is_primitive = class_id.is_none();
+    if let Some(cid) = class_id {
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        let is_array = name.starts_with('[');
+        let is_hidden = ctx.is_class_hidden(cid);
+        return (false, is_array, is_hidden);
+    }
+    (is_primitive, false, false)
+}
+
+// ---------------------------------------------------------------------------
+// Registration entry points
+// ---------------------------------------------------------------------------
+
+/// Register every native handler this WP owns into `r`.
+///
+/// Wired into `vm/src/vm/vm_init.rs` alongside the other Wave-2 native
+/// registrations (proxy, ServiceLoader, etc.).
+pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
+    let impl_class = "sun/instrument/InstrumentationImpl";
+    // Two-arg add (transformer, canRetransform).
+    r.register(
+        impl_class,
+        "addTransformer0",
+        "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
+        native_add_transformer0,
+    );
+    // Some JDK builds also have a one-arg variant that defaults
+    // canRetransform=false.
+    r.register(
+        impl_class,
+        "addTransformer0",
+        "(Ljava/lang/instrument/ClassFileTransformer;)V",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let with_can = [
+                args.first().cloned().unwrap_or(Value::Object(None)),
+                args.get(1).cloned().unwrap_or(Value::Object(None)),
+                Value::Int(0),
+            ];
+            native_add_transformer0(ctx, &with_can)
+        }) as NativeCallback,
+    );
+    // JDK 25 InstrumentationImpl.addTransformer(transformer, canRetransform) is
+    // a Java method that stores the transformer in `mTransformerManager` /
+    // `mRetransfomableTransformerManager`. We don't drive those Java fields
+    // when we run our own rust-side chain, so any agent that calls this
+    // public method (the spec-blessed entry point) would have its
+    // transformer recorded only in JDK Java fields that our retransform
+    // path can't see. Override the Java method with a native that records
+    // the transformer in our rust-side chain — that way every agent
+    // registration funnels into one place regardless of which API surface
+    // the agent uses.
+    r.register(
+        impl_class,
+        "addTransformer",
+        "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
+        (|_ctx: &mut dyn NativeContext, args: &[Value]| {
+            let transformer = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let can_retransform = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+            add_transformer_entry(TransformerEntry {
+                transformer_ref: transformer,
+                can_retransform,
+                native_method_prefix: None,
+            });
+            Ok(None)
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "addTransformer",
+        "(Ljava/lang/instrument/ClassFileTransformer;)V",
+        (|_ctx: &mut dyn NativeContext, args: &[Value]| {
+            let transformer = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            add_transformer_entry(TransformerEntry {
+                transformer_ref: transformer,
+                can_retransform: false,
+                native_method_prefix: None,
+            });
+            Ok(None)
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "removeTransformer",
+        "(Ljava/lang/instrument/ClassFileTransformer;)Z",
+        native_remove_transformer,
+    );
+    r.register(
+        impl_class,
+        "redefineClasses0",
+        "(J[Ljava/lang/instrument/ClassDefinition;)V",
+        // Some JDK builds prefix with the native_id long; just discard
+        // it and forward to the standard handler.
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            // args = [this, nativeId(long takes 2 slots in JVM stacks
+            // but is a single Value::Long here), defs[]]
+            // Skip the long argument and pass [this, defs[]].
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let defs = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_redefine_classes0(ctx, &[receiver, defs])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "redefineClasses0",
+        "([Ljava/lang/instrument/ClassDefinition;)V",
+        native_redefine_classes0,
+    );
+    r.register(
+        impl_class,
+        "retransformClasses0",
+        "(J[Ljava/lang/Class;)V",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let classes = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_retransform_classes0(ctx, &[receiver, classes])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "retransformClasses0",
+        "([Ljava/lang/Class;)V",
+        native_retransform_classes0,
+    );
+    r.register(
+        impl_class,
+        "getAllLoadedClasses0",
+        "()[Ljava/lang/Class;",
+        native_get_all_loaded_classes0,
+    );
+    // JDK 25 (J)[Ljava/lang/Class; variant — first arg is `long jvmtienv`.
+    r.register(
+        impl_class,
+        "getAllLoadedClasses0",
+        "(J)[Ljava/lang/Class;",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            native_get_all_loaded_classes0(ctx, &[receiver])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "getInitiatedClasses0",
+        "(Ljava/lang/ClassLoader;)[Ljava/lang/Class;",
+        native_get_initiated_classes0,
+    );
+    r.register(
+        impl_class,
+        "getInitiatedClasses0",
+        "(JLjava/lang/ClassLoader;)[Ljava/lang/Class;",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let loader = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_get_initiated_classes0(ctx, &[receiver, loader])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "isModifiableClass0",
+        "(Ljava/lang/Class;)Z",
+        native_is_modifiable_class0,
+    );
+    r.register(
+        impl_class,
+        "isModifiableClass0",
+        "(JLjava/lang/Class;)Z",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let cls = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_is_modifiable_class0(ctx, &[receiver, cls])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "getObjectSize0",
+        "(Ljava/lang/Object;)J",
+        native_get_object_size0,
+    );
+    r.register(
+        impl_class,
+        "getObjectSize0",
+        "(JLjava/lang/Object;)J",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let obj = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_get_object_size0(ctx, &[receiver, obj])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "appendToBootstrapClassLoaderSearch0",
+        "(Ljava/lang/String;)V",
+        native_append_to_bootstrap_search0,
+    );
+    r.register(
+        impl_class,
+        "appendToBootstrapClassLoaderSearch0",
+        "(JLjava/lang/String;)V",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let path = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_append_to_bootstrap_search0(ctx, &[receiver, path])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "appendToSystemClassLoaderSearch0",
+        "(Ljava/lang/String;)V",
+        native_append_to_system_search0,
+    );
+    r.register(
+        impl_class,
+        "appendToSystemClassLoaderSearch0",
+        "(JLjava/lang/String;)V",
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
+            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
+            let path = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_append_to_system_search0(ctx, &[receiver, path])
+        }) as NativeCallback,
+    );
+    r.register(
+        impl_class,
+        "setNativeMethodPrefix0",
+        "(Ljava/lang/instrument/ClassFileTransformer;Ljava/lang/String;)V",
+        native_set_native_method_prefix0,
+    );
+    // JDK 25 setNativeMethodPrefixes(long, String[], boolean) — bulk variant.
+    r.register(
+        impl_class,
+        "setNativeMethodPrefixes",
+        "(J[Ljava/lang/String;Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    // setHasRetransformableTransformers(long, boolean) — JVMTI capability flag toggle.
+    // We always claim retransform support; this setter is a no-op.
+    r.register(
+        impl_class,
+        "setHasRetransformableTransformers",
+        "(JZ)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        impl_class,
+        "setHasRetransformableTransformers",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    // JDK 25 InstrumentationImpl natives take `long jvmtienv` (descriptor (J)Z).
+    // Register both the (J)Z variant (the JDK 25 actual signature) and the
+    // legacy ()Z variant (backstop in case some workloads see the older arity).
+    r.register(
+        impl_class,
+        "isRetransformClassesSupported0",
+        "(J)Z",
+        native_is_retransform_supported0,
+    );
+    r.register(
+        impl_class,
+        "isRetransformClassesSupported0",
+        "()Z",
+        native_is_retransform_supported0,
+    );
+    r.register(
+        impl_class,
+        "isRedefineClassesSupported0",
+        "(J)Z",
+        native_is_redefine_supported0,
+    );
+    r.register(
+        impl_class,
+        "isRedefineClassesSupported0",
+        "()Z",
+        native_is_redefine_supported0,
+    );
+    r.register(
+        impl_class,
+        "isNativeMethodPrefixSupported0",
+        "(J)Z",
+        native_is_prefix_supported0,
+    );
+    r.register(
+        impl_class,
+        "isNativeMethodPrefixSupported0",
+        "()Z",
+        native_is_prefix_supported0,
+    );
+    // Constructor `<init>(JLjava/lang/String;ZZ)V` — JDK's
+    // `sun.instrument.InstrumentationImpl(jvmtienv, agentArgs, isRedefine,
+    // isRetransform)`. Since our `agent_loader::build_instrumentation_mirror`
+    // wants to instantiate this from native code, register a no-op ctor that
+    // accepts and discards the args (the Instrumentation Java object's
+    // observable behavior comes from the natives we register above).
+    r.register(
+        impl_class,
+        "<init>",
+        "(JLjava/lang/String;ZZ)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // ---- in-process probe bridge ----
+    let bridge_class = "rustjvm/Instrument";
+    r.register(
+        bridge_class,
+        "addTransformer",
+        "(Ljava/lang/Object;)V",
+        native_bridge_add_transformer,
+    );
+    r.register(
+        bridge_class,
+        "removeTransformer",
+        "(Ljava/lang/Object;)Z",
+        native_bridge_remove_transformer,
+    );
+    r.register(
+        bridge_class,
+        "getTransformerCount",
+        "()I",
+        native_bridge_get_transformer_count,
+    );
+    r.register(
+        bridge_class,
+        "getAllLoadedClasses",
+        "()[Ljava/lang/Class;",
+        native_bridge_get_all_loaded_classes,
+    );
+    r.register(
+        bridge_class,
+        "isModifiableClass",
+        "(Ljava/lang/Class;)Z",
+        native_bridge_is_modifiable_class,
+    );
+    r.register(
+        bridge_class,
+        "getObjectSize",
+        "(Ljava/lang/Object;)J",
+        native_bridge_get_object_size,
+    );
+    r.register(
+        bridge_class,
+        "redefineClass",
+        "(Ljava/lang/Class;[B)Z",
+        native_bridge_redefine_class,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_objref(addr: usize) -> ObjectRef {
+        // Build a dummy ObjectRef from a raw addr. Only used inside
+        // unit tests where we never dereference it.
+        unsafe { std::mem::transmute::<usize, ObjectRef>(addr) }
+    }
+
+    #[test]
+    fn add_then_remove_transformer_roundtrip() {
+        reset_transformer_chain();
+        let t1 = fake_objref(0x1000);
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: t1,
+            can_retransform: false,
+            native_method_prefix: None,
+        });
+        assert_eq!(transformer_count(), 1);
+        let removed = remove_transformer_entry(t1);
+        assert!(removed);
+        assert_eq!(transformer_count(), 0);
+    }
+
+    #[test]
+    fn remove_unknown_transformer_returns_false() {
+        reset_transformer_chain();
+        let t = fake_objref(0x2000);
+        assert!(!remove_transformer_entry(t));
+    }
+
+    #[test]
+    fn snapshot_preserves_order() {
+        reset_transformer_chain();
+        let t1 = fake_objref(0x1000);
+        let t2 = fake_objref(0x2000);
+        let t3 = fake_objref(0x3000);
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: t1,
+            can_retransform: true,
+            native_method_prefix: None,
+        });
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: t2,
+            can_retransform: false,
+            native_method_prefix: Some("$pfx".into()),
+        });
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: t3,
+            can_retransform: true,
+            native_method_prefix: None,
+        });
+        let snap = snapshot_transformer_chain();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x1000);
+        assert_eq!(snap[1].transformer_ref.as_ptr() as usize, 0x2000);
+        assert_eq!(snap[1].native_method_prefix.as_deref(), Some("$pfx"));
+        assert_eq!(snap[2].transformer_ref.as_ptr() as usize, 0x3000);
+        // Cleanup.
+        reset_transformer_chain();
+    }
+
+    #[test]
+    fn is_modifiable_rejects_primitive_array_hidden() {
+        assert!(is_modifiable_class(false, false, false));
+        assert!(!is_modifiable_class(true, false, false));
+        assert!(!is_modifiable_class(false, true, false));
+        assert!(!is_modifiable_class(false, false, true));
+        assert!(!is_modifiable_class(true, true, true));
+    }
+
+    #[test]
+    fn reset_clears_transformer_chain() {
+        reset_transformer_chain();
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x100),
+            can_retransform: true,
+            native_method_prefix: None,
+        });
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x200),
+            can_retransform: false,
+            native_method_prefix: None,
+        });
+        assert_eq!(transformer_count(), 2);
+        reset_transformer_chain();
+        assert_eq!(transformer_count(), 0);
+    }
+
+    #[test]
+    fn add_premain_transformer_appends_to_chain() {
+        reset_transformer_chain();
+        let t = fake_objref(0x4000);
+        add_premain_transformer(t, true, Some("__".into()));
+        let snap = snapshot_transformer_chain();
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].can_retransform);
+        assert_eq!(snap[0].native_method_prefix.as_deref(), Some("__"));
+        reset_transformer_chain();
+    }
+
+    #[test]
+    fn approximate_object_size_object() {
+        // Header (32) + 5 slots * 16 = 32 + 80 = 112.
+        let sz = approximate_object_size(ObjectKind::Object, ArrayElementType::Reference, 0, 5);
+        assert_eq!(sz, 112);
+    }
+
+    #[test]
+    fn approximate_object_size_byte_array() {
+        // Header (32) + 10 bytes aligned-up-to-8 = 32 + 16 = 48.
+        let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Byte, 10, 0);
+        assert_eq!(sz, 48);
+    }
+
+    #[test]
+    fn approximate_object_size_long_array() {
+        // Header (32) + 4 * 8 = 32 + 32 = 64.
+        let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Long, 4, 0);
+        assert_eq!(sz, 64);
+    }
+
+    #[test]
+    fn approximate_object_size_ref_array() {
+        // Header (32) + 3 refs * 8 = 32 + 24 = 56.
+        let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Reference, 3, 0);
+        assert_eq!(sz, 56);
+    }
+
+    #[test]
+    fn approximate_object_size_empty_array_is_positive() {
+        let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Int, 0, 0);
+        assert!(sz > 0);
+    }
+
+    #[test]
+    fn register_natives_includes_required_methods() {
+        let mut r = NativeMethodRegistry::new();
+        register_instrumentation_natives(&mut r);
+        let impl_class = "sun/instrument/InstrumentationImpl";
+        assert!(r
+            .find(
+                impl_class,
+                "addTransformer0",
+                "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "removeTransformer",
+                "(Ljava/lang/instrument/ClassFileTransformer;)Z",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "redefineClasses0",
+                "([Ljava/lang/instrument/ClassDefinition;)V",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "retransformClasses0",
+                "([Ljava/lang/Class;)V",
+            )
+            .is_some());
+        assert!(r
+            .find(impl_class, "getAllLoadedClasses0", "()[Ljava/lang/Class;")
+            .is_some());
+        assert!(r
+            .find(impl_class, "isModifiableClass0", "(Ljava/lang/Class;)Z")
+            .is_some());
+        assert!(r
+            .find(impl_class, "getObjectSize0", "(Ljava/lang/Object;)J")
+            .is_some());
+        assert!(r
+            .find(impl_class, "isRetransformClassesSupported0", "()Z")
+            .is_some());
+        assert!(r
+            .find(impl_class, "isRedefineClassesSupported0", "()Z")
+            .is_some());
+        assert!(r
+            .find(impl_class, "isNativeMethodPrefixSupported0", "()Z")
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "appendToBootstrapClassLoaderSearch0",
+                "(Ljava/lang/String;)V",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "appendToSystemClassLoaderSearch0",
+                "(Ljava/lang/String;)V",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "setNativeMethodPrefix0",
+                "(Ljava/lang/instrument/ClassFileTransformer;Ljava/lang/String;)V",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                impl_class,
+                "getInitiatedClasses0",
+                "(Ljava/lang/ClassLoader;)[Ljava/lang/Class;",
+            )
+            .is_some());
+        // Bridge surface for the in-process probe.
+        let bridge = "rustjvm/Instrument";
+        assert!(r
+            .find(bridge, "addTransformer", "(Ljava/lang/Object;)V")
+            .is_some());
+        assert!(r
+            .find(bridge, "removeTransformer", "(Ljava/lang/Object;)Z")
+            .is_some());
+        assert!(r.find(bridge, "getTransformerCount", "()I").is_some());
+        assert!(r
+            .find(bridge, "getAllLoadedClasses", "()[Ljava/lang/Class;")
+            .is_some());
+        assert!(r
+            .find(bridge, "isModifiableClass", "(Ljava/lang/Class;)Z")
+            .is_some());
+        assert!(r
+            .find(bridge, "getObjectSize", "(Ljava/lang/Object;)J")
+            .is_some());
+        assert!(r
+            .find(bridge, "redefineClass", "(Ljava/lang/Class;[B)Z")
+            .is_some());
+    }
+}

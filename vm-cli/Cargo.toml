@@ -1,0 +1,29 @@
+[package]
+name = "rustjvm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line launcher for the RustJVM"
+readme = "../README.md"
+
+[[bin]]
+name = "rustjvm"
+path = "src/main.rs"
+
+[features]
+default = []
+synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]
+
+[dependencies]
+rustjvm-vm = { path = "../vm" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[lints]
+workspace = true

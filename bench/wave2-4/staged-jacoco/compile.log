@@ -1,0 +1,8 @@
+﻿
+stage-jacoco-probe: using javac at C:\Program Files\Java\jdk-25\bin\javac.exe
+stage-jacoco-probe: compiling 2 sources
+
+
+stage-jacoco-probe: located jacoco agent at C:\craton\ejbca-ce\lib\coverage\jacocoagent.jar
+stage-jacoco-probe: main class = Main
+stage-jacoco-probe: staged classes at C:\craton\rust-jvm\bench\wave2-4\staged-jacoco\classes

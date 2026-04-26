@@ -1,0 +1,1506 @@
+//! Java Platform Module System (JPMS) support — Phase N.
+//!
+//! Implements the module graph, readability, exports/opens access control,
+//! and the unnamed-module compatibility layer needed to load Java 9+ code.
+//!
+//! # Key concepts
+//!
+//! * **Named module** — declared by a `module-info.class`; has an explicit name
+//!   and controls which packages it exports and to whom.
+//! * **Unnamed module** — every class loaded from the classpath (no module
+//!   declaration) belongs to the unnamed module.  The unnamed module reads every
+//!   named module and the named modules export everything to it (classpath-mode
+//!   compatibility).
+//! * **Readability** — module A *reads* module B if A has a `requires B` edge
+//!   (directly or transitively).
+//! * **Exports** — module B *exports* package `p` to module A if `p` appears in
+//!   B's `exports` table with `A` in the qualifier list, or the list is empty
+//!   (unqualified export).
+
+#![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet};
+
+// ---------------------------------------------------------------------------
+// Module flag constants (from JVMS 4.7.25)
+// ---------------------------------------------------------------------------
+
+/// Module declaration flag: all packages are open (open module).
+pub const ACC_MODULE_OPEN: u16 = 0x0020;
+/// `requires` flag: transitive read edge.
+pub const ACC_REQUIRES_TRANSITIVE: u16 = 0x0020;
+/// `requires` flag: static (compile-time only) dependency.
+pub const ACC_REQUIRES_STATIC: u16 = 0x0040;
+/// Synthetic element (compiler-generated).
+pub const ACC_SYNTHETIC: u16 = 0x1000;
+/// Mandated element (implicitly declared by spec).
+pub const ACC_MANDATED: u16 = 0x8000;
+
+// ---------------------------------------------------------------------------
+// Module descriptor components
+// ---------------------------------------------------------------------------
+
+/// A single `requires` directive in a module declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRequiresEntry {
+    /// Binary module name, e.g. `"java.base"`.
+    pub module_name: String,
+    /// True if this is `requires transitive` — callers of this module also read
+    /// the required module.
+    pub is_transitive: bool,
+    /// True if this is `requires static` — dependency is compile-time only.
+    pub is_static: bool,
+}
+
+/// A single `exports` directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleExportsEntry {
+    /// Exported package in slash format, e.g. `"java/lang"`.
+    pub package_name: String,
+    /// Qualified targets.  Empty ⇒ unqualified (exported to all modules).
+    pub to_modules: Vec<String>,
+}
+
+impl ModuleExportsEntry {
+    /// Does this entry export the package to `requester`?
+    pub fn accessible_to(&self, requester: &str) -> bool {
+        self.to_modules.is_empty() || self.to_modules.iter().any(|m| m == requester)
+    }
+}
+
+/// A single `opens` directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleOpensEntry {
+    /// Opened package in slash format.
+    pub package_name: String,
+    /// Qualified targets.  Empty ⇒ unqualified open.
+    pub to_modules: Vec<String>,
+}
+
+impl ModuleOpensEntry {
+    /// Is the package open to `requester`?
+    pub fn open_to(&self, requester: &str) -> bool {
+        self.to_modules.is_empty() || self.to_modules.iter().any(|m| m == requester)
+    }
+}
+
+/// A single `provides` directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleProvidesEntry {
+    /// Service interface (binary class name).
+    pub service: String,
+    /// Implementing classes (binary class names).
+    pub with: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// ModuleDescriptor
+// ---------------------------------------------------------------------------
+
+/// Full parsed representation of a `module-info.class` Module attribute.
+#[derive(Debug, Clone)]
+pub struct ModuleDescriptor {
+    /// Module name, e.g. `"java.base"`.
+    pub name: String,
+    /// Optional version string.
+    pub version: Option<String>,
+    /// True if declared as `open module`.
+    pub is_open: bool,
+    /// Direct `requires` edges.
+    pub requires: Vec<ModuleRequiresEntry>,
+    /// Exported packages.
+    pub exports: Vec<ModuleExportsEntry>,
+    /// Opened packages (for deep reflection).
+    pub opens: Vec<ModuleOpensEntry>,
+    /// Service types used by this module.
+    pub uses: Vec<String>,
+    /// Service implementations provided.
+    pub provides: Vec<ModuleProvidesEntry>,
+}
+
+impl ModuleDescriptor {
+    /// Returns true if this module exports `pkg` to module `requester`.
+    ///
+    /// An open module exports every package to everyone.
+    pub fn exports_package_to(&self, pkg: &str, requester: &str) -> bool {
+        if self.is_open {
+            return true;
+        }
+        self.exports
+            .iter()
+            .any(|e| e.package_name == pkg && e.accessible_to(requester))
+    }
+
+    /// Returns true if this module opens `pkg` to module `requester` (for
+    /// reflective access).
+    ///
+    /// An open module opens every package to everyone.
+    pub fn opens_package_to(&self, pkg: &str, requester: &str) -> bool {
+        if self.is_open {
+            return true;
+        }
+        self.opens
+            .iter()
+            .any(|o| o.package_name == pkg && o.open_to(requester))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ModuleRegistry
+// ---------------------------------------------------------------------------
+
+/// The unnamed module sentinel.  All classpath classes that lack a
+/// `module-info.class` belong to this logical module.
+pub const UNNAMED_MODULE: &str = "";
+
+/// The `java.base` module — every named module implicitly reads it.
+pub const JAVA_BASE: &str = "java.base";
+
+/// A dynamic export or open edge added at runtime via `Module.addExports()`,
+/// `Module.addOpens()`, or CLI `--add-exports`/`--add-opens`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicExport {
+    /// Package name in slash format.
+    pub package: String,
+    /// Target module.  `None` = unqualified (open/export to all).
+    pub to_module: Option<String>,
+}
+
+/// Tracks all registered modules, the package-to-module mapping, and the
+/// pre-computed readability graph.
+pub struct ModuleRegistry {
+    /// module name → descriptor
+    modules: HashMap<String, ModuleDescriptor>,
+
+    /// package (slash format) → module name that owns it.
+    package_to_module: HashMap<String, String>,
+
+    /// Readability graph after transitive closure: module → set of modules it
+    /// can read.  Only populated after `build_readability_graph()`.
+    readable: HashMap<String, HashSet<String>>,
+
+    /// True once `build_readability_graph` has been called.
+    graph_built: bool,
+
+    /// Dynamic read edges added at runtime (`Module.addReads`, `--add-reads`).
+    extra_reads: HashMap<String, HashSet<String>>,
+
+    /// Dynamic exports added at runtime (`Module.addExports`, `--add-exports`).
+    extra_exports: HashMap<String, Vec<DynamicExport>>,
+
+    /// Dynamic opens added at runtime (`Module.addOpens`, `--add-opens`).
+    extra_opens: HashMap<String, Vec<DynamicExport>>,
+}
+
+impl Default for ModuleRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModuleRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            modules: HashMap::with_capacity(16),
+            package_to_module: HashMap::with_capacity(16),
+            readable: HashMap::with_capacity(16),
+            graph_built: false,
+            extra_reads: HashMap::new(),
+            extra_exports: HashMap::new(),
+            extra_opens: HashMap::new(),
+        }
+    }
+
+    /// Register a module and index its packages.
+    ///
+    /// If a module with the same name was already registered it is silently
+    /// replaced (last writer wins — callers should avoid duplicates).
+    pub fn register(&mut self, desc: ModuleDescriptor, packages: Vec<String>) {
+        let name = desc.name.clone();
+        // Index packages
+        for pkg in packages {
+            self.package_to_module
+                .entry(pkg)
+                .or_insert_with(|| name.clone());
+        }
+        self.modules.insert(name, desc);
+        // Invalidate graph when new modules arrive
+        self.graph_built = false;
+        self.readable.clear();
+    }
+
+    /// Look up a module descriptor by name.
+    pub fn get(&self, name: &str) -> Option<&ModuleDescriptor> {
+        self.modules.get(name)
+    }
+
+    /// Return an iterator over all registered module descriptors.
+    pub fn all(&self) -> impl Iterator<Item = &ModuleDescriptor> {
+        self.modules.values()
+    }
+
+    /// Number of registered modules.
+    pub fn len(&self) -> usize {
+        self.modules.len()
+    }
+
+    /// True if no modules have been registered.
+    pub fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+
+    /// Determine which named module owns `pkg` (slash format, e.g. `"java/lang"`).
+    ///
+    /// Returns `None` if no registered module declares that package — meaning
+    /// the class belongs to the unnamed module.
+    pub fn module_for_package(&self, pkg: &str) -> Option<&str> {
+        self.package_to_module.get(pkg).map(|s| s.as_str())
+    }
+
+    /// Compute the transitive readability closure and cache it.
+    ///
+    /// After this call, `reads()` and `can_access()` become meaningful.
+    /// Safe to call multiple times; subsequent calls are no-ops if no new
+    /// modules have been registered since the last call.
+    pub fn build_readability_graph(&mut self) {
+        if self.graph_built {
+            return;
+        }
+
+        // Step 1 — seed each module's readable set with direct requires
+        // and dynamic addReads edges.
+        let module_names: Vec<String> = self.modules.keys().cloned().collect();
+        let mut readable: HashMap<String, HashSet<String>> = HashMap::with_capacity(16);
+
+        for name in &module_names {
+            let set = readable.entry(name.clone()).or_default();
+            // A module always reads itself.
+            set.insert(name.clone());
+            // Every module reads java.base (mandated).
+            set.insert(JAVA_BASE.to_string());
+
+            if let Some(desc) = self.modules.get(name) {
+                for req in &desc.requires {
+                    if !req.is_static {
+                        set.insert(req.module_name.clone());
+                    }
+                }
+            }
+
+            // Incorporate dynamic reads from add_reads() / --add-reads.
+            if let Some(extras) = self.extra_reads.get(name) {
+                for target in extras {
+                    set.insert(target.clone());
+                }
+            }
+        }
+
+        // Step 2 — propagate `requires transitive`.
+        // If M `requires transitive` B, then every module that reads M also
+        // reads B.  Iterate until stable.
+        //
+        // Pre-compute the transitive-requires edges once (they don't change
+        // during propagation) to avoid repeated HashMap lookups and String
+        // clones inside the fixpoint loop.
+        let transitive_edges: Vec<(usize, Vec<usize>)> = {
+            // Build name-to-index map for compact representation
+            let name_to_idx: HashMap<&str, usize> = module_names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.as_str(), i))
+                .collect();
+
+            module_names
+                .iter()
+                .enumerate()
+                .filter_map(|(m_idx, m_name)| {
+                    let desc = self.modules.get(m_name)?;
+                    let trans: Vec<usize> = desc
+                        .requires
+                        .iter()
+                        .filter(|r| r.is_transitive && !r.is_static)
+                        .filter_map(|r| name_to_idx.get(r.module_name.as_str()).copied())
+                        .collect();
+                    if trans.is_empty() {
+                        None
+                    } else {
+                        Some((m_idx, trans))
+                    }
+                })
+                .collect()
+        };
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &(m_idx, ref trans_idxs) in &transitive_edges {
+                let m_name = &module_names[m_idx];
+
+                // Find every module X that reads M (by index)
+                let reader_idxs: Vec<usize> = module_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| {
+                        readable
+                            .get(name.as_str())
+                            .is_some_and(|set| set.contains(m_name.as_str()))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+
+                for reader_idx in reader_idxs {
+                    let reader_name = &module_names[reader_idx];
+                    for &dep_idx in trans_idxs {
+                        let dep_name = &module_names[dep_idx];
+                        if readable
+                            .entry(reader_name.clone())
+                            .or_default()
+                            .insert(dep_name.clone())
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.readable = readable;
+        self.graph_built = true;
+    }
+
+    /// Detect cycles in the `requires` graph (excluding self-loops via
+    /// `java.base` which every module reads).
+    ///
+    /// Returns a list of cycles, where each cycle is a list of module names
+    /// forming the cycle. An empty Vec means no cycles.
+    ///
+    /// JPMS specification does not forbid cycles in the `requires` graph
+    /// (only circular dependencies during class loading are errors), but
+    /// detecting them is useful for diagnostics and spec conformance testing.
+    pub fn detect_cycles(&self) -> Vec<Vec<String>> {
+        let names: Vec<&str> = self.modules.keys().map(|s| s.as_str()).collect();
+        let name_to_idx: HashMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, i))
+            .collect();
+        let n = names.len();
+
+        // Build adjacency list (only real requires, not self/java.base).
+        let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
+        for (i, name) in names.iter().enumerate() {
+            if let Some(desc) = self.modules.get(*name) {
+                for req in &desc.requires {
+                    if !req.is_static {
+                        if let Some(&j) = name_to_idx.get(req.module_name.as_str()) {
+                            if i != j {
+                                adj[i].push(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standard DFS-based cycle detection (Tarjan-flavored).
+        let mut visited = vec![false; n];
+        let mut on_stack = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+
+        fn dfs(
+            v: usize,
+            adj: &[Vec<usize>],
+            visited: &mut [bool],
+            on_stack: &mut [bool],
+            stack: &mut Vec<usize>,
+            cycles: &mut Vec<Vec<String>>,
+            names: &[&str],
+        ) {
+            visited[v] = true;
+            on_stack[v] = true;
+            stack.push(v);
+
+            for &w in &adj[v] {
+                if !visited[w] {
+                    dfs(w, adj, visited, on_stack, stack, cycles, names);
+                } else if on_stack[w] {
+                    // Found a cycle: extract the cycle from the stack.
+                    let pos = stack.iter().position(|&x| x == w).unwrap_or(0);
+                    let cycle: Vec<String> =
+                        stack[pos..].iter().map(|&i| names[i].to_string()).collect();
+                    cycles.push(cycle);
+                }
+            }
+
+            stack.pop();
+            on_stack[v] = false;
+        }
+
+        for i in 0..n {
+            if !visited[i] {
+                dfs(i, &adj, &mut visited, &mut on_stack, &mut stack, &mut cycles, &names);
+            }
+        }
+
+        cycles
+    }
+
+    /// Does module `reader` read module `provider`?
+    ///
+    /// The unnamed module reads everything.  Every module reads `java.base`
+    /// and itself.  If the graph has not been built yet this falls back to
+    /// checking only direct `requires` edges.
+    pub fn reads(&self, reader: &str, provider: &str) -> bool {
+        // Unnamed module reads all named modules (classpath compat).
+        if reader == UNNAMED_MODULE {
+            return true;
+        }
+        // Every module reads itself and java.base.
+        if reader == provider || provider == JAVA_BASE || provider == UNNAMED_MODULE {
+            return true;
+        }
+
+        // If the reader module has no registered descriptor, use open-world
+        // assumption: unknown modules can read anything.
+        if !self.modules.contains_key(reader) {
+            return true;
+        }
+
+        if self.graph_built {
+            self.readable
+                .get(reader)
+                .is_some_and(|set| set.contains(provider))
+        } else {
+            // Fallback: direct requires only
+            self.modules
+                .get(reader)
+                .is_some_and(|desc| desc.requires.iter().any(|r| r.module_name == provider))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic mutations (JPMS §5.4.4, java.lang.Module API)
+    // -----------------------------------------------------------------------
+
+    /// Add a dynamic read edge: `reader` module reads `provider`.
+    ///
+    /// This is the backing store for `java.lang.Module.addReads()` and the
+    /// `--add-reads` CLI flag. If the readability graph has already been built
+    /// the edge is inserted directly; otherwise it will be picked up on the
+    /// next `build_readability_graph` call via the `extra_reads` list.
+    pub fn add_reads(&mut self, reader: &str, provider: &str) {
+        self.extra_reads
+            .entry(reader.to_string())
+            .or_default()
+            .insert(provider.to_string());
+        // Patch the cached graph if it was already computed.
+        if self.graph_built {
+            self.readable
+                .entry(reader.to_string())
+                .or_default()
+                .insert(provider.to_string());
+        }
+    }
+
+    /// Add a dynamic export: `module_name` now exports `pkg` to `target`
+    /// (empty `target` = unqualified, to all modules).
+    ///
+    /// Backing store for `java.lang.Module.addExports()` and `--add-exports`.
+    pub fn add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
+        self.extra_exports
+            .entry(module_name.to_string())
+            .or_default()
+            .push(DynamicExport {
+                package: pkg.to_string(),
+                to_module: if target.is_empty() {
+                    None
+                } else {
+                    Some(target.to_string())
+                },
+            });
+    }
+
+    /// Add a dynamic open: `module_name` now opens `pkg` to `target`
+    /// (empty `target` = unqualified, to all modules).
+    ///
+    /// Backing store for `java.lang.Module.addOpens()` and `--add-opens`.
+    pub fn add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
+        self.extra_opens
+            .entry(module_name.to_string())
+            .or_default()
+            .push(DynamicExport {
+                package: pkg.to_string(),
+                to_module: if target.is_empty() {
+                    None
+                } else {
+                    Some(target.to_string())
+                },
+            });
+    }
+
+    /// Check deep reflection access (JPMS `opens`, JEP 403 "strong encapsulation").
+    ///
+    /// This is called by reflection code (`Method.invoke`, `Field.set/get`,
+    /// `Constructor.newInstance`, `AccessibleObject.setAccessible`) to enforce
+    /// that `accessor_module` has deep reflective access to `target_pkg` in
+    /// `target_module`.
+    ///
+    /// Rules (JEP 403, JPMS §5.4.4, JDK 17+):
+    /// 1. Same module → allowed.
+    /// 2. Target is unnamed (classpath class) → allowed. An unnamed module
+    ///    cannot encapsulate — every one of its packages is implicitly open.
+    /// 3. Target is an open module → allowed (`module M { open ... }`).
+    /// 4. Target explicitly `opens target_pkg [to accessor]` in its
+    ///    module-info → allowed.
+    /// 5. A dynamic `add_opens` edge exists (either from the
+    ///    `--add-opens` CLI flag or the `java.lang.Module.addOpens` runtime
+    ///    API) → allowed.
+    /// 6. Otherwise → `Err(...)`. The reflection native turns this into an
+    ///    `InaccessibleObjectException` (for `setAccessible`) or
+    ///    `IllegalAccessException` (for direct `invoke`/`get`/`set`).
+    ///
+    /// Note: an unnamed *accessor* is NOT automatically allowed. Pre-JEP-403
+    /// JDKs (9–16) treated classpath code as a special case, but modular
+    /// JDK 17+ strong encapsulation requires `--add-opens` to reach
+    /// non-opened packages of a named module — this matches HotSpot's
+    /// `Module::can_access_member` behavior.
+    pub fn check_deep_reflection_access(
+        &self,
+        accessor_module: &str,
+        target_module: &str,
+        target_pkg: &str,
+    ) -> Result<(), String> {
+        // Rule 1: same module always wins.
+        if accessor_module == target_module {
+            return Ok(());
+        }
+
+        // Rule 2: target unnamed — no encapsulation to enforce.
+        if target_module == UNNAMED_MODULE {
+            return Ok(());
+        }
+
+        // Readability required before deep access can be meaningful.
+        if !self.reads(accessor_module, target_module) {
+            return Err(format!(
+                "module {accessor_module} does not read module {target_module}"
+            ));
+        }
+
+        // Rules 3 + 4: declared opens on the target module.
+        if let Some(desc) = self.modules.get(target_module) {
+            if desc.opens_package_to(target_pkg, accessor_module) {
+                return Ok(());
+            }
+        }
+
+        // Rule 5: dynamic opens (from --add-opens or Module.addOpens).
+        if let Some(extras) = self.extra_opens.get(target_module) {
+            for de in extras {
+                if de.package == target_pkg
+                    && (de.to_module.is_none()
+                        || de.to_module.as_deref() == Some(accessor_module))
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Rule 6: denied.
+        let accessor_label = if accessor_module.is_empty() {
+            "unnamed module"
+        } else {
+            accessor_module
+        };
+        Err(format!(
+            "module {target_module} does not \"opens {}\" to {accessor_label}",
+            target_pkg.replace('/', ".")
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-module queries (for java.lang.Module native methods)
+    // -----------------------------------------------------------------------
+
+    /// Is `pkg` exported by `module_name` unconditionally (to all modules)?
+    ///
+    /// This implements `Module.isExported(String)` — checks whether the package
+    /// is in the unqualified exports list or the module is open.
+    pub fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
+        if module_name == UNNAMED_MODULE {
+            return true; // unnamed module exports everything
+        }
+        if let Some(desc) = self.modules.get(module_name) {
+            if desc.is_open {
+                return true;
+            }
+            if desc.exports.iter().any(|e| e.package_name == pkg && e.to_modules.is_empty()) {
+                return true;
+            }
+        }
+        // Check dynamic exports (unqualified).
+        if let Some(extras) = self.extra_exports.get(module_name) {
+            if extras.iter().any(|de| de.package == pkg && de.to_module.is_none()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Is `pkg` exported by `module_name` to `to_module`?
+    ///
+    /// This implements `Module.isExported(String, Module)`.
+    pub fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
+        if module_name == UNNAMED_MODULE || module_name == to_module {
+            return true;
+        }
+        if let Some(desc) = self.modules.get(module_name) {
+            if desc.exports_package_to(pkg, to_module) {
+                return true;
+            }
+        }
+        // Check dynamic exports.
+        if let Some(extras) = self.extra_exports.get(module_name) {
+            if extras.iter().any(|de| {
+                de.package == pkg
+                    && (de.to_module.is_none() || de.to_module.as_deref() == Some(to_module))
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Is `pkg` opened by `module_name` unconditionally?
+    ///
+    /// This implements `Module.isOpen(String)`.
+    pub fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
+        if module_name == UNNAMED_MODULE {
+            return true; // unnamed module opens everything
+        }
+        if let Some(desc) = self.modules.get(module_name) {
+            if desc.is_open {
+                return true;
+            }
+            if desc.opens.iter().any(|o| o.package_name == pkg && o.to_modules.is_empty()) {
+                return true;
+            }
+        }
+        // Check dynamic opens (unqualified).
+        if let Some(extras) = self.extra_opens.get(module_name) {
+            if extras.iter().any(|de| de.package == pkg && de.to_module.is_none()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Is `pkg` opened by `module_name` to `to_module`?
+    ///
+    /// This implements `Module.isOpen(String, Module)`.
+    pub fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
+        if module_name == UNNAMED_MODULE || module_name == to_module {
+            return true;
+        }
+        if let Some(desc) = self.modules.get(module_name) {
+            if desc.opens_package_to(pkg, to_module) {
+                return true;
+            }
+        }
+        // Check dynamic opens.
+        if let Some(extras) = self.extra_opens.get(module_name) {
+            if extras.iter().any(|de| {
+                de.package == pkg
+                    && (de.to_module.is_none() || de.to_module.as_deref() == Some(to_module))
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return all packages owned by `module_name`.
+    pub fn packages_of(&self, module_name: &str) -> Vec<String> {
+        self.package_to_module
+            .iter()
+            .filter(|(_, m)| m.as_str() == module_name)
+            .map(|(pkg, _)| pkg.clone())
+            .collect()
+    }
+
+    /// Return all registered module names.
+    pub fn module_names(&self) -> Vec<String> {
+        self.modules.keys().cloned().collect()
+    }
+
+    /// Return all provider implementation classes for a given service interface.
+    ///
+    /// Walks every registered module's `provides` declarations looking for
+    /// entries whose service matches `service_class` (binary class name,
+    /// e.g. `"com/example/MyService"`).
+    pub fn service_providers(&self, service_class: &str) -> Vec<String> {
+        let mut providers = Vec::new();
+        for desc in self.modules.values() {
+            for p in &desc.provides {
+                if p.service == service_class {
+                    providers.extend(p.with.iter().cloned());
+                }
+            }
+        }
+        providers
+    }
+
+    // -----------------------------------------------------------------------
+    // Standard access check
+    // -----------------------------------------------------------------------
+
+    /// Check whether code in module `accessor_module` (accessing package
+    /// `target_pkg` of module `target_module`) is permitted by JPMS rules.
+    ///
+    /// Returns `Ok(())` if access is allowed, `Err(reason)` otherwise.
+    ///
+    /// # Unnamed-module compatibility
+    ///
+    /// * The unnamed module can always access any package.
+    /// * The unnamed module is always readable by named modules in classpath
+    ///   mode (same JVM instance).
+    pub fn check_module_access(
+        &self,
+        accessor_module: &str,
+        target_module: &str,
+        target_pkg: &str,
+    ) -> Result<(), String> {
+        // Same module — always allowed.
+        if accessor_module == target_module {
+            return Ok(());
+        }
+        // Unnamed module is always allowed (classpath compat).
+        if accessor_module == UNNAMED_MODULE || target_module == UNNAMED_MODULE {
+            return Ok(());
+        }
+
+        // 1. Readability check.
+        if !self.reads(accessor_module, target_module) {
+            return Err(format!(
+                "module {accessor_module} does not read module {target_module}"
+            ));
+        }
+
+        // 2. Exports check.
+        // If neither module is registered, use open-world assumption → allow.
+        if self.modules.get(accessor_module).is_none()
+            && self.modules.get(target_module).is_none()
+        {
+            return Ok(());
+        }
+        if let Some(target_desc) = self.modules.get(target_module) {
+            if !target_desc.exports_package_to(target_pkg, accessor_module) {
+                // Check dynamic exports before rejecting.
+                let has_dynamic = self.extra_exports.get(target_module).is_some_and(|extras| {
+                    extras.iter().any(|de| {
+                        de.package == target_pkg
+                            && (de.to_module.is_none()
+                                || de.to_module.as_deref() == Some(accessor_module))
+                    })
+                });
+                if !has_dynamic {
+                    return Err(format!(
+                        "module {target_module} does not export package {target_pkg} to {accessor_module}"
+                    ));
+                }
+            }
+        }
+        // If we have no descriptor for target_module, allow (unknown module — open world).
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor construction from reader types
+// ---------------------------------------------------------------------------
+
+/// Build a [`ModuleDescriptor`] from a parsed `Attribute::Module`.
+///
+/// Returns `None` if the attribute is not a Module attribute.
+pub fn descriptor_from_module_attribute(
+    attr: &rustjvm_reader::attribute::Attribute,
+    cp: &rustjvm_reader::constant_pool::ConstantPool,
+) -> Option<ModuleDescriptor> {
+    use rustjvm_reader::attribute::Attribute;
+    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+
+    let (name_index, flags, version_index, requires_raw, exports_raw, opens_raw, uses_raw, provides_raw) =
+        match attr {
+            Attribute::Module {
+                name_index,
+                flags,
+                version_index,
+                requires,
+                exports,
+                opens,
+                uses,
+                provides,
+            } => (name_index, flags, version_index, requires, exports, opens, uses, provides),
+            _ => return None,
+        };
+
+    let name = cp.get_utf8(*name_index)?.to_string();
+
+    let version = if *version_index != 0 {
+        cp.get_utf8(*version_index).map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let is_open = (flags & ACC_MODULE_OPEN) != 0;
+
+    // Helper: resolve a CONSTANT_Module or CONSTANT_Package entry's name
+    let resolve_name = |idx: u16| -> Option<String> {
+        match cp.get(idx) {
+            Some(ConstantPoolEntry::Module { name_index }) => {
+                cp.get_utf8(*name_index).map(|s| s.to_string())
+            }
+            Some(ConstantPoolEntry::Package { name_index }) => {
+                cp.get_utf8(*name_index).map(|s| s.to_string())
+            }
+            // Some implementations store the name directly as Utf8
+            Some(ConstantPoolEntry::Utf8(s)) => Some(s.to_string()),
+            _ => None,
+        }
+    };
+
+    let requires: Vec<ModuleRequiresEntry> = requires_raw
+        .iter()
+        .filter_map(|r| {
+            let module_name = resolve_name(r.requires_index)?;
+            Some(ModuleRequiresEntry {
+                module_name,
+                is_transitive: (r.requires_flags & ACC_REQUIRES_TRANSITIVE) != 0,
+                is_static: (r.requires_flags & ACC_REQUIRES_STATIC) != 0,
+            })
+        })
+        .collect();
+
+    let exports: Vec<ModuleExportsEntry> = exports_raw
+        .iter()
+        .filter_map(|e| {
+            let package_name = resolve_name(e.exports_index)?;
+            let to_modules: Vec<String> = e
+                .exports_to
+                .iter()
+                .filter_map(|&idx| resolve_name(idx))
+                .collect();
+            Some(ModuleExportsEntry {
+                package_name,
+                to_modules,
+            })
+        })
+        .collect();
+
+    let opens: Vec<ModuleOpensEntry> = opens_raw
+        .iter()
+        .filter_map(|o| {
+            let package_name = resolve_name(o.opens_index)?;
+            let to_modules: Vec<String> = o
+                .opens_to
+                .iter()
+                .filter_map(|&idx| resolve_name(idx))
+                .collect();
+            Some(ModuleOpensEntry {
+                package_name,
+                to_modules,
+            })
+        })
+        .collect();
+
+    // `uses` entries reference CONSTANT_Class
+    let uses: Vec<String> = uses_raw
+        .iter()
+        .filter_map(|&idx| cp.get_class_name(idx).map(|s| s.to_string()))
+        .collect();
+
+    let provides: Vec<ModuleProvidesEntry> = provides_raw
+        .iter()
+        .filter_map(|p| {
+            let service = cp.get_class_name(p.provides_index).map(|s| s.to_string())?;
+            let with: Vec<String> = p
+                .provides_with
+                .iter()
+                .filter_map(|&idx| cp.get_class_name(idx).map(|s| s.to_string()))
+                .collect();
+            Some(ModuleProvidesEntry { service, with })
+        })
+        .collect();
+
+    Some(ModuleDescriptor {
+        name,
+        version,
+        is_open,
+        requires,
+        exports,
+        opens,
+        uses,
+        provides,
+    })
+}
+
+/// Extract the list of packages from a `ModulePackages` attribute.
+///
+/// Returns the packages as slash-format strings (e.g. `"java/lang"`).
+pub fn packages_from_module_packages_attribute(
+    attr: &rustjvm_reader::attribute::Attribute,
+    cp: &rustjvm_reader::constant_pool::ConstantPool,
+) -> Option<Vec<String>> {
+    use rustjvm_reader::attribute::Attribute;
+    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+
+    if let Attribute::ModulePackages { packages } = attr {
+        let names: Vec<String> = packages
+            .iter()
+            .filter_map(|&idx| {
+                // CONSTANT_Package { name_index } → Utf8
+                match cp.get(idx) {
+                    Some(ConstantPoolEntry::Package { name_index }) => {
+                        cp.get_utf8(*name_index).map(|s| s.to_string())
+                    }
+                    Some(ConstantPoolEntry::Utf8(s)) => Some(s.to_string()),
+                    _ => None,
+                }
+            })
+            .collect();
+        Some(names)
+    } else {
+        None
+    }
+}
+
+/// Extract the package name from a binary class name.
+///
+/// `"java/lang/Object"` → `"java/lang"`, `"Foo"` → `""`.
+pub fn package_of(class_name: &str) -> &str {
+    match class_name.rfind('/') {
+        Some(pos) => &class_name[..pos],
+        None => "",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_desc(name: &str) -> ModuleDescriptor {
+        ModuleDescriptor {
+            name: name.to_string(),
+            version: None,
+            is_open: false,
+            requires: vec![],
+            exports: vec![],
+            opens: vec![],
+            uses: vec![],
+            provides: vec![],
+        }
+    }
+
+    #[test]
+    fn unnamed_reads_everything() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.reads(UNNAMED_MODULE, "java.base"));
+        assert!(reg.reads(UNNAMED_MODULE, "java.logging"));
+        assert!(reg.reads(UNNAMED_MODULE, "com.example.mymod"));
+    }
+
+    #[test]
+    fn module_reads_itself_and_java_base() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("com.example"), vec![]);
+        reg.build_readability_graph();
+        assert!(reg.reads("com.example", "com.example"));
+        assert!(reg.reads("com.example", JAVA_BASE));
+    }
+
+    #[test]
+    fn direct_requires_edge() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let desc_b = sample_desc("modB");
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(desc_b, vec![]);
+        reg.build_readability_graph();
+
+        assert!(reg.reads("modA", "modB"));
+        assert!(!reg.reads("modB", "modA")); // not symmetric
+    }
+
+    #[test]
+    fn transitive_requires_propagates() {
+        // A requires transitive B, C requires A → C should also read B
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: true,
+            is_static: false,
+        });
+
+        let mut desc_c = sample_desc("modC");
+        desc_c.requires.push(ModuleRequiresEntry {
+            module_name: "modA".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.register(desc_c, vec![]);
+        reg.build_readability_graph();
+
+        assert!(reg.reads("modC", "modA"));
+        assert!(reg.reads("modC", "modB")); // via transitive
+    }
+
+    #[test]
+    fn package_to_module_lookup() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(
+            sample_desc("java.base"),
+            vec!["java/lang".to_string(), "java/util".to_string()],
+        );
+        assert_eq!(reg.module_for_package("java/lang"), Some("java.base"));
+        assert_eq!(reg.module_for_package("java/util"), Some("java.base"));
+        assert_eq!(reg.module_for_package("com/example"), None);
+    }
+
+    #[test]
+    fn exports_unqualified() {
+        let mut desc = sample_desc("modA");
+        desc.exports.push(ModuleExportsEntry {
+            package_name: "com/foo".to_string(),
+            to_modules: vec![],
+        });
+        assert!(desc.exports_package_to("com/foo", "modB"));
+        assert!(desc.exports_package_to("com/foo", "modC"));
+        assert!(!desc.exports_package_to("com/bar", "modB"));
+    }
+
+    #[test]
+    fn exports_qualified() {
+        let mut desc = sample_desc("modA");
+        desc.exports.push(ModuleExportsEntry {
+            package_name: "com/foo".to_string(),
+            to_modules: vec!["modB".to_string()],
+        });
+        assert!(desc.exports_package_to("com/foo", "modB"));
+        assert!(!desc.exports_package_to("com/foo", "modC"));
+    }
+
+    #[test]
+    fn open_module_exports_everything() {
+        let mut desc = sample_desc("modA");
+        desc.is_open = true;
+        assert!(desc.exports_package_to("any/package", "any.module"));
+        assert!(desc.opens_package_to("any/package", "any.module"));
+    }
+
+    #[test]
+    fn check_access_same_module() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.check_module_access("modA", "modA", "pkg").is_ok());
+    }
+
+    #[test]
+    fn check_access_unnamed_always_ok() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.check_module_access(UNNAMED_MODULE, "java.base", "java/lang").is_ok());
+        assert!(reg.check_module_access("java.base", UNNAMED_MODULE, "java/lang").is_ok());
+    }
+
+    #[test]
+    fn check_access_unregistered_module_allowed() {
+        let reg = ModuleRegistry::new();
+        // No module descriptors → open-world assumption
+        assert!(reg.check_module_access("modA", "modB", "pkg").is_ok());
+    }
+
+    #[test]
+    fn package_of_helper() {
+        assert_eq!(package_of("java/lang/Object"), "java/lang");
+        assert_eq!(package_of("Foo"), "");
+        assert_eq!(package_of("com/example/Foo"), "com/example");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: Dynamic mutations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn add_reads_dynamic() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.build_readability_graph();
+
+        // Before addReads, modA does not read modB (no requires edge).
+        assert!(!reg.reads("modA", "modB"));
+
+        reg.add_reads("modA", "modB");
+        assert!(reg.reads("modA", "modB"));
+    }
+
+    #[test]
+    fn add_exports_dynamic() {
+        let mut desc = sample_desc("modA");
+        desc.exports.push(ModuleExportsEntry {
+            package_name: "com/internal".to_string(),
+            to_modules: vec!["modB".to_string()], // only exported to modB
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc, vec!["com/internal".to_string()]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.register(sample_desc("modC"), vec![]);
+
+        // modC cannot access com/internal initially.
+        assert!(!reg.is_package_exported_to("modA", "com/internal", "modC"));
+
+        // Add dynamic export to modC.
+        reg.add_exports("modA", "com/internal", "modC");
+        assert!(reg.is_package_exported_to("modA", "com/internal", "modC"));
+    }
+
+    #[test]
+    fn add_opens_dynamic() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.register(sample_desc("modB"), vec![]);
+
+        assert!(!reg.is_package_open_to("modA", "com/secret", "modB"));
+
+        reg.add_opens("modA", "com/secret", "modB");
+        assert!(reg.is_package_open_to("modA", "com/secret", "modB"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: isExported / isOpen queries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_package_exported_unqualified_named_module() {
+        let mut desc = sample_desc("modA");
+        desc.exports.push(ModuleExportsEntry {
+            package_name: "com/public".to_string(),
+            to_modules: vec![], // unqualified
+        });
+        desc.exports.push(ModuleExportsEntry {
+            package_name: "com/private".to_string(),
+            to_modules: vec!["modB".to_string()], // qualified
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc, vec![]);
+
+        assert!(reg.is_package_exported_unqualified("modA", "com/public"));
+        assert!(!reg.is_package_exported_unqualified("modA", "com/private"));
+        assert!(!reg.is_package_exported_unqualified("modA", "com/nonexistent"));
+    }
+
+    #[test]
+    fn is_package_exported_to_qualified() {
+        let mut desc = sample_desc("modA");
+        desc.exports.push(ModuleExportsEntry {
+            package_name: "com/foo".to_string(),
+            to_modules: vec!["modB".to_string()],
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc, vec![]);
+
+        assert!(reg.is_package_exported_to("modA", "com/foo", "modB"));
+        assert!(!reg.is_package_exported_to("modA", "com/foo", "modC"));
+    }
+
+    #[test]
+    fn unnamed_module_exports_and_opens_everything() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.is_package_exported_unqualified(UNNAMED_MODULE, "anything"));
+        assert!(reg.is_package_open_unqualified(UNNAMED_MODULE, "anything"));
+        assert!(reg.is_package_exported_to(UNNAMED_MODULE, "anything", "modX"));
+        assert!(reg.is_package_open_to(UNNAMED_MODULE, "anything", "modX"));
+    }
+
+    #[test]
+    fn open_module_opens_and_exports_all() {
+        let mut desc = sample_desc("modA");
+        desc.is_open = true;
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc, vec![]);
+
+        assert!(reg.is_package_exported_unqualified("modA", "any/pkg"));
+        assert!(reg.is_package_open_unqualified("modA", "any/pkg"));
+        assert!(reg.is_package_exported_to("modA", "any/pkg", "modB"));
+        assert!(reg.is_package_open_to("modA", "any/pkg", "modB"));
+    }
+
+    #[test]
+    fn is_package_open_unqualified_declared() {
+        let mut desc = sample_desc("modA");
+        desc.opens.push(ModuleOpensEntry {
+            package_name: "com/reflect".to_string(),
+            to_modules: vec![], // unqualified
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc, vec![]);
+
+        assert!(reg.is_package_open_unqualified("modA", "com/reflect"));
+        assert!(!reg.is_package_open_unqualified("modA", "com/other"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: packages_of / module_names / service_providers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn packages_of_module() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(
+            sample_desc("java.base"),
+            vec!["java/lang".to_string(), "java/util".to_string(), "java/io".to_string()],
+        );
+        reg.register(sample_desc("modB"), vec!["com/b".to_string()]);
+
+        let mut pkgs = reg.packages_of("java.base");
+        pkgs.sort();
+        assert_eq!(pkgs, vec!["java/io", "java/lang", "java/util"]);
+        assert_eq!(reg.packages_of("modB"), vec!["com/b"]);
+        assert!(reg.packages_of("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn module_names_list() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+        let mut names = reg.module_names();
+        names.sort();
+        assert_eq!(names, vec!["modA", "modB"]);
+    }
+
+    #[test]
+    fn service_providers_from_provides() {
+        let mut desc = sample_desc("modA");
+        desc.provides.push(ModuleProvidesEntry {
+            service: "com/example/SPI".to_string(),
+            with: vec!["com/example/SPIImpl".to_string()],
+        });
+        let mut desc_b = sample_desc("modB");
+        desc_b.provides.push(ModuleProvidesEntry {
+            service: "com/example/SPI".to_string(),
+            with: vec!["com/other/SPIImpl2".to_string()],
+        });
+        desc_b.provides.push(ModuleProvidesEntry {
+            service: "com/example/OtherSPI".to_string(),
+            with: vec!["com/other/OtherImpl".to_string()],
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc, vec![]);
+        reg.register(desc_b, vec![]);
+
+        let mut providers = reg.service_providers("com/example/SPI");
+        providers.sort();
+        assert_eq!(providers, vec!["com/example/SPIImpl", "com/other/SPIImpl2"]);
+
+        let other = reg.service_providers("com/example/OtherSPI");
+        assert_eq!(other, vec!["com/other/OtherImpl"]);
+
+        assert!(reg.service_providers("nonexistent/SPI").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: Cycle detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_cycles_no_cycles() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+
+        assert!(reg.detect_cycles().is_empty());
+    }
+
+    #[test]
+    fn detect_cycles_simple_cycle() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let mut desc_b = sample_desc("modB");
+        desc_b.requires.push(ModuleRequiresEntry {
+            module_name: "modA".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(desc_b, vec![]);
+
+        let cycles = reg.detect_cycles();
+        assert!(!cycles.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: Deep reflection access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deep_reflection_same_module_ok() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.check_deep_reflection_access("modA", "modA", "com/foo").is_ok());
+    }
+
+    #[test]
+    fn deep_reflection_unnamed_target_always_ok() {
+        // A classpath (unnamed) target has nothing to encapsulate —
+        // reflection into it always succeeds regardless of accessor.
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        assert!(reg.check_deep_reflection_access("modA", UNNAMED_MODULE, "com/foo").is_ok());
+        assert!(reg.check_deep_reflection_access(UNNAMED_MODULE, UNNAMED_MODULE, "anything").is_ok());
+    }
+
+    #[test]
+    fn deep_reflection_unnamed_accessor_denied_by_default_jep403() {
+        // JEP 403 (JDK 17+): classpath code CANNOT deep-reflect into a
+        // named module's non-opened package by default. Pre-JEP-403 JDKs
+        // treated unnamed accessors as unconditionally allowed — that is
+        // the behavior RustJVM explicitly rejects here.
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.build_readability_graph();
+        assert!(
+            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret").is_err(),
+            "unnamed accessor must not bypass strong encapsulation"
+        );
+    }
+
+    #[test]
+    fn deep_reflection_unnamed_accessor_allowed_with_add_opens() {
+        // Same denied case, but `--add-opens modA/com.secret=ALL-UNNAMED`
+        // (represented here as dynamic add_opens with empty target) grants
+        // access to the unnamed accessor.
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.build_readability_graph();
+        // add_opens with empty target = unqualified = open to all (incl. unnamed)
+        reg.add_opens("modA", "com/secret", "");
+        assert!(
+            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret").is_ok(),
+            "--add-opens should grant unnamed accessor deep access"
+        );
+    }
+
+    #[test]
+    fn deep_reflection_denied_without_opens() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let desc_b = sample_desc("modB");
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(desc_b, vec!["com/secret".to_string()]);
+        reg.build_readability_graph();
+
+        // modA reads modB, but modB does not open com/secret → denied.
+        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_err());
+    }
+
+    #[test]
+    fn deep_reflection_allowed_with_opens() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let mut desc_b = sample_desc("modB");
+        desc_b.opens.push(ModuleOpensEntry {
+            package_name: "com/secret".to_string(),
+            to_modules: vec!["modA".to_string()],
+        });
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(desc_b, vec!["com/secret".to_string()]);
+        reg.build_readability_graph();
+
+        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_ok());
+    }
+
+    #[test]
+    fn deep_reflection_dynamic_add_opens() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let desc_b = sample_desc("modB");
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(desc_b, vec!["com/secret".to_string()]);
+        reg.build_readability_graph();
+
+        // Initially denied.
+        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_err());
+
+        // Dynamic addOpens.
+        reg.add_opens("modB", "com/secret", "modA");
+        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: Dynamic export affects check_module_access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dynamic_export_enables_access() {
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+        let desc_b = sample_desc("modB"); // no exports
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(desc_b, vec!["com/internal".to_string()]);
+        reg.build_readability_graph();
+
+        // modA reads modB, but modB doesn't export com/internal → denied.
+        assert!(reg.check_module_access("modA", "modB", "com/internal").is_err());
+
+        // Dynamic addExports.
+        reg.add_exports("modB", "com/internal", "modA");
+        assert!(reg.check_module_access("modA", "modB", "com/internal").is_ok());
+    }
+}

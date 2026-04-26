@@ -1,0 +1,34 @@
+target/
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+apps/
+
+# NOTE: .class files in test_classes/ and demo/ are intentional test fixtures
+# and should remain checked in. Do not add a blanket *.class ignore.
+
+# JAR files (benchmark dependencies — download separately)
+bench/*.jar
+
+# Temp files
+*.tmp
+
+# Windows artifacts
+nul
+
+# Distribution binaries
+dist/*.exe
+dist/*.dll
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Claude Code
+.claude/

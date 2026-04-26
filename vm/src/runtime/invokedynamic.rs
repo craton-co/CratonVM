@@ -1,0 +1,2009 @@
+//! invokedynamic support: StringConcatFactory and LambdaMetafactory.
+//!
+//! Handles the two most common bootstrap methods produced by javac:
+//!
+//! 1. **StringConcatFactory.makeConcatWithConstants** (Java 9+): compiles `"foo" + bar`
+//!    to invokedynamic with a recipe string. `\u0001` = argument placeholder.
+//!
+//! 2. **LambdaMetafactory.metafactory** (Java 8+): compiles lambdas and method
+//!    references to invokedynamic, producing lightweight proxy objects that implement
+//!    a functional interface and delegate to the implementation method.
+
+use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+
+use crate::classloading::resolution::{
+    LambdaCallSite, MethodHandle, MethodHandleKind, RecordMethodKind, ResolvedCallSite, SwitchLabel,
+};
+use crate::classloading::ClassId;
+use crate::error::{MethodCallFailed, RuntimeError, VmError};
+use crate::threading::jvm_thread::JvmThread;
+use crate::types::{ObjectRef, Value};
+use crate::vm::{create_java_string, read_java_string, NativeContextImpl, SharedVm};
+
+/// The StringConcatFactory bootstrap method class name.
+const STRING_CONCAT_FACTORY: &str = "java/lang/invoke/StringConcatFactory";
+
+/// The StringConcatFactory bootstrap method name (with recipe).
+const MAKE_CONCAT_WITH_CONSTANTS: &str = "makeConcatWithConstants";
+
+/// The StringConcatFactory.makeConcat method name (no recipe, all args concatenated).
+const MAKE_CONCAT: &str = "makeConcat";
+
+/// The LambdaMetafactory bootstrap method class name.
+const LAMBDA_METAFACTORY: &str = "java/lang/invoke/LambdaMetafactory";
+
+/// The LambdaMetafactory.metafactory bootstrap method name.
+const METAFACTORY: &str = "metafactory";
+
+/// The LambdaMetafactory.altMetafactory bootstrap method name (advanced flags variant).
+const ALT_METAFACTORY: &str = "altMetafactory";
+
+/// The SwitchBootstraps bootstrap method class name (JEP 441, Java 21).
+const SWITCH_BOOTSTRAPS: &str = "java/lang/runtime/SwitchBootstraps";
+
+/// SwitchBootstraps.typeSwitch bootstrap method name.
+const TYPE_SWITCH: &str = "typeSwitch";
+
+/// SwitchBootstraps.enumSwitch bootstrap method name.
+const ENUM_SWITCH: &str = "enumSwitch";
+
+/// ObjectMethods bootstrap class (JEP 395, Java 16+) — records.
+const OBJECT_METHODS: &str = "java/lang/runtime/ObjectMethods";
+
+/// ObjectMethods.bootstrap method name.
+const BOOTSTRAP: &str = "bootstrap";
+
+/// Data extracted from the constant pool under a read lock, owned so we can
+/// drop the lock before proceeding with string creation (which needs a write lock).
+struct IndyInfo {
+    bsm_class: String,
+    bsm_method: String,
+    target_name: String,
+    target_descriptor: String,
+    /// The recipe string (first bootstrap argument, if StringConcatFactory).
+    recipe: String,
+    /// Additional constant strings from bootstrap arguments (for \u0002 placeholders).
+    constant_args: Vec<String>,
+    /// Raw CP indices for bootstrap arguments (needed for LambdaMetafactory).
+    bootstrap_arg_indices: Vec<u16>,
+}
+
+/// Execute an invokedynamic instruction.
+///
+/// Supports two bootstrap methods:
+/// - `StringConcatFactory.makeConcatWithConstants` — string concatenation
+/// - `LambdaMetafactory.metafactory` — lambda / method reference creation
+///
+/// Call sites are cached after first bootstrap: subsequent executions reuse the
+/// cached result without re-resolving the constant pool.
+pub fn execute_invokedynamic(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+) -> Result<(), MethodCallFailed> {
+    let current_class_id = thread.frames[frame_idx].class_id;
+
+    // --- Fast path: check call site cache ---
+    {
+        let cache = shared.resolution_cache.read();
+        if let Some(site) = cache.get_call_site(current_class_id, cp_index) {
+            return execute_cached_call_site(shared, thread, frame_idx, site);
+        }
+    }
+
+    // --- Slow path: bootstrap the call site ---
+    // Extract all needed data under the class_manager read lock, then drop it.
+    // This avoids deadlocking when create_java_string needs a write lock.
+    let info = {
+        let cm = shared.class_manager.read();
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic: class {current_class_id} not found"),
+            })?;
+
+        // 1. Resolve the InvokeDynamic CP entry
+        let (bsm_index, nat_index) = match class.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::InvokeDynamic {
+                bootstrap_method_attr_index,
+                name_and_type_index,
+            }) => (*bootstrap_method_attr_index, *name_and_type_index),
+            _ => {
+                return Err(VmError::Internal {
+                    message: format!("invokedynamic cp#{cp_index}: not an InvokeDynamic entry"),
+                }
+                .into());
+            }
+        };
+
+        // 2. Get the target name and descriptor from NameAndType
+        let (target_name, target_descriptor) = class
+            .constant_pool
+            .get_name_and_type(nat_index)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic: invalid name_and_type at cp#{nat_index}"),
+            })?;
+
+        // 3. Look up the bootstrap method
+        let bsm = class
+            .bootstrap_methods
+            .get(bsm_index as usize)
+            .ok_or_else(|| VmError::Internal {
+                message: format!(
+                    "invokedynamic: bootstrap method index {bsm_index} out of bounds (have {})",
+                    class.bootstrap_methods.len()
+                ),
+            })?;
+
+        // 4. Resolve the MethodHandle to determine which bootstrap method it is
+        let bsm_handle =
+            resolve_method_handle_full(&class.constant_pool, bsm.bootstrap_method_ref)?;
+        let bsm_class = bsm_handle.class_name;
+        let bsm_method = bsm_handle.member_name;
+
+        // 5. Extract recipe and constant args (if StringConcatFactory)
+        let recipe = if let Some(&arg_index) = bsm.bootstrap_arguments.first() {
+            resolve_string_constant(&class.constant_pool, arg_index).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let constant_args: Vec<String> = bsm
+            .bootstrap_arguments
+            .iter()
+            .skip(1) // skip recipe
+            .map(|&idx| resolve_string_constant(&class.constant_pool, idx).unwrap_or_default())
+            .collect();
+
+        let bootstrap_arg_indices = bsm.bootstrap_arguments.clone();
+
+        IndyInfo {
+            bsm_class,
+            bsm_method,
+            target_name: target_name.to_string(),
+            target_descriptor: target_descriptor.to_string(),
+            recipe,
+            constant_args,
+            bootstrap_arg_indices,
+        }
+    }; // cm read lock dropped here
+
+    if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT_WITH_CONSTANTS {
+        // Cache the StringConcat call site
+        let site = ResolvedCallSite::StringConcat {
+            recipe: info.recipe.clone(),
+            constant_args: info.constant_args.clone(),
+            target_descriptor: info.target_descriptor.clone(),
+        };
+        shared
+            .resolution_cache
+            .write()
+            .put_call_site(current_class_id, cp_index, site);
+
+        execute_string_concat(shared, thread, frame_idx, &info)
+    } else if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT {
+        // makeConcat has no recipe — all arguments are simply concatenated in order.
+        // Synthesize a recipe of all \u{0001} placeholders so the existing concat
+        // logic works unchanged.
+        let arg_types = parse_descriptor_args(&info.target_descriptor);
+        let synthetic_recipe: String = std::iter::repeat('\u{0001}').take(arg_types.len()).collect();
+        let patched_info = IndyInfo {
+            bsm_class: info.bsm_class.clone(),
+            bsm_method: info.bsm_method.clone(),
+            target_name: info.target_name.clone(),
+            target_descriptor: info.target_descriptor.clone(),
+            recipe: synthetic_recipe.clone(),
+            constant_args: vec![],
+            bootstrap_arg_indices: info.bootstrap_arg_indices.clone(),
+        };
+
+        let site = ResolvedCallSite::StringConcat {
+            recipe: synthetic_recipe,
+            constant_args: vec![],
+            target_descriptor: info.target_descriptor.clone(),
+        };
+        shared
+            .resolution_cache
+            .write()
+            .put_call_site(current_class_id, cp_index, site);
+
+        execute_string_concat(shared, thread, frame_idx, &patched_info)
+    } else if info.bsm_class == LAMBDA_METAFACTORY
+        && (info.bsm_method == METAFACTORY || info.bsm_method == ALT_METAFACTORY)
+    {
+        // altMetafactory has additional bootstrap arguments (flags, marker interfaces,
+        // bridges) beyond the 3 standard ones, but the core lambda proxy creation is
+        // identical — extra args are advisory and not needed for dispatch.
+        bootstrap_lambda(shared, thread, frame_idx, cp_index, &info)
+    } else if info.bsm_class == SWITCH_BOOTSTRAPS && info.bsm_method == TYPE_SWITCH {
+        bootstrap_type_switch(shared, thread, frame_idx, cp_index, &info)
+    } else if info.bsm_class == SWITCH_BOOTSTRAPS && info.bsm_method == ENUM_SWITCH {
+        bootstrap_enum_switch(shared, thread, frame_idx, cp_index, &info)
+    } else if info.bsm_class == OBJECT_METHODS && info.bsm_method == BOOTSTRAP {
+        bootstrap_record_object_method(shared, thread, frame_idx, cp_index, &info)
+    } else {
+        // Graceful fallback for unrecognized bootstrap methods: pop the expected
+        // arguments from the operand stack (based on the invokedynamic descriptor)
+        // and push a null result. This prevents stack corruption that would otherwise
+        // cascade into stack underflow errors in <clinit> and other callers.
+        let nat_str = format!("{}{}", info.target_name, info.target_descriptor);
+        let caller = {
+            let f = &thread.frames[frame_idx];
+            format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc)
+        };
+        crate::runtime::diagnostics::record_swallow(
+            shared,
+            "invokedynamic",
+            "unrecognized-bsm",
+            &format!(
+                "bsm={}.{} target={} caller=[{}]",
+                info.bsm_class, info.bsm_method, nat_str, caller
+            ),
+        );
+        fallback_unrecognized_bsm(shared, thread, frame_idx, &info)
+    }
+}
+
+/// Graceful fallback for unrecognized bootstrap methods.
+///
+/// Pops the expected arguments from the operand stack (based on the invokedynamic
+/// descriptor) and pushes an appropriate default result. For reference return types
+/// this is `null`; for primitives, the zero value. This prevents stack corruption
+/// that would otherwise cascade into stack underflow errors.
+fn fallback_unrecognized_bsm(
+    _shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    let arg_types = parse_descriptor_args(&info.target_descriptor);
+
+    // Pop all arguments that the caller pushed for this invokedynamic
+    for _ in 0..arg_types.len() {
+        let _ = thread.frames[frame_idx].stack.pop()?;
+    }
+
+    // Determine return type and push appropriate default
+    let ret_type = info
+        .target_descriptor
+        .rsplit(')')
+        .next()
+        .unwrap_or("V");
+
+    match ret_type.as_bytes().first() {
+        Some(b'V') | None => {
+            // void — push nothing
+        }
+        Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
+            thread.frames[frame_idx].stack.push(Value::Int(0))?;
+        }
+        Some(b'J') => {
+            thread.frames[frame_idx].stack.push(Value::Long(0))?;
+        }
+        Some(b'F') => {
+            thread.frames[frame_idx].stack.push(Value::Float(0.0))?;
+        }
+        Some(b'D') => {
+            thread.frames[frame_idx].stack.push(Value::Double(0.0))?;
+        }
+        _ => {
+            // Reference type (L...; or [...) — push null
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(None))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute a previously cached call site (fast path).
+fn execute_cached_call_site(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    site: &ResolvedCallSite,
+) -> Result<(), MethodCallFailed> {
+    match site {
+        ResolvedCallSite::StringConcat {
+            recipe,
+            constant_args,
+            target_descriptor,
+        } => {
+            let info = IndyInfo {
+                bsm_class: String::new(),
+                bsm_method: String::new(),
+                target_name: String::new(),
+                target_descriptor: target_descriptor.clone(),
+                recipe: recipe.clone(),
+                constant_args: constant_args.clone(),
+                bootstrap_arg_indices: vec![],
+            };
+            execute_string_concat(shared, thread, frame_idx, &info)
+        }
+        ResolvedCallSite::Lambda(lcs) => execute_cached_lambda(shared, thread, frame_idx, lcs),
+        ResolvedCallSite::TypeSwitch { labels } => {
+            execute_type_switch(shared, thread, frame_idx, labels)
+        }
+        ResolvedCallSite::EnumSwitch { labels } => {
+            execute_enum_switch(shared, thread, frame_idx, labels)
+        }
+        ResolvedCallSite::RecordObjectMethod {
+            method,
+            component_names,
+            field_indices,
+            field_descriptors,
+        } => execute_record_object_method(
+            shared,
+            thread,
+            frame_idx,
+            *method,
+            component_names,
+            field_indices,
+            field_descriptors,
+        ),
+    }
+}
+
+/// Bootstrap a LambdaMetafactory.metafactory call site.
+///
+/// LambdaMetafactory bootstrap arguments:
+///   arg[0]: MethodType — SAM erased method type
+///   arg[1]: MethodHandle — implementation method
+///   arg[2]: MethodType — SAM instantiated method type
+///
+/// The invokedynamic descriptor specifies the captured values → functional interface type.
+fn bootstrap_lambda(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    let current_class_id = thread.frames[frame_idx].class_id;
+
+    // Parse bootstrap arguments from constant pool
+    // We need to re-acquire the class manager lock briefly to resolve the BSM args
+    let (sam_erased_desc, impl_handle, instantiated_desc) = {
+        let cm = shared.class_manager.read();
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: "lambda bootstrap: class not found".to_string(),
+            })?;
+
+        if info.bootstrap_arg_indices.len() < 3 {
+            return Err(VmError::Internal {
+                message: format!(
+                    "LambdaMetafactory: expected 3 bootstrap args, got {}",
+                    info.bootstrap_arg_indices.len()
+                ),
+            }
+            .into());
+        }
+
+        let sam_erased = resolve_method_type(&class.constant_pool, info.bootstrap_arg_indices[0])
+            .ok_or_else(|| VmError::Internal {
+            message: "LambdaMetafactory: invalid SAM erased MethodType".to_string(),
+        })?;
+
+        let impl_mh =
+            resolve_method_handle_full(&class.constant_pool, info.bootstrap_arg_indices[1])?;
+
+        let instantiated = resolve_method_type(&class.constant_pool, info.bootstrap_arg_indices[2])
+            .ok_or_else(|| VmError::Internal {
+                message: "LambdaMetafactory: invalid instantiated MethodType".to_string(),
+            })?;
+
+        (sam_erased, impl_mh, instantiated)
+    };
+
+    // Parse the factory descriptor to determine:
+    //   - capture types (parameters of the invokedynamic)
+    //   - functional interface (return type)
+    let capture_types = parse_descriptor_args(&info.target_descriptor);
+    let functional_interface =
+        parse_return_type_class(&info.target_descriptor).ok_or_else(|| VmError::Internal {
+            message: format!(
+                "LambdaMetafactory: cannot parse return type from '{}'",
+                info.target_descriptor
+            ),
+        })?;
+
+    // Allocate a synthetic proxy ClassId
+    let proxy_class_id = shared.alloc_lambda_proxy_id();
+
+    // Build the LambdaCallSite
+    let call_site = LambdaCallSite {
+        functional_interface: functional_interface.clone(),
+        sam_method_name: info.target_name.clone(),
+        sam_descriptor: sam_erased_desc,
+        impl_handle,
+        instantiated_descriptor: instantiated_desc,
+        capture_types: capture_types.clone(),
+        proxy_class_id,
+    };
+
+    // Register the lambda proxy and cache the call site
+    {
+        let mut proxies = shared.lambda_proxies.write();
+        if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
+            proxies.insert(proxy_class_id, call_site.clone());
+        }
+    }
+    shared.resolution_cache.write().put_call_site(
+        current_class_id,
+        cp_index,
+        ResolvedCallSite::Lambda(call_site),
+    );
+
+    // Now execute: pop captured values, allocate proxy object, push it
+    allocate_lambda_proxy(shared, thread, frame_idx, proxy_class_id, &capture_types)
+}
+
+/// Execute a cached lambda call site: pop captures, allocate proxy, push result.
+fn execute_cached_lambda(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    lcs: &LambdaCallSite,
+) -> Result<(), MethodCallFailed> {
+    allocate_lambda_proxy(
+        shared,
+        thread,
+        frame_idx,
+        lcs.proxy_class_id,
+        &lcs.capture_types,
+    )
+}
+
+/// Pop captured values from the stack, allocate a lambda proxy object, push it.
+fn allocate_lambda_proxy(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    proxy_class_id: ClassId,
+    capture_types: &[char],
+) -> Result<(), MethodCallFailed> {
+    let num_captures = capture_types.len();
+
+    // Pop captured values (pushed left-to-right, pop right-to-left)
+    let mut captures: Vec<Value> = Vec::with_capacity(num_captures);
+    for _ in 0..num_captures {
+        captures.push(thread.frames[frame_idx].stack.pop()?);
+    }
+    captures.reverse();
+
+    // Allocate a proxy object on the heap with fields for captured values.
+    // Use try_alloc + GC retry to avoid aborting on young-gen exhaustion.
+    let proxy_ref = match shared.heap.try_alloc_object(proxy_class_id, num_captures) {
+        Some(obj) => obj,
+        None => {
+            thread.tlab.retire();
+            super::interpreter::maybe_gc_forced_pub(shared, thread);
+            shared.heap.try_alloc_object(proxy_class_id, num_captures).ok_or_else(|| {
+                MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                    crate::error::RuntimeError::OutOfMemoryError {
+                        message: format!(
+                            "Java heap space (lambda proxy with {} captures)",
+                            num_captures,
+                        ),
+                    },
+                ))
+            })?
+        }
+    };
+    for (i, val) in captures.iter().enumerate() {
+        shared.heap.set_field(proxy_ref, i, *val);
+    }
+
+    // Push the proxy object onto the stack
+    thread.frames[frame_idx]
+        .stack
+        .push(Value::Object(Some(proxy_ref)))?;
+
+    Ok(())
+}
+
+/// Parse the return type of a method descriptor as a class name.
+/// E.g. `"(I)Ljava/util/function/Consumer;"` → `Some("java/util/function/Consumer")`
+fn parse_return_type_class(descriptor: &str) -> Option<String> {
+    let ret = descriptor.rsplit(')').next()?;
+    if ret.starts_with('L') && ret.ends_with(';') {
+        Some(ret[1..ret.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve a MethodHandle CP entry to a full [`MethodHandle`] struct.
+///
+/// Extracts reference_kind, class name, member name, and descriptor from
+/// the constant pool. Handles all 9 reference kinds (field refs, method refs,
+/// interface method refs).
+pub fn resolve_method_handle_full(
+    cp: &ConstantPool,
+    mh_index: u16,
+) -> Result<MethodHandle, MethodCallFailed> {
+    let (ref_kind, ref_index) = match cp.get(mh_index) {
+        Some(ConstantPoolEntry::MethodHandle {
+            reference_kind,
+            reference_index,
+        }) => (*reference_kind, *reference_index),
+        _ => {
+            return Err(VmError::Internal {
+                message: format!("invokedynamic: cp#{mh_index} is not a MethodHandle"),
+            }
+            .into());
+        }
+    };
+
+    let kind = MethodHandleKind::from_tag(ref_kind).ok_or_else(|| VmError::Internal {
+        message: format!("invokedynamic: invalid MethodHandle reference_kind {ref_kind}"),
+    })?;
+
+    // Extract class_index and name_and_type_index from the reference entry.
+    // reference_kind 1-4 reference FieldReference, 5-9 reference MethodReference
+    // or InterfaceMethodReference.
+    let (class_index, nat_index) = match cp.get(ref_index) {
+        Some(ConstantPoolEntry::FieldReference {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        Some(ConstantPoolEntry::InterfaceMethodReference {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        _ => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "invokedynamic: MethodHandle ref cp#{ref_index} \
+                     is not a Field/Method/InterfaceMethod reference"
+                ),
+            }
+            .into());
+        }
+    };
+
+    let class_name = cp
+        .get_class_name(class_index)
+        .ok_or_else(|| VmError::Internal {
+            message: format!("invokedynamic: invalid class at cp#{class_index}"),
+        })?
+        .to_string();
+
+    let (member_name, descriptor) =
+        cp.get_name_and_type(nat_index)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic: invalid name_and_type at cp#{nat_index}"),
+            })?;
+
+    Ok(MethodHandle {
+        kind,
+        class_name,
+        member_name: member_name.to_string(),
+        descriptor: descriptor.to_string(),
+    })
+}
+
+/// Execute StringConcatFactory.makeConcatWithConstants.
+///
+/// Called after the class_manager read lock has been released.
+fn execute_string_concat(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    let arg_types = parse_descriptor_args(&info.target_descriptor);
+
+    // Pop arguments from the stack (pushed left-to-right, pop right-to-left).
+    //
+    // WP4.3 — descriptor-aware decode: for `J`-typed (long) args the
+    // operand-stack slot is untagged raw bits (CompactValue::long stores
+    // the i64 directly without NaN-boxing for non-collision values), and a
+    // plain `pop()` decodes it via `to_value()` → `Value::Double` because
+    // the bit pattern is not NaN-tagged.  String concat then formats it as
+    // `0.0` / a denormal.  Routing the pop through `decode_by_descriptor`
+    // (already present in `types/src/compact_value.rs:520`) yields the
+    // declared `Value::Long(...)` instead, which formats correctly.
+    let mut arg_values: Vec<Value> = Vec::with_capacity(arg_types.len());
+    for i in 0..arg_types.len() {
+        let cv = thread.frames[frame_idx].stack.pop_compact();
+        let desc_byte = arg_types
+            .get(arg_types.len() - 1 - i)
+            .copied()
+            .unwrap_or('L') as u8;
+        arg_values.push(cv.decode_by_descriptor(desc_byte));
+    }
+    arg_values.reverse();
+
+    // Walk the recipe and build the result string
+    let mut result = String::new();
+    let mut arg_idx = 0;
+    let mut const_idx = 0;
+
+    for ch in info.recipe.chars() {
+        if ch == '\u{0001}' {
+            // Argument placeholder
+            if arg_idx < arg_values.len() {
+                let arg_type = arg_types.get(arg_idx).copied().unwrap_or('L');
+                let s = value_to_string(shared, Some(thread), &arg_values[arg_idx], arg_type);
+                result.push_str(&s);
+                arg_idx += 1;
+            }
+        } else if ch == '\u{0002}' {
+            // Constant placeholder (from bootstrap_arguments[1..])
+            if let Some(s) = info.constant_args.get(const_idx) {
+                result.push_str(s);
+            }
+            const_idx += 1;
+        } else {
+            result.push(ch);
+        }
+    }
+
+    let str_ref = create_java_string(shared, &result);
+    thread.frames[frame_idx]
+        .stack
+        .push(Value::Object(Some(str_ref)))?;
+
+    Ok(())
+}
+
+/// Resolve a CONSTANT_MethodType CP entry to its descriptor string.
+pub fn resolve_method_type(cp: &ConstantPool, index: u16) -> Option<String> {
+    match cp.get(index)? {
+        ConstantPoolEntry::MethodType { descriptor_index } => {
+            cp.get_utf8(*descriptor_index).map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a string constant from the constant pool.
+pub(crate) fn resolve_string_constant(cp: &ConstantPool, index: u16) -> Option<String> {
+    match cp.get(index)? {
+        ConstantPoolEntry::StringReference { string_index } => {
+            cp.get_utf8(*string_index).map(|s| s.to_string())
+        }
+        ConstantPoolEntry::Utf8(s) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Parse the argument types from a method descriptor.
+fn parse_descriptor_args(descriptor: &str) -> Vec<char> {
+    let mut args = Vec::new();
+    let bytes = descriptor.as_bytes();
+    let mut i = 0;
+
+    if i < bytes.len() && bytes[i] == b'(' {
+        i += 1;
+    }
+
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'B' | b'C' | b'I' | b'S' | b'Z' => {
+                args.push(bytes[i] as char);
+                i += 1;
+            }
+            b'J' => {
+                args.push('J');
+                i += 1;
+            }
+            b'F' => {
+                args.push('F');
+                i += 1;
+            }
+            b'D' => {
+                args.push('D');
+                i += 1;
+            }
+            b'L' => {
+                args.push('L');
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                args.push('L');
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    if bytes[i] == b'L' {
+                        while i < bytes.len() && bytes[i] != b';' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    args
+}
+
+/// Convert a JVM Value to its string representation for string concatenation.
+///
+/// When `thread` is provided, objects that are not strings or primitive wrappers
+/// will have their `toString()` called via virtual dispatch. This produces
+/// correct output for ArrayList, HashMap, user classes, etc.
+fn value_to_string(
+    shared: &SharedVm,
+    thread: Option<&mut JvmThread>,
+    value: &Value,
+    type_char: char,
+) -> String {
+    match value {
+        Value::Int(v) => match type_char {
+            'Z' => {
+                if *v != 0 {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            'C' => {
+                if let Some(ch) = char::from_u32(*v as u32) {
+                    ch.to_string()
+                } else {
+                    format!("\\u{:04x}", *v as u16)
+                }
+            }
+            _ => v.to_string(),
+        },
+        Value::Long(v) => v.to_string(),
+        Value::Float(v) => format_float(*v),
+        Value::Double(v) => format_double(*v),
+        Value::Object(None) => "null".to_string(),
+        Value::Object(Some(obj_ref)) => {
+            // Try to read as a Java String first
+            if let Some(s) = read_java_string(&shared.heap, *obj_ref) {
+                return s;
+            }
+
+            // Check for wrapper types (1-field objects with a primitive value)
+            let nf = shared.heap.get_header(*obj_ref).num_slots as usize;
+            if nf == 1 {
+                match shared.heap.get_field(*obj_ref, 0) {
+                    Value::Int(v) => {
+                        let class_id = shared.heap.class_id_of(*obj_ref);
+                        let name = shared.class_manager.read()
+                            .get_class(class_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        if name.contains("Boolean") {
+                            return if v != 0 { "true".to_string() } else { "false".to_string() };
+                        } else if name.contains("Character") {
+                            return char::from_u32(v as u32).unwrap_or('?').to_string();
+                        }
+                        return v.to_string();
+                    }
+                    Value::Long(v) => return v.to_string(),
+                    Value::Float(v) => return format_float(v),
+                    Value::Double(v) => return format_double(v),
+                    _ => {}
+                }
+            }
+
+            // Call toString() via virtual dispatch if thread context is available
+            if let Some(t) = thread {
+                let mut ctx = NativeContextImpl { shared, thread: t };
+                use rustjvm_native_api::NativeContext;
+                match ctx.invoke_virtual(*obj_ref, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(str_ref)))) => {
+                        return ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string());
+                    }
+                    _ => {}
+                }
+            }
+
+            // Final fallback: ClassName@hash
+            let class_id = shared.heap.class_id_of(*obj_ref);
+            let class_name = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let dotted = class_name.replace('/', ".");
+            let hash = shared.heap.identity_hash_code(*obj_ref);
+            format!("{dotted}@{hash:x}")
+        }
+        _ => "?".to_string(),
+    }
+}
+
+/// Format a float value like Java does.
+fn format_float(v: f32) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else if v == 0.0 && v.is_sign_negative() {
+        "-0.0".to_string()
+    } else {
+        let s = format!("{v}");
+        if !s.contains('.') && !s.contains('E') && !s.contains('e') {
+            format!("{s}.0")
+        } else {
+            s
+        }
+    }
+}
+
+/// Format a double value like Java does.
+fn format_double(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else if v == 0.0 && v.is_sign_negative() {
+        "-0.0".to_string()
+    } else {
+        let s = format!("{v}");
+        if !s.contains('.') && !s.contains('E') && !s.contains('e') {
+            format!("{s}.0")
+        } else {
+            s
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SwitchBootstraps — JEP 441 (Pattern Matching for switch, Java 21)
+// ---------------------------------------------------------------------------
+
+/// Bootstrap a `SwitchBootstraps.typeSwitch` call site.
+///
+/// Bootstrap arguments are an array of labels: each is a `Class<?>` (type check),
+/// an `Integer` (exact int match), or a `String` (exact string match).
+/// ClassIds are pre-resolved here so the execution loop needs no locks.
+fn bootstrap_type_switch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    let current_class_id = thread.frames[frame_idx].class_id;
+
+    // Phase 1: extract label names from constant pool (read lock only).
+    let raw_labels: Vec<RawSwitchLabel> = {
+        let cm = shared.class_manager.read();
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("typeSwitch: class {current_class_id} not found"),
+            })?;
+
+        let mut raw = Vec::with_capacity(info.bootstrap_arg_indices.len());
+        for &arg_idx in &info.bootstrap_arg_indices {
+            match class.constant_pool.get(arg_idx) {
+                Some(ConstantPoolEntry::ClassReference { name_index }) => {
+                    let name = class
+                        .constant_pool
+                        .get_utf8(*name_index)
+                        .unwrap_or("")
+                        .to_string();
+                    raw.push(RawSwitchLabel::Type(name));
+                }
+                Some(ConstantPoolEntry::Integer(v)) => {
+                    raw.push(RawSwitchLabel::Int(*v));
+                }
+                Some(ConstantPoolEntry::Long(v)) => {
+                    raw.push(RawSwitchLabel::Long(*v));
+                }
+                Some(ConstantPoolEntry::Float(v)) => {
+                    raw.push(RawSwitchLabel::Float(*v));
+                }
+                Some(ConstantPoolEntry::Double(v)) => {
+                    raw.push(RawSwitchLabel::Double(*v));
+                }
+                Some(ConstantPoolEntry::StringReference { string_index }) => {
+                    let s = class
+                        .constant_pool
+                        .get_utf8(*string_index)
+                        .unwrap_or("")
+                        .to_string();
+                    raw.push(RawSwitchLabel::Str(s));
+                }
+                Some(ConstantPoolEntry::Dynamic { name_and_type_index, .. }) => {
+                    // JDK 25 primitive patterns (JEP 507): Dynamic constant that
+                    // resolves via ConstantBootstraps.primitiveClass to a primitive
+                    // Class (int.class, long.class, etc.). The name in the
+                    // NameAndType is the primitive type descriptor ("I", "J", etc.).
+                    if let Some(ConstantPoolEntry::NameAndType { name_index, .. }) =
+                        class.constant_pool.get(*name_and_type_index)
+                    {
+                        let desc = class
+                            .constant_pool
+                            .get_utf8(*name_index)
+                            .unwrap_or("")
+                            .to_string();
+                        raw.push(RawSwitchLabel::PrimitiveClass(desc));
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        "Unrecognized constant pool entry type in switch label resolution (index {})",
+                        arg_idx
+                    );
+                }
+            }
+        }
+        raw
+    }; // read lock dropped
+
+    // Phase 2: resolve all Type labels to ClassIds (one write lock per class, done once).
+    let mut labels = Vec::with_capacity(raw_labels.len());
+    for raw in raw_labels {
+        match raw {
+            RawSwitchLabel::Type(name) => {
+                let cid = shared.load_class_concurrent(&name)?;
+                labels.push(SwitchLabel::Type {
+                    class_name: name,
+                    class_id: cid,
+                });
+            }
+            RawSwitchLabel::Int(v) => labels.push(SwitchLabel::Int(v)),
+            RawSwitchLabel::Long(v) => labels.push(SwitchLabel::Long(v)),
+            RawSwitchLabel::Float(v) => labels.push(SwitchLabel::Float(v)),
+            RawSwitchLabel::Double(v) => labels.push(SwitchLabel::Double(v)),
+            RawSwitchLabel::Str(s) => labels.push(SwitchLabel::Str(s)),
+            RawSwitchLabel::PrimitiveClass(desc) => {
+                labels.push(SwitchLabel::PrimitiveClass(desc));
+            }
+        }
+    }
+
+    // Cache the call site — subsequent executions use pre-resolved ClassIds.
+    let site = ResolvedCallSite::TypeSwitch {
+        labels: labels.clone(),
+    };
+    shared
+        .resolution_cache
+        .write()
+        .put_call_site(current_class_id, cp_index, site);
+
+    execute_type_switch(shared, thread, frame_idx, &labels)
+}
+
+/// Temporary label type used during bootstrap before ClassId resolution.
+enum RawSwitchLabel {
+    Type(String),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Str(String),
+    PrimitiveClass(String),
+}
+
+/// Execute a cached `typeSwitch` call site.
+///
+/// Stack: `[..., target: Object, startIndex: int]` → `[..., matchIndex: int]`
+///
+/// All Type labels have pre-resolved ClassIds — no lock acquisitions in the loop.
+pub fn execute_type_switch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    labels: &[SwitchLabel],
+) -> Result<(), MethodCallFailed> {
+    let start_index = match thread.frames[frame_idx].stack.pop()? {
+        Value::Int(i) => i.max(0) as usize,
+        _ => 0,
+    };
+    let target = thread.frames[frame_idx].stack.pop()?;
+
+    let result = match target {
+        // Null target has no matching label → return labels.len() (default arm).
+        // Callers that want `case null` handling must check the pattern before
+        // invoking the bootstrap.
+        Value::Object(None) => labels.len() as i32,
+        Value::Object(Some(obj_ref)) => {
+            let obj_class_id = shared.heap.class_id_of(obj_ref);
+            // Read the object's class name once for boxed-type matching.
+            let obj_class_name = shared
+                .class_manager
+                .read()
+                .get_class(obj_class_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            type_switch_match(
+                shared,
+                obj_ref,
+                obj_class_id,
+                &obj_class_name,
+                labels,
+                start_index,
+            )
+        }
+        Value::Int(v) => primitive_match(
+            labels,
+            start_index,
+            |l| matches!(l, SwitchLabel::Int(e) if *e == v)
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "I" || d == "Z" || d == "B" || d == "S" || d == "C"),
+        ),
+        Value::Long(v) => primitive_match(
+            labels,
+            start_index,
+            |l| matches!(l, SwitchLabel::Long(e) if *e == v)
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "J"),
+        ),
+        Value::Float(v) => primitive_match(
+            labels,
+            start_index,
+            |l| matches!(l, SwitchLabel::Float(e) if e.to_bits() == v.to_bits())
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "F"),
+        ),
+        Value::Double(v) => primitive_match(
+            labels,
+            start_index,
+            |l| matches!(l, SwitchLabel::Double(e) if e.to_bits() == v.to_bits())
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "D"),
+        ),
+        _ => -1,
+    };
+
+    thread.frames[frame_idx].stack.push(Value::Int(result))?;
+    Ok(())
+}
+
+/// Match an object reference against switch labels. No locks acquired.
+fn type_switch_match(
+    shared: &SharedVm,
+    obj_ref: ObjectRef,
+    obj_class_id: ClassId,
+    obj_class_name: &str,
+    labels: &[SwitchLabel],
+    start_index: usize,
+) -> i32 {
+    for (i, label) in labels.iter().enumerate().skip(start_index) {
+        let matched = match label {
+            SwitchLabel::Type {
+                class_id,
+                class_name: _,
+            } => {
+                // JEP 441: type patterns use instanceof semantics (subclass check).
+                // A Long does NOT match `case Integer i` — only exact type or
+                // supertype matches are valid.
+                shared
+                    .class_manager
+                    .read()
+                    .is_subclass_of(obj_class_id, *class_id)
+            }
+            SwitchLabel::Int(expected) => {
+                unbox_int(shared, obj_ref, obj_class_name) == Some(*expected)
+            }
+            SwitchLabel::Long(expected) => {
+                unbox_long(shared, obj_ref, obj_class_name) == Some(*expected)
+            }
+            SwitchLabel::Float(expected) => unbox_float(shared, obj_ref, obj_class_name)
+                .is_some_and(|v| v.to_bits() == expected.to_bits()),
+            SwitchLabel::Double(expected) => unbox_double(shared, obj_ref, obj_class_name)
+                .is_some_and(|v| v.to_bits() == expected.to_bits()),
+            SwitchLabel::Str(expected) => {
+                read_java_string(&shared.heap, obj_ref).as_deref() == Some(expected.as_str())
+            }
+            SwitchLabel::PrimitiveClass(desc) => {
+                // JEP 507: primitive type pattern matches boxed wrapper types.
+                match desc.as_str() {
+                    "I" | "Z" | "B" | "S" | "C" => matches!(obj_class_name,
+                        "java/lang/Integer" | "java/lang/Boolean" | "java/lang/Byte"
+                        | "java/lang/Short" | "java/lang/Character"),
+                    "J" => obj_class_name == "java/lang/Long",
+                    "F" => obj_class_name == "java/lang/Float",
+                    "D" => obj_class_name == "java/lang/Double",
+                    _ => false,
+                }
+            }
+        };
+        if matched {
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// JEP 507: Check if a boxed primitive value matches a target wrapper type
+/// via widening or narrowing conversion.
+///
+/// For example, a boxed `Integer(42)` matches `java/lang/Long` (widening)
+/// and a boxed `Integer(5)` matches `java/lang/Byte` (narrowing, value in range).
+fn primitive_pattern_match(
+    shared: &SharedVm,
+    obj_ref: ObjectRef,
+    obj_class_name: &str,
+    target_class_name: &str,
+) -> bool {
+    // Extract the numeric value from the source wrapper.
+    let source_value = match obj_class_name {
+        "java/lang/Byte" | "java/lang/Short" | "java/lang/Integer"
+        | "java/lang/Character" | "java/lang/Boolean" => {
+            match shared.heap.get_field(obj_ref, 0) {
+                Value::Int(v) => NumericValue::Int(v),
+                _ => return false,
+            }
+        }
+        "java/lang/Long" => match shared.heap.get_field(obj_ref, 0) {
+            Value::Long(v) => NumericValue::Long(v),
+            _ => return false,
+        },
+        "java/lang/Float" => match shared.heap.get_field(obj_ref, 0) {
+            Value::Float(v) => NumericValue::Float(v),
+            _ => return false,
+        },
+        "java/lang/Double" => match shared.heap.get_field(obj_ref, 0) {
+            Value::Double(v) => NumericValue::Double(v),
+            _ => return false,
+        },
+        _ => return false,
+    };
+
+    // Try to convert to target type.
+    match target_class_name {
+        "java/lang/Byte" => match source_value {
+            NumericValue::Int(v) => v >= i8::MIN as i32 && v <= i8::MAX as i32,
+            NumericValue::Long(v) => v >= i8::MIN as i64 && v <= i8::MAX as i64,
+            _ => false,
+        },
+        "java/lang/Short" => match source_value {
+            NumericValue::Int(v) => v >= i16::MIN as i32 && v <= i16::MAX as i32,
+            NumericValue::Long(v) => v >= i16::MIN as i64 && v <= i16::MAX as i64,
+            _ => false,
+        },
+        "java/lang/Character" => match source_value {
+            NumericValue::Int(v) => v >= 0 && v <= u16::MAX as i32,
+            NumericValue::Long(v) => v >= 0 && v <= u16::MAX as i64,
+            _ => false,
+        },
+        "java/lang/Integer" => match source_value {
+            NumericValue::Int(_) => true, // same type always matches
+            NumericValue::Long(v) => v >= i32::MIN as i64 && v <= i32::MAX as i64,
+            NumericValue::Float(v) => {
+                !v.is_nan() && !v.is_infinite()
+                    && v >= i32::MIN as f32
+                    && v <= i32::MAX as f32
+                    && v == (v as i32) as f32
+            }
+            NumericValue::Double(v) => {
+                !v.is_nan() && !v.is_infinite()
+                    && v >= i32::MIN as f64
+                    && v <= i32::MAX as f64
+                    && v == (v as i32) as f64
+            }
+        },
+        "java/lang/Long" => match source_value {
+            NumericValue::Int(v) => {
+                // Widening: int -> long always succeeds.
+                let _ = v;
+                true
+            }
+            NumericValue::Long(_) => true,
+            NumericValue::Float(v) => {
+                !v.is_nan() && !v.is_infinite()
+                    && v >= i64::MIN as f32
+                    && v <= i64::MAX as f32
+                    && v == (v as i64) as f32
+            }
+            NumericValue::Double(v) => {
+                !v.is_nan() && !v.is_infinite()
+                    && v >= i64::MIN as f64
+                    && v <= i64::MAX as f64
+                    && v == (v as i64) as f64
+            }
+        },
+        "java/lang/Float" => match source_value {
+            NumericValue::Int(v) => {
+                // Widening: int -> float (may lose precision, but allowed as widening).
+                let _ = v;
+                true
+            }
+            NumericValue::Long(v) => {
+                let _ = v;
+                true
+            }
+            NumericValue::Float(_) => true,
+            NumericValue::Double(v) => {
+                // Narrowing: double -> float only if exact.
+                !v.is_nan() && v == (v as f32) as f64
+            }
+        },
+        "java/lang/Double" => match source_value {
+            // Widening to double always succeeds from any numeric type.
+            NumericValue::Int(_) | NumericValue::Long(_) | NumericValue::Float(_) => true,
+            NumericValue::Double(_) => true,
+        },
+        _ => false,
+    }
+}
+
+/// A numeric value extracted from a boxed primitive wrapper.
+enum NumericValue {
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+}
+
+/// Search labels for a primitive match.
+fn primitive_match(
+    labels: &[SwitchLabel],
+    start: usize,
+    pred: impl Fn(&SwitchLabel) -> bool,
+) -> i32 {
+    for (i, label) in labels.iter().enumerate().skip(start) {
+        if pred(label) {
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// Unbox a numeric wrapper to i32 (Integer, Byte, Short, Character, Boolean).
+fn unbox_int(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<i32> {
+    match class_name {
+        "java/lang/Integer"
+        | "java/lang/Byte"
+        | "java/lang/Short"
+        | "java/lang/Character"
+        | "java/lang/Boolean" => match shared.heap.get_field(obj, 0) {
+            Value::Int(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn unbox_long(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<i64> {
+    if class_name == "java/lang/Long" {
+        match shared.heap.get_field(obj, 0) {
+            Value::Long(v) => Some(v),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn unbox_float(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<f32> {
+    if class_name == "java/lang/Float" {
+        match shared.heap.get_field(obj, 0) {
+            Value::Float(v) => Some(v),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn unbox_double(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<f64> {
+    if class_name == "java/lang/Double" {
+        match shared.heap.get_field(obj, 0) {
+            Value::Double(v) => Some(v),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+// ===========================================================================
+// ObjectMethods.bootstrap — record equals/hashCode/toString (JEP 395)
+// ===========================================================================
+
+/// Bootstrap `ObjectMethods.bootstrap` for record classes.
+///
+/// Bootstrap arguments:
+///   arg[0]: Class — the record class
+///   arg[1]: String — component names separated by `;`
+///   arg[2..]: MethodHandle — getField handles for each component
+///
+/// The target name (`info.target_name`) tells us which method:
+///   "equals", "hashCode", or "toString".
+fn bootstrap_record_object_method(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    let current_class_id = thread.frames[frame_idx].class_id;
+
+    let method = match info.target_name.as_str() {
+        "equals" => RecordMethodKind::Equals,
+        "hashCode" => RecordMethodKind::HashCode,
+        "toString" => RecordMethodKind::ToString,
+        other => {
+            return Err(VmError::Internal {
+                message: format!("ObjectMethods.bootstrap: unknown target '{other}'"),
+            }
+            .into());
+        }
+    };
+
+    // Parse component names and field descriptors from bootstrap arguments.
+    let (component_names, field_indices, field_descriptors) = {
+        let cm = shared.class_manager.read();
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("ObjectMethods bootstrap: class {current_class_id} not found"),
+            })?;
+
+        // arg[0] = Class reference (the record class) — get its record components
+        // arg[1] = String with component names separated by `;`
+        let names_str = if info.bootstrap_arg_indices.len() >= 2 {
+            resolve_string_constant(&class.constant_pool, info.bootstrap_arg_indices[1])
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let component_names: Vec<String> = names_str
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        // arg[2..] = MethodHandle getters — extract field descriptors from them.
+        // Each MethodHandle is a REF_getField for the record component.
+        let mut field_descriptors = Vec::with_capacity(component_names.len());
+        for &arg_idx in info.bootstrap_arg_indices.iter().skip(2) {
+            let desc = resolve_method_handle_field_descriptor(&class.constant_pool, arg_idx)
+                .unwrap_or_else(|| "I".to_string());
+            field_descriptors.push(desc);
+        }
+
+        // Field indices: record components are stored in order starting from the
+        // first field offset. We resolve the record class to get its field layout.
+        let record_class_name = if !info.bootstrap_arg_indices.is_empty() {
+            class
+                .constant_pool
+                .get_class_name(info.bootstrap_arg_indices[0])
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        // Drop read lock before acquiring write lock for class loading
+        drop(cm);
+
+        // Determine the field indices for each component.
+        let field_indices: Vec<usize> = if let Some(ref rec_name) = record_class_name {
+            let rec_cid = shared.load_class_concurrent(rec_name)?;
+            let cm = shared.class_manager.read();
+            if let Some(rec_class) = cm.get_class(rec_cid) {
+                let first_field = rec_class.first_field_index;
+                (0..component_names.len())
+                    .map(|i| first_field + i)
+                    .collect()
+            } else {
+                (0..component_names.len()).collect()
+            }
+        } else {
+            (0..component_names.len()).collect()
+        };
+
+        (component_names, field_indices, field_descriptors)
+    };
+
+    // Cache the call site.
+    let site = ResolvedCallSite::RecordObjectMethod {
+        method,
+        component_names: component_names.clone(),
+        field_indices: field_indices.clone(),
+        field_descriptors: field_descriptors.clone(),
+    };
+    shared
+        .resolution_cache
+        .write()
+        .put_call_site(current_class_id, cp_index, site);
+
+    execute_record_object_method(
+        shared,
+        thread,
+        frame_idx,
+        method,
+        &component_names,
+        &field_indices,
+        &field_descriptors,
+    )
+}
+
+/// Resolve a MethodHandle CP entry to extract the field descriptor.
+/// Used for ObjectMethods bootstrap to determine component types.
+fn resolve_method_handle_field_descriptor(cp: &ConstantPool, index: u16) -> Option<String> {
+    match cp.get(index) {
+        Some(ConstantPoolEntry::MethodHandle {
+            reference_kind: _,
+            reference_index,
+        }) => {
+            // The reference_index points to a FieldReference
+            match cp.get(*reference_index) {
+                Some(ConstantPoolEntry::FieldReference {
+                    name_and_type_index,
+                    ..
+                }) => {
+                    let (_, desc) = cp.get_name_and_type(*name_and_type_index)?;
+                    Some(desc.to_string())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Execute a record ObjectMethods call site.
+///
+/// For `toString`: Stack `[..., this]` → `[..., String]`
+/// For `hashCode`: Stack `[..., this]` → `[..., int]`
+/// For `equals`:   Stack `[..., this, other]` → `[..., boolean]`
+fn execute_record_object_method(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method: RecordMethodKind,
+    component_names: &[String],
+    field_indices: &[usize],
+    field_descriptors: &[String],
+) -> Result<(), MethodCallFailed> {
+    match method {
+        RecordMethodKind::Equals => {
+            let other = thread.frames[frame_idx].stack.pop()?;
+            let this = thread.frames[frame_idx].stack.pop()?;
+
+            #[allow(unreachable_patterns)]
+            let result = match (&this, &other) {
+                (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                    // Must be same class
+                    let a_cid = shared.heap.class_id_of(*a);
+                    let b_cid = shared.heap.class_id_of(*b);
+                    if a_cid != b_cid {
+                        0
+                    } else {
+                        // Compare each component field
+                        let mut equal = true;
+                        for &fi in field_indices {
+                            let va = shared.heap.get_field(*a, fi);
+                            let vb = shared.heap.get_field(*b, fi);
+                            if !values_equal(shared, &va, &vb) {
+                                equal = false;
+                                break;
+                            }
+                        }
+                        if equal { 1 } else { 0 }
+                    }
+                }
+                // this == other (both same ref)
+                (Value::Object(Some(a)), Value::Object(Some(b))) if a == b => 1,
+                // this.equals(null) → false
+                _ => 0,
+            };
+            thread.frames[frame_idx].stack.push(Value::Int(result))?;
+        }
+        RecordMethodKind::HashCode => {
+            let this = thread.frames[frame_idx].stack.pop()?;
+            let hash = match this {
+                Value::Object(Some(obj)) => {
+                    let mut h: i32 = 0;
+                    for &fi in field_indices {
+                        let v = shared.heap.get_field(obj, fi);
+                        let vh = value_hash(shared, &v);
+                        h = h.wrapping_mul(31).wrapping_add(vh);
+                    }
+                    h
+                }
+                _ => 0,
+            };
+            thread.frames[frame_idx].stack.push(Value::Int(hash))?;
+        }
+        RecordMethodKind::ToString => {
+            let this = thread.frames[frame_idx].stack.pop()?;
+            let s = match this {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(obj);
+                    let class_name = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    // Use simple name (after last '/' and after '$' for inner classes)
+                    let simple = class_name
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&class_name)
+                        .rsplit('$')
+                        .next()
+                        .unwrap_or(&class_name);
+
+                    let mut result = format!("{simple}[");
+                    for (i, name) in component_names.iter().enumerate() {
+                        if i > 0 {
+                            result.push_str(", ");
+                        }
+                        let fi = field_indices.get(i).copied().unwrap_or(i);
+                        let desc = field_descriptors.get(i).map(|s| s.as_str()).unwrap_or("I");
+                        let v = shared.heap.get_field(obj, fi);
+                        let vs = format_field_value(shared, &v, desc);
+                        result.push_str(name);
+                        result.push('=');
+                        result.push_str(&vs);
+                    }
+                    result.push(']');
+                    result
+                }
+                _ => "null".to_string(),
+            };
+            let str_ref = create_java_string(shared, &s);
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(str_ref)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Compare two JVM values for equality (used by record equals).
+fn values_equal(shared: &SharedVm, a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Long(x), Value::Long(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => {
+            // Float.equals semantics: NaN == NaN, +0 != -0
+            x.to_bits() == y.to_bits()
+        }
+        (Value::Double(x), Value::Double(y)) => {
+            // Double.equals semantics
+            x.to_bits() == y.to_bits()
+        }
+        (Value::Object(None), Value::Object(None)) => true,
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x == y {
+                return true;
+            }
+            // For String objects, compare by content
+            let x_cid = shared.heap.class_id_of(*x);
+            let x_name = shared
+                .class_manager
+                .read()
+                .get_class(x_cid)
+                .map(|c| c.name.clone());
+            if x_name.as_deref() == Some("java/lang/String") {
+                let xs = read_java_string(&shared.heap, *x);
+                let ys = read_java_string(&shared.heap, *y);
+                return xs == ys;
+            }
+            // For other objects, reference equality
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Hash a JVM value (used by record hashCode).
+fn value_hash(shared: &SharedVm, v: &Value) -> i32 {
+    match v {
+        Value::Int(n) => *n,
+        Value::Long(n) => (*n ^ (*n >> 32)) as i32,
+        Value::Float(f) => f.to_bits() as i32,
+        Value::Double(d) => {
+            let bits = d.to_bits();
+            (bits ^ (bits >> 32)) as i32
+        }
+        Value::Object(Some(obj)) => {
+            // For strings, hash the content
+            let cid = shared.heap.class_id_of(*obj);
+            let name = shared
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.clone());
+            if name.as_deref() == Some("java/lang/String") {
+                if let Some(s) = read_java_string(&shared.heap, *obj) {
+                    return s.bytes().fold(0i32, |h, b| h.wrapping_mul(31).wrapping_add(b as i32));
+                }
+            }
+            obj.as_ptr() as i32
+        }
+        Value::Object(None) => 0,
+        _ => 0,
+    }
+}
+
+/// Format a field value for record toString.
+fn format_field_value(shared: &SharedVm, v: &Value, descriptor: &str) -> String {
+    match v {
+        Value::Int(n) => {
+            if descriptor == "Z" {
+                if *n != 0 { "true".to_string() } else { "false".to_string() }
+            } else if descriptor == "C" {
+                format!("{}", char::from_u32(*n as u32).unwrap_or('?'))
+            } else {
+                n.to_string()
+            }
+        }
+        Value::Long(n) => n.to_string(),
+        Value::Float(f) => format!("{f}"),
+        Value::Double(d) => format!("{d}"),
+        Value::Object(Some(obj)) => {
+            if let Some(s) = read_java_string(&shared.heap, *obj) {
+                s
+            } else {
+                format!("object@{:x}", obj.as_ptr() as usize)
+            }
+        }
+        Value::Object(None) => "null".to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Bootstrap a `SwitchBootstraps.enumSwitch` call site.
+///
+/// Bootstrap arguments are string constants representing enum constant names.
+/// The resulting call site takes `(Enum target, int startIndex)` and returns
+/// the index of the matching enum constant name.
+fn bootstrap_enum_switch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    let current_class_id = thread.frames[frame_idx].class_id;
+
+    // Resolve bootstrap arguments — all are string constants (enum constant names).
+    let labels = {
+        let cm = shared.class_manager.read();
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("enumSwitch: class {current_class_id} not found"),
+            })?;
+
+        let mut labels = Vec::with_capacity(info.bootstrap_arg_indices.len());
+        for &arg_idx in &info.bootstrap_arg_indices {
+            let s = resolve_string_constant(&class.constant_pool, arg_idx).unwrap_or_default();
+            labels.push(s);
+        }
+        labels
+    };
+
+    // Cache the call site.
+    let site = ResolvedCallSite::EnumSwitch {
+        labels: labels.clone(),
+    };
+    shared
+        .resolution_cache
+        .write()
+        .put_call_site(current_class_id, cp_index, site);
+
+    execute_enum_switch(shared, thread, frame_idx, &labels)
+}
+
+/// Execute a cached `enumSwitch` call site.
+///
+/// Stack: `[..., target: Enum, startIndex: int]` → `[..., matchIndex: int]`
+pub fn execute_enum_switch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    labels: &[String],
+) -> Result<(), MethodCallFailed> {
+    let start_index = match thread.frames[frame_idx].stack.pop()? {
+        Value::Int(i) => i.max(0) as usize,
+        _ => 0,
+    };
+    let target = thread.frames[frame_idx].stack.pop()?;
+
+    let result = match target {
+        // Null target has no matching label → return labels.len() (default arm).
+        Value::Object(None) => labels.len() as i32,
+        Value::Object(Some(obj_ref)) => {
+            // Read the enum constant name from field 0 (Enum.<init> stores name there).
+            let name = match shared.heap.get_field(obj_ref, 0) {
+                Value::Object(Some(name_ref)) => read_java_string(&shared.heap, name_ref),
+                _ => None,
+            };
+
+            let mut match_index: i32 = -1;
+            if let Some(name) = name {
+                for (i, label) in labels.iter().enumerate().skip(start_index) {
+                    if *label == name {
+                        match_index = i as i32;
+                        break;
+                    }
+                }
+            }
+            match_index
+        }
+        _ => -1,
+    };
+
+    thread.frames[frame_idx].stack.push(Value::Int(result))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_descriptor_args_empty() {
+        assert_eq!(parse_descriptor_args("()V"), vec![]);
+    }
+
+    #[test]
+    fn parse_descriptor_args_mixed() {
+        let args = parse_descriptor_args("(ILjava/lang/String;DJ)Ljava/lang/String;");
+        assert_eq!(args, vec!['I', 'L', 'D', 'J']);
+    }
+
+    #[test]
+    fn parse_descriptor_args_array() {
+        let args = parse_descriptor_args("([I[Ljava/lang/String;)V");
+        assert_eq!(args, vec!['L', 'L']);
+    }
+
+    #[test]
+    fn parse_descriptor_args_all_primitives() {
+        let args = parse_descriptor_args("(BCDFIJSZ)V");
+        assert_eq!(args, vec!['B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z']);
+    }
+
+    #[test]
+    fn format_float_special_values() {
+        assert_eq!(format_float(f32::NAN), "NaN");
+        assert_eq!(format_float(f32::INFINITY), "Infinity");
+        assert_eq!(format_float(f32::NEG_INFINITY), "-Infinity");
+        assert_eq!(format_float(-0.0f32), "-0.0");
+    }
+
+    #[test]
+    fn format_double_special_values() {
+        assert_eq!(format_double(f64::NAN), "NaN");
+        assert_eq!(format_double(f64::INFINITY), "Infinity");
+        assert_eq!(format_double(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(format_double(-0.0f64), "-0.0");
+    }
+
+    #[test]
+    fn value_to_string_primitives() {
+        use crate::config::VmConfig;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        assert_eq!(value_to_string(&shared, None, &Value::Int(42), 'I'), "42");
+        assert_eq!(value_to_string(&shared, None, &Value::Int(1), 'Z'), "true");
+        assert_eq!(value_to_string(&shared, None, &Value::Int(0), 'Z'), "false");
+        assert_eq!(value_to_string(&shared, None, &Value::Int(65), 'C'), "A");
+        assert_eq!(
+            value_to_string(&shared, None, &Value::Long(123456789), 'J'),
+            "123456789"
+        );
+        assert_eq!(value_to_string(&shared, None, &Value::Object(None), 'L'), "null");
+    }
+
+    #[test]
+    fn value_to_string_java_string() {
+        use crate::config::VmConfig;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let str_ref = create_java_string(&shared, "Hello");
+        assert_eq!(
+            value_to_string(&shared, None, &Value::Object(Some(str_ref)), 'L'),
+            "Hello"
+        );
+    }
+
+    /// Build a ConstantPool for testing resolve_method_handle_full.
+    fn make_method_handle_cp(ref_kind: u8) -> ConstantPool {
+        use rustjvm_reader::constant_pool::ConstantPoolEntry as CPE;
+
+        let entries = vec![
+            CPE::Tombstone,                                         // 0 (unused)
+            CPE::Utf8("com/example/Foo".to_string().into()),        // 1
+            CPE::ClassReference { name_index: 1 },                  // 2
+            CPE::Utf8("doStuff".to_string().into()),                // 3
+            CPE::Utf8("(I)Ljava/lang/String;".to_string().into()),  // 4
+            CPE::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            CPE::MethodReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+            CPE::MethodHandle {
+                reference_kind: ref_kind,
+                reference_index: 6,
+            }, // 7
+        ];
+        ConstantPool::new(entries)
+    }
+
+    #[test]
+    fn resolve_method_handle_full_invoke_static() {
+        let cp = make_method_handle_cp(6); // InvokeStatic
+        let mh = resolve_method_handle_full(&cp, 7).unwrap();
+        assert_eq!(mh.kind, MethodHandleKind::InvokeStatic);
+        assert_eq!(mh.class_name, "com/example/Foo");
+        assert_eq!(mh.member_name, "doStuff");
+        assert_eq!(mh.descriptor, "(I)Ljava/lang/String;");
+    }
+
+    #[test]
+    fn resolve_method_handle_full_invoke_virtual() {
+        let cp = make_method_handle_cp(5); // InvokeVirtual
+        let mh = resolve_method_handle_full(&cp, 7).unwrap();
+        assert_eq!(mh.kind, MethodHandleKind::InvokeVirtual);
+    }
+
+    #[test]
+    fn resolve_method_handle_full_invalid_kind() {
+        let cp = make_method_handle_cp(0); // Invalid kind 0
+        assert!(resolve_method_handle_full(&cp, 7).is_err());
+    }
+
+    #[test]
+    fn resolve_method_handle_full_field_ref() {
+        use rustjvm_reader::constant_pool::ConstantPoolEntry as CPE;
+        let entries = vec![
+            CPE::Tombstone,                                  // 0
+            CPE::Utf8("com/example/Bar".to_string().into()), // 1
+            CPE::ClassReference { name_index: 1 },           // 2
+            CPE::Utf8("value".to_string().into()),           // 3
+            CPE::Utf8("I".to_string().into()),               // 4
+            CPE::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            CPE::FieldReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+            CPE::MethodHandle {
+                reference_kind: 1,
+                reference_index: 6,
+            }, // 7 GetField
+        ];
+        let cp = ConstantPool::new(entries);
+        let mh = resolve_method_handle_full(&cp, 7).unwrap();
+        assert_eq!(mh.kind, MethodHandleKind::GetField);
+        assert_eq!(mh.class_name, "com/example/Bar");
+        assert_eq!(mh.member_name, "value");
+        assert_eq!(mh.descriptor, "I");
+    }
+
+    #[test]
+    fn resolve_method_type_test() {
+        use rustjvm_reader::constant_pool::ConstantPoolEntry as CPE;
+        let entries = vec![
+            CPE::Tombstone,
+            CPE::Utf8("(Ljava/lang/Object;)V".to_string().into()), // 1
+            CPE::MethodType {
+                descriptor_index: 1,
+            }, // 2
+        ];
+        let cp = ConstantPool::new(entries);
+        assert_eq!(
+            resolve_method_type(&cp, 2),
+            Some("(Ljava/lang/Object;)V".to_string())
+        );
+        assert_eq!(resolve_method_type(&cp, 1), None); // Not a MethodType
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 83.1: Primitive pattern matching — widening/narrowing
+    // -----------------------------------------------------------------------
+
+    /// Helper: allocate a boxed wrapper on the heap and test primitive_pattern_match.
+    fn test_ppm(source_class: &str, value: Value, target_class: &str) -> bool {
+        use crate::config::VmConfig;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let class_id = ClassId::new(0);
+        let obj = shared.heap.alloc_object(class_id, 1);
+        shared.heap.set_field(obj, 0, value);
+        primitive_pattern_match(&shared, obj, source_class, target_class)
+    }
+
+    #[test]
+    fn ppm_int_to_long_widening() {
+        // int 42 should match long pattern (widening).
+        assert!(test_ppm("java/lang/Integer", Value::Int(42), "java/lang/Long"));
+    }
+
+    #[test]
+    fn ppm_int_to_double_widening() {
+        // int 42 should match double pattern (widening).
+        assert!(test_ppm("java/lang/Integer", Value::Int(42), "java/lang/Double"));
+    }
+
+    #[test]
+    fn ppm_int_to_byte_narrowing_in_range() {
+        // int 5 is in byte range [-128, 127], should match byte pattern.
+        assert!(test_ppm("java/lang/Integer", Value::Int(5), "java/lang/Byte"));
+    }
+
+    #[test]
+    fn ppm_int_to_byte_narrowing_out_of_range() {
+        // int 200 is NOT in byte range, should NOT match.
+        assert!(!test_ppm("java/lang/Integer", Value::Int(200), "java/lang/Byte"));
+    }
+
+    #[test]
+    fn ppm_long_to_int_narrowing_in_range() {
+        // long 42 is in int range, should match.
+        assert!(test_ppm("java/lang/Long", Value::Long(42), "java/lang/Integer"));
+    }
+
+    #[test]
+    fn ppm_long_to_int_narrowing_out_of_range() {
+        // long exceeding int range should NOT match.
+        assert!(!test_ppm(
+            "java/lang/Long",
+            Value::Long(i64::MAX),
+            "java/lang/Integer"
+        ));
+    }
+
+    #[test]
+    fn ppm_int_to_char_narrowing_in_range() {
+        // int 65 ('A') is in char range [0, 65535], should match.
+        assert!(test_ppm("java/lang/Integer", Value::Int(65), "java/lang/Character"));
+    }
+
+    #[test]
+    fn ppm_int_to_char_narrowing_negative() {
+        // Negative int should NOT match char pattern.
+        assert!(!test_ppm(
+            "java/lang/Integer",
+            Value::Int(-1),
+            "java/lang/Character"
+        ));
+    }
+
+    #[test]
+    fn ppm_string_to_long_no_match() {
+        // Non-numeric class should never match a numeric pattern.
+        assert!(!test_ppm("java/lang/String", Value::Int(0), "java/lang/Long"));
+    }
+
+    #[test]
+    fn ppm_float_to_double_widening() {
+        // float -> double is always a widening conversion.
+        assert!(test_ppm(
+            "java/lang/Float",
+            Value::Float(3.14),
+            "java/lang/Double"
+        ));
+    }
+}

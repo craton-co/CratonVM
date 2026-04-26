@@ -1,0 +1,12 @@
+﻿
+stage-mockito-probe: using javac at C:\Program Files\Java\jdk-25\bin\javac.exe
+stage-mockito-probe: located jars
+  mockito-core=C:\Users\Victor\.m2\repository\org\mockito\mockito-core\4.0.0\mockito-core-4.0.0.jar
+  byte-buddy=C:\Users\Victor\.m2\repository\net\bytebuddy\byte-buddy\1.12.12\byte-buddy-1.12.12.jar
+  byte-buddy-agent=C:\Users\Victor\.m2\repository\net\bytebuddy\byte-buddy-agent\1.12.12\byte-buddy-agent-1.12.12.jar
+  objenesis=C:\Users\Victor\.m2\repository\org\objenesis\objenesis\1.2\objenesis-1.2.jar
+stage-mockito-probe: compiling 2 sources with mockito on cp
+
+
+stage-mockito-probe: main class = Main
+stage-mockito-probe: staged classes at C:\craton\rust-jvm\bench\wave2-4\staged-mockito\classes

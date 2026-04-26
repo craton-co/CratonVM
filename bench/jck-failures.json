@@ -1,0 +1,54 @@
+{
+  "timestamp": 0,
+  "total": 0,
+  "passed": 0,
+  "failed": 0,
+  "failure_categories": {
+    "ClassNotFound": {
+      "description": "Test class or dependency class could not be loaded by the classloader",
+      "count": 0,
+      "examples": []
+    },
+    "NoSuchMethod": {
+      "description": "Required method not found on the resolved class (missing native or bytecode method)",
+      "count": 0,
+      "examples": []
+    },
+    "NativeMethodNotFound": {
+      "description": "ACC_NATIVE method invoked but no Rust implementation registered in the native bridge",
+      "count": 0,
+      "examples": []
+    },
+    "VerificationError": {
+      "description": "Bytecode verification rejected the class file (stack map, type safety)",
+      "count": 0,
+      "examples": []
+    },
+    "LinkageError": {
+      "description": "Class or method linking failed (incompatible class change, circular dependency)",
+      "count": 0,
+      "examples": []
+    },
+    "RuntimeError": {
+      "description": "Uncategorized runtime error during test execution (interpreter bug, JIT miscompile)",
+      "count": 0,
+      "examples": []
+    },
+    "Timeout": {
+      "description": "Test exceeded the per-test timeout (possible infinite loop or deadlock)",
+      "count": 0,
+      "examples": []
+    },
+    "OutputMismatch": {
+      "description": "Test completed but produced incorrect output compared to the JCK expected output",
+      "count": 0,
+      "examples": []
+    },
+    "UnsupportedFeature": {
+      "description": "Test exercises a JVM feature not yet implemented (e.g. certain reflection, MethodHandle combinators)",
+      "count": 0,
+      "examples": []
+    }
+  },
+  "failures": []
+}

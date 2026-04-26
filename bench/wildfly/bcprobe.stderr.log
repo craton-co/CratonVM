@@ -1,0 +1,3 @@
+﻿[2m2026-04-25T19:18:50.544062Z[0m [34mDEBUG[0m [2mrustjvm_vm::runtime::exceptions[0m[2m:[0m runtime_error origin: NullPointerException { message: Some("Cannot invoke get on null") } [3mclass[0m[2m=[0mjava/security/Provider$Service [3mmethod[0m[2m=[0m<init> [3mpc[0m[2m=[0m29
+Exception in thread "main" java/lang/InternalError: cannot create instance of org.bouncycastle.jcajce.provider.digest.GOST3411$Mappings : java.lang.NullPointerException
+

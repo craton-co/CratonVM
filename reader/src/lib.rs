@@ -1,0 +1,41 @@
+// TODO: Re-enable missing_docs once the public API stabilises and doc comments
+// are added to all spec-derived types (struct fields, enum variants, etc.).
+#![allow(missing_docs)]
+
+//! Java `.class` file parser for the RustJVM project.
+//!
+//! This crate handles parsing of Java class files according to the JVM specification,
+//! supporting class file versions from Java 1.1 (major version 45) through Java 25
+//! (major version 69).
+//!
+//! # Modules
+//!
+//! - [`class_reader`] — Main entry point for parsing `.class` file bytes
+//! - [`constant_pool`] — JVM constant pool entries (all 20 tag types)
+//! - [`instruction`] — Bytecode instruction decoding (200+ opcodes)
+//! - [`attribute`] — Class/method/field attributes (30+ types)
+//! - [`stack_map`] — StackMapTable verification frames (Java 7+)
+//! - [`field_type`] / [`method_descriptor`] — JVM type descriptor parsing
+
+pub mod attribute;
+pub mod buffer;
+pub mod class_access_flags;
+pub mod class_file;
+pub mod class_file_version;
+pub mod class_reader;
+pub mod class_reader_error;
+pub mod constant_pool;
+pub mod field;
+pub mod field_type;
+pub mod instruction;
+pub mod jimage;
+pub mod method;
+pub mod method_descriptor;
+pub mod signature;
+pub mod stack_map;
+
+pub use class_file::ClassFile;
+pub use class_reader::read_class;
+pub use class_reader_error::ClassReaderError;
+pub use constant_pool::ConstantPool;
+pub use jimage::{JImageError, JImageReader};

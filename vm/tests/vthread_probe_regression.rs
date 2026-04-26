@@ -1,0 +1,275 @@
+//! Virtual-thread probe regression test.
+//!
+//! Pins the runtime behavior of `Thread.ofVirtual().start(...)` end-to-end
+//! through the `rustjvm.exe` CLI binary against the probes in
+//! `apps/vthread_probe/`:
+//!
+//!   * `Counter.java`     — 1 virtual thread incrementing an `AtomicInteger`,
+//!                          must print `After: n=1`. (Matches the user-supplied
+//!                          repro for the "v-thread counter only reaches 1"
+//!                          investigation: Counter.java is by-design 1 thread,
+//!                          so `n=1` is the **correct** expected output.)
+//!   * `VthreadProbe.java`— 10000 virtual threads sleeping 10 ms each then
+//!                          incrementing a shared `AtomicInteger` and counting
+//!                          down a `CountDownLatch`. Must print
+//!                          `counted=10000 ok=true` followed by `OK`.
+//!   * `Tiny.java`        — 1 virtual thread printing a line; pins
+//!                          `Thread.ofVirtual()` builder + .start(Runnable) +
+//!                          Thread.join() round-trip including the
+//!                          `Joined OK` final line.
+//!
+//! The binary path is resolved via `RUSTJVM_BIN` env var, then the cargo
+//! `target/{release,debug}` fallback. Class files are produced on-demand via
+//! `javac --release 21` if absent. If neither the binary nor `javac` is
+//! available the test reports `skipped` rather than failing.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn probe_dir() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .unwrap()
+        .join("apps")
+        .join("vthread_probe")
+}
+
+fn probe_classes_dir() -> PathBuf {
+    probe_dir().join("classes")
+}
+
+fn rustjvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target = manifest.parent().unwrap().join("target");
+    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    for profile in &["release", "debug"] {
+        let candidate = target.join(profile).join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Compile the vthread probes via `javac` if the classes directory is missing
+/// or stale relative to the .java source files. Best-effort.
+fn ensure_probes_compiled() -> bool {
+    let classes = probe_classes_dir();
+    let required = ["Counter.class", "Tiny.class", "VthreadProbe.class"];
+    if required.iter().all(|f| classes.join(f).exists()) {
+        return true;
+    }
+    let _ = std::fs::create_dir_all(&classes);
+    let dir = probe_dir();
+    let sources: Vec<PathBuf> = ["Counter.java", "Tiny.java", "VthreadProbe.java"]
+        .iter()
+        .map(|f| dir.join(f))
+        .filter(|p| p.exists())
+        .collect();
+    if sources.is_empty() {
+        return false;
+    }
+    let mut cmd = Command::new("javac");
+    cmd.arg("--release")
+        .arg("21")
+        .arg("-d")
+        .arg(&classes);
+    for src in &sources {
+        cmd.arg(src);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => required.iter().all(|f| classes.join(f).exists()),
+        _ => false,
+    }
+}
+
+/// Run a single probe class through the rustjvm binary. Returns
+/// `Some((stdout, stderr))` on successful spawn (regardless of exit code, so
+/// callers can examine output even when the VM exits non-zero), `None` when
+/// pre-requisites are unavailable so the caller can `return` and report skip.
+fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
+    if !ensure_probes_compiled() {
+        eprintln!(
+            "[vthread_probe_regression] vthread_probe class files unavailable; skipping {class_name}"
+        );
+        return None;
+    }
+    let bin = match rustjvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "[vthread_probe_regression] rustjvm binary not found; \
+                 build with `cargo build --release -p rustjvm-cli`"
+            );
+            return None;
+        }
+    };
+    let classes = probe_classes_dir();
+    // Spawn a child process with the requested timeout. We use a thread-based
+    // wait so we can kill the child if it hangs (helps when the v-thread
+    // scheduler regresses to a 1-carrier livelock).
+    let mut child = match Command::new(&bin)
+        .arg("-c")
+        .arg(&classes)
+        .arg(class_name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[vthread_probe_regression] failed to spawn rustjvm: {e}");
+            return None;
+        }
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "[vthread_probe_regression] {class_name} timed out after {:?}",
+                        timeout
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("[vthread_probe_regression] try_wait failed: {e}");
+                return None;
+            }
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[vthread_probe_regression] wait_with_output failed: {e}");
+            return None;
+        }
+    };
+    Some((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// Memoize each probe run so all subtests targeting the same class share one
+/// VM spawn. Keyed by class name.
+fn cached_run(class_name: &'static str, timeout: Duration) -> Option<(String, String)> {
+    static COUNTER: OnceLock<Option<(String, String)>> = OnceLock::new();
+    static TINY: OnceLock<Option<(String, String)>> = OnceLock::new();
+    static VTHREAD: OnceLock<Option<(String, String)>> = OnceLock::new();
+    let cell: &OnceLock<Option<(String, String)>> = match class_name {
+        "Counter" => &COUNTER,
+        "Tiny" => &TINY,
+        "VthreadProbe" => &VTHREAD,
+        other => panic!("unknown vthread probe class: {other}"),
+    };
+    cell.get_or_init(|| run_probe(class_name, timeout)).clone()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// `Counter.java` launches **one** virtual thread that increments an
+/// `AtomicInteger`. The expected output is `After: n=1`. This pins the
+/// minimal `Thread.ofVirtual().start(Runnable)` round-trip on the carrier
+/// pool so a regression to "vthread launched but never executes" surfaces
+/// as `n=0` rather than an unrelated timeout/crash.
+#[test]
+fn vthread_counter_single_increments_to_1() {
+    let (stdout, stderr) = match cached_run("Counter", Duration::from_secs(30)) {
+        Some(o) => o,
+        None => return,
+    };
+    let combined = format!("{stdout}\n--- STDERR ---\n{stderr}");
+    assert!(
+        combined.contains("Begin"),
+        "Counter probe never reached the 'Begin' line — VM bootstrap regressed?\n{combined}"
+    );
+    assert!(
+        combined.contains("After: n=1"),
+        "Counter probe expected 'After: n=1' but got:\n{combined}"
+    );
+    // Defensive: explicitly reject obviously broken outputs.
+    assert!(
+        !combined.contains("After: n=0"),
+        "Counter probe printed 'After: n=0' — vthread spawned but never \
+         executed the Runnable body before main joined.\n{combined}"
+    );
+}
+
+/// `Tiny.java` exercises `Thread.ofVirtual()` builder + `.start(Runnable)` +
+/// `Thread.join()`. Pins that the builder is reachable, that the v-thread
+/// runs to completion (printing `In vthread`), and that join returns cleanly
+/// (`Joined OK`).
+#[test]
+fn vthread_tiny_builder_start_join() {
+    let (stdout, stderr) = match cached_run("Tiny", Duration::from_secs(30)) {
+        Some(o) => o,
+        None => return,
+    };
+    let combined = format!("{stdout}\n--- STDERR ---\n{stderr}");
+    for needle in ["Begin", "Got builder:", "In vthread", "Joined OK"] {
+        assert!(
+            combined.contains(needle),
+            "Tiny probe missing expected line '{needle}'. Output:\n{combined}"
+        );
+    }
+}
+
+/// `VthreadProbe.java` launches 10000 virtual threads each sleeping 10 ms
+/// then incrementing a shared `AtomicInteger` and counting down a
+/// `CountDownLatch`. The acceptance gate is the literal `counted=10000`
+/// line followed by `OK` on stdout. This is the load-bearing regression
+/// test against "only one carrier executes" / "carrier pool starves" /
+/// "Thread.sleep on a v-thread never resumes".
+#[test]
+fn vthread_probe_10000_all_increment() {
+    let (stdout, stderr) = match cached_run("VthreadProbe", Duration::from_secs(60)) {
+        Some(o) => o,
+        None => return,
+    };
+    let combined = format!("{stdout}\n--- STDERR ---\n{stderr}");
+    if !combined.contains("counted=10000 ok=true") {
+        // Surface the actual count line for triage so a regression to e.g.
+        // `counted=1 ok=false` or `counted=4096 ok=false` is immediately
+        // visible.
+        let counted_line = combined
+            .lines()
+            .find(|l| l.starts_with("counted="))
+            .unwrap_or("(no `counted=` line emitted)");
+        panic!(
+            "VthreadProbe failed to count all 10000 vthreads.\n\
+             observed: {counted_line}\n\
+             full output:\n{combined}"
+        );
+    }
+    assert!(
+        combined.contains("\nOK\n") || combined.trim_end().ends_with("OK") ||
+            combined.contains("\nOK\r\n"),
+        "VthreadProbe printed counted=10000 but never reached final 'OK' \
+         marker — exit raced the println? Output:\n{combined}"
+    );
+    assert!(
+        !combined.contains("FAIL"),
+        "VthreadProbe explicitly printed FAIL:\n{combined}"
+    );
+}

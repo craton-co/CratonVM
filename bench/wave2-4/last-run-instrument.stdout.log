@@ -1,0 +1,10 @@
+﻿agent: premain entered
+agent: isRetransformClassesSupported=true
+agent: addTransformer done
+agent: retransforming Target
+agent: transform className=Target size=242 patched=1
+agent: retransformClasses done
+before=99
+after=99
+OK
+

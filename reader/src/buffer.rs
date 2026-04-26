@@ -1,0 +1,157 @@
+use crate::class_reader_error::ClassReaderError;
+
+/// A byte buffer for reading binary data from a `.class` file.
+///
+/// Provides sequential reading of primitive types in big-endian byte order,
+/// as specified by the JVM class file format.
+pub struct ClassFileBuffer<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> ClassFileBuffer<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, position: 0 }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.position
+    }
+
+    pub fn read_u8(&mut self) -> Result<u8, ClassReaderError> {
+        if self.position >= self.data.len() {
+            return Err(ClassReaderError::UnexpectedEndOfData {
+                position: self.position,
+            });
+        }
+        let value = self.data[self.position];
+        self.position += 1;
+        Ok(value)
+    }
+
+    pub fn read_u16(&mut self) -> Result<u16, ClassReaderError> {
+        if self.position + 2 > self.data.len() {
+            return Err(ClassReaderError::UnexpectedEndOfData {
+                position: self.position,
+            });
+        }
+        let value = u16::from_be_bytes([self.data[self.position], self.data[self.position + 1]]);
+        self.position += 2;
+        Ok(value)
+    }
+
+    pub fn read_u32(&mut self) -> Result<u32, ClassReaderError> {
+        if self.position + 4 > self.data.len() {
+            return Err(ClassReaderError::UnexpectedEndOfData {
+                position: self.position,
+            });
+        }
+        let value = u32::from_be_bytes([
+            self.data[self.position],
+            self.data[self.position + 1],
+            self.data[self.position + 2],
+            self.data[self.position + 3],
+        ]);
+        self.position += 4;
+        Ok(value)
+    }
+
+    pub fn read_i32(&mut self) -> Result<i32, ClassReaderError> {
+        self.read_u32().map(|v| v as i32)
+    }
+
+    pub fn read_i64(&mut self) -> Result<i64, ClassReaderError> {
+        if self.position + 8 > self.data.len() {
+            return Err(ClassReaderError::UnexpectedEndOfData {
+                position: self.position,
+            });
+        }
+        let value = i64::from_be_bytes([
+            self.data[self.position],
+            self.data[self.position + 1],
+            self.data[self.position + 2],
+            self.data[self.position + 3],
+            self.data[self.position + 4],
+            self.data[self.position + 5],
+            self.data[self.position + 6],
+            self.data[self.position + 7],
+        ]);
+        self.position += 8;
+        Ok(value)
+    }
+
+    pub fn read_f32(&mut self) -> Result<f32, ClassReaderError> {
+        self.read_u32().map(f32::from_bits)
+    }
+
+    pub fn read_f64(&mut self) -> Result<f64, ClassReaderError> {
+        self.read_i64().map(|v| f64::from_bits(v as u64))
+    }
+
+    pub fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], ClassReaderError> {
+        if self.position + count > self.data.len() {
+            return Err(ClassReaderError::UnexpectedEndOfData {
+                position: self.position,
+            });
+        }
+        let bytes = &self.data[self.position..self.position + count];
+        self.position += count;
+        Ok(bytes)
+    }
+
+    pub fn skip(&mut self, count: usize) -> Result<(), ClassReaderError> {
+        if self.position + count > self.data.len() {
+            return Err(ClassReaderError::UnexpectedEndOfData {
+                position: self.position,
+            });
+        }
+        self.position += count;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_u8() {
+        let data = [0xCA];
+        let mut buf = ClassFileBuffer::new(&data);
+        assert_eq!(buf.read_u8().unwrap(), 0xCA);
+    }
+
+    #[test]
+    fn read_u16_big_endian() {
+        let data = [0xCA, 0xFE];
+        let mut buf = ClassFileBuffer::new(&data);
+        assert_eq!(buf.read_u16().unwrap(), 0xCAFE);
+    }
+
+    #[test]
+    fn read_u32_big_endian() {
+        let data = [0xCA, 0xFE, 0xBA, 0xBE];
+        let mut buf = ClassFileBuffer::new(&data);
+        assert_eq!(buf.read_u32().unwrap(), 0xCAFEBABE);
+    }
+
+    #[test]
+    fn read_past_end_returns_error() {
+        let data = [0x01];
+        let mut buf = ClassFileBuffer::new(&data);
+        assert!(buf.read_u16().is_err());
+    }
+
+    #[test]
+    fn read_bytes_slice() {
+        let data = [1, 2, 3, 4, 5];
+        let mut buf = ClassFileBuffer::new(&data);
+        let bytes = buf.read_bytes(3).unwrap();
+        assert_eq!(bytes, &[1, 2, 3]);
+        assert_eq!(buf.position(), 3);
+    }
+}

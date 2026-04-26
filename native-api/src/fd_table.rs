@@ -1,0 +1,1709 @@
+//! File descriptor table for I/O operations.
+
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// FileDescriptorTable
+// ---------------------------------------------------------------------------
+
+pub type FdId = u32;
+
+enum FileEntry {
+    Stdin(Mutex<io::Stdin>),
+    Stdout(Mutex<io::Stdout>),
+    Stderr(Mutex<io::Stderr>),
+    FileRead(Mutex<BufReader<fs::File>>),
+    FileWrite(Mutex<BufWriter<fs::File>>),
+    /// Read+write access for AsynchronousFileChannel / RandomAccessFile
+    FileReadWrite(Mutex<fs::File>),
+    /// UDP socket for DatagramChannel
+    UdpSocket(Mutex<std::net::UdpSocket>),
+    /// TCP stream socket (SocketChannel)
+    TcpStream(Mutex<std::net::TcpStream>),
+    /// TCP listener socket (ServerSocketChannel)
+    TcpListener(Mutex<std::net::TcpListener>),
+    /// Read end of an in-memory pipe
+    PipeRead(Arc<Mutex<VecDeque<u8>>>),
+    /// Write end of an in-memory pipe
+    PipeWrite(Arc<Mutex<VecDeque<u8>>>),
+    /// TLS-wrapped TCP stream (SSLSocket)
+    TlsStream(Mutex<native_tls::TlsStream<std::net::TcpStream>>),
+    /// WP1.12 — subprocess stdout pipe (read side). Wraps the `ChildStdout`
+    /// handle returned by `std::process::Command::spawn()` so the JDK's
+    /// `FileInputStream.read*` natives can pull bytes through the same
+    /// `fd_table().read_bytes()` API they use for files.
+    ChildStdoutPipe(Mutex<std::process::ChildStdout>),
+    /// WP1.12 — subprocess stderr pipe (read side).
+    ChildStderrPipe(Mutex<std::process::ChildStderr>),
+    /// WP1.12 — subprocess stdin pipe (write side). Bytes written go to
+    /// the child process's standard input.
+    ChildStdinPipe(Mutex<std::process::ChildStdin>),
+}
+
+/// Thread-safe registry of open file handles, keyed by integer file descriptors.
+///
+/// Pre-registers fd 0/1/2 for stdin/stdout/stderr.
+/// T10.9.B: FxHashMap — fd IDs are internal u32 counters.
+pub struct FileDescriptorTable {
+    entries: RwLock<FxHashMap<FdId, FileEntry>>,
+    next_fd: AtomicU32,
+}
+
+impl FileDescriptorTable {
+    pub fn new() -> Self {
+        let mut entries: FxHashMap<FdId, FileEntry> = FxHashMap::default();
+        entries.insert(0, FileEntry::Stdin(Mutex::new(io::stdin())));
+        entries.insert(1, FileEntry::Stdout(Mutex::new(io::stdout())));
+        entries.insert(2, FileEntry::Stderr(Mutex::new(io::stderr())));
+        Self {
+            entries: RwLock::new(entries),
+            next_fd: AtomicU32::new(3),
+        }
+    }
+
+    /// Open a file for reading. Returns the fd_id.
+    pub fn open_read(&self, path: &str) -> Result<FdId, io::Error> {
+        // Reserve fd first, before opening the file
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            // Roll back the counter since we won't use this fd
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        self.entries
+            .write()
+            .insert(fd, FileEntry::FileRead(Mutex::new(reader)));
+        Ok(fd)
+    }
+
+    /// Open a file for writing (optionally appending). Returns the fd_id.
+    pub fn open_write(&self, path: &str, append: bool) -> Result<FdId, io::Error> {
+        // Reserve fd first, before opening the file
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            // Roll back the counter since we won't use this fd
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(!append)
+            .append(append)
+            .open(path)?;
+        let writer = BufWriter::new(file);
+        self.entries
+            .write()
+            .insert(fd, FileEntry::FileWrite(Mutex::new(writer)));
+        Ok(fd)
+    }
+
+    /// Read a single byte. Returns 0-255 or -1 at EOF.
+    pub fn read_byte(&self, fd: FdId) -> Result<i32, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::Stdin(stdin)) => {
+                let mut buf = [0u8; 1];
+                let n = stdin.lock().read(&mut buf)?;
+                Ok(if n == 0 { -1 } else { buf[0] as i32 })
+            }
+            Some(FileEntry::FileRead(reader)) => {
+                let mut buf = [0u8; 1];
+                let n = reader.lock().read(&mut buf)?;
+                Ok(if n == 0 { -1 } else { buf[0] as i32 })
+            }
+            // WP1.12 — subprocess stdout/stderr read.
+            Some(FileEntry::ChildStdoutPipe(p)) => {
+                let mut buf = [0u8; 1];
+                let n = p.lock().read(&mut buf)?;
+                Ok(if n == 0 { -1 } else { buf[0] as i32 })
+            }
+            Some(FileEntry::ChildStderrPipe(p)) => {
+                let mut buf = [0u8; 1];
+                let n = p.lock().read(&mut buf)?;
+                Ok(if n == 0 { -1 } else { buf[0] as i32 })
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
+        }
+    }
+
+    /// Read up to `len` bytes into `buf`. Returns count read, or 0 at EOF.
+    pub fn read_bytes(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::Stdin(stdin)) => stdin.lock().read(buf),
+            Some(FileEntry::FileRead(reader)) => reader.lock().read(buf),
+            // WP1.12 — subprocess stdout/stderr bulk read.
+            Some(FileEntry::ChildStdoutPipe(p)) => p.lock().read(buf),
+            Some(FileEntry::ChildStderrPipe(p)) => p.lock().read(buf),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
+        }
+    }
+
+    /// Read one line (for BufferedReader). Returns None at EOF.
+    /// Read a single line from the file descriptor, recognizing any of
+    /// the three line terminators `\n`, `\r\n`, or a bare `\r` — matching
+    /// `java.io.BufferedReader.readLine` exactly (JDK 25 javadoc:
+    /// "A line is considered to be terminated by any one of a line feed
+    /// ('\n'), a carriage return ('\r'), a carriage return followed
+    /// immediately by a line feed, or by reaching the end-of-file (EOF)").
+    ///
+    /// Previously this delegated to `std::io::BufRead::read_line` which
+    /// only terminates on `\n`, so a file written on classic Mac OS
+    /// (`\r`-only line endings) would read as a single gigantic line.
+    /// T2.4.14 asked for byte-level correctness; the new implementation
+    /// reads one byte at a time from the underlying stream and stops
+    /// at the first terminator, consuming `\n` after `\r` if present to
+    /// avoid leaking it into the next call.
+    ///
+    /// Returns `Ok(None)` on EOF (no bytes read), `Ok(Some(line))`
+    /// otherwise. The trailing terminator is *not* included in the
+    /// returned string. I/O errors propagate as `Err`.
+    pub fn read_line(&self, fd: FdId) -> Result<Option<String>, io::Error> {
+        // Helper that reads a single byte from a `BufRead` source and
+        // returns `None` at EOF. We cannot use `read_exact([u8; 1])`
+        // because EOF is a normal termination, not an error.
+        fn read_one<R: io::BufRead>(r: &mut R) -> io::Result<Option<u8>> {
+            let mut buf = [0u8; 1];
+            match r.read(&mut buf)? {
+                0 => Ok(None),
+                _ => Ok(Some(buf[0])),
+            }
+        }
+        // Loop that reads bytes from a generic `BufRead` until the
+        // first line terminator. After seeing `\r`, peek the next
+        // byte and consume it iff it is `\n` (so `\r\n` stays
+        // atomic). Otherwise fall through.
+        fn read_line_inner<R: io::BufRead>(r: &mut R) -> io::Result<Option<String>> {
+            let mut bytes: Vec<u8> = Vec::new();
+            loop {
+                match read_one(r)? {
+                    None => {
+                        if bytes.is_empty() {
+                            return Ok(None);
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(b'\n') => break,
+                    Some(b'\r') => {
+                        // Peek the next byte: if it's \n, consume it.
+                        let peek = r.fill_buf()?;
+                        if !peek.is_empty() && peek[0] == b'\n' {
+                            r.consume(1);
+                        }
+                        break;
+                    }
+                    Some(b) => bytes.push(b),
+                }
+            }
+            // Decode as UTF-8 lossily — matching JDK behavior where a
+            // reader atop a charset will have already transcoded, but
+            // our line reader operates at the byte level.
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::Stdin(stdin)) => {
+                // `io::Stdin` itself is not `BufRead`, but `StdinLock`
+                // — obtained via `Stdin::lock()` — is. The outer
+                // parking_lot `Mutex` guard lets us hold the
+                // `StdinLock` exclusively while we read one line.
+                let guard = stdin.lock();
+                let mut stdin_lock = guard.lock();
+                read_line_inner(&mut stdin_lock)
+            }
+            Some(FileEntry::FileRead(reader)) => {
+                // `BufReader<File>` implements `BufRead`; the
+                // parking_lot guard defers directly.
+                let mut guard = reader.lock();
+                read_line_inner(&mut *guard)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
+        }
+    }
+
+    /// Write a single byte.
+    pub fn write_byte(&self, fd: FdId, b: u8) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::Stdout(stdout)) => {
+                stdout.lock().write_all(&[b])?;
+                Ok(())
+            }
+            Some(FileEntry::Stderr(stderr)) => {
+                stderr.lock().write_all(&[b])?;
+                Ok(())
+            }
+            Some(FileEntry::FileWrite(writer)) => {
+                writer.lock().write_all(&[b])?;
+                Ok(())
+            }
+            // WP1.12 — write to subprocess stdin.
+            Some(FileEntry::ChildStdinPipe(p)) => {
+                p.lock().write_all(&[b])?;
+                Ok(())
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
+        }
+    }
+
+    /// Write bytes from a slice.
+    pub fn write_bytes(&self, fd: FdId, data: &[u8]) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::Stdout(stdout)) => {
+                stdout.lock().write_all(data)?;
+                Ok(())
+            }
+            Some(FileEntry::Stderr(stderr)) => {
+                stderr.lock().write_all(data)?;
+                Ok(())
+            }
+            Some(FileEntry::FileWrite(writer)) => {
+                writer.lock().write_all(data)?;
+                Ok(())
+            }
+            // WP1.12 — bulk write to subprocess stdin.
+            Some(FileEntry::ChildStdinPipe(p)) => {
+                p.lock().write_all(data)?;
+                Ok(())
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
+        }
+    }
+
+    /// Write a UTF-8 string.
+    pub fn write_string(&self, fd: FdId, text: &str) -> Result<(), io::Error> {
+        self.write_bytes(fd, text.as_bytes())
+    }
+
+    /// Flush buffered output.
+    pub fn flush(&self, fd: FdId) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::Stdout(stdout)) => {
+                stdout.lock().flush()?;
+                Ok(())
+            }
+            Some(FileEntry::Stderr(stderr)) => {
+                stderr.lock().flush()?;
+                Ok(())
+            }
+            Some(FileEntry::FileWrite(writer)) => {
+                writer.lock().flush()?;
+                Ok(())
+            }
+            // WP1.12 — flushing ChildStdin pushes buffered bytes into the
+            // subprocess's stdin immediately. Without this, the child may
+            // block waiting for data that's sitting in our userspace buffer.
+            Some(FileEntry::ChildStdinPipe(p)) => {
+                p.lock().flush()?;
+                Ok(())
+            }
+            _ => Ok(()), // no-op for non-writable fds
+        }
+    }
+
+    /// Close a file descriptor. Returns an error if flushing a writer fails.
+    pub fn close(&self, fd: FdId) -> Result<(), io::Error> {
+        // Don't close stdin/stdout/stderr
+        if fd >= 3 {
+            let mut entries = self.entries.write();
+            // Flush before removing if it's a writer
+            if let Some(FileEntry::FileWrite(writer)) = entries.get(&fd) {
+                writer.lock().flush()?;
+            }
+            entries.remove(&fd);
+        }
+        Ok(())
+    }
+
+    /// Estimate available bytes (best-effort).
+    pub fn available(&self, fd: FdId) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileRead(reader)) => {
+                let mut buf = reader.lock();
+                let buffered = buf.buffer().len();
+                // Also account for bytes remaining in the underlying file
+                // beyond what's already buffered.
+                let file_remaining = {
+                    use std::io::Seek;
+                    let inner = buf.get_mut();
+                    let pos = inner.stream_position().unwrap_or(0);
+                    let end = inner.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
+                    // Seek back to where we were
+                    let _ = inner.seek(std::io::SeekFrom::Start(pos));
+                    end.saturating_sub(pos) as usize
+                };
+                Ok(buffered + file_remaining)
+            }
+            Some(FileEntry::Stdin(_)) => Ok(0),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 92: AsynchronousFileChannel, DatagramChannel support
+    // -----------------------------------------------------------------------
+
+    /// Open a file for read+write access (used by AsynchronousFileChannel).
+    pub fn open_read_write(&self, path: &str, create: bool) -> Result<FdId, io::Error> {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .open(path)?;
+        self.entries
+            .write()
+            .insert(fd, FileEntry::FileReadWrite(Mutex::new(file)));
+        Ok(fd)
+    }
+
+    /// Read bytes from a file at a specific position (pread).
+    /// Does not change the file's current position.
+    pub fn pread_at(&self, fd: FdId, buf: &mut [u8], position: u64) -> Result<usize, io::Error> {
+        use io::{Read, Seek, SeekFrom};
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                let saved = f.stream_position()?;
+                f.seek(SeekFrom::Start(position))?;
+                let n = f.read(buf)?;
+                f.seek(SeekFrom::Start(saved))?;
+                Ok(n)
+            }
+            Some(FileEntry::FileRead(reader)) => {
+                let mut r = reader.lock();
+                let inner = r.get_mut();
+                let saved = inner.stream_position()?;
+                inner.seek(SeekFrom::Start(position))?;
+                let n = inner.read(buf)?;
+                inner.seek(SeekFrom::Start(saved))?;
+                Ok(n)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for pread")),
+        }
+    }
+
+    /// Write bytes to a file at a specific position (pwrite).
+    /// Does not change the file's current position.
+    pub fn pwrite_at(&self, fd: FdId, data: &[u8], position: u64) -> Result<usize, io::Error> {
+        use io::{Seek, SeekFrom, Write};
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                let saved = f.stream_position()?;
+                f.seek(SeekFrom::Start(position))?;
+                f.write_all(data)?;
+                f.seek(SeekFrom::Start(saved))?;
+                Ok(data.len())
+            }
+            Some(FileEntry::FileWrite(writer)) => {
+                let mut w = writer.lock();
+                let inner = w.get_mut();
+                let saved = inner.stream_position()?;
+                inner.seek(SeekFrom::Start(position))?;
+                inner.write_all(data)?;
+                inner.seek(SeekFrom::Start(saved))?;
+                Ok(data.len())
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for pwrite")),
+        }
+    }
+
+    /// Sequential read from a FileReadWrite file (advances the cursor).
+    pub fn rw_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                f.read(buf)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_read")),
+        }
+    }
+
+    /// Sequential write to a FileReadWrite file (advances the cursor).
+    pub fn rw_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
+        use io::Write;
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                f.write(data)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_write")),
+        }
+    }
+
+    /// Seek in a FileReadWrite file. Returns new position.
+    pub fn rw_seek(&self, fd: FdId, pos: io::SeekFrom) -> Result<u64, io::Error> {
+        use io::Seek;
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                f.seek(pos)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_seek")),
+        }
+    }
+
+    /// Get the current position in a FileReadWrite file.
+    pub fn rw_position(&self, fd: FdId) -> Result<u64, io::Error> {
+        use io::Seek;
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                f.stream_position()
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_position")),
+        }
+    }
+
+    /// Clone the underlying `std::fs::File` for any file-backed entry.
+    ///
+    /// The returned handle refers to the same kernel file but has an
+    /// independent seek cursor, which is what `mmap` / `MapViewOfFile`
+    /// require. Returns an error if the fd is not backed by a real file.
+    pub fn clone_file(&self, fd: FdId) -> Result<fs::File, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => file.lock().try_clone(),
+            Some(FileEntry::FileRead(reader)) => reader.lock().get_ref().try_clone(),
+            Some(FileEntry::FileWrite(writer)) => {
+                // BufWriter::get_ref() borrows; flush first to not lose data.
+                let mut w = writer.lock();
+                w.flush().ok();
+                w.get_ref().try_clone()
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for clone_file",
+            )),
+        }
+    }
+
+    /// Set the length of a FileReadWrite file (truncate or extend).
+    pub fn rw_set_length(&self, fd: FdId, len: u64) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let f = file.lock();
+                f.set_len(len)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_set_length")),
+        }
+    }
+
+    /// Get the size of a file by fd.
+    pub fn file_size(&self, fd: FdId) -> Result<u64, io::Error> {
+        use io::{Seek, SeekFrom};
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::FileReadWrite(file)) => {
+                let mut f = file.lock();
+                let saved = f.stream_position()?;
+                let size = f.seek(SeekFrom::End(0))?;
+                f.seek(SeekFrom::Start(saved))?;
+                Ok(size)
+            }
+            Some(FileEntry::FileRead(reader)) => {
+                let mut r = reader.lock();
+                let inner = r.get_mut();
+                let saved = inner.stream_position()?;
+                let size = inner.seek(SeekFrom::End(0))?;
+                inner.seek(SeekFrom::Start(saved))?;
+                Ok(size)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for size")),
+        }
+    }
+
+    /// Open a UDP socket. Returns the fd_id.
+    pub fn open_udp(&self, bind_addr: Option<&str>) -> Result<FdId, io::Error> {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let addr = bind_addr.unwrap_or("0.0.0.0:0");
+        let socket = std::net::UdpSocket::bind(addr)?;
+        self.entries
+            .write()
+            .insert(fd, FileEntry::UdpSocket(Mutex::new(socket)));
+        Ok(fd)
+    }
+
+    /// Send UDP datagram to a target address. Returns bytes sent.
+    pub fn udp_send(&self, fd: FdId, data: &[u8], target: &str) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(sock)) => {
+                let s = sock.lock();
+                s.send_to(data, target)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp send")),
+        }
+    }
+
+    /// Receive a UDP datagram. Returns (bytes_read, source_addr).
+    pub fn udp_recv(&self, fd: FdId, buf: &mut [u8]) -> Result<(usize, String), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(sock)) => {
+                let s = sock.lock();
+                let (n, addr) = s.recv_from(buf)?;
+                Ok((n, addr.to_string()))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp recv")),
+        }
+    }
+
+    /// Set non-blocking mode on a UDP socket.
+    pub fn udp_set_nonblocking(&self, fd: FdId, nonblocking: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(sock)) => {
+                sock.lock().set_nonblocking(nonblocking)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Get the local address of a UDP socket.
+    pub fn udp_local_addr(&self, fd: FdId) -> Result<String, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(sock)) => {
+                Ok(sock.lock().local_addr()?.to_string())
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Connect a TCP stream to a remote address. Returns the fd_id.
+    pub fn open_tcp_connect(&self, addr: &str) -> Result<FdId, io::Error> {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let stream = std::net::TcpStream::connect(addr)?;
+        self.entries
+            .write()
+            .insert(fd, FileEntry::TcpStream(Mutex::new(stream)));
+        Ok(fd)
+    }
+
+    /// Wrap an existing TcpStream (e.g. from accept). Returns the fd_id.
+    pub fn insert_tcp_stream(&self, stream: std::net::TcpStream) -> FdId {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .write()
+            .insert(fd, FileEntry::TcpStream(Mutex::new(stream)));
+        fd
+    }
+
+    /// WP1.12 — wrap a subprocess's `ChildStdout` pipe and return the fd_id.
+    /// The JDK-side `FileInputStream` wrapping this fd gets bytes from the
+    /// child process's standard output.
+    pub fn insert_child_stdout(&self, stream: std::process::ChildStdout) -> FdId {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .write()
+            .insert(fd, FileEntry::ChildStdoutPipe(Mutex::new(stream)));
+        fd
+    }
+
+    /// WP1.12 — wrap a subprocess's `ChildStderr` pipe and return the fd_id.
+    pub fn insert_child_stderr(&self, stream: std::process::ChildStderr) -> FdId {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .write()
+            .insert(fd, FileEntry::ChildStderrPipe(Mutex::new(stream)));
+        fd
+    }
+
+    /// WP1.12 — wrap a subprocess's `ChildStdin` pipe and return the fd_id.
+    /// Writing bytes to this fd pipes them into the child's standard input.
+    pub fn insert_child_stdin(&self, stream: std::process::ChildStdin) -> FdId {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .write()
+            .insert(fd, FileEntry::ChildStdinPipe(Mutex::new(stream)));
+        fd
+    }
+
+    /// Open a TCP listener bound to the given address. Returns the fd_id.
+    pub fn open_tcp_listener(&self, addr: &str) -> Result<FdId, io::Error> {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let listener = std::net::TcpListener::bind(addr)?;
+        self.entries
+            .write()
+            .insert(fd, FileEntry::TcpListener(Mutex::new(listener)));
+        Ok(fd)
+    }
+
+    /// Accept a connection on a TCP listener. Returns (new_stream_fd, remote_addr).
+    pub fn tcp_accept(&self, fd: FdId) -> Result<(FdId, String), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpListener(listener)) => {
+                let (stream, addr) = listener.lock().accept()?;
+                drop(entries);
+                let new_fd = self.insert_tcp_stream(stream);
+                Ok((new_fd, addr.to_string()))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp accept")),
+        }
+    }
+
+    /// Read from a TCP stream. Returns bytes read.
+    pub fn tcp_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(stream)) => {
+                let mut s = stream.lock();
+                s.read(buf)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp read")),
+        }
+    }
+
+    /// Write to a TCP stream. Returns bytes written.
+    pub fn tcp_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(stream)) => {
+                let mut s = stream.lock();
+                s.write(data)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp write")),
+        }
+    }
+
+    /// Set non-blocking mode on a TCP stream or listener.
+    pub fn tcp_set_nonblocking(&self, fd: FdId, nonblocking: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(stream)) => stream.lock().set_nonblocking(nonblocking),
+            Some(FileEntry::TcpListener(listener)) => listener.lock().set_nonblocking(nonblocking),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get the local address of a TCP stream or listener.
+    pub fn tcp_local_addr(&self, fd: FdId) -> Result<String, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(stream)) => Ok(stream.lock().local_addr()?.to_string()),
+            Some(FileEntry::TcpListener(listener)) => Ok(listener.lock().local_addr()?.to_string()),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get the peer address of a TCP stream.
+    pub fn tcp_peer_addr(&self, fd: FdId) -> Result<String, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(stream)) => Ok(stream.lock().peer_addr()?.to_string()),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Check if a fd is ready for read/write (non-blocking poll).
+    /// Returns (readable, writable).
+    pub fn poll_ready(&self, fd: FdId) -> (bool, bool) {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(sock)) => {
+                let s = sock.lock();
+                // Temporarily set non-blocking, peek for data, then restore.
+                // Use a 65536-byte buffer because on Windows, peek with a
+                // buffer smaller than the datagram returns WSAEMSGSIZE error.
+                let _ = s.set_nonblocking(true);
+                let mut peek_buf = [0u8; 65536];
+                let readable = match s.peek(&mut peek_buf) {
+                    Ok(n) => n > 0,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                    // On Windows, WSAEMSGSIZE (10040) means data IS available
+                    // but larger than the peek buffer — treat as readable.
+                    #[cfg(target_os = "windows")]
+                    Err(ref e) if e.raw_os_error() == Some(10040) => true,
+                    Err(_) => false,
+                };
+                // Restore to blocking mode
+                let _ = s.set_nonblocking(false);
+                (readable, true) // UDP sockets are always writable
+            }
+            Some(FileEntry::TcpStream(stream)) => {
+                let s = stream.lock();
+                let _ = s.set_nonblocking(true);
+                let mut peek_buf = [0u8; 1];
+                let readable = match s.peek(&mut peek_buf) {
+                    Ok(n) => n > 0,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                    Err(_) => false,
+                };
+                let _ = s.set_nonblocking(false);
+                (readable, true) // TCP streams are generally writable
+            }
+            Some(FileEntry::TcpListener(listener)) => {
+                let l = listener.lock();
+                let _ = l.set_nonblocking(true);
+                let readable = match l.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream); // we peeked; actual accept will happen later
+                        true
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                    Err(_) => false,
+                };
+                let _ = l.set_nonblocking(false);
+                (readable, false) // listeners are readable (acceptable), not writable
+            }
+            Some(FileEntry::FileRead(_)) => (true, false),
+            Some(FileEntry::FileWrite(_)) => (false, true),
+            Some(FileEntry::FileReadWrite(_)) => (true, true),
+            Some(FileEntry::PipeRead(buf)) => {
+                let b = buf.lock();
+                (!b.is_empty(), false)
+            }
+            Some(FileEntry::PipeWrite(_)) => (false, true),
+            _ => (false, false),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TCP socket options
+    // -----------------------------------------------------------------------
+
+    /// Set TCP_NODELAY on a TCP stream.
+    pub fn tcp_set_nodelay(&self, fd: FdId, nodelay: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => s.lock().set_nodelay(nodelay),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get TCP_NODELAY on a TCP stream.
+    pub fn tcp_nodelay(&self, fd: FdId) -> Result<bool, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => s.lock().nodelay(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set read timeout on a TCP stream.
+    pub fn tcp_set_read_timeout(&self, fd: FdId, timeout: Option<Duration>) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => s.lock().set_read_timeout(timeout),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get read timeout on a TCP stream.
+    pub fn tcp_read_timeout(&self, fd: FdId) -> Result<Option<Duration>, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => s.lock().read_timeout(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set write timeout on a TCP stream.
+    pub fn tcp_set_write_timeout(&self, fd: FdId, timeout: Option<Duration>) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => s.lock().set_write_timeout(timeout),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set TTL on a TCP stream.
+    pub fn tcp_set_ttl(&self, fd: FdId, ttl: u32) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => s.lock().set_ttl(ttl),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set SO_KEEPALIVE on a TCP stream (via socket2).
+    pub fn tcp_set_keepalive(&self, fd: FdId, keepalive: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.set_keepalive(keepalive)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get SO_KEEPALIVE on a TCP stream.
+    pub fn tcp_keepalive(&self, fd: FdId) -> Result<bool, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.keepalive()
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set SO_LINGER on a TCP stream.
+    pub fn tcp_set_linger(&self, fd: FdId, linger: Option<Duration>) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.set_linger(linger)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get SO_LINGER on a TCP stream.
+    pub fn tcp_linger(&self, fd: FdId) -> Result<Option<Duration>, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.linger()
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set SO_SNDBUF on a TCP stream.
+    pub fn tcp_set_send_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.set_send_buffer_size(size)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get SO_SNDBUF on a TCP stream.
+    pub fn tcp_send_buffer_size(&self, fd: FdId) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.send_buffer_size()
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set SO_RCVBUF on a TCP stream.
+    pub fn tcp_set_recv_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.set_recv_buffer_size(size)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Get SO_RCVBUF on a TCP stream.
+    pub fn tcp_recv_buffer_size(&self, fd: FdId) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.recv_buffer_size()
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Set SO_REUSEADDR on a TCP listener (via socket2).
+    pub fn tcp_set_reuse_address(&self, fd: FdId, reuse: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpListener(l)) => {
+                let listener = l.lock();
+                let sock = socket2::SockRef::from(&*listener);
+                sock.set_reuse_address(reuse)
+            }
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let sock = socket2::SockRef::from(&*stream);
+                sock.set_reuse_address(reuse)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    /// Estimate available bytes on a TCP stream using peek.
+    pub fn tcp_available(&self, fd: FdId) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TcpStream(s)) => {
+                let stream = s.lock();
+                let _ = stream.set_nonblocking(true);
+                let mut buf = [0u8; 8192];
+                let avail = match stream.peek(&mut buf) {
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                    Err(_) => 0,
+                };
+                let _ = stream.set_nonblocking(false);
+                Ok(avail)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UDP socket options
+    // -----------------------------------------------------------------------
+
+    /// Set SO_REUSEADDR on a UDP socket via socket2.
+    pub fn udp_set_reuse_address(&self, fd: FdId, on: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(s)) => {
+                let sock = s.lock();
+                let sock_ref = socket2::SockRef::from(&*sock);
+                sock_ref.set_reuse_address(on)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set SO_BROADCAST on a UDP socket.
+    pub fn udp_set_broadcast(&self, fd: FdId, on: bool) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(s)) => s.lock().set_broadcast(on),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set TTL on a UDP socket.
+    pub fn udp_set_ttl(&self, fd: FdId, ttl: u32) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(s)) => s.lock().set_ttl(ttl),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set read timeout on a UDP socket.
+    pub fn udp_set_read_timeout(&self, fd: FdId, timeout: Option<Duration>) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(s)) => s.lock().set_read_timeout(timeout),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Join a multicast group on a UDP socket (IPv4).
+    pub fn udp_join_multicast_v4(
+        &self,
+        fd: FdId,
+        multiaddr: &std::net::Ipv4Addr,
+        interface: &std::net::Ipv4Addr,
+    ) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(s)) => s.lock().join_multicast_v4(multiaddr, interface),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Leave a multicast group on a UDP socket (IPv4).
+    pub fn udp_leave_multicast_v4(
+        &self,
+        fd: FdId,
+        multiaddr: &std::net::Ipv4Addr,
+        interface: &std::net::Ipv4Addr,
+    ) -> Result<(), io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::UdpSocket(s)) => s.lock().leave_multicast_v4(multiaddr, interface),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipe channels (in-memory)
+    // -----------------------------------------------------------------------
+
+    /// Create an in-memory pipe. Returns (read_fd, write_fd).
+    pub fn open_pipe(&self) -> (FdId, FdId) {
+        let buf = Arc::new(Mutex::new(VecDeque::with_capacity(8192)));
+        let read_fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let write_fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.write();
+        entries.insert(read_fd, FileEntry::PipeRead(buf.clone()));
+        entries.insert(write_fd, FileEntry::PipeWrite(buf));
+        (read_fd, write_fd)
+    }
+
+    /// Read from the read end of a pipe. Returns bytes read (0 if empty).
+    pub fn pipe_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::PipeRead(pipe)) => {
+                let mut p = pipe.lock();
+                let n = buf.len().min(p.len());
+                for (i, b) in p.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                Ok(n)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for pipe read")),
+        }
+    }
+
+    /// Write to the write end of a pipe. Returns bytes written.
+    pub fn pipe_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::PipeWrite(pipe)) => {
+                let mut p = pipe.lock();
+                p.extend(data);
+                Ok(data.len())
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for pipe write")),
+        }
+    }
+
+    // =========================================================================
+    // TLS operations
+    // =========================================================================
+
+    /// Connect via TLS to the given host:port. Returns the fd_id.
+    pub fn open_tls_connect(&self, host: &str, port: u16) -> Result<FdId, io::Error> {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let addr = format!("{}:{}", host, port);
+        let tcp = std::net::TcpStream::connect(&addr)?;
+        let connector = native_tls::TlsConnector::new()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tls_stream = connector
+            .connect(host, tcp)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.entries
+            .write()
+            .insert(fd, FileEntry::TlsStream(Mutex::new(tls_stream)));
+        Ok(fd)
+    }
+
+    /// Read from a TLS stream.
+    pub fn tls_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TlsStream(stream)) => {
+                let mut s = stream.lock();
+                s.read(buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tls read")),
+        }
+    }
+
+    /// Write to a TLS stream.
+    pub fn tls_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
+        let entries = self.entries.read();
+        match entries.get(&fd) {
+            Some(FileEntry::TlsStream(stream)) => {
+                let mut s = stream.lock();
+                s.write(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tls write")),
+        }
+    }
+}
+
+impl Default for FileDescriptorTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for FileDescriptorTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileDescriptorTable")
+            .field("open_fds", &self.entries.read().len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Helper: create a temp file with the given content and return its path.
+    fn temp_file_with(content: &str) -> String {
+        let id = TEST_COUNTER.fetch_add(1, AtomOrd::Relaxed);
+        let dir = std::env::temp_dir();
+        let name = format!("rustjvm_fdtest_{}_{}.txt", std::process::id(), id);
+        let path = dir.join(name);
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        drop(f);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Helper: create a unique temp file path (file may or may not exist).
+    fn temp_path(suffix: &str) -> String {
+        let id = TEST_COUNTER.fetch_add(1, AtomOrd::Relaxed);
+        let dir = std::env::temp_dir();
+        let name = format!("rustjvm_fdtest_{}_{}_{}.txt", std::process::id(), id, suffix);
+        dir.join(name).to_string_lossy().into_owned()
+    }
+
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_table_has_three_standard_fds() {
+        let table = FileDescriptorTable::new();
+        // stdin(0), stdout(1), stderr(2) are pre-registered
+        assert_eq!(table.entries.read().len(), 3);
+    }
+
+    #[test]
+    fn default_is_same_as_new() {
+        let table = FileDescriptorTable::default();
+        assert_eq!(table.entries.read().len(), 3);
+    }
+
+    #[test]
+    fn debug_format_shows_open_fds() {
+        let table = FileDescriptorTable::new();
+        let dbg = format!("{:?}", table);
+        assert!(dbg.contains("open_fds: 3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // open_read
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_read_returns_fd_ge_3() {
+        let path = temp_file_with("hello");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert!(fd >= 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_read_nonexistent_file_errors() {
+        let table = FileDescriptorTable::new();
+        let result = table.open_read("/tmp/rustjvm_fdtest_nonexistent_xyzzy.txt");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // open_write
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_write_creates_file() {
+        let path = temp_path("write_create");
+        let _ = fs::remove_file(&path);
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        assert!(fd >= 3);
+        assert!(fs::metadata(&path).is_ok());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_write_truncate_mode() {
+        let path = temp_file_with("old content");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        table.write_string(fd, "new").unwrap();
+        table.flush(fd).unwrap();
+        table.close(fd).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "new");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_write_append_mode() {
+        let path = temp_file_with("first");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, true).unwrap();
+        table.write_string(fd, "second").unwrap();
+        table.flush(fd).unwrap();
+        table.close(fd).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "firstsecond");
+        let _ = fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // read_line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_line_returns_lines_without_newline() {
+        let path = temp_file_with("line1\nline2\nline3\n");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some("line1".to_string()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("line2".to_string()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("line3".to_string()));
+        assert_eq!(table.read_line(fd).unwrap(), None); // EOF
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_line_strips_crlf() {
+        let path = temp_file_with("hello\r\nworld\r\n");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some("hello".to_string()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("world".to_string()));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_line_bad_fd_errors() {
+        let table = FileDescriptorTable::new();
+        let result = table.read_line(999);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // read_byte / read_bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_byte_returns_bytes_then_eof() {
+        let path = temp_file_with("AB");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_byte(fd).unwrap(), b'A' as i32);
+        assert_eq!(table.read_byte(fd).unwrap(), b'B' as i32);
+        assert_eq!(table.read_byte(fd).unwrap(), -1); // EOF
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_bytes_fills_buffer() {
+        let path = temp_file_with("hello world");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        let mut buf = [0u8; 5];
+        let n = table.read_bytes(fd, &mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_byte_bad_fd_errors() {
+        let table = FileDescriptorTable::new();
+        assert!(table.read_byte(999).is_err());
+    }
+
+    #[test]
+    fn read_bytes_bad_fd_errors() {
+        let table = FileDescriptorTable::new();
+        let mut buf = [0u8; 4];
+        assert!(table.read_bytes(999, &mut buf).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // write_byte / write_bytes / write_string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_byte_to_file() {
+        let path = temp_path("write_byte");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        table.write_byte(fd, b'X').unwrap();
+        table.flush(fd).unwrap();
+        table.close(fd).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "X");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_bytes_to_file() {
+        let path = temp_path("write_bytes");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        table.write_bytes(fd, b"hello").unwrap();
+        table.flush(fd).unwrap();
+        table.close(fd).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_string_to_file() {
+        let path = temp_path("write_string");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        table.write_string(fd, "rust jvm").unwrap();
+        table.flush(fd).unwrap();
+        table.close(fd).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "rust jvm");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_byte_bad_fd_errors() {
+        let table = FileDescriptorTable::new();
+        assert!(table.write_byte(999, b'X').is_err());
+    }
+
+    #[test]
+    fn write_bytes_bad_fd_errors() {
+        let table = FileDescriptorTable::new();
+        assert!(table.write_bytes(999, b"data").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // close
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn close_removes_fd() {
+        let path = temp_file_with("data");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        table.close(fd).unwrap();
+        // After close, reading should fail
+        assert!(table.read_byte(fd).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn close_already_closed_fd_is_noop() {
+        let path = temp_file_with("data");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        table.close(fd).unwrap();
+        // Second close should not panic
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn close_does_not_remove_stdin_stdout_stderr() {
+        let table = FileDescriptorTable::new();
+        table.close(0).unwrap();
+        table.close(1).unwrap();
+        table.close(2).unwrap();
+        // Standard fds should still be present
+        assert_eq!(table.entries.read().len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // flush
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flush_nonwritable_fd_is_noop() {
+        let path = temp_file_with("data");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        // flush on a read fd should be Ok (no-op for non-writable)
+        assert!(table.flush(fd).is_ok());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn flush_nonexistent_fd_is_noop() {
+        let table = FileDescriptorTable::new();
+        assert!(table.flush(999).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // available
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn available_on_read_fd() {
+        let path = temp_file_with("hello");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        // Before any read, buffer may be empty (0) — that's valid
+        let avail = table.available(fd).unwrap();
+        let _ = avail; // just checking available() didn't error
+        // After a read, there may be more in the buffer
+        let _ = table.read_byte(fd);
+        let _ = table.available(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn available_bad_fd_errors() {
+        let table = FileDescriptorTable::new();
+        assert!(table.available(999).is_err());
+    }
+
+    #[test]
+    fn available_stdin_returns_zero() {
+        let table = FileDescriptorTable::new();
+        assert_eq!(table.available(0).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple concurrent opens
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multiple_concurrent_opens_get_unique_fds() {
+        let p1 = temp_file_with("a");
+        let p2 = temp_file_with("b");
+        let p3 = temp_file_with("c");
+        let table = FileDescriptorTable::new();
+        let fd1 = table.open_read(&p1).unwrap();
+        let fd2 = table.open_read(&p2).unwrap();
+        let fd3 = table.open_read(&p3).unwrap();
+        assert_ne!(fd1, fd2);
+        assert_ne!(fd2, fd3);
+        assert_ne!(fd1, fd3);
+        assert!(fd1 >= 3 && fd2 >= 3 && fd3 >= 3);
+        let _ = fs::remove_file(&p1);
+        let _ = fs::remove_file(&p2);
+        let _ = fs::remove_file(&p3);
+    }
+
+    // -----------------------------------------------------------------------
+    // FD counter overflow protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fd_overflow_protection_read() {
+        let path = temp_file_with("overflow test");
+        let table = FileDescriptorTable::new();
+        // Force the counter near the limit
+        table.next_fd.store(u32::MAX - 10, Ordering::Relaxed);
+        let result = table.open_read(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("file descriptor limit exceeded"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fd_overflow_protection_write() {
+        let path = temp_path("overflow_write");
+        let table = FileDescriptorTable::new();
+        table.next_fd.store(u32::MAX - 10, Ordering::Relaxed);
+        let result = table.open_write(&path, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("file descriptor limit exceeded"));
+        let _ = fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip: write then read
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let path = temp_path("roundtrip");
+        let table = FileDescriptorTable::new();
+
+        // Write
+        let wfd = table.open_write(&path, false).unwrap();
+        table.write_string(wfd, "line1\nline2\n").unwrap();
+        table.flush(wfd).unwrap();
+        table.close(wfd).unwrap();
+
+        // Read back
+        let rfd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(rfd).unwrap(), Some("line1".to_string()));
+        assert_eq!(table.read_line(rfd).unwrap(), Some("line2".to_string()));
+        assert_eq!(table.read_line(rfd).unwrap(), None);
+        table.close(rfd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Write to stdout/stderr fds (smoke test — just ensure no panic/error)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_to_stdout_fd() {
+        let table = FileDescriptorTable::new();
+        // Writing to stdout fd should succeed (output goes to test harness)
+        assert!(table.write_byte(1, b'\n').is_ok());
+        assert!(table.write_bytes(1, b"").is_ok());
+        assert!(table.write_string(1, "").is_ok());
+    }
+
+    #[test]
+    fn write_to_stderr_fd() {
+        let table = FileDescriptorTable::new();
+        assert!(table.write_byte(2, b'\n').is_ok());
+    }
+
+    #[test]
+    fn flush_stdout_stderr() {
+        let table = FileDescriptorTable::new();
+        assert!(table.flush(1).is_ok());
+        assert!(table.flush(2).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Read from write fd should fail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_from_write_fd_errors() {
+        let path = temp_path("read_write_fd");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        assert!(table.read_byte(fd).is_err());
+        assert!(table.read_line(fd).is_err());
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_to_read_fd_errors() {
+        let path = temp_file_with("data");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert!(table.write_byte(fd, b'X').is_err());
+        assert!(table.write_bytes(fd, b"X").is_err());
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.4.14 — BufferedReader.readLine: must recognize \n, \r\n, and
+    // bare \r as line terminators (BufferedReader javadoc contract).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t2_read_line_unix_lf() {
+        let path = temp_file_with("alpha\nbeta\n");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some("alpha".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("beta".into()));
+        assert_eq!(table.read_line(fd).unwrap(), None);
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn t2_read_line_windows_crlf_stays_atomic() {
+        let path = temp_file_with("one\r\ntwo\r\nthree");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some("one".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("two".into()));
+        // Final line without terminator still produces a value.
+        assert_eq!(table.read_line(fd).unwrap(), Some("three".into()));
+        assert_eq!(table.read_line(fd).unwrap(), None);
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn t2_read_line_classic_mac_cr_only() {
+        // Classic Mac OS used a bare \r as the line terminator. The
+        // previous implementation returned the entire file as a single
+        // line because `BufRead::read_line` only stops on \n.
+        let path = temp_file_with("uno\rdos\rtres");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some("uno".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("dos".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("tres".into()));
+        assert_eq!(table.read_line(fd).unwrap(), None);
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn t2_read_line_mixed_terminators() {
+        // Verifies interleaved \n / \r / \r\n all work in the same file.
+        let path = temp_file_with("a\nb\rc\r\nd");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some("a".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("b".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("c".into()));
+        assert_eq!(table.read_line(fd).unwrap(), Some("d".into()));
+        assert_eq!(table.read_line(fd).unwrap(), None);
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn t2_read_line_empty_line_returns_empty_string() {
+        // Consecutive newlines should each yield an empty line, not get
+        // collapsed. Same invariant as BufferedReader.readLine.
+        let path = temp_file_with("\n\n");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+        assert_eq!(table.read_line(fd).unwrap(), Some(String::new()));
+        assert_eq!(table.read_line(fd).unwrap(), Some(String::new()));
+        assert_eq!(table.read_line(fd).unwrap(), None);
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+}

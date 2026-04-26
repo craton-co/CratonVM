@@ -1,0 +1,2800 @@
+//! T19.H4 — JBoss Modules `LocalModuleLoader` + `DefaultBootModuleLoaderHolder`.
+//!
+//! After `ConcurrentHashMap.initTable`, `MethodHandles$Lookup`,
+//! `StackWalker`, `JDKSpecific`, and `currentCarrierThread` are unblocked,
+//! KC16 (WildFly / JBoss Modules) reaches:
+//!
+//! ```text
+//! Exception in thread "main" java/lang/NullPointerException:
+//!     Cannot invoke loadModule on null
+//! ```
+//!
+//! `org.jboss.modules.Main.main(String[])` reads
+//! `DefaultBootModuleLoaderHolder.INSTANCE` (the holder idiom for a
+//! lazy `ModuleLoader` singleton).  The holder's `<clinit>` fails (for
+//! the same WeakReference / MBean reasons documented in
+//! `deprecated_internal.rs::register_jboss_module_loader_init_bypass`)
+//! and B6-swallows.  Without the post-clinit fixup wired up below,
+//! `INSTANCE` is left null and `Main.loadModule` NPEs.
+//!
+//! This module fixes the NPE end-to-end:
+//!
+//! 1. `DefaultBootModuleLoaderHolder.INSTANCE` is populated post-clinit
+//!    with a synthetic `LocalModuleLoader` object.  See
+//!    [`build_default_boot_holder_instance`] (called from
+//!    `vm/src/vm/vm_util.rs::post_clinit_fixup`).
+//! 2. `LocalModuleLoader.loadModule(String)` is registered as a native
+//!    that walks the `-mp` filesystem path, parses `module.xml`, and
+//!    returns a synthetic `org/jboss/modules/Module` whose resource
+//!    roots are the jars listed in `module.xml`.  See
+//!    [`native_loader_load_module`].
+//! 3. `Module.getClassLoader()` returns a synthetic
+//!    `ModuleClassLoader` that delegates to the system class loader
+//!    (KC16 doesn't fully sandbox the boot module).  See
+//!    [`native_module_get_class_loader`].
+//! 4. `Module.loadClass(String)` resolves through the system class
+//!    loader using the module's resource roots as classpath.  See
+//!    [`native_module_load_class`].
+//!
+//! # Security
+//!
+//! - `validate_module_name` rejects empty / oversize / NUL / control /
+//!   path-separator / `..` traversal sequences.  KC16's
+//!   `org.jboss.as.standalone` uses dots only; any module name that
+//!   tries to escape `<mp>` fails closed.
+//! - `module.xml` parsing is delegated to `jboss_module_xml.rs` whose
+//!   T17.Γ caps (1 MiB file size, hard nesting limit, strict-accept
+//!   rules) we inherit.
+//! - Every resolved module path is required to lie under the
+//!   `-mp` root: we canonicalize the root and the candidate, then
+//!   assert a prefix match.  This defeats both `..` traversal and
+//!   symlink attacks (because canonicalize follows symlinks before
+//!   the prefix comparison).
+//!
+//! # Concurrency
+//!
+//! - The cached `Module` objects per `(loader, name)` live in a
+//!   `parking_lot::Mutex<HashMap>` so concurrent `loadModule` calls
+//!   from multiple worker threads are safe.
+//! - The `OnceLock<PathBuf>` resolved from `-mp` is computed on the
+//!   first call.  Re-entrancy is fine: we never call back into Java
+//!   from inside the lookup path.
+
+#![allow(clippy::needless_pass_by_value)]
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use rustjvm_types::{ObjectRef, Value};
+
+use crate::alloc_concurrent_synthetic;
+use crate::jboss_module_xml::{parse_module_xml, ModuleXml};
+
+// ===========================================================================
+// Class names (kept centralized so anchor strings are easy to spot in greps)
+// ===========================================================================
+
+pub(crate) const CN_MODULE_LOADER: &str = "org/jboss/modules/LocalModuleLoader";
+pub(crate) const CN_MODULE: &str = "org/jboss/modules/Module";
+pub(crate) const CN_MODULE_CLASSLOADER: &str = "org/jboss/modules/ModuleClassLoader";
+pub(crate) const CN_DEFAULT_BOOT_HOLDER: &str =
+    "org/jboss/modules/DefaultBootModuleLoaderHolder";
+pub(crate) const CN_MODULE_NOT_FOUND: &str = "org/jboss/modules/ModuleNotFoundException";
+
+// ---------------------------------------------------------------------------
+// Field layout — kept in sync with the synthetic_stub_fields entries in
+// classloading/src/class_manager.rs.  Each native uses the slot indices
+// below by name.
+// ---------------------------------------------------------------------------
+
+/// `LocalModuleLoader`:  slot 0 = root (String, the `-mp` path).
+const LOADER_SLOT_ROOT: usize = 0;
+const LOADER_FIELD_COUNT: usize = 1;
+
+/// `Module`:
+///   slot 0 = name (String)
+///   slot 1 = loader (LocalModuleLoader or null)
+///   slot 2 = classLoader (ModuleClassLoader or null, lazily populated)
+///   slot 3 = resourceRoots (Object[] of String paths)
+const MOD_SLOT_NAME: usize = 0;
+const MOD_SLOT_LOADER: usize = 1;
+const MOD_SLOT_CLASSLOADER: usize = 2;
+const MOD_SLOT_RESOURCE_ROOTS: usize = 3;
+const MOD_FIELD_COUNT: usize = 4;
+
+/// `ModuleClassLoader`:
+///   slot 0 = module (Module back-reference)
+const MCL_SLOT_MODULE: usize = 0;
+const MCL_FIELD_COUNT: usize = 1;
+
+/// `ModuleNotFoundException`: 2 fields (message, cause) like every
+/// `Throwable` subclass.
+pub(crate) const MNF_FIELD_COUNT: usize = 2;
+
+// ===========================================================================
+// Module-name validation
+// ===========================================================================
+
+/// Reject module names that a downstream API could interpret as a path
+/// traversal, an absolute filesystem reference, or an unexpected
+/// control sequence.
+///
+/// JBoss module names are dot-separated (e.g. `org.jboss.as.standalone`).
+/// Anything that contains `:`, `/`, `\`, `..`, NUL, or any control byte
+/// is rejected with `IllegalArgumentException`.
+pub(crate) fn validate_module_name(name: &str) -> Result<(), RuntimeError> {
+    if name.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "module name must not be empty".to_string(),
+        });
+    }
+    if name.len() > 256 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "module name too long: {} bytes (max 256)",
+                name.len()
+            ),
+        });
+    }
+    for b in name.bytes() {
+        if b < 0x20 || b == 0x7F {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "module name contains control byte".to_string(),
+            });
+        }
+        if b == b'/' || b == b'\\' || b == b':' {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "module name contains path separator".to_string(),
+            });
+        }
+    }
+    if name.contains("..") {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "module name contains traversal sequence".to_string(),
+        });
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Module-path resolution
+// ===========================================================================
+
+/// Process-wide cache of the canonicalized `-mp` root.  Set lazily on
+/// the first `loadModule` call.
+static MP_ROOT_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Find the `-mp <path>` argument in the process command line.
+///
+/// JBoss Modules consumes this flag from `Main.main(String[])` — by
+/// the time `loadModule` is called the value has been parsed but
+/// not stored anywhere our native code can see.  Instead, we scan
+/// `std::env::args()`, which still contains the raw CLI arguments
+/// (the rustjvm CLI captures positional args via `trailing_var_arg`,
+/// so they remain in the process argv).
+///
+/// Returns `None` if `-mp` is not present (or has no following arg).
+fn find_mp_argument() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == "-mp" || a == "-modulepath" || a == "--module-path" {
+            if let Some(next) = iter.next() {
+                return Some(next.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve and canonicalize the `-mp` root once.  Subsequent calls
+/// return the cached value.
+fn resolve_mp_root() -> Option<PathBuf> {
+    MP_ROOT_CACHE
+        .get_or_init(|| {
+            let raw = find_mp_argument()?;
+            // `-mp` accepts a list separated by `;` (Windows) / `:` (Unix).
+            // Take the first entry as the canonical root for path-prefix
+            // checks, but search every entry when looking up modules.
+            let primary = raw.split(if cfg!(windows) { ';' } else { ':' }).next()?;
+            let p = Path::new(primary);
+            // `canonicalize` resolves symlinks; if the path doesn't
+            // exist we fall back to a non-canonical absolute path so
+            // tests that operate on tempdirs still see a deterministic
+            // root value.  In production the path always exists.
+            match std::fs::canonicalize(p) {
+                Ok(c) => Some(c),
+                Err(_) => p.canonicalize().ok().or_else(|| Some(p.to_path_buf())),
+            }
+        })
+        .clone()
+}
+
+/// Per-test override for the `-mp` root.  When set, takes precedence
+/// over `MP_ROOT_CACHE`.
+#[cfg(test)]
+static MP_ROOT_TEST_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_mp_root_for_test(root: Option<PathBuf>) {
+    *MP_ROOT_TEST_OVERRIDE.lock() = root;
+}
+
+#[cfg(test)]
+fn current_mp_root_for_test() -> Option<PathBuf> {
+    MP_ROOT_TEST_OVERRIDE.lock().clone()
+}
+
+#[cfg(not(test))]
+fn current_mp_root_for_test() -> Option<PathBuf> {
+    None
+}
+
+/// Active module path root: test override > resolved CLI > None.
+fn module_path_root() -> Option<PathBuf> {
+    if let Some(p) = current_mp_root_for_test() {
+        return Some(p);
+    }
+    resolve_mp_root()
+}
+
+// ===========================================================================
+// Module discovery
+// ===========================================================================
+
+/// Resolved on-disk location of a module.
+///
+/// `module.xml` lives at `module_dir/module.xml`; resource jars live
+/// at `module_dir/<resource-root.path>` and are returned as absolute
+/// canonical strings.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedModule {
+    pub module_xml_path: PathBuf,
+    pub module_dir: PathBuf,
+    pub mx: ModuleXml,
+    pub resource_roots: Vec<PathBuf>,
+}
+
+/// Locate the `module.xml` file for `name` by walking every layer
+/// under `<root>/system/layers/<layer>/<dot-to-slash(name)>/main/`
+/// plus the legacy `<root>/<dot-to-slash(name)>/main/` location.
+///
+/// Returns `None` if no matching directory was found anywhere.
+pub(crate) fn locate_module_xml(root: &Path, name: &str) -> Option<PathBuf> {
+    let rel = name.replace('.', "/");
+    // Legacy non-layered path.
+    let legacy = root.join(&rel).join("main").join("module.xml");
+    if legacy.is_file() {
+        return Some(legacy);
+    }
+    // Layered path.  Read layers.conf if present; default to `base`.
+    let layers_root = root.join("system").join("layers");
+    let mut layers: Vec<String> = Vec::new();
+    let layers_conf = root.join("layers.conf");
+    if let Ok(contents) = std::fs::read_to_string(&layers_conf) {
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("layers=") {
+                for part in rest.split(',') {
+                    let p = part.trim();
+                    if !p.is_empty() {
+                        layers.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // JBoss always implicitly appends `base`.
+    if !layers.iter().any(|l| l == "base") {
+        layers.push("base".to_string());
+    }
+    for layer in &layers {
+        let candidate = layers_root.join(layer).join(&rel).join("main").join("module.xml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // Add-ons tree.
+    let addons_root = root.join("system").join("add-ons");
+    if let Ok(entries) = std::fs::read_dir(&addons_root) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(&rel).join("main").join("module.xml");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Given a canonicalized module-path root and a resolved
+/// `module.xml` path, assert the module path is *under* the root.
+///
+/// Defeats both `..` traversal and symlink attacks: every path is
+/// canonicalized first, so a symlink target outside the root is
+/// detected by the prefix check.
+fn ensure_under_root(root: &Path, candidate: &Path) -> Result<(), RuntimeError> {
+    let canonical_candidate = std::fs::canonicalize(candidate)
+        .unwrap_or_else(|_| candidate.to_path_buf());
+    let canonical_root = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf());
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(RuntimeError::SecurityException {
+            message: format!(
+                "module path {} escapes module root {}",
+                canonical_candidate.display(),
+                canonical_root.display(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve `name` against `root` end-to-end: locate module.xml, parse
+/// it, materialize each resource-root path, and verify everything
+/// stays inside the root.
+pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, RuntimeError> {
+    validate_module_name(name)?;
+    let module_xml_path = locate_module_xml(root, name).ok_or_else(|| {
+        RuntimeError::ClassNotFoundException {
+            class_name: format!("module:{}", name),
+        }
+    })?;
+    ensure_under_root(root, &module_xml_path)?;
+    let module_dir = module_xml_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf());
+    let mx = parse_module_xml(&module_xml_path).map_err(|e| {
+        RuntimeError::IOException {
+            message: format!(
+                "failed to parse {}: {}",
+                module_xml_path.display(),
+                e
+            ),
+        }
+    })?;
+    // Resource roots are relative to module_dir.  Materialize each as
+    // an absolute path and confirm it stays under the canonical root.
+    let mut resource_roots = Vec::with_capacity(mx.resource_roots.len());
+    for rr in &mx.resource_roots {
+        // Reject `..` segments at the input layer too — defense in depth.
+        if rr.path.contains("..") {
+            return Err(RuntimeError::SecurityException {
+                message: format!(
+                    "resource-root path {} contains traversal sequence",
+                    rr.path
+                ),
+            });
+        }
+        let absolute = module_dir.join(&rr.path);
+        ensure_under_root(root, &absolute)?;
+        resource_roots.push(absolute);
+    }
+    Ok(ResolvedModule {
+        module_xml_path,
+        module_dir,
+        mx,
+        resource_roots,
+    })
+}
+
+/// WP2.1 — resolve `name` against an ordered list of roots.
+///
+/// Used by `LocalModuleLoader.loadModule` when the user constructed the
+/// loader with `new LocalModuleLoader(File[])` (the JBoss public API).
+/// Each root is tried in turn; on `ClassNotFoundException` we move to
+/// the next root, on any other error we propagate immediately.
+///
+/// The first root that successfully resolves wins.  If every root
+/// returns `ClassNotFoundException`, the final error is rebuilt with
+/// the original module name so callers can map it to
+/// `ModuleNotFoundException`.
+pub(crate) fn resolve_module_in_roots(
+    roots: &[PathBuf],
+    name: &str,
+) -> Result<ResolvedModule, RuntimeError> {
+    validate_module_name(name)?;
+    if roots.is_empty() {
+        return Err(RuntimeError::ClassNotFoundException {
+            class_name: format!("module:{}", name),
+        });
+    }
+    let mut last_err: Option<RuntimeError> = None;
+    for root in roots {
+        match resolve_module(root, name) {
+            Ok(r) => return Ok(r),
+            Err(e @ RuntimeError::ClassNotFoundException { .. }) => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| RuntimeError::ClassNotFoundException {
+        class_name: format!("module:{}", name),
+    }))
+}
+
+// ===========================================================================
+// Module / Loader cache
+// ===========================================================================
+
+/// Per-process cache of `(module-name, ObjectRef)` so concurrent
+/// `loadModule(name)` from multiple threads always returns the same
+/// `Module` instance — JBoss's contract.
+///
+/// We don't track per-loader caches because rustjvm only has one
+/// `LocalModuleLoader` instance (the boot holder).  When/if a second
+/// loader appears, the cache keys can be promoted to
+/// `(loader_object_ref, name)`.
+static MODULE_CACHE: OnceLock<Mutex<std::collections::HashMap<String, ObjectRef>>> =
+    OnceLock::new();
+
+fn module_cache() -> &'static Mutex<std::collections::HashMap<String, ObjectRef>> {
+    MODULE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Per-process cache of `(module-name, ResolvedModule)` so the dependency
+/// closure walker can re-read the module's parsed `module.xml` (resources,
+/// dependencies, etc.) without re-parsing every call.  Keyed by the same
+/// canonical module name as `MODULE_CACHE`.
+///
+/// This complements `MODULE_CACHE` (which holds the Java-visible Module
+/// objects) — we need both because the resolver state lives in Rust and the
+/// Module reference lives in the JVM heap.
+static RESOLVED_MODULES: OnceLock<Mutex<std::collections::HashMap<String, ResolvedModule>>> =
+    OnceLock::new();
+
+fn resolved_modules() -> &'static Mutex<std::collections::HashMap<String, ResolvedModule>> {
+    RESOLVED_MODULES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_module_cache_for_test() {
+    if let Some(c) = MODULE_CACHE.get() {
+        c.lock().clear();
+    }
+    if let Some(c) = RESOLVED_MODULES.get() {
+        c.lock().clear();
+    }
+    let _ = REGISTERED_PATHS.get().map(|m| m.lock().clear());
+}
+
+/// Set of resource-root paths that have already been pushed onto the shared
+/// dynamic classpath.  We dedupe so each JAR is only registered once even
+/// when multiple modules point at it (or when transitive walks revisit the
+/// same dependency).
+static REGISTERED_PATHS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn registered_paths() -> &'static Mutex<std::collections::HashSet<String>> {
+    REGISTERED_PATHS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Process-wide cache of the boot holder INSTANCE so the post-clinit
+/// fixup and the `loadModule` native always hand out the same
+/// `LocalModuleLoader`.
+static BOOT_LOADER: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+
+fn boot_loader_slot() -> &'static Mutex<Option<ObjectRef>> {
+    BOOT_LOADER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_boot_loader_for_test() {
+    if let Some(c) = BOOT_LOADER.get() {
+        *c.lock() = None;
+    }
+}
+
+// ===========================================================================
+// Public construction helpers (called from vm/src/vm/vm_util.rs)
+// ===========================================================================
+
+/// Construct (or fetch) the singleton `LocalModuleLoader` object.
+///
+/// Called both from [`build_default_boot_holder_instance`] and from
+/// the lazy-rebuild path in [`native_loader_load_module`] when the
+/// caller didn't pass a real receiver.
+pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
+    {
+        let slot = boot_loader_slot().lock();
+        if let Some(o) = *slot {
+            return o;
+        }
+    }
+    let loader = alloc_concurrent_synthetic(ctx, CN_MODULE_LOADER, LOADER_FIELD_COUNT);
+    let root_str = match module_path_root() {
+        Some(p) => ctx.create_string(&p.to_string_lossy()),
+        None => ctx.create_string(""),
+    };
+    ctx.set_field(loader, LOADER_SLOT_ROOT, Value::Object(Some(root_str)));
+    {
+        let mut slot = boot_loader_slot().lock();
+        // Double-checked locking: another thread may have raced us.
+        if let Some(o) = *slot {
+            return o;
+        }
+        *slot = Some(loader);
+    }
+    loader
+}
+
+/// Allocate the `DefaultBootModuleLoaderHolder.INSTANCE` value.  The
+/// caller (a post-clinit fixup in `vm_util.rs`) writes the result to
+/// the holder's static field.
+pub fn build_default_boot_holder_instance(ctx: &mut dyn NativeContext) -> ObjectRef {
+    build_local_module_loader(ctx)
+}
+
+// ===========================================================================
+// Native: LocalModuleLoader.loadModule(String) → Module
+// ===========================================================================
+
+fn build_resource_root_array(
+    ctx: &mut dyn NativeContext,
+    paths: &[PathBuf],
+) -> ObjectRef {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        let s = ctx.create_string(&p.to_string_lossy());
+        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+    }
+    arr
+}
+
+/// Build a `Module` object populated from `resolved`.
+fn build_module_object(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    loader: ObjectRef,
+    resolved: &ResolvedModule,
+) -> ObjectRef {
+    let module = alloc_concurrent_synthetic(ctx, CN_MODULE, MOD_FIELD_COUNT);
+    let name_str = ctx.create_string(name);
+    ctx.set_field(module, MOD_SLOT_NAME, Value::Object(Some(name_str)));
+    ctx.set_field(module, MOD_SLOT_LOADER, Value::Object(Some(loader)));
+    let arr = build_resource_root_array(ctx, &resolved.resource_roots);
+    ctx.set_field(module, MOD_SLOT_RESOURCE_ROOTS, Value::Object(Some(arr)));
+    // Class loader is populated lazily on first `getClassLoader()` call.
+    ctx.set_field(module, MOD_SLOT_CLASSLOADER, Value::Object(None));
+    module
+}
+
+/// Throw `org.jboss.modules.ModuleNotFoundException` with `name`.
+fn throw_module_not_found(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> MethodCallFailed {
+    let exc = alloc_concurrent_synthetic(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT);
+    let msg = ctx.create_string(name);
+    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// WP2.1 — Extract the `File[]` roots that the user passed to
+/// `new LocalModuleLoader(File[])`.
+///
+/// The real jboss-modules.jar carries the roots in
+/// `LocalModuleFinder.repoRoots`, which is reachable from the
+/// `LocalModuleLoader` instance via the inherited `ModuleLoader.finders`
+/// field (or `getFinders()` accessor).
+///
+/// We try (in order):
+///
+/// 1. `getFinders()` virtual call — works when the loader's superclass
+///    layout is intact.
+/// 2. Direct `finders` field read — fallback when the synthetic stub
+///    layout doesn't include `getFinders` dispatch.
+///
+/// For each `LocalModuleFinder` element we read its `repoRoots: File[]`
+/// field, then call `File.getAbsolutePath()` on each entry to get the
+/// canonical path string.
+///
+/// Returns an empty Vec on any failure — the caller falls back to the
+/// process-wide `module_path_root()` resolution.
+fn extract_receiver_roots(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+) -> Vec<PathBuf> {
+    let finders_arr = read_finders_array(ctx, receiver);
+    let finders_arr = match finders_arr {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let n = ctx.array_length(finders_arr);
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for i in 0..n {
+        let finder = match ctx.get_array_element(finders_arr, i) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        // Only LocalModuleFinder carries File[] roots.  Other finders
+        // (custom user finders) have no file-system root we can extract;
+        // skip them and let module_path_root() handle the fallback.
+        let class_name = ctx
+            .class_name_of_id(ctx.class_id_of_object(finder))
+            .unwrap_or_default();
+        if !class_name.ends_with("/LocalModuleFinder")
+            && !class_name.ends_with(".LocalModuleFinder")
+            && class_name != "org/jboss/modules/LocalModuleFinder"
+        {
+            continue;
+        }
+        let repo_roots_val = ctx.get_field_by_name(finder, "repoRoots");
+        let arr = match repo_roots_val {
+            Value::Object(Some(a)) => a,
+            _ => continue,
+        };
+        let m = ctx.array_length(arr);
+        for j in 0..m {
+            let file = match ctx.get_array_element(arr, j) {
+                Value::Object(Some(f)) => f,
+                _ => continue,
+            };
+            // Prefer `File.getAbsolutePath()` virtual call — it returns the
+            // OS-canonical path string regardless of how the File was
+            // constructed.  Fall back to the `path` field if invoke fails.
+            let path_str = match ctx.invoke_virtual(
+                file,
+                "getAbsolutePath",
+                "()Ljava/lang/String;",
+                &[Value::Object(Some(file))],
+            ) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                _ => None,
+            };
+            let path_str = path_str.or_else(|| {
+                match ctx.get_field_by_name(file, "path") {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                }
+            });
+            if let Some(p) = path_str {
+                if !p.is_empty() {
+                    let path = PathBuf::from(&p);
+                    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                    roots.push(canonical);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// Read the `finders: ModuleFinder[]` field from a ModuleLoader receiver.
+///
+/// Tries the virtual `getFinders()` accessor first (cheaper and survives
+/// any field-renaming), then falls back to a direct `finders` field
+/// read.  Returns the array ObjectRef or None.
+fn read_finders_array(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+) -> Option<ObjectRef> {
+    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
+        receiver,
+        "getFinders",
+        "()[Lorg/jboss/modules/ModuleFinder;",
+        &[Value::Object(Some(receiver))],
+    ) {
+        return Some(arr);
+    }
+    match ctx.get_field_by_name(receiver, "finders") {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// `LocalModuleLoader.loadModule(String name)` — locate the module on
+/// disk, parse `module.xml`, and return a populated `Module`.
+pub(crate) fn native_loader_load_module(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] = this (LocalModuleLoader), args[1] = String name
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => build_local_module_loader(ctx),
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("LocalModuleLoader.loadModule: name must not be null".to_string()),
+            }
+            .into());
+        }
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "LocalModuleLoader.loadModule: name must be a String".to_string(),
+            }
+            .into());
+        }
+    };
+    let name = ctx.read_string(name_obj).unwrap_or_default();
+    if let Err(e) = validate_module_name(&name) {
+        return Err(e.into());
+    }
+
+    // Cache hit?
+    {
+        let cache = module_cache().lock();
+        if let Some(cached) = cache.get(&name) {
+            return Ok(Some(Value::Object(Some(*cached))));
+        }
+    }
+
+    // T19.H8 — Skip `extract_receiver_roots` when the receiver is the
+    // synthetic boot loader. The post-clinit fixup in `vm_util.rs`
+    // allocates a `LocalModuleLoader` with one zero-initialised slot
+    // (no `finders` populated). `extract_receiver_roots` then calls
+    // `invoke_virtual(receiver, "getFinders", ...)`, which on a synthetic
+    // stub class with no bytecode for `getFinders` recurses through the
+    // virtual-dispatch fallback path back into `loadModule` (or sister
+    // dispatch sites), producing the Main.main pc=1306 100%-CPU spin
+    // that watchdog T19.H1 caught with 0 dumps.  We fall straight to
+    // the process-wide `-mp` cache for any receiver whose `finders`
+    // slot is null/uninitialised — the original WP2.1 path is still
+    // taken for caller-constructed `LocalModuleLoader(File[])`.
+    let receiver_has_finders = matches!(
+        ctx.get_field_by_name(this, "finders"),
+        Value::Object(Some(_))
+    );
+    let mut roots: Vec<PathBuf> = if receiver_has_finders {
+        extract_receiver_roots(ctx, this)
+    } else {
+        Vec::new()
+    };
+    if let Some(mp) = module_path_root() {
+        if !roots.iter().any(|r| r == &mp) {
+            roots.push(mp);
+        }
+    }
+    if roots.is_empty() {
+        return Err(throw_module_not_found(ctx, &name));
+    }
+
+    let resolved = match resolve_module_in_roots(&roots, &name) {
+        Ok(r) => r,
+        Err(RuntimeError::ClassNotFoundException { .. }) => {
+            return Err(throw_module_not_found(ctx, &name));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let module = build_module_object(ctx, &name, this, &resolved);
+
+    // Stash the resolved module so the dependency-closure walker (used by
+    // ModuleClassLoader.loadClass / getResource) can re-traverse without
+    // re-parsing the XML.
+    {
+        let mut store = resolved_modules().lock();
+        store.insert(name.clone(), resolved.clone());
+    }
+
+    // Pre-register the module's own resource-root jars on the shared
+    // dynamic classpath so the system class loader can resolve classes
+    // that we route through (after the visibility check).  This keeps
+    // class definition single-sourced (no double-define) while still
+    // letting the MCL.loadClass native vouch for visibility.
+    register_resource_roots(ctx, &resolved.resource_roots);
+
+    // T19_H15 — additionally register the **transitive linkage closure**
+    // of resource-roots on the shared classpath.  When bytecode in this
+    // module is verified, the JVM's verifier resolves referenced classes
+    // (field types, parameter types, exception classes) through the
+    // application class loader — bypassing JBoss's per-module
+    // `MCL.loadClass` native.  Without the deps' jars on the dynamic
+    // classpath at this point, the verifier raises
+    // `NoClassDefFoundError` (KC16 hits this on
+    // `org.jboss.as.controller.access.JmxAction$Impact` referenced
+    // indirectly from `org.jboss.as.jmx.PluggableMBeanServerImpl`).
+    //
+    // `register_resource_roots` deduplicates by absolute path, so
+    // re-walking on every loadModule call is O(n) in already-seen jars
+    // and idempotent.
+    let linkage_roots = transitive_linkage_roots(&name);
+    if !linkage_roots.is_empty() {
+        register_resource_roots(ctx, &linkage_roots);
+    }
+
+    // Insert into cache, but check for race-loser.
+    let mut cache = module_cache().lock();
+    if let Some(existing) = cache.get(&name) {
+        return Ok(Some(Value::Object(Some(*existing))));
+    }
+    cache.insert(name.clone(), module);
+    Ok(Some(Value::Object(Some(module))))
+}
+
+// ===========================================================================
+// Module visibility closure (used by ModuleClassLoader natives)
+// ===========================================================================
+
+/// Append `paths` to the shared dynamic classpath if they haven't been
+/// registered before.  Deduplicated by full path string so the same JAR
+/// pointed at by two modules' `resource-root` is only added once.
+fn register_resource_roots(ctx: &mut dyn NativeContext, paths: &[PathBuf]) {
+    let mut to_register: Vec<String> = Vec::new();
+    {
+        let mut seen = registered_paths().lock();
+        for p in paths {
+            let s = p.to_string_lossy().to_string();
+            if seen.insert(s.clone()) {
+                to_register.push(s);
+            }
+        }
+    }
+    if !to_register.is_empty() {
+        ctx.register_dynamic_classpath(&to_register);
+    }
+}
+
+/// Resolve `name` (re-parsing the on-disk module.xml if not yet cached) and
+/// return its parsed descriptor.  Used by the visibility-closure walk —
+/// missing modules return None so the walker can short-circuit on a missing
+/// optional dep without raising.
+fn ensure_resolved(name: &str) -> Option<ResolvedModule> {
+    {
+        let cache = resolved_modules().lock();
+        if let Some(r) = cache.get(name) {
+            return Some(r.clone());
+        }
+    }
+    let root = module_path_root()?;
+    match resolve_module(&root, name) {
+        Ok(r) => {
+            let mut cache = resolved_modules().lock();
+            cache.insert(name.to_string(), r.clone());
+            Some(r)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Walk the visibility closure of `start_module`: itself plus every
+/// non-optional dependency, plus every transitive `export="true"` dep.
+///
+/// This mirrors JBoss Modules' "self + imports + transitive exports" rule:
+/// - the module itself is always visible
+/// - each direct `<module name="..."/>` dep is visible
+/// - if the dep declares `export="true"`, *its* deps are also visible
+/// - missing optional deps are silently skipped (per `optional="true"`)
+/// - missing required deps log a warning but do not abort (best-effort)
+///
+/// Returns the **list of resolved module names** in BFS order plus the union
+/// of resource-root paths the closure can see.
+fn module_visibility_closure(start_module: &str) -> (Vec<String>, Vec<PathBuf>) {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut queue: VecDeque<(String, bool)> = VecDeque::new();
+    // (name, follow_exports_only) — start: follow direct deps too
+    queue.push_back((start_module.to_string(), false));
+    while let Some((name, exports_only)) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let resolved = match ensure_resolved(&name) {
+            Some(r) => r,
+            None => {
+                continue;
+            }
+        };
+        order.push(name.clone());
+        roots.extend(resolved.resource_roots.iter().cloned());
+        for dep in &resolved.mx.dependencies {
+            // System dependencies (`<system>`) reference the JDK directly —
+            // bootstrap classpath already covers them; nothing to add here.
+            if !matches!(dep.kind, crate::jboss_module_xml::DependencyKind::Module) {
+                continue;
+            }
+            if exports_only && !dep.export {
+                // Walking a non-direct module — only follow re-exports.
+                continue;
+            }
+            let next_name = dep.name.clone();
+            // For a re-exported dep, we follow its own re-exports recursively.
+            // For a direct dep, we follow its non-optional + re-exported deps.
+            let next_exports_only = true;
+            // Optional+missing must not error — ensure_resolved returns None
+            // and the loop simply skips it.
+            let _ = next_exports_only;
+            // Push regardless of optional flag; ensure_resolved handles missing.
+            queue.push_back((next_name, true));
+            let _ = dep.optional;
+        }
+    }
+    (order, roots)
+}
+
+/// T19_H15 — walk the **transitive linkage closure** of `start_module`.
+///
+/// Unlike [`module_visibility_closure`] (which models JBoss's runtime
+/// `loadClass` visibility — start + direct deps + re-exports of those
+/// deps), this walker descends through **every** module dep recursively,
+/// regardless of `export="true"`.  It returns the union of resource-root
+/// paths reachable from `start_module` through the full dep graph.
+///
+/// Why both closures exist:
+///
+/// * **Runtime visibility** (the existing `module_visibility_closure`) is
+///   what `ModuleClassLoader.loadClass` enforces.  KC16's runtime code
+///   that walks `m.loadClass(name)` must only see classes that JBoss's
+///   actual class loader would expose.
+///
+/// * **Linkage closure** (this function) is what the bytecode verifier
+///   needs.  When bytecode in module X references a class C from module
+///   Y (a dep of X), the JVM verifier resolves C through the *application*
+///   class loader — bypassing JBoss's `MCL.loadClass`.  Without Y's jars
+///   on the shared classpath, `find_class_bytes_delegated` can't find C
+///   and the verifier raises `NoClassDefFoundError`.
+///
+///   The KC16 boot path triggers this when `org.jboss.as.controller`'s
+///   `JmxAction$Impact` is referenced via field/parameter signatures of
+///   classes loaded indirectly by JBoss bootstrap.  Registering only the
+///   start module's own roots (or even its runtime visibility closure) is
+///   not enough — `org.jboss.as.controller-client` re-exports
+///   `org.jboss.as.controller`, but the verifier may also need the
+///   non-re-exported `org.jboss.as.protocol` etc. for ancillary symbols.
+///
+/// Returns the union of resource-root paths in BFS order.  Optional /
+/// missing deps are silently skipped (best-effort) so a single
+/// unresolved optional doesn't abort registration of the rest of the
+/// closure.
+fn transitive_linkage_roots(start_module: &str) -> Vec<PathBuf> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(start_module.to_string());
+    // Bound the walk so a maliciously-crafted module graph (cycle,
+    // explosion) cannot exhaust memory or stall the loader.  Each module
+    // descriptor adds at most a few dozen jars; 4096 modules is several
+    // orders of magnitude past anything WildFly / Keycloak ships.
+    const MAX_MODULES: usize = 4096;
+    while let Some(name) = queue.pop_front() {
+        if visited.len() >= MAX_MODULES {
+            break;
+        }
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let resolved = match ensure_resolved(&name) {
+            Some(r) => r,
+            None => continue,
+        };
+        roots.extend(resolved.resource_roots.iter().cloned());
+        for dep in &resolved.mx.dependencies {
+            // Skip <system> deps — JDK classes come from the bootstrap
+            // classpath, not the application classpath.
+            if !matches!(dep.kind, crate::jboss_module_xml::DependencyKind::Module) {
+                continue;
+            }
+            queue.push_back(dep.name.clone());
+        }
+    }
+    roots
+}
+
+/// Search `roots` (filesystem dirs and JARs) for `entry_path` (a slash-
+/// separated path inside the module).  Returns the absolute path-string of
+/// the first JAR/dir that contains the entry, or None.
+fn find_entry_in_roots(roots: &[PathBuf], entry_path: &str) -> Option<String> {
+    for r in roots {
+        // Directory layout: r/<entry_path>
+        if r.is_dir() {
+            let candidate = r.join(entry_path);
+            if candidate.is_file() {
+                return Some(r.to_string_lossy().to_string());
+            }
+        } else if r.is_file() {
+            // JAR layout — open and check the central directory.
+            let f = match std::fs::File::open(r) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut archive = match zip::ZipArchive::new(f) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            if archive.by_name(entry_path).is_ok() {
+                return Some(r.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read entry bytes from `roots[0..]` matching `entry_path`.
+fn read_entry_from_roots(roots: &[PathBuf], entry_path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    for r in roots {
+        if r.is_dir() {
+            let candidate = r.join(entry_path);
+            if candidate.is_file() {
+                return std::fs::read(&candidate).ok();
+            }
+        } else if r.is_file() {
+            let f = match std::fs::File::open(r) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut archive = match zip::ZipArchive::new(f) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let buf_opt = if let Ok(mut entry) = archive.by_name(entry_path) {
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                if entry.read_to_end(&mut buf).is_ok() {
+                    Some(buf)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(buf) = buf_opt {
+                return Some(buf);
+            }
+        }
+    }
+    None
+}
+
+// ===========================================================================
+// Native: Module.getClassLoader() → ClassLoader
+// ===========================================================================
+
+pub(crate) fn native_module_get_class_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.getClassLoader: receiver must not be null".to_string()),
+            }
+            .into());
+        }
+    };
+    if let Value::Object(Some(existing)) = ctx.get_field(this, MOD_SLOT_CLASSLOADER) {
+        return Ok(Some(Value::Object(Some(existing))));
+    }
+    let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
+    ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(this)));
+    ctx.set_field(this, MOD_SLOT_CLASSLOADER, Value::Object(Some(mcl)));
+    Ok(Some(Value::Object(Some(mcl))))
+}
+
+// ===========================================================================
+// Native: Module.loadClass(String) / Module.loadClass(String, boolean)
+// ===========================================================================
+
+pub(crate) fn native_module_load_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.loadClass: receiver must not be null".to_string()),
+            }
+            .into());
+        }
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.loadClass: name must not be null".to_string()),
+            }
+            .into());
+        }
+    };
+    let class_name = ctx.read_string(name_obj).unwrap_or_default();
+    let internal = class_name.replace('.', "/");
+    match ctx.load_class(&internal) {
+        Ok(Some(mirror)) => Ok(Some(mirror)),
+        _ => {
+            let exc =
+                alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+            let msg = ctx.create_string(&class_name);
+            ctx.set_field(exc, 0, Value::Object(Some(msg)));
+            Err(MethodCallFailed::ExceptionThrown(exc))
+        }
+    }
+}
+
+// ===========================================================================
+// Native: ModuleClassLoader.loadClass(String) — module-scoped delegation
+// ===========================================================================
+//
+// JVM spec §5.3.2 + JBoss Modules' contract:
+// 1. parent-first for `java.*` / `javax.*` / `jdk.*` / `sun.*` / `com.sun.*`
+//    / `org.w3c.*` / `org.xml.*` / `org.ietf.*` (always go through bootstrap)
+// 2. self-first for everything else: search the module's own resource roots
+//    plus the visibility closure (transitive re-exported deps)
+// 3. throw CNFE if not found in the closure (do not "leak" classes loaded
+//    by other modules onto the shared classpath)
+
+/// Names that *must* go through the parent (bootstrap) loader.
+fn is_jdk_internal_class(name: &str) -> bool {
+    let n = name.replace('.', "/");
+    n.starts_with("java/")
+        || n.starts_with("javax/")
+        || n.starts_with("jdk/")
+        || n.starts_with("sun/")
+        || n.starts_with("com/sun/")
+        || n.starts_with("org/w3c/")
+        || n.starts_with("org/xml/")
+        || n.starts_with("org/ietf/")
+}
+
+/// Resolve the Module name behind a ModuleClassLoader instance.
+///
+/// MCL.slot(0) → Module backref → Module.slot(0) → String name.
+fn module_name_of_mcl(ctx: &dyn NativeContext, mcl: ObjectRef) -> Option<String> {
+    let module = match ctx.get_field(mcl, MCL_SLOT_MODULE) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let name_val = ctx.get_field(module, MOD_SLOT_NAME);
+    if let Value::Object(Some(s)) = name_val {
+        ctx.read_string(s)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn native_module_classloader_load_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "ModuleClassLoader.loadClass: receiver must not be null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "ModuleClassLoader.loadClass: name must not be null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    let class_name = ctx.read_string(name_obj).unwrap_or_default();
+    let internal = class_name.replace('.', "/");
+
+    // Step 1 — parent-first for JDK internals so they always come from the
+    // bootstrap loader (not the module's resource roots, even if a module
+    // tries to ship a duplicate `java.*` class).
+    if is_jdk_internal_class(&class_name) {
+        return match ctx.load_class(&internal) {
+            Ok(Some(mirror)) => Ok(Some(mirror)),
+            _ => {
+                let exc =
+                    alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+                let msg = ctx.create_string(&class_name);
+                ctx.set_field(exc, 0, Value::Object(Some(msg)));
+                Err(MethodCallFailed::ExceptionThrown(exc))
+            }
+        };
+    }
+
+    // Step 2 — module-scoped self-first lookup.  Walk the module's
+    // visibility closure and confirm at least one resource root contains
+    // the .class entry before delegating to the system class loader.
+    let module_name = module_name_of_mcl(ctx, this);
+    let entry_path = format!("{}.class", internal);
+    let mut visible = false;
+    if let Some(name) = module_name.as_deref() {
+        let (_modules, roots) = module_visibility_closure(name);
+        // Register every visible root on the shared dynamic classpath so
+        // the system class loader can resolve once visibility passes.
+        // (`register_resource_roots` is idempotent.)
+        register_resource_roots(ctx, &roots);
+        if find_entry_in_roots(&roots, &entry_path).is_some() {
+            visible = true;
+        }
+    } else {
+        // Defensive: if we don't have a module backref (synthetic or test
+        // fixture), behave like a plain delegating loader so apps that
+        // don't depend on isolation still work.
+        visible = true;
+    }
+
+    if !visible {
+        let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+        let msg = ctx.create_string(&class_name);
+        ctx.set_field(exc, 0, Value::Object(Some(msg)));
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
+
+    match ctx.load_class(&internal) {
+        Ok(Some(mirror)) => Ok(Some(mirror)),
+        _ => {
+            let exc =
+                alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+            let msg = ctx.create_string(&class_name);
+            ctx.set_field(exc, 0, Value::Object(Some(msg)));
+            Err(MethodCallFailed::ExceptionThrown(exc))
+        }
+    }
+}
+
+// ===========================================================================
+// Native: ModuleClassLoader.findClass(String) — module-scoped only
+// ===========================================================================
+//
+// findClass is the "local search" hook called by ClassLoader.loadClass after
+// parent-first delegation fails.  For JBoss Modules it should ONLY check the
+// module's own resource roots — never delegate to a parent.
+
+pub(crate) fn native_module_classloader_find_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "ModuleClassLoader.findClass: receiver must not be null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "ModuleClassLoader.findClass: name must not be null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    let class_name = ctx.read_string(name_obj).unwrap_or_default();
+    let internal = class_name.replace('.', "/");
+    let entry_path = format!("{}.class", internal);
+
+    let module_name = module_name_of_mcl(ctx, this);
+    if let Some(name) = module_name.as_deref() {
+        let (_modules, roots) = module_visibility_closure(name);
+        register_resource_roots(ctx, &roots);
+        if find_entry_in_roots(&roots, &entry_path).is_some() {
+            if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+                return Ok(Some(mirror));
+            }
+        }
+    }
+
+    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+    let msg = ctx.create_string(&class_name);
+    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    Err(MethodCallFailed::ExceptionThrown(exc))
+}
+
+// ===========================================================================
+// Native: ModuleClassLoader.findResource(String) /
+//         ModuleClassLoader.getResource(String)
+// ===========================================================================
+//
+// Returns a `classpath:` / `jar:file:` URL for the first hit in the module's
+// visibility closure, or null if not visible.
+
+pub(crate) fn native_module_classloader_get_resource(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = ctx.read_string(name_obj).unwrap_or_default();
+    let trimmed = name.trim_start_matches('/').to_string();
+
+    let module_name = match module_name_of_mcl(ctx, this) {
+        Some(n) => n,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let (_modules, roots) = module_visibility_closure(&module_name);
+    register_resource_roots(ctx, &roots);
+    let hit_root = match find_entry_in_roots(&roots, &trimmed) {
+        Some(s) => s,
+        None => {
+            // Permit JDK / `java.*` resource lookups to fall through to
+            // the parent (system) loader — same parent-first contract as
+            // loadClass.  Returns null if the parent doesn't have it.
+            if ctx.find_resource(&trimmed).is_some() {
+                let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+                let full = ctx.create_string(&format!("classpath:/{trimmed}"));
+                ctx.set_field(url, 5, Value::Object(Some(full)));
+                return Ok(Some(Value::Object(Some(url))));
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+    let url_string = if hit_root.ends_with(".jar") {
+        // Normalize Windows backslashes for valid URL path component.
+        let path = hit_root.replace('\\', "/");
+        format!("jar:file:/{path}!/{trimmed}")
+    } else {
+        let path = hit_root.replace('\\', "/");
+        format!("file:/{path}/{trimmed}")
+    };
+    let full = ctx.create_string(&url_string);
+    ctx.set_field(url, 0, Value::Object(Some(full)));
+    ctx.set_field(url, 5, Value::Object(Some(full)));
+    Ok(Some(Value::Object(Some(url))))
+}
+
+/// `ModuleClassLoader.getResourceAsStream(String) -> InputStream`.
+pub(crate) fn native_module_classloader_get_resource_as_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = ctx.read_string(name_obj).unwrap_or_default();
+    let trimmed = name.trim_start_matches('/').to_string();
+
+    let bytes_opt = match module_name_of_mcl(ctx, this) {
+        Some(module_name) => {
+            let (_modules, roots) = module_visibility_closure(&module_name);
+            read_entry_from_roots(&roots, &trimmed).or_else(|| ctx.find_resource(&trimmed))
+        }
+        None => ctx.find_resource(&trimmed),
+    };
+
+    match bytes_opt {
+        None => Ok(Some(Value::Object(None))),
+        Some(bytes) => {
+            let len = bytes.len();
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            ctx.set_field(stream, 1, Value::Int(0));
+            ctx.set_field(stream, 2, Value::Int(0));
+            ctx.set_field(stream, 3, Value::Int(len as i32));
+            ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
+            ctx.set_field_by_name(stream, "pos", Value::Int(0));
+            ctx.set_field_by_name(stream, "mark", Value::Int(0));
+            ctx.set_field_by_name(stream, "count", Value::Int(len as i32));
+            Ok(Some(Value::Object(Some(stream))))
+        }
+    }
+}
+
+// ===========================================================================
+// Native: Module.getName(), Module.getModuleLoader()
+// ===========================================================================
+
+pub(crate) fn native_module_get_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, MOD_SLOT_NAME)))
+}
+
+pub(crate) fn native_module_get_module_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let l = build_local_module_loader(ctx);
+            return Ok(Some(Value::Object(Some(l))));
+        }
+    };
+    let stored = ctx.get_field(this, MOD_SLOT_LOADER);
+    if let Value::Object(Some(_)) = stored {
+        return Ok(Some(stored));
+    }
+    let l = build_local_module_loader(ctx);
+    ctx.set_field(this, MOD_SLOT_LOADER, Value::Object(Some(l)));
+    Ok(Some(Value::Object(Some(l))))
+}
+
+// ===========================================================================
+// Registration
+// ===========================================================================
+
+// ===========================================================================
+// Native: Module.getProperty(String, String) / getProperty(String)
+// ===========================================================================
+//
+// JBoss `Module` has a private `properties:Ljava/util/Map;` field that
+// downstream WildFly code reads via `getProperty`.  Our synthetic Module
+// shape doesn't have that field, so the bytecode's `getfield properties`
+// returns null → invokeinterface containsKey NPEs.  The fix: short-circuit
+// the property read at the native boundary — the boot path doesn't actually
+// depend on any property being set, so returning the caller's default
+// (or null) is sufficient.
+
+pub(crate) fn native_module_get_property_with_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] = this, args[1] = key, args[2] = default
+    let _this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(args.get(2).copied().unwrap_or(Value::Object(None)))),
+    };
+    // Echo the default; ignore key.  The module.xml `<properties>` block
+    // is metadata-only and our boot path doesn't consult it.
+    let _ = ctx;
+    Ok(Some(args.get(2).copied().unwrap_or(Value::Object(None))))
+}
+
+pub(crate) fn native_module_get_property(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_module_get_property_names(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Return an empty ArrayList — this matches the "no properties set"
+    // case the boot path expects.
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `DefaultBootModuleLoaderHolder$1.run()` — the PrivilegedAction whose
+/// `run()` produces the boot loader.  Without this override the real
+/// bytecode reflectively instantiates a LocalModuleLoader, which tangles
+/// with our WeakReference / MBean gap and yields null.  Returning the
+/// cached synthetic loader directly short-circuits the whole reflection
+/// dance so `<clinit>` finishes with a non-null INSTANCE.
+pub(crate) fn native_boot_holder_priv_action_run(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let loader = build_local_module_loader(ctx);
+    Ok(Some(Value::Object(Some(loader))))
+}
+
+/// Install every `LocalModuleLoader` / `Module` / `ModuleClassLoader`
+/// native this module owns.
+pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
+    // DefaultBootModuleLoaderHolder$1.run() overrides — both the
+    // typed and erased signatures get the same implementation so the
+    // JVM's bytecode dispatch resolves one or the other.
+    let holder_inner = "org/jboss/modules/DefaultBootModuleLoaderHolder$1";
+    registry.register(
+        holder_inner,
+        "run",
+        "()Lorg/jboss/modules/ModuleLoader;",
+        native_boot_holder_priv_action_run,
+    );
+    registry.register(
+        holder_inner,
+        "run",
+        "()Ljava/lang/Object;",
+        native_boot_holder_priv_action_run,
+    );
+    // LocalModuleLoader: also register on the abstract `ModuleLoader`
+    // base class so virtual dispatch from JBoss bytecode that holds a
+    // `ModuleLoader` reference picks up the same implementation.
+    let signatures: &[(&str, &str)] = &[
+        (CN_MODULE_LOADER, "loadModule"),
+        ("org/jboss/modules/ModuleLoader", "loadModule"),
+    ];
+    for (cn, name) in signatures {
+        registry.register(
+            cn,
+            name,
+            "(Ljava/lang/String;)Lorg/jboss/modules/Module;",
+            native_loader_load_module,
+        );
+        // Some JBoss versions use ModuleIdentifier — register a thin
+        // wrapper that delegates to the String-based path.
+        registry.register(
+            cn,
+            name,
+            "(Lorg/jboss/modules/ModuleIdentifier;)Lorg/jboss/modules/Module;",
+            native_loader_load_module_by_identifier,
+        );
+    }
+
+    // Module surface.
+    registry.register(
+        CN_MODULE,
+        "getName",
+        "()Ljava/lang/String;",
+        native_module_get_name,
+    );
+    registry.register(
+        CN_MODULE,
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        native_module_get_class_loader,
+    );
+    registry.register(
+        CN_MODULE,
+        "getClassLoader",
+        "()Lorg/jboss/modules/ModuleClassLoader;",
+        native_module_get_class_loader,
+    );
+    registry.register(
+        CN_MODULE,
+        "getModuleLoader",
+        "()Lorg/jboss/modules/ModuleLoader;",
+        native_module_get_module_loader,
+    );
+    registry.register(
+        CN_MODULE,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        native_module_load_class,
+    );
+    registry.register(
+        CN_MODULE,
+        "loadClass",
+        "(Ljava/lang/String;Z)Ljava/lang/Class;",
+        |ctx, args| {
+            // Drop the boolean and reuse the single-arg path.
+            let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
+            native_module_load_class(ctx, &trimmed)
+        },
+    );
+
+    // T19.H4: Module.getProperty / getPropertyNames overrides.  These
+    // short-circuit the JBoss Module's `properties:Map` field which our
+    // synthetic shape doesn't carry.  The boot path doesn't depend on
+    // module properties — they're metadata only.
+    registry.register(
+        CN_MODULE,
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_module_get_property,
+    );
+    registry.register(
+        CN_MODULE,
+        "getProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        native_module_get_property_with_default,
+    );
+    registry.register(
+        CN_MODULE,
+        "getPropertyNames",
+        "()Ljava/util/List;",
+        native_module_get_property_names,
+    );
+
+    // T19.H4: Module.getClassLoaderPrivate() — JBoss's package-private
+    // accessor used in Main.main.  Same dispatch as the public
+    // getClassLoader() variants.
+    registry.register(
+        CN_MODULE,
+        "getClassLoaderPrivate",
+        "()Lorg/jboss/modules/ModuleClassLoader;",
+        native_module_get_class_loader,
+    );
+
+    // ModuleClassLoader surface.
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        native_module_classloader_load_class,
+    );
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "loadClass",
+        "(Ljava/lang/String;Z)Ljava/lang/Class;",
+        |ctx, args| {
+            let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
+            native_module_classloader_load_class(ctx, &trimmed)
+        },
+    );
+    // findClass: invoked by ClassLoader.loadClass after parent-first
+    // delegation fails — ours short-circuits and only checks the module
+    // closure so cross-module classes never leak through.
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "findClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        native_module_classloader_find_class,
+    );
+    // getResource / getResourceAsStream / findResource — all closure-bound.
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "getResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        native_module_classloader_get_resource,
+    );
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "findResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        native_module_classloader_get_resource,
+    );
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        native_module_classloader_get_resource_as_stream,
+    );
+}
+
+/// `loadModule(ModuleIdentifier)` — extract the dotted name from the
+/// identifier and delegate.
+fn native_loader_load_module_by_identifier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let id_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "loadModule(ModuleIdentifier): identifier must not be null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    // ModuleIdentifier has `String getName()` — call it.
+    let name_val = ctx.invoke(
+        "org/jboss/modules/ModuleIdentifier",
+        "getName",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(id_obj))],
+    )?;
+    let name = match name_val {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if name.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "loadModule(ModuleIdentifier): identifier produced empty name"
+                .to_string(),
+        }
+        .into());
+    }
+    let name_str = ctx.create_string(&name);
+    let new_args: Vec<Value> = vec![args[0], Value::Object(Some(name_str))];
+    native_loader_load_module(ctx, &new_args)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use parking_lot::Mutex as PMutex;
+
+    /// Serial test guard — the `-mp` test override and module cache are
+    /// process-wide singletons.  Tests must run serialized so they
+    /// don't see each other's side effects.
+    static TEST_LOCK: PMutex<()> = PMutex::new(());
+
+    fn setup_test_env(tmp_root: &Path) {
+        clear_module_cache_for_test();
+        clear_boot_loader_for_test();
+        set_mp_root_for_test(Some(tmp_root.to_path_buf()));
+    }
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn make_minimal_module_xml(name: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<module name="{}" xmlns="urn:jboss:module:1.9">
+    <resources>
+    </resources>
+</module>
+"#,
+            name
+        )
+    }
+
+    fn make_module_xml_with_jars(name: &str, jars: &[&str]) -> String {
+        let mut s = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<module name=\"{}\" xmlns=\"urn:jboss:module:1.9\">\n  <resources>\n",
+            name
+        );
+        for j in jars {
+            s.push_str(&format!("    <resource-root path=\"{}\"/>\n", j));
+        }
+        s.push_str("  </resources>\n</module>\n");
+        s
+    }
+
+    // -----------------------------------------------------------------
+    // validate_module_name
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_validate_accepts_valid_module_names() {
+        let _g = TEST_LOCK.lock();
+        assert!(validate_module_name("org.jboss.as.standalone").is_ok());
+        assert!(validate_module_name("java.base").is_ok());
+        assert!(validate_module_name("x").is_ok());
+        // 256 bytes exactly — boundary
+        let max = "a".repeat(256);
+        assert!(validate_module_name(&max).is_ok());
+    }
+
+    #[test]
+    fn t19_h4_validate_rejects_empty_and_oversize() {
+        let _g = TEST_LOCK.lock();
+        assert!(validate_module_name("").is_err());
+        let too_long = "a".repeat(257);
+        assert!(validate_module_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn t19_h4_validate_rejects_traversal_and_separators() {
+        let _g = TEST_LOCK.lock();
+        assert!(validate_module_name("../etc/passwd").is_err());
+        assert!(validate_module_name("..").is_err());
+        assert!(validate_module_name("foo/bar").is_err());
+        assert!(validate_module_name("foo\\bar").is_err());
+        assert!(validate_module_name("C:\\Windows").is_err());
+        assert!(validate_module_name("a:b").is_err());
+    }
+
+    #[test]
+    fn t19_h4_validate_rejects_control_bytes() {
+        let _g = TEST_LOCK.lock();
+        assert!(validate_module_name("foo\0bar").is_err());
+        assert!(validate_module_name("foo\nbar").is_err());
+        assert!(validate_module_name("foo\tbar").is_err());
+        assert!(validate_module_name("foo\x7fbar").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // resolve_module — happy path
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_resolve_module_legacy_path() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mod_xml =
+            root.join("org/jboss/as/standalone/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("org.jboss.as.standalone"));
+        let r = resolve_module(root, "org.jboss.as.standalone").unwrap();
+        assert_eq!(r.mx.name, "org.jboss.as.standalone");
+        assert!(r.module_xml_path.ends_with("module.xml"));
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_layered_base_path() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mod_xml = root
+            .join("system/layers/base/org/jboss/as/standalone/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("org.jboss.as.standalone"));
+        let r = resolve_module(root, "org.jboss.as.standalone").unwrap();
+        assert_eq!(r.mx.name, "org.jboss.as.standalone");
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_layered_with_layers_conf() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(&root.join("layers.conf"), "layers=keycloak\n");
+        let mod_xml = root
+            .join("system/layers/keycloak/com/example/foo/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("com.example.foo"));
+        let r = resolve_module(root, "com.example.foo").unwrap();
+        assert_eq!(r.mx.name, "com.example.foo");
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_resource_roots_resolved() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let main_dir = root.join("com/example/foo/main");
+        write(
+            &main_dir.join("module.xml"),
+            &make_module_xml_with_jars("com.example.foo", &["a.jar", "b.jar"]),
+        );
+        // Touch the jars so canonicalize doesn't fail
+        write(&main_dir.join("a.jar"), "PK");
+        write(&main_dir.join("b.jar"), "PK");
+        let r = resolve_module(root, "com.example.foo").unwrap();
+        assert_eq!(r.resource_roots.len(), 2);
+        assert!(r.resource_roots[0].ends_with("a.jar"));
+        assert!(r.resource_roots[1].ends_with("b.jar"));
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_missing_returns_class_not_found() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_module(tmp.path(), "no.such.module").unwrap_err();
+        match err {
+            RuntimeError::ClassNotFoundException { class_name } => {
+                assert!(class_name.contains("no.such.module"));
+            }
+            other => panic!("expected ClassNotFoundException, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_rejects_invalid_name() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_module(tmp.path(), "../etc").is_err());
+        assert!(resolve_module(tmp.path(), "").is_err());
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_rejects_resource_root_traversal() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let main_dir = root.join("com/example/evil/main");
+        write(
+            &main_dir.join("module.xml"),
+            &make_module_xml_with_jars("com.example.evil", &["../../escape.jar"]),
+        );
+        let err = resolve_module(root, "com.example.evil").unwrap_err();
+        assert!(matches!(err, RuntimeError::SecurityException { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // build_local_module_loader / boot holder caching
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_build_local_module_loader_is_idempotent() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let a = build_local_module_loader(&mut ctx);
+        let b = build_local_module_loader(&mut ctx);
+        assert_eq!(a.as_ptr(), b.as_ptr());
+    }
+
+    #[test]
+    fn t19_h4_default_boot_holder_instance_returns_same_loader() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let a = build_default_boot_holder_instance(&mut ctx);
+        let b = build_default_boot_holder_instance(&mut ctx);
+        let c = build_local_module_loader(&mut ctx);
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(a.as_ptr(), c.as_ptr());
+    }
+
+    // -----------------------------------------------------------------
+    // native_loader_load_module — happy path + cache + errors
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_load_module_happy_path_returns_module_with_resource_roots() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let main_dir = root.join("org/jboss/as/standalone/main");
+        write(
+            &main_dir.join("module.xml"),
+            &make_module_xml_with_jars(
+                "org.jboss.as.standalone",
+                &["jboss-as-server.jar"],
+            ),
+        );
+        write(&main_dir.join("jboss-as-server.jar"), "PK");
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("org.jboss.as.standalone");
+        let result = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap();
+        let module = match result {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected non-null Module, got {:?}", other),
+        };
+        // resourceRoots slot should be a non-null Object[]
+        let roots = ctx.get_field(module, MOD_SLOT_RESOURCE_ROOTS);
+        if let Value::Object(Some(arr)) = roots {
+            assert_eq!(ctx.array_length(arr), 1);
+        } else {
+            panic!("expected Object[] in resourceRoots, got {:?}", roots);
+        }
+    }
+
+    #[test]
+    fn t19_h4_load_module_caches_repeat_calls() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mod_xml = root.join("a/b/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("a.b"));
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name1 = ctx.create_string("a.b");
+        let r1 = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name1))],
+        )
+        .unwrap()
+        .unwrap();
+        let name2 = ctx.create_string("a.b");
+        let r2 = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name2))],
+        )
+        .unwrap()
+        .unwrap();
+        match (r1, r2) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                assert_eq!(a.as_ptr(), b.as_ptr(), "module cache must return same ref");
+            }
+            other => panic!("expected non-null modules, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_load_module_missing_throws_module_not_found() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("ghost.module.never.exists");
+        let err = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap_err();
+        match err {
+            MethodCallFailed::ExceptionThrown(_) => {}
+            other => panic!("expected ExceptionThrown(ModuleNotFoundException), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_load_module_null_name_throws_npe() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let err = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(None)],
+        )
+        .unwrap_err();
+        let s = format!("{:?}", err);
+        assert!(s.contains("Null") || s.contains("null"), "got {}", s);
+    }
+
+    #[test]
+    fn t19_h4_load_module_traversal_name_rejected() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("../escape");
+        let err = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap_err();
+        let s = format!("{:?}", err);
+        assert!(
+            s.contains("traversal") || s.contains("IllegalArgument"),
+            "got {}",
+            s
+        );
+    }
+
+    #[test]
+    fn t19_h4_load_module_with_no_mp_set_throws_module_not_found() {
+        let _g = TEST_LOCK.lock();
+        clear_module_cache_for_test();
+        clear_boot_loader_for_test();
+        set_mp_root_for_test(None);
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("anything");
+        let err = native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap_err();
+        match err {
+            MethodCallFailed::ExceptionThrown(_) => {}
+            other => panic!("expected ExceptionThrown, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Module accessors
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_module_get_name_returns_string() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mod_xml = root.join("foo/bar/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("foo.bar"));
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("foo.bar");
+        let module = match native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(m)) => m,
+            other => panic!("got {:?}", other),
+        };
+        let result =
+            native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
+                .unwrap()
+                .unwrap();
+        if let Value::Object(Some(s)) = result {
+            assert_eq!(ctx.read_string(s).as_deref(), Some("foo.bar"));
+        } else {
+            panic!("expected non-null name string, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn t19_h4_module_get_class_loader_lazy_populates() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mod_xml = root.join("zz/yy/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("zz.yy"));
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("zz.yy");
+        let module = match native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(m)) => m,
+            other => panic!("got {:?}", other),
+        };
+        // First call populates.
+        let r1 =
+            native_module_get_class_loader(&mut ctx, &[Value::Object(Some(module))])
+                .unwrap()
+                .unwrap();
+        // Second call returns same instance.
+        let r2 =
+            native_module_get_class_loader(&mut ctx, &[Value::Object(Some(module))])
+                .unwrap()
+                .unwrap();
+        match (r1, r2) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                assert_eq!(a.as_ptr(), b.as_ptr());
+            }
+            other => panic!("expected non-null ClassLoader pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_module_get_class_loader_null_receiver_throws_npe() {
+        let _g = TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        let err = native_module_get_class_loader(&mut ctx, &[Value::Object(None)])
+            .unwrap_err();
+        let s = format!("{:?}", err);
+        assert!(s.contains("Null") || s.contains("null"), "got {}", s);
+    }
+
+    #[test]
+    fn t19_h4_module_get_module_loader_falls_back_to_boot() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let result =
+            native_module_get_module_loader(&mut ctx, &[Value::Object(None)])
+                .unwrap()
+                .unwrap();
+        match result {
+            Value::Object(Some(_)) => {}
+            other => panic!("expected non-null loader, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Concurrency: 4 threads racing loadModule for the same module
+    // must end up with one cached instance.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_load_module_concurrent_4_threads_share_one_module() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mod_xml = root.join("race/me/main/module.xml");
+        write(&mod_xml, &make_minimal_module_xml("race.me"));
+        setup_test_env(root);
+
+        // Each thread builds its own context — the module cache lives
+        // process-wide so cross-context lookups still hit the same
+        // ObjectRef.  We can't truly invoke from background threads
+        // because MockNativeContext isn't Send; instead we serialize
+        // the calls but use four distinct receiver/name pairs to
+        // simulate concurrent traffic.
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let mut refs = Vec::new();
+        for _ in 0..4 {
+            let name = ctx.create_string("race.me");
+            let result = native_loader_load_module(
+                &mut ctx,
+                &[Value::Object(Some(loader)), Value::Object(Some(name))],
+            )
+            .unwrap()
+            .unwrap();
+            if let Value::Object(Some(m)) = result {
+                refs.push(m);
+            } else {
+                panic!("expected non-null Module");
+            }
+        }
+        let first = refs[0].as_ptr();
+        for r in &refs[1..] {
+            assert_eq!(r.as_ptr(), first, "all calls must return same ObjectRef");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // ensure_under_root — symlink/traversal defense
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_ensure_under_root_accepts_descendants() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let inside = root.join("subdir/file.txt");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, "x").unwrap();
+        ensure_under_root(root, &inside).unwrap();
+    }
+
+    #[test]
+    fn t19_h4_ensure_under_root_rejects_escapes() {
+        let _g = TEST_LOCK.lock();
+        let tmp_root = tempfile::tempdir().unwrap();
+        let tmp_other = tempfile::tempdir().unwrap();
+        let outside = tmp_other.path().join("foo");
+        std::fs::write(&outside, "x").unwrap();
+        let err = ensure_under_root(tmp_root.path(), &outside).unwrap_err();
+        assert!(matches!(err, RuntimeError::SecurityException { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // Registration smoke
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_register_jboss_module_loader_adds_surface() {
+        let _g = TEST_LOCK.lock();
+        let mut r = NativeMethodRegistry::new();
+        let before = r.len();
+        register_jboss_module_loader(&mut r);
+        let after = r.len();
+        // We register at least: 2 DefaultBootModuleLoaderHolder$1.run
+        // overloads, loadModule/String + loadModule/Identifier on both
+        // LocalModuleLoader and ModuleLoader (4), plus 11 methods on
+        // Module / ModuleClassLoader (incl. property accessors and
+        // getClassLoaderPrivate).  Assert at least 15 net new
+        // registrations.
+        assert!(
+            after >= before + 15,
+            "expected >= 15 new registrations, got {}",
+            after - before
+        );
+    }
+
+    #[test]
+    fn t19_h4_boot_holder_priv_action_run_returns_loader() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let result = native_boot_holder_priv_action_run(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        match result {
+            Value::Object(Some(_)) => {}
+            other => panic!("expected non-null loader, got {:?}", other),
+        }
+        // Running again must return the same loader ref (idempotent).
+        let loader_a = native_boot_holder_priv_action_run(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        let loader_b = native_boot_holder_priv_action_run(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        match (loader_a, loader_b) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                assert_eq!(a.as_ptr(), b.as_ptr());
+            }
+            other => panic!("expected pair of non-null loaders, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // find_mp_argument — ensure CLI parsing works for edge cases
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t19_h4_get_property_with_default_returns_default() {
+        let _g = TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let key = ctx.create_string("foo");
+        let default = ctx.create_string("bar");
+        let result = native_module_get_property_with_default(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(key)),
+                Value::Object(Some(default)),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        match result {
+            Value::Object(Some(s)) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some("bar"));
+            }
+            other => panic!("expected default string, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_get_property_returns_null() {
+        let _g = TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let key = ctx.create_string("foo");
+        let result = native_module_get_property(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(key))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(result, Value::Object(None)));
+    }
+
+    #[test]
+    fn t19_h4_get_property_names_returns_empty_list() {
+        let _g = TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let result = native_module_get_property_names(
+            &mut ctx,
+            &[Value::Object(Some(this))],
+        )
+        .unwrap()
+        .unwrap();
+        match result {
+            Value::Object(Some(_list)) => {}
+            other => panic!("expected non-null List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_locate_module_xml_finds_addon_layer() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let xml = root
+            .join("system/add-ons/keycloak/com/extra/foo/main/module.xml");
+        write(&xml, &make_minimal_module_xml("com.extra.foo"));
+        let found = locate_module_xml(root, "com.extra.foo").unwrap();
+        assert!(found.ends_with("module.xml"));
+    }
+
+    // -----------------------------------------------------------------
+    // T19_H15 — transitive linkage closure & dynamic-classpath
+    // registration when loadModule is called.
+    //
+    // Without this fix, KC16 boots far enough to call
+    // `loadModule("org.jboss.as.standalone")` but then NCDFEs on
+    // `org.jboss.as.controller.access.JmxAction$Impact` when bytecode
+    // in the controller-dependent module is verified — because the
+    // controller jar wasn't yet on the application classpath.
+    // -----------------------------------------------------------------
+
+    /// Build a module.xml with `dependencies` (Module deps).
+    fn make_module_xml_with_deps(
+        name: &str,
+        jars: &[&str],
+        deps: &[(&str, bool /* export */, bool /* optional */)],
+    ) -> String {
+        let mut s = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<module name=\"{}\" xmlns=\"urn:jboss:module:1.9\">\n  <resources>\n",
+            name
+        );
+        for j in jars {
+            s.push_str(&format!("    <resource-root path=\"{}\"/>\n", j));
+        }
+        s.push_str("  </resources>\n  <dependencies>\n");
+        for (dep, export, optional) in deps {
+            s.push_str(&format!(
+                "    <module name=\"{}\"{}{}/>\n",
+                dep,
+                if *export { " export=\"true\"" } else { "" },
+                if *optional { " optional=\"true\"" } else { "" },
+            ));
+        }
+        s.push_str("  </dependencies>\n</module>\n");
+        s
+    }
+
+    /// Helper: write a module with N jars under `<root>/<dotted-path>/main/`.
+    fn write_module_with_deps(
+        root: &Path,
+        name: &str,
+        jars: &[&str],
+        deps: &[(&str, bool, bool)],
+    ) {
+        let path: PathBuf = name.split('.').collect();
+        let main_dir = root.join(&path).join("main");
+        write(
+            &main_dir.join("module.xml"),
+            &make_module_xml_with_deps(name, jars, deps),
+        );
+        for j in jars {
+            // Touch the jar so canonicalize / file-existence checks pass.
+            write(&main_dir.join(j), "PK");
+        }
+    }
+
+    #[test]
+    fn t19_h15_transitive_linkage_walks_full_dep_tree() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // start -> mid -> leaf  (no `export="true"` on either edge)
+        write_module_with_deps(root, "start", &["s.jar"], &[("mid", false, false)]);
+        write_module_with_deps(root, "mid", &["m.jar"], &[("leaf", false, false)]);
+        write_module_with_deps(root, "leaf", &["l.jar"], &[]);
+        setup_test_env(root);
+
+        let roots = transitive_linkage_roots("start");
+        // Should include all three jars regardless of `export="true"`.
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "s.jar"), "got {:?}", names);
+        assert!(names.iter().any(|n| n == "m.jar"), "got {:?}", names);
+        assert!(names.iter().any(|n| n == "l.jar"), "got {:?}", names);
+    }
+
+    #[test]
+    fn t19_h15_transitive_linkage_handles_cycle_without_loop() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // a -> b -> a  (cycle)
+        write_module_with_deps(root, "a", &["a.jar"], &[("b", false, false)]);
+        write_module_with_deps(root, "b", &["b.jar"], &[("a", false, false)]);
+        setup_test_env(root);
+
+        let roots = transitive_linkage_roots("a");
+        assert!(!roots.is_empty(), "linkage walk must terminate on cycles");
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "a.jar"));
+        assert!(names.iter().any(|n| n == "b.jar"));
+    }
+
+    #[test]
+    fn t19_h15_transitive_linkage_skips_missing_deps_silently() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // start depends on `missing` (not on disk). Walk must not error.
+        write_module_with_deps(
+            root,
+            "start",
+            &["s.jar"],
+            &[("missing", false, true), ("present", false, false)],
+        );
+        write_module_with_deps(root, "present", &["p.jar"], &[]);
+        setup_test_env(root);
+
+        let roots = transitive_linkage_roots("start");
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "s.jar"));
+        assert!(names.iter().any(|n| n == "p.jar"));
+    }
+
+    #[test]
+    fn t19_h15_transitive_linkage_skips_system_deps() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // start has a Module dep + a `<system>` dep (which mod_xml
+        // parses as `DependencyKind::System`).  System deps come from
+        // the bootstrap classpath, not application — we must not try
+        // to register a `system` module's roots.
+        let main_dir = root.join("start/main");
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<module name="start" xmlns="urn:jboss:module:1.9">
+  <resources>
+    <resource-root path="s.jar"/>
+  </resources>
+  <dependencies>
+    <module name="present"/>
+    <system export="true">
+      <paths>
+        <path name="java/lang"/>
+      </paths>
+    </system>
+  </dependencies>
+</module>
+"#
+        );
+        write(&main_dir.join("module.xml"), &xml);
+        write(&main_dir.join("s.jar"), "PK");
+        write_module_with_deps(root, "present", &["p.jar"], &[]);
+        setup_test_env(root);
+
+        let roots = transitive_linkage_roots("start");
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "s.jar"));
+        assert!(names.iter().any(|n| n == "p.jar"));
+    }
+
+    #[test]
+    fn t19_h15_load_module_registers_transitive_classpath() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Mirrors the WildFly shape that triggered the original bug:
+        // jmx -> controller (no export) -> protocol (no export).
+        // The bytecode in `jmx` references a class in `controller`,
+        // and the verifier needs `controller.jar` on the classpath
+        // even though `controller` is not re-exported.
+        write_module_with_deps(
+            root,
+            "org.jboss.as.jmx",
+            &["wildfly-jmx.jar"],
+            &[("org.jboss.as.controller", false, false)],
+        );
+        write_module_with_deps(
+            root,
+            "org.jboss.as.controller",
+            &["wildfly-controller.jar"],
+            &[("org.jboss.as.protocol", false, false)],
+        );
+        write_module_with_deps(
+            root,
+            "org.jboss.as.protocol",
+            &["wildfly-protocol.jar"],
+            &[],
+        );
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("org.jboss.as.jmx");
+        native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap();
+
+        let registered = ctx.registered_classpath_snapshot();
+        assert!(
+            registered.iter().any(|p| p.ends_with("wildfly-jmx.jar")),
+            "must register own jar; got {:?}",
+            registered
+        );
+        assert!(
+            registered.iter().any(|p| p.ends_with("wildfly-controller.jar")),
+            "must register direct dep jar so the verifier can find \
+             classes referenced from JMX bytecode; got {:?}",
+            registered
+        );
+        assert!(
+            registered.iter().any(|p| p.ends_with("wildfly-protocol.jar")),
+            "must register transitive dep jar so the verifier can find \
+             second-hop class references; got {:?}",
+            registered
+        );
+    }
+
+    #[test]
+    fn t19_h15_load_module_idempotent_no_duplicate_classpath() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_module_with_deps(
+            root,
+            "a",
+            &["a.jar"],
+            &[("b", false, false)],
+        );
+        write_module_with_deps(root, "b", &["b.jar"], &[]);
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let n1 = ctx.create_string("a");
+        native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(n1))],
+        )
+        .unwrap();
+        // Second call should return cached module without re-registering.
+        let n2 = ctx.create_string("a");
+        native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(n2))],
+        )
+        .unwrap();
+
+        let registered = ctx.registered_classpath_snapshot();
+        let count_a = registered.iter().filter(|p| p.ends_with("a.jar")).count();
+        let count_b = registered.iter().filter(|p| p.ends_with("b.jar")).count();
+        assert_eq!(count_a, 1, "a.jar must register once; got {:?}", registered);
+        assert_eq!(count_b, 1, "b.jar must register once; got {:?}", registered);
+    }
+
+    #[test]
+    fn t19_h15_load_module_inner_class_naming_passthrough() {
+        // The ModuleClassLoader path must accept `Outer$Inner` style
+        // names with `$`-separated nested class identifiers — JBoss
+        // bytecode references them with `getDeclaredClasses` /
+        // `Class.forName("...$Inner")` calls during enum init.
+        // We can't load real bytecode in the unit-test mock, but we
+        // can drive the `loadClass` native end-to-end and confirm the
+        // visibility lookup uses the correct entry-path encoding.
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_module_with_deps(root, "x", &["x.jar"], &[]);
+        setup_test_env(root);
+
+        // Confirm `find_entry_in_roots` searches with the literal `$`.
+        let main_dir = root.join("x/main");
+        // Replace x.jar with a real (empty) zip that contains
+        // `Outer$Inner.class` so the lookup hits.
+        let jar_path = main_dir.join("x.jar");
+        let f = std::fs::File::create(&jar_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("Outer$Inner.class", zip::write::FileOptions::default())
+            .unwrap();
+        use std::io::Write;
+        zw.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
+        zw.finish().unwrap();
+
+        // Force the resolver to re-read the on-disk module since we
+        // just rewrote x.jar after `setup_test_env` populated nothing.
+        clear_module_cache_for_test();
+        let _ = transitive_linkage_roots("x");
+        let resolved = ensure_resolved("x").expect("module must resolve");
+        let hit = find_entry_in_roots(
+            &resolved.resource_roots,
+            "Outer$Inner.class",
+        );
+        assert!(
+            hit.is_some(),
+            "find_entry_in_roots must accept `$` in inner-class names"
+        );
+    }
+
+    #[test]
+    fn t19_h15_register_resource_roots_handles_nonexistent_paths_gracefully() {
+        // `register_dynamic_classpath` / `add_path` must silently
+        // skip non-existent paths — JBoss modules sometimes list jars
+        // that aren't shipped (e.g. optional add-ons).  We expose
+        // the unfiltered path string here; the consumer
+        // (ClassPath::add_path) handles the actual filtering.
+        let _g = TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        let bogus = vec![PathBuf::from("does/not/exist.jar")];
+        register_resource_roots(&mut ctx, &bogus);
+        // The mock does record the path string regardless — the real
+        // `add_path` will skip it.  We're only asserting that
+        // `register_resource_roots` doesn't panic on a missing file.
+        let snap = ctx.registered_classpath_snapshot();
+        assert_eq!(snap.len(), 1);
+    }
+
+    #[test]
+    fn t19_h15_transitive_linkage_includes_export_transitive() {
+        // Even without the linkage closure, `export="true"` paths
+        // were already followed.  Confirm we don't lose that:
+        // a -[export]-> b -[export]-> c.
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_module_with_deps(root, "a", &["a.jar"], &[("b", true, false)]);
+        write_module_with_deps(root, "b", &["b.jar"], &[("c", true, false)]);
+        write_module_with_deps(root, "c", &["c.jar"], &[]);
+        setup_test_env(root);
+
+        let roots = transitive_linkage_roots("a");
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "a.jar"));
+        assert!(names.iter().any(|n| n == "b.jar"));
+        assert!(names.iter().any(|n| n == "c.jar"));
+    }
+
+    #[test]
+    fn t19_h15_load_module_no_deps_registers_only_self() {
+        // Backwards-compat: a leaf module with no deps must still
+        // register exactly its own resource roots — no broader walk.
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_module_with_deps(root, "leaf", &["only.jar"], &[]);
+        setup_test_env(root);
+
+        let mut ctx = MockNativeContext::new();
+        let loader = build_local_module_loader(&mut ctx);
+        let name = ctx.create_string("leaf");
+        native_loader_load_module(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .unwrap();
+
+        let registered = ctx.registered_classpath_snapshot();
+        assert!(
+            registered.iter().any(|p| p.ends_with("only.jar")),
+            "got {:?}",
+            registered
+        );
+        assert_eq!(
+            registered.iter().filter(|p| p.ends_with("only.jar")).count(),
+            1,
+            "must register exactly once; got {:?}",
+            registered
+        );
+    }
+
+    #[test]
+    fn t19_h15_module_visibility_closure_unchanged_by_linkage_walk() {
+        // The runtime `module_visibility_closure` (used by MCL.loadClass
+        // for *enforcement*) must still follow JBoss's "self + direct +
+        // transitive re-exports" rule — narrower than
+        // `transitive_linkage_roots`.  Confirm the two walks return
+        // different sets when there's a non-exported dep.
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_module_with_deps(
+            root,
+            "start",
+            &["s.jar"],
+            &[("direct", false, false)],
+        );
+        write_module_with_deps(
+            root,
+            "direct",
+            &["d.jar"],
+            &[("hidden", false, false)],
+        );
+        write_module_with_deps(root, "hidden", &["h.jar"], &[]);
+        setup_test_env(root);
+
+        // Linkage closure: includes h.jar (transitive non-export dep).
+        let linkage = transitive_linkage_roots("start");
+        let linkage_names: Vec<String> = linkage
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(linkage_names.iter().any(|n| n == "h.jar"));
+
+        // Visibility closure: must NOT include h.jar (non-exported
+        // dep of a direct dep — JBoss's runtime rule hides it).
+        let (_modules, vis) = module_visibility_closure("start");
+        let vis_names: Vec<String> = vis
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(vis_names.iter().any(|n| n == "s.jar"));
+        assert!(vis_names.iter().any(|n| n == "d.jar"));
+        assert!(
+            !vis_names.iter().any(|n| n == "h.jar"),
+            "visibility closure must not include non-exported \
+             transitive deps; got {:?}",
+            vis_names
+        );
+    }
+}

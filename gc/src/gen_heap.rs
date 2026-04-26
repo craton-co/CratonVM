@@ -1,0 +1,3768 @@
+//! Generational garbage-collected heap.
+//!
+//! Combines a young generation (semi-space copying) with an old generation
+//! (non-moving free-list mark-sweep) and a card table for efficient
+//! old→young reference tracking.
+//!
+//! ## Allocation
+//! All new objects are allocated in the young generation's from-space via
+//! bump-pointer allocation. Objects are promoted to the old generation
+//! after surviving [`PROMOTION_AGE`] minor GC cycles.
+//!
+//! ## Minor GC
+//! Triggered when young from-space exceeds [`YOUNG_GC_THRESHOLD_PERCENT`]%.
+//! Copies live young objects to young to-space (incrementing age), or
+//! promotes them to old gen if their age reaches the threshold.
+//! Dirty card table entries are scanned for old→young references as
+//! additional roots.
+//!
+//! ## Major GC
+//! Triggered when old gen runs out of space during promotion. Performs a
+//! mark-sweep of the old generation, freeing unreachable objects back to
+//! the free list.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+use parking_lot::Mutex;
+
+use std::sync::Arc;
+
+use crate::arena::Arena;
+use crate::card_table::CardTable;
+use crate::collector::{GarbageCollector, MonitorCleanup};
+use crate::concurrent_mark::ConcurrentGcState;
+use crate::gc::GcResult;
+use crate::heap::{
+    array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
+    ObjectKind, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE,
+    SLOT_SIZE,
+};
+use crate::old_gen::OldGen;
+use crate::satb::SatbQueue;
+use rustjvm_types::{ClassId, ObjectRef, Value};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Size of each young-generation semi-space.
+///
+/// Bumped from 16 MB to 64 MB to reduce minor-GC frequency under
+/// allocation-heavy workloads (the RealWorldBench "GC stress" phase
+/// was 26× slower than HotSpot because it triggered full GC after
+/// every ~16 MB of allocation). HotSpot defaults to ~25% of max heap
+/// for the young gen; 64 MB for a 256 MB max heap is the same ratio.
+const DEFAULT_YOUNG_SEMI_SIZE: usize = 64 * 1024 * 1024;
+
+/// Size of the old generation (128 MB).
+const DEFAULT_OLD_GEN_SIZE: usize = 128 * 1024 * 1024;
+
+/// Number of minor GC survivals before an object is promoted to old gen.
+const PROMOTION_AGE: u8 = 3;
+
+/// GC threshold: trigger minor GC when young from-space usage exceeds this %.
+const YOUNG_GC_THRESHOLD_PERCENT: usize = 75;
+
+/// Maximum allowed heap expansion factor (4x the initial size).
+const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
+
+/// If GC reclaims less than this fraction of young gen, expand the heap.
+const GC_EXPANSION_THRESHOLD_PERCENT: usize = 25;
+
+// ---------------------------------------------------------------------------
+// GenerationalHeap
+// ---------------------------------------------------------------------------
+
+/// Statistics for the generational heap.  All counters are
+/// monotonically non-decreasing; use [`HeapStats::snapshot`] to capture a
+/// consistent view at one point in time.  This is Phase H (RH.1) — a
+/// hardening-only addition so tests can assert that allocation pressure
+/// does not corrupt promotion bookkeeping (every object is accounted
+/// for exactly once).
+#[derive(Default, Debug)]
+pub struct HeapStats {
+    /// Number of minor GC cycles completed.
+    minor_gc_count: AtomicU64,
+    /// Number of major (old-gen mark-sweep) GC cycles completed.
+    major_gc_count: AtomicU64,
+    /// Total bytes copied in the young gen across all minor GCs.
+    bytes_copied_young: AtomicU64,
+    /// Total objects copied in the young gen across all minor GCs.
+    objects_copied_young: AtomicU64,
+    /// Total bytes promoted from young→old across all minor GCs.
+    bytes_promoted: AtomicU64,
+    /// Total objects promoted from young→old across all minor GCs.
+    objects_promoted: AtomicU64,
+    /// Total bytes freed by major GC sweep phases.
+    bytes_freed_old: AtomicU64,
+    /// Number of young allocations since startup.
+    young_allocations: AtomicU64,
+    /// Number of old-gen direct allocations (e.g. humongous) since
+    /// startup.  Currently all allocations go through young, but the
+    /// counter is exposed for future humongous handling.
+    old_allocations: AtomicU64,
+}
+
+/// Immutable snapshot of [`HeapStats`] at a moment in time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapStatsSnapshot {
+    pub minor_gc_count: u64,
+    pub major_gc_count: u64,
+    pub bytes_copied_young: u64,
+    pub objects_copied_young: u64,
+    pub bytes_promoted: u64,
+    pub objects_promoted: u64,
+    pub bytes_freed_old: u64,
+    pub young_allocations: u64,
+    pub old_allocations: u64,
+}
+
+impl HeapStats {
+    pub fn snapshot(&self) -> HeapStatsSnapshot {
+        // `Relaxed` is fine for monotonic counters sampled from outside
+        // a GC pause — snapshot consistency is not guaranteed and
+        // callers only use this for observability / regression tests.
+        HeapStatsSnapshot {
+            minor_gc_count: self.minor_gc_count.load(Ordering::Relaxed),
+            major_gc_count: self.major_gc_count.load(Ordering::Relaxed),
+            bytes_copied_young: self.bytes_copied_young.load(Ordering::Relaxed),
+            objects_copied_young: self.objects_copied_young.load(Ordering::Relaxed),
+            bytes_promoted: self.bytes_promoted.load(Ordering::Relaxed),
+            objects_promoted: self.objects_promoted.load(Ordering::Relaxed),
+            bytes_freed_old: self.bytes_freed_old.load(Ordering::Relaxed),
+            young_allocations: self.young_allocations.load(Ordering::Relaxed),
+            old_allocations: self.old_allocations.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero.  Useful in tests that want to
+    /// observe a single GC cycle in isolation.
+    pub fn reset(&self) {
+        self.minor_gc_count.store(0, Ordering::Relaxed);
+        self.major_gc_count.store(0, Ordering::Relaxed);
+        self.bytes_copied_young.store(0, Ordering::Relaxed);
+        self.objects_copied_young.store(0, Ordering::Relaxed);
+        self.bytes_promoted.store(0, Ordering::Relaxed);
+        self.objects_promoted.store(0, Ordering::Relaxed);
+        self.bytes_freed_old.store(0, Ordering::Relaxed);
+        self.young_allocations.store(0, Ordering::Relaxed);
+        self.old_allocations.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A generational garbage-collected heap.
+///
+/// Young generation: two semi-spaces (from/to) using Cheney copying.
+/// Old generation: non-moving free-list allocator with mark-sweep.
+/// Card table: tracks old→young cross-generation references.
+pub struct GenerationalHeap {
+    /// Young generation from-space (allocation target).
+    young_from: Mutex<Arena>,
+    /// Young generation to-space (GC copy target).
+    young_to: Mutex<Arena>,
+    /// Old generation (promoted objects).
+    old_gen: Mutex<OldGen>,
+    /// Card table covering the old generation's address space.
+    card_table: Mutex<CardTable>,
+    /// Next identity hash code.
+    next_hash_code: AtomicI32,
+    /// Young GC threshold in bytes.
+    young_gc_threshold: Mutex<usize>,
+    /// Lock for volatile field access. Ensures 16-byte Value reads/writes are
+    /// atomic (not torn) since x86-64 only guarantees 8-byte atomic access.
+    volatile_lock: Mutex<()>,
+    /// Global SATB queue for concurrent GC write barrier logging.
+    /// Shared with the concurrent marker; `None` if concurrent GC is not enabled.
+    satb_queue: Option<Arc<SatbQueue>>,
+    /// Concurrent GC phase tracker. Shared with the concurrent marker.
+    concurrent_gc_state: Option<Arc<ConcurrentGcState>>,
+    /// Maximum young semi-space size (limits growth).
+    max_young_semi_size: usize,
+    /// Phase H (RH.1) statistics — updated during every minor/major GC.
+    stats: HeapStats,
+}
+
+// Safety: Same reasoning as Heap — raw pointers are to internally owned memory.
+// The Mutex on each sub-allocator serializes access.
+unsafe impl Send for GenerationalHeap {}
+unsafe impl Sync for GenerationalHeap {}
+
+impl GenerationalHeap {
+    /// Create a new generational heap with default sizes.
+    pub fn new() -> Self {
+        Self::with_sizes(DEFAULT_YOUNG_SEMI_SIZE, DEFAULT_OLD_GEN_SIZE)
+    }
+
+    /// Create a generational heap with custom young semi-space and old gen sizes.
+    pub fn with_sizes(young_semi_size: usize, old_gen_size: usize) -> Self {
+        let young_semi_size = young_semi_size.max(1024);
+        let old_gen_size = old_gen_size.max(1024);
+        let threshold = young_semi_size * YOUNG_GC_THRESHOLD_PERCENT / 100;
+        let max_young = young_semi_size * MAX_HEAP_EXPANSION_FACTOR;
+
+        let old_gen = OldGen::new(old_gen_size);
+        let card_table = CardTable::new(old_gen.base_ptr() as usize, old_gen_size);
+
+        Self {
+            young_from: Mutex::new(Arena::new(young_semi_size)),
+            young_to: Mutex::new(Arena::new(young_semi_size)),
+            old_gen: Mutex::new(old_gen),
+            card_table: Mutex::new(card_table),
+            next_hash_code: AtomicI32::new(1),
+            young_gc_threshold: Mutex::new(threshold),
+            volatile_lock: Mutex::new(()),
+            satb_queue: None,
+            concurrent_gc_state: None,
+            max_young_semi_size: max_young,
+            stats: HeapStats::default(),
+        }
+    }
+
+    /// Return a handle to the GC statistics counters.  Counters are
+    /// updated during GC cycles and allocation fast-paths.
+    pub fn stats(&self) -> &HeapStats {
+        &self.stats
+    }
+
+    /// Create a generational heap with a total capacity split proportionally.
+    /// Young gen gets 25% (split into two semi-spaces), old gen gets 75%.
+    /// This is used for compatibility with tests that use `Heap::with_capacity`.
+    pub fn with_capacity(total_bytes: usize) -> Self {
+        let total = total_bytes.max(4096);
+        let young_total = total / 4; // 25% for young gen
+        let young_semi = young_total / 2; // split into two semi-spaces
+        let old_size = total - young_total; // 75% for old gen
+        Self::with_sizes(young_semi.max(512), old_size.max(512))
+    }
+
+    // ----- Allocation --------------------------------------------------------
+
+    /// Allocate a new Java object in the young generation.
+    pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+        let ptr = self.alloc_young(total_size);
+
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Object,
+            element_type: ArrayElementType::Reference,
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: 0,
+            num_slots: u32::try_from(num_fields).unwrap_or(u32::MAX),
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+
+        // SAFETY: `ptr` was just bump-allocated from the young arena with sufficient
+        // size (`HEADER_SIZE + num_fields * SLOT_SIZE`) and 8-byte alignment, so
+        // writing an `ObjectHeader` at its start is valid. The pointer is non-null
+        // and exclusively owned by this allocation; wrapping it in `ObjectRef` is
+        // sound because the header has been fully initialized.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            ObjectRef::from_raw(ptr)
+        }
+    }
+
+    /// Allocate a new Java object and initialize primitive-typed slots to
+    /// their spec-mandated typed zero based on `descriptor_bytes`.
+    ///
+    /// See [`crate::heap::default_value_for_descriptor`] for the
+    /// descriptor-byte-to-default-Value mapping. This method is the
+    /// canonical allocation entry point for the VM's `new` bytecode path —
+    /// it fixes a subtle correctness bug where primitive fields on a
+    /// freshly-allocated object decoded as `Value::Object(None)` instead
+    /// of the correctly-tagged zero, breaking `Unsafe.compareAndSetInt`
+    /// comparisons against `Int(0)`.
+    ///
+    /// Fields beyond `descriptor_bytes.len()` keep the zeroed default
+    /// (`Object(None)`), matching the reference-slot spec default.
+    pub fn alloc_object_with_descriptors(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        descriptor_bytes: &[u8],
+    ) -> ObjectRef {
+        let obj = self.alloc_object(class_id, num_fields);
+        let n = num_fields.min(descriptor_bytes.len());
+        for i in 0..n {
+            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
+                self.set_field(obj, i, default);
+            }
+        }
+        obj
+    }
+
+    /// Fallible variant of [`Self::alloc_object_with_descriptors`] that
+    /// returns `None` on young-gen exhaustion (caller should trigger GC
+    /// and retry).
+    pub fn try_alloc_object_with_descriptors(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+        descriptor_bytes: &[u8],
+    ) -> Option<ObjectRef> {
+        let obj = self.try_alloc_object(class_id, num_fields)?;
+        let n = num_fields.min(descriptor_bytes.len());
+        for i in 0..n {
+            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
+                self.set_field(obj, i, default);
+            }
+        }
+        Some(obj)
+    }
+
+    /// Allocate a new Java array in the young generation.
+    ///
+    /// Arrays use compact element sizes: 1 byte for boolean/byte, 2 for char/short,
+    /// 4 for int/float, 8 for long/double/reference.
+    pub fn alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> ObjectRef {
+        let data_size = array_data_size(length, element_type)
+            .unwrap_or_else(|_| { eprintln!("FATAL: array data size overflow in gen_heap alloc_array (length={}, element_type={:?})", length, element_type); std::process::abort(); });
+        let total_size = HEADER_SIZE + data_size;
+        let ptr = self.alloc_young(total_size);
+
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Array,
+            element_type,
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: u32::try_from(length).unwrap_or(u32::MAX),
+            num_slots: u32::try_from(length).unwrap_or(u32::MAX),
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+
+        // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
+        // (`HEADER_SIZE + data_size`) and 8-byte alignment. Writing the header is valid
+        // because the region is exclusively owned and properly sized. The data region
+        // is already zeroed by `try_alloc_young()`. Wrapping in `ObjectRef` is sound
+        // because the header is fully initialized.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            // Data region already zeroed by try_alloc_young() — no redundant memset needed.
+            ObjectRef::from_raw(ptr)
+        }
+    }
+
+    /// Try to allocate a Java object. Returns `None` if young gen is exhausted.
+    pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        let total_size = HEADER_SIZE + num_fields.checked_mul(SLOT_SIZE)?;
+        let ptr = self.try_alloc_young(total_size)?;
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Object,
+            element_type: ArrayElementType::Reference,
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: 0,
+            num_slots: u32::try_from(num_fields).ok()?,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+        // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
+        // and 8-byte alignment via `try_alloc_young`. The pointer is exclusively owned,
+        // so writing the header and creating an `ObjectRef` are sound.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    /// Try to allocate a Java array. Returns `None` if young gen is exhausted.
+    pub fn try_alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
+        let data_size = array_data_size(length, element_type).ok()?;
+        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let ptr = self.try_alloc_young(total_size)?;
+        let header = ObjectHeader {
+            class_id,
+            kind: ObjectKind::Array,
+            element_type,
+            _padding: [0; 2],
+            identity_hash_code: self.next_hash(),
+            array_length: u32::try_from(length).ok()?,
+            num_slots: u32::try_from(length).ok()?,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+        // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
+        // for the array header + data and 8-byte alignment. The pointer is exclusively
+        // owned, so writing the header and creating an `ObjectRef` are sound.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
+    // ----- Header access -----------------------------------------------------
+
+    /// Read the object header from a heap reference.
+    pub fn get_header(&self, obj_ref: ObjectRef) -> &ObjectHeader {
+        // SAFETY: `obj_ref` was created by one of this heap's `alloc_*` methods (or
+        // forwarded during GC), so its pointer targets a valid, fully initialized
+        // `ObjectHeader` within a heap-owned arena. The reference lifetime is bounded
+        // by `&self`, ensuring the arena stays alive.
+        unsafe { &*(obj_ref.as_ptr() as *const ObjectHeader) }
+    }
+
+    /// Get the class id of a heap object.
+    pub fn class_id_of(&self, obj_ref: ObjectRef) -> ClassId {
+        self.get_header(obj_ref).class_id
+    }
+
+    /// Get the kind (Object or Array) of a heap allocation.
+    pub fn kind_of(&self, obj_ref: ObjectRef) -> ObjectKind {
+        self.get_header(obj_ref).kind
+    }
+
+    /// Get the element type of an array object.
+    pub fn element_type_of(&self, obj_ref: ObjectRef) -> ArrayElementType {
+        self.get_header(obj_ref).element_type
+    }
+
+    /// Get the identity hash code of a heap object.
+    pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
+        self.get_header(obj_ref).identity_hash_code
+    }
+
+    /// Conservative validity check for a *raw address* — used by NEW-1.5
+    /// JIT frame root scanning to filter spurious stack values.
+    ///
+    /// Returns `Some(ObjectRef)` if `addr` lands on a live object header in
+    /// any of this heap's three storage regions (young from-space, young
+    /// to-space, or old-gen). Returns `None` for any address that is null,
+    /// outside every region, or fails the header sanity checks (alignment,
+    /// kind tag, plausible num_slots).
+    ///
+    /// This is intentionally a structural check only — we do not consult
+    /// the live-object marking bitmap or the class manager. False positives
+    /// are acceptable because the caller treats every returned `ObjectRef`
+    /// as a *root* (which only inflates retention; it cannot cause incorrect
+    /// behavior). False negatives (missing a real object) would be wrong, so
+    /// we err on the inclusive side.
+    pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
+        // Reject obvious garbage.
+        if addr == 0 {
+            return None;
+        }
+        // Object headers are 8-byte aligned (and HEADER_SIZE itself is a
+        // multiple of 8). A pointer to a real object never has its low 3
+        // bits set.
+        if addr & 0x7 != 0 {
+            return None;
+        }
+        let raw = addr as *const u8;
+
+        // Region check: must fall inside one of the three arenas. Holding
+        // the locks for the duration of the validation is fine — this is
+        // only called during stop-the-world root scanning.
+        let in_region = self.young_from.lock().contains(raw)
+            || self.young_to.lock().contains(raw)
+            || self.old_gen.lock().contains(raw);
+        if !in_region {
+            return None;
+        }
+
+        // SAFETY: The region check above confirmed `raw` is inside one of the
+        // three arenas, so reading `HEADER_SIZE` bytes from it is valid memory.
+        // The reference is short-lived and the arena locks are held.
+        let header = unsafe { &*(raw as *const ObjectHeader) };
+
+        // Validate the discriminated-union tag. Object/Array are the only
+        // valid kinds; anything else means we landed in the middle of a
+        // field or in stale memory.
+        match header.kind {
+            ObjectKind::Object | ObjectKind::Array => {}
+        }
+        // Cap num_slots at a sanity limit so a stale word can't fool us
+        // into "validating" a slot count that would exceed the arena.
+        const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24; // 16M slots → 256 MB obj
+        if header.num_slots > MAX_PLAUSIBLE_SLOTS {
+            return None;
+        }
+        // Array length, if it's an array, must also be plausible.
+        if matches!(header.kind, ObjectKind::Array)
+            && header.array_length as usize > (1 << 27)
+        {
+            return None;
+        }
+
+        // SAFETY: `raw` passed the region containment and header sanity checks above,
+        // so it points to a valid object header within a heap arena.
+        Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
+    }
+
+    // ----- Field access ------------------------------------------------------
+
+    /// Get the value of a field at the given index.
+    pub fn get_field(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        // KC16 SIGSEGV audit: runtime (not debug-only) bounds check. A
+        // corrupted ObjectRef whose fake header has a huge num_slots would
+        // happily pass the old debug_assert in release and then read
+        // arbitrary memory.  For the suspect-header case we still panic
+        // (that's a real bug).  For in-bounds-of-reality but out-of-bounds
+        // of this object's layout (the common case when synthetic and
+        // real-JDK class layouts disagree), return Object(None) — the
+        // interpreter's primitive-field coercion will further normalize
+        // it.  This converts what would be a silent SIGSEGV / panic into
+        // a benign null read, matching HotSpot's behavior when an object
+        // is accessed through a Reflection path that resolved a
+        // larger-than-actual layout.
+        let header = self.get_header(obj_ref);
+        let num_slots = header.num_slots as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(
+                target: "rustjvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                kind_byte = header.kind as u8,
+                gc_flags = format!("{:x}", header.gc_flags),
+                "gen_heap::get_field: suspect header",
+            );
+            panic!("gen_heap::get_field suspect header: num_slots={num_slots}");
+        }
+        if index >= num_slots {
+            // Layout mismatch — return null/zero instead of reading past
+            // the object.  A one-line trace at debug level would help
+            // diagnose future drift without flooding stderr.
+            return Value::Object(None);
+        }
+        // SAFETY: `obj_ref` points to a valid heap object and `index` is within
+        // `num_slots` (checked above). `slot_ptr` computes
+        // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
+        // object's allocated region. `read_slot` reads a `Value` from that address.
+        unsafe {
+            let ptr = slot_ptr(obj_ref, index);
+            read_slot(ptr)
+        }
+    }
+
+    /// Set the value of a field at the given index.
+    ///
+    /// Automatically fires the write barrier for generational GC correctness.
+    /// Callers do NOT need to call `write_barrier` separately.
+    pub fn set_field(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        // KC16 SIGSEGV audit: runtime bounds check.  Silently drop writes
+        // that fall past the object's declared layout (layout mismatch
+        // between synthetic and real JDK class shapes) rather than
+        // overflowing into the neighboring object.  Still panic on
+        // clearly-corrupt headers.
+        let header = self.get_header(obj_ref);
+        let num_slots = header.num_slots as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(
+                target: "rustjvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                kind_byte = header.kind as u8,
+                gc_flags = format!("{:x}", header.gc_flags),
+                value = ?value,
+                "gen_heap::set_field: suspect header",
+            );
+            panic!("gen_heap::set_field suspect header: num_slots={num_slots}");
+        }
+        if index >= num_slots {
+            return;
+        }
+        debug_assert!(index < self.get_header(obj_ref).num_slots as usize);
+        // SAFETY: Same as `get_field` — `index` is within `num_slots` so the
+        // computed slot pointer is within the object's allocated region.
+        // `write_slot` writes a `Value` at the computed address.
+        unsafe {
+            let ptr = slot_ptr(obj_ref, index);
+            write_slot(ptr, value);
+        }
+        self.write_barrier(obj_ref, value);
+    }
+
+    /// Get the value of a volatile field.
+    ///
+    /// Uses a lock to ensure 16-byte `Value` reads are atomic (not torn).
+    /// On x86-64, naturally aligned 8-byte ops are atomic, but `Value` is
+    /// 16 bytes so a plain read could observe a partially written value.
+    pub fn get_field_volatile(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        let _guard = self.volatile_lock.lock();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let val = self.get_field(obj_ref, index);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        val
+    }
+
+    /// Set the value of a volatile field.
+    ///
+    /// Uses a lock to ensure 16-byte `Value` writes are atomic (not torn).
+    /// Write barrier fires via `set_field`.
+    pub fn set_field_volatile(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        let _guard = self.volatile_lock.lock();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        self.set_field(obj_ref, index, value); // barrier fires inside set_field
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // ----- T10.9.E descriptor-aware field access --------------------------
+
+    /// Descriptor-aware get — normalizes the returned `Value` to the declared
+    /// field type. See [`crate::heap::coerce_field_value_by_descriptor`].
+    pub fn get_field_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
+        let raw = self.get_field(obj_ref, index);
+        crate::heap::coerce_field_value_by_descriptor(raw, desc_byte)
+    }
+
+    /// Volatile descriptor-aware get.
+    pub fn get_field_volatile_as(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        desc_byte: u8,
+    ) -> Value {
+        let raw = self.get_field_volatile(obj_ref, index);
+        crate::heap::coerce_field_value_by_descriptor(raw, desc_byte)
+    }
+
+    /// Descriptor-aware set — normalizes the written `Value` to the declared
+    /// field type before the underlying slot write.
+    pub fn set_field_as(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        value: Value,
+        desc_byte: u8,
+    ) {
+        let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
+        self.set_field(obj_ref, index, coerced);
+    }
+
+    /// Volatile descriptor-aware set.
+    pub fn set_field_volatile_as(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        value: Value,
+        desc_byte: u8,
+    ) {
+        let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
+        self.set_field_volatile(obj_ref, index, coerced);
+    }
+
+    // ----- Array access ------------------------------------------------------
+
+    /// Get the length of an array.
+    pub fn array_length(&self, obj_ref: ObjectRef) -> usize {
+        let header = self.get_header(obj_ref);
+        debug_assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        header.array_length as usize
+    }
+
+    /// Bulk-read a char[] array into a `Vec<u16>`.
+    ///
+    /// Much faster than per-element `get_array_element` for reading Java
+    /// String backing arrays — copies the raw 2-byte-per-element data directly.
+    pub fn read_char_array_bulk(&self, obj_ref: ObjectRef) -> Vec<u16> {
+        let header = self.get_header(obj_ref);
+        debug_assert_eq!(header.kind, ObjectKind::Array);
+        debug_assert_eq!(header.element_type, ArrayElementType::Char);
+        let len = header.array_length as usize;
+        let mut out = vec![0u16; len];
+        // SAFETY: `obj_ref` is a valid Char array with `len` elements (verified by
+        // header assertions above). Each char element is 2 bytes, so `HEADER_SIZE`
+        // to `HEADER_SIZE + len * 2` is within the allocation. The destination
+        // buffer `out` is freshly allocated with the same length. The regions do
+        // not overlap because `out` is on the Rust heap, not in the GC arena.
+        unsafe {
+            let src = obj_ref.as_ptr().add(HEADER_SIZE);
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 2);
+        }
+        out
+    }
+
+    /// Get a raw pointer to the start of the array data region.
+    ///
+    /// This is the address immediately after the object header. The caller is
+    /// responsible for knowing the element type and bounds.
+    pub fn array_data_ptr(&self, obj_ref: ObjectRef) -> *mut u8 {
+        // SAFETY: `obj_ref` is a valid heap object whose allocation includes
+        // `HEADER_SIZE` plus the data region, so advancing by `HEADER_SIZE`
+        // yields a pointer within the allocation. Caller is responsible for
+        // bounds and element-type correctness.
+        unsafe { obj_ref.as_ptr().add(HEADER_SIZE) }
+    }
+
+    /// Get an array element at the given index.
+    ///
+    /// Returns `Err` with the index if out of bounds.
+    pub fn get_array_element(&self, obj_ref: ObjectRef, index: usize) -> Result<Value, i32> {
+        let header = self.get_header(obj_ref);
+        debug_assert_eq!(header.kind, ObjectKind::Array);
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: Bounds check above guarantees `index < array_length`. The array
+        // was allocated with sufficient data space for all elements after the header.
+        // `read_prim_element` reads the correctly typed element at the given index.
+        unsafe {
+            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            Ok(read_prim_element(base, index, header.element_type))
+        }
+    }
+
+    /// Like `get_array_element`, but auto-unboxes values stored by native
+    /// collections. See `Heap::get_array_element_unboxing` for details.
+    pub fn get_array_element_unboxing(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+    ) -> Result<Value, i32> {
+        let header = self.get_header(obj_ref);
+        debug_assert_eq!(header.kind, ObjectKind::Array);
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: Bounds check above guarantees `index < array_length`. The array
+        // data region is within the allocation. For reference elements, the inner
+        // `ObjectRef` was stored by a prior `set_array_element`, so dereferencing
+        // its header to check `AUTOBOX_CLASS_ID` is valid.
+        unsafe {
+            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let value = read_prim_element(base, index, header.element_type);
+            if header.element_type == ArrayElementType::Reference {
+                if let Value::Object(Some(obj)) = value {
+                    let obj_header = &*(obj.as_ptr() as *const ObjectHeader);
+                    if obj_header.class_id == AUTOBOX_CLASS_ID {
+                        return Ok(self.get_field(obj, 0));
+                    }
+                }
+            }
+            Ok(value)
+        }
+    }
+
+    /// Set an array element at the given index.
+    ///
+    /// Returns `Err` with the index if out of bounds.
+    pub fn set_array_element(
+        &self,
+        obj_ref: ObjectRef,
+        index: usize,
+        value: Value,
+    ) -> Result<(), i32> {
+        let header = self.get_header(obj_ref);
+        debug_assert_eq!(header.kind, ObjectKind::Array);
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: Bounds check above guarantees `index < array_length`. The array
+        // data region is within the allocation. `write_prim_element` writes at the
+        // correct element offset. For reference arrays, autobox wrappers are
+        // allocated on this heap and thus valid.
+        unsafe {
+            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            // Compact ref arrays only store 8-byte pointers. If a non-Object
+            // value is written (e.g. Value::Int from a native collection),
+            // auto-box it into a 1-field wrapper object.
+            if header.element_type == ArrayElementType::Reference {
+                match value {
+                    Value::Object(_) => {
+                        write_prim_element(base, index, header.element_type, value);
+                        // Write barrier: old-gen array storing young-gen ref
+                        self.write_barrier(obj_ref, value);
+                    }
+                    _ => {
+                        let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                        self.set_field(wrapper, 0, value);
+                        let wrapper_val = Value::Object(Some(wrapper));
+                        write_prim_element(base, index, header.element_type, wrapper_val);
+                        // Write barrier: track the wrapper reference for gen GC
+                        self.write_barrier(obj_ref, Value::Object(Some(wrapper)));
+                    }
+                }
+            } else {
+                write_prim_element(base, index, header.element_type, value);
+            }
+        }
+        Ok(())
+    }
+
+    // ----- Write barrier -----------------------------------------------------
+
+    /// Write barrier — called after every reference store into a heap object.
+    ///
+    /// Performs two functions:
+    /// 1. **Card marking:** If source is in old gen and target is in young gen,
+    ///    marks the card table entry dirty (for minor GC).
+    /// 2. **SATB logging:** If concurrent marking is active, logs the *old*
+    ///    reference value to the SATB queue (for concurrent GC correctness).
+    #[inline]
+    pub fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
+        // Fast path: only care about reference stores
+        let target_ref = match stored_value {
+            Value::Object(Some(r)) => r,
+            _ => return,
+        };
+
+        let obj_ptr = obj.as_ptr();
+        // SAFETY: `obj` is a live heap ObjectRef, so its pointer targets a valid
+        // ObjectHeader within a heap arena.
+        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+        // Card table barrier: source in old gen, target in young gen
+        if header.gc_flags & GC_FLAG_OLD_GEN != 0 {
+            // SAFETY: `target_ref` is a live heap ObjectRef (the value just stored),
+            // so its pointer targets a valid ObjectHeader.
+            let target_header = unsafe { &*(target_ref.as_ptr() as *const ObjectHeader) };
+            if target_header.gc_flags & GC_FLAG_OLD_GEN == 0 {
+                let mut card_table = self.card_table.lock();
+                card_table.mark_dirty(obj_ptr as usize);
+            }
+        }
+    }
+
+    /// SATB write barrier — called BEFORE a reference field is overwritten.
+    ///
+    /// If concurrent marking is active, logs the old reference value to the
+    /// global SATB queue so the concurrent marker won't miss live objects.
+    ///
+    /// This should be called by the interpreter/JIT before every putfield/putstatic
+    /// that overwrites a reference-typed field.
+    #[inline]
+    pub fn satb_barrier(&self, old_value: Value) {
+        // Fast path: check if concurrent marking is active
+        if let Some(ref state) = self.concurrent_gc_state {
+            if !state.is_marking_active() {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        // Only log reference values
+        let old_ref = match old_value {
+            Value::Object(Some(r)) => r,
+            _ => return,
+        };
+
+        // Log the old reference to the SATB queue
+        if let Some(ref satb) = self.satb_queue {
+            satb.flush(vec![old_ref.as_ptr() as usize]);
+        }
+    }
+
+    /// Enable concurrent GC support by attaching shared SATB and state.
+    pub fn enable_concurrent_gc(
+        &mut self,
+        satb_queue: Arc<SatbQueue>,
+        gc_state: Arc<ConcurrentGcState>,
+    ) {
+        self.satb_queue = Some(satb_queue);
+        self.concurrent_gc_state = Some(gc_state);
+    }
+
+    /// Get the old generation's base pointer and capacity (for creating a ConcurrentMarker).
+    pub fn old_gen_info(&self) -> (usize, usize) {
+        let og = self.old_gen.lock();
+        (og.base_ptr() as usize, og.capacity())
+    }
+
+    /// Access the old generation directly (for concurrent sweep).
+    /// Returns a lock guard.
+    pub fn old_gen_lock(&self) -> parking_lot::MutexGuard<'_, OldGen> {
+        self.old_gen.lock()
+    }
+
+    // ----- GC ----------------------------------------------------------------
+
+    /// Returns true when the young generation should be collected.
+    pub fn needs_gc(&self) -> bool {
+        self.young_from.lock().used() >= *self.young_gc_threshold.lock()
+    }
+
+    /// Total bytes currently allocated across young and old generations.
+    pub fn allocated_bytes(&self) -> usize {
+        self.young_from.lock().used() + self.old_gen.lock().used()
+    }
+
+    /// Check if the old generation is above 75% capacity.
+    pub fn old_gen_needs_gc(&self) -> bool {
+        let og = self.old_gen.lock();
+        og.used() >= og.capacity() * 75 / 100
+    }
+
+    /// Run a minor garbage collection cycle.
+    ///
+    /// Copies live young-gen objects to young to-space (or promotes to old gen
+    /// if they have survived enough cycles). Scans dirty card table entries
+    /// for old→young references.
+    ///
+    /// Returns GC statistics and a pointer remapping table.
+    /// Like [`collect_garbage`] but keeps dead finalizable objects alive so
+    /// their `finalize()` method can be invoked.  Returns the GC result and
+    /// the *new* (post-GC) addresses of dead finalizable objects.
+    pub fn collect_garbage_with_finalizers(
+        &self,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
+        self.collect_garbage_inner(roots, finalizer_addrs, monitors)
+    }
+
+    pub fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult {
+        self.collect_garbage_inner(roots, &[], monitors).0
+    }
+
+    fn collect_garbage_inner(
+        &self,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
+        // NEW-1.5: If any thread is currently inside a JIT call, warn but
+        // proceed with GC anyway. The conservative root scanner may treat
+        // a coincidental integer as a heap pointer (keeping an extra object
+        // alive), but that is a minor leak — far better than OOM / abort.
+        // The previous behaviour of *skipping GC entirely* caused
+        // deterministic OutOfMemoryError whenever any JIT-compiled method
+        // was on the call stack (the interpreter's maybe_gc could never
+        // actually collect). TODO: remove this warning once precise JIT
+        // oop maps land.
+        if crate::gc_quiescence::is_active() {
+            tracing::warn!(
+                "GC running while JIT frames are active (depth={}) — \
+                 conservative roots may over-retain",
+                crate::gc_quiescence::depth(),
+            );
+        }
+
+        let mut young_from = self.young_from.lock();
+        let mut young_to = self.young_to.lock();
+        let mut old_gen = self.old_gen.lock();
+        let mut card_table = self.card_table.lock();
+
+        let bytes_before = young_from.used();
+        let mut objects_copied: usize = 0;
+        let mut pointer_map = HashMap::new();
+
+        // Collect additional roots from dirty cards in old gen
+        let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
+        // (old_gen_obj, slot_index, _) for each old→young reference slot
+        Self::scan_dirty_cards(&card_table, &old_gen, &young_from, &mut extra_roots);
+
+        // Phase 1: Forward all root objects
+        for root in roots.iter_mut() {
+            let old_ptr = root.as_ptr();
+            if !young_from.contains(old_ptr) {
+                continue; // Skip roots not in young gen (e.g., old gen objects)
+            }
+            let new_ptr = Self::forward_object(
+                &young_from,
+                &mut young_to,
+                &mut old_gen,
+                old_ptr,
+                &mut objects_copied,
+                &mut pointer_map,
+            );
+            // SAFETY: `new_ptr` was returned by `forward_object`, which allocated
+            // space in young_to or old_gen and copied a valid object there.
+            *root = unsafe { ObjectRef::from_raw(new_ptr) };
+        }
+
+        // Phase 1b: Forward old→young references from dirty cards
+        // Ref arrays use compact 8-byte pointers; object fields use 16-byte Value.
+        for &(old_obj, slot_idx, _) in &extra_roots {
+            // SAFETY: `old_obj` is a live old-gen ObjectRef collected from dirty card
+            // scanning, so its pointer targets a valid ObjectHeader.
+            let header = unsafe { &*(old_obj.as_ptr() as *const ObjectHeader) };
+            let is_ref_array = header.kind == ObjectKind::Array
+                && header.element_type == ArrayElementType::Reference;
+
+            if is_ref_array {
+                // SAFETY: `old_obj` is a valid old-gen object and `slot_idx` was collected
+                // from dirty card scanning (within array bounds). Pointer arithmetic stays
+                // within the object's allocation.
+                let slot_ptr = unsafe {
+                    old_obj
+                        .as_ptr()
+                        .add(HEADER_SIZE + slot_idx * REF_ELEMENT_SIZE)
+                };
+                // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
+                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                if raw != 0 {
+                    let ref_ptr = raw as usize as *mut u8;
+                    if young_from.contains(ref_ptr) {
+                        let new_ptr = Self::forward_object(
+                            &young_from,
+                            &mut young_to,
+                            &mut old_gen,
+                            ref_ptr,
+                            &mut objects_copied,
+                            &mut pointer_map,
+                        );
+                        // SAFETY: Writing the forwarded pointer back to the same valid slot.
+                        unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
+                    }
+                }
+            } else {
+                // SAFETY: `old_obj` is a valid old-gen object, `slot_idx` is within
+                // `num_slots` (from dirty card scanning). Arithmetic stays in bounds.
+                let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                // SAFETY: `slot_ptr` points to a valid `Value`-sized slot in the object.
+                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                if let Value::Object(Some(ref_obj)) = value {
+                    let ref_ptr = ref_obj.as_ptr();
+                    if young_from.contains(ref_ptr) {
+                        let new_ptr = Self::forward_object(
+                            &young_from,
+                            &mut young_to,
+                            &mut old_gen,
+                            ref_ptr,
+                            &mut objects_copied,
+                            &mut pointer_map,
+                        );
+                        // SAFETY: `new_ptr` is a valid forwarded allocation.
+                        let new_value =
+                            Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
+                        // SAFETY: Writing updated Value back to the same valid slot.
+                        unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
+                    }
+                }
+            }
+        }
+
+        // Phase 2 + 2b: Combined Cheney scan and promoted object scan.
+        //
+        // We alternate between scanning young_to (standard Cheney) and
+        // scanning newly promoted old-gen objects until both are fully
+        // processed. This is necessary because:
+        //   - Scanning a young_to object may forward a reference that gets
+        //     promoted to old gen (needs promoted scan).
+        //   - Scanning a promoted old-gen object may forward a reference
+        //     that lands in young_to (needs Cheney scan) or gets promoted
+        //     itself (needs another promoted scan iteration).
+        let mut scan_cursor: usize = 0;
+        let mut scanned_promoted: HashSet<usize> = HashSet::new();
+        // Accumulate old-gen addresses needing card dirty marks after GC.
+        // These arise when a promoted object contains a reference that was
+        // forwarded to young to-space (old→young cross-gen reference).
+        let mut deferred_dirty_cards: Vec<usize> = Vec::new();
+
+        loop {
+            let mut made_progress = false;
+
+            // Cheney scan: process any unscanned objects in young_to
+            while scan_cursor < young_to.used() {
+                made_progress = true;
+                // SAFETY: `scan_cursor` is within `young_to.used()` and advances by
+                // `total_size` per object, so this points to a valid object header
+                // in the young to-space arena.
+                let obj_ptr = unsafe { young_to.base_ptr_mut().add(scan_cursor) };
+                // SAFETY: `obj_ptr` points to a copied/promoted object with a valid header.
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                let total_size = gen_object_total_size(header);
+
+                // Scan ref slots: ref arrays use compact 8-byte pointers,
+                // object fields use 16-byte Value.
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for i in 0..header.array_length as usize {
+                            // SAFETY: `i` is within `array_length`, so the offset is
+                            // within the array's data region.
+                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                            // SAFETY: `s_ptr` points to a valid 8-byte ref element.
+                            let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                            if raw != 0 {
+                                let ref_ptr = raw as usize as *mut u8;
+                                if young_from.contains(ref_ptr) {
+                                    let new_ref_ptr = Self::forward_object(
+                                        &young_from,
+                                        &mut young_to,
+                                        &mut old_gen,
+                                        ref_ptr,
+                                        &mut objects_copied,
+                                        &mut pointer_map,
+                                    );
+                                    // SAFETY: Writing forwarded pointer back to the same valid slot.
+                                    unsafe {
+                                        std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for slot_idx in 0..header.num_slots as usize {
+                        // SAFETY: `slot_idx` is within `num_slots`, so the offset is
+                        // within the object's field region.
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                        // SAFETY: `s_ptr` points to a valid `Value`-sized slot.
+                        let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                        if let Value::Object(Some(ref_obj)) = value {
+                            let ref_ptr = ref_obj.as_ptr();
+                            if young_from.contains(ref_ptr) {
+                                let new_ref_ptr = Self::forward_object(
+                                    &young_from,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                );
+                                // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
+                                let new_value = Value::Object(Some(unsafe {
+                                    ObjectRef::from_raw(new_ref_ptr)
+                                }));
+                                // SAFETY: Writing updated Value back to the same valid slot.
+                                unsafe { std::ptr::write(s_ptr as *mut Value, new_value) };
+                            }
+                        }
+                    }
+                }
+
+                scan_cursor += total_size;
+            }
+
+            // Promoted object scan: process any unscanned promoted objects
+            let unscanned: Vec<*mut u8> = pointer_map
+                .values()
+                .filter(|&&new_addr| old_gen.contains(new_addr as *const u8))
+                .filter(|&&new_addr| !scanned_promoted.contains(&new_addr))
+                .map(|&new_addr| new_addr as *mut u8)
+                .collect();
+
+            for obj_ptr in unscanned {
+                made_progress = true;
+                scanned_promoted.insert(obj_ptr as usize);
+                // SAFETY: `obj_ptr` is a promoted object in old gen (verified by the
+                // `old_gen.contains` filter above), with a valid copied header.
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+                // Scan ref slots: ref arrays use compact 8-byte pointers,
+                // object fields use 16-byte Value.
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for i in 0..header.array_length as usize {
+                            // SAFETY: `i` < `array_length`; offset within array data region.
+                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                            // SAFETY: `s_ptr` points to a valid 8-byte ref element.
+                            let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                            if raw != 0 {
+                                let ref_ptr = raw as usize as *mut u8;
+                                if young_from.contains(ref_ptr) {
+                                    let new_ref_ptr = Self::forward_object(
+                                        &young_from,
+                                        &mut young_to,
+                                        &mut old_gen,
+                                        ref_ptr,
+                                        &mut objects_copied,
+                                        &mut pointer_map,
+                                    );
+                                    // SAFETY: Writing forwarded pointer back to the same valid slot.
+                                    unsafe {
+                                        std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                                    }
+                                    // Mark card dirty if the forwarded ref landed in young
+                                    // to-space — this old→young cross-gen reference must be
+                                    // visible to the NEXT minor GC's dirty card scan.
+                                    if !old_gen.contains(new_ref_ptr) {
+                                        deferred_dirty_cards.push(obj_ptr as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for slot_idx in 0..header.num_slots as usize {
+                        // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                        let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                        if let Value::Object(Some(ref_obj)) = value {
+                            let ref_ptr = ref_obj.as_ptr();
+                            if young_from.contains(ref_ptr) {
+                                let new_ref_ptr = Self::forward_object(
+                                    &young_from,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                );
+                                // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
+                                let new_value = Value::Object(Some(unsafe {
+                                    ObjectRef::from_raw(new_ref_ptr)
+                                }));
+                                // SAFETY: Writing updated Value back to the same valid slot.
+                                unsafe { std::ptr::write(s_ptr as *mut Value, new_value) };
+                                // Mark card dirty if the forwarded ref landed in young
+                                // to-space — this old→young cross-gen reference must be
+                                // visible to the NEXT minor GC's dirty card scan.
+                                if !old_gen.contains(new_ref_ptr) {
+                                    card_table.mark_dirty(obj_ptr as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !made_progress {
+                break;
+            }
+        }
+
+        // Phase 2.5: Resurrect dead finalizable objects — forward any
+        // unreachable finalizable objects so finalize() can access them.
+        let mut dead_finalizers = Vec::new();
+        for &old_addr in finalizer_addrs {
+            if pointer_map.contains_key(&old_addr) {
+                continue; // already reachable — skip
+            }
+            let old_ptr = old_addr as *mut u8;
+            if !young_from.contains(old_ptr) {
+                continue; // not in young gen (e.g. old gen or invalid)
+            }
+            let new_ptr = Self::forward_object(
+                &young_from,
+                &mut young_to,
+                &mut old_gen,
+                old_ptr,
+                &mut objects_copied,
+                &mut pointer_map,
+            );
+            dead_finalizers.push(new_ptr as usize);
+        }
+
+        // Phase 2.5b: Continue Cheney scan for resurrected objects and their refs
+        if !dead_finalizers.is_empty() {
+            loop {
+                let mut made_progress = false;
+                while scan_cursor < young_to.used() {
+                    made_progress = true;
+                    // SAFETY: `scan_cursor` is within `young_to.used()`; points to a valid copied object header.
+                    let obj_ptr = unsafe { young_to.base_ptr_mut().add(scan_cursor) };
+                    let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    let total_size = gen_object_total_size(header);
+                    if header.kind == ObjectKind::Array {
+                        if header.element_type == ArrayElementType::Reference {
+                            for i in 0..header.array_length as usize {
+                                // SAFETY: `i` < `array_length`; offset within array data region.
+                                let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                                let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                                if raw != 0 {
+                                    let ref_ptr = raw as usize as *mut u8;
+                                    if young_from.contains(ref_ptr) {
+                                        let new_ref_ptr = Self::forward_object(
+                                            &young_from, &mut young_to, &mut old_gen,
+                                            ref_ptr, &mut objects_copied, &mut pointer_map,
+                                        );
+                                        // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
+                                        unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for slot_idx in 0..header.num_slots as usize {
+                            // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                            let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                            if let Value::Object(Some(ref_obj)) = value {
+                                let ref_ptr = ref_obj.as_ptr();
+                                if young_from.contains(ref_ptr) {
+                                    let new_ref_ptr = Self::forward_object(
+                                        &young_from, &mut young_to, &mut old_gen,
+                                        ref_ptr, &mut objects_copied, &mut pointer_map,
+                                    );
+                                    // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
+                                    let new_value = Value::Object(Some(unsafe {
+                                        ObjectRef::from_raw(new_ref_ptr)
+                                    }));
+                                    // SAFETY: Writing updated Value back to the same valid slot.
+                                    unsafe { std::ptr::write(s_ptr as *mut Value, new_value); }
+                                }
+                            }
+                        }
+                    }
+                    scan_cursor += total_size;
+                }
+                // Also scan promoted objects from resurrection
+                let unscanned: Vec<*mut u8> = pointer_map
+                    .values()
+                    .filter(|&&new_addr| old_gen.contains(new_addr as *const u8))
+                    .filter(|&&new_addr| !scanned_promoted.contains(&new_addr))
+                    .map(|&new_addr| new_addr as *mut u8)
+                    .collect();
+                for obj_ptr in unscanned {
+                    made_progress = true;
+                    scanned_promoted.insert(obj_ptr as usize);
+                    // SAFETY: `obj_ptr` is a promoted old-gen object with a valid copied header.
+                    let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    if header.kind == ObjectKind::Array {
+                        if header.element_type == ArrayElementType::Reference {
+                            for i in 0..header.array_length as usize {
+                                // SAFETY: `i` < `array_length`; offset within array data region.
+                                let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                                let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                                if raw != 0 {
+                                    let ref_ptr = raw as usize as *mut u8;
+                                    if young_from.contains(ref_ptr) {
+                                        let new_ref_ptr = Self::forward_object(
+                                            &young_from, &mut young_to, &mut old_gen,
+                                            ref_ptr, &mut objects_copied, &mut pointer_map,
+                                        );
+                                        // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
+                                        unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
+                                        if !old_gen.contains(new_ref_ptr) {
+                                            card_table.mark_dirty(obj_ptr as usize);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for slot_idx in 0..header.num_slots as usize {
+                            // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                            let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                            if let Value::Object(Some(ref_obj)) = value {
+                                let ref_ptr = ref_obj.as_ptr();
+                                if young_from.contains(ref_ptr) {
+                                    let new_ref_ptr = Self::forward_object(
+                                        &young_from, &mut young_to, &mut old_gen,
+                                        ref_ptr, &mut objects_copied, &mut pointer_map,
+                                    );
+                                    // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
+                                    let new_value = Value::Object(Some(unsafe {
+                                        ObjectRef::from_raw(new_ref_ptr)
+                                    }));
+                                    // SAFETY: Writing updated Value back to the same valid slot.
+                                    unsafe { std::ptr::write(s_ptr as *mut Value, new_value); }
+                                    if !old_gen.contains(new_ref_ptr) {
+                                        deferred_dirty_cards.push(obj_ptr as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !made_progress {
+                    break;
+                }
+            }
+        }
+
+        let bytes_copied = young_to.used();
+
+        // Phase H (RH.1): compute promotion / young-copy stats from the
+        // pointer_map BEFORE major_gc appends its own entries below.
+        // Every entry at this point is a minor-GC forward: new_addr is
+        // either in old_gen (promoted) or in young_to-space (copied).
+        // Walking the map once avoids an expensive counter plumbed
+        // through `forward_object`'s 12 call sites.
+        let mut bytes_promoted_cycle: u64 = 0;
+        let mut objects_promoted_cycle: u64 = 0;
+        let mut bytes_copied_young_cycle: u64 = 0;
+        let mut objects_copied_young_cycle: u64 = 0;
+        for &new_addr in pointer_map.values() {
+            let new_ptr = new_addr as *const u8;
+            // SAFETY: `new_addr` is a pointer returned by forward_object,
+            // which either allocated in young_to or in old_gen. Both
+            // allocations begin with a valid ObjectHeader.
+            let header = unsafe { &*(new_addr as *const ObjectHeader) };
+            // `gen_object_total_size` is the sum of HEADER_SIZE and the
+            // variable-length object body, computed from the header
+            // exactly as the copy path does.
+            let sz = gen_object_total_size(header) as u64;
+            if old_gen.contains(new_ptr) {
+                bytes_promoted_cycle += sz;
+                objects_promoted_cycle += 1;
+            } else {
+                bytes_copied_young_cycle += sz;
+                objects_copied_young_cycle += 1;
+            }
+        }
+
+        // Phase 3: Clear card table and reset young from-space
+        card_table.clear_all();
+        // Re-mark cards for promoted objects that still reference young gen.
+        // These old→young cross-gen references were established during the
+        // Phase 2 promoted-object scan and must be visible to the next GC.
+        for addr in &deferred_dirty_cards {
+            card_table.mark_dirty(*addr);
+        }
+        young_from.reset();
+
+        // Phase 4: Remap monitors and swap young spaces
+        monitors.remap_after_gc(&pointer_map);
+        std::mem::swap(&mut *young_from, &mut *young_to);
+
+        // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
+        let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 {
+            tracing::debug!(
+                "Old gen at {}% — running major GC (mark-compact)",
+                old_gen.used() * 100 / old_gen.capacity(),
+            );
+            let old_used_before = old_gen.used();
+            let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
+            // Merge old-gen compaction relocations into the overall pointer map
+            // so the VM can update external roots (statics, JNI, string pool, etc.)
+            pointer_map.extend(compact_map);
+            let old_used_after = old_gen.used();
+            // `used` can rise after compaction if the compactor's metadata
+            // overhead exceeds reclaimed garbage; clamp with saturating_sub.
+            self.stats
+                .bytes_freed_old
+                .fetch_add(old_used_before.saturating_sub(old_used_after) as u64, Ordering::Relaxed);
+            true
+        } else {
+            false
+        };
+
+        let bytes_freed = bytes_before.saturating_sub(bytes_copied);
+
+        // Phase 6: Adaptive heap expansion.
+        // If GC didn't reclaim enough space (less than 25% of capacity freed),
+        // expand the young gen to avoid GC thrashing.
+        //
+        // After swap: young_from has live data, young_to is empty (was reset).
+        // We can only safely grow young_to (empty arena). This means the
+        // expansion takes effect on the NEXT GC cycle — when live objects are
+        // copied into the now-larger to-space, which then becomes from-space.
+        let freed_percent = if bytes_before > 0 {
+            bytes_freed * 100 / bytes_before
+        } else {
+            100
+        };
+        if freed_percent < GC_EXPANSION_THRESHOLD_PERCENT {
+            let current_cap = young_to.capacity();
+            let new_cap = (current_cap * 2).min(self.max_young_semi_size);
+            if new_cap > current_cap {
+                tracing::debug!(
+                    "GC: low reclamation ({}% freed) — expanding young to-space {} → {} bytes",
+                    freed_percent,
+                    current_cap,
+                    new_cap,
+                );
+                // young_to is empty after reset+swap, safe to grow
+                young_to.grow(new_cap);
+                // Update threshold based on the upcoming larger from-space
+                *self.young_gc_threshold.lock() = new_cap * YOUNG_GC_THRESHOLD_PERCENT / 100;
+            }
+        }
+
+        // Phase H (RH.1): commit per-cycle counters to the lifetime
+        // accumulator. Do this at the end so tests can observe GC
+        // statistics after the call returns.
+        self.stats.minor_gc_count.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_promoted
+            .fetch_add(bytes_promoted_cycle, Ordering::Relaxed);
+        self.stats
+            .objects_promoted
+            .fetch_add(objects_promoted_cycle, Ordering::Relaxed);
+        self.stats
+            .bytes_copied_young
+            .fetch_add(bytes_copied_young_cycle, Ordering::Relaxed);
+        self.stats
+            .objects_copied_young
+            .fetch_add(objects_copied_young_cycle, Ordering::Relaxed);
+        if major_ran {
+            self.stats.major_gc_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        (
+            GcResult {
+                stats: crate::gc::GcStats {
+                    objects_copied,
+                    bytes_copied,
+                    bytes_freed,
+                },
+                pointer_map,
+            },
+            dead_finalizers,
+        )
+    }
+
+    /// Run a major garbage collection on the old generation using mark-compact.
+    ///
+    /// 1. **Mark phase:** starting from `roots` + all young-gen objects, traverse
+    ///    the heap marking live old-gen objects (set `GC_FLAG_MARKED`).
+    /// 2. **Compact phase:** slide all live objects toward the start of the heap,
+    ///    eliminating fragmentation. Update all internal references.
+    /// 3. **Cross-gen fixup:** update young-gen references that pointed into
+    ///    old gen to use the new compacted addresses.
+    /// 4. **Root fixup:** update external root references pointing into old gen.
+    ///
+    /// Returns a pointer map (old_addr → new_addr) for relocated old-gen objects.
+    /// The caller merges this into the overall `GcResult` for VM-level root updates.
+    fn major_gc(
+        roots: &mut [ObjectRef],
+        young_from: &Arena,
+        old_gen: &mut OldGen,
+    ) -> HashMap<usize, usize> {
+        // ---- Mark phase ---- BFS from roots + young-gen cross-references ----
+
+        let mut worklist: Vec<*mut u8> = Vec::new();
+
+        // Seed: root ObjectRefs that point into old gen
+        for root in roots.iter() {
+            let ptr = root.as_ptr();
+            if old_gen.contains(ptr) {
+                // SAFETY: `ptr` is a root ObjectRef in old gen (verified by `contains` above); its header is valid.
+                let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+                if header.gc_flags & GC_FLAG_MARKED == 0 {
+                    header.gc_flags |= GC_FLAG_MARKED;
+                    worklist.push(ptr);
+                }
+            }
+        }
+
+        // Seed: young from-space references into old gen
+        Self::mark_young_to_old_refs(young_from, old_gen, &mut worklist);
+
+        // BFS: transitively mark all reachable old-gen objects
+        while let Some(obj_ptr) = worklist.pop() {
+            Self::scan_object_for_old_refs(obj_ptr, old_gen, &mut worklist);
+        }
+
+        // ---- Compact phase ---- sliding compaction of old gen ----
+
+        let compact_map = old_gen.compact();
+
+        // ---- Cross-gen fixup ---- update young-gen refs into old gen ----
+
+        if !compact_map.is_empty() {
+            Self::fixup_young_old_refs(young_from, &compact_map);
+
+            // ---- Root fixup ---- update roots pointing into old gen ----
+            for root in roots.iter_mut() {
+                let old_addr = root.as_ptr() as usize;
+                if let Some(&new_addr) = compact_map.get(&old_addr) {
+                    // SAFETY: `new_addr` comes from the compaction map, pointing to a valid relocated object.
+                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+
+        compact_map
+    }
+
+    /// Scan young from-space for references into old gen and mark them.
+    fn mark_young_to_old_refs(
+        young_from: &Arena,
+        old_gen: &OldGen,
+        worklist: &mut Vec<*mut u8>,
+    ) {
+        let mut cursor: usize = 0;
+        while cursor < young_from.used() {
+            // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
+            let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let total_size = gen_object_total_size(header);
+            if total_size < HEADER_SIZE {
+                break;
+            }
+
+            if header.kind == ObjectKind::Array {
+                if header.element_type == ArrayElementType::Reference {
+                    for i in 0..header.array_length as usize {
+                        // SAFETY: `i` < `array_length`; offset within array data region.
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                        if raw != 0 {
+                            let ref_ptr = raw as usize as *mut u8;
+                            if old_gen.contains(ref_ptr) {
+                                // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
+                                let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
+                                if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                                    ref_header.gc_flags |= GC_FLAG_MARKED;
+                                    worklist.push(ref_ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for slot_idx in 0..header.num_slots as usize {
+                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        let ref_ptr = ref_obj.as_ptr();
+                        if old_gen.contains(ref_ptr) {
+                            // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
+                            let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
+                            if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                                ref_header.gc_flags |= GC_FLAG_MARKED;
+                                worklist.push(ref_ptr);
+                            }
+                        }
+                    }
+                }
+            }
+
+            cursor += total_size;
+        }
+    }
+
+    /// Scan a single object's reference slots for old-gen pointers and mark them.
+    fn scan_object_for_old_refs(
+        obj_ptr: *mut u8,
+        old_gen: &OldGen,
+        worklist: &mut Vec<*mut u8>,
+    ) {
+        // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
+        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+        if header.kind == ObjectKind::Array {
+            if header.element_type == ArrayElementType::Reference {
+                for i in 0..header.array_length as usize {
+                    // SAFETY: `i` < `array_length`; offset within array data region.
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                    let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                    if raw != 0 {
+                        let ref_ptr = raw as usize as *mut u8;
+                        if old_gen.contains(ref_ptr) {
+                            // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
+                            let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
+                            if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                                ref_header.gc_flags |= GC_FLAG_MARKED;
+                                worklist.push(ref_ptr);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for slot_idx in 0..header.num_slots as usize {
+                // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                if let Value::Object(Some(ref_obj)) = value {
+                    let ref_ptr = ref_obj.as_ptr();
+                    if old_gen.contains(ref_ptr) {
+                        // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
+                        let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
+                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                            ref_header.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(ref_ptr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// After old-gen compaction, update references in young from-space that
+    /// pointed to old-gen objects which have been relocated.
+    fn fixup_young_old_refs(young_from: &Arena, compact_map: &HashMap<usize, usize>) {
+        let mut cursor: usize = 0;
+        while cursor < young_from.used() {
+            // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
+            let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let total_size = gen_object_total_size(header);
+            if total_size < HEADER_SIZE {
+                break;
+            }
+
+            if header.kind == ObjectKind::Array {
+                if header.element_type == ArrayElementType::Reference {
+                    for i in 0..header.array_length as usize {
+                        // SAFETY: `i` < `array_length`; offset within array data region.
+                        let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                        let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                        if raw != 0 {
+                            if let Some(&new_addr) = compact_map.get(&(raw as usize)) {
+                                // SAFETY: Writing the compacted address back to the same valid ref-array slot.
+                                unsafe { std::ptr::write(slot as *mut u64, new_addr as u64) };
+                            }
+                        }
+                    }
+                }
+            } else {
+                for slot_idx in 0..header.num_slots as usize {
+                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    let value = unsafe { std::ptr::read(slot as *const Value) };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        if let Some(&new_addr) = compact_map.get(&(ref_obj.as_ptr() as usize)) {
+                            // SAFETY: `new_addr` comes from the compaction map, pointing to a valid relocated object.
+                            let new_value = Value::Object(Some(unsafe {
+                                ObjectRef::from_raw(new_addr as *mut u8)
+                            }));
+                            // SAFETY: Writing updated Value back to the same valid slot.
+                            unsafe { std::ptr::write(slot as *mut Value, new_value) };
+                        }
+                    }
+                }
+            }
+
+            cursor += total_size;
+        }
+    }
+
+    // ----- Internal ----------------------------------------------------------
+
+    /// Allocate bytes in the young from-space.
+    ///
+    /// Returns `None` if the young generation is exhausted and cannot satisfy
+    /// the allocation. The caller should trigger a GC cycle and retry, or
+    /// throw `OutOfMemoryError`.
+    fn try_alloc_young(&self, size: usize) -> Option<*mut u8> {
+        let ptr = {
+            let mut from = self.young_from.lock();
+            from.alloc(size, 8)
+            // Lock released here — zeroing happens outside the lock
+        };
+        if let Some(ptr) = ptr {
+            // Zero the block after releasing the lock (O(size) memset)
+            // SAFETY: `ptr` was just allocated from the arena with `size` bytes; zeroing is within bounds.
+            unsafe { std::ptr::write_bytes(ptr, 0, size) };
+            self.stats.young_allocations.fetch_add(1, Ordering::Relaxed);
+            return Some(ptr);
+        }
+        None
+    }
+
+    /// Check if an allocation of `size` bytes would succeed in the young from-space.
+    /// Does NOT allocate — just probes available space.
+    pub fn try_alloc_young_probe(&self, size: usize) -> Option<()> {
+        let from = self.young_from.lock();
+        let aligned = from.used().checked_add(7).map(|v| v & !7)?;
+        let end = aligned.checked_add(size)?;
+        if end <= from.capacity() { Some(()) } else { None }
+    }
+
+    /// Carve out a TLAB-sized chunk from the young from-space.
+    ///
+    /// Returns `Some((ptr, size))` on success, where `ptr` is the start of
+    /// the zeroed region and `size` is the actual TLAB size (may be smaller
+    /// than requested if the arena is nearly full).
+    pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
+        let mut from = self.young_from.lock();
+        let available = from.remaining();
+        if available < 256 {
+            return None; // Not enough for a useful TLAB
+        }
+        let actual_size = requested_size.min(available);
+        let ptr = from.alloc(actual_size, 8)?;
+        // Zero the TLAB region
+        // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
+        unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
+        Some((ptr, actual_size))
+    }
+
+    /// Allocate bytes in the young from-space.
+    ///
+    /// If the from-space is full, logs a fatal error and aborts. The
+    /// interpreter's `gc_alloc_*` functions use `try_alloc_young` with
+    /// GC-and-retry; this method is only called by the panicking
+    /// `alloc_object`/`alloc_array` convenience wrappers.
+    fn alloc_young(&self, size: usize) -> *mut u8 {
+        self.try_alloc_young(size).unwrap_or_else(|| {
+            let from = self.young_from.lock();
+            eprintln!(
+                "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
+                 from-space has {}/{} used",
+                size,
+                from.used(),
+                from.capacity(),
+            );
+            std::process::abort();
+        })
+    }
+
+    /// Generate the next identity hash code.
+    ///
+    /// H1: exposed publicly so `interpreter::init_object_header` (TLAB
+    /// fast path) can mint a unique hash at allocation time, matching the
+    /// non-TLAB allocators. Without this, freshly TLAB-allocated objects
+    /// of `ClassId(0)` (java/lang/Object) with no fields produce an
+    /// all-zero header that the stale-pointer detector mis-flags as
+    /// stale.
+    pub fn next_hash(&self) -> i32 {
+        self.next_hash_code.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Forward (copy or promote) a single object from young from-space.
+    ///
+    /// If the object has been forwarded already, returns the existing address.
+    /// If the object has survived enough GCs (age >= PROMOTION_AGE), promotes
+    /// it to old gen. Otherwise copies to young to-space with incremented age.
+    fn forward_object(
+        young_from: &Arena,
+        young_to: &mut Arena,
+        old_gen: &mut OldGen,
+        old_ptr: *mut u8,
+        objects_copied: &mut usize,
+        pointer_map: &mut HashMap<usize, usize>,
+    ) -> *mut u8 {
+        // SAFETY: `old_ptr` points to a live young-gen object; its header is valid.
+        let header = unsafe { &*(old_ptr as *const ObjectHeader) };
+
+        // KC16 SIGSEGV audit: sanity-check header before using it. A corrupted
+        // header (e.g., slot tag mis-identified a non-pointer bit-pattern as an
+        // ObjectRef) would cause forward_object to walk into arbitrary memory.
+        // Emitting forensic output here converts a silent SIGSEGV into a visible
+        // diagnostic.
+        let kind_byte = header.kind as u8;
+        if kind_byte > 1
+            || header.num_slots > (1 << 24)
+            || header.array_length > (1 << 27)
+        {
+            tracing::debug!(
+                target: "rustjvm::gc::guard",
+                old_ptr = ?old_ptr,
+                kind_byte,
+                num_slots = header.num_slots,
+                array_length = header.array_length,
+                class_id = ?header.class_id,
+                gc_flags = format!("{:x}", header.gc_flags),
+                backtrace = ?std::backtrace::Backtrace::capture(),
+                "gen_heap::forward_object: suspect header",
+            );
+            // Leave the object unmoved; this is a suspected false root or
+            // corrupted slot. Returning old_ptr preserves progress while the
+            // eprintln above gives us the evidence needed to diagnose.
+            return old_ptr;
+        }
+
+        // Already forwarded?
+        if header.is_forwarded() {
+            let fwd = header.forwarding_address();
+            // KC16 SIGSEGV audit: verify the forwarding address is sane before
+            // returning it. A stale forwarding pointer left over from a prior
+            // GC cycle that wasn't cleared by session 73's fix would send
+            // callers to freed memory.
+            if fwd.is_null() || (fwd as usize) % 8 != 0 {
+                tracing::debug!(
+                    target: "rustjvm::gc::guard",
+                    fwd = ?fwd,
+                    old_ptr = ?old_ptr,
+                    class_id = ?header.class_id,
+                    gc_flags = format!("{:x}", header.gc_flags),
+                    gc_age = header.gc_age,
+                    backtrace = ?std::backtrace::Backtrace::capture(),
+                    "gen_heap::forward_object: bad forwarding_ptr",
+                );
+                return old_ptr;
+            }
+            // Ensure pointer_map has this entry so update_all_roots can update
+            // all references to this old address, even if this is a second
+            // encounter of the same object (e.g., root + dirty card + Cheney scan).
+            pointer_map.entry(old_ptr as usize).or_insert(fwd as usize);
+            return fwd;
+        }
+
+        let total_size = gen_object_total_size(header);
+
+        // Sanity: skip objects with implausibly large computed sizes. This
+        // guards against false conservative roots from JIT spill slots that
+        // bit-match a heap address but don't point at a real object.
+        const MAX_SANE_OBJECT_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+        if total_size > MAX_SANE_OBJECT_SIZE || total_size < HEADER_SIZE {
+            tracing::warn!(
+                "GC: skipping suspected false root at {:p} (computed size {} bytes, \
+                 kind={:?}, num_slots={}, array_len={})",
+                old_ptr,
+                total_size,
+                header.kind,
+                header.num_slots,
+                header.array_length,
+            );
+            return old_ptr; // Leave unmoved — likely not a real object
+        }
+        // Promote if this GC survival would reach or exceed the promotion age.
+        // E.g., with PROMOTION_AGE=3: an object at age 2, surviving this GC,
+        // would become age 3 → promote instead.
+        let should_promote = header.gc_age + 1 >= PROMOTION_AGE;
+
+        let new_ptr = if should_promote {
+            // Promote to old gen
+            match old_gen.alloc(total_size, 8) {
+                Some(ptr) => ptr,
+                None => {
+                    // Old gen full — fall back to young to-space
+                    // (Major GC will be needed later)
+                    match young_to.alloc(total_size, 8) {
+                        Some(ptr) => ptr,
+                        None => {
+                            // Both old gen and to-space are full — keep the object in from-space.
+                            // This is a best-effort: the object won't be moved but remains reachable.
+                            // A proper OOM should be raised at the next allocation attempt.
+                            tracing::error!(
+                                "GC: both old gen and young to-space out of memory during promotion \
+                                 (tried {} bytes, to-space {}/{})",
+                                total_size,
+                                young_to.used(),
+                                young_to.capacity(),
+                            );
+                            return old_ptr; // Leave object unmoved
+                        }
+                    }
+                }
+            }
+        } else {
+            // Copy to young to-space
+            match young_to.alloc(total_size, 8) {
+                Some(ptr) => ptr,
+                None => {
+                    tracing::error!(
+                        "GC: young to-space out of memory: tried {} bytes, to-space has {}/{} used",
+                        total_size,
+                        young_to.used(),
+                        young_to.capacity(),
+                    );
+                    return old_ptr; // Leave object unmoved
+                }
+            }
+        };
+
+        // Copy the entire object
+        // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
+        }
+
+        // Update the new header
+        // SAFETY: `new_ptr` was just allocated and the object was copied there; its header is valid and mutable.
+        let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
+        new_header.forwarding_ptr = std::ptr::null_mut();
+
+        if should_promote && old_gen.contains(new_ptr) {
+            // Mark as old gen
+            new_header.gc_flags |= GC_FLAG_OLD_GEN;
+        } else {
+            // Increment age for young gen survivors
+            new_header.gc_age = new_header.gc_age.saturating_add(1);
+        }
+
+        // Install forwarding pointer in the old header
+        // SAFETY: `old_ptr` is a valid young-gen object; writing the forwarding pointer into its header is safe.
+        let old_header = unsafe { &mut *(old_ptr as *mut ObjectHeader) };
+        old_header.forwarding_ptr = new_ptr;
+
+        pointer_map.insert(old_ptr as usize, new_ptr as usize);
+        *objects_copied += 1;
+
+        debug_assert!(young_from.contains(old_ptr));
+
+        new_ptr
+    }
+
+    /// Scan dirty cards in the card table for old→young references.
+    ///
+    /// For each dirty card, walks the objects in that card region and collects
+    /// slots containing references into young from-space.
+    fn scan_dirty_cards(
+        card_table: &CardTable,
+        old_gen: &OldGen,
+        young_from: &Arena,
+        extra_roots: &mut Vec<(ObjectRef, usize, usize)>,
+    ) {
+        let dirty_indices: Vec<usize> = card_table.dirty_card_indices().collect();
+        if dirty_indices.is_empty() {
+            return;
+        }
+
+        // Walk all objects in old gen and check if they fall within dirty card regions
+        let objects = old_gen.walk_objects();
+        for (obj_ptr, _total_size) in objects {
+            let obj_addr = obj_ptr as usize;
+
+            // Check if this object's card is dirty
+            let card_base = card_table.base_addr();
+            if obj_addr < card_base {
+                continue;
+            }
+            let card_idx = (obj_addr - card_base) / crate::card_table::CARD_SIZE;
+            if !card_table.is_dirty(card_idx) {
+                continue;
+            }
+
+            // SAFETY: `obj_ptr` is from `old_gen.walk_objects()`, pointing to a valid old-gen object header.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+            // Scan ref slots: ref arrays use compact 8-byte pointers,
+            // object fields use 16-byte Value.
+            if header.kind == ObjectKind::Array {
+                if header.element_type == ArrayElementType::Reference {
+                    for i in 0..header.array_length as usize {
+                        // SAFETY: `i` < `array_length`; offset within array data region.
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                        if raw != 0 {
+                            let ref_ptr = raw as usize as *mut u8;
+                            if young_from.contains(ref_ptr) {
+                                // SAFETY: `obj_ptr` is a valid old-gen object pointer; wrapping in ObjectRef is sound.
+                                let obj_ref = unsafe { ObjectRef::from_raw(obj_ptr) };
+                                extra_roots.push((obj_ref, i, 0));
+                            }
+                        }
+                    }
+                }
+            } else {
+                for slot_idx in 0..header.num_slots as usize {
+                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        if young_from.contains(ref_obj.as_ptr()) {
+                            // SAFETY: `obj_ptr` is a valid old-gen object pointer; wrapping in ObjectRef is sound.
+                            let obj_ref = unsafe { ObjectRef::from_raw(obj_ptr) };
+                            extra_roots.push((obj_ref, slot_idx, 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The capacity of each young semi-space.
+    pub fn young_semi_capacity(&self) -> usize {
+        self.young_from.lock().capacity()
+    }
+
+    /// The capacity of the old generation.
+    pub fn old_gen_capacity(&self) -> usize {
+        self.old_gen.lock().capacity()
+    }
+
+    /// The number of bytes currently used in the young from-space.
+    pub fn young_from_used(&self) -> usize {
+        self.young_from.lock().used()
+    }
+
+    /// The number of bytes currently used in the old generation.
+    pub fn old_gen_used(&self) -> usize {
+        self.old_gen.lock().used()
+    }
+
+    /// Check if a pointer is in the young from-space.
+    pub fn is_in_young(&self, ptr: *const u8) -> bool {
+        self.young_from.lock().contains(ptr)
+    }
+
+    /// Check if a pointer is in the old generation.
+    pub fn is_in_old(&self, ptr: *const u8) -> bool {
+        self.old_gen.lock().contains(ptr)
+    }
+
+    /// Walk all live objects in both young and old generations.
+    /// Returns a Vec of (raw pointer, total byte size) for each object.
+    /// Must be called during a GC safepoint (all mutator threads paused).
+    pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
+        let mut result = Vec::new();
+
+        // Walk young generation (from-space only — to-space is GC scratch)
+        {
+            let young = self.young_from.lock();
+            let base = young.base_ptr() as usize;
+            let used = young.used();
+            let mut offset = 0;
+            while offset < used {
+                let ptr = (base + offset) as *mut u8;
+                // SAFETY: `ptr` is within `young_from.used()` region; reading the header is valid.
+                let header = unsafe { &*(ptr as *const ObjectHeader) };
+                let total_size = if header.kind == ObjectKind::Array {
+                    HEADER_SIZE
+                        + array_data_size(header.array_length as usize, header.element_type)
+                            .unwrap_or(0)
+                } else {
+                    HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+                };
+                if total_size < HEADER_SIZE || offset + total_size > used {
+                    break;
+                }
+                result.push((ptr, total_size));
+                offset += total_size;
+            }
+        }
+
+        // Walk old generation
+        {
+            let old = self.old_gen.lock();
+            result.extend(old.walk_objects());
+        }
+
+        result
+    }
+}
+
+impl Default for GenerationalHeap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for GenerationalHeap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let yf = self.young_from.lock();
+        let yt = self.young_to.lock();
+        let og = self.old_gen.lock();
+        f.debug_struct("GenerationalHeap")
+            .field("young_from_used", &yf.used())
+            .field("young_from_capacity", &yf.capacity())
+            .field("young_to_used", &yt.used())
+            .field("young_to_capacity", &yt.capacity())
+            .field("old_gen_used", &og.used())
+            .field("old_gen_capacity", &og.capacity())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Size / slot access helpers
+// ---------------------------------------------------------------------------
+
+/// Compute total size of a heap object (for GC cursor advancement).
+/// Objects use SLOT_SIZE per field. Arrays use compact element sizes.
+#[inline]
+fn gen_object_total_size(header: &ObjectHeader) -> usize {
+    if header.kind == ObjectKind::Array {
+        HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
+            .unwrap_or(0)
+    } else {
+        HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+    }
+}
+
+/// Compute a pointer to the slot at `index` within an object/array.
+#[inline]
+fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
+    // SAFETY: Caller guarantees `index` is within the object's slot count; pointer arithmetic stays within the allocation.
+    unsafe { obj_ref.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE) }
+}
+
+/// Read a `Value` from a slot pointer.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid, initialized `Value`-sized region within a
+/// heap-allocated object. The caller must ensure no concurrent writes to
+/// the same slot.
+// SAFETY: caller guarantees `ptr` points to a valid Value within a heap object.
+#[inline]
+unsafe fn read_slot(ptr: *mut u8) -> Value {
+    std::ptr::read(ptr as *const Value)
+}
+
+/// Write a `Value` to a slot pointer.
+///
+/// # Safety
+///
+/// `ptr` must point to a `Value`-sized region within a heap-allocated object.
+/// The caller must ensure exclusive access to the slot.
+// SAFETY: caller guarantees `ptr` points to a valid Value slot within a heap object.
+#[inline]
+unsafe fn write_slot(ptr: *mut u8, value: Value) {
+    std::ptr::write(ptr as *mut Value, value);
+}
+
+// ---------------------------------------------------------------------------
+// GarbageCollector trait impl
+// ---------------------------------------------------------------------------
+
+impl GarbageCollector for GenerationalHeap {
+    fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        self.alloc_object(class_id, num_fields)
+    }
+
+    fn alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> ObjectRef {
+        self.alloc_array(class_id, element_type, length)
+    }
+
+    fn get_header(&self, obj: ObjectRef) -> &ObjectHeader {
+        self.get_header(obj)
+    }
+
+    fn class_id_of(&self, obj: ObjectRef) -> ClassId {
+        self.class_id_of(obj)
+    }
+
+    fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
+        self.kind_of(obj)
+    }
+
+    fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
+        self.element_type_of(obj)
+    }
+
+    fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        self.identity_hash_code(obj)
+    }
+
+    fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field(obj, index)
+    }
+
+    fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value)
+    }
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field_volatile(obj, index)
+    }
+
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field_volatile(obj, index, value)
+    }
+
+    fn array_length(&self, obj: ObjectRef) -> usize {
+        self.array_length(obj)
+    }
+
+    fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
+        self.get_array_element(obj, index)
+    }
+
+    fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        self.set_array_element(obj, index, value)
+    }
+
+    fn needs_gc(&self) -> bool {
+        self.needs_gc()
+    }
+
+    fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult {
+        self.collect_garbage(roots, monitors)
+    }
+
+    fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
+        self.write_barrier(obj, stored_value)
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No-op monitor cleanup for tests in the gc crate.
+    struct NoOpMonitors;
+    impl crate::collector::MonitorCleanup for NoOpMonitors {
+        fn remap_after_gc(&self, _pointer_map: &std::collections::HashMap<usize, usize>) {}
+    }
+
+    /// Create a small generational heap for testing.
+    fn small_gen_heap() -> GenerationalHeap {
+        // 4KB young semi-space, 8KB old gen
+        GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    #[test]
+    fn alloc_object_in_young() {
+        let heap = small_gen_heap();
+        let obj = heap.alloc_object(ClassId::new(1), 2);
+        assert!(heap.is_in_young(obj.as_ptr()));
+        assert!(!heap.is_in_old(obj.as_ptr()));
+        assert_eq!(heap.class_id_of(obj), ClassId::new(1));
+        assert_eq!(heap.get_header(obj).num_slots, 2);
+        assert_eq!(heap.get_header(obj).gc_age, 0);
+        assert_eq!(heap.get_header(obj).gc_flags, 0);
+    }
+
+    #[test]
+    fn alloc_array_in_young() {
+        let heap = small_gen_heap();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
+        assert!(heap.is_in_young(arr.as_ptr()));
+        assert_eq!(heap.array_length(arr), 5);
+        assert_eq!(heap.kind_of(arr), ObjectKind::Array);
+    }
+
+    #[test]
+    fn field_set_and_get() {
+        let heap = small_gen_heap();
+        let obj = heap.alloc_object(ClassId::new(0), 3);
+        heap.set_field(obj, 0, Value::Int(42));
+        heap.set_field(obj, 1, Value::Long(100));
+        heap.set_field(obj, 2, Value::Float(2.71));
+
+        assert_eq!(heap.get_field(obj, 0).as_int(), Some(42));
+        assert_eq!(heap.get_field(obj, 1).as_long(), Some(100));
+        assert_eq!(heap.get_field(obj, 2).as_float(), Some(2.71));
+    }
+
+    #[test]
+    fn array_set_and_get() {
+        let heap = small_gen_heap();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
+        heap.set_array_element(arr, 0, Value::Int(10)).unwrap();
+        heap.set_array_element(arr, 1, Value::Int(20)).unwrap();
+        heap.set_array_element(arr, 2, Value::Int(30)).unwrap();
+
+        assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(10)));
+        assert_eq!(heap.get_array_element(arr, 1), Ok(Value::Int(20)));
+        assert_eq!(heap.get_array_element(arr, 2), Ok(Value::Int(30)));
+        assert!(heap.get_array_element(arr, 3).is_err());
+    }
+
+    #[test]
+    fn minor_gc_basic() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(1), 2);
+        heap.set_field(obj, 0, Value::Int(42));
+        heap.set_field(obj, 1, Value::Long(100));
+
+        let mut roots = vec![obj];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        assert_eq!(result.stats.objects_copied, 1);
+
+        // Root should be updated
+        let new_obj = roots[0];
+        assert_ne!(new_obj.as_ptr(), obj.as_ptr());
+
+        // Fields intact
+        assert_eq!(heap.get_field(new_obj, 0).as_int(), Some(42));
+        assert_eq!(heap.get_field(new_obj, 1).as_long(), Some(100));
+
+        // Age should be incremented
+        assert_eq!(heap.get_header(new_obj).gc_age, 1);
+    }
+
+    #[test]
+    fn minor_gc_unreachable_freed() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let _dead = heap.alloc_object(ClassId::new(0), 2);
+        let live = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(live, 0, Value::Int(999));
+
+        let mut roots = vec![live];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        assert_eq!(result.stats.objects_copied, 1);
+        assert!(result.stats.bytes_freed > 0);
+
+        let new_live = roots[0];
+        assert_eq!(heap.get_field(new_live, 0).as_int(), Some(999));
+    }
+
+    #[test]
+    fn minor_gc_preserves_references() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Int(77));
+
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        assert_eq!(result.stats.objects_copied, 2);
+
+        let new_a = roots[0];
+        match heap.get_field(new_a, 0) {
+            Value::Object(Some(new_b)) => {
+                assert_ne!(new_b.as_ptr(), obj_b.as_ptr());
+                assert_eq!(heap.get_field(new_b, 0).as_int(), Some(77));
+            }
+            _ => panic!("Expected A's field to reference B"),
+        }
+    }
+
+    #[test]
+    fn promotion_after_enough_gcs() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj, 0, Value::Int(42));
+
+        let mut roots = vec![obj];
+
+        // Run PROMOTION_AGE minor GCs — object should be promoted on the last one
+        for i in 0..PROMOTION_AGE {
+            let result = heap.collect_garbage(&mut roots, &monitors);
+            assert_eq!(result.stats.objects_copied, 1);
+            let cur = roots[0];
+
+            if i < PROMOTION_AGE - 1 {
+                // Still in young gen
+                assert!(
+                    heap.is_in_young(cur.as_ptr()),
+                    "Expected in young gen at iteration {i}"
+                );
+                assert_eq!(heap.get_header(cur).gc_age, i + 1);
+            } else {
+                // Should be promoted to old gen
+                assert!(
+                    heap.is_in_old(cur.as_ptr()),
+                    "Expected in old gen after {PROMOTION_AGE} GCs"
+                );
+                assert!(heap.get_header(cur).is_old_gen());
+            }
+        }
+
+        // Field value should still be intact
+        assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(42));
+    }
+
+    #[test]
+    fn write_barrier_marks_card_dirty() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        // First, promote an object to old gen
+        let old_obj = heap.alloc_object(ClassId::new(0), 1);
+        let mut roots = vec![old_obj];
+
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        let promoted = roots[0];
+        assert!(heap.is_in_old(promoted.as_ptr()));
+
+        // Allocate a young object
+        let young_obj = heap.alloc_object(ClassId::new(0), 0);
+        assert!(heap.is_in_young(young_obj.as_ptr()));
+
+        // Store young ref into old object
+        heap.set_field(promoted, 0, Value::Object(Some(young_obj)));
+        heap.write_barrier(promoted, Value::Object(Some(young_obj)));
+
+        // Card should be dirty
+        let card_table = heap.card_table.lock();
+        let card_idx = (promoted.as_ptr() as usize - card_table.base_addr())
+            / crate::card_table::CARD_SIZE;
+        assert!(card_table.is_dirty(card_idx));
+    }
+
+    #[test]
+    fn card_table_preserves_old_to_young_ref() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        // Promote an object to old gen
+        let old_obj = heap.alloc_object(ClassId::new(0), 1);
+        let mut roots = vec![old_obj];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        let promoted = roots[0];
+        assert!(heap.is_in_old(promoted.as_ptr()));
+
+        // Allocate a young object and store ref from old → young
+        let young_obj = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(young_obj, 0, Value::Int(999));
+        heap.set_field(promoted, 0, Value::Object(Some(young_obj)));
+        heap.write_barrier(promoted, Value::Object(Some(young_obj)));
+
+        // Minor GC: only the promoted object is a root (young_obj is NOT a root)
+        // But the write barrier should have marked the card dirty, so the GC
+        // should discover young_obj via the dirty card scan.
+        let mut gc_roots = vec![promoted];
+        let result = heap.collect_garbage(&mut gc_roots, &monitors);
+
+        // young_obj should have been copied (reachable via dirty card)
+        assert!(result.stats.objects_copied >= 1);
+
+        // Verify the old→young reference was updated
+        let promoted_after = gc_roots[0];
+        match heap.get_field(promoted_after, 0) {
+            Value::Object(Some(new_young)) => {
+                assert_eq!(heap.get_field(new_young, 0).as_int(), Some(999));
+            }
+            _ => panic!("Expected promoted object to still reference young object"),
+        }
+    }
+
+    #[test]
+    fn needs_gc_threshold() {
+        // Create heap with very small young gen
+        let heap = GenerationalHeap::with_sizes(1024, 4096);
+        assert!(!heap.needs_gc());
+
+        // Allocate objects until threshold is exceeded
+        let mut count = 0;
+        while !heap.needs_gc() {
+            heap.alloc_object(ClassId::new(0), 1);
+            count += 1;
+            if count > 100 {
+                panic!("needs_gc never triggered");
+            }
+        }
+        assert!(heap.needs_gc());
+    }
+
+    #[test]
+    fn multiple_gc_cycles() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj1 = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj1, 0, Value::Int(1));
+        let mut roots = vec![obj1];
+
+        // Cycle 1
+        let r1 = heap.collect_garbage(&mut roots, &monitors);
+        assert_eq!(r1.stats.objects_copied, 1);
+        assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(1));
+
+        // Cycle 2: add another object
+        let obj2 = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj2, 0, Value::Int(2));
+        heap.set_field(roots[0], 0, Value::Object(Some(obj2)));
+        roots = vec![roots[0]];
+
+        let r2 = heap.collect_garbage(&mut roots, &monitors);
+        assert_eq!(r2.stats.objects_copied, 2);
+    }
+
+    #[test]
+    fn identity_hash_codes_unique() {
+        let heap = small_gen_heap();
+        let obj1 = heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = heap.alloc_object(ClassId::new(0), 0);
+        assert_ne!(heap.identity_hash_code(obj1), heap.identity_hash_code(obj2),);
+    }
+
+    #[test]
+    fn major_gc_frees_old_gen_garbage() {
+        // Create a heap with small old gen to force major GC
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 4 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Promote several objects to old gen, then drop references to some
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..5 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(obj, 0, Value::Int(i));
+            roots.push(obj);
+        }
+
+        // Run enough minor GCs to promote all objects
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        // All should be in old gen now
+        for root in &roots {
+            assert!(
+                heap.is_in_old(root.as_ptr()),
+                "Expected object to be in old gen after promotion"
+            );
+        }
+
+        // Verify values intact
+        for (i, root) in roots.iter().enumerate() {
+            assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32));
+        }
+
+        // Drop references to some objects (keep indices 0 and 2)
+        let kept_root0 = roots[0];
+        let kept_root2 = roots[2];
+        roots = vec![kept_root0, kept_root2];
+
+        // Manually trigger major GC (mark-compact)
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let old_used_before = old_gen.used();
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let old_used_after = old_gen.used();
+            assert!(
+                old_used_after < old_used_before,
+                "Major GC should have freed memory: before={}, after={}",
+                old_used_before,
+                old_used_after,
+            );
+        }
+
+        // Roots may have been relocated by compaction — use updated refs
+        assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(0));
+        assert_eq!(heap.get_field(roots[1], 0).as_int(), Some(2));
+    }
+
+    #[test]
+    fn major_gc_preserves_old_gen_references() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Create a chain: A -> B -> C (all will be promoted to old gen)
+        let obj_c = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj_c, 0, Value::Int(333));
+
+        let obj_b = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj_b, 0, Value::Object(Some(obj_c)));
+
+        let obj_a = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+
+        let mut roots = vec![obj_a];
+
+        // Promote to old gen
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        let promoted_a = roots[0];
+        assert!(heap.is_in_old(promoted_a.as_ptr()));
+
+        // Also create some garbage in old gen
+        let garbage = heap.alloc_object(ClassId::new(0), 0);
+        let mut garbage_roots = vec![garbage];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut garbage_roots, &monitors);
+        }
+        // Drop reference to garbage
+
+        // Run major GC (mark-compact) with only A as a root
+        let mut major_roots = vec![promoted_a];
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen);
+        }
+
+        // Walk the chain from the (possibly relocated) root: A -> B -> C
+        let compacted_a = major_roots[0];
+        match heap.get_field(compacted_a, 0) {
+            Value::Object(Some(new_b)) => match heap.get_field(new_b, 0) {
+                Value::Object(Some(new_c)) => {
+                    assert_eq!(heap.get_field(new_c, 0).as_int(), Some(333));
+                }
+                _ => panic!("Expected B -> C reference"),
+            },
+            _ => panic!("Expected A -> B reference"),
+        }
+    }
+
+    #[test]
+    fn stress_alloc_gc_cycles() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let mut live_refs: Vec<ObjectRef> = Vec::new();
+
+        // Rapid alloc/dealloc cycles
+        for cycle in 0..20 {
+            // Allocate some objects
+            for j in 0..5 {
+                let obj = heap.alloc_object(ClassId::new(0), 1);
+                heap.set_field(obj, 0, Value::Int(cycle * 100 + j));
+                live_refs.push(obj);
+            }
+
+            // Drop half the references
+            if live_refs.len() > 5 {
+                live_refs = live_refs.split_off(live_refs.len() / 2);
+            }
+
+            // Trigger GC if needed
+            if heap.needs_gc() {
+                heap.collect_garbage(&mut live_refs, &monitors);
+            }
+        }
+
+        // Final GC
+        heap.collect_garbage(&mut live_refs, &monitors);
+
+        // All surviving objects should be readable without panicking
+        for obj_ref in &live_refs {
+            let _ = heap.get_field(*obj_ref, 0);
+        }
+    }
+
+    #[test]
+    fn stress_fill_young_and_promote() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let mut roots = Vec::new();
+
+        // Fill young gen repeatedly, causing GC and promotions
+        let obj_size = HEADER_SIZE + SLOT_SIZE; // 1 field object
+        let approx_objects_per_young = 2 * 1024 / obj_size;
+
+        for wave in 0..6 {
+            // Allocate until GC triggers or young gen is full
+            let mut wave_objs = Vec::new();
+            for i in 0..approx_objects_per_young {
+                let obj = match heap.try_alloc_object(ClassId::new(0), 1) {
+                    Some(obj) => obj,
+                    None => {
+                        // Young gen full — trigger GC and retry
+                        roots.append(&mut wave_objs);
+                        heap.collect_garbage(&mut roots, &monitors);
+                        match heap.try_alloc_object(ClassId::new(0), 1) {
+                            Some(obj) => obj,
+                            None => break, // Can't allocate even after GC
+                        }
+                    }
+                };
+                heap.set_field(obj, 0, Value::Int((wave * 1000 + i) as i32));
+                wave_objs.push(obj);
+
+                if heap.needs_gc() {
+                    // Combine with existing roots
+                    roots.append(&mut wave_objs);
+                    heap.collect_garbage(&mut roots, &monitors);
+                    break;
+                }
+            }
+            roots.extend(wave_objs);
+
+            // Keep only last 10 objects each wave to manage memory
+            if roots.len() > 10 {
+                roots = roots.split_off(roots.len() - 10);
+            }
+        }
+
+        // Everything should be accessible
+        for root in &roots {
+            let _ = heap.get_field(*root, 0);
+        }
+    }
+
+    #[test]
+    fn gc_handles_cycles_in_young_gen() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(0), 1);
+        let obj_b = heap.alloc_object(ClassId::new(0), 1);
+
+        // A -> B -> A (cycle)
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Object(Some(obj_a)));
+
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        assert_eq!(result.stats.objects_copied, 2); // both survive
+
+        // Verify the cycle is intact
+        let new_a = roots[0];
+        match heap.get_field(new_a, 0) {
+            Value::Object(Some(new_b)) => match heap.get_field(new_b, 0) {
+                Value::Object(Some(back_to_a)) => {
+                    assert_eq!(back_to_a.as_ptr(), new_a.as_ptr());
+                }
+                _ => panic!("Expected B->A cycle"),
+            },
+            _ => panic!("Expected A->B reference"),
+        }
+    }
+
+    #[test]
+    fn heap_expansion_on_gc_pressure() {
+        // Small heap under allocation pressure: GC runs, and if reclamation
+        // is low, the to-space expands for the next cycle.
+        let heap = GenerationalHeap::with_capacity(64 * 1024); // 64 KB
+        let monitors = NoOpMonitors;
+        let _initial_cap = heap.young_semi_capacity();
+
+        // Allocate objects, keeping half alive to create GC pressure.
+        let mut live: Vec<ObjectRef> = Vec::new();
+        for i in 0..200 {
+            match heap.try_alloc_object(ClassId::new(0), 2) {
+                Some(obj) => {
+                    if i % 2 == 0 {
+                        live.push(obj);
+                    }
+                }
+                None => {
+                    heap.collect_garbage(&mut live, &monitors);
+                    let obj = heap.try_alloc_object(ClassId::new(0), 2)
+                        .expect("alloc should succeed after GC");
+                    if i % 2 == 0 {
+                        live.push(obj);
+                    }
+                }
+            }
+        }
+        // The heap should have detected low reclamation and expanded to-space
+    }
+
+    #[test]
+    fn tlab_refill() {
+        let heap = GenerationalHeap::with_capacity(1024 * 1024); // 1 MB
+        let result = heap.refill_tlab(64 * 1024);
+        assert!(result.is_some(), "refill_tlab should succeed");
+        let (ptr, size) = result.unwrap();
+        assert!(!ptr.is_null());
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn gc_reclaims_dead_objects() {
+        // Allocate objects, don't keep roots to them, GC should reclaim.
+        let heap = GenerationalHeap::with_capacity(256 * 1024); // 256 KB
+        // Fill up young gen — use try_alloc with manual GC on failure
+        let mut dummy_roots: Vec<ObjectRef> = Vec::new();
+        for _ in 0..100 {
+            if heap.try_alloc_object(ClassId::new(0), 4).is_none() {
+                heap.collect_garbage(&mut dummy_roots, &NoOpMonitors);
+                let _obj = heap.try_alloc_object(ClassId::new(0), 4);
+            }
+        }
+        // GC with empty roots — all objects are dead
+        let mut roots = vec![];
+        let result = heap.collect_garbage(&mut roots, &NoOpMonitors);
+        assert!(result.stats.bytes_freed > 0, "GC should free dead objects");
+    }
+
+    #[test]
+    fn gc_preserves_live_objects() {
+        let heap = GenerationalHeap::with_capacity(256 * 1024);
+        let live = heap.alloc_object(ClassId::new(1), 2);
+        heap.set_field(live, 0, Value::Int(42));
+        // Allocate dead objects
+        for _ in 0..50 {
+            if heap.try_alloc_object(ClassId::new(0), 2).is_none() {
+                break; // Don't overflow
+            }
+        }
+        let mut roots = vec![live];
+        let _result = heap.collect_garbage(&mut roots, &NoOpMonitors);
+        // The root should still be valid after GC
+        let survived = roots[0];
+        assert_eq!(heap.get_field(survived, 0).as_int(), Some(42));
+    }
+
+    #[test]
+    fn heavy_allocation_with_gc_cycles() {
+        // Simulates the workload that caused M4 heap exhaustion.
+        let heap = GenerationalHeap::with_capacity(256 * 1024); // 256 KB
+        let monitors = NoOpMonitors;
+        let mut live_objs: Vec<ObjectRef> = Vec::new();
+
+        for i in 0..1000 {
+            let obj = heap.alloc_object(ClassId::new(0), 2);
+            heap.set_field(obj, 0, Value::Int(i as i32));
+            // Keep every 20th object alive
+            if i % 20 == 0 {
+                live_objs.push(obj);
+            }
+            // Trigger GC periodically
+            if heap.needs_gc() {
+                let mut roots: Vec<ObjectRef> = live_objs.clone();
+                let _result = heap.collect_garbage(&mut roots, &monitors);
+                // Update live_objs to new addresses
+                live_objs = roots;
+            }
+        }
+
+        // Verify all surviving objects
+        for obj in &live_objs {
+            let header = heap.get_header(*obj);
+            assert_eq!(header.class_id, ClassId::new(0));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 26: GC Compaction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn s26_compact_eliminates_fragmentation() {
+        // Create a heap with small old gen, promote objects, free some, compact
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 4 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Allocate 6 objects and promote them all to old gen
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..6 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(obj, 0, Value::Int(i * 100));
+            roots.push(obj);
+        }
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        for root in &roots {
+            assert!(heap.is_in_old(root.as_ptr()), "Object should be in old gen");
+        }
+
+        // Drop every other object (indices 1, 3, 5) — creates fragmentation
+        let kept = vec![roots[0], roots[2], roots[4]];
+        roots = kept;
+
+        // Before compaction: multiple free blocks (fragmented)
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let free_blocks_before = old_gen.free_block_count();
+
+            let compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+
+            // After compaction: exactly one free block (defragmented)
+            assert_eq!(
+                old_gen.free_block_count(),
+                1,
+                "After compaction, there should be exactly one contiguous free block"
+            );
+
+            // The largest free block should equal total free space
+            let total_free = old_gen.capacity() - old_gen.used();
+            assert_eq!(
+                old_gen.largest_free_block(),
+                total_free,
+                "Largest free block should be all free space after compaction"
+            );
+
+            // Some objects should have moved
+            assert!(
+                !compact_map.is_empty() || free_blocks_before <= 1,
+                "Objects should have been relocated (or heap was already compacted)"
+            );
+        }
+
+        // Values should be preserved after compaction
+        assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(0));
+        assert_eq!(heap.get_field(roots[1], 0).as_int(), Some(200));
+        assert_eq!(heap.get_field(roots[2], 0).as_int(), Some(400));
+    }
+
+    #[test]
+    fn s26_compact_updates_internal_references() {
+        // Object A -> B -> C, all in old gen. Compact should update A->B and B->C.
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let obj_c = heap.alloc_object(ClassId::new(3), 1);
+        heap.set_field(obj_c, 0, Value::Int(777));
+
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_b, 0, Value::Object(Some(obj_c)));
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+
+        // Also allocate garbage between chain objects
+        let garbage1 = heap.alloc_object(ClassId::new(0), 2);
+        let garbage2 = heap.alloc_object(ClassId::new(0), 2);
+
+        let mut roots = vec![obj_a, obj_b, obj_c, garbage1, garbage2];
+
+        // Promote all to old gen
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        // Drop garbage references, keep only A (B and C reachable via A)
+        roots = vec![roots[0]];
+
+        // Run major GC (mark-compact)
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+
+            // Only 3 live objects (A, B, C) — garbage should be freed
+            assert_eq!(
+                old_gen.free_block_count(),
+                1,
+                "After compaction, old gen should have one free block"
+            );
+        }
+
+        // Walk the chain from compacted A -> B -> C
+        let a = roots[0];
+        match heap.get_field(a, 0) {
+            Value::Object(Some(b)) => {
+                assert_eq!(heap.class_id_of(b), ClassId::new(2), "B should have class 2");
+                match heap.get_field(b, 0) {
+                    Value::Object(Some(c)) => {
+                        assert_eq!(
+                            heap.class_id_of(c),
+                            ClassId::new(3),
+                            "C should have class 3"
+                        );
+                        assert_eq!(heap.get_field(c, 0).as_int(), Some(777));
+                    }
+                    _ => panic!("Expected B -> C reference after compaction"),
+                }
+            }
+            _ => panic!("Expected A -> B reference after compaction"),
+        }
+    }
+
+    #[test]
+    fn s26_compact_recovers_fragmented_space() {
+        // Allocate objects in a pattern that fragments the heap, then verify
+        // compaction recovers enough space for a large allocation that would
+        // have failed without compaction.
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 4 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Allocate many small objects and promote them
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..8 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(obj, 0, Value::Int(i));
+            roots.push(obj);
+        }
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        // Record old gen usage before freeing
+        let used_before_free = heap.old_gen.lock().used();
+
+        // Free every other object — creates interleaved free blocks
+        roots = roots
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, o)| o)
+            .collect();
+
+        // Run mark-compact via major GC
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+
+            // Used space should have decreased (half the objects freed)
+            assert!(
+                old_gen.used() < used_before_free,
+                "Old gen used should decrease after freeing half the objects"
+            );
+
+            // Should be exactly 1 free block (fully compacted)
+            assert_eq!(old_gen.free_block_count(), 1);
+
+            // The single free block should be large enough for a new large alloc
+            assert!(
+                old_gen.largest_free_block() >= HEADER_SIZE + 4 * SLOT_SIZE,
+                "Compacted free block should be large enough for a 4-field object"
+            );
+        }
+
+        // Verify surviving objects have correct values (0, 2, 4, 6)
+        for (i, root) in roots.iter().enumerate() {
+            let expected = (i * 2) as i32;
+            assert_eq!(heap.get_field(*root, 0).as_int(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn s26_compact_pointer_map_in_gc_result() {
+        // Verify that compaction pointer_map flows through collect_garbage()
+        // so the VM can update external roots.
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 2 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Fill old gen to >75% to trigger major GC during minor GC
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..10 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(obj, 0, Value::Int(i));
+            roots.push(obj);
+        }
+
+        // Promote to old gen
+        for _ in 0..PROMOTION_AGE {
+            let result = heap.collect_garbage(&mut roots, &monitors);
+            // Update roots from minor GC pointer_map
+            for root in &mut roots {
+                if let Some(&new_addr) = result.pointer_map.get(&(root.as_ptr() as usize)) {
+                    // SAFETY: `new_addr` comes from the GC pointer map, pointing to a valid relocated object.
+                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+
+        // Drop most references — keep only 2 objects
+        roots = vec![roots[0], roots[5]];
+
+        // Allocate more to trigger minor GC which should cascade into major GC
+        for _ in 0..20 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            // Don't keep reference — these are garbage
+            let _ = obj;
+        }
+
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        // The pointer_map should contain entries (from minor GC and/or major GC compaction)
+        // Surviving objects should still be accessible
+        for root in &roots {
+            let val = heap.get_field(*root, 0);
+            assert!(
+                val.as_int().is_some(),
+                "Root should have valid Int field after compaction"
+            );
+        }
+    }
+
+    #[test]
+    fn s26_compact_no_move_when_contiguous() {
+        // If live objects are already contiguous, compaction should be a no-op
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 4 * 1024);
+        let monitors = NoOpMonitors;
+
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..3 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(obj, 0, Value::Int(i));
+            roots.push(obj);
+        }
+
+        // Promote all to old gen
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        // All objects are contiguous (no gaps) — compaction should not move anything
+        let ptrs_before: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            assert!(
+                compact_map.is_empty(),
+                "No objects should move when they are already contiguous"
+            );
+        }
+
+        // Pointers should be unchanged
+        let ptrs_after: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        assert_eq!(ptrs_before, ptrs_after);
+    }
+
+    #[test]
+    fn s26_compact_forwarding_ptrs_cleared() {
+        // After compaction, no objects should have forwarding pointers set
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 4 * 1024);
+        let monitors = NoOpMonitors;
+
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..4 {
+            let obj = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(obj, 0, Value::Int(i));
+            roots.push(obj);
+        }
+
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+
+        // Free some, then compact
+        roots = vec![roots[0], roots[2]];
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+
+            // Verify no forwarding pointers remain set
+            for (obj_ptr, _) in old_gen.walk_objects() {
+                // SAFETY: `obj_ptr` is from `old_gen.walk_objects()`, pointing to a valid old-gen object header.
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                assert!(
+                    header.forwarding_ptr.is_null(),
+                    "Forwarding pointer should be cleared after compaction"
+                );
+                assert_eq!(
+                    header.gc_flags & GC_FLAG_MARKED,
+                    0,
+                    "Mark bit should be cleared after compaction"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // S29: GC Write Barrier Verification
+    // =========================================================================
+
+    /// Helper: promote an object to old gen by surviving PROMOTION_AGE minor GCs.
+    fn promote_to_old(heap: &GenerationalHeap, obj: ObjectRef) -> ObjectRef {
+        let monitors = NoOpMonitors;
+        let mut roots = vec![obj];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        assert!(heap.is_in_old(roots[0].as_ptr()), "object should be promoted to old gen");
+        roots[0]
+    }
+
+    #[test]
+    fn s29_random_graph_gc_never_collects_reachable() {
+        // Property-based: build random object graph, GC, verify all reachable objects survive
+        // with correct field values.
+        let heap = GenerationalHeap::with_sizes(32 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Allocate 50 objects, each tagged with its index
+        let n = 50;
+        let mut objs: Vec<ObjectRef> = Vec::new();
+        for i in 0..n {
+            let obj = heap.alloc_object(ClassId::new(0), 2); // field 0 = tag, field 1 = link
+            heap.set_field(obj, 0, Value::Int(i as i32));
+            heap.set_field(obj, 1, Value::Object(None));
+            objs.push(obj);
+        }
+
+        // Build random links: obj[i].field[1] = obj[(i*7+3) % n] (deterministic pseudo-random)
+        for i in 0..n {
+            let target_idx = (i * 7 + 3) % n;
+            heap.set_field(objs[i], 1, Value::Object(Some(objs[target_idx])));
+        }
+
+        // Use first 10 as roots
+        let mut roots: Vec<ObjectRef> = objs[..10].to_vec();
+
+        // Compute reachable set from roots via BFS
+        let mut reachable: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for i in 0..10 {
+            reachable.insert(i);
+            queue.push_back(i);
+        }
+        while let Some(idx) = queue.pop_front() {
+            let target_idx = (idx * 7 + 3) % n;
+            if reachable.insert(target_idx) {
+                queue.push_back(target_idx);
+            }
+        }
+
+        // Run GC
+        heap.collect_garbage(&mut roots, &monitors);
+
+        // Verify all roots survived and their tags are correct
+        for (i, root) in roots.iter().enumerate() {
+            let tag = heap.get_field(*root, 0);
+            assert_eq!(tag.as_int(), Some(i as i32),
+                "S29: root {} tag should be {} after GC", i, i);
+        }
+
+        // Walk reachable graph from roots and verify all tags
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut walk_queue: std::collections::VecDeque<ObjectRef> = std::collections::VecDeque::new();
+        for r in &roots {
+            walk_queue.push_back(*r);
+        }
+        while let Some(obj) = walk_queue.pop_front() {
+            let tag = heap.get_field(obj, 0).as_int().unwrap() as usize;
+            if !visited.insert(tag) { continue; }
+            // Verify tag is in our expected reachable set
+            assert!(reachable.contains(&tag),
+                "S29: object with tag {} should be reachable", tag);
+            // Follow link
+            if let Value::Object(Some(next)) = heap.get_field(obj, 1) {
+                walk_queue.push_back(next);
+            }
+        }
+        // All reachable objects should have been visited
+        assert_eq!(visited.len(), reachable.len(),
+            "S29: all {} reachable objects should survive GC, found {}", reachable.len(), visited.len());
+    }
+
+    #[test]
+    fn s29_cross_gen_old_to_young_chain() {
+        // Test old→young reference chain: old object points to young, GC must preserve young.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Create and promote root to old gen
+        let root = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(root, 0, Value::Int(100));
+        let promoted = promote_to_old(&heap, root);
+
+        // Create chain of young objects: y1 → y2 → y3
+        let y1 = heap.alloc_object(ClassId::new(0), 2);
+        let y2 = heap.alloc_object(ClassId::new(0), 2);
+        let y3 = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(y1, 0, Value::Int(1));
+        heap.set_field(y2, 0, Value::Int(2));
+        heap.set_field(y3, 0, Value::Int(3));
+        heap.set_field(y1, 1, Value::Object(Some(y2)));
+        heap.set_field(y2, 1, Value::Object(Some(y3)));
+
+        // Link old → y1
+        heap.set_field(promoted, 1, Value::Object(Some(y1)));
+        heap.write_barrier(promoted, Value::Object(Some(y1)));
+
+        // GC with only old object as root — young chain must survive via dirty card
+        let mut roots = vec![promoted];
+        heap.collect_garbage(&mut roots, &monitors);
+
+        // Walk chain and verify all tags
+        let old_after = roots[0];
+        assert_eq!(heap.get_field(old_after, 0).as_int(), Some(100));
+        let y1_after = match heap.get_field(old_after, 1) {
+            Value::Object(Some(r)) => r,
+            _ => panic!("S29: old→young link broken after GC"),
+        };
+        assert_eq!(heap.get_field(y1_after, 0).as_int(), Some(1));
+        let y2_after = match heap.get_field(y1_after, 1) {
+            Value::Object(Some(r)) => r,
+            _ => panic!("S29: y1→y2 link broken after GC"),
+        };
+        assert_eq!(heap.get_field(y2_after, 0).as_int(), Some(2));
+        let y3_after = match heap.get_field(y2_after, 1) {
+            Value::Object(Some(r)) => r,
+            _ => panic!("S29: y2→y3 link broken after GC"),
+        };
+        assert_eq!(heap.get_field(y3_after, 0).as_int(), Some(3));
+    }
+
+    #[test]
+    fn s29_cross_gen_young_to_old_survives() {
+        // Young object references old object — young must be collected if unreachable,
+        // old must survive independently.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Promote an object to old gen
+        let old_obj = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(old_obj, 0, Value::Int(42));
+        let promoted = promote_to_old(&heap, old_obj);
+
+        // Create young object pointing to old
+        let young = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(young, 0, Value::Int(7));
+        heap.set_field(young, 1, Value::Object(Some(promoted)));
+
+        // Both as roots — both should survive
+        let mut roots = vec![promoted, young];
+        heap.collect_garbage(&mut roots, &monitors);
+
+        let old_after = roots[0];
+        let young_after = roots[1];
+        assert_eq!(heap.get_field(old_after, 0).as_int(), Some(42));
+        assert_eq!(heap.get_field(young_after, 0).as_int(), Some(7));
+        // Young's reference to old should be updated
+        match heap.get_field(young_after, 1) {
+            Value::Object(Some(r)) => assert_eq!(
+                heap.get_field(r, 0).as_int(), Some(42),
+                "S29: young→old reference should point to correct old object"
+            ),
+            _ => panic!("S29: young→old link broken after GC"),
+        }
+    }
+
+    #[test]
+    fn s29_card_table_multiple_dirty_cards() {
+        // Multiple old objects on different cards all pointing to young — all must be preserved.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Promote 5 objects — spread across old gen (different cards if possible)
+        let mut old_objs = Vec::new();
+        for i in 0..5 {
+            let obj = heap.alloc_object(ClassId::new(0), 2);
+            heap.set_field(obj, 0, Value::Int(i * 100));
+            old_objs.push(obj);
+        }
+        let mut roots: Vec<ObjectRef> = old_objs.clone();
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        // All should be in old gen now
+        for r in &roots {
+            assert!(heap.is_in_old(r.as_ptr()), "S29: object should be promoted");
+        }
+
+        // Create 5 young objects, each referenced by one old object
+        let mut young_objs = Vec::new();
+        for i in 0..5 {
+            let y = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(y, 0, Value::Int(i * 10 + 1));
+            young_objs.push(y);
+            heap.set_field(roots[i as usize], 1, Value::Object(Some(y)));
+            heap.write_barrier(roots[i as usize], Value::Object(Some(y)));
+        }
+
+        // GC with only old objects as roots
+        heap.collect_garbage(&mut roots, &monitors);
+
+        // Verify all old→young links preserved
+        for (i, old) in roots.iter().enumerate() {
+            match heap.get_field(*old, 1) {
+                Value::Object(Some(y)) => {
+                    assert_eq!(heap.get_field(y, 0).as_int(), Some(i as i32 * 10 + 1),
+                        "S29: old[{}]→young tag should be {}", i, i * 10 + 1);
+                }
+                _ => panic!("S29: old[{}]→young link broken after GC", i),
+            }
+        }
+    }
+
+    #[test]
+    fn s29_card_table_overwrite_still_marks_new_target() {
+        // Overwrite an old→young ref with a different young ref, verify new target preserved.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(obj, 0, Value::Int(1));
+        let promoted = promote_to_old(&heap, obj);
+
+        // First young target
+        let y1 = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(y1, 0, Value::Int(10));
+        heap.set_field(promoted, 1, Value::Object(Some(y1)));
+        heap.write_barrier(promoted, Value::Object(Some(y1)));
+
+        // Overwrite with different young target
+        let y2 = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(y2, 0, Value::Int(20));
+        heap.set_field(promoted, 1, Value::Object(Some(y2)));
+        heap.write_barrier(promoted, Value::Object(Some(y2)));
+
+        // GC: y1 is unreachable, y2 reachable via old
+        let mut roots = vec![promoted];
+        heap.collect_garbage(&mut roots, &monitors);
+
+        match heap.get_field(roots[0], 1) {
+            Value::Object(Some(y)) => {
+                assert_eq!(heap.get_field(y, 0).as_int(), Some(20),
+                    "S29: overwritten ref should point to y2 (tag=20)");
+            }
+            _ => panic!("S29: old→young link broken after overwrite + GC"),
+        }
+    }
+
+    #[test]
+    fn s29_stress_random_link_unlink_gc_cycles() {
+        // Stress test: all objects are roots so GC updates all refs. Random link/unlink per cycle.
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 128 * 1024);
+        let monitors = NoOpMonitors;
+
+        let num_objects = 80;
+        let num_cycles = 20;
+
+        // All objects are roots — GC will update all of them
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..num_objects {
+            let obj = heap.alloc_object(ClassId::new(0), 2); // field 0=tag, field 1=link
+            heap.set_field(obj, 0, Value::Int(i as i32));
+            roots.push(obj);
+        }
+
+        for cycle in 0..num_cycles {
+            // Deterministic pseudo-random linking among roots
+            let n = roots.len();
+            for i in 0..n {
+                let target_idx = (i * 13 + cycle * 7 + 5) % n;
+                heap.set_field(roots[i], 1, Value::Object(Some(roots[target_idx])));
+            }
+
+            // Unlink every 3rd
+            for i in (0..n).step_by(3) {
+                heap.set_field(roots[i], 1, Value::Object(None));
+            }
+
+            // Run GC — all objects are roots, so all survive and get updated
+            heap.collect_garbage(&mut roots, &monitors);
+
+            // Verify tags
+            for (i, root) in roots.iter().enumerate() {
+                let tag = heap.get_field(*root, 0).as_int().unwrap();
+                assert_eq!(tag, i as i32,
+                    "S29 cycle {}: root {} tag corrupted (got {})", cycle, i, tag);
+            }
+
+            // Verify linked objects are reachable with correct tags
+            for i in 0..n {
+                if i % 3 == 0 { continue; } // unlinked
+                let target_idx = (i * 13 + cycle * 7 + 5) % n;
+                match heap.get_field(roots[i], 1) {
+                    Value::Object(Some(linked)) => {
+                        let linked_tag = heap.get_field(linked, 0).as_int().unwrap();
+                        assert_eq!(linked_tag, target_idx as i32,
+                            "S29 cycle {}: obj[{}] link tag should be {}, got {}",
+                            cycle, i, target_idx, linked_tag);
+                    }
+                    _ => panic!("S29 cycle {}: obj[{}] link broken", cycle, i),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn s29_cross_gen_old_to_young_ref_array() {
+        // Old object has a reference array pointing to young objects — verify write barrier
+        // preserves all young objects through GC.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Promote a reference array to old gen
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 4);
+        let promoted_arr = promote_to_old(&heap, arr);
+
+        // Create young objects and store in the old array
+        let mut young_tags = Vec::new();
+        for i in 0..4 {
+            let y = heap.alloc_object(ClassId::new(0), 1);
+            heap.set_field(y, 0, Value::Int(i * 11));
+            young_tags.push(i * 11);
+            heap.set_array_element(promoted_arr, i as usize, Value::Object(Some(y))).unwrap();
+            heap.write_barrier(promoted_arr, Value::Object(Some(y)));
+        }
+
+        // GC with only old array as root
+        let mut roots = vec![promoted_arr];
+        heap.collect_garbage(&mut roots, &monitors);
+
+        let arr_after = roots[0];
+        for i in 0..4 {
+            match heap.get_array_element(arr_after, i as usize).unwrap() {
+                Value::Object(Some(y)) => {
+                    assert_eq!(heap.get_field(y, 0).as_int(), Some(young_tags[i as usize]),
+                        "S29: ref array[{}] young tag should be {}", i, young_tags[i as usize]);
+                }
+                _ => panic!("S29: ref array[{}] lost after GC", i),
+            }
+        }
+    }
+
+    #[test]
+    fn s29_write_barrier_no_false_positives() {
+        // Write barrier should NOT mark card for: young→young, old→old, non-reference stores.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Promote two objects to old gen
+        let o1 = heap.alloc_object(ClassId::new(0), 2);
+        let o2 = heap.alloc_object(ClassId::new(0), 1);
+        let mut roots = vec![o1, o2];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        let old1 = roots[0];
+        let old2 = roots[1];
+        assert!(heap.is_in_old(old1.as_ptr()));
+        assert!(heap.is_in_old(old2.as_ptr()));
+
+        // Clear card table
+        heap.card_table.lock().clear_all();
+
+        // Old → Old: should NOT dirty card
+        heap.set_field(old1, 1, Value::Object(Some(old2)));
+        heap.write_barrier(old1, Value::Object(Some(old2)));
+        assert!(heap.card_table.lock().take_dirty_cards().is_empty(),
+            "S29: old→old should not dirty card");
+
+        // Young → Young: should NOT dirty card
+        let y1 = heap.alloc_object(ClassId::new(0), 2);
+        let y2 = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(y1, 1, Value::Object(Some(y2)));
+        heap.write_barrier(y1, Value::Object(Some(y2)));
+        assert!(heap.card_table.lock().take_dirty_cards().is_empty(),
+            "S29: young→young should not dirty card");
+
+        // Non-reference store: should NOT dirty card
+        heap.set_field(old1, 0, Value::Int(999));
+        heap.write_barrier(old1, Value::Int(999));
+        assert!(heap.card_table.lock().take_dirty_cards().is_empty(),
+            "S29: non-ref store should not dirty card");
+
+        // Old → Young: SHOULD dirty card
+        heap.set_field(old1, 1, Value::Object(Some(y1)));
+        heap.write_barrier(old1, Value::Object(Some(y1)));
+        assert!(!heap.card_table.lock().take_dirty_cards().is_empty(),
+            "S29: old→young SHOULD dirty card");
+    }
+
+    #[test]
+    fn s29_gc_cycle_with_promotion_and_cross_gen_refs() {
+        // Complex scenario: objects promoted over multiple GC cycles while maintaining
+        // cross-generational references.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Create chain: A → B → C → D
+        let a = heap.alloc_object(ClassId::new(0), 2);
+        let b = heap.alloc_object(ClassId::new(0), 2);
+        let c = heap.alloc_object(ClassId::new(0), 2);
+        let d = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(a, 0, Value::Int(1));
+        heap.set_field(b, 0, Value::Int(2));
+        heap.set_field(c, 0, Value::Int(3));
+        heap.set_field(d, 0, Value::Int(4));
+        heap.set_field(a, 1, Value::Object(Some(b)));
+        heap.set_field(b, 1, Value::Object(Some(c)));
+        heap.set_field(c, 1, Value::Object(Some(d)));
+
+        let mut roots = vec![a];
+
+        // Run PROMOTION_AGE GCs — all should be promoted
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        let a_old = roots[0];
+        assert!(heap.is_in_old(a_old.as_ptr()), "S29: A should be in old gen");
+
+        // Verify entire chain survives promotion
+        let b_old = match heap.get_field(a_old, 1) {
+            Value::Object(Some(r)) => r,
+            _ => panic!("S29: A→B link lost during promotion"),
+        };
+        assert_eq!(heap.get_field(b_old, 0).as_int(), Some(2));
+
+        let c_old = match heap.get_field(b_old, 1) {
+            Value::Object(Some(r)) => r,
+            _ => panic!("S29: B→C link lost during promotion"),
+        };
+        assert_eq!(heap.get_field(c_old, 0).as_int(), Some(3));
+
+        let d_old = match heap.get_field(c_old, 1) {
+            Value::Object(Some(r)) => r,
+            _ => panic!("S29: C→D link lost during promotion"),
+        };
+        assert_eq!(heap.get_field(d_old, 0).as_int(), Some(4));
+
+        // Now add a new young object hanging off the old chain
+        let e = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(e, 0, Value::Int(5));
+        heap.set_field(d_old, 1, Value::Object(Some(e)));
+        heap.write_barrier(d_old, Value::Object(Some(e)));
+
+        // GC again — e should survive via dirty card
+        heap.collect_garbage(&mut roots, &monitors);
+        let a_final = roots[0];
+        // Walk full chain: A→B→C→D→E
+        let mut current = a_final;
+        for expected_tag in [1, 2, 3, 4] {
+            assert_eq!(heap.get_field(current, 0).as_int(), Some(expected_tag));
+            current = match heap.get_field(current, 1) {
+                Value::Object(Some(r)) => r,
+                _ => panic!("S29: chain broken at tag={}", expected_tag),
+            };
+        }
+        assert_eq!(heap.get_field(current, 0).as_int(), Some(5),
+            "S29: E (young, linked from old D) should survive");
+    }
+
+    #[test]
+    fn s29_stress_1000_objects_random_graph_gc() {
+        // Large stress test: 1000 objects, random links, multiple GC cycles.
+        let heap = GenerationalHeap::with_sizes(256 * 1024, 512 * 1024);
+        let monitors = NoOpMonitors;
+
+        let n = 1000;
+        let mut objs: Vec<ObjectRef> = Vec::new();
+        for i in 0..n {
+            let obj = heap.alloc_object(ClassId::new(0), 2);
+            heap.set_field(obj, 0, Value::Int(i as i32));
+            objs.push(obj);
+        }
+
+        // Build deterministic random graph
+        for i in 0..n {
+            let target = (i * 37 + 17) % n;
+            heap.set_field(objs[i], 1, Value::Object(Some(objs[target])));
+        }
+
+        // All objects are roots initially
+        let mut roots = objs.clone();
+
+        // GC cycle 1: everything should survive
+        heap.collect_garbage(&mut roots, &monitors);
+        for (i, root) in roots.iter().enumerate() {
+            assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32),
+                "S29 stress: object {} tag corrupted after GC1", i);
+        }
+
+        // Drop half the roots — only first 500
+        roots.truncate(500);
+
+        // GC cycle 2
+        heap.collect_garbage(&mut roots, &monitors);
+        for (i, root) in roots.iter().enumerate() {
+            assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32),
+                "S29 stress: root {} tag corrupted after GC2", i);
+        }
+
+        // GC cycles 3-5: repeatedly compact
+        for cycle in 3..=5 {
+            heap.collect_garbage(&mut roots, &monitors);
+            for (i, root) in roots.iter().enumerate() {
+                assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32),
+                    "S29 stress: root {} tag corrupted after GC{}", i, cycle);
+            }
+        }
+    }
+
+    #[test]
+    fn s29_barrier_correctness_promoted_then_linked() {
+        // Edge case: object promoted during GC, then immediately linked to a young object.
+        // Next GC must see the cross-gen ref via write barrier.
+        let heap = GenerationalHeap::with_sizes(16 * 1024, 32 * 1024);
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(obj, 0, Value::Int(42));
+        let mut roots = vec![obj];
+
+        // Promote object
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&mut roots, &monitors);
+        }
+        let promoted = roots[0];
+        assert!(heap.is_in_old(promoted.as_ptr()));
+
+        // Allocate young, link from old, and immediately GC
+        let young = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(young, 0, Value::Int(99));
+        heap.set_field(promoted, 1, Value::Object(Some(young)));
+        heap.write_barrier(promoted, Value::Object(Some(young)));
+
+        // GC: young object's only root is via old object + write barrier
+        heap.collect_garbage(&mut roots, &monitors);
+
+        let after = roots[0];
+        match heap.get_field(after, 1) {
+            Value::Object(Some(y)) => {
+                assert_eq!(heap.get_field(y, 0).as_int(), Some(99),
+                    "S29: young object linked from just-promoted old should survive");
+            }
+            _ => panic!("S29: old→young link lost after promotion+barrier+GC"),
+        }
+    }
+}

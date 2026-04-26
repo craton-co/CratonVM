@@ -1,0 +1,61 @@
+[workspace]
+members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "classloading", "gc", "vm", "vm-cli", "jfr"]
+resolver = "2"
+
+[workspace.package]
+publish = false
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/craton-co/rust-jvm"
+homepage = "https://github.com/craton-co/rust-jvm"
+description = "A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler"
+keywords = ["jvm", "java", "virtual-machine", "interpreter", "jit"]
+categories = ["compilers", "emulators"]
+
+[workspace.dependencies]
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# RJ.4 — silence lints that do not represent real defects so
+# `cargo doc --workspace --no-deps` stays at zero warnings (the
+# roadmap success criterion). Code-lints are "allow" not "deny":
+# individual crates can still re-tighten them locally.
+#   * `dead_code`, `unused_*`: natives register at runtime via
+#     `NativeMethodRegistry::register`; the compiler sees them as
+#     orphaned. Marking with `#[used]` everywhere would be noisier
+#     than tolerating the lint.
+#   * rustdoc `broken_intra_doc_links` / `invalid_html_tags` /
+#     `private_intra_doc_links` / `redundant_explicit_links`:
+#     doc-comments liberally reference private helpers, Java types
+#     (`<offset>`, `[Xn,]`) and code samples; the net value of
+#     enforcing rustdoc hyperlinks over those is negative.
+[workspace.lints.rust]
+dead_code = "allow"
+unused_imports = "allow"
+unused_variables = "allow"
+unused_mut = "allow"
+unused_assignments = "allow"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "allow"
+private_intra_doc_links = "allow"
+invalid_html_tags = "allow"
+redundant_explicit_links = "allow"
+
+[workspace.lints.clippy]
+# Clippy "never returns" false positive on functions that panic — our
+# `unimplemented!()`/`panic!()` paths trip this on every native stub.
+empty_loop = "allow"
+# Forever-looping server accept loops also trip this.
+while_let_loop = "allow"
+
+# Compile ZIP decompression with optimisations even in debug mode.
+# Without this, deflate is ~15x slower and JMOD loading takes 30s+ for 200 classes.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3

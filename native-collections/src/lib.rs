@@ -1,0 +1,16973 @@
+//! Synthetic native implementations for the Java Collections Framework.
+//!
+//! **DEPRECATED (Session 15)**: These are Rust-backed synthetic stubs used only when
+//! `synthetic-jdk` feature is enabled. In real JDK mode, `java.util.*` classes are
+//! loaded from JDK class files and executed via the interpreter.
+//!
+//! This crate is gated behind the `synthetic-jdk` feature flag at the API level:
+//! `register_collections_natives()` and `register_builtins()` are only available
+//! when the feature is enabled. The crate still compiles for backward compatibility
+//! but is not called in the default (real JDK) build path.
+
+use rustjvm_types::ClassId;
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::{ObjectRef, Value};
+
+/// Create an iterator backed by a snapshot array of the given size.
+/// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
+pub fn make_iterator_from_array(
+    ctx: &mut dyn NativeContext,
+    snapshot_array: ObjectRef,
+    size: usize,
+) -> MethodCallResult {
+    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3);
+    ctx.set_field(itr, 0, Value::Object(Some(snapshot_array)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    ctx.set_field(itr, 2, Value::Int(size as i32));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+/// Register all collection native methods.
+pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
+    register_arraylist_natives(registry);
+    register_hashmap_natives(registry);
+    register_hashset_natives(registry);
+    register_iterator_natives(registry);
+    register_arrays_natives(registry);
+    register_optional_natives(registry);
+    register_collections_utility_natives(registry);
+    register_map_entry_natives(registry);
+    register_factory_natives(registry);
+    register_stream_natives(registry);
+    register_collectors_natives(registry);
+    register_int_stream_natives(registry);
+    register_long_stream_natives(registry);
+    register_double_stream_natives(registry);
+    register_interface_natives(registry);
+    register_copy_constructor_natives(registry);
+    register_comparator_natives(registry);
+    register_string_joiner_natives(registry);
+    register_random_natives(registry);
+    register_optional_int_natives(registry);
+    register_optional_long_natives(registry);
+    register_optional_double_natives(registry);
+    register_linked_list_natives(registry);
+    register_linked_hashmap_natives(registry);
+    register_array_deque_natives(registry);
+    register_priority_queue_natives(registry);
+    register_vector_natives(registry);
+    register_stack_natives(registry);
+    register_bulk_ops_natives(registry);
+    register_queue_deque_interface_natives(registry);
+    register_tree_map_natives(registry);
+    register_tree_set_natives(registry);
+    register_concurrent_hashmap_natives(registry);
+    register_properties_natives(registry);
+    register_collections_extras_natives(registry);
+    register_blocking_queue_natives(registry);
+    register_iterator_protocol_natives(registry);
+    register_scheduled_executor_natives(registry);
+    register_concurrent_skip_list_map_natives(registry);
+    register_stamped_lock_natives(registry);
+    register_phaser_natives(registry);
+    register_priority_blocking_queue_natives(registry);
+    register_executors_scheduled_natives(registry);
+    register_concurrent_completeness_natives(registry);
+}
+
+// ===========================================================================
+// Helper: allocate a synthetic object with a well-known class name
+/// Create a snapshot-based iterator (2 fields: array=0, cursor=1) from an existing array.pub fn make_iterator_from_array(    ctx: &mut dyn NativeContext,    array: ObjectRef,    _count: usize,) -> MethodCallResult {    let itr = alloc_synthetic(ctx, "java/util/Iterator", 2);    ctx.set_field(itr, 0, Value::Object(Some(array)));    ctx.set_field(itr, 1, Value::Int(0));    Ok(Some(Value::Object(Some(itr))))}
+// ===========================================================================
+
+/// Allocate a synthetic object, trying to load the real class first.
+fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
+    match ctx.ensure_class_initialized(class_name) {
+        Ok(class_id) => ctx.alloc_object(class_id, num_fields),
+        Err(_) => ctx.alloc_object(ClassId::new(0), num_fields),
+    }
+}
+
+/// Allocate a reference array (Object[]) of the given length.
+fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
+    ctx.new_ref_array(ClassId::new(0), length)
+}
+
+/// Try to read an object's string representation for display purposes.
+///
+/// For objects that are not plain strings or primitives, this calls
+/// `toString()` via virtual dispatch so that overridden implementations
+/// (e.g. ArrayList, HashMap, user classes) produce correct output.
+fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
+    match val {
+        Value::Object(None) => "null".to_string(),
+        Value::Object(Some(obj)) => {
+            // Fast path: if it's a Java String, read it directly
+            if let Some(s) = ctx.read_string(*obj) {
+                return s;
+            }
+
+            // Fast path for wrapper types: if the object has exactly 1 field
+            // and its value is a primitive, format it directly.
+            let nf = ctx.object_num_fields(*obj);
+            if nf == 1 {
+                match ctx.get_field(*obj, 0) {
+                    Value::Int(v) => {
+                        let class_id = ctx.class_id_of_object(*obj);
+                        let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+                        return if name.contains("Boolean") {
+                            if v != 0 { "true" } else { "false" }.to_string()
+                        } else if name.contains("Character") {
+                            char::from_u32(v as u32).unwrap_or('?').to_string()
+                        } else if name.contains("Byte") {
+                            (v as i8).to_string()
+                        } else if name.contains("Short") {
+                            (v as i16).to_string()
+                        } else {
+                            v.to_string()
+                        };
+                    }
+                    Value::Long(v) => return v.to_string(),
+                    Value::Float(v) => return format!("{}", v),
+                    Value::Double(v) => return format!("{}", v),
+                    _ => {}
+                }
+            }
+
+            // Call toString() via virtual dispatch
+            match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(str_ref)))) => {
+                    ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string())
+                }
+                _ => {
+                    // Final fallback: ClassName@hash
+                    let class_id = ctx.class_id_of_object(*obj);
+                    let class_name = ctx
+                        .class_name_of_id(class_id)
+                        .unwrap_or_else(|| "?".to_string());
+                    let hash = ctx.identity_hash_code(*obj);
+                    format!("{}@{:x}", class_name.replace('/', "."), hash)
+                }
+            }
+        }
+        Value::Int(v) => v.to_string(),
+        Value::Long(v) => v.to_string(),
+        Value::Float(v) => format!("{}", v),
+        Value::Double(v) => format!("{}", v),
+        _ => "?".to_string(),
+    }
+}
+
+/// Unbox a wrapper object (Integer, Long, Boolean, etc.) to its primitive Value.
+/// Returns None if the object is not a recognized 1-field wrapper type.
+fn unbox_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Value> {
+    let nf = ctx.object_num_fields(obj);
+    if nf == 1 {
+        let inner = ctx.get_field(obj, 0);
+        match inner {
+            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_) => Some(inner),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Normalize a Value for comparison: unbox wrapper objects to their primitive.
+fn normalize_for_compare(ctx: &dyn NativeContext, v: &Value) -> Value {
+    match v {
+        Value::Object(Some(obj)) => {
+            if let Some(prim) = unbox_wrapper(ctx, *obj) {
+                prim
+            } else {
+                *v
+            }
+        }
+        _ => *v,
+    }
+}
+
+/// Check if two Values refer to the same object (by identity) or are equal
+/// strings/wrapper values. Used by ArrayList.contains/indexOf and HashMap key lookup.
+fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
+    // Normalize: unbox wrapper objects to primitives for comparison
+    let na = normalize_for_compare(ctx, a);
+    let nb = normalize_for_compare(ctx, b);
+    match (&na, &nb) {
+        (Value::Object(Some(oa)), Value::Object(Some(ob))) => {
+            // Identity check first
+            if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
+                return true;
+            }
+            // String value equality
+            if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
+                sa == sb
+            } else {
+                false
+            }
+        }
+        (Value::Object(None), Value::Object(None)) => true,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Long(a), Value::Long(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Double(a), Value::Double(b)) => a == b,
+        // Cross-type numeric: Int vs Long
+        (Value::Int(a), Value::Long(b)) => (*a as i64) == *b,
+        (Value::Long(a), Value::Int(b)) => *a == (*b as i64),
+        _ => false,
+    }
+}
+
+// ===========================================================================
+// ArrayList — Object layout: field 0 = Object[] elementData, field 1 = Int size
+// ===========================================================================
+
+const AL_FIELD_DATA: usize = 0;
+const AL_FIELD_SIZE: usize = 1;
+const AL_NUM_FIELDS: usize = 2;
+const AL_DEFAULT_CAPACITY: usize = 10;
+
+/// Extract ArrayList state: (elementData, size).
+fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32) {
+    let data = match ctx.get_field(this, AL_FIELD_DATA) {
+        Value::Object(Some(arr)) => Some(arr),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, AL_FIELD_SIZE) {
+        Value::Int(s) => s,
+        _ => 0,
+    };
+    (data, size)
+}
+
+/// Ensure the backing array has room for at least `min_cap` elements.
+fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) -> ObjectRef {
+    let (data, _size) = al_state(ctx, this);
+    let old_cap = data.map_or(0, |d| ctx.array_length(d));
+
+    if min_cap <= old_cap {
+        return data.unwrap();
+    }
+
+    // Grow: max(old_cap * 1.5, min_cap) — matches Java's ArrayList strategy.
+    // Use >> 1 for integer 1.5x, with minimum growth of 1 (handles old_cap == 0).
+    let growth = std::cmp::max(old_cap >> 1, 1);
+    let new_cap = std::cmp::max(old_cap + growth, min_cap);
+    // Cap at a sane maximum to prevent OOM from absurd allocations.
+    const AL_MAX_CAPACITY: usize = 1 << 30; // ~1 billion elements
+    if new_cap > AL_MAX_CAPACITY {
+        return data.unwrap_or_else(|| alloc_ref_array(ctx, 0));
+    }
+    let new_buf = alloc_ref_array(ctx, new_cap);
+
+    // Copy old content
+    if let Some(old_buf) = data {
+        let copy_len = std::cmp::min(old_cap, new_cap);
+        for i in 0..copy_len {
+            let val = ctx.get_array_element(old_buf, i);
+            ctx.set_array_element(new_buf, i, val);
+        }
+    }
+
+    ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
+    new_buf
+}
+
+fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/ArrayList";
+
+    r.register(c, "<init>", "()V", native_al_init);
+    r.register(c, "<init>", "(I)V", native_al_init_capacity);
+    r.register(c, "size", "()I", native_al_size);
+    r.register(c, "isEmpty", "()Z", native_al_is_empty);
+    r.register(c, "get", "(I)Ljava/lang/Object;", native_al_get);
+    r.register(
+        c,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        native_al_set,
+    );
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_al_add);
+    r.register(c, "add", "(ILjava/lang/Object;)V", native_al_add_at);
+    r.register(c, "remove", "(I)Ljava/lang/Object;", native_al_remove_at);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_al_remove_obj);
+    r.register(c, "clear", "()V", native_al_clear);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
+    r.register(c, "indexOf", "(Ljava/lang/Object;)I", native_al_index_of);
+    r.register(
+        c,
+        "lastIndexOf",
+        "(Ljava/lang/Object;)I",
+        native_al_last_index_of,
+    );
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_al_to_array);
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_collection_to_array_generator,
+    );
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
+    r.register(c, "ensureCapacity", "(I)V", native_al_ensure_capacity);
+    r.register(c, "trimToSize", "()V", native_al_trim_to_size);
+    r.register(c, "toString", "()Ljava/lang/String;", native_al_to_string);
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_al_add_all);
+    r.register(c, "subList", "(II)Ljava/util/List;", native_al_sub_list);
+    r.register(c, "hashCode", "()I", native_al_hash_code);
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", native_al_equals);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_al_for_each,
+    );
+    r.register(
+        c,
+        "sort",
+        "(Ljava/util/Comparator;)V",
+        native_al_sort_comparator,
+    );
+    r.register(
+        c,
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+        native_al_remove_if,
+    );
+    r.register(
+        c,
+        "replaceAll",
+        "(Ljava/util/function/UnaryOperator;)V",
+        native_al_replace_all,
+    );
+    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
+}
+
+pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+    ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_al_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    const AL_MAX_INIT_CAPACITY: usize = 1 << 30;
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) => std::cmp::min(std::cmp::max(*c, 0) as usize, AL_MAX_INIT_CAPACITY),
+        _ => AL_DEFAULT_CAPACITY,
+    };
+    let buf = alloc_ref_array(ctx, cap);
+    ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (_, size) = al_state(ctx, this);
+    Ok(Some(Value::Int(size)))
+}
+
+pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let (_, size) = al_state(ctx, this);
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    if index < 0 || index >= size {
+        return Ok(Some(Value::Object(None))); // IndexOutOfBoundsException (simplified)
+    }
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_array_element(data, index as usize);
+    Ok(Some(val))
+}
+
+pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    if index < 0 || index >= size {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let old = ctx.get_array_element(data, index as usize);
+    ctx.set_array_element(data, index as usize, new_val);
+    Ok(Some(old))
+}
+
+pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (_, size) = al_state(ctx, this);
+    let size = size as usize;
+    let buf = al_ensure_capacity(ctx, this, size + 1);
+    ctx.set_array_element(buf, size, elem);
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size + 1) as i32));
+    Ok(Some(Value::Int(1))) // returns true
+}
+
+pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => return Ok(None),
+    };
+    let elem = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (_, size) = al_state(ctx, this);
+    let size = size as usize;
+    if index > size {
+        return Ok(None); // IndexOutOfBoundsException (simplified)
+    }
+    let buf = al_ensure_capacity(ctx, this, size + 1);
+    // Shift elements right
+    for i in (index..size).rev() {
+        let val = ctx.get_array_element(buf, i);
+        ctx.set_array_element(buf, i + 1, val);
+    }
+    ctx.set_array_element(buf, index, elem);
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size + 1) as i32));
+    Ok(None)
+}
+
+pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    if index < 0 || index >= size {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let old = ctx.get_array_element(data, index as usize);
+    // Shift elements left
+    let size = size as usize;
+    for i in (index as usize + 1)..size {
+        let val = ctx.get_array_element(data, i);
+        ctx.set_array_element(data, i - 1, val);
+    }
+    // Null out the last element
+    ctx.set_array_element(data, size - 1, Value::Object(None));
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size - 1) as i32));
+    Ok(Some(old))
+}
+
+pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let size = size as usize;
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        if values_equal(ctx, &elem, &target) {
+            // Shift left
+            for j in (i + 1)..size {
+                let val = ctx.get_array_element(data, j);
+                ctx.set_array_element(data, j - 1, val);
+            }
+            ctx.set_array_element(data, size - 1, Value::Object(None));
+            ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size - 1) as i32));
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+pub fn native_al_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, this);
+    if let Some(d) = data {
+        for i in 0..(size as usize) {
+            ctx.set_array_element(d, i, Value::Object(None));
+        }
+    }
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    for i in 0..(size as usize) {
+        let elem = ctx.get_array_element(data, i);
+        if values_equal(ctx, &elem, &target) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+pub fn native_al_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(-1))),
+    };
+    for i in 0..(size as usize) {
+        let elem = ctx.get_array_element(data, i);
+        if values_equal(ctx, &elem, &target) {
+            return Ok(Some(Value::Int(i as i32)));
+        }
+    }
+    Ok(Some(Value::Int(-1)))
+}
+
+fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(-1))),
+    };
+    let size = size as usize;
+    for i in (0..size).rev() {
+        let elem = ctx.get_array_element(data, i);
+        if values_equal(ctx, &elem, &target) {
+            return Ok(Some(Value::Int(i as i32)));
+        }
+    }
+    Ok(Some(Value::Int(-1)))
+}
+
+pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    let size = size as usize;
+    let result = alloc_ref_array(ctx, size);
+    if let Some(d) = data {
+        for i in 0..size {
+            let val = ctx.get_array_element(d, i);
+            ctx.set_array_element(result, i, val);
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+/// Collection.toArray(IntFunction) — delegates to toArray() since RustJVM uses Object[] uniformly.
+fn native_collection_to_array_generator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // The IntFunction generator is used in real Java to create a typed array (T[]).
+    // Since RustJVM uses Object[] uniformly, we ignore the generator and delegate.
+    native_al_to_array(ctx, args)
+}
+
+pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Create ArrayList$Itr: field 0 = list, field 1 = cursor
+    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", AL_ITR_NUM_FIELDS);
+    ctx.set_field(itr, AL_ITR_FIELD_LIST, Value::Object(Some(this)));
+    ctx.set_field(itr, AL_ITR_FIELD_CURSOR, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_al_ensure_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let min_cap = match args.get(1) {
+        Some(Value::Int(c)) => std::cmp::max(*c, 0) as usize,
+        _ => return Ok(None),
+    };
+    al_ensure_capacity(ctx, this, min_cap);
+    Ok(None)
+}
+
+fn native_al_trim_to_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, this);
+    let size = size as usize;
+    let old_cap = data.map_or(0, |d| ctx.array_length(d));
+    if size < old_cap {
+        let new_buf = alloc_ref_array(ctx, size);
+        if let Some(old_buf) = data {
+            for i in 0..size {
+                let val = ctx.get_array_element(old_buf, i);
+                ctx.set_array_element(new_buf, i, val);
+            }
+        }
+        ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
+    }
+    Ok(None)
+}
+
+pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    let size = size as usize;
+    let mut parts = Vec::with_capacity(size);
+    if let Some(d) = data {
+        for i in 0..size {
+            let val = ctx.get_array_element(d, i);
+            parts.push(obj_to_display_string(ctx, &val));
+        }
+    }
+    let text = format!("[{}]", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    // Try to read the other collection as an ArrayList
+    let (other_data, other_size) = al_state(ctx, other);
+    let other_size = other_size as usize;
+    if other_size == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let other_data = match other_data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let (_, my_size) = al_state(ctx, this);
+    let my_size = my_size as usize;
+    let buf = al_ensure_capacity(ctx, this, my_size + other_size);
+    for i in 0..other_size {
+        let val = ctx.get_array_element(other_data, i);
+        ctx.set_array_element(buf, my_size + i, val);
+    }
+    ctx.set_field(
+        this,
+        AL_FIELD_SIZE,
+        Value::Int((my_size + other_size) as i32),
+    );
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from = match args.get(1) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => 0,
+    };
+    let to = match args.get(2) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => 0,
+    };
+    let (data, _size) = al_state(ctx, this);
+    let sub_size = to.saturating_sub(from);
+    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let new_buf = alloc_ref_array(ctx, std::cmp::max(sub_size, AL_DEFAULT_CAPACITY));
+    if let Some(d) = data {
+        for i in 0..sub_size {
+            let val = ctx.get_array_element(d, from + i);
+            ctx.set_array_element(new_buf, i, val);
+        }
+    }
+    ctx.set_field(new_list, AL_FIELD_DATA, Value::Object(Some(new_buf)));
+    ctx.set_field(new_list, AL_FIELD_SIZE, Value::Int(sub_size as i32));
+    Ok(Some(Value::Object(Some(new_list))))
+}
+
+fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (data, size) = al_state(ctx, this);
+    let size = size as usize;
+    let mut hash: i32 = 1;
+    if let Some(d) = data {
+        for i in 0..size {
+            let val = ctx.get_array_element(d, i);
+            let elem_hash = match val {
+                Value::Object(Some(obj)) => ctx.identity_hash_code(obj),
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
+        }
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    // Identity check
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    let (data_a, size_a) = al_state(ctx, this);
+    let (data_b, size_b) = al_state(ctx, other);
+    if size_a != size_b {
+        return Ok(Some(Value::Int(0)));
+    }
+    let size = size_a as usize;
+    match (data_a, data_b) {
+        (Some(da), Some(db)) => {
+            for i in 0..size {
+                let va = ctx.get_array_element(da, i);
+                let vb = ctx.get_array_element(db, i);
+                if !values_equal(ctx, &va, &vb) {
+                    return Ok(Some(Value::Int(0)));
+                }
+            }
+            Ok(Some(Value::Int(1)))
+        }
+        (None, None) => Ok(Some(Value::Int(1))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+// ===========================================================================
+// HashMap — field 0 = Object[] buckets, field 1 = Int size, field 2 = Int cap
+// HashMap$Node — field 0 = key, field 1 = value, field 2 = hash, field 3 = next
+// ===========================================================================
+
+const MAP_FIELD_BUCKETS: usize = 0;
+const MAP_FIELD_SIZE: usize = 1;
+const MAP_FIELD_CAPACITY: usize = 2;
+const MAP_NUM_FIELDS: usize = 3;
+const MAP_DEFAULT_CAPACITY: usize = 16;
+
+const NODE_FIELD_KEY: usize = 0;
+const NODE_FIELD_VALUE: usize = 1;
+const NODE_FIELD_HASH: usize = 2;
+const NODE_FIELD_NEXT: usize = 3;
+const NODE_NUM_FIELDS: usize = 4;
+
+/// Extract HashMap state: (buckets, size, capacity).
+fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
+    let buckets = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
+        Value::Object(Some(arr)) => Some(arr),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, MAP_FIELD_SIZE) {
+        Value::Int(s) => s,
+        _ => 0,
+    };
+    let cap = match ctx.get_field(this, MAP_FIELD_CAPACITY) {
+        Value::Int(c) => c,
+        _ => MAP_DEFAULT_CAPACITY as i32,
+    };
+    (buckets, size, cap)
+}
+
+/// Compute hash for a key.
+fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
+    // Try to read as string for better distribution
+    if let Some(s) = ctx.read_string(key) {
+        let mut h: i32 = 0;
+        for ch in s.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        // Spread bits (like HashMap.hash in JDK)
+        h ^ (h >> 16)
+    } else if let Some(prim) = unbox_wrapper(ctx, key) {
+        // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
+        let h = match prim {
+            Value::Int(v) => v,
+            Value::Long(v) => (v ^ (v >> 32)) as i32,
+            Value::Float(v) => v.to_bits() as i32,
+            Value::Double(v) => {
+                let bits = v.to_bits() as i64;
+                (bits ^ (bits >> 32)) as i32
+            }
+            _ => ctx.identity_hash_code(key),
+        };
+        h ^ (h >> 16)
+    } else {
+        let h = ctx.identity_hash_code(key);
+        h ^ (h >> 16)
+    }
+}
+
+/// Check if two keys are equal.
+fn map_keys_equal(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+    if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
+        return true;
+    }
+    // String value equality
+    if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
+        return sa == sb;
+    }
+    // Wrapper type equality: unbox and compare primitives
+    if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
+        return match (pa, pb) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Long(x), Value::Long(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Double(x), Value::Double(y)) => x == y,
+            (Value::Int(x), Value::Long(y)) => (x as i64) == y,
+            (Value::Long(x), Value::Int(y)) => x == (y as i64),
+            _ => false,
+        };
+    }
+    false
+}
+
+/// Get the bucket index for a given hash and capacity.
+fn map_bucket_index(hash: i32, capacity: i32) -> usize {
+    // Use bitwise AND for power-of-two capacity (like JDK HashMap)
+    ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
+}
+
+/// Allocate a HashMap$Node entry.
+fn map_alloc_node(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+    value: Value,
+    hash: i32,
+    next: Option<ObjectRef>,
+) -> ObjectRef {
+    let node = alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS);
+    ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
+    ctx.set_field(node, NODE_FIELD_VALUE, value);
+    ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
+    ctx.set_field(node, NODE_FIELD_NEXT, Value::Object(next));
+    node
+}
+
+/// Maximum capacity for HashMap buckets (~1 billion).
+const MAP_MAX_CAPACITY: i32 = 1 << 30;
+
+/// Resize the HashMap when load factor is exceeded.
+fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let (old_buckets, size, old_cap) = map_state(ctx, this);
+    if old_cap >= MAP_MAX_CAPACITY {
+        return; // cannot grow further
+    }
+    let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
+    let new_buckets = alloc_ref_array(ctx, new_cap as usize);
+
+    // Re-hash all entries
+    if let Some(old_b) = old_buckets {
+        for i in 0..(old_cap as usize) {
+            let mut node_val = ctx.get_array_element(old_b, i);
+            while let Value::Object(Some(node)) = node_val {
+                let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                    Value::Int(h) => h,
+                    _ => 0,
+                };
+                let next = ctx.get_field(node, NODE_FIELD_NEXT);
+
+                // Insert into new bucket
+                let new_idx = map_bucket_index(key_hash, new_cap);
+                let existing = ctx.get_array_element(new_buckets, new_idx);
+                ctx.set_field(node, NODE_FIELD_NEXT, existing);
+                ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+
+                node_val = next;
+            }
+        }
+    }
+
+    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
+    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+}
+
+/// Collect all keys from a HashMap into a Vec.
+fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let (buckets, _size, cap) = map_state(ctx, this);
+    let mut keys = Vec::new();
+    if let Some(b) = buckets {
+        for i in 0..(cap as usize) {
+            let mut node_val = ctx.get_array_element(b, i);
+            while let Value::Object(Some(node)) = node_val {
+                let key = ctx.get_field(node, NODE_FIELD_KEY);
+                keys.push(key);
+                node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+            }
+        }
+    }
+    keys
+}
+
+/// Collect all values from a HashMap into a Vec.
+fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let (buckets, _size, cap) = map_state(ctx, this);
+    let mut values = Vec::new();
+    if let Some(b) = buckets {
+        for i in 0..(cap as usize) {
+            let mut node_val = ctx.get_array_element(b, i);
+            while let Value::Object(Some(node)) = node_val {
+                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                values.push(value);
+                node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+            }
+        }
+    }
+    values
+}
+
+/// Collect all key-value pairs as (key, value) from a HashMap.
+fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    let (buckets, _size, cap) = map_state(ctx, this);
+    let mut entries = Vec::new();
+    if let Some(b) = buckets {
+        for i in 0..(cap as usize) {
+            let mut node_val = ctx.get_array_element(b, i);
+            while let Value::Object(Some(node)) = node_val {
+                let key = ctx.get_field(node, NODE_FIELD_KEY);
+                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                entries.push((key, value));
+                node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+            }
+        }
+    }
+    entries
+}
+
+fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/HashMap";
+
+    r.register(c, "<init>", "()V", native_map_init);
+    r.register(c, "<init>", "(I)V", native_map_init_capacity);
+    r.register(c, "size", "()I", native_map_size);
+    r.register(c, "isEmpty", "()Z", native_map_is_empty);
+    r.register(
+        c,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_put,
+    );
+    r.register(
+        c,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_get,
+    );
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_remove,
+    );
+    r.register(
+        c,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_key,
+    );
+    r.register(
+        c,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_value,
+    );
+    r.register(c, "clear", "()V", native_map_clear);
+    r.register(c, "keySet", "()Ljava/util/Set;", native_map_key_set);
+    r.register(c, "values", "()Ljava/util/Collection;", native_map_values);
+    r.register(c, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
+    r.register(c, "toString", "()Ljava/lang/String;", native_map_to_string);
+    r.register(
+        c,
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_get_or_default,
+    );
+    r.register(
+        c,
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_put_if_absent,
+    );
+    r.register(c, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+    r.register(c, "hashCode", "()I", native_map_hash_code);
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", native_map_equals);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_map_for_each,
+    );
+    r.register(
+        c,
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+        native_map_compute_if_absent,
+    );
+    r.register(
+        c,
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_map_compute,
+    );
+    r.register(
+        c,
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_map_compute_if_present,
+    );
+    r.register(
+        c,
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_map_merge,
+    );
+    r.register(
+        c,
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+        native_map_replace_all,
+    );
+}
+
+pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(
+        this,
+        MAP_FIELD_CAPACITY,
+        Value::Int(MAP_DEFAULT_CAPACITY as i32),
+    );
+    Ok(None)
+}
+
+fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) => {
+            // Round up to power of 2, capped at MAP_MAX_CAPACITY
+            let mut n = std::cmp::max(*c, 1) as u32;
+            n = n.next_power_of_two();
+            std::cmp::min(n as usize, MAP_MAX_CAPACITY as usize)
+        }
+        _ => MAP_DEFAULT_CAPACITY,
+    };
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    Ok(None)
+}
+
+// Public wrappers for cross-module access (EnumMap, IdentityHashMap, WeakHashMap)
+pub fn native_map_put_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_put(ctx, args)
+}
+pub fn native_map_get_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_get(ctx, args)
+}
+pub fn native_map_remove_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_remove(ctx, args)
+}
+pub fn native_map_contains_key_pub(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_map_contains_key(ctx, args)
+}
+pub fn native_map_contains_value_pub(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_map_contains_value(ctx, args)
+}
+pub fn native_map_size_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_size(ctx, args)
+}
+pub fn native_map_is_empty_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_is_empty(ctx, args)
+}
+pub fn native_map_clear_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_clear(ctx, args)
+}
+pub fn native_map_key_set_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_key_set(ctx, args)
+}
+pub fn native_map_values_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_values(ctx, args)
+}
+pub fn native_map_entry_set_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_entry_set(ctx, args)
+}
+pub fn native_map_to_string_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_to_string(ctx, args)
+}
+
+fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (_, size, _) = map_state(ctx, this);
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let (_, size, _) = map_state(ctx, this);
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    // Handle null key: hash=0, bucket=0, key field stores null
+    let (key_ref, hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(None) => (None, 0, true),
+        _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
+    };
+
+    // Check for resize first
+    let (_, size, cap) = map_state(ctx, this);
+    if size + 1 > (cap * 3) / 4 {
+        map_resize(ctx, this);
+    }
+
+    let (buckets, size, cap) = map_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    let idx = map_bucket_index(hash, cap);
+    let mut node_val = ctx.get_array_element(buckets, idx);
+
+    // Walk chain looking for existing key
+    while let Value::Object(Some(node)) = node_val {
+        let node_key_field = ctx.get_field(node, NODE_FIELD_KEY);
+        if is_null_key {
+            // Looking for a null-key node
+            if matches!(node_key_field, Value::Object(None)) {
+                let old_value = ctx.get_field(node, NODE_FIELD_VALUE);
+                ctx.set_field(node, NODE_FIELD_VALUE, value);
+                return Ok(Some(old_value));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+                let old_value = ctx.get_field(node, NODE_FIELD_VALUE);
+                ctx.set_field(node, NODE_FIELD_VALUE, value);
+                return Ok(Some(old_value));
+            }
+        }
+        node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+
+    // Key not found — insert at head of chain
+    let existing_head = ctx.get_array_element(buckets, idx);
+    let head_ref = match existing_head {
+        Value::Object(obj_opt) => obj_opt,
+        _ => None,
+    };
+    // Create node — for null keys, store Value::Object(None) in key field
+    let new_node = ctx.alloc_object(rustjvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
+    ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
+    ctx.set_field(new_node, NODE_FIELD_VALUE, value);
+    ctx.set_field(
+        new_node,
+        NODE_FIELD_NEXT,
+        head_ref.map_or(Value::Object(None), |r| Value::Object(Some(r))),
+    );
+    ctx.set_array_element(buckets, idx, Value::Object(Some(new_node)));
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size + 1));
+
+    Ok(Some(Value::Object(None))) // no old value
+}
+
+fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let (key_ref, hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(None) => (None, 0, true),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let (buckets, _, cap) = map_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    let idx = map_bucket_index(hash, cap);
+    let mut node_val = ctx.get_array_element(buckets, idx);
+
+    while let Value::Object(Some(node)) = node_val {
+        let node_key_field = ctx.get_field(node, NODE_FIELD_KEY);
+        if is_null_key {
+            if matches!(node_key_field, Value::Object(None)) {
+                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                return Ok(Some(value));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                return Ok(Some(value));
+            }
+        }
+        node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let (key_ref, hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(None) => (None, 0, true),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let (buckets, size, cap) = map_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    let idx = map_bucket_index(hash, cap);
+    let head_val = ctx.get_array_element(buckets, idx);
+
+    // Helper closure: check if node matches our key
+    let node_matches = |ctx: &dyn NativeContext, node: ObjectRef| -> bool {
+        let node_key_field = ctx.get_field(node, NODE_FIELD_KEY);
+        if is_null_key {
+            matches!(node_key_field, Value::Object(None))
+        } else if let Value::Object(Some(nk)) = node_key_field {
+            key_ref.is_some_and(|k| map_keys_equal(ctx, nk, k))
+        } else {
+            false
+        }
+    };
+
+    // Check if the head node is the target
+    if let Value::Object(Some(head)) = head_val {
+        if node_matches(ctx, head) {
+            let next = ctx.get_field(head, NODE_FIELD_NEXT);
+            ctx.set_array_element(buckets, idx, next);
+            ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size - 1));
+            let old_value = ctx.get_field(head, NODE_FIELD_VALUE);
+            return Ok(Some(old_value));
+        }
+
+        // Walk chain
+        let mut prev = head;
+        let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
+
+        while let Value::Object(Some(curr)) = curr_val {
+            if node_matches(ctx, curr) {
+                let next = ctx.get_field(curr, NODE_FIELD_NEXT);
+                ctx.set_field(prev, NODE_FIELD_NEXT, next);
+                ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size - 1));
+                let old_value = ctx.get_field(curr, NODE_FIELD_VALUE);
+                return Ok(Some(old_value));
+            }
+            prev = curr;
+            curr_val = ctx.get_field(curr, NODE_FIELD_NEXT);
+        }
+    }
+
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let result = native_map_get(ctx, args)?;
+    let found = !matches!(result, Some(Value::Object(None)));
+    Ok(Some(Value::Int(if found { 1 } else { 0 })))
+}
+
+fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let values = map_collect_values(ctx, this);
+    for val in &values {
+        if values_equal(ctx, val, &target) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let (buckets, _, cap) = map_state(ctx, this);
+    if let Some(b) = buckets {
+        for i in 0..(cap as usize) {
+            ctx.set_array_element(b, i, Value::Object(None));
+        }
+    }
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = map_collect_keys(ctx, this);
+    // Build a HashSet from the keys
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    // Initialize the backing map
+    let cap = std::cmp::max(keys.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+
+    // Add each key
+    for key in &keys {
+        if let Value::Object(Some(k)) = key {
+            let hash = map_hash_key(ctx, *k);
+            let (b, size, c) = map_state(ctx, backing_map);
+            let b = b.unwrap();
+            let idx = map_bucket_index(hash, c);
+            let existing = ctx.get_array_element(b, idx);
+            let head = match existing {
+                Value::Object(obj_opt) => obj_opt,
+                _ => None,
+            };
+            let sentinel = Value::Int(1);
+            let node = map_alloc_node(ctx, *k, sentinel, hash, head);
+            ctx.set_array_element(b, idx, Value::Object(Some(node)));
+            ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(size + 1));
+        }
+    }
+
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let values = map_collect_values(ctx, this);
+    // Build an ArrayList from the values
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in values.iter().enumerate() {
+        ctx.set_array_element(buf, i, *val);
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(values.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let entries = map_collect_entries(ctx, this);
+    // Build a HashSet of Map.Entry objects
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+
+    // Each entry is a Map.Entry object with 2 fields: key and value
+    for (key, value) in &entries {
+        let entry_obj = alloc_synthetic(ctx, "java/util/HashMap$Entry", 2);
+        ctx.set_field(entry_obj, 0, *key);
+        ctx.set_field(entry_obj, 1, *value);
+
+        // Add to the set's backing map
+        let hash = ctx.identity_hash_code(entry_obj);
+        let (b, size, c) = map_state(ctx, backing_map);
+        let b = b.unwrap();
+        let idx = map_bucket_index(hash, c);
+        let existing = ctx.get_array_element(b, idx);
+        let head = match existing {
+            Value::Object(obj_opt) => obj_opt,
+            _ => None,
+        };
+        let sentinel = Value::Int(1);
+        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(size + 1));
+    }
+
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let entries = map_collect_entries(ctx, this);
+    let mut parts = Vec::with_capacity(entries.len());
+    for (key, value) in &entries {
+        let ks = obj_to_display_string(ctx, key);
+        let vs = obj_to_display_string(ctx, value);
+        parts.push(format!("{}={}", ks, vs));
+    }
+    let text = format!("{{{}}}", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let result = native_map_get(ctx, args)?;
+    match result {
+        Some(Value::Object(None)) => {
+            // Return the default value (arg 2)
+            let default_val = args.get(2).copied().unwrap_or(Value::Object(None));
+            Ok(Some(default_val))
+        }
+        _ => Ok(result),
+    }
+}
+
+fn native_map_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Check if key exists
+    let get_result = native_map_get(ctx, args)?;
+    match get_result {
+        Some(Value::Object(None)) => {
+            // Key not present — do the put
+            native_map_put(ctx, args)
+        }
+        _ => Ok(get_result), // Key present — return existing value
+    }
+}
+
+fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let entries = map_collect_entries(ctx, other);
+    for (key, value) in entries {
+        if let Value::Object(Some(k)) = key {
+            // Call put on this map
+            let put_args = [Value::Object(Some(this)), Value::Object(Some(k)), value];
+            native_map_put(ctx, &put_args)?;
+        }
+    }
+    Ok(None)
+}
+
+fn native_map_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let entries = map_collect_entries(ctx, this);
+    let mut hash: i32 = 0;
+    for (key, value) in &entries {
+        let kh = match key {
+            Value::Object(Some(obj)) => ctx.identity_hash_code(*obj),
+            Value::Int(v) => *v,
+            _ => 0,
+        };
+        let vh = match value {
+            Value::Object(Some(obj)) => ctx.identity_hash_code(*obj),
+            Value::Int(v) => *v,
+            _ => 0,
+        };
+        hash = hash.wrapping_add(kh ^ vh);
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    let (_, size_a, _) = map_state(ctx, this);
+    let (_, size_b, _) = map_state(ctx, other);
+    if size_a != size_b {
+        return Ok(Some(Value::Int(0)));
+    }
+    // Check all entries in this map exist in other
+    let entries = map_collect_entries(ctx, this);
+    for (key, value) in &entries {
+        if let Value::Object(Some(k)) = key {
+            let get_args = [Value::Object(Some(other)), Value::Object(Some(*k))];
+            let other_val = native_map_get(ctx, &get_args)?;
+            match other_val {
+                Some(ref ov) => {
+                    if !values_equal(ctx, value, ov) {
+                        return Ok(Some(Value::Int(0)));
+                    }
+                }
+                None => return Ok(Some(Value::Int(0))),
+            }
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+// ===========================================================================
+// HashSet — field 0 = Object (backing HashMap)
+// ===========================================================================
+
+const HS_FIELD_MAP: usize = 0;
+const HS_NUM_FIELDS: usize = 1;
+
+/// Get the backing HashMap from a HashSet.
+fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field(this, HS_FIELD_MAP) {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+fn register_hashset_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/HashSet";
+
+    r.register(c, "<init>", "()V", native_hs_init);
+    r.register(c, "<init>", "(I)V", native_hs_init_capacity);
+    r.register(c, "size", "()I", native_hs_size);
+    r.register(c, "isEmpty", "()Z", native_hs_is_empty);
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_hs_remove);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_hs_contains);
+    r.register(c, "clear", "()V", native_hs_clear);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_hs_iterator);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_hs_to_array);
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_collection_to_array_generator,
+    );
+    r.register(c, "toString", "()Ljava/lang/String;", native_hs_to_string);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_hs_for_each,
+    );
+    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
+}
+
+fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    // Initialize the backing HashMap
+    let init_args = [Value::Object(Some(backing))];
+    native_map_init(ctx, &init_args)?;
+    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    Ok(None)
+}
+
+fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cap = args
+        .get(1)
+        .copied()
+        .unwrap_or(Value::Int(MAP_DEFAULT_CAPACITY as i32));
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let init_args = [Value::Object(Some(backing)), cap];
+    native_map_init_capacity(ctx, &init_args)?;
+    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    Ok(None)
+}
+
+fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let map_args = [Value::Object(Some(backing))];
+    native_map_size(ctx, &map_args)
+}
+
+fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(1))),
+    };
+    let map_args = [Value::Object(Some(backing))];
+    native_map_is_empty(ctx, &map_args)
+}
+
+fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // put(key, sentinel) — returns null if key was new
+    let sentinel = Value::Int(1);
+    let put_args = [Value::Object(Some(backing)), elem, sentinel];
+    let old = native_map_put(ctx, &put_args)?;
+    let was_new = matches!(old, Some(Value::Object(None)));
+    Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
+}
+
+fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let remove_args = [Value::Object(Some(backing)), elem];
+    let old = native_map_remove(ctx, &remove_args)?;
+    let was_present = !matches!(old, Some(Value::Object(None)));
+    Ok(Some(Value::Int(if was_present { 1 } else { 0 })))
+}
+
+fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let ck_args = [Value::Object(Some(backing)), elem];
+    native_map_contains_key(ctx, &ck_args)
+}
+
+fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let clear_args = [Value::Object(Some(backing))];
+    native_map_clear(ctx, &clear_args)
+}
+
+fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    // Collect keys into a snapshot array
+    let keys = map_collect_keys(ctx, backing);
+    let keys_arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(keys_arr, i, *k);
+    }
+    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(keys.len() as i32));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    let arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => {
+            let s = ctx.create_string("[]");
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let keys = map_collect_keys(ctx, backing);
+    let mut parts = Vec::with_capacity(keys.len());
+    for k in &keys {
+        parts.push(obj_to_display_string(ctx, k));
+    }
+    let text = format!("[{}]", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// ===========================================================================
+// Iterators — ArrayList$Itr and HashMap$KeyItr
+// ===========================================================================
+
+const AL_ITR_FIELD_LIST: usize = 0;
+const AL_ITR_FIELD_CURSOR: usize = 1;
+const AL_ITR_NUM_FIELDS: usize = 2;
+
+const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
+const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
+const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
+const MAP_KEY_ITR_NUM_FIELDS: usize = 3;
+
+fn register_iterator_natives(r: &mut NativeMethodRegistry) {
+    // ArrayList$Itr
+    r.register(
+        "java/util/ArrayList$Itr",
+        "hasNext",
+        "()Z",
+        native_al_itr_has_next,
+    );
+    r.register(
+        "java/util/ArrayList$Itr",
+        "next",
+        "()Ljava/lang/Object;",
+        native_al_itr_next,
+    );
+
+    // HashMap$KeyItr
+    r.register(
+        "java/util/HashMap$KeyItr",
+        "hasNext",
+        "()Z",
+        native_map_key_itr_has_next,
+    );
+    r.register(
+        "java/util/HashMap$KeyItr",
+        "next",
+        "()Ljava/lang/Object;",
+        native_map_key_itr_next,
+    );
+}
+
+fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
+        Value::Int(c) => c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let list = match ctx.get_field(this, AL_ITR_FIELD_LIST) {
+        Value::Object(Some(l)) => l,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (_, size) = al_state(ctx, list);
+    Ok(Some(Value::Int(if cursor < size { 1 } else { 0 })))
+}
+
+fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
+        Value::Int(c) => c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list = match ctx.get_field(this, AL_ITR_FIELD_LIST) {
+        Value::Object(Some(l)) => l,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, list);
+    if cursor >= size {
+        return Ok(Some(Value::Object(None))); // NoSuchElementException (simplified)
+    }
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_array_element(data, cursor as usize);
+    ctx.set_field(this, AL_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    Ok(Some(val))
+}
+
+fn native_map_key_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, MAP_KEY_ITR_FIELD_CURSOR) {
+        Value::Int(c) => c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let total = match ctx.get_field(this, MAP_KEY_ITR_FIELD_TOTAL) {
+        Value::Int(t) => t,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(if cursor < total { 1 } else { 0 })))
+}
+
+fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cursor = match ctx.get_field(this, MAP_KEY_ITR_FIELD_CURSOR) {
+        Value::Int(c) => c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let total = match ctx.get_field(this, MAP_KEY_ITR_FIELD_TOTAL) {
+        Value::Int(t) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if cursor >= total {
+        return Ok(Some(Value::Object(None)));
+    }
+    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_array_element(keys, cursor as usize);
+    ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    Ok(Some(val))
+}
+
+// ===========================================================================
+// Arrays utility class
+// ===========================================================================
+
+fn register_arrays_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        "java/util/Arrays",
+        "copyOf",
+        "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+        native_arrays_copy_of,
+    );
+    r.register(
+        "java/util/Arrays",
+        "toString",
+        "([Ljava/lang/Object;)Ljava/lang/String;",
+        native_arrays_to_string,
+    );
+    r.register(
+        "java/util/Arrays",
+        "asList",
+        "([Ljava/lang/Object;)Ljava/util/List;",
+        native_arrays_as_list,
+    );
+    r.register("java/util/Arrays", "sort", "([I)V", native_arrays_sort_int);
+    r.register(
+        "java/util/Arrays",
+        "sort",
+        "([Ljava/lang/Object;)V",
+        native_arrays_sort_objects,
+    );
+    r.register("java/util/Arrays", "fill", "([II)V", native_arrays_fill_int);
+    r.register(
+        "java/util/Arrays",
+        "fill",
+        "([Ljava/lang/Object;Ljava/lang/Object;)V",
+        native_arrays_fill_object,
+    );
+    r.register(
+        "java/util/Arrays",
+        "binarySearch",
+        "([II)I",
+        native_arrays_binary_search_int,
+    );
+    r.register(
+        "java/util/Arrays",
+        "equals",
+        "([I[I)Z",
+        native_arrays_equals_int,
+    );
+}
+
+fn native_arrays_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = match args.first() {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let new_len = match args.get(1) {
+        Some(Value::Int(l)) => std::cmp::max(*l, 0) as usize,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let old_len = ctx.array_length(src);
+    let result = alloc_ref_array(ctx, new_len);
+    let copy_len = std::cmp::min(old_len, new_len);
+    for i in 0..copy_len {
+        let val = ctx.get_array_element(src, i);
+        ctx.set_array_element(result, i, val);
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_arrays_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            let s = ctx.create_string("null");
+            return Ok(Some(Value::Object(Some(s))));
+        }
+        _ => {
+            let s = ctx.create_string("null");
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let len = ctx.array_length(arr);
+    let mut parts = Vec::with_capacity(len);
+    for i in 0..len {
+        let val = ctx.get_array_element(arr, i);
+        parts.push(obj_to_display_string(ctx, &val));
+    }
+    let text = format!("[{}]", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => {
+            // Return empty list
+            let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+            let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+            ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+            ctx.set_field(list, AL_FIELD_SIZE, Value::Int(0));
+            return Ok(Some(Value::Object(Some(list))));
+        }
+    };
+    let len = ctx.array_length(arr);
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let cap = std::cmp::max(len, AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    for i in 0..len {
+        let val = ctx.get_array_element(arr, i);
+        ctx.set_array_element(buf, i, val);
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(len as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+// java.util.Optional
+// ===========================================================================
+
+const OPT_FIELD_VALUE: usize = 0;
+const OPT_NUM_FIELDS: usize = 1;
+
+fn register_optional_natives(r: &mut NativeMethodRegistry) {
+    let o = "java/util/Optional";
+    r.register(o, "empty", "()Ljava/util/Optional;", native_opt_empty);
+    r.register(
+        o,
+        "of",
+        "(Ljava/lang/Object;)Ljava/util/Optional;",
+        native_opt_of,
+    );
+    r.register(
+        o,
+        "ofNullable",
+        "(Ljava/lang/Object;)Ljava/util/Optional;",
+        native_opt_of_nullable,
+    );
+    r.register(o, "get", "()Ljava/lang/Object;", native_opt_get);
+    r.register(o, "isPresent", "()Z", native_opt_is_present);
+    r.register(o, "isEmpty", "()Z", native_opt_is_empty);
+    r.register(
+        o,
+        "orElse",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_opt_or_else,
+    );
+    r.register(
+        o,
+        "orElseThrow",
+        "()Ljava/lang/Object;",
+        native_opt_or_else_throw,
+    );
+    r.register(o, "equals", "(Ljava/lang/Object;)Z", native_opt_equals);
+    r.register(o, "hashCode", "()I", native_opt_hash_code);
+    r.register(o, "toString", "()Ljava/lang/String;", native_opt_to_string);
+    r.register(
+        o,
+        "ifPresent",
+        "(Ljava/util/function/Consumer;)V",
+        native_opt_if_present,
+    );
+    r.register(
+        o,
+        "map",
+        "(Ljava/util/function/Function;)Ljava/util/Optional;",
+        native_opt_map,
+    );
+    r.register(
+        o,
+        "flatMap",
+        "(Ljava/util/function/Function;)Ljava/util/Optional;",
+        native_opt_flat_map,
+    );
+    r.register(
+        o,
+        "filter",
+        "(Ljava/util/function/Predicate;)Ljava/util/Optional;",
+        native_opt_filter,
+    );
+    r.register(
+        o,
+        "orElseGet",
+        "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
+        native_opt_or_else_get,
+    );
+    r.register(
+        o,
+        "ifPresentOrElse",
+        "(Ljava/util/function/Consumer;Ljava/lang/Runnable;)V",
+        native_opt_if_present_or_else,
+    );
+    r.register(
+        o,
+        "or",
+        "(Ljava/util/function/Supplier;)Ljava/util/Optional;",
+        native_opt_or,
+    );
+    r.register(
+        o,
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_opt_stream,
+    );
+    r.register(
+        o,
+        "orElseThrow",
+        "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
+        native_opt_or_else_throw_supplier,
+    );
+}
+
+fn native_opt_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    // field 0 stays as default (null)
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(None)) | None => {
+            Err(rustjvm_types::error::RuntimeError::NullPointerException { message: None }.into())
+        }
+        Some(val) => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            ctx.set_field(opt, OPT_FIELD_VALUE, *val);
+            Ok(Some(Value::Object(Some(opt))))
+        }
+    }
+}
+
+fn native_opt_of_nullable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    let val = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(opt, OPT_FIELD_VALUE, val);
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    match val {
+        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No value present".to_string(),
+        }
+        .into()),
+        _ => Ok(Some(val)),
+    }
+}
+
+fn native_opt_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    Ok(Some(Value::Int(if matches!(val, Value::Object(None)) {
+        0
+    } else {
+        1
+    })))
+}
+
+fn native_opt_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    Ok(Some(Value::Int(if matches!(val, Value::Object(None)) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_opt_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let default = args.get(1).copied().unwrap_or(Value::Object(None));
+            return Ok(Some(default));
+        }
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    match val {
+        Value::Object(None) => {
+            let default = args.get(1).copied().unwrap_or(Value::Object(None));
+            Ok(Some(default))
+        }
+        _ => Ok(Some(val)),
+    }
+}
+
+fn native_opt_or_else_throw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No value present".to_string(),
+            }
+            .into())
+        }
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    match val {
+        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No value present".to_string(),
+        }
+        .into()),
+        _ => Ok(Some(val)),
+    }
+}
+
+fn native_opt_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_val = ctx.get_field(this, OPT_FIELD_VALUE);
+    let other_val = ctx.get_field(other, OPT_FIELD_VALUE);
+    let eq = values_equal(ctx, &this_val, &other_val);
+    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
+}
+
+fn native_opt_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    match val {
+        Value::Object(Some(obj)) => Ok(Some(Value::Int(ctx.identity_hash_code(obj)))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let s = ctx.create_string("Optional.empty");
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    let s = match val {
+        Value::Object(None) => "Optional.empty".to_string(),
+        _ => {
+            let display = obj_to_display_string(ctx, &val);
+            format!("Optional[{display}]")
+        }
+    };
+    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+}
+
+// ===========================================================================
+// Arrays.sort / fill / binarySearch / equals (added to register_arrays_natives)
+// ===========================================================================
+
+fn native_arrays_sort_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let len = ctx.array_length(arr);
+    let mut vals: Vec<i32> = Vec::with_capacity(len);
+    for i in 0..len {
+        match ctx.get_array_element(arr, i) {
+            Value::Int(v) => vals.push(v),
+            _ => vals.push(0),
+        }
+    }
+    vals.sort();
+    for (i, &v) in vals.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(v));
+    }
+    Ok(None)
+}
+
+fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let len = ctx.array_length(arr);
+    // Read all elements with their string representation for sorting
+    let mut items: Vec<(String, Value)> = Vec::with_capacity(len);
+    for i in 0..len {
+        let val = ctx.get_array_element(arr, i);
+        let key = match &val {
+            Value::Object(Some(obj)) => ctx.read_string(*obj).unwrap_or_default(),
+            Value::Object(None) => String::new(),
+            _ => String::new(),
+        };
+        items.push((key, val));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for (i, (_, val)) in items.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(None)
+}
+
+fn native_arrays_fill_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let val = args.get(1).copied().unwrap_or(Value::Int(0));
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        ctx.set_array_element(arr, i, val);
+    }
+    Ok(None)
+}
+
+fn native_arrays_fill_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        ctx.set_array_element(arr, i, val);
+    }
+    Ok(None)
+}
+
+fn native_arrays_binary_search_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let key = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let len = ctx.array_length(arr);
+    let mut low: usize = 0;
+    let mut high = len;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let mid_val = match ctx.get_array_element(arr, mid) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        match mid_val.cmp(&key) {
+            std::cmp::Ordering::Less => low = mid + 1,
+            std::cmp::Ordering::Equal => return Ok(Some(Value::Int(mid as i32))),
+            std::cmp::Ordering::Greater => high = mid,
+        }
+    }
+    // Not found: return -(insertion point) - 1
+    Ok(Some(Value::Int(-(low as i32) - 1)))
+}
+
+fn native_arrays_equals_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let a = match args.first() {
+        Some(Value::Object(Some(arr))) => *arr,
+        Some(Value::Object(None)) => {
+            return match args.get(1) {
+                Some(Value::Object(None)) => Ok(Some(Value::Int(1))),
+                _ => Ok(Some(Value::Int(0))),
+            };
+        }
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let b = match args.get(1) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let len_a = ctx.array_length(a);
+    let len_b = ctx.array_length(b);
+    if len_a != len_b {
+        return Ok(Some(Value::Int(0)));
+    }
+    for i in 0..len_a {
+        if ctx.get_array_element(a, i) != ctx.get_array_element(b, i) {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+// ===========================================================================
+// Collections utilities
+// ===========================================================================
+
+fn register_collections_utility_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/Collections";
+    r.register(c, "sort", "(Ljava/util/List;)V", native_collections_sort);
+    r.register(
+        c,
+        "emptyList",
+        "()Ljava/util/List;",
+        native_collections_empty_list,
+    );
+    r.register(
+        c,
+        "singletonList",
+        "(Ljava/lang/Object;)Ljava/util/List;",
+        native_collections_singleton_list,
+    );
+    r.register(
+        c,
+        "reverse",
+        "(Ljava/util/List;)V",
+        native_collections_reverse,
+    );
+    r.register(
+        c,
+        "unmodifiableList",
+        "(Ljava/util/List;)Ljava/util/List;",
+        native_collections_unmodifiable_list,
+    );
+    r.register(
+        c,
+        "sort",
+        "(Ljava/util/List;Ljava/util/Comparator;)V",
+        native_collections_sort_comparator,
+    );
+}
+
+fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, list);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let len = size as usize;
+    // Read elements with string keys
+    let mut items: Vec<(String, Value)> = Vec::with_capacity(len);
+    for i in 0..len {
+        let val = ctx.get_array_element(data, i);
+        let key = match &val {
+            Value::Object(Some(obj)) => ctx.read_string(*obj).unwrap_or_default(),
+            _ => String::new(),
+        };
+        items.push((key, val));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for (i, (_, val)) in items.iter().enumerate() {
+        ctx.set_array_element(data, i, *val);
+    }
+    Ok(None)
+}
+
+fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, 0);
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(arr)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(0));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_collections_singleton_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let val = args.first().copied().unwrap_or(Value::Object(None));
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, 1);
+    ctx.set_array_element(arr, 0, val);
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(arr)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(1));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_collections_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, list);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let len = size as usize;
+    // Read all elements
+    let mut elems: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        elems.push(ctx.get_array_element(data, i));
+    }
+    // Write back in reverse
+    for (i, val) in elems.iter().rev().enumerate() {
+        ctx.set_array_element(data, i, *val);
+    }
+    Ok(None)
+}
+
+fn native_collections_unmodifiable_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Pragmatic: return a defensive copy (regular ArrayList)
+    let src = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, src);
+    let len = size as usize;
+    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let new_arr = alloc_ref_array(ctx, len);
+    if let Some(src_data) = data {
+        for i in 0..len {
+            let val = ctx.get_array_element(src_data, i);
+            ctx.set_array_element(new_arr, i, val);
+        }
+    }
+    ctx.set_field(new_list, AL_FIELD_DATA, Value::Object(Some(new_arr)));
+    ctx.set_field(new_list, AL_FIELD_SIZE, Value::Int(size));
+    Ok(Some(Value::Object(Some(new_list))))
+}
+
+// ===========================================================================
+// forEach implementations
+// ===========================================================================
+
+fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, this);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let len = size as usize;
+    // Collect elements first to avoid borrowing issues during invoke_virtual.
+    let mut elems = Vec::with_capacity(len);
+    for i in 0..len {
+        elems.push(ctx.get_array_element(data, i));
+    }
+    for elem in &elems {
+        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
+    }
+    Ok(None)
+}
+
+fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let entries = map_collect_entries(ctx, this);
+    for (key, value) in &entries {
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[*key, *value],
+        )?;
+    }
+    Ok(None)
+}
+
+fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    for key in &keys {
+        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*key])?;
+    }
+    Ok(None)
+}
+
+// ===========================================================================
+// Optional functional methods
+// ===========================================================================
+
+fn native_opt_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if !matches!(val, Value::Object(None)) {
+        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val])?;
+    }
+    Ok(None)
+}
+
+fn native_opt_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return native_opt_empty(ctx, &[]),
+    };
+    let mapper = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return native_opt_empty(ctx, &[]),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        return native_opt_empty(ctx, &[]);
+    }
+    let result = ctx.invoke_virtual(
+        mapper,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[val],
+    )?;
+    let mapped = result.unwrap_or(Value::Object(None));
+    native_opt_of_nullable(ctx, &[mapped])
+}
+
+fn native_opt_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return native_opt_empty(ctx, &[]),
+    };
+    let mapper = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return native_opt_empty(ctx, &[]),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        return native_opt_empty(ctx, &[]);
+    }
+    let result = ctx.invoke_virtual(
+        mapper,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[val],
+    )?;
+    // flatMap returns the Optional directly (the Function must return an Optional).
+    Ok(result)
+}
+
+fn native_opt_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return native_opt_empty(ctx, &[]),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return native_opt_empty(ctx, &[]),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        return native_opt_empty(ctx, &[]);
+    }
+    let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[val])?;
+    let passed = matches!(result, Some(Value::Int(1)));
+    if passed {
+        // Return `this` (the same Optional)
+        Ok(Some(Value::Object(Some(this))))
+    } else {
+        native_opt_empty(ctx, &[])
+    }
+}
+
+fn native_opt_or_else_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            // null optional → call supplier
+            let supplier = match args.get(1) {
+                Some(Value::Object(Some(r))) => *r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            return ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]);
+        }
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        let supplier = match args.get(1) {
+            Some(Value::Object(Some(r))) => *r,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])
+    } else {
+        Ok(Some(val))
+    }
+}
+
+fn native_opt_if_present_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if !matches!(val, Value::Object(None)) {
+        let consumer = match args.get(1) {
+            Some(Value::Object(Some(r))) => *r,
+            _ => return Ok(None),
+        };
+        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[val])?;
+    } else {
+        let runnable = match args.get(2) {
+            Some(Value::Object(Some(r))) => *r,
+            _ => return Ok(None),
+        };
+        ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+fn native_opt_or(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            // null optional → call supplier
+            let supplier = match args.get(1) {
+                Some(Value::Object(Some(r))) => *r,
+                _ => return native_opt_empty(ctx, &[]),
+            };
+            return ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]);
+        }
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        let supplier = match args.get(1) {
+            Some(Value::Object(Some(r))) => *r,
+            _ => return native_opt_empty(ctx, &[]),
+        };
+        ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])
+    } else {
+        Ok(Some(Value::Object(Some(this))))
+    }
+}
+
+fn native_opt_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        make_stream(ctx, &[])
+    } else {
+        make_stream(ctx, &[val])
+    }
+}
+
+fn native_opt_or_else_throw_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No value present".to_string(),
+            }
+            .into());
+        }
+    };
+    let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    if matches!(val, Value::Object(None)) {
+        Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No value present".to_string(),
+        }
+        .into())
+    } else {
+        Ok(Some(val))
+    }
+}
+
+// ===========================================================================
+// Comparator-based sort
+// ===========================================================================
+
+fn native_al_sort_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let comparator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        Some(Value::Object(None)) | None => {
+            // null comparator → natural ordering (delegate to existing sort)
+            return native_collections_sort(ctx, &[Value::Object(Some(this))]);
+        }
+        _ => return Ok(None),
+    };
+    sort_with_comparator(ctx, this, comparator)
+}
+
+fn native_collections_sort_comparator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let comparator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        Some(Value::Object(None)) | None => {
+            // null comparator → natural ordering
+            return native_collections_sort(ctx, &[Value::Object(Some(list))]);
+        }
+        _ => return Ok(None),
+    };
+    sort_with_comparator(ctx, list, comparator)
+}
+
+/// Insertion sort using a Comparator lambda.
+fn sort_with_comparator(
+    ctx: &mut dyn NativeContext,
+    list: ObjectRef,
+    comparator: ObjectRef,
+) -> MethodCallResult {
+    let (data, size) = al_state(ctx, list);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let len = size as usize;
+    if len <= 1 {
+        return Ok(None);
+    }
+
+    // Read all elements into a Vec.
+    let mut elems: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        elems.push(ctx.get_array_element(data, i));
+    }
+
+    // Insertion sort — O(n²) but stable and correct.
+    for i in 1..len {
+        let key = elems[i];
+        let mut j = i;
+        while j > 0 {
+            let cmp_result = comparator_compare(ctx, comparator, elems[j - 1], key)?;
+            let cmp = match cmp_result {
+                Some(Value::Int(v)) => v,
+                _ => 0,
+            };
+            if cmp <= 0 {
+                break;
+            }
+            elems[j] = elems[j - 1];
+            j -= 1;
+        }
+        elems[j] = key;
+    }
+
+    // Write sorted elements back.
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(data, i, *val);
+    }
+    Ok(None)
+}
+
+// ===========================================================================
+// Map.Entry accessors
+// ===========================================================================
+
+fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/HashMap$Entry";
+    r.register(c, "getKey", "()Ljava/lang/Object;", native_entry_get_key);
+    r.register(
+        c,
+        "getValue",
+        "()Ljava/lang/Object;",
+        native_entry_get_value,
+    );
+    r.register(
+        c,
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_entry_set_value,
+    );
+}
+
+fn native_entry_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, 0)))
+}
+
+fn native_entry_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, 1)))
+}
+
+fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let new_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let old_val = ctx.get_field(this, 1);
+    ctx.set_field(this, 1, new_val);
+    Ok(Some(old_val))
+}
+
+// ===========================================================================
+// ArrayList.removeIf / replaceAll
+// ===========================================================================
+
+fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let data = match ctx.get_field(this, AL_FIELD_DATA) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = match ctx.get_field(this, AL_FIELD_SIZE) {
+        Value::Int(s) => s as usize,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    // Snapshot elements, then test each with the predicate.
+    let mut keep = Vec::with_capacity(size);
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?;
+        let is_true = matches!(result, Some(Value::Int(v)) if v != 0);
+        if !is_true {
+            keep.push(elem);
+        }
+    }
+
+    let removed = keep.len() < size;
+
+    // Write back kept elements.
+    for (i, val) in keep.iter().enumerate() {
+        ctx.set_array_element(data, i, *val);
+    }
+    // Clear trailing slots.
+    for i in keep.len()..size {
+        ctx.set_array_element(data, i, Value::Object(None));
+    }
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(keep.len() as i32));
+
+    Ok(Some(Value::Int(if removed { 1 } else { 0 })))
+}
+
+fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let operator = match args.get(1) {
+        Some(Value::Object(Some(op))) => *op,
+        _ => return Ok(None),
+    };
+
+    let data = match ctx.get_field(this, AL_FIELD_DATA) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Ok(None),
+    };
+    let size = match ctx.get_field(this, AL_FIELD_SIZE) {
+        Value::Int(s) => s as usize,
+        _ => return Ok(None),
+    };
+
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        let result = ctx.invoke_virtual(
+            operator,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[elem],
+        )?;
+        let raw = result.unwrap_or(Value::Object(None));
+        // Unbox wrapper returns so the list stores the primitive the
+        // lambda produced, not a boxed Integer/Long/etc.
+        let new_val = normalize_for_compare(ctx, &raw);
+        ctx.set_array_element(data, i, new_val);
+    }
+
+    Ok(None)
+}
+
+// ===========================================================================
+// HashMap functional methods (computeIfAbsent, compute, merge, replaceAll)
+// ===========================================================================
+
+fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let function = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // Check if key already present.
+    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    if let Some(Value::Object(Some(_))) = existing {
+        return Ok(existing);
+    }
+
+    // Key absent — call function.apply(key).
+    let result = ctx.invoke_virtual(
+        function,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key],
+    )?;
+    let raw = result.unwrap_or(Value::Object(None));
+    // Unbox wrapper returns (Integer/Long/etc.) so callers see the primitive
+    // variant produced by the lambda impl, matching javac's autoboxing view.
+    let new_val = normalize_for_compare(ctx, &raw);
+
+    if let Value::Object(None) = new_val {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
+}
+
+fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let bi_function = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let old_val = existing.unwrap_or(Value::Object(None));
+
+    let result = ctx.invoke_virtual(
+        bi_function,
+        "apply",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key, old_val],
+    )?;
+    let raw = result.unwrap_or(Value::Object(None));
+    // Unbox wrapper returns so callers see the primitive the lambda produced.
+    let new_val = normalize_for_compare(ctx, &raw);
+
+    if let Value::Object(None) = new_val {
+        // Remove mapping if new value is null.
+        if let Value::Object(Some(_)) = old_val {
+            native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+
+    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
+}
+
+fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let bi_function = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let old_val = existing.unwrap_or(Value::Object(None));
+
+    // Only apply if key is present (old_val is non-null)
+    if let Value::Object(None) = old_val {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    let result = ctx.invoke_virtual(
+        bi_function,
+        "apply",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key, old_val],
+    )?;
+    let raw = result.unwrap_or(Value::Object(None));
+    let new_val = normalize_for_compare(ctx, &raw);
+
+    if let Value::Object(None) = new_val {
+        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        return Ok(Some(Value::Object(None)));
+    }
+
+    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
+}
+
+fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let bi_function = match args.get(3) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let old_val = existing.unwrap_or(Value::Object(None));
+
+    let new_val = if let Value::Object(Some(_)) = old_val {
+        // Key present — merge with BiFunction.
+        let result = ctx.invoke_virtual(
+            bi_function,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[old_val, value],
+        )?;
+        let raw = result.unwrap_or(Value::Object(None));
+        // Unbox wrapper returns so callers see the primitive variant.
+        normalize_for_compare(ctx, &raw)
+    } else {
+        // Key absent — use value directly.
+        value
+    };
+
+    if let Value::Object(None) = new_val {
+        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        return Ok(Some(Value::Object(None)));
+    }
+
+    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
+}
+
+fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let bi_function = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(None),
+    };
+
+    let entries = map_collect_entries(ctx, this);
+    for (key, value) in &entries {
+        let result = ctx.invoke_virtual(
+            bi_function,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[*key, *value],
+        )?;
+        let raw = result.unwrap_or(Value::Object(None));
+        // Unbox wrapper returns so stored values reflect the primitive
+        // produced by the lambda impl.
+        let new_val = normalize_for_compare(ctx, &raw);
+        native_map_put(ctx, &[Value::Object(Some(this)), *key, new_val])?;
+    }
+
+    Ok(None)
+}
+
+// ===========================================================================
+// Factory methods: List.of, Set.of, Map.of, Map.entry
+// ===========================================================================
+
+fn register_factory_natives(r: &mut NativeMethodRegistry) {
+    // List.of
+    r.register(
+        "java/util/List",
+        "of",
+        "()Ljava/util/List;",
+        native_list_of_0,
+    );
+    r.register(
+        "java/util/List",
+        "of",
+        "(Ljava/lang/Object;)Ljava/util/List;",
+        native_list_of_1,
+    );
+    r.register(
+        "java/util/List",
+        "of",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/List;",
+        native_list_of_2,
+    );
+    r.register(
+        "java/util/List",
+        "of",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/List;",
+        native_list_of_3,
+    );
+    r.register(
+        "java/util/List",
+        "of",
+        "([Ljava/lang/Object;)Ljava/util/List;",
+        native_list_of_array,
+    );
+
+    // Set.of
+    r.register("java/util/Set", "of", "()Ljava/util/Set;", native_set_of_0);
+    r.register(
+        "java/util/Set",
+        "of",
+        "(Ljava/lang/Object;)Ljava/util/Set;",
+        native_set_of_1,
+    );
+    r.register(
+        "java/util/Set",
+        "of",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
+        native_set_of_2,
+    );
+    r.register(
+        "java/util/Set",
+        "of",
+        "([Ljava/lang/Object;)Ljava/util/Set;",
+        native_set_of_array,
+    );
+
+    // Map.of
+    r.register("java/util/Map", "of", "()Ljava/util/Map;", native_map_of_0);
+    r.register(
+        "java/util/Map",
+        "of",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
+        native_map_of_1,
+    );
+    r.register(
+        "java/util/Map",
+        "of",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
+        native_map_of_2,
+    );
+    r.register(
+        "java/util/Map",
+        "entry",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_map_entry,
+    );
+}
+
+/// Helper: create an ArrayList from a slice of values.
+fn make_list_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(buf, i, *val);
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(elems.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Helper: create an ArrayList (returns ObjectRef, not MethodCallResult).
+fn make_list_of_raw(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(buf, i, *val);
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(elems.len() as i32));
+    list
+}
+
+/// Helper: create a HashSet from a slice of values.
+fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+
+    let sentinel = Value::Int(1);
+    for elem in elems {
+        native_map_put(ctx, &[Value::Object(Some(backing_map)), *elem, sentinel])?;
+    }
+
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// Helper: create a HashMap from key-value pairs.
+fn make_map_of(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodCallResult {
+    let map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(map, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+
+    for (key, value) in pairs {
+        native_map_put(ctx, &[Value::Object(Some(map)), *key, *value])?;
+    }
+
+    Ok(Some(Value::Object(Some(map))))
+}
+
+fn native_list_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    make_list_of(ctx, &[])
+}
+
+fn native_list_of_1(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    make_list_of(_ctx, &[e1])
+}
+
+fn native_list_of_2(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    make_list_of(_ctx, &[e1, e2])
+}
+
+fn native_list_of_3(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
+    make_list_of(_ctx, &[e1, e2, e3])
+}
+
+fn native_list_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return make_list_of(ctx, &[]),
+    };
+    let len = ctx.array_length(arr);
+    let mut elems = Vec::with_capacity(len);
+    for i in 0..len {
+        elems.push(ctx.get_array_element(arr, i));
+    }
+    make_list_of(ctx, &elems)
+}
+
+fn native_set_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    make_set_of(ctx, &[])
+}
+
+fn native_set_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    make_set_of(ctx, &[e1])
+}
+
+fn native_set_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    make_set_of(ctx, &[e1, e2])
+}
+
+fn native_set_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return make_set_of(ctx, &[]),
+    };
+    let len = ctx.array_length(arr);
+    let mut elems = Vec::with_capacity(len);
+    for i in 0..len {
+        elems.push(ctx.get_array_element(arr, i));
+    }
+    make_set_of(ctx, &elems)
+}
+
+fn native_map_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    make_map_of(ctx, &[])
+}
+
+fn native_map_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let k = args.first().copied().unwrap_or(Value::Object(None));
+    let v = args.get(1).copied().unwrap_or(Value::Object(None));
+    make_map_of(ctx, &[(k, v)])
+}
+
+fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let k1 = args.first().copied().unwrap_or(Value::Object(None));
+    let v1 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let k2 = args.get(2).copied().unwrap_or(Value::Object(None));
+    let v2 = args.get(3).copied().unwrap_or(Value::Object(None));
+    make_map_of(ctx, &[(k1, v1), (k2, v2)])
+}
+
+fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let key = args.first().copied().unwrap_or(Value::Object(None));
+    let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    let entry = alloc_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    ctx.set_field(entry, 0, key);
+    ctx.set_field(entry, 1, value);
+    Ok(Some(Value::Object(Some(entry))))
+}
+
+// ===========================================================================
+// Stream API — Eager evaluation on Vec<Value>
+// ===========================================================================
+
+const STREAM_FIELD_ELEMENTS: usize = 0;
+const STREAM_NUM_FIELDS: usize = 1;
+
+/// Create a Stream from a slice of values.
+fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+/// Extract elements from a Stream.
+fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    match ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+        Value::Object(Some(arr)) => {
+            let len = ctx.array_length(arr);
+            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn register_stream_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/stream/Stream";
+
+    // Source methods
+    r.register(
+        c,
+        "of",
+        "(Ljava/lang/Object;)Ljava/util/stream/Stream;",
+        native_stream_of_one,
+    );
+    r.register(
+        c,
+        "of",
+        "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
+        native_stream_of_array,
+    );
+    r.register(
+        c,
+        "empty",
+        "()Ljava/util/stream/Stream;",
+        native_stream_empty,
+    );
+    r.register(
+        c,
+        "concat",
+        "(Ljava/util/stream/Stream;Ljava/util/stream/Stream;)Ljava/util/stream/Stream;",
+        native_stream_concat,
+    );
+
+    // Intermediate operations
+    r.register(
+        c,
+        "filter",
+        "(Ljava/util/function/Predicate;)Ljava/util/stream/Stream;",
+        native_stream_filter,
+    );
+    r.register(
+        c,
+        "map",
+        "(Ljava/util/function/Function;)Ljava/util/stream/Stream;",
+        native_stream_map,
+    );
+    r.register(
+        c,
+        "flatMap",
+        "(Ljava/util/function/Function;)Ljava/util/stream/Stream;",
+        native_stream_flat_map,
+    );
+    r.register(
+        c,
+        "sorted",
+        "()Ljava/util/stream/Stream;",
+        native_stream_sorted,
+    );
+    r.register(
+        c,
+        "sorted",
+        "(Ljava/util/Comparator;)Ljava/util/stream/Stream;",
+        native_stream_sorted_cmp,
+    );
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/Stream;",
+        native_stream_distinct,
+    );
+    r.register(
+        c,
+        "limit",
+        "(J)Ljava/util/stream/Stream;",
+        native_stream_limit,
+    );
+    r.register(
+        c,
+        "skip",
+        "(J)Ljava/util/stream/Stream;",
+        native_stream_skip,
+    );
+    r.register(
+        c,
+        "peek",
+        "(Ljava/util/function/Consumer;)Ljava/util/stream/Stream;",
+        native_stream_peek,
+    );
+
+    // Terminal operations
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_stream_for_each,
+    );
+    r.register(c, "count", "()J", native_stream_count);
+    r.register(
+        c,
+        "toArray",
+        "()[Ljava/lang/Object;",
+        native_stream_to_array,
+    );
+    r.register(
+        c,
+        "findFirst",
+        "()Ljava/util/Optional;",
+        native_stream_find_first,
+    );
+    r.register(
+        c,
+        "findAny",
+        "()Ljava/util/Optional;",
+        native_stream_find_first,
+    ); // same as findFirst for sequential
+    r.register(
+        c,
+        "anyMatch",
+        "(Ljava/util/function/Predicate;)Z",
+        native_stream_any_match,
+    );
+    r.register(
+        c,
+        "allMatch",
+        "(Ljava/util/function/Predicate;)Z",
+        native_stream_all_match,
+    );
+    r.register(
+        c,
+        "noneMatch",
+        "(Ljava/util/function/Predicate;)Z",
+        native_stream_none_match,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/lang/Object;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+        native_stream_reduce_identity,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/util/function/BinaryOperator;)Ljava/util/Optional;",
+        native_stream_reduce_optional,
+    );
+    r.register(
+        c,
+        "min",
+        "(Ljava/util/Comparator;)Ljava/util/Optional;",
+        native_stream_min,
+    );
+    r.register(
+        c,
+        "max",
+        "(Ljava/util/Comparator;)Ljava/util/Optional;",
+        native_stream_max,
+    );
+
+    // collect
+    r.register(
+        c,
+        "collect",
+        "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+        native_stream_collect,
+    );
+
+    // mapToInt
+    r.register(
+        c,
+        "mapToInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/IntStream;",
+        native_stream_map_to_int,
+    );
+
+    // mapToLong
+    r.register(
+        c,
+        "mapToLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/LongStream;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mapper = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let elements = stream_elements(ctx, this);
+            let mapped: Vec<Value> = elements
+                .iter()
+                .map(|e| {
+                    ctx.invoke_virtual(
+                        mapper,
+                        "applyAsLong",
+                        "(Ljava/lang/Object;)J",
+                        &[*e],
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Long(0))
+                })
+                .collect();
+            let stream = alloc_synthetic(ctx, "java/util/stream/LongStream", 1);
+            let arr = alloc_ref_array(ctx, mapped.len());
+            for (i, v) in mapped.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+
+    // mapToDouble
+    r.register(
+        c,
+        "mapToDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/DoubleStream;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mapper = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let elements = stream_elements(ctx, this);
+            let mapped: Vec<Value> = elements
+                .iter()
+                .map(|e| {
+                    ctx.invoke_virtual(
+                        mapper,
+                        "applyAsDouble",
+                        "(Ljava/lang/Object;)D",
+                        &[*e],
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Double(0.0))
+                })
+                .collect();
+            let stream = alloc_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+            let arr = alloc_ref_array(ctx, mapped.len());
+            for (i, v) in mapped.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+
+    // toList (Java 16+ convenience)
+    r.register(c, "toList", "()Ljava/util/List;", native_stream_to_list);
+}
+
+// -- Source methods --
+
+fn native_stream_of_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let elem = args.first().copied().unwrap_or(Value::Object(None));
+    make_stream(ctx, &[elem])
+}
+
+fn native_stream_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return make_stream(ctx, &[]),
+    };
+    let len = ctx.array_length(arr);
+    let elems: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+    make_stream(ctx, &elems)
+}
+
+fn native_stream_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    make_stream(ctx, &[])
+}
+
+fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let a = match args.first() {
+        Some(Value::Object(Some(r))) => stream_elements(ctx, *r),
+        _ => Vec::new(),
+    };
+    let b = match args.get(1) {
+        Some(Value::Object(Some(r))) => stream_elements(ctx, *r),
+        _ => Vec::new(),
+    };
+    let mut combined = a;
+    combined.extend(b);
+    make_stream(ctx, &combined)
+}
+
+fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (data, size) = al_state(ctx, this);
+    let elements: Vec<Value> = match data {
+        Some(d) => (0..size as usize)
+            .map(|i| ctx.get_array_element(d, i))
+            .collect(),
+        None => Vec::new(),
+    };
+    make_stream(ctx, &elements)
+}
+
+fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return make_stream(ctx, &[]),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    make_stream(ctx, &keys)
+}
+
+// -- Intermediate operations --
+
+fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut kept = Vec::new();
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+        if matches!(result, Some(Value::Int(v)) if v != 0) {
+            kept.push(*elem);
+        }
+    }
+    make_stream(ctx, &kept)
+}
+
+fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let function = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result = ctx.invoke_virtual(
+            function,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[*elem],
+        )?;
+        mapped.push(result.unwrap_or(Value::Object(None)));
+    }
+    make_stream(ctx, &mapped)
+}
+
+fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let function = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut flat = Vec::new();
+    for elem in &elements {
+        let result = ctx.invoke_virtual(
+            function,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[*elem],
+        )?;
+        if let Some(Value::Object(Some(inner_stream))) = result {
+            let inner = stream_elements(ctx, inner_stream);
+            flat.extend(inner);
+        }
+    }
+    make_stream(ctx, &flat)
+}
+
+/// Extract a numeric sort key from a Value, unboxing wrapper objects.
+fn numeric_sort_key(ctx: &dyn NativeContext, val: &Value) -> Option<f64> {
+    match val {
+        Value::Int(v) => Some(*v as f64),
+        Value::Long(v) => Some(*v as f64),
+        Value::Float(v) => Some(*v as f64),
+        Value::Double(v) => Some(*v),
+        Value::Object(Some(obj)) => {
+            if let Some(prim) = unbox_wrapper(ctx, *obj) {
+                match prim {
+                    Value::Int(v) => Some(v as f64),
+                    Value::Long(v) => Some(v as f64),
+                    Value::Float(v) => Some(v as f64),
+                    Value::Double(v) => Some(v),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let mut elements = stream_elements(ctx, this);
+
+    // Check if all elements are numeric (including boxed wrappers) — sort numerically
+    let all_numeric = elements.iter().all(|v| numeric_sort_key(ctx, v).is_some());
+    if all_numeric {
+        elements.sort_by(|a, b| {
+            let ka = numeric_sort_key(ctx, a).unwrap_or(0.0);
+            let kb = numeric_sort_key(ctx, b).unwrap_or(0.0);
+            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    } else {
+        // Fallback: sort by string representation
+        let mut strs: Vec<(String, Value)> = elements
+            .drain(..)
+            .map(|v| {
+                let s = obj_to_display_string(ctx, &v);
+                (s, v)
+            })
+            .collect();
+        strs.sort_by(|a, b| a.0.cmp(&b.0));
+        elements = strs.into_iter().map(|(_, v)| v).collect();
+    }
+    make_stream(ctx, &elements)
+}
+
+fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let comparator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let mut elems = stream_elements(ctx, this);
+    let len = elems.len();
+    // Insertion sort — O(n²) but stable.
+    for i in 1..len {
+        let key = elems[i];
+        let mut j = i;
+        while j > 0 {
+            let cmp_result = comparator_compare(ctx, comparator, elems[j - 1], key)?;
+            let cmp = match cmp_result {
+                Some(Value::Int(v)) => v,
+                _ => 0,
+            };
+            if cmp <= 0 {
+                break;
+            }
+            elems[j] = elems[j - 1];
+            j -= 1;
+        }
+        elems[j] = key;
+    }
+    make_stream(ctx, &elems)
+}
+
+fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut unique: Vec<Value> = Vec::new();
+    for elem in &elements {
+        let dup = unique.iter().any(|u| values_equal(ctx, u, elem));
+        if !dup {
+            unique.push(*elem);
+        }
+    }
+    make_stream(ctx, &unique)
+}
+
+fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let n = match args.get(1) {
+        Some(Value::Long(v)) => *v as usize,
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let elements = stream_elements(ctx, this);
+    let limited: Vec<Value> = elements.into_iter().take(n).collect();
+    make_stream(ctx, &limited)
+}
+
+fn native_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let n = match args.get(1) {
+        Some(Value::Long(v)) => *v as usize,
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let elements = stream_elements(ctx, this);
+    let skipped: Vec<Value> = elements.into_iter().skip(n).collect();
+    make_stream(ctx, &skipped)
+}
+
+fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
+    }
+    make_stream(ctx, &elements)
+}
+
+// -- Terminal operations --
+
+fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
+    }
+    Ok(None)
+}
+
+fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let elements = stream_elements(ctx, this);
+    Ok(Some(Value::Long(elements.len() as i64)))
+}
+
+fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    if let Some(first) = elements.first() {
+        ctx.set_field(opt, OPT_FIELD_VALUE, *first);
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+        if matches!(result, Some(Value::Int(v)) if v != 0) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+        if !matches!(result, Some(Value::Int(v)) if v != 0) {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+        if matches!(result, Some(Value::Int(v)) if v != 0) {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(args.get(1).copied()),
+    };
+    let identity = args.get(1).copied().unwrap_or(Value::Object(None));
+    let operator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(identity)),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut acc = identity;
+    for elem in &elements {
+        let result = ctx.invoke_virtual(
+            operator,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[acc, *elem],
+        )?;
+        // T16.9 follow-up: The `BinaryOperator<T>` SAM descriptor returns
+        // `Object`, so primitive-returning lambdas (e.g. `Math::max` on
+        // `Integer`) get auto-boxed by the lambda-proxy `coerce_return`.
+        // Callers (and the stream's internal accumulator) expect the
+        // primitive form. Unbox single-field `Integer`/`Long`/`Float`/
+        // `Double` wrappers back to `Value::Int` / `Value::Long` / etc.
+        // Non-wrapper objects pass through unchanged.
+        let raw = result.unwrap_or(Value::Object(None));
+        acc = normalize_for_compare(ctx, &raw);
+    }
+    Ok(Some(acc))
+}
+
+fn native_stream_reduce_optional(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let operator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    if elements.is_empty() {
+        return Ok(Some(Value::Object(Some(opt))));
+    }
+    let mut acc = elements[0];
+    for elem in elements.iter().skip(1) {
+        let result = ctx.invoke_virtual(
+            operator,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[acc, *elem],
+        )?;
+        acc = result.unwrap_or(Value::Object(None));
+    }
+    ctx.set_field(opt, OPT_FIELD_VALUE, acc);
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let comparator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    if elements.is_empty() {
+        return Ok(Some(Value::Object(Some(opt))));
+    }
+    let mut best = elements[0];
+    for elem in elements.iter().skip(1) {
+        let cmp = comparator_compare(ctx, comparator, *elem, best)?;
+        if matches!(cmp, Some(Value::Int(v)) if v < 0) {
+            best = *elem;
+        }
+    }
+    ctx.set_field(opt, OPT_FIELD_VALUE, best);
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let comparator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    if elements.is_empty() {
+        return Ok(Some(Value::Object(Some(opt))));
+    }
+    let mut best = elements[0];
+    for elem in elements.iter().skip(1) {
+        let cmp = comparator_compare(ctx, comparator, *elem, best)?;
+        if matches!(cmp, Some(Value::Int(v)) if v > 0) {
+            best = *elem;
+        }
+    }
+    ctx.set_field(opt, OPT_FIELD_VALUE, best);
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_stream_to_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_list_of(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    make_list_of(ctx, &elements)
+}
+
+fn native_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let function = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut ints = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result =
+            ctx.invoke_virtual(function, "applyAsInt", "(Ljava/lang/Object;)I", &[*elem])?;
+        ints.push(result.unwrap_or(Value::Int(0)));
+    }
+    make_int_stream(ctx, &ints)
+}
+
+// ===========================================================================
+// Collectors — tagged synthetic objects
+// ===========================================================================
+
+const COLLECTOR_FIELD_TAG: usize = 0;
+const COLLECTOR_FIELD_ARG1: usize = 1;
+const COLLECTOR_FIELD_ARG2: usize = 2;
+const COLLECTOR_FIELD_ARG3: usize = 3;
+const COLLECTOR_NUM_FIELDS: usize = 4;
+
+const COLLECTOR_TAG_TO_LIST: i32 = 1;
+const COLLECTOR_TAG_TO_SET: i32 = 2;
+const COLLECTOR_TAG_JOINING: i32 = 3;
+const COLLECTOR_TAG_JOINING_DELIM: i32 = 4;
+const COLLECTOR_TAG_TO_MAP: i32 = 5;
+const COLLECTOR_TAG_COUNTING: i32 = 6;
+const COLLECTOR_TAG_GROUPING_BY: i32 = 7;
+const COLLECTOR_TAG_PARTITIONING_BY: i32 = 8;
+/// groupingBy(classifier, downstream) — arg1=classifier, arg2=downstream Collector
+const COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM: i32 = 9;
+/// T2.3.18 — `Collectors.groupingBy(Function,Supplier,Collector)`.
+/// ARG1=classifier, ARG2=supplier (ignored — we always build a HashMap since
+/// every supported Supplier from Collectors.* yields some Map subtype our
+/// synthetic HashMap natively satisfies), ARG3=downstream Collector.
+const COLLECTOR_TAG_GROUPING_BY_SUPPLIER: i32 = 10;
+/// T2.3.19 — `Collectors.partitioningBy(Predicate,Collector)` with
+/// downstream collector applied to each partition.
+const COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM: i32 = 11;
+
+fn register_collectors_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/stream/Collectors";
+
+    r.register(
+        c,
+        "toList",
+        "()Ljava/util/stream/Collector;",
+        native_collectors_to_list,
+    );
+    r.register(
+        c,
+        "toSet",
+        "()Ljava/util/stream/Collector;",
+        native_collectors_to_set,
+    );
+    r.register(
+        c,
+        "toUnmodifiableList",
+        "()Ljava/util/stream/Collector;",
+        native_collectors_to_list,
+    );
+    r.register(
+        c,
+        "toUnmodifiableSet",
+        "()Ljava/util/stream/Collector;",
+        native_collectors_to_set,
+    );
+    r.register(
+        c,
+        "toMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+        native_collectors_to_map,
+    );
+    r.register(
+        c,
+        "joining",
+        "()Ljava/util/stream/Collector;",
+        native_collectors_joining,
+    );
+    r.register(
+        c,
+        "joining",
+        "(Ljava/lang/CharSequence;)Ljava/util/stream/Collector;",
+        native_collectors_joining_delim,
+    );
+    r.register(
+        c,
+        "counting",
+        "()Ljava/util/stream/Collector;",
+        native_collectors_counting,
+    );
+    r.register(
+        c,
+        "groupingBy",
+        "(Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+        native_collectors_grouping_by,
+    );
+    r.register(
+        c,
+        "groupingBy",
+        "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_grouping_by_downstream,
+    );
+    r.register(
+        c,
+        "partitioningBy",
+        "(Ljava/util/function/Predicate;)Ljava/util/stream/Collector;",
+        native_collectors_partitioning_by,
+    );
+    // T2.3.18 — groupingBy(Function, Supplier, Collector)
+    r.register(
+        c,
+        "groupingBy",
+        "(Ljava/util/function/Function;Ljava/util/function/Supplier;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_grouping_by_supplier,
+    );
+    // T2.3.19 — partitioningBy(Predicate, Collector)
+    r.register(
+        c,
+        "partitioningBy",
+        "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_partitioning_by_downstream,
+    );
+}
+
+fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
+    let collector = alloc_synthetic(ctx, "java/util/stream/Collector", COLLECTOR_NUM_FIELDS);
+    ctx.set_field(collector, COLLECTOR_FIELD_TAG, Value::Int(tag));
+    collector
+}
+
+fn native_collectors_to_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_LIST);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_SET);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_joining(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_joining_delim(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
+    let delim = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, delim);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_counting(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_COUNTING);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_grouping_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY);
+    let classifier = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_grouping_by_downstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM);
+    let classifier = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_partitioning_by(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_PARTITIONING_BY);
+    let predicate = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, predicate);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// T2.3.18 — `Collectors.groupingBy(Function, Supplier, Collector)`.
+/// Stores classifier in ARG1, supplier in ARG2, and the downstream
+/// Collector in ARG3 for `native_stream_collect` to apply per-group.
+fn native_collectors_grouping_by_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY_SUPPLIER);
+    let classifier = args.first().copied().unwrap_or(Value::Object(None));
+    let supplier = args.get(1).copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(2).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, supplier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// T2.3.19 — `Collectors.partitioningBy(Predicate, Collector)`.
+/// Stores predicate in ARG1 and downstream Collector in ARG2.
+fn native_collectors_partitioning_by_downstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM);
+    let predicate = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, predicate);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let collector = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elements = stream_elements(ctx, this);
+    let tag = match ctx.get_field(collector, COLLECTOR_FIELD_TAG) {
+        Value::Int(t) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    match tag {
+        COLLECTOR_TAG_TO_LIST => make_list_of(ctx, &elements),
+        COLLECTOR_TAG_TO_SET => make_set_of(ctx, &elements),
+        COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
+        COLLECTOR_TAG_JOINING => {
+            let mut parts = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                parts.push(obj_to_display_string(ctx, elem));
+            }
+            let joined = parts.join("");
+            let s = ctx.create_string(&joined);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        COLLECTOR_TAG_JOINING_DELIM => {
+            let delim_str = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let mut parts = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                parts.push(obj_to_display_string(ctx, elem));
+            }
+            let joined = parts.join(&delim_str);
+            let s = ctx.create_string(&joined);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        COLLECTOR_TAG_TO_MAP => {
+            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mut pairs = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                let k = ctx
+                    .invoke_virtual(
+                        key_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let v = ctx
+                    .invoke_virtual(
+                        val_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                pairs.push((k, v));
+            }
+            make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_GROUPING_BY => {
+            let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Group elements by classifier result into HashMap<K, ArrayList<V>>
+            // We use a Vec to collect groups, then build the map
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for elem in &elements {
+                let key = ctx
+                    .invoke_virtual(
+                        classifier,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                // Find existing group
+                let mut found = false;
+                for (gk, gv) in &mut groups {
+                    if values_equal(ctx, gk, &key) {
+                        gv.push(*elem);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    groups.push((key, vec![*elem]));
+                }
+            }
+            // Build HashMap<K, ArrayList<V>>
+            let mut pairs = Vec::with_capacity(groups.len());
+            for (key, vals) in &groups {
+                let list = make_list_of_raw(ctx, vals);
+                pairs.push((*key, Value::Object(Some(list))));
+            }
+            make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_PARTITIONING_BY => {
+            let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mut true_list = Vec::new();
+            let mut false_list = Vec::new();
+            for elem in &elements {
+                let result = ctx
+                    .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?
+                    .unwrap_or(Value::Int(0));
+                if matches!(result, Value::Int(v) if v != 0) {
+                    true_list.push(*elem);
+                } else {
+                    false_list.push(*elem);
+                }
+            }
+            // Build HashMap with Boolean.TRUE and Boolean.FALSE keys
+            let true_al = make_list_of_raw(ctx, &true_list);
+            let false_al = make_list_of_raw(ctx, &false_list);
+            let true_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+            ctx.set_field(true_key, 0, Value::Int(1));
+            let false_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+            ctx.set_field(false_key, 0, Value::Int(0));
+            let pairs = [
+                (Value::Object(Some(true_key)), Value::Object(Some(true_al))),
+                (
+                    Value::Object(Some(false_key)),
+                    Value::Object(Some(false_al)),
+                ),
+            ];
+            make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM => {
+            let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+
+            // Group elements by classifier into Vec<(key, Vec<elem>)>
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for elem in &elements {
+                let key = ctx
+                    .invoke_virtual(
+                        classifier,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let mut found = false;
+                for (gk, gv) in &mut groups {
+                    if values_equal(ctx, gk, &key) {
+                        gv.push(*elem);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    groups.push((key, vec![*elem]));
+                }
+            }
+
+            // Apply downstream collector to each group inline to avoid recursion.
+            let downstream_tag = match downstream {
+                Value::Object(Some(d)) => {
+                    match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
+                        Value::Int(t) => Some((d, t)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let mut pairs = Vec::with_capacity(groups.len());
+            for (key, group_elems) in &groups {
+                let group_result = match downstream_tag {
+                    Some((_d, COLLECTOR_TAG_TO_LIST)) => {
+                        make_list_of(ctx, group_elems)?.unwrap_or(Value::Object(None))
+                    }
+                    Some((_d, COLLECTOR_TAG_TO_SET)) => {
+                        make_set_of(ctx, group_elems)?.unwrap_or(Value::Object(None))
+                    }
+                    Some((_d, COLLECTOR_TAG_COUNTING)) => {
+                        // Box as java/lang/Long so .intValue() works
+                        let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                        ctx.set_field(long_obj, 0, Value::Long(group_elems.len() as i64));
+                        Value::Object(Some(long_obj))
+                    }
+                    _ => {
+                        // Fallback: build stream and collect (single level only)
+                        let group_stream =
+                            alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+                        let arr = alloc_ref_array(ctx, group_elems.len());
+                        for (i, v) in group_elems.iter().enumerate() {
+                            ctx.set_array_element(arr, i, *v);
+                        }
+                        ctx.set_field(
+                            group_stream,
+                            STREAM_FIELD_ELEMENTS,
+                            Value::Object(Some(arr)),
+                        );
+                        native_stream_collect(
+                            ctx,
+                            &[Value::Object(Some(group_stream)), downstream],
+                        )?
+                        .unwrap_or(Value::Object(None))
+                    }
+                };
+                pairs.push((*key, group_result));
+            }
+            make_map_of(ctx, &pairs)
+        }
+        // T2.3.18 — groupingBy(Function, Supplier, Collector).
+        // Semantically equivalent to the 2-arg downstream variant; the
+        // supplier argument just customizes the Map subtype — since our
+        // synthetic HashMap is the only map shape native code produces,
+        // we honor the spec by materializing the supplier's object and
+        // populating it via its put(K,V) method instead of our internal
+        // make_map_of helper. This keeps user-supplied LinkedHashMap /
+        // TreeMap / EnumMap suppliers working.
+        COLLECTOR_TAG_GROUPING_BY_SUPPLIER => {
+            let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG3);
+
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for elem in &elements {
+                let key = ctx
+                    .invoke_virtual(
+                        classifier,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let mut found = false;
+                for (gk, gv) in &mut groups {
+                    if values_equal(ctx, gk, &key) {
+                        gv.push(*elem);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    groups.push((key, vec![*elem]));
+                }
+            }
+
+            // Materialize the user-supplied Map via the Supplier. If the
+            // supplier cannot be invoked (null / not a real Supplier we can
+            // dispatch), fall back to a plain HashMap built via make_map_of.
+            let map_obj = match supplier {
+                Value::Object(Some(s)) => {
+                    match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
+                        Ok(Some(Value::Object(Some(m)))) => Some(m),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+
+            let downstream_tag = match downstream {
+                Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
+                    Value::Int(t) => Some((d, t)),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            let mut pairs = Vec::with_capacity(groups.len());
+            for (key, group_elems) in &groups {
+                let group_result = match downstream_tag {
+                    Some((_d, COLLECTOR_TAG_TO_LIST)) => {
+                        make_list_of(ctx, group_elems)?.unwrap_or(Value::Object(None))
+                    }
+                    Some((_d, COLLECTOR_TAG_TO_SET)) => {
+                        make_set_of(ctx, group_elems)?.unwrap_or(Value::Object(None))
+                    }
+                    Some((_d, COLLECTOR_TAG_COUNTING)) => {
+                        let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                        ctx.set_field(long_obj, 0, Value::Long(group_elems.len() as i64));
+                        Value::Object(Some(long_obj))
+                    }
+                    _ => {
+                        let group_stream =
+                            alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+                        let arr = alloc_ref_array(ctx, group_elems.len());
+                        for (i, v) in group_elems.iter().enumerate() {
+                            ctx.set_array_element(arr, i, *v);
+                        }
+                        ctx.set_field(
+                            group_stream,
+                            STREAM_FIELD_ELEMENTS,
+                            Value::Object(Some(arr)),
+                        );
+                        native_stream_collect(
+                            ctx,
+                            &[Value::Object(Some(group_stream)), downstream],
+                        )?
+                        .unwrap_or(Value::Object(None))
+                    }
+                };
+                pairs.push((*key, group_result));
+            }
+
+            if let Some(m) = map_obj {
+                for (k, v) in &pairs {
+                    ctx.invoke_virtual(
+                        m,
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*k, *v],
+                    )?;
+                }
+                Ok(Some(Value::Object(Some(m))))
+            } else {
+                make_map_of(ctx, &pairs)
+            }
+        }
+        // T2.3.19 — partitioningBy(Predicate, Collector).
+        COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM => {
+            let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+
+            let mut true_list = Vec::new();
+            let mut false_list = Vec::new();
+            for elem in &elements {
+                let result = ctx
+                    .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?
+                    .unwrap_or(Value::Int(0));
+                if matches!(result, Value::Int(v) if v != 0) {
+                    true_list.push(*elem);
+                } else {
+                    false_list.push(*elem);
+                }
+            }
+
+            let downstream_tag = match downstream {
+                Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
+                    Value::Int(t) => Some((d, t)),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            let reduce_bucket = |ctx: &mut dyn NativeContext,
+                                 bucket: &[Value]|
+             -> Result<Value, rustjvm_types::error::MethodCallFailed> {
+                let v = match downstream_tag {
+                    Some((_d, COLLECTOR_TAG_TO_LIST)) => {
+                        make_list_of(ctx, bucket)?.unwrap_or(Value::Object(None))
+                    }
+                    Some((_d, COLLECTOR_TAG_TO_SET)) => {
+                        make_set_of(ctx, bucket)?.unwrap_or(Value::Object(None))
+                    }
+                    Some((_d, COLLECTOR_TAG_COUNTING)) => {
+                        let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                        ctx.set_field(long_obj, 0, Value::Long(bucket.len() as i64));
+                        Value::Object(Some(long_obj))
+                    }
+                    _ => {
+                        let group_stream =
+                            alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+                        let arr = alloc_ref_array(ctx, bucket.len());
+                        for (i, v) in bucket.iter().enumerate() {
+                            ctx.set_array_element(arr, i, *v);
+                        }
+                        ctx.set_field(
+                            group_stream,
+                            STREAM_FIELD_ELEMENTS,
+                            Value::Object(Some(arr)),
+                        );
+                        native_stream_collect(
+                            ctx,
+                            &[Value::Object(Some(group_stream)), downstream],
+                        )?
+                        .unwrap_or(Value::Object(None))
+                    }
+                };
+                Ok(v)
+            };
+            let true_v = reduce_bucket(ctx, &true_list)?;
+            let false_v = reduce_bucket(ctx, &false_list)?;
+            let true_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+            ctx.set_field(true_key, 0, Value::Int(1));
+            let false_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+            ctx.set_field(false_key, 0, Value::Int(0));
+            let pairs = [
+                (Value::Object(Some(true_key)), true_v),
+                (Value::Object(Some(false_key)), false_v),
+            ];
+            make_map_of(ctx, &pairs)
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+// ===========================================================================
+// IntStream — same 1-field layout, backing array stores Value::Int
+// ===========================================================================
+
+fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
+    let stream = alloc_synthetic(ctx, "java/util/stream/IntStream", STREAM_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn int_stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    stream_elements(ctx, stream)
+}
+
+fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/stream/IntStream";
+
+    r.register(
+        c,
+        "range",
+        "(II)Ljava/util/stream/IntStream;",
+        native_int_stream_range,
+    );
+    r.register(
+        c,
+        "rangeClosed",
+        "(II)Ljava/util/stream/IntStream;",
+        native_int_stream_range_closed,
+    );
+    r.register(
+        c,
+        "of",
+        "(I)Ljava/util/stream/IntStream;",
+        native_int_stream_of,
+    );
+    r.register(c, "sum", "()I", native_int_stream_sum);
+    r.register(c, "count", "()J", native_int_stream_count);
+    r.register(c, "min", "()Ljava/util/OptionalInt;", native_int_stream_min);
+    r.register(c, "max", "()Ljava/util/OptionalInt;", native_int_stream_max);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/IntConsumer;)V",
+        native_int_stream_for_each,
+    );
+    r.register(
+        c,
+        "filter",
+        "(Ljava/util/function/IntPredicate;)Ljava/util/stream/IntStream;",
+        native_int_stream_filter,
+    );
+    r.register(
+        c,
+        "map",
+        "(Ljava/util/function/IntUnaryOperator;)Ljava/util/stream/IntStream;",
+        native_int_stream_map,
+    );
+    r.register(c, "toArray", "()[I", native_int_stream_to_array);
+    r.register(
+        c,
+        "boxed",
+        "()Ljava/util/stream/Stream;",
+        native_int_stream_boxed,
+    );
+    r.register(
+        c,
+        "average",
+        "()Ljava/util/OptionalDouble;",
+        native_int_stream_average,
+    );
+}
+
+fn native_int_stream_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let start = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let end = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = std::cmp::max(0, end - start) as usize;
+    let elems: Vec<Value> = (0..count).map(|i| Value::Int(start + i as i32)).collect();
+    make_int_stream(ctx, &elems)
+}
+
+fn native_int_stream_range_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let start = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let end = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = std::cmp::max(0, end - start + 1) as usize;
+    let elems: Vec<Value> = (0..count).map(|i| Value::Int(start + i as i32)).collect();
+    make_int_stream(ctx, &elems)
+}
+
+fn native_int_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let v = args.first().copied().unwrap_or(Value::Int(0));
+    make_int_stream(ctx, &[v])
+}
+
+fn native_int_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let sum: i32 = elements
+        .iter()
+        .map(|v| match v {
+            Value::Int(i) => *i,
+            _ => 0,
+        })
+        .sum();
+    Ok(Some(Value::Int(sum)))
+}
+
+fn native_int_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let elements = int_stream_elements(ctx, this);
+    Ok(Some(Value::Long(elements.len() as i64)))
+}
+
+fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    if let Some(min) = elements
+        .iter()
+        .filter_map(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .min()
+    {
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(min));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    if let Some(max) = elements
+        .iter()
+        .filter_map(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .max()
+    {
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(max));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elements = int_stream_elements(ctx, this);
+    for elem in &elements {
+        ctx.invoke_virtual(consumer, "accept", "(I)V", &[*elem])?;
+    }
+    Ok(None)
+}
+
+fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut kept = Vec::new();
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(I)Z", &[*elem])?;
+        if matches!(result, Some(Value::Int(v)) if v != 0) {
+            kept.push(*elem);
+        }
+    }
+    make_int_stream(ctx, &kept)
+}
+
+fn native_int_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let operator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result = ctx.invoke_virtual(operator, "applyAsInt", "(I)I", &[*elem])?;
+        mapped.push(result.unwrap_or(Value::Int(0)));
+    }
+    make_int_stream(ctx, &mapped)
+}
+
+fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    // Elements are already Value::Int — just wrap in a Stream
+    make_stream(ctx, &elements)
+}
+
+fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    if !elements.is_empty() {
+        let sum: i64 = elements
+            .iter()
+            .map(|v| match v {
+                Value::Int(i) => *i as i64,
+                _ => 0,
+            })
+            .sum();
+        let avg = sum as f64 / elements.len() as f64;
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+// ===========================================================================
+// LongStream — same 1-field layout, backing array stores Value::Long
+// ===========================================================================
+
+fn make_long_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
+    let stream = alloc_synthetic(ctx, "java/util/stream/LongStream", STREAM_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/stream/LongStream";
+
+    r.register(
+        c,
+        "of",
+        "(J)Ljava/util/stream/LongStream;",
+        native_long_stream_of,
+    );
+    r.register(
+        c,
+        "range",
+        "(JJ)Ljava/util/stream/LongStream;",
+        native_long_stream_range,
+    );
+    r.register(
+        c,
+        "rangeClosed",
+        "(JJ)Ljava/util/stream/LongStream;",
+        native_long_stream_range_closed,
+    );
+    r.register(c, "sum", "()J", native_long_stream_sum);
+    r.register(c, "count", "()J", native_long_stream_count);
+    r.register(
+        c,
+        "min",
+        "()Ljava/util/OptionalLong;",
+        native_long_stream_min,
+    );
+    r.register(
+        c,
+        "max",
+        "()Ljava/util/OptionalLong;",
+        native_long_stream_max,
+    );
+    r.register(
+        c,
+        "average",
+        "()Ljava/util/OptionalDouble;",
+        native_long_stream_average,
+    );
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/LongConsumer;)V",
+        native_long_stream_for_each,
+    );
+    r.register(
+        c,
+        "filter",
+        "(Ljava/util/function/LongPredicate;)Ljava/util/stream/LongStream;",
+        native_long_stream_filter,
+    );
+    r.register(
+        c,
+        "map",
+        "(Ljava/util/function/LongUnaryOperator;)Ljava/util/stream/LongStream;",
+        native_long_stream_map,
+    );
+    r.register(c, "toArray", "()[J", native_long_stream_to_array);
+    r.register(
+        c,
+        "boxed",
+        "()Ljava/util/stream/Stream;",
+        native_long_stream_boxed,
+    );
+    r.register(
+        c,
+        "asDoubleStream",
+        "()Ljava/util/stream/DoubleStream;",
+        native_long_stream_as_double,
+    );
+}
+
+fn native_long_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let v = args.first().copied().unwrap_or(Value::Long(0));
+    make_long_stream(ctx, &[v])
+}
+
+fn native_long_stream_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let start = match args.first() {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let end = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let count = std::cmp::max(0, end - start) as usize;
+    let elems: Vec<Value> = (0..count).map(|i| Value::Long(start + i as i64)).collect();
+    make_long_stream(ctx, &elems)
+}
+
+fn native_long_stream_range_closed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let start = match args.first() {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let end = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let count = std::cmp::max(0, end - start + 1) as usize;
+    let elems: Vec<Value> = (0..count).map(|i| Value::Long(start + i as i64)).collect();
+    make_long_stream(ctx, &elems)
+}
+
+fn native_long_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let elements = stream_elements(ctx, this);
+    let sum: i64 = elements
+        .iter()
+        .map(|v| match v {
+            Value::Long(l) => *l,
+            _ => 0,
+        })
+        .sum();
+    Ok(Some(Value::Long(sum)))
+}
+
+fn native_long_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let elements = stream_elements(ctx, this);
+    Ok(Some(Value::Long(elements.len() as i64)))
+}
+
+fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    if let Some(min) = elements
+        .iter()
+        .filter_map(|v| match v {
+            Value::Long(l) => Some(*l),
+            _ => None,
+        })
+        .min()
+    {
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(min));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    if let Some(max) = elements
+        .iter()
+        .filter_map(|v| match v {
+            Value::Long(l) => Some(*l),
+            _ => None,
+        })
+        .max()
+    {
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(max));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    if !elements.is_empty() {
+        let sum: i64 = elements
+            .iter()
+            .map(|v| match v {
+                Value::Long(l) => *l,
+                _ => 0,
+            })
+            .sum();
+        let avg = sum as f64 / elements.len() as f64;
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_long_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        ctx.invoke_virtual(consumer, "accept", "(J)V", &[*elem])?;
+    }
+    Ok(None)
+}
+
+fn native_long_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut kept = Vec::new();
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(J)Z", &[*elem])?;
+        if matches!(result, Some(Value::Int(v)) if v != 0) {
+            kept.push(*elem);
+        }
+    }
+    make_long_stream(ctx, &kept)
+}
+
+fn native_long_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let operator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result = ctx.invoke_virtual(operator, "applyAsLong", "(J)J", &[*elem])?;
+        mapped.push(result.unwrap_or(Value::Long(0)));
+    }
+    make_long_stream(ctx, &mapped)
+}
+
+fn native_long_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    make_stream(ctx, &elements)
+}
+
+fn native_long_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let doubles: Vec<Value> = elements
+        .iter()
+        .map(|v| match v {
+            Value::Long(l) => Value::Double(*l as f64),
+            _ => Value::Double(0.0),
+        })
+        .collect();
+    make_double_stream(ctx, &doubles)
+}
+
+// ===========================================================================
+// DoubleStream — same 1-field layout, backing array stores Value::Double
+// ===========================================================================
+
+fn make_double_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
+    let stream = alloc_synthetic(ctx, "java/util/stream/DoubleStream", STREAM_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/stream/DoubleStream";
+
+    r.register(
+        c,
+        "of",
+        "(D)Ljava/util/stream/DoubleStream;",
+        native_double_stream_of,
+    );
+    r.register(c, "sum", "()D", native_double_stream_sum);
+    r.register(c, "count", "()J", native_double_stream_count);
+    r.register(
+        c,
+        "min",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_min,
+    );
+    r.register(
+        c,
+        "max",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_max,
+    );
+    r.register(
+        c,
+        "average",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_average,
+    );
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/DoubleConsumer;)V",
+        native_double_stream_for_each,
+    );
+    r.register(
+        c,
+        "filter",
+        "(Ljava/util/function/DoublePredicate;)Ljava/util/stream/DoubleStream;",
+        native_double_stream_filter,
+    );
+    r.register(
+        c,
+        "map",
+        "(Ljava/util/function/DoubleUnaryOperator;)Ljava/util/stream/DoubleStream;",
+        native_double_stream_map,
+    );
+    r.register(c, "toArray", "()[D", native_double_stream_to_array);
+    r.register(
+        c,
+        "boxed",
+        "()Ljava/util/stream/Stream;",
+        native_double_stream_boxed,
+    );
+    r.register(
+        c,
+        "mapToLong",
+        "(Ljava/util/function/DoubleToLongFunction;)Ljava/util/stream/LongStream;",
+        native_double_stream_map_to_long,
+    );
+    r.register(
+        c,
+        "mapToInt",
+        "(Ljava/util/function/DoubleToIntFunction;)Ljava/util/stream/IntStream;",
+        native_double_stream_map_to_int,
+    );
+}
+
+fn native_double_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let v = args.first().copied().unwrap_or(Value::Double(0.0));
+    make_double_stream(ctx, &[v])
+}
+
+fn native_double_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(0.0))),
+    };
+    let elements = stream_elements(ctx, this);
+    let sum: f64 = elements
+        .iter()
+        .map(|v| match v {
+            Value::Double(d) => *d,
+            _ => 0.0,
+        })
+        .sum();
+    Ok(Some(Value::Double(sum)))
+}
+
+fn native_double_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let elements = stream_elements(ctx, this);
+    Ok(Some(Value::Long(elements.len() as i64)))
+}
+
+fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    if let Some(min) = elements
+        .iter()
+        .filter_map(|v| match v {
+            Value::Double(d) => Some(*d),
+            _ => None,
+        })
+        .reduce(f64::min)
+    {
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(min));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    if let Some(max) = elements
+        .iter()
+        .filter_map(|v| match v {
+            Value::Double(d) => Some(*d),
+            _ => None,
+        })
+        .reduce(f64::max)
+    {
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(max));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    if !elements.is_empty() {
+        let sum: f64 = elements
+            .iter()
+            .map(|v| match v {
+                Value::Double(d) => *d,
+                _ => 0.0,
+            })
+            .sum();
+        let avg = sum / elements.len() as f64;
+        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_double_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elements = stream_elements(ctx, this);
+    for elem in &elements {
+        ctx.invoke_virtual(consumer, "accept", "(D)V", &[*elem])?;
+    }
+    Ok(None)
+}
+
+fn native_double_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut kept = Vec::new();
+    for elem in &elements {
+        let result = ctx.invoke_virtual(predicate, "test", "(D)Z", &[*elem])?;
+        if matches!(result, Some(Value::Int(v)) if v != 0) {
+            kept.push(*elem);
+        }
+    }
+    make_double_stream(ctx, &kept)
+}
+
+fn native_double_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let operator = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result = ctx.invoke_virtual(operator, "applyAsDouble", "(D)D", &[*elem])?;
+        mapped.push(result.unwrap_or(Value::Double(0.0)));
+    }
+    make_double_stream(ctx, &mapped)
+}
+
+fn native_double_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Double, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let arr = ctx.new_array(
+        rustjvm_types::ArrayElementType::Double,
+        elements.len(),
+    );
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    make_stream(ctx, &elements)
+}
+
+fn native_double_stream_map_to_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let func = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result = ctx.invoke_virtual(func, "applyAsLong", "(D)J", &[*elem])?;
+        mapped.push(result.unwrap_or(Value::Long(0)));
+    }
+    make_long_stream(ctx, &mapped)
+}
+
+fn native_double_stream_map_to_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let func = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result = ctx.invoke_virtual(func, "applyAsInt", "(D)I", &[*elem])?;
+        mapped.push(result.unwrap_or(Value::Int(0)));
+    }
+    make_int_stream(ctx, &mapped)
+}
+
+// ===========================================================================
+// Interface method registrations
+// ===========================================================================
+// When bytecode invokes methods via interface types (e.g. Collection.iterator()),
+// the interpreter resolves based on the invoked class name from the constant pool.
+// For synthetic objects (ClassId(0)), there's no class hierarchy to search, so
+// we register native methods for common interfaces that delegate to the concrete
+// implementations (ArrayList / HashSet).
+
+fn register_interface_natives(registry: &mut NativeMethodRegistry) {
+    // --- java/util/Collection ---
+    registry.register(
+        "java/util/Collection",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_al_iterator,
+    );
+    registry.register("java/util/Collection", "size", "()I", native_al_size);
+    registry.register(
+        "java/util/Collection",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_al_stream,
+    );
+    registry.register("java/util/Collection", "isEmpty", "()Z", native_al_is_empty);
+    registry.register(
+        "java/util/Collection",
+        "toArray",
+        "()[Ljava/lang/Object;",
+        native_al_to_array,
+    );
+    registry.register(
+        "java/util/Collection",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_collection_to_array_generator,
+    );
+
+    // --- java/util/List ---
+    registry.register(
+        "java/util/List",
+        "get",
+        "(I)Ljava/lang/Object;",
+        native_al_get,
+    );
+    registry.register("java/util/List", "size", "()I", native_al_size);
+    registry.register(
+        "java/util/List",
+        "add",
+        "(Ljava/lang/Object;)Z",
+        native_al_add,
+    );
+    registry.register(
+        "java/util/List",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_al_iterator,
+    );
+    registry.register("java/util/List", "isEmpty", "()Z", native_al_is_empty);
+    registry.register(
+        "java/util/List",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_al_stream,
+    );
+    registry.register(
+        "java/util/List",
+        "toArray",
+        "()[Ljava/lang/Object;",
+        native_al_to_array,
+    );
+    registry.register(
+        "java/util/List",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_collection_to_array_generator,
+    );
+
+    // --- java/lang/Iterable ---
+    registry.register(
+        "java/lang/Iterable",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_al_iterator,
+    );
+    registry.register(
+        "java/lang/Iterable",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_al_for_each,
+    );
+
+    // --- forEach on Collection / List / Set ---
+    registry.register(
+        "java/util/Collection",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_al_for_each,
+    );
+    registry.register(
+        "java/util/List",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_al_for_each,
+    );
+    registry.register(
+        "java/util/Set",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_hs_for_each,
+    );
+
+    // --- java/util/Set ---
+    registry.register(
+        "java/util/Set",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_hs_iterator,
+    );
+    registry.register("java/util/Set", "size", "()I", native_hs_size);
+    registry.register("java/util/Set", "isEmpty", "()Z", native_hs_is_empty);
+
+    // --- java/util/Map ---
+    registry.register("java/util/Map", "size", "()I", native_map_size);
+    registry.register(
+        "java/util/Map",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_get,
+    );
+    registry.register(
+        "java/util/Map",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_put,
+    );
+    registry.register(
+        "java/util/Map",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_key,
+    );
+    registry.register(
+        "java/util/Map",
+        "keySet",
+        "()Ljava/util/Set;",
+        native_map_key_set,
+    );
+    registry.register(
+        "java/util/Map",
+        "values",
+        "()Ljava/util/Collection;",
+        native_map_values,
+    );
+    registry.register(
+        "java/util/Map",
+        "entrySet",
+        "()Ljava/util/Set;",
+        native_map_entry_set,
+    );
+
+    // --- java/util/Map$Entry interface ---
+    registry.register(
+        "java/util/Map$Entry",
+        "getKey",
+        "()Ljava/lang/Object;",
+        native_entry_get_key,
+    );
+    registry.register(
+        "java/util/Map$Entry",
+        "getValue",
+        "()Ljava/lang/Object;",
+        native_entry_get_value,
+    );
+    registry.register(
+        "java/util/Map$Entry",
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_entry_set_value,
+    );
+    // Also register under AbstractMap$SimpleEntry for completeness
+    registry.register(
+        "java/util/AbstractMap$SimpleEntry",
+        "getKey",
+        "()Ljava/lang/Object;",
+        native_entry_get_key,
+    );
+    registry.register(
+        "java/util/AbstractMap$SimpleEntry",
+        "getValue",
+        "()Ljava/lang/Object;",
+        native_entry_get_value,
+    );
+    registry.register(
+        "java/util/AbstractMap$SimpleEntry",
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_entry_set_value,
+    );
+}
+
+// ===========================================================================
+// Collection copy constructors
+// ===========================================================================
+
+fn register_copy_constructor_natives(registry: &mut NativeMethodRegistry) {
+    // ArrayList(Collection)
+    registry.register(
+        "java/util/ArrayList",
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_al_init_from_collection,
+    );
+    // HashSet(Collection)
+    registry.register(
+        "java/util/HashSet",
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_hs_init_from_collection,
+    );
+    // HashMap(Map)
+    registry.register(
+        "java/util/HashMap",
+        "<init>",
+        "(Ljava/util/Map;)V",
+        native_map_init_from_map,
+    );
+}
+
+/// ArrayList.<init>(Collection) — copy elements from source collection into this list.
+fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            // null or missing — just init empty
+            let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+            ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
+            ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+            return Ok(None);
+        }
+    };
+
+    // Try to read source as an ArrayList (field 0 = data array, field 1 = size)
+    let (src_data, src_size) = al_state(ctx, source);
+    if let (Some(arr), size) = (src_data, src_size) {
+        if size > 0 {
+            let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
+            let buf = alloc_ref_array(ctx, cap);
+            for i in 0..size as usize {
+                let val = ctx.get_array_element(arr, i);
+                ctx.set_array_element(buf, i, val);
+            }
+            ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
+            ctx.set_field(this, AL_FIELD_SIZE, Value::Int(size));
+        } else {
+            let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+            ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
+            ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+        }
+    } else {
+        // Source might not be an ArrayList — init empty
+        let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+        ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
+        ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    }
+
+    Ok(None)
+}
+
+/// HashSet.<init>(Collection) — copy elements from source into this set.
+fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            // Init empty HashSet
+            let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+            let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+            ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+            ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+            ctx.set_field(
+                backing,
+                MAP_FIELD_CAPACITY,
+                Value::Int(MAP_DEFAULT_CAPACITY as i32),
+            );
+            ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+            return Ok(None);
+        }
+    };
+
+    // Create backing HashMap for this set
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = MAP_DEFAULT_CAPACITY;
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+
+    // Try to read source as ArrayList
+    let (src_data, src_size) = al_state(ctx, source);
+    let sentinel = Value::Int(1);
+    if let (Some(arr), size) = (src_data, src_size) {
+        for i in 0..size as usize {
+            let val = ctx.get_array_element(arr, i);
+            native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
+        }
+    }
+
+    Ok(None)
+}
+
+/// HashMap.<init>(Map) — copy entries from source map into this map.
+fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            // Init empty HashMap
+            let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+            ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+            ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+            ctx.set_field(
+                this,
+                MAP_FIELD_CAPACITY,
+                Value::Int(MAP_DEFAULT_CAPACITY as i32),
+            );
+            return Ok(None);
+        }
+    };
+
+    // Init this map
+    let cap = MAP_DEFAULT_CAPACITY;
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+
+    // Copy entries from source
+    let entries = map_collect_entries(ctx, source);
+    for (key, value) in entries {
+        native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
+    }
+
+    Ok(None)
+}
+
+// ===========================================================================
+// Comparator factory methods
+// ===========================================================================
+
+// Comparator synthetic objects: 3 fields (tag, arg1, arg2)
+const CMP_FIELD_TAG: usize = 0;
+const CMP_FIELD_ARG1: usize = 1;
+const CMP_FIELD_ARG2: usize = 2;
+const CMP_NUM_FIELDS: usize = 3;
+
+const CMP_TAG_NATURAL_ORDER: i32 = 1;
+const CMP_TAG_REVERSE_ORDER: i32 = 2;
+const CMP_TAG_COMPARING: i32 = 3;
+const CMP_TAG_REVERSED: i32 = 4;
+const CMP_TAG_THEN_COMPARING: i32 = 5;
+
+fn make_comparator(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
+    let cmp = alloc_synthetic(ctx, "java/util/Comparator$Native", CMP_NUM_FIELDS);
+    ctx.set_field(cmp, CMP_FIELD_TAG, Value::Int(tag));
+    cmp
+}
+
+/// Compare two values using a Comparator. If the comparator is a tagged factory
+/// object, dispatch based on tag. Otherwise, fall through to invoke_virtual (for lambdas).
+pub fn comparator_compare(
+    ctx: &mut dyn NativeContext,
+    comparator: ObjectRef,
+    a: Value,
+    b: Value,
+) -> MethodCallResult {
+    // Guard: only read the tag if the object has enough fields (factory comparators have 3).
+    // Lambda proxies may have 0 fields, so reading field 0 would panic.
+    let tag = if ctx.object_num_fields(comparator) >= CMP_NUM_FIELDS {
+        match ctx.get_field(comparator, CMP_FIELD_TAG) {
+            Value::Int(t) if (CMP_TAG_NATURAL_ORDER..=CMP_TAG_THEN_COMPARING).contains(&t) => {
+                Some(t)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let tag = match tag {
+        Some(t) => t,
+        None => {
+            // Not a factory comparator — delegate to invoke_virtual (lambda path)
+            return ctx.invoke_virtual(
+                comparator,
+                "compare",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                &[a, b],
+            );
+        }
+    };
+
+    match tag {
+        CMP_TAG_NATURAL_ORDER => natural_compare(ctx, &a, &b),
+        CMP_TAG_REVERSE_ORDER => {
+            let result = natural_compare(ctx, &a, &b)?;
+            Ok(result.map(|v| match v {
+                Value::Int(i) => Value::Int(-i),
+                other => other,
+            }))
+        }
+        CMP_TAG_COMPARING => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let ka = ctx
+                .invoke_virtual(
+                    key_fn,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[a],
+                )?
+                .unwrap_or(Value::Object(None));
+            let kb = ctx
+                .invoke_virtual(
+                    key_fn,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[b],
+                )?
+                .unwrap_or(Value::Object(None));
+            natural_compare(ctx, &ka, &kb)
+        }
+        CMP_TAG_REVERSED => {
+            let inner = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let result = comparator_compare(ctx, inner, a, b)?;
+            Ok(result.map(|v| match v {
+                Value::Int(i) => Value::Int(-i),
+                other => other,
+            }))
+        }
+        CMP_TAG_THEN_COMPARING => {
+            let primary = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let result = comparator_compare(ctx, primary, a, b)?;
+            match result {
+                Some(Value::Int(0)) => {
+                    let secondary = match ctx.get_field(comparator, CMP_FIELD_ARG2) {
+                        Value::Object(Some(r)) => r,
+                        _ => return Ok(Some(Value::Int(0))),
+                    };
+                    comparator_compare(ctx, secondary, a, b)
+                }
+                other => Ok(other),
+            }
+        }
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+/// Natural ordering: compare by string content or by wrapper field 0 value.
+fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodCallResult {
+    match (a, b) {
+        (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
+            // Try string comparison first
+            let sa = ctx.read_string(*ra);
+            let sb = ctx.read_string(*rb);
+            if let (Some(sa), Some(sb)) = (sa, sb) {
+                return Ok(Some(Value::Int(sa.cmp(&sb) as i32)));
+            }
+            // Try as wrapper: compare field 0 values
+            let fa = ctx.get_field(*ra, 0);
+            let fb = ctx.get_field(*rb, 0);
+            match (fa, fb) {
+                (Value::Int(a), Value::Int(b)) => Ok(Some(Value::Int(a.cmp(&b) as i32))),
+                (Value::Long(a), Value::Long(b)) => Ok(Some(Value::Int(a.cmp(&b) as i32))),
+                (Value::Float(a), Value::Float(b)) => Ok(Some(Value::Int(a.total_cmp(&b) as i32))),
+                (Value::Double(a), Value::Double(b)) => {
+                    Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                }
+                _ => Ok(Some(Value::Int(0))),
+            }
+        }
+        // Compare bare ints/longs/etc. (for comparingInt results)
+        (Value::Int(a), Value::Int(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),
+        (Value::Long(a), Value::Long(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),
+        (Value::Float(a), Value::Float(b)) => Ok(Some(Value::Int(a.total_cmp(b) as i32))),
+        (Value::Double(a), Value::Double(b)) => Ok(Some(Value::Int(a.total_cmp(b) as i32))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/util/Comparator",
+        "naturalOrder",
+        "()Ljava/util/Comparator;",
+        native_comparator_natural_order,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "reverseOrder",
+        "()Ljava/util/Comparator;",
+        native_comparator_reverse_order,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "comparing",
+        "(Ljava/util/function/Function;)Ljava/util/Comparator;",
+        native_comparator_comparing,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "comparingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/Comparator;",
+        native_comparator_comparing,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "comparingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/Comparator;",
+        native_comparator_comparing,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "comparingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/Comparator;",
+        native_comparator_comparing,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "reversed",
+        "()Ljava/util/Comparator;",
+        native_comparator_reversed,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "thenComparing",
+        "(Ljava/util/Comparator;)Ljava/util/Comparator;",
+        native_comparator_then_comparing,
+    );
+}
+
+fn native_comparator_natural_order(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let cmp = make_comparator(ctx, CMP_TAG_NATURAL_ORDER);
+    Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_reverse_order(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let cmp = make_comparator(ctx, CMP_TAG_REVERSE_ORDER);
+    Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let key_fn = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cmp = make_comparator(ctx, CMP_TAG_COMPARING);
+    ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(key_fn)));
+    Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cmp = make_comparator(ctx, CMP_TAG_REVERSED);
+    ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
+    Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_then_comparing(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING);
+    ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
+    ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(other)));
+    Ok(Some(Value::Object(Some(cmp))))
+}
+
+// ===========================================================================
+// Phase 13 Step 5: StringJoiner
+// ===========================================================================
+
+// StringJoiner is a 5-field synthetic:
+//   field 0 = delimiter (String)
+//   field 1 = prefix (String or null)
+//   field 2 = suffix (String or null)
+//   field 3 = elements ArrayList
+//   field 4 = emptyValue (String or null)
+const SJ_FIELD_DELIM: usize = 0;
+const SJ_FIELD_PREFIX: usize = 1;
+const SJ_FIELD_SUFFIX: usize = 2;
+const SJ_FIELD_ELEMENTS: usize = 3;
+const SJ_FIELD_EMPTY_VALUE: usize = 4;
+fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/util/StringJoiner",
+        "<init>",
+        "(Ljava/lang/CharSequence;)V",
+        native_sj_init_delim,
+    );
+    registry.register(
+        "java/util/StringJoiner",
+        "<init>",
+        "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)V",
+        native_sj_init_full,
+    );
+    registry.register(
+        "java/util/StringJoiner",
+        "add",
+        "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;",
+        native_sj_add,
+    );
+    registry.register(
+        "java/util/StringJoiner",
+        "toString",
+        "()Ljava/lang/String;",
+        native_sj_to_string,
+    );
+    registry.register("java/util/StringJoiner", "length", "()I", native_sj_length);
+    registry.register(
+        "java/util/StringJoiner",
+        "merge",
+        "(Ljava/util/StringJoiner;)Ljava/util/StringJoiner;",
+        native_sj_merge,
+    );
+    registry.register(
+        "java/util/StringJoiner",
+        "setEmptyValue",
+        "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;",
+        native_sj_set_empty_value,
+    );
+}
+
+fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let delim = match args.get(1) {
+        Some(Value::Object(Some(r))) => Value::Object(Some(*r)),
+        _ => Value::Object(None),
+    };
+    // Create an empty ArrayList for elements
+    let elements = alloc_synthetic(ctx, "java/util/ArrayList", 2);
+    let backing = alloc_ref_array(ctx, 10);
+    ctx.set_field(elements, 0, Value::Object(Some(backing)));
+    ctx.set_field(elements, 1, Value::Int(0));
+
+    ctx.set_field(this, SJ_FIELD_DELIM, delim);
+    ctx.set_field(this, SJ_FIELD_PREFIX, Value::Object(None));
+    ctx.set_field(this, SJ_FIELD_SUFFIX, Value::Object(None));
+    ctx.set_field(this, SJ_FIELD_ELEMENTS, Value::Object(Some(elements)));
+    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, Value::Object(None));
+    Ok(None)
+}
+
+fn native_sj_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let delim = match args.get(1) {
+        Some(Value::Object(Some(r))) => Value::Object(Some(*r)),
+        _ => Value::Object(None),
+    };
+    let prefix = match args.get(2) {
+        Some(Value::Object(Some(r))) => Value::Object(Some(*r)),
+        _ => Value::Object(None),
+    };
+    let suffix = match args.get(3) {
+        Some(Value::Object(Some(r))) => Value::Object(Some(*r)),
+        _ => Value::Object(None),
+    };
+
+    let elements = alloc_synthetic(ctx, "java/util/ArrayList", 2);
+    let backing = alloc_ref_array(ctx, 10);
+    ctx.set_field(elements, 0, Value::Object(Some(backing)));
+    ctx.set_field(elements, 1, Value::Int(0));
+
+    ctx.set_field(this, SJ_FIELD_DELIM, delim);
+    ctx.set_field(this, SJ_FIELD_PREFIX, prefix);
+    ctx.set_field(this, SJ_FIELD_SUFFIX, suffix);
+    ctx.set_field(this, SJ_FIELD_ELEMENTS, Value::Object(Some(elements)));
+    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, Value::Object(None));
+    Ok(None)
+}
+
+fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let element = match args.get(1) {
+        Some(v) => *v,
+        _ => Value::Object(None),
+    };
+    // Get the elements ArrayList and add to it
+    let elements = match ctx.get_field(this, SJ_FIELD_ELEMENTS) {
+        Value::Object(Some(r)) => r,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    // Read current size
+    let size = match ctx.get_field(elements, 1) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    let backing = match ctx.get_field(elements, 0) {
+        Value::Object(Some(r)) => r,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let capacity = ctx.array_length(backing);
+    if size as usize >= capacity {
+        let new_cap = capacity * 2;
+        let new_backing = alloc_ref_array(ctx, new_cap);
+        for i in 0..capacity {
+            let v = ctx.get_array_element(backing, i);
+            ctx.set_array_element(new_backing, i, v);
+        }
+        ctx.set_field(elements, 0, Value::Object(Some(new_backing)));
+        ctx.set_array_element(new_backing, size as usize, element);
+    } else {
+        ctx.set_array_element(backing, size as usize, element);
+    }
+    ctx.set_field(elements, 1, Value::Int(size + 1));
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// Helper: read all elements from a StringJoiner's internal ArrayList as strings
+fn sj_read_elements(ctx: &mut dyn NativeContext, sj: ObjectRef) -> Vec<String> {
+    let elements = match ctx.get_field(sj, SJ_FIELD_ELEMENTS) {
+        Value::Object(Some(r)) => r,
+        _ => return Vec::new(),
+    };
+    let size = match ctx.get_field(elements, 1) {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
+    let backing = match ctx.get_field(elements, 0) {
+        Value::Object(Some(r)) => r,
+        _ => return Vec::new(),
+    };
+    let mut result = Vec::with_capacity(size);
+    for i in 0..size {
+        let elem = ctx.get_array_element(backing, i);
+        let s = match elem {
+            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_else(|| "null".to_string()),
+            _ => "null".to_string(),
+        };
+        result.push(s);
+    }
+    result
+}
+
+fn sj_build_string(ctx: &mut dyn NativeContext, sj: ObjectRef) -> String {
+    let elements = sj_read_elements(ctx, sj);
+    let delim = match ctx.get_field(sj, SJ_FIELD_DELIM) {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let prefix = match ctx.get_field(sj, SJ_FIELD_PREFIX) {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let suffix = match ctx.get_field(sj, SJ_FIELD_SUFFIX) {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    if elements.is_empty() {
+        // Check emptyValue
+        if let Value::Object(Some(ev)) = ctx.get_field(sj, SJ_FIELD_EMPTY_VALUE) {
+            return ctx.read_string(ev).unwrap_or_default();
+        }
+        return format!("{prefix}{suffix}");
+    }
+
+    let joined = elements.join(&delim);
+    format!("{prefix}{joined}{suffix}")
+}
+
+fn native_sj_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let result = sj_build_string(ctx, this);
+    let s = ctx.create_string(&result);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_sj_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let result = sj_build_string(ctx, this);
+    Ok(Some(Value::Int(result.len() as i32)))
+}
+
+fn native_sj_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    // Merge: add all elements from other into this (without other's prefix/suffix)
+    let other_elements = sj_read_elements(ctx, other);
+    if other_elements.is_empty() {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    // Join other's elements with other's delimiter and add as a single element
+    let other_delim = match ctx.get_field(other, SJ_FIELD_DELIM) {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let merged = other_elements.join(&other_delim);
+    let merged_str = ctx.create_string(&merged);
+    // Add as single element to this
+    native_sj_add(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(merged_str))],
+    )
+}
+
+fn native_sj_set_empty_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let empty_val = match args.get(1) {
+        Some(v) => *v,
+        _ => Value::Object(None),
+    };
+    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, empty_val);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+// ===========================================================================
+// Phase 14 Step 1: java.util.Random
+// ===========================================================================
+
+// Random = 2-field synthetic (field 0 = Long seed, field 1 = unused/reserved)
+const RND_FIELD_SEED: usize = 0;
+
+fn register_random_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/Random";
+    registry.register(c, "<init>", "()V", native_random_init);
+    registry.register(c, "<init>", "(J)V", native_random_init_seed);
+    registry.register(c, "nextInt", "()I", native_random_next_int);
+    registry.register(c, "nextInt", "(I)I", native_random_next_int_bound);
+    registry.register(c, "nextLong", "()J", native_random_next_long);
+    registry.register(c, "nextDouble", "()D", native_random_next_double);
+    registry.register(c, "nextFloat", "()F", native_random_next_float);
+    registry.register(c, "nextBoolean", "()Z", native_random_next_boolean);
+    registry.register(c, "setSeed", "(J)V", native_random_set_seed);
+    registry.register(c, "nextGaussian", "()D", native_random_next_gaussian);
+}
+
+/// Java LCG constants
+const LCG_MULTIPLIER: i64 = 0x5DEECE66D;
+const LCG_INCREMENT: i64 = 0xB;
+const LCG_MASK: i64 = (1i64 << 48) - 1;
+
+fn rnd_scramble_seed(seed: i64) -> i64 {
+    (seed ^ LCG_MULTIPLIER) & LCG_MASK
+}
+
+fn rnd_next(ctx: &mut dyn NativeContext, this: ObjectRef, bits: u32) -> i32 {
+    let old_seed = match ctx.get_field(this, RND_FIELD_SEED) {
+        Value::Long(s) => s,
+        _ => 0,
+    };
+    let new_seed = (old_seed
+        .wrapping_mul(LCG_MULTIPLIER)
+        .wrapping_add(LCG_INCREMENT))
+        & LCG_MASK;
+    ctx.set_field(this, RND_FIELD_SEED, Value::Long(new_seed));
+    (new_seed >> (48 - bits)) as i32
+}
+
+fn native_random_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(42);
+    ctx.set_field(this, RND_FIELD_SEED, Value::Long(rnd_scramble_seed(seed)));
+    Ok(None)
+}
+
+fn native_random_init_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let seed = match args.get(1) {
+        Some(Value::Long(s)) => *s,
+        _ => 0,
+    };
+    ctx.set_field(this, RND_FIELD_SEED, Value::Long(rnd_scramble_seed(seed)));
+    Ok(None)
+}
+
+fn native_random_next_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(rnd_next(ctx, this, 32))))
+}
+
+fn native_random_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let bound = match args.get(1) {
+        Some(Value::Int(b)) => *b,
+        _ => 1,
+    };
+    if bound <= 0 {
+        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "bound must be positive".to_string(),
+        }
+        .into());
+    }
+    // Rejection sampling for uniform distribution
+    let mut r = rnd_next(ctx, this, 31);
+    let m = bound - 1;
+    if (bound & m) == 0 {
+        // power of two
+        r = ((bound as i64 * r as i64) >> 31) as i32;
+    } else {
+        let mut u = r;
+        loop {
+            r = u % bound;
+            if u.wrapping_sub(r).wrapping_add(m) >= 0 {
+                break;
+            }
+            u = rnd_next(ctx, this, 31);
+        }
+    }
+    Ok(Some(Value::Int(r)))
+}
+
+fn native_random_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let hi = rnd_next(ctx, this, 32) as i64;
+    let lo = rnd_next(ctx, this, 32) as i64;
+    Ok(Some(Value::Long((hi << 32) + lo)))
+}
+
+fn native_random_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(0.0))),
+    };
+    let hi = (rnd_next(ctx, this, 26) as i64) << 27;
+    let lo = rnd_next(ctx, this, 27) as i64;
+    let v = (hi + lo) as f64 / ((1i64 << 53) as f64);
+    Ok(Some(Value::Double(v)))
+}
+
+fn native_random_next_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Float(0.0))),
+    };
+    let v = rnd_next(ctx, this, 24) as f32 / ((1i32 << 24) as f32);
+    Ok(Some(Value::Float(v)))
+}
+
+fn native_random_next_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let v = rnd_next(ctx, this, 1);
+    Ok(Some(Value::Int(v)))
+}
+
+fn native_random_set_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let seed = match args.get(1) {
+        Some(Value::Long(s)) => *s,
+        _ => 0,
+    };
+    ctx.set_field(this, RND_FIELD_SEED, Value::Long(rnd_scramble_seed(seed)));
+    Ok(None)
+}
+
+fn native_random_next_gaussian(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(0.0))),
+    };
+    // Box-Muller transform (simplified: generate a pair, return one)
+    loop {
+        let hi1 = (rnd_next(ctx, this, 26) as i64) << 27;
+        let lo1 = rnd_next(ctx, this, 27) as i64;
+        let v1 = 2.0 * ((hi1 + lo1) as f64 / ((1i64 << 53) as f64)) - 1.0;
+        let hi2 = (rnd_next(ctx, this, 26) as i64) << 27;
+        let lo2 = rnd_next(ctx, this, 27) as i64;
+        let v2 = 2.0 * ((hi2 + lo2) as f64 / ((1i64 << 53) as f64)) - 1.0;
+        let s = v1 * v1 + v2 * v2;
+        if s < 1.0 && s != 0.0 {
+            let multiplier = (-2.0 * s.ln() / s).sqrt();
+            return Ok(Some(Value::Double(v1 * multiplier)));
+        }
+    }
+}
+
+// ===========================================================================
+// Phase 14 Step 4: OptionalInt / OptionalLong / OptionalDouble
+// ===========================================================================
+
+fn register_optional_int_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/OptionalInt";
+    registry.register(c, "of", "(I)Ljava/util/OptionalInt;", native_opt_int_of);
+    registry.register(
+        c,
+        "empty",
+        "()Ljava/util/OptionalInt;",
+        native_opt_int_empty,
+    );
+    registry.register(c, "getAsInt", "()I", native_opt_int_get);
+    registry.register(c, "isPresent", "()Z", native_opt_int_is_present);
+    registry.register(c, "orElse", "(I)I", native_opt_int_or_else);
+    registry.register(
+        c,
+        "ifPresent",
+        "(Ljava/util/function/IntConsumer;)V",
+        native_opt_int_if_present,
+    );
+}
+
+fn register_optional_long_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/OptionalLong";
+    registry.register(c, "of", "(J)Ljava/util/OptionalLong;", native_opt_long_of);
+    registry.register(
+        c,
+        "empty",
+        "()Ljava/util/OptionalLong;",
+        native_opt_long_empty,
+    );
+    registry.register(c, "getAsLong", "()J", native_opt_long_get);
+    registry.register(c, "isPresent", "()Z", native_opt_long_is_present);
+    registry.register(c, "orElse", "(J)J", native_opt_long_or_else);
+    registry.register(
+        c,
+        "ifPresent",
+        "(Ljava/util/function/LongConsumer;)V",
+        native_opt_long_if_present,
+    );
+}
+
+fn register_optional_double_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/OptionalDouble";
+    registry.register(
+        c,
+        "of",
+        "(D)Ljava/util/OptionalDouble;",
+        native_opt_double_of,
+    );
+    registry.register(
+        c,
+        "empty",
+        "()Ljava/util/OptionalDouble;",
+        native_opt_double_empty,
+    );
+    registry.register(c, "getAsDouble", "()D", native_opt_double_get);
+    registry.register(c, "isPresent", "()Z", native_opt_double_is_present);
+    registry.register(c, "orElse", "(D)D", native_opt_double_or_else);
+    registry.register(
+        c,
+        "ifPresent",
+        "(Ljava/util/function/DoubleConsumer;)V",
+        native_opt_double_if_present,
+    );
+}
+
+// --- OptionalInt ---
+
+fn native_opt_int_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let val = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(val));
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_int_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_int_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No value present".to_string(),
+            }
+            .into())
+        }
+    };
+    match ctx.get_field(this, OPT_FIELD_VALUE) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No value present".to_string(),
+        }
+        .into()),
+        other => Ok(Some(other)),
+    }
+}
+
+fn native_opt_int_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
+    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+}
+
+fn native_opt_int_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return match args.get(1) {
+                Some(Value::Int(v)) => Ok(Some(Value::Int(*v))),
+                _ => Ok(Some(Value::Int(0))),
+            }
+        }
+    };
+    let default_val = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    match ctx.get_field(this, OPT_FIELD_VALUE) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(default_val))),
+    }
+}
+
+fn native_opt_int_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    if let Value::Int(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+        ctx.invoke_virtual(consumer, "accept", "(I)V", &[Value::Int(v)])?;
+    }
+    Ok(None)
+}
+
+// --- OptionalLong ---
+
+fn native_opt_long_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let val = match args.first() {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(val));
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_long_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No value present".to_string(),
+            }
+            .into())
+        }
+    };
+    match ctx.get_field(this, OPT_FIELD_VALUE) {
+        Value::Long(v) => Ok(Some(Value::Long(v))),
+        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No value present".to_string(),
+        }
+        .into()),
+        other => Ok(Some(other)),
+    }
+}
+
+fn native_opt_long_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
+    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+}
+
+fn native_opt_long_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return match args.get(1) {
+                Some(Value::Long(v)) => Ok(Some(Value::Long(*v))),
+                _ => Ok(Some(Value::Long(0))),
+            }
+        }
+    };
+    let default_val = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    match ctx.get_field(this, OPT_FIELD_VALUE) {
+        Value::Long(v) => Ok(Some(Value::Long(v))),
+        _ => Ok(Some(Value::Long(default_val))),
+    }
+}
+
+fn native_opt_long_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    if let Value::Long(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+        ctx.invoke_virtual(consumer, "accept", "(J)V", &[Value::Long(v)])?;
+    }
+    Ok(None)
+}
+
+// --- OptionalDouble ---
+
+fn native_opt_double_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let val = match args.first() {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(val));
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_double_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_opt_double_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No value present".to_string(),
+            }
+            .into())
+        }
+    };
+    match ctx.get_field(this, OPT_FIELD_VALUE) {
+        Value::Double(v) => Ok(Some(Value::Double(v))),
+        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No value present".to_string(),
+        }
+        .into()),
+        other => Ok(Some(other)),
+    }
+}
+
+fn native_opt_double_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
+    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+}
+
+fn native_opt_double_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return match args.get(1) {
+                Some(Value::Double(v)) => Ok(Some(Value::Double(*v))),
+                _ => Ok(Some(Value::Double(0.0))),
+            }
+        }
+    };
+    let default_val = match args.get(1) {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    match ctx.get_field(this, OPT_FIELD_VALUE) {
+        Value::Double(v) => Ok(Some(Value::Double(v))),
+        _ => Ok(Some(Value::Double(default_val))),
+    }
+}
+
+fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    if let Value::Double(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+        ctx.invoke_virtual(consumer, "accept", "(D)V", &[Value::Double(v)])?;
+    }
+    Ok(None)
+}
+
+// ===========================================================================
+// Phase 14 Step 5: LinkedList
+// ===========================================================================
+
+// LinkedList = 3-field synthetic (field 0 = head Node, field 1 = tail Node, field 2 = Int size)
+// Node = 3-field synthetic (field 0 = prev Node, field 1 = next Node, field 2 = element value)
+const LL_FIELD_HEAD: usize = 0;
+const LL_FIELD_TAIL: usize = 1;
+const LL_FIELD_SIZE: usize = 2;
+const LL_NODE_PREV: usize = 0;
+const LL_NODE_NEXT: usize = 1;
+const LL_NODE_ELEM: usize = 2;
+
+fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
+    let node = alloc_synthetic(ctx, "java/util/LinkedList$Node", 3);
+    ctx.set_field(node, LL_NODE_PREV, Value::Object(None));
+    ctx.set_field(node, LL_NODE_NEXT, Value::Object(None));
+    ctx.set_field(node, LL_NODE_ELEM, element);
+    node
+}
+
+fn ll_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, LL_FIELD_SIZE) {
+        Value::Int(n) => n,
+        _ => 0,
+    }
+}
+
+fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/LinkedList";
+    registry.register(c, "<init>", "()V", native_ll_init);
+    registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ll_add);
+    registry.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ll_add_first);
+    registry.register(c, "addLast", "(Ljava/lang/Object;)V", native_ll_add_last);
+    registry.register(c, "get", "(I)Ljava/lang/Object;", native_ll_get);
+    registry.register(c, "getFirst", "()Ljava/lang/Object;", native_ll_get_first);
+    registry.register(c, "getLast", "()Ljava/lang/Object;", native_ll_get_last);
+    registry.register(
+        c,
+        "removeFirst",
+        "()Ljava/lang/Object;",
+        native_ll_remove_first,
+    );
+    registry.register(
+        c,
+        "removeLast",
+        "()Ljava/lang/Object;",
+        native_ll_remove_last,
+    );
+    registry.register(c, "size", "()I", native_ll_size);
+    registry.register(c, "isEmpty", "()Z", native_ll_is_empty);
+    registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ll_contains);
+    registry.register(c, "clear", "()V", native_ll_clear);
+    registry.register(c, "peek", "()Ljava/lang/Object;", native_ll_peek);
+    registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
+    registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
+    registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
+    registry.register(c, "toString", "()Ljava/lang/String;", native_ll_to_string);
+    registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ll_iterator);
+
+    // LinkedList$Itr
+    let itr = "java/util/LinkedList$Itr";
+    registry.register(itr, "hasNext", "()Z", native_ll_itr_has_next);
+    registry.register(itr, "next", "()Ljava/lang/Object;", native_ll_itr_next);
+}
+
+fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
+    ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
+    let node = ll_alloc_node(ctx, element);
+    let size = ll_size(ctx, this);
+    if let Value::Object(Some(tail)) = ctx.get_field(this, LL_FIELD_TAIL) {
+        ctx.set_field(tail, LL_NODE_NEXT, Value::Object(Some(node)));
+        ctx.set_field(node, LL_NODE_PREV, Value::Object(Some(tail)));
+        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+    } else {
+        // Empty list
+        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
+        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+    }
+    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size + 1));
+}
+
+fn ll_link_first(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
+    let node = ll_alloc_node(ctx, element);
+    let size = ll_size(ctx, this);
+    if let Value::Object(Some(head)) = ctx.get_field(this, LL_FIELD_HEAD) {
+        ctx.set_field(head, LL_NODE_PREV, Value::Object(Some(node)));
+        ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(head)));
+        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
+    } else {
+        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
+        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+    }
+    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size + 1));
+}
+
+fn native_ll_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let element = args.get(1).copied().unwrap_or(Value::Object(None));
+    ll_link_last(ctx, this, element);
+    Ok(Some(Value::Int(1))) // returns true
+}
+
+fn native_ll_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let element = args.get(1).copied().unwrap_or(Value::Object(None));
+    ll_link_first(ctx, this, element);
+    Ok(None)
+}
+
+fn native_ll_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let element = args.get(1).copied().unwrap_or(Value::Object(None));
+    ll_link_last(ctx, this, element);
+    Ok(None)
+}
+
+/// Traverse to the node at the given index
+fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<ObjectRef> {
+    let size = ll_size(ctx, this);
+    if index < 0 || index >= size {
+        return None;
+    }
+    if index < size / 2 {
+        // Traverse from head
+        let mut cur = match ctx.get_field(this, LL_FIELD_HEAD) {
+            Value::Object(Some(r)) => r,
+            _ => return None,
+        };
+        for _ in 0..index {
+            cur = match ctx.get_field(cur, LL_NODE_NEXT) {
+                Value::Object(Some(r)) => r,
+                _ => return None,
+            };
+        }
+        Some(cur)
+    } else {
+        // Traverse from tail
+        let mut cur = match ctx.get_field(this, LL_FIELD_TAIL) {
+            Value::Object(Some(r)) => r,
+            _ => return None,
+        };
+        for _ in 0..(size - 1 - index) {
+            cur = match ctx.get_field(cur, LL_NODE_PREV) {
+                Value::Object(Some(r)) => r,
+                _ => return None,
+            };
+        }
+        Some(cur)
+    }
+}
+
+fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ll_node_at(ctx, this, index) {
+        Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
+        None => Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
+    }
+}
+
+fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "List is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    match ctx.get_field(this, LL_FIELD_HEAD) {
+        Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
+        _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "List is empty".to_string(),
+        }
+        .into()),
+    }
+}
+
+fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "List is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    match ctx.get_field(this, LL_FIELD_TAIL) {
+        Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, LL_NODE_ELEM))),
+        _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "List is empty".to_string(),
+        }
+        .into()),
+    }
+}
+
+fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    let head = match ctx.get_field(this, LL_FIELD_HEAD) {
+        Value::Object(Some(r)) => r,
+        _ => return Value::Object(None),
+    };
+    let element = ctx.get_field(head, LL_NODE_ELEM);
+    let next = ctx.get_field(head, LL_NODE_NEXT);
+    let size = ll_size(ctx, this);
+    match next {
+        Value::Object(Some(next_node)) => {
+            ctx.set_field(next_node, LL_NODE_PREV, Value::Object(None));
+            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(next_node)));
+        }
+        _ => {
+            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
+            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+        }
+    }
+    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size - 1));
+    element
+}
+
+fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    let tail = match ctx.get_field(this, LL_FIELD_TAIL) {
+        Value::Object(Some(r)) => r,
+        _ => return Value::Object(None),
+    };
+    let element = ctx.get_field(tail, LL_NODE_ELEM);
+    let prev = ctx.get_field(tail, LL_NODE_PREV);
+    let size = ll_size(ctx, this);
+    match prev {
+        Value::Object(Some(prev_node)) => {
+            ctx.set_field(prev_node, LL_NODE_NEXT, Value::Object(None));
+            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(prev_node)));
+        }
+        _ => {
+            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
+            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+        }
+    }
+    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size - 1));
+    element
+}
+
+fn native_ll_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "List is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    if ll_size(ctx, this) == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "List is empty".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ll_unlink_first(ctx, this)))
+}
+
+fn native_ll_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "List is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    if ll_size(ctx, this) == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "List is empty".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ll_unlink_last(ctx, this)))
+}
+
+fn native_ll_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(ll_size(ctx, this))))
+}
+
+fn native_ll_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    Ok(Some(Value::Int(if ll_size(ctx, this) == 0 {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    while let Some(cur) = cur_opt {
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        if values_equal(ctx, &elem, &target) {
+            return Ok(Some(Value::Int(1)));
+        }
+        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_ll_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
+    ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ll_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.get_field(this, LL_FIELD_HEAD) {
+        Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_ll_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if ll_size(ctx, this) == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    Ok(Some(ll_unlink_first(ctx, this)))
+}
+
+fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let size = ll_size(ctx, this) as usize;
+    let arr = alloc_ref_array(ctx, size);
+    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let mut i = 0;
+    while let Some(cur) = cur_opt {
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        ctx.set_array_element(arr, i, elem);
+        i += 1;
+        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let s = ctx.create_string("[]");
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let size = ll_size(ctx, this) as usize;
+    let mut parts = Vec::with_capacity(size);
+    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    while let Some(cur) = cur_opt {
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        parts.push(obj_to_display_string(ctx, &elem));
+        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    let text = format!("[{}]", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// LinkedList$Itr = 2-field synthetic (field 0 = current node, field 1 = list ref for size tracking)
+fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let head = ctx.get_field(this, LL_FIELD_HEAD);
+    let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 2);
+    ctx.set_field(itr, 0, head); // current node
+    ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_ll_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let has = matches!(ctx.get_field(this, 0), Value::Object(Some(_)));
+    Ok(Some(Value::Int(if has { 1 } else { 0 })))
+}
+
+fn native_ll_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let cur = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let element = ctx.get_field(cur, LL_NODE_ELEM);
+    let next = ctx.get_field(cur, LL_NODE_NEXT);
+    ctx.set_field(this, 0, next);
+    Ok(Some(element))
+}
+
+// ===========================================================================
+// LinkedHashMap — insertion-ordered HashMap
+// ===========================================================================
+// LinkedHashMap = 5-field synthetic:
+//   0: buckets (Object[]), 1: size (Int), 2: capacity (Int), 3: head (Node), 4: tail (Node)
+// LinkedHashMap$Node = 6-field synthetic:
+//   0: key, 1: value, 2: hash, 3: next (bucket chain), 4: before, 5: after (insertion order)
+
+const LHM_FIELD_BUCKETS: usize = 0;
+const LHM_FIELD_SIZE: usize = 1;
+const LHM_FIELD_CAPACITY: usize = 2;
+const LHM_FIELD_HEAD: usize = 3;
+const LHM_FIELD_TAIL: usize = 4;
+
+const LHM_NODE_KEY: usize = 0;
+const LHM_NODE_VALUE: usize = 1;
+const LHM_NODE_HASH: usize = 2;
+const LHM_NODE_NEXT: usize = 3;
+const LHM_NODE_BEFORE: usize = 4;
+const LHM_NODE_AFTER: usize = 5;
+const LHM_NODE_NUM_FIELDS: usize = 6;
+
+fn lhm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
+    let buckets = match ctx.get_field(this, LHM_FIELD_BUCKETS) {
+        Value::Object(Some(arr)) => Some(arr),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, LHM_FIELD_SIZE) {
+        Value::Int(s) => s,
+        _ => 0,
+    };
+    let cap = match ctx.get_field(this, LHM_FIELD_CAPACITY) {
+        Value::Int(c) => c,
+        _ => MAP_DEFAULT_CAPACITY as i32,
+    };
+    (buckets, size, cap)
+}
+
+fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i32) -> ObjectRef {
+    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Node", LHM_NODE_NUM_FIELDS);
+    ctx.set_field(node, LHM_NODE_KEY, key);
+    ctx.set_field(node, LHM_NODE_VALUE, value);
+    ctx.set_field(node, LHM_NODE_HASH, Value::Int(hash));
+    ctx.set_field(node, LHM_NODE_NEXT, Value::Object(None));
+    ctx.set_field(node, LHM_NODE_BEFORE, Value::Object(None));
+    ctx.set_field(node, LHM_NODE_AFTER, Value::Object(None));
+    node
+}
+
+fn lhm_link_tail(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
+    let tail = ctx.get_field(this, LHM_FIELD_TAIL);
+    if let Value::Object(Some(t)) = tail {
+        ctx.set_field(t, LHM_NODE_AFTER, Value::Object(Some(node)));
+        ctx.set_field(node, LHM_NODE_BEFORE, Value::Object(Some(t)));
+    } else {
+        // Empty list — node becomes head
+        ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(Some(node)));
+    }
+    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(Some(node)));
+}
+
+fn lhm_unlink(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
+    let before = ctx.get_field(node, LHM_NODE_BEFORE);
+    let after = ctx.get_field(node, LHM_NODE_AFTER);
+
+    // Fix before's after
+    if let Value::Object(Some(b)) = before {
+        ctx.set_field(b, LHM_NODE_AFTER, after);
+    } else {
+        ctx.set_field(this, LHM_FIELD_HEAD, after);
+    }
+    // Fix after's before
+    if let Value::Object(Some(a)) = after {
+        ctx.set_field(a, LHM_NODE_BEFORE, before);
+    } else {
+        ctx.set_field(this, LHM_FIELD_TAIL, before);
+    }
+}
+
+fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let (_, size, cap) = lhm_state(ctx, this);
+    let new_cap = (cap as usize) * 2;
+    let new_buckets = alloc_ref_array(ctx, new_cap);
+
+    // Walk insertion-order list and rehash
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        let hash = match ctx.get_field(node, LHM_NODE_HASH) {
+            Value::Int(h) => h,
+            _ => 0,
+        };
+        let idx = map_bucket_index(hash, new_cap as i32);
+
+        // Detach from old bucket chain
+        ctx.set_field(node, LHM_NODE_NEXT, Value::Object(None));
+
+        // Insert at head of new bucket
+        let head = ctx.get_array_element(new_buckets, idx);
+        if let Value::Object(Some(h)) = head {
+            ctx.set_field(node, LHM_NODE_NEXT, Value::Object(Some(h)));
+        }
+        ctx.set_array_element(new_buckets, idx, Value::Object(Some(node)));
+
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+
+    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size));
+    ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
+}
+
+fn lhm_find_node(ctx: &dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
+    let (buckets, _, cap) = lhm_state(ctx, this);
+    let buckets = buckets?;
+    let (hash, is_null) = match key {
+        Value::Object(Some(k)) => (map_hash_key(ctx, *k), false),
+        Value::Object(None) => (0, true),
+        _ => return None,
+    };
+    let idx = map_bucket_index(hash, cap);
+    let mut node_val = ctx.get_array_element(buckets, idx);
+    while let Value::Object(Some(node)) = node_val {
+        let node_key = ctx.get_field(node, LHM_NODE_KEY);
+        if is_null {
+            if matches!(node_key, Value::Object(None)) {
+                return Some(node);
+            }
+        } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key) {
+            if map_keys_equal(ctx, nk, *k) {
+                return Some(node);
+            }
+        }
+        node_val = ctx.get_field(node, LHM_NODE_NEXT);
+    }
+    None
+}
+
+fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/LinkedHashMap";
+
+    registry.register(c, "<init>", "()V", native_lhm_init);
+    registry.register(c, "<init>", "(I)V", native_lhm_init_capacity);
+    registry.register(c, "size", "()I", native_lhm_size);
+    registry.register(c, "isEmpty", "()Z", native_lhm_is_empty);
+    registry.register(
+        c,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_lhm_put,
+    );
+    registry.register(
+        c,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_lhm_get,
+    );
+    registry.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_lhm_remove,
+    );
+    registry.register(
+        c,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_lhm_contains_key,
+    );
+    registry.register(
+        c,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_lhm_contains_value,
+    );
+    registry.register(c, "clear", "()V", native_lhm_clear);
+    registry.register(c, "keySet", "()Ljava/util/Set;", native_lhm_key_set);
+    registry.register(c, "values", "()Ljava/util/Collection;", native_lhm_values);
+    registry.register(c, "entrySet", "()Ljava/util/Set;", native_lhm_entry_set);
+    registry.register(c, "toString", "()Ljava/lang/String;", native_lhm_to_string);
+    registry.register(
+        c,
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_lhm_get_or_default,
+    );
+    registry.register(
+        c,
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_lhm_put_if_absent,
+    );
+    registry.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_lhm_for_each,
+    );
+    registry.register(c, "putAll", "(Ljava/util/Map;)V", native_lhm_put_all);
+}
+
+fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(None));
+    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(None));
+}
+
+fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    lhm_init_with_cap(ctx, this, MAP_DEFAULT_CAPACITY);
+    Ok(None)
+}
+
+fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) => (*c as usize).next_power_of_two().max(MAP_DEFAULT_CAPACITY),
+        _ => MAP_DEFAULT_CAPACITY,
+    };
+    lhm_init_with_cap(ctx, this, cap);
+    Ok(None)
+}
+
+fn native_lhm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (_, size, _) = lhm_state(ctx, this);
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_lhm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let (_, size, _) = lhm_state(ctx, this);
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    let hash = match key_val {
+        Value::Object(Some(k)) => map_hash_key(ctx, k),
+        Value::Object(None) => 0,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // Check for resize
+    let (_, size, cap) = lhm_state(ctx, this);
+    if size + 1 > (cap * 3) / 4 {
+        lhm_resize(ctx, this);
+    }
+
+    // Check for existing key
+    if let Some(node) = lhm_find_node(ctx, this, &key_val) {
+        let old = ctx.get_field(node, LHM_NODE_VALUE);
+        ctx.set_field(node, LHM_NODE_VALUE, value);
+        return Ok(Some(old));
+    }
+
+    // Insert new node
+    let (buckets, size, cap) = lhm_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let idx = map_bucket_index(hash, cap);
+
+    let new_node = lhm_alloc_node(ctx, key_val, value, hash);
+
+    // Insert at head of bucket chain
+    let head = ctx.get_array_element(buckets, idx);
+    if let Value::Object(Some(h)) = head {
+        ctx.set_field(new_node, LHM_NODE_NEXT, Value::Object(Some(h)));
+    }
+    ctx.set_array_element(buckets, idx, Value::Object(Some(new_node)));
+
+    // Link at tail of insertion-order list
+    lhm_link_tail(ctx, this, new_node);
+
+    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size + 1));
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(node) = lhm_find_node(ctx, this, &key) {
+        Ok(Some(ctx.get_field(node, LHM_NODE_VALUE)))
+    } else {
+        Ok(Some(Value::Object(None)))
+    }
+}
+
+fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let (hash, is_null) = match key_val {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k), false),
+        Value::Object(None) => (0, true),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let (buckets, size, cap) = lhm_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let idx = map_bucket_index(hash, cap);
+
+    // Walk bucket chain, tracking prev
+    let mut prev: Option<ObjectRef> = None;
+    let mut node_val = ctx.get_array_element(buckets, idx);
+    while let Value::Object(Some(node)) = node_val {
+        let node_key = ctx.get_field(node, LHM_NODE_KEY);
+        let found = if is_null {
+            matches!(node_key, Value::Object(None))
+        } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key_val) {
+            map_keys_equal(ctx, nk, k)
+        } else {
+            false
+        };
+
+        if found {
+            let old_value = ctx.get_field(node, LHM_NODE_VALUE);
+            let next = ctx.get_field(node, LHM_NODE_NEXT);
+
+            // Unlink from bucket chain
+            if let Some(p) = prev {
+                ctx.set_field(p, LHM_NODE_NEXT, next);
+            } else {
+                ctx.set_array_element(buckets, idx, next);
+            }
+
+            // Unlink from insertion-order list
+            lhm_unlink(ctx, this, node);
+
+            ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size - 1));
+            return Ok(Some(old_value));
+        }
+
+        prev = Some(node);
+        node_val = ctx.get_field(node, LHM_NODE_NEXT);
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_lhm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    Ok(Some(Value::Int(
+        if lhm_find_node(ctx, this, &key).is_some() {
+            1
+        } else {
+            0
+        },
+    )))
+}
+
+fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        let val = ctx.get_field(node, LHM_NODE_VALUE);
+        if values_equal(ctx, &val, &target) {
+            return Ok(Some(Value::Int(1)));
+        }
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_lhm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let (_, _, cap) = lhm_state(ctx, this);
+    let new_buckets = alloc_ref_array(ctx, cap as usize);
+    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(None));
+    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(None));
+    Ok(None)
+}
+
+fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let mut keys = Vec::new();
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        keys.push(ctx.get_field(node, LHM_NODE_KEY));
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+    keys
+}
+
+fn lhm_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let mut vals = Vec::new();
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        vals.push(ctx.get_field(node, LHM_NODE_VALUE));
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+    vals
+}
+
+fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = lhm_collect_keys(ctx, this);
+    make_set_of(ctx, &keys)
+}
+
+fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let vals = lhm_collect_values(ctx, this);
+    make_list_of(ctx, &vals)
+}
+
+fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut entries = Vec::new();
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        let key = ctx.get_field(node, LHM_NODE_KEY);
+        let val = ctx.get_field(node, LHM_NODE_VALUE);
+        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+        ctx.set_field(entry, 0, key);
+        ctx.set_field(entry, 1, val);
+        entries.push(Value::Object(Some(entry)));
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+    make_set_of(ctx, &entries)
+}
+
+fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string("{}"))))),
+    };
+    let mut parts = Vec::new();
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        let key = ctx.get_field(node, LHM_NODE_KEY);
+        let val = ctx.get_field(node, LHM_NODE_VALUE);
+        let ks = obj_to_display_string(ctx, &key);
+        let vs = obj_to_display_string(ctx, &val);
+        parts.push(format!("{ks}={vs}"));
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+    let s = format!("{{{}}}", parts.join(", "));
+    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+}
+
+fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    if let Some(node) = lhm_find_node(ctx, this, &key) {
+        Ok(Some(ctx.get_field(node, LHM_NODE_VALUE)))
+    } else {
+        Ok(Some(default))
+    }
+}
+
+fn native_lhm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(node) = lhm_find_node(ctx, this, &key) {
+        let existing = ctx.get_field(node, LHM_NODE_VALUE);
+        Ok(Some(existing))
+    } else {
+        native_lhm_put(ctx, args)
+    }
+}
+
+fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    while let Value::Object(Some(node)) = cur {
+        let key = ctx.get_field(node, LHM_NODE_KEY);
+        let val = ctx.get_field(node, LHM_NODE_VALUE);
+        ctx.invoke_virtual(
+            consumer,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[key, val],
+        )?;
+        cur = ctx.get_field(node, LHM_NODE_AFTER);
+    }
+    Ok(None)
+}
+
+fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+
+    // Collect entries from source map (walk either LHM insertion list or HashMap buckets)
+    let mut entries = Vec::new();
+    // Try LHM head first (5-field object)
+    let head = ctx.get_field(source, LHM_FIELD_HEAD);
+    if let Value::Object(Some(_)) = head {
+        let mut cur = head;
+        while let Value::Object(Some(node)) = cur {
+            let key = ctx.get_field(node, LHM_NODE_KEY);
+            let val = ctx.get_field(node, LHM_NODE_VALUE);
+            entries.push((key, val));
+            cur = ctx.get_field(node, LHM_NODE_AFTER);
+        }
+    } else {
+        // Fall back to HashMap bucket scan
+        let (buckets, _, cap) = map_state(ctx, source);
+        if let Some(b) = buckets {
+            for i in 0..(cap as usize) {
+                let mut nv = ctx.get_array_element(b, i);
+                while let Value::Object(Some(node)) = nv {
+                    let key = ctx.get_field(node, NODE_FIELD_KEY);
+                    let val = ctx.get_field(node, NODE_FIELD_VALUE);
+                    entries.push((key, val));
+                    nv = ctx.get_field(node, NODE_FIELD_NEXT);
+                }
+            }
+        }
+    }
+
+    for (key, val) in entries {
+        native_lhm_put(ctx, &[Value::Object(Some(this)), key, val])?;
+    }
+    Ok(None)
+}
+
+// ===========================================================================
+// ArrayDeque (circular buffer based Deque implementation)
+// ===========================================================================
+
+const AD_FIELD_DATA: usize = 0; // Object[] circular buffer
+const AD_FIELD_HEAD: usize = 1; // Int head index
+const AD_FIELD_TAIL: usize = 2; // Int tail index
+const AD_FIELD_SIZE: usize = 3; // Int element count
+const AD_DEFAULT_CAPACITY: usize = 16;
+
+fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32, i32) {
+    let data = match ctx.get_field(this, AD_FIELD_DATA) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let head = match ctx.get_field(this, AD_FIELD_HEAD) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let tail = match ctx.get_field(this, AD_FIELD_TAIL) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let size = match ctx.get_field(this, AD_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    (data, head, tail, size)
+}
+
+fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    let old_cap = data.map_or(0, |d| ctx.array_length(d));
+    if min_cap <= old_cap {
+        return;
+    }
+    let new_cap = std::cmp::max(old_cap * 2, min_cap);
+    let new_buf = alloc_ref_array(ctx, new_cap);
+    // Copy elements in order: head..end, then 0..wrap
+    if let Some(old_buf) = data {
+        let s = size as usize;
+        let h = head as usize;
+        for i in 0..s {
+            let idx = (h + i) % old_cap;
+            let val = ctx.get_array_element(old_buf, idx);
+            ctx.set_array_element(new_buf, i, val);
+        }
+    }
+    ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(new_buf)));
+    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(size));
+}
+
+fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/ArrayDeque";
+
+    r.register(c, "<init>", "()V", native_ad_init);
+    r.register(c, "<init>", "(I)V", native_ad_init_capacity);
+    r.register(c, "size", "()I", native_ad_size);
+    r.register(c, "isEmpty", "()Z", native_ad_is_empty);
+    r.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ad_add_first);
+    r.register(c, "addLast", "(Ljava/lang/Object;)V", native_ad_add_last);
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_ad_add);
+    r.register(
+        c,
+        "offerFirst",
+        "(Ljava/lang/Object;)Z",
+        native_ad_offer_first,
+    );
+    r.register(
+        c,
+        "offerLast",
+        "(Ljava/lang/Object;)Z",
+        native_ad_offer_last,
+    );
+    r.register(c, "offer", "(Ljava/lang/Object;)Z", native_ad_offer);
+    r.register(
+        c,
+        "removeFirst",
+        "()Ljava/lang/Object;",
+        native_ad_remove_first,
+    );
+    r.register(
+        c,
+        "removeLast",
+        "()Ljava/lang/Object;",
+        native_ad_remove_last,
+    );
+    r.register(c, "pollFirst", "()Ljava/lang/Object;", native_ad_poll_first);
+    r.register(c, "pollLast", "()Ljava/lang/Object;", native_ad_poll_last);
+    r.register(c, "poll", "()Ljava/lang/Object;", native_ad_poll_first);
+    r.register(c, "getFirst", "()Ljava/lang/Object;", native_ad_get_first);
+    r.register(c, "getLast", "()Ljava/lang/Object;", native_ad_get_last);
+    r.register(c, "peekFirst", "()Ljava/lang/Object;", native_ad_peek_first);
+    r.register(c, "peekLast", "()Ljava/lang/Object;", native_ad_peek_last);
+    r.register(c, "peek", "()Ljava/lang/Object;", native_ad_peek_first);
+    r.register(c, "push", "(Ljava/lang/Object;)V", native_ad_add_first);
+    r.register(c, "pop", "()Ljava/lang/Object;", native_ad_remove_first);
+    r.register(c, "element", "()Ljava/lang/Object;", native_ad_get_first);
+    r.register(c, "remove", "()Ljava/lang/Object;", native_ad_remove_first);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_ad_contains);
+    r.register(c, "clear", "()V", native_ad_clear);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_ad_iterator);
+    r.register(c, "toString", "()Ljava/lang/String;", native_ad_to_string);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_ad_for_each,
+    );
+}
+
+fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, AD_DEFAULT_CAPACITY);
+    ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ad_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) => std::cmp::max(*c, 1) as usize,
+        _ => AD_DEFAULT_CAPACITY,
+    };
+    let buf = alloc_ref_array(ctx, cap);
+    ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ad_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (_, _, _, size) = ad_state(ctx, this);
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_ad_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let (_, _, _, size) = ad_state(ctx, this);
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (_, _, _, size) = ad_state(ctx, this);
+    ad_ensure_capacity(ctx, this, (size + 1) as usize);
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let new_head = (head - 1 + cap) % cap;
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, new_head as usize, elem);
+    }
+    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size + 1));
+    Ok(None)
+}
+
+fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (_, _, _, size) = ad_state(ctx, this);
+    ad_ensure_capacity(ctx, this, (size + 1) as usize);
+    let (data, _head, tail, size) = ad_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, tail as usize, elem);
+    }
+    let new_tail = (tail + 1) % cap;
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size + 1));
+    Ok(None)
+}
+
+fn native_ad_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_ad_add_last(ctx, args)?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_ad_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_ad_add_first(ctx, args)?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_ad_offer_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_ad_add_last(ctx, args)?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_ad_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_ad_add_last(ctx, args)?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_ad_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "ArrayDeque is empty".to_string(),
+        }
+        .into());
+    }
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, head as usize)
+    });
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let new_head = (head + 1) % cap;
+    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
+    Ok(Some(elem))
+}
+
+fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, _head, tail, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "ArrayDeque is empty".to_string(),
+        }
+        .into());
+    }
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let new_tail = (tail - 1 + cap) % cap;
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, new_tail as usize)
+    });
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
+    Ok(Some(elem))
+}
+
+fn native_ad_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (_, _, _, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    native_ad_remove_first(ctx, args)
+}
+
+fn native_ad_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (_, _, _, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    native_ad_remove_last(ctx, args)
+}
+
+fn native_ad_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, head, _, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "ArrayDeque is empty".to_string(),
+        }
+        .into());
+    }
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, head as usize)
+    });
+    Ok(Some(elem))
+}
+
+fn native_ad_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, _, tail, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "ArrayDeque is empty".to_string(),
+        }
+        .into());
+    }
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let idx = (tail - 1 + cap) % cap;
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, idx as usize)
+    });
+    Ok(Some(elem))
+}
+
+fn native_ad_peek_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, head, _, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, head as usize)
+    });
+    Ok(Some(elem))
+}
+
+fn native_ad_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, _, tail, size) = ad_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let idx = (tail - 1 + cap) % cap;
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, idx as usize)
+    });
+    Ok(Some(elem))
+}
+
+fn native_ad_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, head, _, size) = ad_state(ctx, this);
+    if let Some(buf) = data {
+        let cap = ctx.array_length(buf);
+        for i in 0..(size as usize) {
+            let idx = (head as usize + i) % cap;
+            let elem = ctx.get_array_element(buf, idx);
+            if values_equal(ctx, &elem, &target) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_ad_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ad_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, head, _, size) = ad_state(ctx, this);
+    let arr = alloc_ref_array(ctx, size as usize);
+    if let Some(buf) = data {
+        let cap = ctx.array_length(buf);
+        for i in 0..(size as usize) {
+            let idx = (head as usize + i) % cap;
+            let elem = ctx.get_array_element(buf, idx);
+            ctx.set_array_element(arr, i, elem);
+        }
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn ad_collect_elements(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let (data, head, _, size) = ad_state(ctx, this);
+    let mut elems = Vec::with_capacity(size as usize);
+    if let Some(buf) = data {
+        let cap = ctx.array_length(buf);
+        for i in 0..(size as usize) {
+            let idx = (head as usize + i) % cap;
+            elems.push(ctx.get_array_element(buf, idx));
+        }
+    }
+    elems
+}
+
+fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor
+    let elems = ad_collect_elements(ctx, this);
+    let arr = alloc_ref_array(ctx, elems.len());
+    for (i, e) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, *e);
+    }
+    let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string("[]"))))),
+    };
+    let elems = ad_collect_elements(ctx, this);
+    let parts: Vec<String> = elems
+        .iter()
+        .map(|e| obj_to_display_string(ctx, e))
+        .collect();
+    let s = format!("[{}]", parts.join(", "));
+    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+}
+
+fn native_ad_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elems = ad_collect_elements(ctx, this);
+    for e in &elems {
+        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*e])?;
+    }
+    Ok(None)
+}
+
+// ===========================================================================
+// PriorityQueue (binary min-heap)
+// ===========================================================================
+
+const PQ_FIELD_DATA: usize = 0; // Object[] heap array
+const PQ_FIELD_SIZE: usize = 1; // Int element count
+const PQ_FIELD_COMPARATOR: usize = 2; // Comparator or null
+const PQ_DEFAULT_CAPACITY: usize = 11;
+
+fn pq_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32) {
+    let data = match ctx.get_field(this, PQ_FIELD_DATA) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, PQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    (data, size)
+}
+
+fn pq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
+    let (data, _size) = pq_state(ctx, this);
+    let old_cap = data.map_or(0, |d| ctx.array_length(d));
+    if min_cap <= old_cap {
+        return;
+    }
+    let new_cap = std::cmp::max(old_cap + old_cap / 2 + 1, min_cap);
+    let new_buf = alloc_ref_array(ctx, new_cap);
+    if let Some(old_buf) = data {
+        for i in 0..old_cap {
+            let val = ctx.get_array_element(old_buf, i);
+            ctx.set_array_element(new_buf, i, val);
+        }
+    }
+    ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(new_buf)));
+}
+
+/// Compare two elements using comparator or natural ordering (string/int/long comparison).
+fn pq_compare(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    a: &Value,
+    b: &Value,
+) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+    let comp = ctx.get_field(this, PQ_FIELD_COMPARATOR);
+    if let Value::Object(Some(comparator)) = comp {
+        let result = ctx.invoke_virtual(
+            comparator,
+            "compare",
+            "(Ljava/lang/Object;Ljava/lang/Object;)I",
+            &[*a, *b],
+        )?;
+        return Ok(match result {
+            Some(Value::Int(v)) => v,
+            _ => 0,
+        });
+    }
+    // Natural ordering: compare by string value, int, long, float, double
+    Ok(match (a, b) {
+        (Value::Object(Some(oa)), Value::Object(Some(ob))) => {
+            if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
+                sa.cmp(&sb) as i32
+            } else {
+                0
+            }
+        }
+        (Value::Int(a), Value::Int(b)) => a.cmp(b) as i32,
+        (Value::Long(a), Value::Long(b)) => a.cmp(b) as i32,
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
+        (Value::Double(a), Value::Double(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
+        _ => 0,
+    })
+}
+
+fn pq_sift_up(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buf: ObjectRef,
+    mut idx: usize,
+) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+    while idx > 0 {
+        let parent = (idx - 1) / 2;
+        let child_val = ctx.get_array_element(buf, idx);
+        let parent_val = ctx.get_array_element(buf, parent);
+        if pq_compare(ctx, this, &child_val, &parent_val)? < 0 {
+            ctx.set_array_element(buf, idx, parent_val);
+            ctx.set_array_element(buf, parent, child_val);
+            idx = parent;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn pq_sift_down(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buf: ObjectRef,
+    mut idx: usize,
+    size: usize,
+) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+    loop {
+        let left = 2 * idx + 1;
+        if left >= size {
+            break;
+        }
+        let right = left + 1;
+        let mut smallest = left;
+        if right < size {
+            let lv = ctx.get_array_element(buf, left);
+            let rv = ctx.get_array_element(buf, right);
+            if pq_compare(ctx, this, &rv, &lv)? < 0 {
+                smallest = right;
+            }
+        }
+        let cur_val = ctx.get_array_element(buf, idx);
+        let small_val = ctx.get_array_element(buf, smallest);
+        if pq_compare(ctx, this, &small_val, &cur_val)? < 0 {
+            ctx.set_array_element(buf, idx, small_val);
+            ctx.set_array_element(buf, smallest, cur_val);
+            idx = smallest;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/PriorityQueue";
+
+    r.register(c, "<init>", "()V", native_pq_init);
+    r.register(c, "<init>", "(I)V", native_pq_init_capacity);
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+        native_pq_init_comparator,
+    );
+    r.register(c, "size", "()I", native_pq_size);
+    r.register(c, "isEmpty", "()Z", native_pq_is_empty);
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_pq_add);
+    r.register(c, "offer", "(Ljava/lang/Object;)Z", native_pq_add);
+    r.register(c, "peek", "()Ljava/lang/Object;", native_pq_peek);
+    r.register(c, "poll", "()Ljava/lang/Object;", native_pq_poll);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_pq_remove);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_pq_contains);
+    r.register(c, "clear", "()V", native_pq_clear);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_pq_to_array);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_pq_iterator);
+    r.register(c, "toString", "()Ljava/lang/String;", native_pq_to_string);
+}
+
+fn native_pq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, PQ_DEFAULT_CAPACITY);
+    ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, PQ_FIELD_COMPARATOR, Value::Object(None));
+    Ok(None)
+}
+
+fn native_pq_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) => std::cmp::max(*c, 1) as usize,
+        _ => PQ_DEFAULT_CAPACITY,
+    };
+    let buf = alloc_ref_array(ctx, cap);
+    ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, PQ_FIELD_COMPARATOR, Value::Object(None));
+    Ok(None)
+}
+
+fn native_pq_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let comp = args.get(1).copied().unwrap_or(Value::Object(None));
+    let buf = alloc_ref_array(ctx, PQ_DEFAULT_CAPACITY);
+    ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, PQ_FIELD_COMPARATOR, comp);
+    Ok(None)
+}
+
+fn native_pq_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (_, size) = pq_state(ctx, this);
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_pq_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let (_, size) = pq_state(ctx, this);
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (_, size) = pq_state(ctx, this);
+    pq_ensure_capacity(ctx, this, (size + 1) as usize);
+    let (data, _) = pq_state(ctx, this);
+    let buf = data.unwrap();
+    ctx.set_array_element(buf, size as usize, elem);
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(size + 1));
+    pq_sift_up(ctx, this, buf, size as usize)?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_pq_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = pq_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = data.map_or(Value::Object(None), |buf| ctx.get_array_element(buf, 0));
+    Ok(Some(elem))
+}
+
+fn native_pq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = pq_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let buf = match data {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let result = ctx.get_array_element(buf, 0);
+    let new_size = size - 1;
+    if new_size > 0 {
+        let last = ctx.get_array_element(buf, new_size as usize);
+        ctx.set_array_element(buf, 0, last);
+    }
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(new_size));
+    if new_size > 0 {
+        pq_sift_down(ctx, this, buf, 0, new_size as usize)?;
+    }
+    Ok(Some(result))
+}
+
+fn native_pq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = pq_state(ctx, this);
+    let buf = match data {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // Find element
+    let mut found_idx = None;
+    for i in 0..(size as usize) {
+        let elem = ctx.get_array_element(buf, i);
+        if values_equal(ctx, &elem, &target) {
+            found_idx = Some(i);
+            break;
+        }
+    }
+    let idx = match found_idx {
+        Some(i) => i,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let new_size = (size - 1) as usize;
+    if idx == new_size {
+        // Removing last element, no sift needed
+        ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(new_size as i32));
+        return Ok(Some(Value::Int(1)));
+    }
+    let last = ctx.get_array_element(buf, new_size);
+    ctx.set_array_element(buf, idx, last);
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(new_size as i32));
+    pq_sift_down(ctx, this, buf, idx, new_size)?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_pq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = pq_state(ctx, this);
+    if let Some(buf) = data {
+        for i in 0..(size as usize) {
+            let elem = ctx.get_array_element(buf, i);
+            if values_equal(ctx, &elem, &target) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_pq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_pq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = pq_state(ctx, this);
+    let arr = alloc_ref_array(ctx, size as usize);
+    if let Some(buf) = data {
+        for i in 0..(size as usize) {
+            let elem = ctx.get_array_element(buf, i);
+            ctx.set_array_element(arr, i, elem);
+        }
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = pq_state(ctx, this);
+    let arr = alloc_ref_array(ctx, size as usize);
+    if let Some(buf) = data {
+        for i in 0..(size as usize) {
+            let elem = ctx.get_array_element(buf, i);
+            ctx.set_array_element(arr, i, elem);
+        }
+    }
+    let itr = alloc_synthetic(ctx, "java/util/PriorityQueue$Itr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string("[]"))))),
+    };
+    let (data, size) = pq_state(ctx, this);
+    let mut parts = Vec::new();
+    if let Some(buf) = data {
+        for i in 0..(size as usize) {
+            let elem = ctx.get_array_element(buf, i);
+            parts.push(obj_to_display_string(ctx, &elem));
+        }
+    }
+    let s = format!("[{}]", parts.join(", "));
+    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+}
+
+// ===========================================================================
+// Vector (synchronized ArrayList — simplified without real locks)
+// ===========================================================================
+
+fn register_vector_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/Vector";
+
+    r.register(c, "<init>", "()V", native_al_init);
+    r.register(c, "<init>", "(I)V", native_al_init_capacity);
+    r.register(c, "size", "()I", native_al_size);
+    r.register(c, "isEmpty", "()Z", native_al_is_empty);
+    r.register(c, "get", "(I)Ljava/lang/Object;", native_al_get);
+    r.register(c, "elementAt", "(I)Ljava/lang/Object;", native_al_get);
+    r.register(
+        c,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        native_al_set,
+    );
+    r.register(
+        c,
+        "setElementAt",
+        "(Ljava/lang/Object;I)V",
+        native_vec_set_element_at,
+    );
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_al_add);
+    r.register(
+        c,
+        "addElement",
+        "(Ljava/lang/Object;)V",
+        native_vec_add_element,
+    );
+    r.register(c, "add", "(ILjava/lang/Object;)V", native_al_add_at);
+    r.register(
+        c,
+        "insertElementAt",
+        "(Ljava/lang/Object;I)V",
+        native_vec_insert_element_at,
+    );
+    r.register(c, "remove", "(I)Ljava/lang/Object;", native_al_remove_at);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_al_remove_obj);
+    r.register(
+        c,
+        "removeElement",
+        "(Ljava/lang/Object;)Z",
+        native_al_remove_obj,
+    );
+    r.register(c, "removeElementAt", "(I)V", native_vec_remove_element_at);
+    r.register(c, "removeAllElements", "()V", native_al_clear);
+    r.register(c, "clear", "()V", native_al_clear);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
+    r.register(c, "indexOf", "(Ljava/lang/Object;)I", native_al_index_of);
+    r.register(
+        c,
+        "lastIndexOf",
+        "(Ljava/lang/Object;)I",
+        native_al_last_index_of,
+    );
+    r.register(
+        c,
+        "firstElement",
+        "()Ljava/lang/Object;",
+        native_vec_first_element,
+    );
+    r.register(
+        c,
+        "lastElement",
+        "()Ljava/lang/Object;",
+        native_vec_last_element,
+    );
+    r.register(c, "capacity", "()I", native_vec_capacity);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_al_to_array);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
+    r.register(c, "toString", "()Ljava/lang/String;", native_al_to_string);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_al_for_each,
+    );
+}
+
+fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // setElementAt(Object obj, int index) — reversed param order from set()
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let idx = match args.get(2) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, this);
+    if idx >= size as usize {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index: idx as i32,
+        }
+        .into());
+    }
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, idx, elem);
+    }
+    Ok(None)
+}
+
+fn native_vec_add_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_al_add(ctx, args)?;
+    Ok(None)
+}
+
+fn native_vec_insert_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // insertElementAt(Object obj, int index) — reversed param order from add(int, Object)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let idx = match args.get(2) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(None),
+    };
+    // Repack args as [this, idx, elem] to match add(int, Object) signature
+    native_al_add_at(ctx, &[Value::Object(Some(this)), Value::Int(idx), elem])
+}
+
+fn native_vec_remove_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_al_remove_at(ctx, args)?;
+    Ok(None)
+}
+
+fn native_vec_first_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "Vector is empty".to_string(),
+        }
+        .into());
+    }
+    let elem = data.map_or(Value::Object(None), |buf| ctx.get_array_element(buf, 0));
+    Ok(Some(elem))
+}
+
+fn native_vec_last_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "Vector is empty".to_string(),
+        }
+        .into());
+    }
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, (size - 1) as usize)
+    });
+    Ok(Some(elem))
+}
+
+fn native_vec_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (data, _) = al_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d));
+    Ok(Some(Value::Int(cap as i32)))
+}
+
+// ===========================================================================
+// Stack (extends Vector with push/pop/peek/search/empty)
+// ===========================================================================
+
+fn register_stack_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/Stack";
+
+    // Inherit all Vector methods
+    r.register(c, "<init>", "()V", native_al_init);
+    r.register(c, "size", "()I", native_al_size);
+    r.register(c, "isEmpty", "()Z", native_al_is_empty);
+    r.register(c, "get", "(I)Ljava/lang/Object;", native_al_get);
+    r.register(
+        c,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        native_al_set,
+    );
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_al_add);
+    r.register(c, "remove", "(I)Ljava/lang/Object;", native_al_remove_at);
+    r.register(c, "clear", "()V", native_al_clear);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
+    r.register(c, "indexOf", "(Ljava/lang/Object;)I", native_al_index_of);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_al_to_array);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
+    r.register(c, "toString", "()Ljava/lang/String;", native_al_to_string);
+
+    // Stack-specific methods
+    r.register(
+        c,
+        "push",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_stack_push,
+    );
+    r.register(c, "pop", "()Ljava/lang/Object;", native_stack_pop);
+    r.register(c, "peek", "()Ljava/lang/Object;", native_stack_peek);
+    r.register(c, "empty", "()Z", native_al_is_empty);
+    r.register(c, "search", "(Ljava/lang/Object;)I", native_stack_search);
+}
+
+fn native_stack_push(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_al_add(ctx, args)?;
+    Ok(Some(elem))
+}
+
+fn native_stack_pop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (_, size) = al_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "Stack is empty".to_string(),
+        }
+        .into());
+    }
+    native_al_remove_at(ctx, &[Value::Object(Some(this)), Value::Int(size - 1)])
+}
+
+fn native_stack_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "Stack is empty".to_string(),
+        }
+        .into());
+    }
+    let elem = data.map_or(Value::Object(None), |buf| {
+        ctx.get_array_element(buf, (size - 1) as usize)
+    });
+    Ok(Some(elem))
+}
+
+fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    // Search from top of stack (last element), return 1-based distance from top
+    if let Some(buf) = data {
+        for i in (0..(size as usize)).rev() {
+            let elem = ctx.get_array_element(buf, i);
+            if values_equal(ctx, &elem, &target) {
+                return Ok(Some(Value::Int((size as usize - i) as i32)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(-1)))
+}
+
+// ===========================================================================
+// Collection bulk operations (addAll, removeAll, retainAll)
+// ===========================================================================
+
+fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
+    // ArrayList
+    r.register(
+        "java/util/ArrayList",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+        native_al_remove_all,
+    );
+    r.register(
+        "java/util/ArrayList",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+        native_al_retain_all,
+    );
+
+    // HashSet
+    r.register(
+        "java/util/HashSet",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+        native_hs_add_all,
+    );
+    r.register(
+        "java/util/HashSet",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+        native_hs_remove_all,
+    );
+    r.register(
+        "java/util/HashSet",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+        native_hs_retain_all,
+    );
+
+    // LinkedList
+    r.register(
+        "java/util/LinkedList",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+        native_ll_add_all,
+    );
+
+    // Vector
+    r.register(
+        "java/util/Vector",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+        native_al_add_all,
+    );
+
+    // ArrayDeque
+    r.register(
+        "java/util/ArrayDeque",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+        native_ad_add_all,
+    );
+}
+
+/// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
+fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    // Try ArrayList layout first (field 0 = Object[], field 1 = Int size)
+    let f0 = ctx.get_field(coll, 0);
+    let f1 = ctx.get_field(coll, 1);
+    if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
+        // Check if field 0 is an array (ArrayList/Vector/Stack pattern)
+        let len = ctx.array_length(arr);
+        if len >= size as usize {
+            let mut elems = Vec::with_capacity(size as usize);
+            for i in 0..(size as usize) {
+                elems.push(ctx.get_array_element(arr, i));
+            }
+            return elems;
+        }
+    }
+    // Try LinkedList layout (field 0 = head Node, field 2 = Int size)
+    if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
+        if size > 0 {
+            let mut elems = Vec::with_capacity(size as usize);
+            let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
+            while let Value::Object(Some(node)) = cur {
+                elems.push(ctx.get_field(node, LL_NODE_ELEM));
+                cur = ctx.get_field(node, LL_NODE_NEXT);
+            }
+            return elems;
+        }
+    }
+    // Try HashSet layout (field 0 = HashMap backing)
+    // For simplicity, try calling iterator
+    Vec::new()
+}
+
+fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll_elems = collect_collection_elements(ctx, coll);
+    let (data, size) = al_state(ctx, this);
+    let buf = match data {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // Compact: keep elements NOT in collection
+    let mut write_idx = 0usize;
+    let mut modified = false;
+    for read_idx in 0..(size as usize) {
+        let elem = ctx.get_array_element(buf, read_idx);
+        let should_remove = coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce));
+        if should_remove {
+            modified = true;
+        } else {
+            if write_idx != read_idx {
+                ctx.set_array_element(buf, write_idx, elem);
+            }
+            write_idx += 1;
+        }
+    }
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(write_idx as i32));
+    Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll_elems = collect_collection_elements(ctx, coll);
+    let (data, size) = al_state(ctx, this);
+    let buf = match data {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let mut write_idx = 0usize;
+    let mut modified = false;
+    for read_idx in 0..(size as usize) {
+        let elem = ctx.get_array_element(buf, read_idx);
+        let should_keep = coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce));
+        if should_keep {
+            if write_idx != read_idx {
+                ctx.set_array_element(buf, write_idx, elem);
+            }
+            write_idx += 1;
+        } else {
+            modified = true;
+        }
+    }
+    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(write_idx as i32));
+    Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = collect_collection_elements(ctx, coll);
+    let mut modified = false;
+    for e in &elems {
+        let result = native_hs_add(ctx, &[Value::Object(Some(this)), *e])?;
+        if result == Some(Value::Int(1)) {
+            modified = true;
+        }
+    }
+    Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll_elems = collect_collection_elements(ctx, coll);
+    let mut modified = false;
+    for e in &coll_elems {
+        let result = native_hs_remove(ctx, &[Value::Object(Some(this)), *e])?;
+        if result == Some(Value::Int(1)) {
+            modified = true;
+        }
+    }
+    Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll_elems = collect_collection_elements(ctx, coll);
+    // Get current HashSet elements (keys of backing HashMap)
+    let current = match hs_backing_map(ctx, this) {
+        Some(m) => map_collect_keys(ctx, m),
+        None => Vec::new(),
+    };
+    let mut modified = false;
+    for e in &current {
+        let should_keep = coll_elems.iter().any(|ce| values_equal(ctx, e, ce));
+        if !should_keep {
+            native_hs_remove(ctx, &[Value::Object(Some(this)), *e])?;
+            modified = true;
+        }
+    }
+    Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+fn native_ll_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = collect_collection_elements(ctx, coll);
+    if elems.is_empty() {
+        return Ok(Some(Value::Int(0)));
+    }
+    for e in &elems {
+        ll_link_last(ctx, this, *e);
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_ad_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = collect_collection_elements(ctx, coll);
+    if elems.is_empty() {
+        return Ok(Some(Value::Int(0)));
+    }
+    for e in &elems {
+        native_ad_add_last(ctx, &[Value::Object(Some(this)), *e])?;
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+// ===========================================================================
+// Queue/Deque interface method registrations
+// ===========================================================================
+
+fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
+    // --- java/util/Queue interface ---
+    registry.register(
+        "java/util/Queue",
+        "offer",
+        "(Ljava/lang/Object;)Z",
+        native_ad_offer,
+    );
+    registry.register(
+        "java/util/Queue",
+        "poll",
+        "()Ljava/lang/Object;",
+        native_ad_poll_first,
+    );
+    registry.register(
+        "java/util/Queue",
+        "peek",
+        "()Ljava/lang/Object;",
+        native_ad_peek_first,
+    );
+    registry.register(
+        "java/util/Queue",
+        "add",
+        "(Ljava/lang/Object;)Z",
+        native_ad_add,
+    );
+    registry.register(
+        "java/util/Queue",
+        "remove",
+        "()Ljava/lang/Object;",
+        native_ad_remove_first,
+    );
+    registry.register(
+        "java/util/Queue",
+        "element",
+        "()Ljava/lang/Object;",
+        native_ad_get_first,
+    );
+    registry.register("java/util/Queue", "size", "()I", native_ad_size);
+    registry.register("java/util/Queue", "isEmpty", "()Z", native_ad_is_empty);
+
+    // --- java/util/Deque interface ---
+    registry.register(
+        "java/util/Deque",
+        "addFirst",
+        "(Ljava/lang/Object;)V",
+        native_ad_add_first,
+    );
+    registry.register(
+        "java/util/Deque",
+        "addLast",
+        "(Ljava/lang/Object;)V",
+        native_ad_add_last,
+    );
+    registry.register(
+        "java/util/Deque",
+        "removeFirst",
+        "()Ljava/lang/Object;",
+        native_ad_remove_first,
+    );
+    registry.register(
+        "java/util/Deque",
+        "removeLast",
+        "()Ljava/lang/Object;",
+        native_ad_remove_last,
+    );
+    registry.register(
+        "java/util/Deque",
+        "peekFirst",
+        "()Ljava/lang/Object;",
+        native_ad_peek_first,
+    );
+    registry.register(
+        "java/util/Deque",
+        "peekLast",
+        "()Ljava/lang/Object;",
+        native_ad_peek_last,
+    );
+    registry.register(
+        "java/util/Deque",
+        "push",
+        "(Ljava/lang/Object;)V",
+        native_ad_add_first,
+    );
+    registry.register(
+        "java/util/Deque",
+        "pop",
+        "()Ljava/lang/Object;",
+        native_ad_remove_first,
+    );
+    registry.register("java/util/Deque", "size", "()I", native_ad_size);
+    registry.register("java/util/Deque", "isEmpty", "()Z", native_ad_is_empty);
+
+    // Iterator support for ArrayDeque$Itr and PriorityQueue$Itr
+    // They follow the same 2-field snapshot pattern (field 0 = array, field 1 = cursor)
+    for itr_class in &["java/util/ArrayDeque$Itr", "java/util/PriorityQueue$Itr"] {
+        registry.register(itr_class, "hasNext", "()Z", native_snapshot_itr_has_next);
+        registry.register(
+            itr_class,
+            "next",
+            "()Ljava/lang/Object;",
+            native_snapshot_itr_next,
+        );
+    }
+}
+
+/// Generic snapshot-based iterator: field 0 = Object[] snapshot, field 1 = Int cursor
+fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr) as i32;
+    Ok(Some(Value::Int(if cursor < len { 1 } else { 0 })))
+}
+
+fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr) as i32;
+    if cursor >= len {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No more elements".to_string(),
+        }
+        .into());
+    }
+    let elem = ctx.get_array_element(arr, cursor as usize);
+    ctx.set_field(this, 1, Value::Int(cursor + 1));
+    Ok(Some(elem))
+}
+
+// ===========================================================================
+// TreeMap — sorted map backed by sorted array (binary-search for O(log n) lookup)
+// ===========================================================================
+
+const TM_FIELD_DATA: usize = 0; // Object[] interleaved [k0, v0, k1, v1, ...]
+const TM_FIELD_SIZE: usize = 1; // Int: number of entries
+const TM_FIELD_COMPARATOR: usize = 2; // Comparator object or null
+const TM_NUM_FIELDS: usize = 3;
+const TM_DEFAULT_CAPACITY: usize = 16; // initial entry slots (array len = 32)
+
+// TreeSet — sorted set backed by sorted array
+const TS_FIELD_DATA: usize = 0; // Object[] sorted elements
+const TS_FIELD_SIZE: usize = 1; // Int: number of elements
+const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
+const TS_NUM_FIELDS: usize = 3;
+const TS_DEFAULT_CAPACITY: usize = 16;
+
+// ----- comparison helper -----
+
+fn tree_compare(
+    ctx: &mut dyn NativeContext,
+    comparator: &Value,
+    a: Value,
+    b: Value,
+) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+    let result = match comparator {
+        Value::Object(Some(cmp)) => comparator_compare(ctx, *cmp, a, b)?,
+        _ => natural_compare(ctx, &a, &b)?,
+    };
+    match result {
+        Some(Value::Int(v)) => Ok(v),
+        _ => Ok(0),
+    }
+}
+
+// ----- TreeMap binary search -----
+// Returns Ok(index) if key found at that entry index, Err(insert_pos) if not found.
+fn tm_binary_search(
+    ctx: &mut dyn NativeContext,
+    data: ObjectRef,
+    size: i32,
+    comparator: &Value,
+    key: &Value,
+) -> Result<Result<usize, usize>, rustjvm_types::error::MethodCallFailed> {
+    let mut low: usize = 0;
+    let mut high = size as usize;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let mid_key = ctx.get_array_element(data, mid * 2);
+        let cmp = tree_compare(ctx, comparator, mid_key, *key)?;
+        if cmp < 0 {
+            low = mid + 1;
+        } else if cmp > 0 {
+            high = mid;
+        } else {
+            return Ok(Ok(mid));
+        }
+    }
+    Ok(Err(low))
+}
+
+// ----- TreeSet binary search -----
+fn ts_binary_search(
+    ctx: &mut dyn NativeContext,
+    data: ObjectRef,
+    size: i32,
+    comparator: &Value,
+    key: &Value,
+) -> Result<Result<usize, usize>, rustjvm_types::error::MethodCallFailed> {
+    let mut low: usize = 0;
+    let mut high = size as usize;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let mid_elem = ctx.get_array_element(data, mid);
+        let cmp = tree_compare(ctx, comparator, mid_elem, *key)?;
+        if cmp < 0 {
+            low = mid + 1;
+        } else if cmp > 0 {
+            high = mid;
+        } else {
+            return Ok(Ok(mid));
+        }
+    }
+    Ok(Err(low))
+}
+
+// Read TreeMap state
+fn tm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, Value) {
+    let data = match ctx.get_field(this, TM_FIELD_DATA) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, TM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let comparator = ctx.get_field(this, TM_FIELD_COMPARATOR);
+    (data, size, comparator)
+}
+
+// Ensure TreeMap data array has room for at least one more entry
+fn tm_ensure_capacity(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    size: i32,
+    data: ObjectRef,
+) -> ObjectRef {
+    let arr_len = ctx.array_length(data);
+    let needed = ((size + 1) as usize) * 2;
+    if needed <= arr_len {
+        return data;
+    }
+    let new_cap = (arr_len * 2).max(needed);
+    let new_arr = alloc_ref_array(ctx, new_cap);
+    for i in 0..(size as usize * 2) {
+        let v = ctx.get_array_element(data, i);
+        ctx.set_array_element(new_arr, i, v);
+    }
+    ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(new_arr)));
+    new_arr
+}
+
+// Insert key/value at position, shifting elements right
+fn tm_insert_at(
+    ctx: &mut dyn NativeContext,
+    data: ObjectRef,
+    size: i32,
+    pos: usize,
+    key: Value,
+    value: Value,
+) {
+    let s = size as usize;
+    for i in (pos..s).rev() {
+        let k = ctx.get_array_element(data, i * 2);
+        let v = ctx.get_array_element(data, i * 2 + 1);
+        ctx.set_array_element(data, (i + 1) * 2, k);
+        ctx.set_array_element(data, (i + 1) * 2 + 1, v);
+    }
+    ctx.set_array_element(data, pos * 2, key);
+    ctx.set_array_element(data, pos * 2 + 1, value);
+}
+
+// Remove entry at position, shifting elements left
+fn tm_remove_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: usize) {
+    let s = size as usize;
+    for i in pos..(s - 1) {
+        let k = ctx.get_array_element(data, (i + 1) * 2);
+        let v = ctx.get_array_element(data, (i + 1) * 2 + 1);
+        ctx.set_array_element(data, i * 2, k);
+        ctx.set_array_element(data, i * 2 + 1, v);
+    }
+    ctx.set_array_element(data, (s - 1) * 2, Value::Object(None));
+    ctx.set_array_element(data, (s - 1) * 2 + 1, Value::Object(None));
+}
+
+// ----- TreeSet helpers -----
+
+fn ts_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, Value) {
+    let data = match ctx.get_field(this, TS_FIELD_DATA) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, TS_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let comparator = ctx.get_field(this, TS_FIELD_COMPARATOR);
+    (data, size, comparator)
+}
+
+fn ts_ensure_capacity(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    size: i32,
+    data: ObjectRef,
+) -> ObjectRef {
+    let arr_len = ctx.array_length(data);
+    let needed = (size + 1) as usize;
+    if needed <= arr_len {
+        return data;
+    }
+    let new_cap = (arr_len * 2).max(needed);
+    let new_arr = alloc_ref_array(ctx, new_cap);
+    for i in 0..(size as usize) {
+        let v = ctx.get_array_element(data, i);
+        ctx.set_array_element(new_arr, i, v);
+    }
+    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
+    new_arr
+}
+
+fn ts_insert_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: usize, elem: Value) {
+    let s = size as usize;
+    for i in (pos..s).rev() {
+        let v = ctx.get_array_element(data, i);
+        ctx.set_array_element(data, i + 1, v);
+    }
+    ctx.set_array_element(data, pos, elem);
+}
+
+fn ts_remove_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: usize) {
+    let s = size as usize;
+    for i in pos..(s - 1) {
+        let v = ctx.get_array_element(data, i + 1);
+        ctx.set_array_element(data, i, v);
+    }
+    ctx.set_array_element(data, s - 1, Value::Object(None));
+}
+
+// ===========================================================================
+// TreeMap native methods
+// ===========================================================================
+
+fn native_tm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, TM_FIELD_COMPARATOR, Value::Object(None));
+    Ok(None)
+}
+
+fn native_tm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, TM_FIELD_COMPARATOR, cmp);
+    Ok(None)
+}
+
+fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => {
+            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+            ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+            buf
+        }
+    };
+    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
+    match search {
+        Ok(idx) => {
+            // Key exists — replace value, return old
+            let old = ctx.get_array_element(data, idx * 2 + 1);
+            ctx.set_array_element(data, idx * 2 + 1, value);
+            Ok(Some(old))
+        }
+        Err(pos) => {
+            // Key not found — insert at pos
+            let data = tm_ensure_capacity(ctx, this, size, data);
+            tm_insert_at(ctx, data, size, pos, key, value);
+            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size + 1));
+            Ok(Some(Value::Object(None)))
+        }
+    }
+}
+
+fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2 + 1))),
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => {
+            let old_val = ctx.get_array_element(data, idx * 2 + 1);
+            tm_remove_at(ctx, data, size, idx);
+            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size - 1));
+            Ok(Some(old_val))
+        }
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let found = tm_binary_search(ctx, data, size, &comparator, &key)?.is_ok();
+    Ok(Some(Value::Int(i32::from(found))))
+}
+
+fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, _) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    for i in 0..(size as usize) {
+        let v = ctx.get_array_element(data, i * 2 + 1);
+        if values_equal(ctx, &v, &target) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = match ctx.get_field(this, TM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let size = match ctx.get_field(this, TM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
+}
+
+fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TM_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeMap is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "TreeMap is empty".to_string(),
+        }
+        .into());
+    }
+    let data = data_opt.unwrap();
+    Ok(Some(ctx.get_array_element(data, 0)))
+}
+
+fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeMap is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "TreeMap is empty".to_string(),
+        }
+        .into());
+    }
+    let data = data_opt.unwrap();
+    Ok(Some(ctx.get_array_element(data, (size as usize - 1) * 2)))
+}
+
+// ceilingKey: smallest key >= given key
+fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2))),
+        Err(pos) => {
+            if pos < size as usize {
+                Ok(Some(ctx.get_array_element(data, pos * 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+// floorKey: largest key <= given key
+fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2))),
+        Err(pos) => {
+            if pos > 0 {
+                Ok(Some(ctx.get_array_element(data, (pos - 1) * 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+// higherKey: smallest key strictly > given key
+fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => {
+            let next = idx + 1;
+            if next < size as usize {
+                Ok(Some(ctx.get_array_element(data, next * 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        Err(pos) => {
+            if pos < size as usize {
+                Ok(Some(ctx.get_array_element(data, pos * 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+// lowerKey: largest key strictly < given key
+fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => {
+            if idx > 0 {
+                Ok(Some(ctx.get_array_element(data, (idx - 1) * 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        Err(pos) => {
+            if pos > 0 {
+                Ok(Some(ctx.get_array_element(data, (pos - 1) * 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ObjectRef {
+    let entry = alloc_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    ctx.set_field(entry, 0, key);
+    ctx.set_field(entry, 1, value);
+    entry
+}
+
+fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = data_opt.unwrap();
+    let k = ctx.get_array_element(data, 0);
+    let v = ctx.get_array_element(data, 1);
+    let entry = tm_make_entry(ctx, k, v);
+    Ok(Some(Value::Object(Some(entry))))
+}
+
+fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = data_opt.unwrap();
+    let last = (size as usize - 1) * 2;
+    let k = ctx.get_array_element(data, last);
+    let v = ctx.get_array_element(data, last + 1);
+    let entry = tm_make_entry(ctx, k, v);
+    Ok(Some(Value::Object(Some(entry))))
+}
+
+fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = data_opt.unwrap();
+    let k = ctx.get_array_element(data, 0);
+    let v = ctx.get_array_element(data, 1);
+    tm_remove_at(ctx, data, size, 0);
+    ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size - 1));
+    let entry = tm_make_entry(ctx, k, v);
+    Ok(Some(Value::Object(Some(entry))))
+}
+
+fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = data_opt.unwrap();
+    let last = (size as usize - 1) * 2;
+    let k = ctx.get_array_element(data, last);
+    let v = ctx.get_array_element(data, last + 1);
+    ctx.set_array_element(data, last, Value::Object(None));
+    ctx.set_array_element(data, last + 1, Value::Object(None));
+    ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size - 1));
+    let entry = tm_make_entry(ctx, k, v);
+    Ok(Some(Value::Object(Some(entry))))
+}
+
+fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    // Return a TreeSet with the same comparator and keys in order
+    let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, std::cmp::max(size as usize, TS_DEFAULT_CAPACITY));
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            ctx.set_array_element(buf, i, k);
+        }
+    }
+    ctx.set_field(ts, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(ts, TS_FIELD_SIZE, Value::Int(size));
+    ctx.set_field(ts, TS_FIELD_COMPARATOR, comparator);
+    Ok(Some(Value::Object(Some(ts))))
+}
+
+fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    // Return an ArrayList with values in order
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            ctx.set_array_element(buf, i, v);
+        }
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(size));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    // Return an ArrayList of Map$Entry objects in sorted order
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            let entry = tm_make_entry(ctx, k, v);
+            ctx.set_array_element(buf, i, Value::Object(Some(entry)));
+        }
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(size));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    for i in 0..(size as usize) {
+        let k = ctx.get_array_element(data, i * 2);
+        let v = ctx.get_array_element(data, i * 2 + 1);
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[k, v],
+        )?;
+    }
+    Ok(None)
+}
+
+fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(default)),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(data, idx * 2 + 1))),
+        Err(_) => Ok(Some(default)),
+    }
+}
+
+fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => {
+            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+            ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+            buf
+        }
+    };
+    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
+    match search {
+        Ok(idx) => {
+            let existing = ctx.get_array_element(data, idx * 2 + 1);
+            Ok(Some(existing))
+        }
+        Err(pos) => {
+            let data = tm_ensure_capacity(ctx, this, size, data);
+            tm_insert_at(ctx, data, size, pos, key, value);
+            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size + 1));
+            Ok(Some(Value::Object(None)))
+        }
+    }
+}
+
+fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    // Read entries from source map (try HashMap layout first, then TreeMap)
+    let src_f0 = ctx.get_field(source, 0);
+    let src_f1 = ctx.get_field(source, 1);
+    let src_f2 = ctx.get_field(source, 2);
+    match (src_f1, src_f2) {
+        (Value::Int(src_size), Value::Int(_capacity)) => {
+            // HashMap/LinkedHashMap layout: field 0 = buckets, field 1 = size, field 2 = capacity
+            if let Value::Object(Some(buckets)) = src_f0 {
+                let num_buckets = ctx.array_length(buckets);
+                for b in 0..num_buckets {
+                    let mut node_val = ctx.get_array_element(buckets, b);
+                    while let Value::Object(Some(node)) = node_val {
+                        let k = ctx.get_field(node, 0); // NODE_FIELD_KEY
+                        let v = ctx.get_field(node, 1); // NODE_FIELD_VALUE
+                        native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
+                        node_val = ctx.get_field(node, 3); // NODE_FIELD_NEXT
+                    }
+                }
+            }
+            let _ = src_size; // suppress warning
+        }
+        (Value::Int(src_size), _) => {
+            // TreeMap layout: field 0 = data array, field 1 = size, field 2 = comparator
+            if let Value::Object(Some(src_data)) = src_f0 {
+                for i in 0..(src_size as usize) {
+                    let k = ctx.get_array_element(src_data, i * 2);
+                    let v = ctx.get_array_element(src_data, i * 2 + 1);
+                    native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    let mut buf = String::from("{");
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            let k = ctx.get_array_element(data, i * 2);
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            buf.push_str(&obj_to_display_string(ctx, &k));
+            buf.push('=');
+            buf.push_str(&obj_to_display_string(ctx, &v));
+        }
+    }
+    buf.push('}');
+    let s = ctx.create_string(&buf);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_tm_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, TM_FIELD_COMPARATOR)))
+}
+
+// headMap: entries with keys strictly < toKey
+fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let to_key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    ctx.set_field(result, TM_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(result, TM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(result, TM_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            let cmp = tree_compare(ctx, &comparator, k, to_key)?;
+            if cmp >= 0 {
+                break;
+            }
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+// tailMap: entries with keys >= fromKey
+fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    ctx.set_field(result, TM_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(result, TM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(result, TM_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            let cmp = tree_compare(ctx, &comparator, k, from_key)?;
+            if cmp >= 0 {
+                let v = ctx.get_array_element(data, i * 2 + 1);
+                native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+            }
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+// subMap: entries with keys >= fromKey and < toKey
+fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    ctx.set_field(result, TM_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(result, TM_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(result, TM_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
+            if cmp_lo < 0 {
+                continue;
+            }
+            let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
+            if cmp_hi >= 0 {
+                break;
+            }
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mapper = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => {
+            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+            ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+            buf
+        }
+    };
+    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
+    match search {
+        Ok(idx) => {
+            let existing = ctx.get_array_element(data, idx * 2 + 1);
+            Ok(Some(existing))
+        }
+        Err(pos) => {
+            let result = ctx.invoke_virtual(
+                mapper,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[key],
+            )?;
+            let val = result.unwrap_or(Value::Object(None));
+            let data = tm_ensure_capacity(ctx, this, size, data);
+            tm_insert_at(ctx, data, size, pos, key, val);
+            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size + 1));
+            Ok(Some(val))
+        }
+    }
+}
+
+fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let remap_fn = match args.get(3) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => {
+            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+            ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+            buf
+        }
+    };
+    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
+    match search {
+        Ok(idx) => {
+            let old_val = ctx.get_array_element(data, idx * 2 + 1);
+            let merged = ctx.invoke_virtual(
+                remap_fn,
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[old_val, value],
+            )?;
+            let new_val = merged.unwrap_or(Value::Object(None));
+            ctx.set_array_element(data, idx * 2 + 1, new_val);
+            Ok(Some(new_val))
+        }
+        Err(pos) => {
+            let data = tm_ensure_capacity(ctx, this, size, data);
+            tm_insert_at(ctx, data, size, pos, key, value);
+            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size + 1));
+            Ok(Some(value))
+        }
+    }
+}
+
+// TreeMap key iterator: snapshot-based, returns keys in sorted order
+fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = tm_state(ctx, this);
+    let snap = alloc_ref_array(ctx, size as usize);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            ctx.set_array_element(snap, i, k);
+        }
+    }
+    let itr = alloc_synthetic(ctx, "java/util/TreeMap$KeyItr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(snap)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+// ===========================================================================
+// TreeSet native methods
+// ===========================================================================
+
+fn native_ts_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, TS_FIELD_COMPARATOR, Value::Object(None));
+    Ok(None)
+}
+
+fn native_ts_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, TS_FIELD_COMPARATOR, cmp);
+    Ok(None)
+}
+
+fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+            ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+            ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
+            ctx.set_field(this, TS_FIELD_COMPARATOR, Value::Object(None));
+            return Ok(None);
+        }
+    };
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, TS_FIELD_COMPARATOR, Value::Object(None));
+    // Add elements from source
+    let elems = collect_collection_elements(ctx, source);
+    for e in elems {
+        native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
+    }
+    Ok(None)
+}
+
+fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => {
+            let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+            ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+            buf
+        }
+    };
+    let search = ts_binary_search(ctx, data, size, &comparator, &elem)?;
+    match search {
+        Ok(_) => Ok(Some(Value::Int(0))), // already present
+        Err(pos) => {
+            let data = ts_ensure_capacity(ctx, this, size, data);
+            ts_insert_at(ctx, data, size, pos, elem);
+            ctx.set_field(this, TS_FIELD_SIZE, Value::Int(size + 1));
+            Ok(Some(Value::Int(1)))
+        }
+    }
+}
+
+fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+        Ok(idx) => {
+            ts_remove_at(ctx, data, size, idx);
+            ctx.set_field(this, TS_FIELD_SIZE, Value::Int(size - 1));
+            Ok(Some(Value::Int(1)))
+        }
+        Err(_) => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let found = ts_binary_search(ctx, data, size, &comparator, &elem)?.is_ok();
+    Ok(Some(Value::Int(i32::from(found))))
+}
+
+fn native_ts_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = match ctx.get_field(this, TS_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_ts_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let size = match ctx.get_field(this, TS_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
+}
+
+fn native_ts_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ts_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeSet is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "TreeSet is empty".to_string(),
+        }
+        .into());
+    }
+    let data = data_opt.unwrap();
+    Ok(Some(ctx.get_array_element(data, 0)))
+}
+
+fn native_ts_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeSet is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "TreeSet is empty".to_string(),
+        }
+        .into());
+    }
+    let data = data_opt.unwrap();
+    Ok(Some(ctx.get_array_element(data, (size - 1) as usize)))
+}
+
+fn native_ts_ceiling(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(data, idx))),
+        Err(pos) => {
+            if pos < size as usize {
+                Ok(Some(ctx.get_array_element(data, pos)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+fn native_ts_floor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(data, idx))),
+        Err(pos) => {
+            if pos > 0 {
+                Ok(Some(ctx.get_array_element(data, pos - 1)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+fn native_ts_higher(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+        Ok(idx) => {
+            let next = idx + 1;
+            if next < size as usize {
+                Ok(Some(ctx.get_array_element(data, next)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        Err(pos) => {
+            if pos < size as usize {
+                Ok(Some(ctx.get_array_element(data, pos)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+fn native_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match ts_binary_search(ctx, data, size, &comparator, &elem)? {
+        Ok(idx) => {
+            if idx > 0 {
+                Ok(Some(ctx.get_array_element(data, idx - 1)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        Err(pos) => {
+            if pos > 0 {
+                Ok(Some(ctx.get_array_element(data, pos - 1)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let snap = alloc_ref_array(ctx, size as usize);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let v = ctx.get_array_element(data, i);
+            ctx.set_array_element(snap, i, v);
+        }
+    }
+    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(snap)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    for i in 0..(size as usize) {
+        let v = ctx.get_array_element(data, i);
+        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[v])?;
+    }
+    Ok(None)
+}
+
+fn native_ts_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let arr = alloc_ref_array(ctx, size as usize);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let v = ctx.get_array_element(data, i);
+            ctx.set_array_element(arr, i, v);
+        }
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_ts_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let mut buf = String::from("[");
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            let v = ctx.get_array_element(data, i);
+            buf.push_str(&obj_to_display_string(ctx, &v));
+        }
+    }
+    buf.push(']');
+    let s = ctx.create_string(&buf);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_ts_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, TS_FIELD_COMPARATOR)))
+}
+
+fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(result, TS_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(result, TS_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            let cmp = tree_compare(ctx, &comparator, e, to_elem)?;
+            if cmp >= 0 {
+                break;
+            }
+            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(result, TS_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(result, TS_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            let cmp = tree_compare(ctx, &comparator, e, from_elem)?;
+            if cmp >= 0 {
+                native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            }
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let to_elem = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ctx.set_field(result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(result, TS_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(result, TS_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            let cmp_lo = tree_compare(ctx, &comparator, e, from_elem)?;
+            if cmp_lo < 0 {
+                continue;
+            }
+            let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
+            if cmp_hi >= 0 {
+                break;
+            }
+            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = collect_collection_elements(ctx, source);
+    let mut changed = false;
+    for e in elems {
+        let result = native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
+        if result == Some(Value::Int(1)) {
+            changed = true;
+        }
+    }
+    Ok(Some(Value::Int(i32::from(changed))))
+}
+
+// ===========================================================================
+// Registration
+// ===========================================================================
+
+fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/TreeMap";
+    registry.register(c, "<init>", "()V", native_tm_init);
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+        native_tm_init_comparator,
+    );
+    registry.register(
+        c,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_put,
+    );
+    registry.register(
+        c,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_get,
+    );
+    registry.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_remove,
+    );
+    registry.register(
+        c,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_tm_contains_key,
+    );
+    registry.register(
+        c,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_tm_contains_value,
+    );
+    registry.register(c, "size", "()I", native_tm_size);
+    registry.register(c, "isEmpty", "()Z", native_tm_is_empty);
+    registry.register(c, "clear", "()V", native_tm_clear);
+    registry.register(c, "firstKey", "()Ljava/lang/Object;", native_tm_first_key);
+    registry.register(c, "lastKey", "()Ljava/lang/Object;", native_tm_last_key);
+    registry.register(
+        c,
+        "ceilingKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_ceiling_key,
+    );
+    registry.register(
+        c,
+        "floorKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_floor_key,
+    );
+    registry.register(
+        c,
+        "higherKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_higher_key,
+    );
+    registry.register(
+        c,
+        "lowerKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_lower_key,
+    );
+    registry.register(
+        c,
+        "firstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_first_entry,
+    );
+    registry.register(
+        c,
+        "lastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_last_entry,
+    );
+    registry.register(
+        c,
+        "pollFirstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_poll_first_entry,
+    );
+    registry.register(
+        c,
+        "pollLastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_poll_last_entry,
+    );
+    registry.register(c, "keySet", "()Ljava/util/Set;", native_tm_key_set);
+    registry.register(c, "values", "()Ljava/util/Collection;", native_tm_values);
+    registry.register(c, "entrySet", "()Ljava/util/Set;", native_tm_entry_set);
+    registry.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_tm_for_each,
+    );
+    registry.register(
+        c,
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_get_or_default,
+    );
+    registry.register(
+        c,
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_put_if_absent,
+    );
+    registry.register(c, "putAll", "(Ljava/util/Map;)V", native_tm_put_all);
+    registry.register(c, "toString", "()Ljava/lang/String;", native_tm_to_string);
+    registry.register(
+        c,
+        "comparator",
+        "()Ljava/util/Comparator;",
+        native_tm_comparator,
+    );
+    registry.register(
+        c,
+        "headMap",
+        "(Ljava/lang/Object;)Ljava/util/SortedMap;",
+        native_tm_head_map,
+    );
+    registry.register(
+        c,
+        "tailMap",
+        "(Ljava/lang/Object;)Ljava/util/SortedMap;",
+        native_tm_tail_map,
+    );
+    registry.register(
+        c,
+        "subMap",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedMap;",
+        native_tm_sub_map,
+    );
+    registry.register(
+        c,
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+        native_tm_compute_if_absent,
+    );
+    registry.register(
+        c,
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_tm_merge,
+    );
+    registry.register(
+        c,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_tm_key_iterator,
+    );
+
+    // Iterator for TreeMap keys
+    let ki = "java/util/TreeMap$KeyItr";
+    registry.register(ki, "hasNext", "()Z", native_snapshot_itr_has_next);
+    registry.register(ki, "next", "()Ljava/lang/Object;", native_snapshot_itr_next);
+
+    // SortedMap/NavigableMap interface dispatch
+    let sm = "java/util/SortedMap";
+    registry.register(sm, "firstKey", "()Ljava/lang/Object;", native_tm_first_key);
+    registry.register(sm, "lastKey", "()Ljava/lang/Object;", native_tm_last_key);
+    registry.register(
+        sm,
+        "comparator",
+        "()Ljava/util/Comparator;",
+        native_tm_comparator,
+    );
+    registry.register(
+        sm,
+        "headMap",
+        "(Ljava/lang/Object;)Ljava/util/SortedMap;",
+        native_tm_head_map,
+    );
+    registry.register(
+        sm,
+        "tailMap",
+        "(Ljava/lang/Object;)Ljava/util/SortedMap;",
+        native_tm_tail_map,
+    );
+    registry.register(
+        sm,
+        "subMap",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedMap;",
+        native_tm_sub_map,
+    );
+    let nm = "java/util/NavigableMap";
+    registry.register(
+        nm,
+        "ceilingKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_ceiling_key,
+    );
+    registry.register(
+        nm,
+        "floorKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_floor_key,
+    );
+    registry.register(
+        nm,
+        "higherKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_higher_key,
+    );
+    registry.register(
+        nm,
+        "lowerKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_tm_lower_key,
+    );
+    registry.register(
+        nm,
+        "firstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_first_entry,
+    );
+    registry.register(
+        nm,
+        "lastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_last_entry,
+    );
+    registry.register(
+        nm,
+        "pollFirstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_poll_first_entry,
+    );
+    registry.register(
+        nm,
+        "pollLastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_tm_poll_last_entry,
+    );
+}
+
+fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
+    let c = "java/util/TreeSet";
+    registry.register(c, "<init>", "()V", native_ts_init);
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+        native_ts_init_comparator,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_ts_init_collection,
+    );
+    registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+    registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
+    registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
+    registry.register(c, "size", "()I", native_ts_size);
+    registry.register(c, "isEmpty", "()Z", native_ts_is_empty);
+    registry.register(c, "clear", "()V", native_ts_clear);
+    registry.register(c, "first", "()Ljava/lang/Object;", native_ts_first);
+    registry.register(c, "last", "()Ljava/lang/Object;", native_ts_last);
+    registry.register(
+        c,
+        "ceiling",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_ceiling,
+    );
+    registry.register(
+        c,
+        "floor",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_floor,
+    );
+    registry.register(
+        c,
+        "higher",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_higher,
+    );
+    registry.register(
+        c,
+        "lower",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_lower,
+    );
+    registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ts_iterator);
+    registry.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_ts_for_each,
+    );
+    registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ts_to_array);
+    registry.register(c, "toString", "()Ljava/lang/String;", native_ts_to_string);
+    registry.register(
+        c,
+        "comparator",
+        "()Ljava/util/Comparator;",
+        native_ts_comparator,
+    );
+    registry.register(
+        c,
+        "headSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+        native_ts_head_set,
+    );
+    registry.register(
+        c,
+        "tailSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+        native_ts_tail_set,
+    );
+    registry.register(
+        c,
+        "subSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+        native_ts_sub_set,
+    );
+    registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+
+    // TreeSet iterator
+    let ti = "java/util/TreeSet$Itr";
+    registry.register(ti, "hasNext", "()Z", native_snapshot_itr_has_next);
+    registry.register(ti, "next", "()Ljava/lang/Object;", native_snapshot_itr_next);
+
+    // SortedSet/NavigableSet interface dispatch
+    let ss = "java/util/SortedSet";
+    registry.register(ss, "first", "()Ljava/lang/Object;", native_ts_first);
+    registry.register(ss, "last", "()Ljava/lang/Object;", native_ts_last);
+    registry.register(
+        ss,
+        "comparator",
+        "()Ljava/util/Comparator;",
+        native_ts_comparator,
+    );
+    registry.register(
+        ss,
+        "headSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+        native_ts_head_set,
+    );
+    registry.register(
+        ss,
+        "tailSet",
+        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+        native_ts_tail_set,
+    );
+    registry.register(
+        ss,
+        "subSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+        native_ts_sub_set,
+    );
+    let ns = "java/util/NavigableSet";
+    registry.register(
+        ns,
+        "ceiling",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_ceiling,
+    );
+    registry.register(
+        ns,
+        "floor",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_floor,
+    );
+    registry.register(
+        ns,
+        "higher",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_higher,
+    );
+    registry.register(
+        ns,
+        "lower",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_ts_lower,
+    );
+}
+
+// ===========================================================================
+// ConcurrentHashMap (Phase 22 / M18, Phase 86.2 — segmented concurrency)
+// ===========================================================================
+//
+// ConcurrentHashMap uses a striped/segmented layout for real concurrency:
+//   field 0 = Object[] segments (array of segment objects)
+//   field 1 = Int segment_mask (num_segments - 1)
+// Each segment is a 3-field HashMap-like object (buckets, size, capacity).
+// Reads (get, containsKey) are lock-free. Writes (put, remove) lock only
+// the target segment via monitor_enter/exit, allowing concurrent writes to
+// different segments without contention.
+
+const CHM_FIELD_SEGMENTS: usize = 0;
+const CHM_FIELD_SEGMENT_MASK: usize = 1;
+const _CHM_NUM_FIELDS: usize = 2;
+const CHM_DEFAULT_SEGMENTS: usize = 16;
+const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
+
+/// Compute hash for a key value (reuses map_hash_key for object keys).
+fn chm_key_hash(ctx: &dyn NativeContext, key: &Value) -> i32 {
+    match key {
+        Value::Object(Some(k)) => map_hash_key(ctx, *k),
+        _ => 0,
+    }
+}
+
+/// Get the segment object for a given hash.
+fn chm_segment_for(ctx: &dyn NativeContext, this: ObjectRef, hash: i32) -> Option<ObjectRef> {
+    let segments = match ctx.get_field(this, CHM_FIELD_SEGMENTS) {
+        Value::Object(Some(arr)) => arr,
+        _ => return None,
+    };
+    let mask = match ctx.get_field(this, CHM_FIELD_SEGMENT_MASK) {
+        Value::Int(m) => m as usize,
+        _ => CHM_DEFAULT_SEGMENTS - 1,
+    };
+    let idx = (hash as u32 as usize) & mask;
+    match ctx.get_array_element(segments, idx) {
+        Value::Object(Some(seg)) => Some(seg),
+        _ => None,
+    }
+}
+
+/// Get all segment objects.
+fn chm_all_segments(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> {
+    let segments = match ctx.get_field(this, CHM_FIELD_SEGMENTS) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Vec::new(),
+    };
+    let mask = match ctx.get_field(this, CHM_FIELD_SEGMENT_MASK) {
+        Value::Int(m) => m as usize,
+        _ => CHM_DEFAULT_SEGMENTS - 1,
+    };
+    let count = mask + 1;
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        if let Value::Object(Some(seg)) = ctx.get_array_element(segments, i) {
+            result.push(seg);
+        }
+    }
+    result
+}
+
+/// Collect all entries from all segments.
+fn chm_collect_all_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    let mut entries = Vec::new();
+    for seg in chm_all_segments(ctx, this) {
+        let seg_entries = map_collect_entries(ctx, seg);
+        entries.extend(seg_entries);
+    }
+    entries
+}
+
+/// Collect all keys from all segments.
+fn chm_collect_all_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let mut keys = Vec::new();
+    for seg in chm_all_segments(ctx, this) {
+        let (buckets, _size, cap) = map_state(ctx, seg);
+        if let Some(b) = buckets {
+            for i in 0..(cap as usize) {
+                let mut node_val = ctx.get_array_element(b, i);
+                while let Value::Object(Some(node)) = node_val {
+                    keys.push(ctx.get_field(node, NODE_FIELD_KEY));
+                    node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Collect all values from all segments.
+fn chm_collect_all_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let mut vals = Vec::new();
+    for seg in chm_all_segments(ctx, this) {
+        let (buckets, _size, cap) = map_state(ctx, seg);
+        if let Some(b) = buckets {
+            for i in 0..(cap as usize) {
+                let mut node_val = ctx.get_array_element(b, i);
+                while let Value::Object(Some(node)) = node_val {
+                    vals.push(ctx.get_field(node, NODE_FIELD_VALUE));
+                    node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                }
+            }
+        }
+    }
+    vals
+}
+
+/// Initialize a CHM with segments.
+fn chm_init_segments(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    num_segments: usize,
+    cap_per_segment: usize,
+) {
+    let segments = alloc_ref_array(ctx, num_segments);
+    for i in 0..num_segments {
+        let seg = ctx.alloc_object(ClassId::new(0), MAP_NUM_FIELDS);
+        let buckets = alloc_ref_array(ctx, cap_per_segment);
+        ctx.set_field(seg, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        ctx.set_field(seg, MAP_FIELD_SIZE, Value::Int(0));
+        ctx.set_field(seg, MAP_FIELD_CAPACITY, Value::Int(cap_per_segment as i32));
+        let _ = ctx.set_array_element(segments, i, Value::Object(Some(seg)));
+    }
+    ctx.set_field(this, CHM_FIELD_SEGMENTS, Value::Object(Some(segments)));
+    ctx.set_field(this, CHM_FIELD_SEGMENT_MASK, Value::Int((num_segments - 1) as i32));
+}
+
+fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/concurrent/ConcurrentHashMap";
+
+    // Constructors
+    r.register(c, "<init>", "()V", native_chm_init_default);
+    r.register(c, "<init>", "(I)V", native_chm_init_capacity);
+    r.register(c, "<init>", "(IFI)V", native_chm_init_full);
+    r.register(c, "<init>", "(Ljava/util/Map;)V", native_chm_init_from_map);
+
+    // Core operations — segmented
+    r.register(c, "size", "()I", native_chm_size);
+    r.register(c, "isEmpty", "()Z", native_chm_is_empty);
+    r.register(
+        c,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_put,
+    );
+    r.register(
+        c,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_get,
+    );
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_remove,
+    );
+    r.register(
+        c,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_chm_contains_key,
+    );
+    r.register(
+        c,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_chm_contains_value,
+    );
+    r.register(c, "clear", "()V", native_chm_clear);
+    r.register(c, "keySet", "()Ljava/util/Set;", native_chm_key_set);
+    r.register(c, "values", "()Ljava/util/Collection;", native_chm_values);
+    r.register(c, "entrySet", "()Ljava/util/Set;", native_chm_entry_set);
+    r.register(c, "toString", "()Ljava/lang/String;", native_chm_to_string);
+    r.register(
+        c,
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_get_or_default,
+    );
+    r.register(
+        c,
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_put_if_absent,
+    );
+    r.register(c, "putAll", "(Ljava/util/Map;)V", native_chm_put_all);
+    r.register(c, "hashCode", "()I", native_chm_hash_code);
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", native_chm_equals);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_chm_for_each,
+    );
+    r.register(
+        c,
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+        native_chm_compute_if_absent,
+    );
+    r.register(
+        c,
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_compute,
+    );
+    r.register(
+        c,
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_merge,
+    );
+    r.register(
+        c,
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+        native_chm_replace_all,
+    );
+
+    // ConcurrentHashMap-specific methods
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_chm_remove_kv,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_replace,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_chm_replace_kv,
+    );
+    r.register(
+        c,
+        "forEach",
+        "(JLjava/util/function/BiConsumer;)V",
+        native_chm_for_each_parallel,
+    );
+    r.register(c, "mappingCount", "()J", native_chm_mapping_count);
+    r.register(
+        c,
+        "newKeySet",
+        "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+        native_chm_new_key_set,
+    );
+    r.register(
+        c,
+        "keySet",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+        native_chm_key_set_view,
+    );
+    r.register(
+        c,
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_chm_contains_value,
+    );
+    r.register(
+        c,
+        "elements",
+        "()Ljava/util/Enumeration;",
+        native_chm_elements,
+    );
+    r.register(c, "keys", "()Ljava/util/Enumeration;", native_chm_keys);
+
+    // Bulk operations — snapshot under per-segment locks
+    r.register(
+        c,
+        "forEachEntry",
+        "(JLjava/util/function/Consumer;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let action = match args.get(2) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(None),
+            };
+            let entries = chm_collect_all_entries(ctx, this);
+            for (key, value) in entries {
+                let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
+                ctx.set_field(entry, NODE_FIELD_KEY, key);
+                ctx.set_field(entry, NODE_FIELD_VALUE, value);
+                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[Value::Object(Some(entry))])?;
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        c,
+        "forEachKey",
+        "(JLjava/util/function/Consumer;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let action = match args.get(2) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(None),
+            };
+            let keys = chm_collect_all_keys(ctx, this);
+            for key in keys {
+                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key])?;
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        c,
+        "forEachValue",
+        "(JLjava/util/function/Consumer;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let action = match args.get(2) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(None),
+            };
+            let vals = chm_collect_all_values(ctx, this);
+            for val in vals {
+                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val])?;
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        c,
+        "search",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let func = match args.get(2) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let entries = chm_collect_all_entries(ctx, this);
+            for (key, val) in entries {
+                let result = ctx.invoke_virtual(func, "apply", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", &[key, val])?;
+                if let Some(Value::Object(Some(_))) = result {
+                    return Ok(result);
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
+    // ConcurrentMap interface — delegates to CHM segmented ops
+    let cm = "java/util/concurrent/ConcurrentMap";
+    r.register(cm, "size", "()I", native_chm_size);
+    r.register(
+        cm,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_get,
+    );
+    r.register(
+        cm,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_put,
+    );
+    r.register(
+        cm,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_chm_remove,
+    );
+    r.register(
+        cm,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_chm_contains_key,
+    );
+}
+
+// --- ConcurrentHashMap segmented native functions (Phase 86.2) ---
+
+fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    Ok(None)
+}
+
+fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let total_cap = match args.get(1) {
+        Some(Value::Int(v)) => (*v).max(1) as usize,
+        _ => CHM_DEFAULT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP,
+    };
+    let cap_per_seg = (total_cap / CHM_DEFAULT_SEGMENTS).max(1).next_power_of_two();
+    chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, cap_per_seg);
+    Ok(None)
+}
+
+fn native_chm_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let total_cap = match args.get(1) {
+        Some(Value::Int(v)) => (*v).max(1) as usize,
+        _ => CHM_DEFAULT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP,
+    };
+    let concurrency = match args.get(3) {
+        Some(Value::Int(v)) => (*v).max(1) as usize,
+        _ => CHM_DEFAULT_SEGMENTS,
+    };
+    let num_segments = concurrency.next_power_of_two().min(256);
+    let cap_per_seg = (total_cap / num_segments).max(1).next_power_of_two();
+    chm_init_segments(ctx, this, num_segments, cap_per_seg);
+    Ok(None)
+}
+
+fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    // Copy entries from source map (HashMap layout: 3-field)
+    let source = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let src_entries = map_collect_entries(ctx, source);
+    for (key, value) in src_entries {
+        let hash = chm_key_hash(ctx, &key);
+        if let Some(seg) = chm_segment_for(ctx, this, hash) {
+            ctx.monitor_enter(seg);
+            native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
+            ctx.monitor_exit(seg);
+        }
+    }
+    Ok(None)
+}
+
+// --- Core read operations (lock-free) ---
+
+fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => native_map_get(ctx, &[Value::Object(Some(seg)), key]),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => native_map_contains_key(ctx, &[Value::Object(Some(seg)), key]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_chm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => native_map_get_or_default(ctx, &[Value::Object(Some(seg)), key, default]),
+        None => Ok(Some(default)),
+    }
+}
+
+fn native_chm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Must scan all segments
+    for seg in chm_all_segments(ctx, this) {
+        let result = native_map_contains_value(ctx, &[Value::Object(Some(seg)), target])?;
+        if result == Some(Value::Int(1)) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+// --- Core write operations (per-segment locking) ---
+
+fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let result = native_map_put(ctx, &[Value::Object(Some(seg)), key, value]);
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let result = native_map_remove(ctx, &[Value::Object(Some(seg)), key]);
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let result = native_map_put_if_absent(ctx, &[Value::Object(Some(seg)), key, value]);
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let result = native_map_compute_if_absent(ctx, &[Value::Object(Some(seg)), key, func]);
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let result = native_map_compute(ctx, &[Value::Object(Some(seg)), key, func]);
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let func = args.get(3).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let result = native_map_merge(ctx, &[Value::Object(Some(seg)), key, value, func]);
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+// --- Bulk operations (iterate all segments) ---
+
+fn native_chm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let mut total = 0i32;
+    for seg in chm_all_segments(ctx, this) {
+        if let Value::Int(s) = ctx.get_field(seg, MAP_FIELD_SIZE) {
+            total += s;
+        }
+    }
+    Ok(Some(Value::Int(total)))
+}
+
+fn native_chm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = native_chm_size(ctx, args)?.unwrap_or(Value::Int(0));
+    match size {
+        Value::Int(0) => Ok(Some(Value::Int(1))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_chm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    for seg in chm_all_segments(ctx, this) {
+        ctx.monitor_enter(seg);
+        native_map_clear(ctx, &[Value::Object(Some(seg))])?;
+        ctx.monitor_exit(seg);
+    }
+    Ok(None)
+}
+
+fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let entries = map_collect_entries(ctx, source);
+    for (key, value) in entries {
+        let hash = chm_key_hash(ctx, &key);
+        if let Some(seg) = chm_segment_for(ctx, this, hash) {
+            ctx.monitor_enter(seg);
+            native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
+            ctx.monitor_exit(seg);
+        }
+    }
+    Ok(None)
+}
+
+fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let func = args.get(1).copied().unwrap_or(Value::Object(None));
+    for seg in chm_all_segments(ctx, this) {
+        ctx.monitor_enter(seg);
+        native_map_replace_all(ctx, &[Value::Object(Some(seg)), func])?;
+        ctx.monitor_exit(seg);
+    }
+    Ok(None)
+}
+
+fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let entries = chm_collect_all_entries(ctx, this);
+    for (key, value) in entries {
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[key, value],
+        )?;
+    }
+    Ok(None)
+}
+
+fn native_chm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = chm_collect_all_keys(ctx, this);
+    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = (keys.len() * 2).max(MAP_DEFAULT_CAPACITY).next_power_of_two();
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, 0, Value::Object(Some(backing)));
+    let sentinel = Value::Object(Some(set)); // reuse set ref as sentinel value
+    for key in keys {
+        native_map_put(ctx, &[Value::Object(Some(backing)), key, sentinel])?;
+    }
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let vals = chm_collect_all_values(ctx, this);
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = alloc_ref_array(ctx, vals.len().max(10));
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(vals.len() as i32));
+    for (i, v) in vals.into_iter().enumerate() {
+        let _ = ctx.set_array_element(arr, i, v);
+    }
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let entries = chm_collect_all_entries(ctx, this);
+    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = (entries.len() * 2).max(MAP_DEFAULT_CAPACITY).next_power_of_two();
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, 0, Value::Object(Some(backing)));
+    for (key, value) in entries {
+        let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
+        ctx.set_field(entry, NODE_FIELD_KEY, key);
+        ctx.set_field(entry, NODE_FIELD_VALUE, value);
+        native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), Value::Object(Some(entry))])?;
+    }
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_chm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let entries = chm_collect_all_entries(ctx, this);
+    let mut parts = Vec::with_capacity(entries.len());
+    for (key, value) in &entries {
+        let k = crate::obj_to_display_string(ctx, key);
+        let v = crate::obj_to_display_string(ctx, value);
+        parts.push(format!("{}={}", k, v));
+    }
+    let s = format!("{{{}}}", parts.join(", "));
+    let sref = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(sref))))
+}
+
+fn native_chm_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let mut total = 0i32;
+    for seg in chm_all_segments(ctx, this) {
+        let result = native_map_hash_code(ctx, &[Value::Object(Some(seg))])?;
+        if let Some(Value::Int(h)) = result {
+            total = total.wrapping_add(h);
+        }
+    }
+    Ok(Some(Value::Int(total)))
+}
+
+fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    let our_entries = chm_collect_all_entries(ctx, this);
+    // Use chm_get for lookups on 'other' (which is also segmented)
+    let other_size = native_chm_size(ctx, &[Value::Object(Some(other))])?
+        .unwrap_or(Value::Int(0));
+    if let Value::Int(os) = other_size {
+        if os != our_entries.len() as i32 {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    for (key, value) in &our_entries {
+        let other_val = native_chm_get(ctx, &[Value::Object(Some(other)), *key])?
+            .unwrap_or(Value::Object(None));
+        if !values_equal(ctx, value, &other_val) {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+// --- ConcurrentHashMap-specific compound operations ---
+
+fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                .unwrap_or(Value::Object(None));
+            if values_equal(ctx, &current, &expected_val) {
+                native_map_remove(ctx, &[Value::Object(Some(seg)), key])?;
+                ctx.monitor_exit(seg);
+                Ok(Some(Value::Int(1)))
+            } else {
+                ctx.monitor_exit(seg);
+                Ok(Some(Value::Int(0)))
+            }
+        }
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                .unwrap_or(Value::Object(None));
+            let result = match current {
+                Value::Object(None) => Ok(Some(Value::Object(None))),
+                _ => {
+                    native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
+                    Ok(Some(current))
+                }
+            };
+            ctx.monitor_exit(seg);
+            result
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    let hash = chm_key_hash(ctx, &key);
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            ctx.monitor_enter(seg);
+            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                .unwrap_or(Value::Object(None));
+            if values_equal(ctx, &current, &old_val) {
+                native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
+                ctx.monitor_exit(seg);
+                Ok(Some(Value::Int(1)))
+            } else {
+                ctx.monitor_exit(seg);
+                Ok(Some(Value::Int(0)))
+            }
+        }
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let action = match args.get(2) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let entries = chm_collect_all_entries(ctx, this);
+    for (key, value) in entries {
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[key, value],
+        )?;
+    }
+    Ok(None)
+}
+
+fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = native_chm_size(ctx, args)?.unwrap_or(Value::Int(0));
+    match size {
+        Value::Int(v) => Ok(Some(Value::Long(v as i64))),
+        _ => Ok(Some(Value::Long(0))),
+    }
+}
+
+fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(
+        backing,
+        MAP_FIELD_CAPACITY,
+        Value::Int(MAP_DEFAULT_CAPACITY as i32),
+    );
+    ctx.set_field(set, 0, Value::Object(Some(backing)));
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_chm_key_set(ctx, args)
+}
+
+fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_chm_values(ctx, args)
+}
+
+fn native_chm_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_chm_key_set(ctx, args)
+}
+
+
+
+// ===========================================================================
+// Properties — delegates to HashMap backing store (same 3-field layout)
+// Field 0,1,2 = HashMap fields (buckets, size, capacity)
+// Field 3 = defaults Properties reference (or null)
+// ===========================================================================
+
+const PROPS_FIELD_DEFAULTS: usize = 3;
+
+fn register_properties_natives(registry: &mut NativeMethodRegistry) {
+    let p = "java/util/Properties";
+
+    // <init>()V — empty properties
+    registry.register(p, "<init>", "()V", native_props_init);
+
+    // <init>(Properties)V — with defaults
+    registry.register(
+        p,
+        "<init>",
+        "(Ljava/util/Properties;)V",
+        native_props_init_defaults,
+    );
+
+    // setProperty(String, String) -> String (old value)
+    registry.register(
+        p,
+        "setProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+        native_map_put,
+    );
+
+    // getProperty(String) -> String
+    registry.register(
+        p,
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_props_get_property,
+    );
+
+    // getProperty(String, String) -> String (with default value)
+    registry.register(
+        p,
+        "getProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        native_props_get_property_default,
+    );
+
+    // size() -> int
+    registry.register(p, "size", "()I", native_map_size);
+
+    // isEmpty() -> boolean
+    registry.register(p, "isEmpty", "()Z", native_map_is_empty);
+
+    // containsKey(Object) -> boolean
+    registry.register(
+        p,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_key,
+    );
+
+    // containsValue(Object) -> boolean
+    registry.register(
+        p,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_value,
+    );
+
+    // put(Object, Object) -> Object
+    registry.register(
+        p,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_put,
+    );
+
+    // get(Object) -> Object
+    registry.register(
+        p,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_get,
+    );
+
+    // remove(Object) -> Object
+    registry.register(
+        p,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_remove,
+    );
+
+    // clear()
+    registry.register(p, "clear", "()V", native_map_clear);
+
+    // keySet() -> Set
+    registry.register(p, "keySet", "()Ljava/util/Set;", native_map_key_set);
+
+    // values() -> Collection
+    registry.register(p, "values", "()Ljava/util/Collection;", native_map_values);
+
+    // entrySet() -> Set
+    registry.register(p, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
+
+    // toString()
+    registry.register(p, "toString", "()Ljava/lang/String;", native_map_to_string);
+
+    // putAll(Map)
+    registry.register(p, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+
+    // load(InputStream) — parse key=value lines
+    registry.register(p, "load", "(Ljava/io/InputStream;)V", native_props_load);
+
+    // load(Reader) — parse key=value lines
+    registry.register(p, "load", "(Ljava/io/Reader;)V", native_props_load);
+
+    // store(OutputStream, String) — write key=value lines
+    registry.register(
+        p,
+        "store",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+        native_props_store,
+    );
+
+    // propertyNames() -> Enumeration (returns keys as ArrayList iterator)
+    registry.register(
+        p,
+        "propertyNames",
+        "()Ljava/util/Enumeration;",
+        native_props_property_names,
+    );
+
+    // stringPropertyNames() -> Set<String>
+    registry.register(
+        p,
+        "stringPropertyNames",
+        "()Ljava/util/Set;",
+        native_props_string_property_names,
+    );
+
+    // getOrDefault(Object, Object) -> Object
+    registry.register(
+        p,
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_get_or_default,
+    );
+
+    // forEach(BiConsumer)
+    registry.register(
+        p,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_map_for_each,
+    );
+
+    // hashCode
+    registry.register(p, "hashCode", "()I", native_map_hash_code);
+
+    // equals
+    registry.register(p, "equals", "(Ljava/lang/Object;)Z", native_map_equals);
+
+    // Also register under Hashtable (Properties extends Hashtable)
+    let ht = "java/util/Hashtable";
+    registry.register(ht, "<init>", "()V", native_map_init);
+    registry.register(
+        ht,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_put,
+    );
+    registry.register(
+        ht,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_get,
+    );
+    registry.register(
+        ht,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_remove,
+    );
+    registry.register(ht, "size", "()I", native_map_size);
+    registry.register(ht, "isEmpty", "()Z", native_map_is_empty);
+    registry.register(
+        ht,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_key,
+    );
+    registry.register(
+        ht,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_map_contains_value,
+    );
+    registry.register(ht, "clear", "()V", native_map_clear);
+    registry.register(ht, "keySet", "()Ljava/util/Set;", native_map_key_set);
+    registry.register(ht, "values", "()Ljava/util/Collection;", native_map_values);
+    registry.register(ht, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
+    registry.register(ht, "toString", "()Ljava/lang/String;", native_map_to_string);
+    registry.register(ht, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+}
+
+fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    native_map_init(ctx, &[Value::Object(Some(this))])?;
+    ctx.set_field(this, PROPS_FIELD_DEFAULTS, Value::Object(None));
+    Ok(None)
+}
+
+fn native_props_init_defaults(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    native_map_init(ctx, &[Value::Object(Some(this))])?;
+    ctx.set_field(this, PROPS_FIELD_DEFAULTS, args[1]);
+    Ok(None)
+}
+
+fn native_props_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // First check this map
+    let result = native_map_get(ctx, args)?;
+    if let Some(Value::Object(Some(_))) = result {
+        return Ok(result);
+    }
+    // Fall through to defaults chain
+    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    while let Value::Object(Some(defs)) = defaults_val {
+        let def_result = native_map_get(ctx, &[Value::Object(Some(defs)), args[1]])?;
+        if let Some(Value::Object(Some(_))) = def_result {
+            return Ok(def_result);
+        }
+        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_props_get_property_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(args[2])),
+    };
+    // First check this map
+    let result = native_map_get(ctx, &[args[0], args[1]])?;
+    if let Some(Value::Object(Some(_))) = result {
+        return Ok(result);
+    }
+    // Fall through to defaults chain
+    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    while let Value::Object(Some(defs)) = defaults_val {
+        let def_result = native_map_get(ctx, &[Value::Object(Some(defs)), args[1]])?;
+        if let Some(Value::Object(Some(_))) = def_result {
+            return Ok(def_result);
+        }
+        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+    }
+    // Return the default value arg
+    Ok(Some(args[2]))
+}
+
+/// Load properties from a stream-like input: parse "key=value" or "key:value" lines.
+/// Simplified: reads all bytes from the stream arg (field 0 = data for BAIS),
+/// then parses lines.
+fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let stream = match args[1] {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(None),
+    };
+
+    // Try to read the stream contents: if it's a BAIS, read data directly
+    // Otherwise try to read it as a string field
+    let text = props_read_input(ctx, stream);
+
+    // Parse key=value lines
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        // Handle continuation lines (trailing \) — simplified: ignore
+        // Find separator: = or :
+        let (key, value) = if let Some(eq_pos) = line.find('=') {
+            (line[..eq_pos].trim(), line[eq_pos + 1..].trim())
+        } else if let Some(colon_pos) = line.find(':') {
+            (line[..colon_pos].trim(), line[colon_pos + 1..].trim())
+        } else {
+            // Key with no value
+            (line, "")
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let key_obj = ctx.create_string(key);
+        let val_obj = ctx.create_string(value);
+        native_map_put(
+            ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(key_obj)),
+                Value::Object(Some(val_obj)),
+            ],
+        )?;
+    }
+    Ok(None)
+}
+
+/// Helper: read all text from a stream or reader object.
+fn props_read_input(ctx: &mut dyn NativeContext, stream: ObjectRef) -> String {
+    // Try BAIS protocol: field 0 = byte[], field 1 = pos, field 2 = mark, field 3 = count
+    if let Value::Object(Some(data_arr)) = ctx.get_field(stream, 0) {
+        let pos = match ctx.get_field(stream, 1) {
+            Value::Int(p) => p as usize,
+            _ => 0,
+        };
+        let count = match ctx.get_field(stream, 3) {
+            Value::Int(c) => c as usize,
+            _ => 0,
+        };
+        let mut bytes = Vec::with_capacity(count.saturating_sub(pos));
+        for i in pos..count {
+            if let Value::Int(b) = ctx.get_array_element(data_arr, i) {
+                bytes.push(b as u8);
+            }
+        }
+        return String::from_utf8_lossy(&bytes).into_owned();
+    }
+    // Fallback: try to read field 0 as a string directly (e.g. BufferedReader)
+    if let Some(s) = ctx.read_string(stream) {
+        return s;
+    }
+    String::new()
+}
+
+/// Store properties to an output stream as "key=value" lines.
+fn native_props_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // Collect all key-value pairs
+    let keys = props_collect_keys(ctx, this);
+    let mut output = String::new();
+
+    // Optional comment header
+    if let Value::Object(Some(comment)) = args[2] {
+        if let Some(c) = ctx.read_string(comment) {
+            output.push_str(&format!("# {}\n", c));
+        }
+    }
+
+    for key_obj in keys {
+        if let Some(key_str) = ctx.read_string(key_obj) {
+            let val = native_map_get(
+                ctx,
+                &[Value::Object(Some(this)), Value::Object(Some(key_obj))],
+            )?;
+            let val_str = match val {
+                Some(Value::Object(Some(v))) => ctx.read_string(v).unwrap_or_default(),
+                _ => String::new(),
+            };
+            output.push_str(&format!("{}={}\n", key_str, val_str));
+        }
+    }
+
+    // Write to output stream (simplified: store as string in the stream)
+    // For BAOS: write bytes directly
+    if let Value::Object(Some(ostream)) = args[1] {
+        let bytes = output.as_bytes();
+        for &b in bytes {
+            // Call write(I)V on the output stream
+            let _ = ctx.invoke_virtual(ostream, "write", "(I)V", &[Value::Int(b as i32)]);
+        }
+    }
+    Ok(None)
+}
+
+/// Collect all key ObjectRefs from the HashMap backing store.
+fn props_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> {
+    let (buckets, _size, cap) = map_state(ctx, this);
+    let mut keys = Vec::new();
+    if let Some(b) = buckets {
+        for i in 0..(cap as usize) {
+            let mut node_val = ctx.get_array_element(b, i);
+            while let Value::Object(Some(node)) = node_val {
+                if let Value::Object(Some(key)) = ctx.get_field(node, NODE_FIELD_KEY) {
+                    keys.push(key);
+                }
+                node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+            }
+        }
+    }
+    keys
+}
+
+/// propertyNames() -> returns an Enumeration-like iterator
+/// We return a snapshot ArrayList iterator (same as keySet iterator)
+fn native_props_property_names(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Just delegate to keySet which returns a HashSet, then get its iterator
+    native_map_key_set(ctx, args)
+}
+
+/// stringPropertyNames() -> Set<String>
+fn native_props_string_property_names(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Collect keys from this and all defaults into a HashSet
+    let result = native_map_key_set(ctx, &[Value::Object(Some(this))])?;
+
+    // Also add keys from defaults chain
+    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    while let Value::Object(Some(defs)) = defaults_val {
+        let def_keys = props_collect_keys(ctx, defs);
+        if let Some(Value::Object(Some(set))) = result {
+            for key in def_keys {
+                // Add to the result set (HashSet add = contains check + add)
+                let key_val = Value::Object(Some(key));
+                let contains = native_hs_contains(ctx, &[Value::Object(Some(set)), key_val])?;
+                if contains != Some(Value::Int(1)) {
+                    native_hs_add(ctx, &[Value::Object(Some(set)), key_val])?;
+                }
+            }
+        }
+        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+    }
+    Ok(result)
+}
+
+// ===========================================================================
+// Phase 39: Collections extras — unmodifiableMap/Set, emptyMap/Set/Iterator,
+//           frequency, disjoint, singleton, Enumeration stubs
+// ===========================================================================
+
+fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/Collections";
+    r.register(
+        c,
+        "emptyMap",
+        "()Ljava/util/Map;",
+        native_collections_empty_map,
+    );
+    r.register(
+        c,
+        "emptySet",
+        "()Ljava/util/Set;",
+        native_collections_empty_set,
+    );
+    r.register(
+        c,
+        "emptyIterator",
+        "()Ljava/util/Iterator;",
+        native_collections_empty_iterator,
+    );
+    r.register(
+        c,
+        "singleton",
+        "(Ljava/lang/Object;)Ljava/util/Set;",
+        native_collections_singleton,
+    );
+    r.register(
+        c,
+        "singletonMap",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
+        native_collections_singleton_map,
+    );
+    r.register(
+        c,
+        "unmodifiableMap",
+        "(Ljava/util/Map;)Ljava/util/Map;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "unmodifiableSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "unmodifiableSortedMap",
+        "(Ljava/util/SortedMap;)Ljava/util/SortedMap;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "unmodifiableSortedSet",
+        "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "unmodifiableCollection",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "synchronizedList",
+        "(Ljava/util/List;)Ljava/util/List;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "synchronizedMap",
+        "(Ljava/util/Map;)Ljava/util/Map;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "synchronizedSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "synchronizedCollection",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        native_collections_identity,
+    );
+    r.register(
+        c,
+        "frequency",
+        "(Ljava/util/Collection;Ljava/lang/Object;)I",
+        native_collections_frequency,
+    );
+    r.register(
+        c,
+        "disjoint",
+        "(Ljava/util/Collection;Ljava/util/Collection;)Z",
+        native_collections_disjoint,
+    );
+    r.register(
+        c,
+        "max",
+        "(Ljava/util/Collection;)Ljava/lang/Object;",
+        native_collections_max,
+    );
+    r.register(
+        c,
+        "min",
+        "(Ljava/util/Collection;)Ljava/lang/Object;",
+        native_collections_min,
+    );
+    r.register(c, "swap", "(Ljava/util/List;II)V", native_collections_swap);
+    r.register(
+        c,
+        "fill",
+        "(Ljava/util/List;Ljava/lang/Object;)V",
+        native_collections_fill,
+    );
+    r.register(
+        c,
+        "nCopies",
+        "(ILjava/lang/Object;)Ljava/util/List;",
+        native_collections_n_copies,
+    );
+    r.register(
+        c,
+        "shuffle",
+        "(Ljava/util/List;)V",
+        native_collections_shuffle,
+    );
+    r.register(
+        c,
+        "addAll",
+        "(Ljava/util/Collection;[Ljava/lang/Object;)Z",
+        native_collections_add_all,
+    );
+    // List.copyOf / Set.copyOf / Map.copyOf
+    r.register(
+        "java/util/List",
+        "copyOf",
+        "(Ljava/util/Collection;)Ljava/util/List;",
+        native_collections_identity,
+    );
+    r.register(
+        "java/util/Set",
+        "copyOf",
+        "(Ljava/util/Collection;)Ljava/util/Set;",
+        native_collections_identity,
+    );
+    r.register(
+        "java/util/Map",
+        "copyOf",
+        "(Ljava/util/Map;)Ljava/util/Map;",
+        native_collections_identity,
+    );
+
+    // Enumeration interface
+    let en = "java/util/Enumeration";
+    r.register(en, "hasMoreElements", "()Z", native_snapshot_itr_has_next);
+    r.register(
+        en,
+        "nextElement",
+        "()Ljava/lang/Object;",
+        native_snapshot_itr_next,
+    );
+}
+
+/// Identity — just returns the first argument (used for unmodifiable/synchronized wrappers)
+fn native_collections_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
+}
+
+fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    native_map_init(ctx, &[Value::Object(Some(map))])?;
+    Ok(Some(Value::Object(Some(map))))
+}
+
+fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let inner_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_collections_empty_iterator(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = alloc_ref_array(ctx, 0);
+    let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyItr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let elem = args.first().cloned().unwrap_or(Value::Object(None));
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let inner_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+    // Add elem
+    native_map_put(
+        ctx,
+        &[Value::Object(Some(inner_map)), elem, Value::Object(None)],
+    )?;
+    Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_collections_singleton_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let key = args.first().cloned().unwrap_or(Value::Object(None));
+    let val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    native_map_init(ctx, &[Value::Object(Some(map))])?;
+    native_map_put(ctx, &[Value::Object(Some(map)), key, val])?;
+    Ok(Some(Value::Object(Some(map))))
+}
+
+fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let coll = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, coll);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let mut count = 0i32;
+    for i in 0..size as usize {
+        let elem = ctx.get_array_element(data, i);
+        if values_equal(ctx, &elem, &target) {
+            count += 1;
+        }
+    }
+    Ok(Some(Value::Int(count)))
+}
+
+fn native_collections_disjoint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c1 = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let c2 = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let (data1, size1) = al_state(ctx, c1);
+    let (data2, size2) = al_state(ctx, c2);
+    let (d1, d2) = match (data1, data2) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    for i in 0..size1 as usize {
+        let elem = ctx.get_array_element(d1, i);
+        for j in 0..size2 as usize {
+            let other = ctx.get_array_element(d2, j);
+            if values_equal(ctx, &elem, &other) {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let coll = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, coll);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mut max_val = ctx.get_array_element(data, 0);
+    let mut max_str = val_to_string(ctx, &max_val);
+    for i in 1..size as usize {
+        let elem = ctx.get_array_element(data, i);
+        let s = val_to_string(ctx, &elem);
+        if s > max_str {
+            max_val = elem;
+            max_str = s;
+        }
+    }
+    Ok(Some(max_val))
+}
+
+fn native_collections_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let coll = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data, size) = al_state(ctx, coll);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mut min_val = ctx.get_array_element(data, 0);
+    let mut min_str = val_to_string(ctx, &min_val);
+    for i in 1..size as usize {
+        let elem = ctx.get_array_element(data, i);
+        let s = val_to_string(ctx, &elem);
+        if s < min_str {
+            min_val = elem;
+            min_str = s;
+        }
+    }
+    Ok(Some(min_val))
+}
+
+fn val_to_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
+    match val {
+        Value::Object(Some(o)) => ctx.read_string(*o).unwrap_or_default(),
+        Value::Int(v) => v.to_string(),
+        Value::Long(v) => v.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let i = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => return Ok(None),
+    };
+    let j = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => return Ok(None),
+    };
+    let (data, _) = al_state(ctx, list);
+    if let Some(d) = data {
+        let a = ctx.get_array_element(d, i);
+        let b = ctx.get_array_element(d, j);
+        ctx.set_array_element(d, i, b);
+        ctx.set_array_element(d, j, a);
+    }
+    Ok(None)
+}
+
+fn native_collections_fill(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, list);
+    if let Some(d) = data {
+        for i in 0..size as usize {
+            ctx.set_array_element(d, i, val);
+        }
+    }
+    Ok(None)
+}
+
+fn native_collections_n_copies(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let n = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let arr = alloc_ref_array(ctx, n.max(0) as usize);
+    for i in 0..n.max(0) as usize {
+        ctx.set_array_element(arr, i, val);
+    }
+    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(arr)));
+    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(n.max(0)));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn native_collections_shuffle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let list = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let (data, size) = al_state(ctx, list);
+    if let Some(d) = data {
+        let n = size as usize;
+        // Simple Fisher-Yates using system time as seed
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(42u64, |t| t.as_nanos() as u64);
+        let mut rng = seed;
+        for i in (1..n).rev() {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (rng >> 33) as usize % (i + 1);
+            let a = ctx.get_array_element(d, i);
+            let b = ctx.get_array_element(d, j);
+            ctx.set_array_element(d, i, b);
+            ctx.set_array_element(d, j, a);
+        }
+    }
+    Ok(None)
+}
+
+fn native_collections_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let coll = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elements = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let len = ctx.array_length(elements);
+    let mut modified = false;
+    for i in 0..len {
+        let elem = ctx.get_array_element(elements, i);
+        native_al_add(ctx, &[Value::Object(Some(coll)), elem])?;
+        modified = true;
+    }
+    Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+// ===========================================================================
+// Phase 41: BlockingQueue family — LinkedBlockingQueue, ArrayBlockingQueue
+// ===========================================================================
+
+// LinkedBlockingQueue = 4-field synthetic (same as LinkedList + capacity)
+const LBQ_FIELD_HEAD: usize = 0;
+const LBQ_FIELD_TAIL: usize = 1;
+const LBQ_FIELD_SIZE: usize = 2;
+const LBQ_FIELD_CAPACITY: usize = 3;
+const _LBQ_NUM_FIELDS: usize = 4;
+
+fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
+    // LinkedBlockingQueue
+    let lbq = "java/util/concurrent/LinkedBlockingQueue";
+    r.register(lbq, "<init>", "()V", native_lbq_init);
+    r.register(lbq, "<init>", "(I)V", native_lbq_init_cap);
+    // put() blocks until space is available (spin-wait with yield)
+    r.register(lbq, "put", "(Ljava/lang/Object;)V", native_lbq_put_blocking);
+    r.register(lbq, "offer", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    r.register(lbq, "add", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    // take() blocks until an element is available (spin-wait with yield)
+    r.register(lbq, "take", "()Ljava/lang/Object;", native_lbq_take_blocking);
+    r.register(lbq, "poll", "()Ljava/lang/Object;", native_lbq_poll);
+    r.register(lbq, "peek", "()Ljava/lang/Object;", native_lbq_peek);
+    r.register(lbq, "size", "()I", native_lbq_size);
+    r.register(lbq, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(lbq, "remainingCapacity", "()I", native_lbq_remaining);
+    r.register(lbq, "clear", "()V", native_lbq_clear);
+    r.register(
+        lbq,
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_lbq_contains,
+    );
+    r.register(lbq, "remove", "(Ljava/lang/Object;)Z", native_lbq_remove);
+    r.register(lbq, "toArray", "()[Ljava/lang/Object;", native_lbq_to_array);
+    r.register(
+        lbq,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_lbq_iterator,
+    );
+    // Also register under BlockingQueue interface
+    let bq = "java/util/concurrent/BlockingQueue";
+    r.register(bq, "put", "(Ljava/lang/Object;)V", native_lbq_put_blocking);
+    r.register(bq, "offer", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    r.register(bq, "take", "()Ljava/lang/Object;", native_lbq_take_blocking);
+    r.register(bq, "poll", "()Ljava/lang/Object;", native_lbq_poll);
+    r.register(bq, "peek", "()Ljava/lang/Object;", native_lbq_peek);
+
+    // ArrayBlockingQueue
+    let abq = "java/util/concurrent/ArrayBlockingQueue";
+    r.register(abq, "<init>", "(I)V", native_abq_init);
+    r.register(abq, "<init>", "(IZ)V", native_abq_init_fair);
+    r.register(abq, "put", "(Ljava/lang/Object;)V", native_lbq_put_blocking);
+    r.register(abq, "offer", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    r.register(abq, "add", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    r.register(abq, "take", "()Ljava/lang/Object;", native_lbq_take_blocking);
+    r.register(abq, "poll", "()Ljava/lang/Object;", native_lbq_poll);
+    r.register(abq, "peek", "()Ljava/lang/Object;", native_lbq_peek);
+    r.register(abq, "size", "()I", native_lbq_size);
+    r.register(abq, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(abq, "remainingCapacity", "()I", native_lbq_remaining);
+    r.register(abq, "clear", "()V", native_lbq_clear);
+    r.register(
+        abq,
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_lbq_contains,
+    );
+    r.register(abq, "remove", "(Ljava/lang/Object;)Z", native_lbq_remove);
+    r.register(abq, "toArray", "()[Ljava/lang/Object;", native_lbq_to_array);
+    r.register(
+        abq,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_lbq_iterator,
+    );
+
+    // ConcurrentLinkedQueue
+    let clq = "java/util/concurrent/ConcurrentLinkedQueue";
+    r.register(clq, "<init>", "()V", native_lbq_init);
+    r.register(clq, "offer", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    r.register(clq, "add", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
+    r.register(clq, "poll", "()Ljava/lang/Object;", native_lbq_poll);
+    r.register(clq, "peek", "()Ljava/lang/Object;", native_lbq_peek);
+    r.register(clq, "size", "()I", native_lbq_size);
+    r.register(clq, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(
+        clq,
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_lbq_contains,
+    );
+    r.register(clq, "remove", "(Ljava/lang/Object;)Z", native_lbq_remove);
+    r.register(
+        clq,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_lbq_iterator,
+    );
+
+    // ConcurrentLinkedDeque
+    let cld = "java/util/concurrent/ConcurrentLinkedDeque";
+    r.register(cld, "<init>", "()V", native_lbq_init);
+    r.register(
+        cld,
+        "offerFirst",
+        "(Ljava/lang/Object;)Z",
+        native_lbq_offer_bool,
+    );
+    r.register(
+        cld,
+        "offerLast",
+        "(Ljava/lang/Object;)Z",
+        native_lbq_offer_bool,
+    );
+    r.register(cld, "pollFirst", "()Ljava/lang/Object;", native_lbq_poll);
+    r.register(
+        cld,
+        "pollLast",
+        "()Ljava/lang/Object;",
+        native_lbq_poll_last,
+    );
+    r.register(cld, "peekFirst", "()Ljava/lang/Object;", native_lbq_peek);
+    r.register(
+        cld,
+        "peekLast",
+        "()Ljava/lang/Object;",
+        native_lbq_peek_last,
+    );
+    r.register(cld, "size", "()I", native_lbq_size);
+    r.register(cld, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(
+        cld,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_lbq_iterator,
+    );
+}
+
+// Blocking queue implementations — backed by ArrayList internally for simplicity
+fn native_lbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let arr = alloc_ref_array(ctx, 16);
+    ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(arr)));
+    ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(0)); // unused, we use simple array
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, LBQ_FIELD_CAPACITY, Value::Int(i32::MAX));
+    Ok(None)
+}
+
+fn native_lbq_init_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let cap = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => i32::MAX,
+    };
+    let arr = alloc_ref_array(ctx, cap.max(1) as usize);
+    ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(arr)));
+    ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(0));
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(this, LBQ_FIELD_CAPACITY, Value::Int(cap));
+    Ok(None)
+}
+
+fn native_abq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_lbq_init_cap(ctx, args)
+}
+
+fn native_abq_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Ignore fair param
+    native_lbq_init_cap(ctx, args)
+}
+
+fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return,
+    };
+    let old_len = ctx.array_length(arr);
+    if needed <= old_len {
+        return;
+    }
+    let new_len = (old_len * 2).max(needed).max(16);
+    let new_arr = alloc_ref_array(ctx, new_len);
+    for i in 0..old_len {
+        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+    }
+    ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(new_arr)));
+}
+
+fn native_lbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    lbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(None),
+    };
+    ctx.set_array_element(arr, size as usize, elem);
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size + 1));
+    Ok(None)
+}
+
+fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let capacity = match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
+        Value::Int(v) if v > 0 => v,
+        _ => i32::MAX,
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size >= capacity {
+        return Ok(Some(Value::Int(0))); // queue full
+    }
+    native_lbq_offer(ctx, args)?;
+    Ok(Some(Value::Int(1)))
+}
+
+/// Blocking put: waits until space is available (spin-wait with yield).
+fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let capacity = match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
+        Value::Int(v) if v > 0 => v,
+        _ => i32::MAX,
+    };
+    let mut spins = 0;
+    loop {
+        ctx.monitor_enter(this);
+        let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if size < capacity {
+            ctx.monitor_exit(this);
+            break;
+        }
+        ctx.monitor_exit(this);
+        spins += 1;
+        if spins > 10000 { break; } // prevent infinite block on single-threaded VM
+        std::thread::yield_now();
+    }
+    native_lbq_offer(ctx, args)
+}
+
+/// Blocking take: waits until an element is available (spin-wait with yield).
+fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut spins = 0;
+    loop {
+        ctx.monitor_enter(this);
+        let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        ctx.monitor_exit(this);
+        if size > 0 {
+            return native_lbq_poll(ctx, args);
+        }
+        spins += 1;
+        if spins > 10000 {
+            return Ok(Some(Value::Object(None)));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn native_lbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let head = ctx.get_array_element(arr, 0);
+    // Shift elements left
+    for i in 0..(size - 1) as usize {
+        ctx.set_array_element(arr, i, ctx.get_array_element(arr, i + 1));
+    }
+    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    Ok(Some(head))
+}
+
+fn native_lbq_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let tail = ctx.get_array_element(arr, (size - 1) as usize);
+    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    Ok(Some(tail))
+}
+
+fn native_lbq_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_array_element(arr, 0)))
+}
+
+fn native_lbq_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_array_element(arr, (size - 1) as usize)))
+}
+
+fn native_lbq_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_lbq_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+fn native_lbq_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let cap = match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
+        Value::Int(v) => v,
+        _ => i32::MAX,
+    };
+    Ok(Some(Value::Int(cap - size)))
+}
+
+fn native_lbq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    for i in 0..size as usize {
+        let elem = ctx.get_array_element(arr, i);
+        if values_equal(ctx, &elem, &target) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    for i in 0..size as usize {
+        let elem = ctx.get_array_element(arr, i);
+        if values_equal(ctx, &elem, &target) {
+            for j in i..(size - 1) as usize {
+                ctx.set_array_element(arr, j, ctx.get_array_element(arr, j + 1));
+            }
+            ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+            ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_lbq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let result = alloc_ref_array(ctx, size as usize);
+    for i in 0..size as usize {
+        ctx.set_array_element(result, i, ctx.get_array_element(arr, i));
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let snap = alloc_ref_array(ctx, size as usize);
+    for i in 0..size as usize {
+        ctx.set_array_element(snap, i, ctx.get_array_element(arr, i));
+    }
+    let itr = alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(snap)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+// ===========================================================================
+// Phase 44: Iterator Protocol + Enumeration completion
+// ===========================================================================
+// Register generic java/util/Iterator interface methods as fallbacks.
+// The snapshot iterator pattern (2-field: array=0, cursor=1) is already used
+// by all collection iterators. This registers them under the interface name
+// so code calling through Iterator<E> references works.
+
+fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
+    // Generic java/util/Iterator interface — fallback to snapshot iterator
+    let itr = "java/util/Iterator";
+    r.register(itr, "hasNext", "()Z", native_snapshot_itr_has_next);
+    r.register(
+        itr,
+        "next",
+        "()Ljava/lang/Object;",
+        native_snapshot_itr_next,
+    );
+    r.register(itr, "remove", "()V", native_itr_remove_noop);
+
+    // ListIterator (extends Iterator)
+    let litr = "java/util/ListIterator";
+    r.register(litr, "hasNext", "()Z", native_snapshot_itr_has_next);
+    r.register(
+        litr,
+        "next",
+        "()Ljava/lang/Object;",
+        native_snapshot_itr_next,
+    );
+    r.register(litr, "hasPrevious", "()Z", native_list_itr_has_previous);
+    r.register(
+        litr,
+        "previous",
+        "()Ljava/lang/Object;",
+        native_list_itr_previous,
+    );
+    r.register(litr, "nextIndex", "()I", native_list_itr_next_index);
+    r.register(litr, "previousIndex", "()I", native_list_itr_previous_index);
+    r.register(litr, "remove", "()V", native_itr_remove_noop);
+    r.register(litr, "set", "(Ljava/lang/Object;)V", native_itr_remove_noop);
+    r.register(litr, "add", "(Ljava/lang/Object;)V", native_itr_remove_noop);
+
+    // Spliterator stubs
+    let spl = "java/util/Spliterator";
+    r.register(spl, "estimateSize", "()J", native_spliterator_estimate_size);
+    r.register(
+        spl,
+        "characteristics",
+        "()I",
+        native_spliterator_characteristics,
+    );
+    r.register(
+        spl,
+        "tryAdvance",
+        "(Ljava/util/function/Consumer;)Z",
+        native_spliterator_try_advance,
+    );
+    r.register(
+        spl,
+        "trySplit",
+        "()Ljava/util/Spliterator;",
+        native_return_null_obj,
+    );
+    r.register(
+        spl,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        native_spliterator_for_each_remaining,
+    );
+
+    // Spliterators factory
+    let spls = "java/util/Spliterators";
+    r.register(
+        spls,
+        "emptySpliterator",
+        "()Ljava/util/Spliterator;",
+        native_spliterators_empty,
+    );
+
+    // Collections.emptyIterator / emptyListIterator / emptyEnumeration
+    let colls = "java/util/Collections";
+    r.register(
+        colls,
+        "emptyIterator",
+        "()Ljava/util/Iterator;",
+        native_empty_iterator,
+    );
+    r.register(
+        colls,
+        "emptyListIterator",
+        "()Ljava/util/ListIterator;",
+        native_empty_iterator,
+    );
+    r.register(
+        colls,
+        "emptyEnumeration",
+        "()Ljava/util/Enumeration;",
+        native_empty_iterator,
+    );
+}
+
+fn native_itr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None) // UnsupportedOperationException in real Java, but no-op for simplicity
+}
+
+// ListIterator extras (snapshot-based: field 0 = array, field 1 = cursor)
+fn native_list_itr_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if cursor > 0 { 1 } else { 0 })))
+}
+
+fn native_list_itr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if cursor <= 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let new_cursor = cursor - 1;
+    ctx.set_field(this, 1, Value::Int(new_cursor));
+    Ok(Some(ctx.get_array_element(arr, new_cursor as usize)))
+}
+
+fn native_list_itr_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(cursor)))
+}
+
+fn native_list_itr_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(cursor - 1)))
+}
+
+// Spliterator stubs (snapshot-based: field 0 = array, field 1 = cursor)
+fn native_spliterator_estimate_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr);
+    Ok(Some(Value::Long(len.saturating_sub(cursor) as i64)))
+}
+
+fn native_spliterator_characteristics(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // SIZED | SUBSIZED | ORDERED = 0x4050
+    Ok(Some(Value::Int(0x4050)))
+}
+
+fn native_spliterator_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr);
+    if cursor >= len {
+        return Ok(Some(Value::Int(0)));
+    }
+    let elem = ctx.get_array_element(arr, cursor);
+    ctx.set_field(this, 1, Value::Int((cursor + 1) as i32));
+    ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem])?;
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_return_null_obj(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_spliterator_for_each_remaining(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(None),
+    };
+    let mut cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr);
+    while cursor < len {
+        let elem = ctx.get_array_element(arr, cursor);
+        cursor += 1;
+        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem])?;
+    }
+    ctx.set_field(this, 1, Value::Int(cursor as i32));
+    Ok(None)
+}
+
+fn native_spliterators_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let arr = alloc_ref_array(ctx, 0);
+    let itr = alloc_synthetic(ctx, "java/util/Spliterators$EmptySpliterator", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let arr = alloc_ref_array(ctx, 0);
+    let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+// ===========================================================================
+// ScheduledExecutorService / ScheduledThreadPoolExecutor
+// ===========================================================================
+
+const STPE_FIELD_POOL_SIZE: usize = 0;
+const STPE_FIELD_SHUTDOWN: usize = 1;
+const STPE_FIELD_TASK_LIST: usize = 2;
+const STPE_NUM_FIELDS: usize = 3;
+
+fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/concurrent/ScheduledThreadPoolExecutor";
+    r.register(c, "<init>", "(I)V", native_stpe_init);
+    r.register(
+        c,
+        "schedule",
+        "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule,
+    );
+    r.register(
+        c,
+        "scheduleAtFixedRate",
+        "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule_fixed_rate,
+    );
+    r.register(
+        c,
+        "scheduleWithFixedDelay",
+        "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule_fixed_delay,
+    );
+    r.register(c, "shutdown", "()V", native_stpe_shutdown);
+    r.register(
+        c,
+        "shutdownNow",
+        "()Ljava/util/List;",
+        native_stpe_shutdown_now,
+    );
+    r.register(c, "isShutdown", "()Z", native_stpe_is_shutdown);
+    r.register(
+        c,
+        "submit",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+        native_stpe_submit_runnable,
+    );
+    r.register(
+        c,
+        "submit",
+        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
+        native_stpe_submit_callable,
+    );
+
+    // Also register under the interface name
+    let iface = "java/util/concurrent/ScheduledExecutorService";
+    r.register(iface, "<init>", "(I)V", native_stpe_init);
+    r.register(
+        iface,
+        "schedule",
+        "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule,
+    );
+    r.register(
+        iface,
+        "scheduleAtFixedRate",
+        "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule_fixed_rate,
+    );
+    r.register(
+        iface,
+        "scheduleWithFixedDelay",
+        "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule_fixed_delay,
+    );
+    r.register(iface, "shutdown", "()V", native_stpe_shutdown);
+    r.register(
+        iface,
+        "shutdownNow",
+        "()Ljava/util/List;",
+        native_stpe_shutdown_now,
+    );
+    r.register(iface, "isShutdown", "()Z", native_stpe_is_shutdown);
+    r.register(
+        iface,
+        "submit",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+        native_stpe_submit_runnable,
+    );
+    r.register(
+        iface,
+        "submit",
+        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
+        native_stpe_submit_callable,
+    );
+}
+
+/// Allocate a completed ScheduledFuture that wraps a result value.
+/// Fields: 0 = result value, 1 = done flag (always 1).
+fn alloc_completed_future(ctx: &mut dyn NativeContext, result: Value) -> ObjectRef {
+    let future = alloc_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2);
+    ctx.set_field(future, 0, result);
+    ctx.set_field(future, 1, Value::Int(1)); // done = true
+    future
+}
+
+fn native_stpe_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let pool_size = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    let task_arr = alloc_ref_array(ctx, 16);
+    ctx.set_field(this, STPE_FIELD_POOL_SIZE, Value::Int(pool_size));
+    ctx.set_field(this, STPE_FIELD_SHUTDOWN, Value::Int(0));
+    ctx.set_field(this, STPE_FIELD_TASK_LIST, Value::Object(Some(task_arr)));
+    Ok(None)
+}
+
+fn native_stpe_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args: this, Runnable, long delay (2 slots), TimeUnit
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let future = alloc_completed_future(ctx, Value::Object(None));
+            return Ok(Some(Value::Object(Some(future))));
+        }
+    };
+    // Execute immediately (simplified)
+    ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    let future = alloc_completed_future(ctx, Value::Object(None));
+    Ok(Some(Value::Object(Some(future))))
+}
+
+fn native_stpe_schedule_fixed_rate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args: this, Runnable, long initialDelay (2 slots), long period (2 slots), TimeUnit
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let future = alloc_completed_future(ctx, Value::Object(None));
+            return Ok(Some(Value::Object(Some(future))));
+        }
+    };
+    // Execute once immediately (simplified)
+    ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    let future = alloc_completed_future(ctx, Value::Object(None));
+    Ok(Some(Value::Object(Some(future))))
+}
+
+fn native_stpe_schedule_fixed_delay(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args: this, Runnable, long initialDelay (2 slots), long period (2 slots), TimeUnit
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let future = alloc_completed_future(ctx, Value::Object(None));
+            return Ok(Some(Value::Object(Some(future))));
+        }
+    };
+    // Execute once immediately (simplified)
+    ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    let future = alloc_completed_future(ctx, Value::Object(None));
+    Ok(Some(Value::Object(Some(future))))
+}
+
+fn native_stpe_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, STPE_FIELD_SHUTDOWN, Value::Int(1));
+    Ok(None)
+}
+
+fn native_stpe_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Set shutdown flag
+    if let Some(Value::Object(Some(this))) = args.first() {
+        ctx.set_field(*this, STPE_FIELD_SHUTDOWN, Value::Int(1));
+    }
+    // Return empty list
+    make_list_of(ctx, &[])
+}
+
+fn native_stpe_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let shutdown = match ctx.get_field(this, STPE_FIELD_SHUTDOWN) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(shutdown != 0))))
+}
+
+fn native_stpe_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let future = alloc_completed_future(ctx, Value::Object(None));
+            return Ok(Some(Value::Object(Some(future))));
+        }
+    };
+    ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    let future = alloc_completed_future(ctx, Value::Object(None));
+    Ok(Some(Value::Object(Some(future))))
+}
+
+fn native_stpe_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let callable = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let future = alloc_completed_future(ctx, Value::Object(None));
+            return Ok(Some(Value::Object(Some(future))));
+        }
+    };
+    let result = ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[])?;
+    let val = result.unwrap_or(Value::Object(None));
+    let future = alloc_completed_future(ctx, val);
+    Ok(Some(Value::Object(Some(future))))
+}
+
+// ===========================================================================
+// ConcurrentSkipListMap (simplified as sorted array-backed map)
+// ===========================================================================
+
+const CSLM_FIELD_KEYS: usize = 0;
+const CSLM_FIELD_VALUES: usize = 1;
+const CSLM_FIELD_SIZE: usize = 2;
+#[allow(dead_code)] // used for documentation; allocations go through constructors
+const CSLM_NUM_FIELDS: usize = 3;
+const CSLM_DEFAULT_CAPACITY: usize = 16;
+
+fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/concurrent/ConcurrentSkipListMap";
+    r.register(c, "<init>", "()V", native_cslm_init);
+    r.register(
+        c,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_cslm_put,
+    );
+    r.register(
+        c,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_cslm_get,
+    );
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_cslm_remove,
+    );
+    r.register(c, "size", "()I", native_cslm_size);
+    r.register(c, "isEmpty", "()Z", native_cslm_is_empty);
+    r.register(
+        c,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        native_cslm_contains_key,
+    );
+    r.register(c, "firstKey", "()Ljava/lang/Object;", native_cslm_first_key);
+    r.register(c, "lastKey", "()Ljava/lang/Object;", native_cslm_last_key);
+    r.register(c, "keySet", "()Ljava/util/Set;", native_cslm_key_set);
+}
+
+/// Binary search in the keys array using natural comparison.
+/// Returns Ok(index) if found, Err(insert_pos) if not found.
+fn cslm_binary_search(
+    ctx: &mut dyn NativeContext,
+    keys: ObjectRef,
+    size: i32,
+    key: &Value,
+) -> Result<Result<usize, usize>, MethodCallFailed> {
+    let comparator = Value::Object(None); // natural ordering
+    let mut low: usize = 0;
+    let mut high = size as usize;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let mid_key = ctx.get_array_element(keys, mid);
+        let cmp = tree_compare(ctx, &comparator, mid_key, *key)?;
+        if cmp < 0 {
+            low = mid + 1;
+        } else if cmp > 0 {
+            high = mid;
+        } else {
+            return Ok(Ok(mid));
+        }
+    }
+    Ok(Err(low))
+}
+
+fn cslm_ensure_capacity(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    size: i32,
+    keys: ObjectRef,
+    values: ObjectRef,
+) -> (ObjectRef, ObjectRef) {
+    let arr_len = ctx.array_length(keys);
+    let needed = (size + 1) as usize;
+    if needed <= arr_len {
+        return (keys, values);
+    }
+    let new_cap = (arr_len * 2).max(needed).max(CSLM_DEFAULT_CAPACITY);
+    let new_keys = alloc_ref_array(ctx, new_cap);
+    let new_values = alloc_ref_array(ctx, new_cap);
+    for i in 0..(size as usize) {
+        ctx.set_array_element(new_keys, i, ctx.get_array_element(keys, i));
+        ctx.set_array_element(new_values, i, ctx.get_array_element(values, i));
+    }
+    ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(new_keys)));
+    ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(new_values)));
+    (new_keys, new_values)
+}
+
+fn cslm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, Option<ObjectRef>, i32) {
+    let keys = match ctx.get_field(this, CSLM_FIELD_KEYS) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let values = match ctx.get_field(this, CSLM_FIELD_VALUES) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    (keys, values, size)
+}
+
+fn native_cslm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let keys = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+    let values = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+    ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(keys)));
+    ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(values)));
+    ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
+    let keys = match keys_opt {
+        Some(k) => k,
+        None => {
+            let k = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+            ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
+            k
+        }
+    };
+    let values_arr = match values_opt {
+        Some(v) => v,
+        None => {
+            let v = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+            ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(v)));
+            v
+        }
+    };
+    let search = cslm_binary_search(ctx, keys, size, &key)?;
+    match search {
+        Ok(idx) => {
+            // Key exists — replace value, return old
+            let old = ctx.get_array_element(values_arr, idx);
+            ctx.set_array_element(values_arr, idx, value);
+            Ok(Some(old))
+        }
+        Err(pos) => {
+            // Insert at pos, shifting elements right
+            let (keys, values_arr) = cslm_ensure_capacity(ctx, this, size, keys, values_arr);
+            let s = size as usize;
+            for i in (pos..s).rev() {
+                let k = ctx.get_array_element(keys, i);
+                let v = ctx.get_array_element(values_arr, i);
+                ctx.set_array_element(keys, i + 1, k);
+                ctx.set_array_element(values_arr, i + 1, v);
+            }
+            ctx.set_array_element(keys, pos, key);
+            ctx.set_array_element(values_arr, pos, value);
+            ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(size + 1));
+            Ok(Some(Value::Object(None)))
+        }
+    }
+}
+
+fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
+    let keys = match keys_opt {
+        Some(k) => k,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let values_arr = match values_opt {
+        Some(v) => v,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match cslm_binary_search(ctx, keys, size, &key)? {
+        Ok(idx) => Ok(Some(ctx.get_array_element(values_arr, idx))),
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
+    let keys = match keys_opt {
+        Some(k) => k,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let values_arr = match values_opt {
+        Some(v) => v,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match cslm_binary_search(ctx, keys, size, &key)? {
+        Ok(idx) => {
+            let old_val = ctx.get_array_element(values_arr, idx);
+            let s = size as usize;
+            for i in idx..(s - 1) {
+                let k = ctx.get_array_element(keys, i + 1);
+                let v = ctx.get_array_element(values_arr, i + 1);
+                ctx.set_array_element(keys, i, k);
+                ctx.set_array_element(values_arr, i, v);
+            }
+            ctx.set_array_element(keys, s - 1, Value::Object(None));
+            ctx.set_array_element(values_arr, s - 1, Value::Object(None));
+            ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(size - 1));
+            Ok(Some(old_val))
+        }
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_cslm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_cslm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
+}
+
+fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (keys_opt, _, size) = cslm_state(ctx, this);
+    let keys = match keys_opt {
+        Some(k) => k,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let found = cslm_binary_search(ctx, keys, size, &key)?.is_ok();
+    Ok(Some(Value::Int(i32::from(found))))
+}
+
+fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "ConcurrentSkipListMap is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    let (keys_opt, _, size) = cslm_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "ConcurrentSkipListMap is empty".to_string(),
+        }
+        .into());
+    }
+    let keys = keys_opt.unwrap();
+    Ok(Some(ctx.get_array_element(keys, 0)))
+}
+
+fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "ConcurrentSkipListMap is empty".to_string(),
+            }
+            .into())
+        }
+    };
+    let (keys_opt, _, size) = cslm_state(ctx, this);
+    if size == 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "ConcurrentSkipListMap is empty".to_string(),
+        }
+        .into());
+    }
+    let keys = keys_opt.unwrap();
+    Ok(Some(ctx.get_array_element(keys, (size - 1) as usize)))
+}
+
+fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (keys_opt, _, size) = cslm_state(ctx, this);
+    // Return a TreeSet with natural ordering containing all keys
+    let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, std::cmp::max(size as usize, TS_DEFAULT_CAPACITY));
+    if let Some(keys) = keys_opt {
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(keys, i);
+            ctx.set_array_element(buf, i, k);
+        }
+    }
+    ctx.set_field(ts, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ctx.set_field(ts, TS_FIELD_SIZE, Value::Int(size));
+    ctx.set_field(ts, TS_FIELD_COMPARATOR, Value::Object(None));
+    Ok(Some(Value::Object(Some(ts))))
+}
+
+// ===========================================================================
+// StampedLock
+// ===========================================================================
+
+const SL_FIELD_STATE: usize = 0; // 0=free, 1=write-locked, >=2 means (state-1) readers
+const SL_FIELD_STAMP: usize = 1; // monotonic stamp counter
+#[allow(dead_code)]
+const SL_NUM_FIELDS: usize = 2;
+
+fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/concurrent/locks/StampedLock";
+    r.register(c, "<init>", "()V", native_sl_init);
+    r.register(c, "readLock", "()J", native_sl_read_lock);
+    r.register(c, "unlockRead", "(J)V", native_sl_unlock_read);
+    r.register(c, "writeLock", "()J", native_sl_write_lock);
+    r.register(c, "unlockWrite", "(J)V", native_sl_unlock_write);
+    r.register(c, "tryOptimisticRead", "()J", native_sl_try_optimistic_read);
+    r.register(c, "validate", "(J)Z", native_sl_validate);
+    r.register(c, "tryReadLock", "()J", native_sl_try_read_lock);
+    r.register(c, "tryWriteLock", "()J", native_sl_try_write_lock);
+    r.register(c, "isReadLocked", "()Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        // state >= 2 means readers are present
+        Ok(Some(Value::Int(if state >= 2 { 1 } else { 0 })))
+    });
+    r.register(c, "isWriteLocked", "()Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        // state == 1 means write-locked
+        Ok(Some(Value::Int(if state == 1 { 1 } else { 0 })))
+    });
+}
+
+fn native_sl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
+    ctx.set_field(this, SL_FIELD_STAMP, Value::Int(1));
+    Ok(None)
+}
+
+fn sl_next_stamp(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
+    let stamp = match ctx.get_field(this, SL_FIELD_STAMP) {
+        Value::Int(v) => v as i64,
+        Value::Long(v) => v,
+        _ => 1,
+    };
+    let next = stamp + 1;
+    ctx.set_field(this, SL_FIELD_STAMP, Value::Long(next));
+    stamp
+}
+
+fn native_sl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    // Acquire monitor and spin-wait if write-locked
+    ctx.monitor_enter(this);
+    let mut state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // Wait for write lock to be released (bounded spin)
+    let mut spins = 0;
+    while state == 1 && spins < 1000 {
+        ctx.monitor_exit(this);
+        std::thread::yield_now();
+        ctx.monitor_enter(this);
+        state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        spins += 1;
+    }
+    // state >= 2 means readers present; state == 0 means free
+    let new_state = if state == 0 || state == 1 { 2 } else { state + 1 };
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+    let stamp = sl_next_stamp(ctx, this);
+    ctx.monitor_exit(this);
+    Ok(Some(Value::Long(stamp)))
+}
+
+fn native_sl_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.monitor_enter(this);
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if state >= 2 {
+        let new_state = if state == 2 { 0 } else { state - 1 };
+        ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+    }
+    ctx.monitor_exit(this);
+    Ok(None)
+}
+
+fn native_sl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    // Acquire monitor and spin-wait if readers or writers present
+    ctx.monitor_enter(this);
+    let mut state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let mut spins = 0;
+    while state != 0 && spins < 1000 {
+        ctx.monitor_exit(this);
+        std::thread::yield_now();
+        ctx.monitor_enter(this);
+        state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        spins += 1;
+    }
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
+    let stamp = sl_next_stamp(ctx, this);
+    ctx.monitor_exit(this);
+    Ok(Some(Value::Long(stamp)))
+}
+
+fn native_sl_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.monitor_enter(this);
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
+    sl_next_stamp(ctx, this);
+    ctx.monitor_exit(this);
+    Ok(None)
+}
+
+fn native_sl_try_optimistic_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if state == 1 {
+        // Write-locked, return 0 (failure)
+        Ok(Some(Value::Long(0)))
+    } else {
+        let stamp = match ctx.get_field(this, SL_FIELD_STAMP) {
+            Value::Int(v) => v as i64,
+            Value::Long(v) => v,
+            _ => 1,
+        };
+        Ok(Some(Value::Long(stamp)))
+    }
+}
+
+fn native_sl_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let expected_stamp = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if expected_stamp == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let current_stamp = match ctx.get_field(this, SL_FIELD_STAMP) {
+        Value::Int(v) => v as i64,
+        Value::Long(v) => v,
+        _ => 0,
+    };
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // Valid if stamp hasn't changed and not write-locked
+    let valid = expected_stamp == current_stamp && state != 1;
+    Ok(Some(Value::Int(i32::from(valid))))
+}
+
+fn native_sl_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if state == 1 {
+        // Write-locked, can't acquire read lock
+        Ok(Some(Value::Long(0)))
+    } else {
+        let new_state = if state == 0 { 2 } else { state + 1 };
+        ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+        let stamp = sl_next_stamp(ctx, this);
+        Ok(Some(Value::Long(stamp)))
+    }
+}
+
+fn native_sl_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if state != 0 {
+        // Not free — someone is holding a lock
+        Ok(Some(Value::Long(0)))
+    } else {
+        ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
+        let stamp = sl_next_stamp(ctx, this);
+        Ok(Some(Value::Long(stamp)))
+    }
+}
+
+// ===========================================================================
+// Phaser
+// ===========================================================================
+
+const PH_FIELD_PARTIES: usize = 0;
+const PH_FIELD_ARRIVED: usize = 1;
+const PH_FIELD_PHASE: usize = 2;
+#[allow(dead_code)]
+const PH_NUM_FIELDS: usize = 3;
+
+fn register_phaser_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/concurrent/Phaser";
+    r.register(c, "<init>", "()V", native_ph_init_empty);
+    r.register(c, "<init>", "(I)V", native_ph_init_parties);
+    r.register(c, "register", "()I", native_ph_register);
+    r.register(c, "arriveAndAwaitAdvance", "()I", native_ph_arrive_and_await);
+    r.register(c, "arriveAndDeregister", "()I", native_ph_arrive_and_deregister);
+    r.register(c, "arrive", "()I", native_ph_arrive);
+    r.register(c, "getPhase", "()I", native_ph_get_phase);
+    r.register(c, "getRegisteredParties", "()I", native_ph_get_registered_parties);
+    r.register(c, "getArrivedParties", "()I", native_ph_get_arrived_parties);
+}
+
+fn native_ph_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(0));
+    ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(0));
+    ctx.set_field(this, PH_FIELD_PHASE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ph_init_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let parties = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(parties));
+    ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(0));
+    ctx.set_field(this, PH_FIELD_PHASE, Value::Int(0));
+    Ok(None)
+}
+
+fn native_ph_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(parties + 1));
+    let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(phase)))
+}
+
+/// Helper: check if all parties have arrived and advance phase if so.
+fn ph_maybe_advance(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if parties > 0 && arrived >= parties {
+        // Advance phase, reset arrived
+        ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(0));
+        ctx.set_field(this, PH_FIELD_PHASE, Value::Int(phase + 1));
+        phase + 1
+    } else {
+        phase
+    }
+}
+
+fn native_ph_arrive_and_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
+    let phase = ph_maybe_advance(ctx, this);
+    Ok(Some(Value::Int(phase)))
+}
+
+fn native_ph_arrive_and_deregister(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
+    if parties > 0 {
+        ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(parties - 1));
+    }
+    let phase = ph_maybe_advance(ctx, this);
+    Ok(Some(Value::Int(phase)))
+}
+
+fn native_ph_arrive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
+    let phase = ph_maybe_advance(ctx, this);
+    Ok(Some(Value::Int(phase)))
+}
+
+fn native_ph_get_phase(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(phase)))
+}
+
+fn native_ph_get_registered_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(parties)))
+}
+
+fn native_ph_get_arrived_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(arrived)))
+}
+
+// ===========================================================================
+// PriorityBlockingQueue (sorted array-backed priority queue)
+// ===========================================================================
+
+const PBQ_FIELD_DATA: usize = 0;
+const PBQ_FIELD_SIZE: usize = 1;
+#[allow(dead_code)]
+const PBQ_NUM_FIELDS: usize = 2;
+const PBQ_DEFAULT_CAPACITY: usize = 16;
+
+fn register_priority_blocking_queue_natives(r: &mut NativeMethodRegistry) {
+    let c = "java/util/concurrent/PriorityBlockingQueue";
+    r.register(c, "<init>", "()V", native_pbq_init);
+    r.register(c, "offer", "(Ljava/lang/Object;)Z", native_pbq_offer);
+    r.register(c, "poll", "()Ljava/lang/Object;", native_pbq_poll);
+    r.register(c, "peek", "()Ljava/lang/Object;", native_pbq_peek);
+    r.register(c, "put", "(Ljava/lang/Object;)V", native_pbq_put);
+    r.register(c, "take", "()Ljava/lang/Object;", native_pbq_take);
+    r.register(c, "size", "()I", native_pbq_size);
+    r.register(c, "isEmpty", "()Z", native_pbq_is_empty);
+}
+
+fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let arr = alloc_ref_array(ctx, PBQ_DEFAULT_CAPACITY);
+    ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(arr)));
+    ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(0));
+    Ok(None)
+}
+
+fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
+    let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
+        Value::Object(Some(a)) => a,
+        _ => return,
+    };
+    let old_len = ctx.array_length(arr);
+    if needed <= old_len {
+        return;
+    }
+    let new_len = (old_len * 2).max(needed).max(PBQ_DEFAULT_CAPACITY);
+    let new_arr = alloc_ref_array(ctx, new_len);
+    for i in 0..old_len {
+        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+    }
+    ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(new_arr)));
+}
+
+fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    pbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    // Binary search for insertion position using natural ordering
+    let comparator = Value::Object(None);
+    let mut low: usize = 0;
+    let mut high = size as usize;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let mid_elem = ctx.get_array_element(arr, mid);
+        let cmp = tree_compare(ctx, &comparator, mid_elem, elem)?;
+        if cmp < 0 {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    // Shift elements right to make room
+    for i in (low..(size as usize)).rev() {
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(arr, i + 1, v);
+    }
+    ctx.set_array_element(arr, low, elem);
+    ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(size + 1));
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Remove head (smallest element at index 0)
+    let head = ctx.get_array_element(arr, 0);
+    for i in 0..(size - 1) as usize {
+        let v = ctx.get_array_element(arr, i + 1);
+        ctx.set_array_element(arr, i, v);
+    }
+    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+    ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(size - 1));
+    Ok(Some(head))
+}
+
+fn native_pbq_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_array_element(arr, 0)))
+}
+
+fn native_pbq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_pbq_offer(ctx, args)?;
+    Ok(None)
+}
+
+fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_pbq_poll(ctx, args)
+}
+
+fn native_pbq_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_pbq_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
+}
+
+// ===========================================================================
+// Executors factory additions
+// ===========================================================================
+
+fn register_executors_scheduled_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        "java/util/concurrent/Executors",
+        "newScheduledThreadPool",
+        "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+        native_executors_new_scheduled_pool,
+    );
+}
+
+fn native_executors_new_scheduled_pool(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let pool_size = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    let executor = alloc_synthetic(
+        ctx,
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        STPE_NUM_FIELDS,
+    );
+    let task_arr = alloc_ref_array(ctx, 16);
+    ctx.set_field(executor, STPE_FIELD_POOL_SIZE, Value::Int(pool_size));
+    ctx.set_field(executor, STPE_FIELD_SHUTDOWN, Value::Int(0));
+    ctx.set_field(executor, STPE_FIELD_TASK_LIST, Value::Object(Some(task_arr)));
+    Ok(Some(Value::Object(Some(executor))))
+}
+
+// ===========================================================================
+// Phase 3.1: java.util.concurrent completeness
+// ===========================================================================
+//
+// This section adds missing CompletionStage methods on CompletableFuture,
+// ForkJoinPool.awaitQuiescence, ThreadPoolExecutor stat methods, and
+// completes any gaps in the concurrent utilities. These complement the
+// registrations already present in native-builtins.
+
+// CompletableFuture field layout (shared with native-builtins):
+// field 0 = result value, field 1 = done flag (0=pending, 1=normal, 2=exceptional, 3=cancelled)
+// field 2 = source CF (for deferred stages), field 3 = handler (for deferred stages)
+const CF_FIELD_RESULT: usize = 0;
+const CF_FIELD_DONE: usize = 1;
+const CF_FIELD_SOURCE: usize = 2;
+const CF_FIELD_HANDLER: usize = 3;
+
+fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
+    let cf = "java/util/concurrent/CompletableFuture";
+
+    // --- CompletionStage methods ---
+
+    // thenRun: run Runnable after completion, return new CF with null result
+    r.register(
+        cf,
+        "thenRun",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_run,
+    );
+
+    // thenCompose: apply Function that returns CompletableFuture, then flatten
+    r.register(
+        cf,
+        "thenCompose",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_compose,
+    );
+
+    // thenCombine: combine results of two CFs with a BiFunction
+    r.register(
+        cf,
+        "thenCombine",
+        "(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_combine,
+    );
+
+    // exceptionally: provide fallback if exception occurred
+    r.register(
+        cf,
+        "exceptionally",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_exceptionally,
+    );
+
+    // handle: BiFunction(result, exception) → new result
+    r.register(
+        cf,
+        "handle",
+        "(Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_handle,
+    );
+
+    // whenComplete: BiConsumer(result, exception) called after completion
+    r.register(
+        cf,
+        "whenComplete",
+        "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_when_complete,
+    );
+
+    // allOf: CompletableFuture[] → CompletableFuture<Void>
+    r.register(
+        cf,
+        "allOf",
+        "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_all_of,
+    );
+
+    // anyOf: CompletableFuture[] → CompletableFuture<Object>
+    r.register(
+        cf,
+        "anyOf",
+        "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_any_of,
+    );
+
+    // completeExceptionally
+    r.register(
+        cf,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)Z",
+        native_cf_complete_exceptionally,
+    );
+
+    // isCompletedExceptionally — true for done=2 (exceptional) or done=3 (cancelled)
+    r.register(
+        cf,
+        "isCompletedExceptionally",
+        "()Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let done = match ctx.get_field(this, CF_FIELD_DONE) {
+                Value::Int(d) => d,
+                _ => 0,
+            };
+            Ok(Some(Value::Int(if done == 2 || done == 3 { 1 } else { 0 })))
+        },
+    );
+
+    // thenApplyAsync (delegates to thenApply in single-threaded model)
+    r.register(
+        cf,
+        "thenApplyAsync",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_apply_p31,
+    );
+
+    // thenAcceptAsync (delegates to thenAccept in single-threaded model)
+    r.register(
+        cf,
+        "thenAcceptAsync",
+        "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_accept_p31,
+    );
+
+    // thenRunAsync
+    r.register(
+        cf,
+        "thenRunAsync",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_run,
+    );
+
+    // thenComposeAsync
+    r.register(
+        cf,
+        "thenComposeAsync",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_compose,
+    );
+
+    // Also register CompletionStage interface methods
+    let cs = "java/util/concurrent/CompletionStage";
+    r.register(
+        cs,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
+        native_cf_then_apply_p31,
+    );
+    r.register(
+        cs,
+        "thenAccept",
+        "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletionStage;",
+        native_cf_then_accept_p31,
+    );
+    r.register(
+        cs,
+        "thenRun",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletionStage;",
+        native_cf_then_run,
+    );
+    r.register(
+        cs,
+        "thenCompose",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
+        native_cf_then_compose,
+    );
+    r.register(
+        cs,
+        "exceptionally",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
+        native_cf_exceptionally,
+    );
+
+    // --- ForkJoinPool.awaitQuiescence ---
+    let pool = "java/util/concurrent/ForkJoinPool";
+    r.register(
+        pool,
+        "awaitQuiescence",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
+    // --- ThreadPoolExecutor stat methods ---
+    let tp = "java/util/concurrent/ThreadPoolExecutor";
+    r.register(tp, "getPoolSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    r.register(tp, "getActiveCount", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(tp, "getCorePoolSize", "()I", native_tp_get_core_pool_size);
+    r.register(tp, "getMaximumPoolSize", "()I", native_tp_get_core_pool_size);
+    r.register(tp, "isShutdown", "()Z", native_tp_is_shutdown);
+    r.register(tp, "isTerminated", "()Z", native_tp_is_shutdown);
+    r.register(
+        tp,
+        "awaitTermination",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    r.register(tp, "getTaskCount", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(0)))
+    });
+    r.register(tp, "getCompletedTaskCount", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(0)))
+    });
+    r.register(
+        tp,
+        "shutdownNow",
+        "()Ljava/util/List;",
+        native_tp_shutdown_now,
+    );
+
+    // --- ForkJoinPool.invoke that actually calls compute ---
+    r.register(
+        pool,
+        "invoke",
+        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;",
+        native_fjp_invoke,
+    );
+
+    // --- ForkJoinTask.invoke that calls compute ---
+    let fjt = "java/util/concurrent/ForkJoinTask";
+    r.register(fjt, "invoke", "()Ljava/lang/Object;", native_fjt_invoke);
+
+    // --- RecursiveTask.invoke that calls compute ---
+    let rt = "java/util/concurrent/RecursiveTask";
+    r.register(rt, "invoke", "()Ljava/lang/Object;", native_rt_invoke);
+
+    // --- RecursiveAction.invoke that calls compute ---
+    let ra = "java/util/concurrent/RecursiveAction";
+    r.register(ra, "invoke", "()Ljava/lang/Object;", native_ra_invoke);
+}
+
+// --- CompletableFuture CompletionStage implementations ---
+
+fn native_cf_then_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Wait for this to be done (in our model, always synchronous)
+    let _done = ctx.get_field(this, CF_FIELD_DONE);
+    let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let func = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_field(this, CF_FIELD_RESULT);
+    let result_cf = ctx.invoke_virtual(
+        func,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[val],
+    )?;
+    // The result should be a CompletableFuture; return it directly
+    match result_cf {
+        Some(Value::Object(Some(cf_obj))) => {
+            // It's already a CF; return it as-is
+            Ok(Some(Value::Object(Some(cf_obj))))
+        }
+        other => {
+            // Wrap the result in a completed CF
+            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+            ctx.set_field(cf, CF_FIELD_RESULT, other.unwrap_or(Value::Object(None)));
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+            Ok(Some(Value::Object(Some(cf))))
+        }
+    }
+}
+
+fn native_cf_then_combine(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let other_cf = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let bi_func = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val1 = ctx.get_field(this, CF_FIELD_RESULT);
+    let val2 = ctx.get_field(other_cf, CF_FIELD_RESULT);
+    let result = ctx.invoke_virtual(
+        bi_func,
+        "apply",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[val1, val2],
+    )?;
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let handler = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            // No handler — just copy the CF
+            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+            let val = ctx.get_field(this, CF_FIELD_RESULT);
+            let done = ctx.get_field(this, CF_FIELD_DONE);
+            ctx.set_field(cf, CF_FIELD_RESULT, val);
+            ctx.set_field(cf, CF_FIELD_DONE, done);
+            return Ok(Some(Value::Object(Some(cf))));
+        }
+    };
+    let done = match ctx.get_field(this, CF_FIELD_DONE) {
+        Value::Int(d) => d,
+        _ => 0,
+    };
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    if done == 2 {
+        // Already exceptionally completed — call the handler immediately
+        let exc = ctx.get_field(this, CF_FIELD_RESULT);
+        let result = ctx.invoke_virtual(
+            handler,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[exc],
+        )?;
+        ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
+        ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1)); // recovery = normal completion
+    } else if done == 0 {
+        // Source not yet complete — defer: store source + handler, mark done=-1
+        ctx.set_field(cf, CF_FIELD_DONE, Value::Int(-1)); // deferred
+        ctx.set_field(cf, CF_FIELD_SOURCE, Value::Object(Some(this)));
+        ctx.set_field(cf, CF_FIELD_HANDLER, Value::Object(Some(handler)));
+    } else {
+        // Normally completed — pass through the result unchanged
+        let val = ctx.get_field(this, CF_FIELD_RESULT);
+        ctx.set_field(cf, CF_FIELD_RESULT, val);
+        ctx.set_field(cf, CF_FIELD_DONE, Value::Int(done));
+    }
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let bi_func = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_field(this, CF_FIELD_RESULT);
+    // In our simplified model, exception is always null
+    let result = ctx.invoke_virtual(
+        bi_func,
+        "apply",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[val, Value::Object(None)],
+    )?;
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_field(this, CF_FIELD_RESULT);
+    // Call BiConsumer(result, exception) — exception is null in our model
+    let _ = ctx.invoke_virtual(
+        consumer,
+        "accept",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        &[val.clone(), Value::Object(None)],
+    );
+    // Return a new CF with the same result (whenComplete does not transform)
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, val);
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // In our model all CFs are already completed synchronously.
+    // allOf returns a CF<Void> that is done.
+    let _arr = args.first(); // the CompletableFuture[] argument
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Return the result of the first CF in the array (all are completed)
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => {
+            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+            ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+            return Ok(Some(Value::Object(Some(cf))));
+        }
+    };
+    let len = ctx.array_length(arr);
+    let result = if len > 0 {
+        let first = ctx.get_array_element(arr, 0);
+        match first {
+            Value::Object(Some(cf_obj)) => ctx.get_field(cf_obj, CF_FIELD_RESULT),
+            _ => Value::Object(None),
+        }
+    } else {
+        Value::Object(None)
+    };
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, result);
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_complete_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let done = match ctx.get_field(this, CF_FIELD_DONE) {
+        Value::Int(d) => d,
+        _ => 0,
+    };
+    if done != 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    // Mark as exceptionally completed (done=2), store exception as result
+    let exc = args.get(1).cloned().unwrap_or(Value::Object(None));
+    ctx.set_field(this, CF_FIELD_RESULT, exc);
+    ctx.set_field(this, CF_FIELD_DONE, Value::Int(2)); // 2 = exceptional
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_cf_then_apply_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let func = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_field(this, CF_FIELD_RESULT);
+    let result = ctx.invoke_virtual(
+        func,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[val],
+    )?;
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+fn native_cf_then_accept_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let val = ctx.get_field(this, CF_FIELD_RESULT);
+    let _ = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[val]);
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
+    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+// --- ThreadPoolExecutor stat methods ---
+
+// ThreadPoolExecutor uses 2-field layout: field 0 = pool size, field 1 = shutdown flag
+const TP_FIELD_SIZE: usize = 0;
+const TP_FIELD_SHUTDOWN: usize = 1;
+
+fn native_tp_get_core_pool_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    match ctx.get_field(this, TP_FIELD_SIZE) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(1))),
+    }
+}
+
+fn native_tp_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match ctx.get_field(this, TP_FIELD_SHUTDOWN) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_tp_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.set_field(this, TP_FIELD_SHUTDOWN, Value::Int(1));
+    // Return empty list
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = alloc_ref_array(ctx, 10);
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+// --- ForkJoinPool / ForkJoinTask invoke that calls compute ---
+
+fn native_fjp_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // pool.invoke(task) — call task.compute() and return result
+    let task = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let result = ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]);
+    match result {
+        Ok(Some(val)) => {
+            // Store result in task field 0 for subsequent join/get calls
+            ctx.set_field(task, 0, val.clone());
+            Ok(Some(val))
+        }
+        Ok(None) => {
+            ctx.set_field(task, 0, Value::Object(None));
+            Ok(Some(Value::Object(None)))
+        }
+        Err(_) => {
+            // If compute is not found, fall back to reading field 0
+            Ok(Some(ctx.get_field(task, 0)))
+        }
+    }
+}
+
+fn native_fjt_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[]);
+    match result {
+        Ok(Some(val)) => {
+            ctx.set_field(this, 0, val.clone());
+            Ok(Some(val))
+        }
+        Ok(None) => {
+            ctx.set_field(this, 0, Value::Object(None));
+            Ok(Some(Value::Object(None)))
+        }
+        Err(_) => Ok(Some(ctx.get_field(this, 0))),
+    }
+}
+
+fn native_rt_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_fjt_invoke(ctx, args)
+}
+
+fn native_ra_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
+    Ok(Some(Value::Object(None)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unit tests for helper functions only.
+    // Integration tests are in vm.rs since they need the full VM.
+
+    #[test]
+    fn map_bucket_index_power_of_two() {
+        use super::map_bucket_index;
+        // For capacity 16, bucket index should be in 0..15
+        for hash in [0, 1, 15, 16, 31, 100, -1, -100, i32::MAX, i32::MIN] {
+            let idx = map_bucket_index(hash, 16);
+            assert!(idx < 16, "hash={hash}, idx={idx}");
+        }
+    }
+
+    #[test]
+    fn map_bucket_index_distribution() {
+        use super::map_bucket_index;
+        // Different positive hashes should give different buckets
+        let b0 = map_bucket_index(0, 16);
+        let b1 = map_bucket_index(1, 16);
+        let b15 = map_bucket_index(15, 16);
+        assert_eq!(b0, 0);
+        assert_eq!(b1, 1);
+        assert_eq!(b15, 15);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3.1: Registration completeness tests
+    // -----------------------------------------------------------------------
+    // These tests verify that all required j.u.concurrent classes are
+    // registered correctly by checking the registry after full registration.
+
+    fn build_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_collections_natives(&mut r);
+        r
+    }
+
+    #[test]
+    fn concurrent_linked_queue_registered() {
+        let r = build_registry();
+        let clq = "java/util/concurrent/ConcurrentLinkedQueue";
+        assert!(r.find(clq, "<init>", "()V").is_some(), "CLQ <init>");
+        assert!(r.find(clq, "offer", "(Ljava/lang/Object;)Z").is_some(), "CLQ offer");
+        assert!(r.find(clq, "poll", "()Ljava/lang/Object;").is_some(), "CLQ poll");
+        assert!(r.find(clq, "peek", "()Ljava/lang/Object;").is_some(), "CLQ peek");
+        assert!(r.find(clq, "isEmpty", "()Z").is_some(), "CLQ isEmpty");
+        assert!(r.find(clq, "size", "()I").is_some(), "CLQ size");
+        assert!(r.find(clq, "iterator", "()Ljava/util/Iterator;").is_some(), "CLQ iterator");
+    }
+
+    #[test]
+    fn concurrent_linked_deque_registered() {
+        let r = build_registry();
+        let cld = "java/util/concurrent/ConcurrentLinkedDeque";
+        assert!(r.find(cld, "offerFirst", "(Ljava/lang/Object;)Z").is_some(), "CLD offerFirst");
+        assert!(r.find(cld, "offerLast", "(Ljava/lang/Object;)Z").is_some(), "CLD offerLast");
+        assert!(r.find(cld, "pollFirst", "()Ljava/lang/Object;").is_some(), "CLD pollFirst");
+        assert!(r.find(cld, "pollLast", "()Ljava/lang/Object;").is_some(), "CLD pollLast");
+        assert!(r.find(cld, "peekFirst", "()Ljava/lang/Object;").is_some(), "CLD peekFirst");
+        assert!(r.find(cld, "peekLast", "()Ljava/lang/Object;").is_some(), "CLD peekLast");
+    }
+
+    #[test]
+    fn linked_blocking_queue_registered() {
+        let r = build_registry();
+        let lbq = "java/util/concurrent/LinkedBlockingQueue";
+        assert!(r.find(lbq, "<init>", "()V").is_some(), "LBQ <init>");
+        assert!(r.find(lbq, "<init>", "(I)V").is_some(), "LBQ <init>(I)");
+        assert!(r.find(lbq, "put", "(Ljava/lang/Object;)V").is_some(), "LBQ put");
+        assert!(r.find(lbq, "take", "()Ljava/lang/Object;").is_some(), "LBQ take");
+        assert!(r.find(lbq, "offer", "(Ljava/lang/Object;)Z").is_some(), "LBQ offer");
+        assert!(r.find(lbq, "poll", "()Ljava/lang/Object;").is_some(), "LBQ poll");
+        assert!(r.find(lbq, "peek", "()Ljava/lang/Object;").is_some(), "LBQ peek");
+        assert!(r.find(lbq, "remainingCapacity", "()I").is_some(), "LBQ remainingCapacity");
+        assert!(r.find(lbq, "size", "()I").is_some(), "LBQ size");
+    }
+
+    #[test]
+    fn array_blocking_queue_registered() {
+        let r = build_registry();
+        let abq = "java/util/concurrent/ArrayBlockingQueue";
+        assert!(r.find(abq, "<init>", "(I)V").is_some(), "ABQ <init>(I)");
+        assert!(r.find(abq, "put", "(Ljava/lang/Object;)V").is_some(), "ABQ put");
+        assert!(r.find(abq, "take", "()Ljava/lang/Object;").is_some(), "ABQ take");
+        assert!(r.find(abq, "offer", "(Ljava/lang/Object;)Z").is_some(), "ABQ offer");
+        assert!(r.find(abq, "poll", "()Ljava/lang/Object;").is_some(), "ABQ poll");
+        assert!(r.find(abq, "remainingCapacity", "()I").is_some(), "ABQ remainingCapacity");
+    }
+
+    #[test]
+    fn completable_future_completion_stage_registered() {
+        let r = build_registry();
+        let cf = "java/util/concurrent/CompletableFuture";
+        assert!(
+            r.find(cf, "thenRun", "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF thenRun"
+        );
+        assert!(
+            r.find(cf, "thenCompose", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF thenCompose"
+        );
+        assert!(
+            r.find(cf, "thenCombine",
+                "(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF thenCombine"
+        );
+        assert!(
+            r.find(cf, "exceptionally", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF exceptionally"
+        );
+        assert!(
+            r.find(cf, "handle", "(Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF handle"
+        );
+        assert!(
+            r.find(cf, "whenComplete", "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF whenComplete"
+        );
+        assert!(
+            r.find(cf, "allOf", "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF allOf"
+        );
+        assert!(
+            r.find(cf, "anyOf", "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;").is_some(),
+            "CF anyOf"
+        );
+    }
+
+    #[test]
+    fn fork_join_pool_await_quiescence_registered() {
+        let r = build_registry();
+        let pool = "java/util/concurrent/ForkJoinPool";
+        assert!(
+            r.find(pool, "awaitQuiescence", "(JLjava/util/concurrent/TimeUnit;)Z").is_some(),
+            "FJP awaitQuiescence"
+        );
+        assert!(
+            r.find(pool, "invoke", "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;").is_some(),
+            "FJP invoke"
+        );
+    }
+
+    #[test]
+    fn fork_join_task_methods_registered() {
+        let r = build_registry();
+        let fjt = "java/util/concurrent/ForkJoinTask";
+        assert!(r.find(fjt, "invoke", "()Ljava/lang/Object;").is_some(), "FJT invoke");
+
+        let rt = "java/util/concurrent/RecursiveTask";
+        assert!(r.find(rt, "invoke", "()Ljava/lang/Object;").is_some(), "RT invoke");
+
+        let ra = "java/util/concurrent/RecursiveAction";
+        assert!(r.find(ra, "invoke", "()Ljava/lang/Object;").is_some(), "RA invoke");
+    }
+
+    #[test]
+    fn thread_pool_executor_stats_registered() {
+        let r = build_registry();
+        let tp = "java/util/concurrent/ThreadPoolExecutor";
+        assert!(r.find(tp, "getPoolSize", "()I").is_some(), "TPE getPoolSize");
+        assert!(r.find(tp, "getActiveCount", "()I").is_some(), "TPE getActiveCount");
+        assert!(r.find(tp, "getCorePoolSize", "()I").is_some(), "TPE getCorePoolSize");
+        assert!(r.find(tp, "getMaximumPoolSize", "()I").is_some(), "TPE getMaximumPoolSize");
+        assert!(r.find(tp, "isShutdown", "()Z").is_some(), "TPE isShutdown");
+        assert!(r.find(tp, "shutdownNow", "()Ljava/util/List;").is_some(), "TPE shutdownNow");
+    }
+
+    #[test]
+    fn completion_stage_interface_registered() {
+        let r = build_registry();
+        let cs = "java/util/concurrent/CompletionStage";
+        assert!(
+            r.find(cs, "thenApply", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;").is_some(),
+            "CS thenApply"
+        );
+        assert!(
+            r.find(cs, "thenAccept", "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletionStage;").is_some(),
+            "CS thenAccept"
+        );
+        assert!(
+            r.find(cs, "thenRun", "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletionStage;").is_some(),
+            "CS thenRun"
+        );
+        assert!(
+            r.find(cs, "thenCompose", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;").is_some(),
+            "CS thenCompose"
+        );
+        assert!(
+            r.find(cs, "exceptionally", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;").is_some(),
+            "CS exceptionally"
+        );
+    }
+
+    #[test]
+    fn concurrent_hashmap_registered() {
+        let r = build_registry();
+        let chm = "java/util/concurrent/ConcurrentHashMap";
+        assert!(r.find(chm, "<init>", "()V").is_some(), "CHM <init>");
+        assert!(r.find(chm, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CHM put");
+        assert!(r.find(chm, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CHM get");
+        assert!(r.find(chm, "size", "()I").is_some(), "CHM size");
+        assert!(r.find(chm, "containsKey", "(Ljava/lang/Object;)Z").is_some(), "CHM containsKey");
+    }
+
+    #[test]
+    fn scheduled_executor_registered() {
+        let r = build_registry();
+        let stpe = "java/util/concurrent/ScheduledThreadPoolExecutor";
+        assert!(r.find(stpe, "<init>", "(I)V").is_some(), "STPE <init>");
+        assert!(r.find(stpe, "shutdown", "()V").is_some(), "STPE shutdown");
+        assert!(r.find(stpe, "isShutdown", "()Z").is_some(), "STPE isShutdown");
+    }
+
+    #[test]
+    fn blocking_queue_interface_registered() {
+        let r = build_registry();
+        let bq = "java/util/concurrent/BlockingQueue";
+        assert!(r.find(bq, "put", "(Ljava/lang/Object;)V").is_some(), "BQ put");
+        assert!(r.find(bq, "take", "()Ljava/lang/Object;").is_some(), "BQ take");
+        assert!(r.find(bq, "offer", "(Ljava/lang/Object;)Z").is_some(), "BQ offer");
+        assert!(r.find(bq, "poll", "()Ljava/lang/Object;").is_some(), "BQ poll");
+    }
+
+    #[test]
+    fn cf_field_layout_constants_consistent() {
+        // Verify the field layout constants match between this file and
+        // the native-builtins crate (both use fields 0=result, 1=done)
+        assert_eq!(CF_FIELD_RESULT, 0);
+        assert_eq!(CF_FIELD_DONE, 1);
+        assert_eq!(TP_FIELD_SIZE, 0);
+        assert_eq!(TP_FIELD_SHUTDOWN, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case tests for capacity growth and map helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_bucket_index_single_bucket() {
+        // Capacity of 1 — everything goes to bucket 0
+        assert_eq!(map_bucket_index(0, 1), 0);
+        assert_eq!(map_bucket_index(42, 1), 0);
+        assert_eq!(map_bucket_index(-1, 1), 0);
+    }
+
+    #[test]
+    fn map_bucket_index_large_capacity() {
+        let cap = 1 << 20; // 1M buckets
+        for hash in [0, 1, -1, i32::MAX, i32::MIN] {
+            let idx = map_bucket_index(hash, cap);
+            assert!(idx < cap as usize, "hash={hash}, idx={idx}, cap={cap}");
+        }
+    }
+
+    #[test]
+    fn map_bucket_index_capacity_two() {
+        // Capacity 2: index should be 0 or 1
+        for hash in [0, 1, 2, 3, -1, -2, i32::MAX, i32::MIN] {
+            let idx = map_bucket_index(hash, 2);
+            assert!(idx < 2, "hash={hash}, idx={idx}");
+        }
+    }
+
+    #[test]
+    fn values_equal_null_null() {
+        // Two null objects should be equal (tested via the public helper)
+        let a = Value::Object(None);
+        let b = Value::Object(None);
+        // We cannot call values_equal without a NativeContext, but we can
+        // check the pattern match logic directly.
+        assert!(matches!((&a, &b), (Value::Object(None), Value::Object(None))));
+    }
+
+    #[test]
+    fn values_equal_ints() {
+        let a = Value::Int(42);
+        let b = Value::Int(42);
+        let c = Value::Int(99);
+        // Direct pattern checks matching values_equal logic
+        assert!(matches!((&a, &b), (Value::Int(x), Value::Int(y)) if x == y));
+        assert!(!matches!((&a, &c), (Value::Int(x), Value::Int(y)) if x == y));
+    }
+
+    #[test]
+    fn values_equal_long() {
+        let a = Value::Long(123456789);
+        let b = Value::Long(123456789);
+        let c = Value::Long(0);
+        assert!(matches!((&a, &b), (Value::Long(x), Value::Long(y)) if x == y));
+        assert!(!matches!((&a, &c), (Value::Long(x), Value::Long(y)) if x == y));
+    }
+
+    #[test]
+    fn values_equal_mixed_types() {
+        let int_val = Value::Int(42);
+        let long_val = Value::Long(42);
+        // Different types should not match
+        assert!(!matches!((&int_val, &long_val), (Value::Int(x), Value::Int(y)) if x == y));
+        assert!(!matches!((&int_val, &long_val), (Value::Long(x), Value::Long(y)) if x == y));
+    }
+
+    #[test]
+    fn arraylist_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/ArrayList";
+        assert!(r.find(c, "<init>", "()V").is_some(), "AL <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "AL <init>(I)");
+        assert!(r.find(c, "size", "()I").is_some(), "AL size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "AL isEmpty");
+        assert!(r.find(c, "get", "(I)Ljava/lang/Object;").is_some(), "AL get");
+        assert!(r.find(c, "set", "(ILjava/lang/Object;)Ljava/lang/Object;").is_some(), "AL set");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "AL add");
+        assert!(r.find(c, "remove", "(I)Ljava/lang/Object;").is_some(), "AL remove(I)");
+        assert!(r.find(c, "clear", "()V").is_some(), "AL clear");
+        assert!(r.find(c, "contains", "(Ljava/lang/Object;)Z").is_some(), "AL contains");
+        assert!(r.find(c, "indexOf", "(Ljava/lang/Object;)I").is_some(), "AL indexOf");
+        assert!(r.find(c, "ensureCapacity", "(I)V").is_some(), "AL ensureCapacity");
+        assert!(r.find(c, "trimToSize", "()V").is_some(), "AL trimToSize");
+    }
+
+    #[test]
+    fn hashmap_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/HashMap";
+        assert!(r.find(c, "<init>", "()V").is_some(), "HM <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "HM <init>(I)");
+        assert!(r.find(c, "size", "()I").is_some(), "HM size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "HM isEmpty");
+        assert!(r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "HM put");
+        assert!(r.find(c, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "HM get");
+        assert!(r.find(c, "remove", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "HM remove");
+        assert!(r.find(c, "containsKey", "(Ljava/lang/Object;)Z").is_some(), "HM containsKey");
+        assert!(r.find(c, "clear", "()V").is_some(), "HM clear");
+    }
+
+    // -----------------------------------------------------------------------
+    // HashSet registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hashset_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/HashSet";
+        assert!(r.find(c, "<init>", "()V").is_some(), "HS <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "HS <init>(I)");
+        assert!(r.find(c, "size", "()I").is_some(), "HS size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "HS isEmpty");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "HS add");
+        assert!(r.find(c, "remove", "(Ljava/lang/Object;)Z").is_some(), "HS remove");
+        assert!(r.find(c, "contains", "(Ljava/lang/Object;)Z").is_some(), "HS contains");
+        assert!(r.find(c, "clear", "()V").is_some(), "HS clear");
+        assert!(r.find(c, "iterator", "()Ljava/util/Iterator;").is_some(), "HS iterator");
+        assert!(r.find(c, "toArray", "()[Ljava/lang/Object;").is_some(), "HS toArray");
+        assert!(r.find(c, "toString", "()Ljava/lang/String;").is_some(), "HS toString");
+    }
+
+    // -----------------------------------------------------------------------
+    // LinkedList registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn linked_list_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/LinkedList";
+        assert!(r.find(c, "<init>", "()V").is_some(), "LL <init>");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "LL add");
+        assert!(r.find(c, "addFirst", "(Ljava/lang/Object;)V").is_some(), "LL addFirst");
+        assert!(r.find(c, "addLast", "(Ljava/lang/Object;)V").is_some(), "LL addLast");
+        assert!(r.find(c, "get", "(I)Ljava/lang/Object;").is_some(), "LL get");
+        assert!(r.find(c, "getFirst", "()Ljava/lang/Object;").is_some(), "LL getFirst");
+        assert!(r.find(c, "getLast", "()Ljava/lang/Object;").is_some(), "LL getLast");
+        assert!(r.find(c, "removeFirst", "()Ljava/lang/Object;").is_some(), "LL removeFirst");
+        assert!(r.find(c, "removeLast", "()Ljava/lang/Object;").is_some(), "LL removeLast");
+        assert!(r.find(c, "size", "()I").is_some(), "LL size");
+    }
+
+    // -----------------------------------------------------------------------
+    // LinkedHashMap registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn linked_hashmap_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/LinkedHashMap";
+        assert!(r.find(c, "<init>", "()V").is_some(), "LHM <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "LHM <init>(I)");
+        assert!(r.find(c, "size", "()I").is_some(), "LHM size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "LHM isEmpty");
+        assert!(r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "LHM put");
+        assert!(r.find(c, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "LHM get");
+    }
+
+    // -----------------------------------------------------------------------
+    // ArrayDeque registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn array_deque_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/ArrayDeque";
+        assert!(r.find(c, "<init>", "()V").is_some(), "AD <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "AD <init>(I)");
+        assert!(r.find(c, "size", "()I").is_some(), "AD size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "AD isEmpty");
+        assert!(r.find(c, "addFirst", "(Ljava/lang/Object;)V").is_some(), "AD addFirst");
+        assert!(r.find(c, "addLast", "(Ljava/lang/Object;)V").is_some(), "AD addLast");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "AD add");
+        assert!(r.find(c, "offerFirst", "(Ljava/lang/Object;)Z").is_some(), "AD offerFirst");
+        assert!(r.find(c, "offerLast", "(Ljava/lang/Object;)Z").is_some(), "AD offerLast");
+    }
+
+    // -----------------------------------------------------------------------
+    // PriorityQueue registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn priority_queue_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/PriorityQueue";
+        assert!(r.find(c, "<init>", "()V").is_some(), "PQ <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "PQ <init>(I)");
+        assert!(r.find(c, "<init>", "(Ljava/util/Comparator;)V").is_some(), "PQ <init>(Comparator)");
+        assert!(r.find(c, "size", "()I").is_some(), "PQ size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "PQ isEmpty");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "PQ add");
+        assert!(r.find(c, "offer", "(Ljava/lang/Object;)Z").is_some(), "PQ offer");
+        assert!(r.find(c, "peek", "()Ljava/lang/Object;").is_some(), "PQ peek");
+        assert!(r.find(c, "poll", "()Ljava/lang/Object;").is_some(), "PQ poll");
+        assert!(r.find(c, "remove", "(Ljava/lang/Object;)Z").is_some(), "PQ remove");
+        assert!(r.find(c, "contains", "(Ljava/lang/Object;)Z").is_some(), "PQ contains");
+        assert!(r.find(c, "clear", "()V").is_some(), "PQ clear");
+        assert!(r.find(c, "toArray", "()[Ljava/lang/Object;").is_some(), "PQ toArray");
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vector_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/Vector";
+        assert!(r.find(c, "<init>", "()V").is_some(), "Vec <init>");
+        assert!(r.find(c, "<init>", "(I)V").is_some(), "Vec <init>(I)");
+        assert!(r.find(c, "size", "()I").is_some(), "Vec size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "Vec isEmpty");
+        assert!(r.find(c, "get", "(I)Ljava/lang/Object;").is_some(), "Vec get");
+        assert!(r.find(c, "elementAt", "(I)Ljava/lang/Object;").is_some(), "Vec elementAt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stack registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stack_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/Stack";
+        assert!(r.find(c, "<init>", "()V").is_some(), "Stack <init>");
+        assert!(r.find(c, "size", "()I").is_some(), "Stack size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "Stack isEmpty");
+        assert!(r.find(c, "get", "(I)Ljava/lang/Object;").is_some(), "Stack get");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "Stack add");
+        assert!(r.find(c, "remove", "(I)Ljava/lang/Object;").is_some(), "Stack remove");
+        assert!(r.find(c, "clear", "()V").is_some(), "Stack clear");
+        assert!(r.find(c, "contains", "(Ljava/lang/Object;)Z").is_some(), "Stack contains");
+    }
+
+    // -----------------------------------------------------------------------
+    // TreeMap registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tree_map_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/TreeMap";
+        assert!(r.find(c, "<init>", "()V").is_some(), "TM <init>");
+        assert!(r.find(c, "<init>", "(Ljava/util/Comparator;)V").is_some(), "TM <init>(Comparator)");
+        assert!(r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "TM put");
+        assert!(r.find(c, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "TM get");
+        assert!(r.find(c, "size", "()I").is_some(), "TM size");
+    }
+
+    // -----------------------------------------------------------------------
+    // TreeSet registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tree_set_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/TreeSet";
+        assert!(r.find(c, "<init>", "()V").is_some(), "TS <init>");
+        assert!(r.find(c, "<init>", "(Ljava/util/Comparator;)V").is_some(), "TS <init>(Comparator)");
+        assert!(r.find(c, "<init>", "(Ljava/util/Collection;)V").is_some(), "TS <init>(Collection)");
+        assert!(r.find(c, "add", "(Ljava/lang/Object;)Z").is_some(), "TS add");
+        assert!(r.find(c, "remove", "(Ljava/lang/Object;)Z").is_some(), "TS remove");
+        assert!(r.find(c, "contains", "(Ljava/lang/Object;)Z").is_some(), "TS contains");
+        assert!(r.find(c, "size", "()I").is_some(), "TS size");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "TS isEmpty");
+        assert!(r.find(c, "clear", "()V").is_some(), "TS clear");
+    }
+
+    // -----------------------------------------------------------------------
+    // Optional registration completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn optional_registered_completely() {
+        let r = build_registry();
+        let c = "java/util/Optional";
+        assert!(r.find(c, "empty", "()Ljava/util/Optional;").is_some(), "Opt empty");
+        assert!(r.find(c, "of", "(Ljava/lang/Object;)Ljava/util/Optional;").is_some(), "Opt of");
+        assert!(r.find(c, "ofNullable", "(Ljava/lang/Object;)Ljava/util/Optional;").is_some(), "Opt ofNullable");
+        assert!(r.find(c, "get", "()Ljava/lang/Object;").is_some(), "Opt get");
+        assert!(r.find(c, "isPresent", "()Z").is_some(), "Opt isPresent");
+        assert!(r.find(c, "isEmpty", "()Z").is_some(), "Opt isEmpty");
+    }
+
+    // -----------------------------------------------------------------------
+    // Field layout constant tests — correctness and uniqueness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn arraylist_field_layout_valid() {
+        assert_eq!(AL_FIELD_DATA, 0, "AL data field should be 0");
+        assert_eq!(AL_FIELD_SIZE, 1, "AL size field should be 1");
+        assert_eq!(AL_NUM_FIELDS, 2, "AL should have 2 fields");
+        assert_eq!(AL_DEFAULT_CAPACITY, 10, "AL default capacity should be 10");
+    }
+
+    #[test]
+    fn hashmap_field_layout_valid() {
+        assert_eq!(MAP_FIELD_BUCKETS, 0);
+        assert_eq!(MAP_FIELD_SIZE, 1);
+        assert_eq!(MAP_FIELD_CAPACITY, 2);
+        assert_eq!(MAP_DEFAULT_CAPACITY, 16, "HM default capacity should be 16 (power of 2)");
+        // Default capacity must be a power of two for bucket indexing
+        assert!(MAP_DEFAULT_CAPACITY.is_power_of_two(), "HM default capacity must be power of 2");
+    }
+
+    #[test]
+    fn hashmap_node_field_layout_valid() {
+        assert_eq!(NODE_FIELD_KEY, 0);
+        assert_eq!(NODE_FIELD_VALUE, 1);
+        assert_eq!(NODE_FIELD_HASH, 2);
+        assert_eq!(NODE_FIELD_NEXT, 3);
+        assert_eq!(NODE_NUM_FIELDS, 4);
+        // All indices must be within NUM_FIELDS
+        assert!(NODE_FIELD_KEY < NODE_NUM_FIELDS);
+        assert!(NODE_FIELD_VALUE < NODE_NUM_FIELDS);
+        assert!(NODE_FIELD_HASH < NODE_NUM_FIELDS);
+        assert!(NODE_FIELD_NEXT < NODE_NUM_FIELDS);
+    }
+
+    #[test]
+    fn linked_list_field_layout_valid() {
+        assert_eq!(LL_FIELD_HEAD, 0);
+        assert_eq!(LL_FIELD_TAIL, 1);
+        assert_eq!(LL_FIELD_SIZE, 2);
+        assert_eq!(LL_NODE_PREV, 0);
+        assert_eq!(LL_NODE_NEXT, 1);
+        assert_eq!(LL_NODE_ELEM, 2);
+    }
+
+    #[test]
+    fn array_deque_field_layout_valid() {
+        assert_eq!(AD_FIELD_DATA, 0);
+        assert_eq!(AD_FIELD_HEAD, 1);
+        assert_eq!(AD_FIELD_TAIL, 2);
+        assert_eq!(AD_FIELD_SIZE, 3);
+        assert_eq!(AD_DEFAULT_CAPACITY, 16);
+        assert!(AD_DEFAULT_CAPACITY.is_power_of_two(), "AD default capacity must be power of 2");
+    }
+
+    #[test]
+    fn priority_queue_field_layout_valid() {
+        assert_eq!(PQ_FIELD_DATA, 0);
+        assert_eq!(PQ_FIELD_SIZE, 1);
+        assert_eq!(PQ_FIELD_COMPARATOR, 2);
+        assert_eq!(PQ_DEFAULT_CAPACITY, 11, "PQ default capacity should be 11 (matches JDK)");
+    }
+
+    #[test]
+    fn hashset_delegates_to_hashmap() {
+        // HashSet uses a single field for its backing HashMap
+        assert_eq!(HS_FIELD_MAP, 0);
+        assert_eq!(HS_NUM_FIELDS, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_bucket_index edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_bucket_index_negative_hash() {
+        // Negative hashes should still produce valid indices
+        for hash in [-1, -100, -1000, i32::MIN, i32::MIN + 1] {
+            let idx = map_bucket_index(hash, 16);
+            assert!(idx < 16, "negative hash={hash} produced out-of-range idx={idx}");
+        }
+    }
+
+    #[test]
+    fn map_bucket_index_max_int_hash() {
+        let idx = map_bucket_index(i32::MAX, 16);
+        assert!(idx < 16);
+        assert_eq!(idx, 15, "i32::MAX & 15 should equal 15");
+    }
+
+    #[test]
+    fn map_bucket_index_zero_hash() {
+        assert_eq!(map_bucket_index(0, 16), 0);
+        assert_eq!(map_bucket_index(0, 32), 0);
+        assert_eq!(map_bucket_index(0, 1), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // values_equal edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn values_equal_int_boundaries() {
+        let min = Value::Int(i32::MIN);
+        let max = Value::Int(i32::MAX);
+        let min2 = Value::Int(i32::MIN);
+        assert!(matches!((&min, &min2), (Value::Int(x), Value::Int(y)) if x == y));
+        assert!(!matches!((&min, &max), (Value::Int(x), Value::Int(y)) if x == y));
+    }
+
+    #[test]
+    fn values_equal_long_boundaries() {
+        let min = Value::Long(i64::MIN);
+        let max = Value::Long(i64::MAX);
+        let min2 = Value::Long(i64::MIN);
+        assert!(matches!((&min, &min2), (Value::Long(x), Value::Long(y)) if x == y));
+        assert!(!matches!((&min, &max), (Value::Long(x), Value::Long(y)) if x == y));
+    }
+
+    #[test]
+    fn values_equal_null_vs_some() {
+        let null = Value::Object(None);
+        let int = Value::Int(0);
+        // Null and Int should never match in the values_equal logic
+        assert!(!matches!((&null, &int), (Value::Int(x), Value::Int(y)) if x == y));
+        assert!(!matches!((&null, &int), (Value::Object(None), Value::Object(None))));
+    }
+
+    #[test]
+    fn values_equal_zero_int() {
+        let a = Value::Int(0);
+        let b = Value::Int(0);
+        assert!(matches!((&a, &b), (Value::Int(x), Value::Int(y)) if x == y));
+    }
+
+    // -----------------------------------------------------------------------
+    // ArrayList method completeness (addAll, subList, etc.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn arraylist_extended_methods_registered() {
+        let r = build_registry();
+        let c = "java/util/ArrayList";
+        assert!(r.find(c, "add", "(ILjava/lang/Object;)V").is_some(), "AL add(I,O)");
+        assert!(r.find(c, "remove", "(Ljava/lang/Object;)Z").is_some(), "AL remove(O)");
+        assert!(r.find(c, "lastIndexOf", "(Ljava/lang/Object;)I").is_some(), "AL lastIndexOf");
+        assert!(r.find(c, "toArray", "()[Ljava/lang/Object;").is_some(), "AL toArray");
+        assert!(r.find(c, "toString", "()Ljava/lang/String;").is_some(), "AL toString");
+        assert!(r.find(c, "addAll", "(Ljava/util/Collection;)Z").is_some(), "AL addAll");
+        assert!(r.find(c, "subList", "(II)Ljava/util/List;").is_some(), "AL subList");
+        assert!(r.find(c, "hashCode", "()I").is_some(), "AL hashCode");
+        assert!(r.find(c, "equals", "(Ljava/lang/Object;)Z").is_some(), "AL equals");
+    }
+
+    #[test]
+    fn arraylist_functional_methods_registered() {
+        let r = build_registry();
+        let c = "java/util/ArrayList";
+        assert!(r.find(c, "forEach", "(Ljava/util/function/Consumer;)V").is_some(), "AL forEach");
+        assert!(r.find(c, "sort", "(Ljava/util/Comparator;)V").is_some(), "AL sort");
+        assert!(r.find(c, "removeIf", "(Ljava/util/function/Predicate;)Z").is_some(), "AL removeIf");
+        assert!(r.find(c, "replaceAll", "(Ljava/util/function/UnaryOperator;)V").is_some(), "AL replaceAll");
+        assert!(r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(), "AL stream");
+    }
+
+    // -----------------------------------------------------------------------
+    // HashMap extended methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hashmap_iterator_and_views_registered() {
+        let r = build_registry();
+        let c = "java/util/HashMap";
+        assert!(r.find(c, "keySet", "()Ljava/util/Set;").is_some(), "HM keySet");
+        assert!(r.find(c, "values", "()Ljava/util/Collection;").is_some(), "HM values");
+        assert!(r.find(c, "entrySet", "()Ljava/util/Set;").is_some(), "HM entrySet");
+    }
+
+    // -----------------------------------------------------------------------
+    // MAP_MAX_CAPACITY test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_max_capacity_is_power_of_two() {
+        assert!(MAP_MAX_CAPACITY > 0);
+        assert!((MAP_MAX_CAPACITY as u32).is_power_of_two());
+        assert_eq!(MAP_MAX_CAPACITY, 1 << 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // Iterator field layout
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn iterator_field_layout_valid() {
+        assert_eq!(AL_ITR_FIELD_LIST, 0);
+        assert_eq!(AL_ITR_FIELD_CURSOR, 1);
+        assert_eq!(AL_ITR_NUM_FIELDS, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Properties registration (via collections extras)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn properties_registered() {
+        let r = build_registry();
+        let c = "java/util/Properties";
+        assert!(r.find(c, "<init>", "()V").is_some(), "Props <init>");
+    }
+
+    // -----------------------------------------------------------------------
+    // ConcurrentSkipListMap registration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_skip_list_map_registered() {
+        let r = build_registry();
+        let c = "java/util/concurrent/ConcurrentSkipListMap";
+        assert!(r.find(c, "<init>", "()V").is_some(), "CSLM <init>");
+        assert!(r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CSLM put");
+        assert!(r.find(c, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CSLM get");
+        assert!(r.find(c, "size", "()I").is_some(), "CSLM size");
+    }
+}

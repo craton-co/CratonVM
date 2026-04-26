@@ -1,0 +1,9 @@
+﻿{
+    "generated_at":  "2026-04-25T14:39:21Z",
+    "rustjvm_bin":  "C:\\craton\\rust-jvm\\target\\release\\rustjvm.exe",
+    "rustjvm_rev":  "unknown",
+    "main_class":  "DirectRunner",
+    "classpath":  "C:\\craton\\rust-jvm\\bench\\wildfly\\staged\\classes;C:\\craton\\rust-jvm\\bench\\wildfly\\staged\\hamcrest.jar;C:\\craton\\rust-jvm\\bench\\wildfly\\staged\\junit.jar",
+    "rc":  0,
+    "timeout_sec":  60
+}

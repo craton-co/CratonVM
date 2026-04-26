@@ -1,0 +1,25 @@
+[package]
+name = "rustjvm-reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Java .class file parser for the RustJVM project"
+readme = "../README.md"
+
+[dependencies]
+rustjvm-types = { path = "../types" }
+thiserror.workspace = true
+tracing.workspace = true
+bitflags = "2"
+cesu8 = "1.1"
+strum = { version = "0.26", features = ["derive"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

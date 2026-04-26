@@ -1,0 +1,155 @@
+//! Stream-terminal and Flow.Subscriber native overrides.
+//!
+//! T16.9: Streams — the JDK's real `Stream.reduce` / `Stream.collect`
+//! terminal operations are implemented in Java bytecode that walks a
+//! Spliterator. In `--synthetic-jdk` mode we have no Java-side Stream
+//! bytecode to fall back to; the synthetic stream natives live in
+//! `rustjvm-native-collections`.
+//!
+//! This module is intentionally small. Its purpose:
+//!
+//! 1. Provide a dedicated home for Stream-terminal / Flow overrides so
+//!    that subsequent edits do not need to touch `phases_late.rs`
+//!    (which is being edited by multiple concurrent work streams).
+//! 2. Override the no-op `Flow.Subscription.request(long)` with a
+//!    saturating-add demand counter, matching the T9.2.2 pattern used
+//!    by HTTP/2 `BodySubscriber`.
+//!
+//! The prior inline `Flow.Subscription` registration in `lib.rs`
+//! (around line 10737) treats `request(J)V` as a no-op. Re-registering
+//! the same key here overwrites the earlier callback because
+//! `NativeMethodRegistry::register` is last-writer-wins for identical
+//! triples.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use rustjvm_types::Value;
+use rustjvm_types::error::MethodCallResult;
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+
+/// Process-wide demand counter for `Flow.Subscription.request(long)`.
+///
+/// Keyed by the subscription ObjectRef's raw pointer (stable for the
+/// lifetime of the object). Values accumulate via saturating add so a
+/// subscriber that repeatedly requests `Long.MAX_VALUE` never wraps.
+fn flow_subscription_demand() -> &'static Mutex<HashMap<u64, i64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register Stream-terminal / Flow.Subscriber overrides.
+pub(crate) fn register_stream_overrides(registry: &mut NativeMethodRegistry) {
+    register_flow_subscription_overrides(registry);
+}
+
+/// Override the no-op `Flow.Subscription.request(long)` with a real
+/// saturating-add demand counter, plus a companion cancel() that drops
+/// the tracked demand.
+fn register_flow_subscription_overrides(registry: &mut NativeMethodRegistry) {
+    let flow_sub = "java/util/concurrent/Flow$Subscription";
+
+    registry.register(flow_sub, "request", "(J)V", native_flow_request);
+    // `cancel()` is registered in lib.rs; re-register here so the demand
+    // map is cleaned up when the subscription is cancelled.
+    registry.register(flow_sub, "cancel", "()V", native_flow_cancel);
+}
+
+/// `Flow.Subscription.request(long n)` — saturating-add the demand.
+/// Zero or negative `n` is silently ignored (JDK reactive-streams spec
+/// says negative should trigger `onError(IllegalArgumentException)`,
+/// but the synthetic JDK path has no live subscriber reference here so
+/// we take the no-op path).
+fn native_flow_request(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let n = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    if n <= 0 {
+        return Ok(None);
+    }
+    let key = this.as_ptr() as u64;
+    let mut map = flow_subscription_demand()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let current = *map.get(&key).unwrap_or(&0);
+    map.insert(key, current.saturating_add(n));
+    // We deliberately do NOT write the demand back into field 0 — that
+    // slot is the cancellation flag in the base lib.rs layout. The demand
+    // map is the sole source of truth.
+    Ok(None)
+}
+
+/// `Flow.Subscription.cancel()` — mark cancelled and drop demand.
+fn native_flow_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, 0, Value::Int(1));
+    let key = this.as_ptr() as u64;
+    let mut map = flow_subscription_demand()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.remove(&key);
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustjvm_native_api::NativeMethodRegistry;
+
+    #[test]
+    fn register_stream_overrides_installs_flow_subscription_request() {
+        let mut r = NativeMethodRegistry::new();
+        register_stream_overrides(&mut r);
+        assert!(r
+            .find(
+                "java/util/concurrent/Flow$Subscription",
+                "request",
+                "(J)V"
+            )
+            .is_some());
+        assert!(r
+            .find("java/util/concurrent/Flow$Subscription", "cancel", "()V")
+            .is_some());
+    }
+
+    #[test]
+    fn flow_subscription_demand_map_uses_saturating_add() {
+        // Direct unit test of the demand-map arithmetic without going
+        // through the full native dispatch path.
+        let demand = flow_subscription_demand();
+        let mut map = demand.lock().unwrap_or_else(|e| e.into_inner());
+        // Synthetic key that does not overlap any real ObjectRef pointer.
+        let key = 0xDEAD_BEEF_C0FF_EE01u64;
+        map.remove(&key); // ensure clean start
+
+        // First request: 10
+        let a = *map.get(&key).unwrap_or(&0);
+        map.insert(key, a.saturating_add(10));
+        assert_eq!(*map.get(&key).unwrap_or(&0), 10);
+
+        // Second request: i64::MAX — must saturate, not wrap
+        let b = *map.get(&key).unwrap_or(&0);
+        map.insert(key, b.saturating_add(i64::MAX));
+        assert_eq!(*map.get(&key).unwrap_or(&0), i64::MAX);
+
+        // Third request: 1 — must stay at i64::MAX
+        let c = *map.get(&key).unwrap_or(&0);
+        map.insert(key, c.saturating_add(1));
+        assert_eq!(*map.get(&key).unwrap_or(&0), i64::MAX);
+
+        map.remove(&key); // cleanup
+    }
+}

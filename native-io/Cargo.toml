@@ -1,0 +1,39 @@
+[package]
+name = "rustjvm-native-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Java I/O native methods for RustJVM"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# T14: gate synthetic NIO overrides (ByteBuffer/HeapByteBuffer/etc.) behind
+# this flag.  In real-JDK mode the JDK classes have their own layout and
+# the synthetic overrides would panic with field-layout mismatches.
+synthetic-jdk = []
+
+[dependencies]
+rustjvm-types = { path = "../types" }
+rustjvm-native-api = { path = "../native-api" }
+parking_lot = "0.12"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+regex = "1"
+memmap2 = "0.9"
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+
+# WP3.1 — real platform-backed Selector. Linux uses epoll via libc; Windows
+# uses WSAPoll via raw `#[link(name = "Ws2_32")]` FFI (same approach as
+# `native-builtins/src/servlet.rs`), so no extra Windows-specific crate is
+# needed. An IOCP-backed `WindowsAsyncSelector` for AsynchronousSocketChannel
+# is a separate WP.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

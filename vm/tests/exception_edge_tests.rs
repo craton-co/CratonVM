@@ -1,0 +1,311 @@
+//! Exception handling edge-case tests (Session 2 hardening).
+//!
+//! Tests cover: finally semantics, deep unwinding, catch priority,
+//! ExceptionInInitializerError wrapping, return-from-try/catch,
+//! exception-in-finally, cross-interface exceptions, and more.
+
+use rustjvm_vm::config::VmConfig;
+use rustjvm_vm::types::Value;
+use rustjvm_vm::vm::Vm;
+
+fn test_resources_dir() -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    format!("{manifest_dir}/tests/resources")
+}
+
+fn class_files_available() -> bool {
+    let dir = test_resources_dir();
+    std::path::Path::new(&format!("{dir}/rustjvm/ExceptionEdgeCases.class")).exists()
+}
+
+fn test_vm() -> Vm {
+    let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
+    Vm::new(config)
+}
+
+fn printed_ints(vm: &Vm) -> Vec<i32> {
+    vm.main_thread
+        .printed
+        .iter()
+        .filter_map(|v| v.as_int())
+        .collect()
+}
+
+macro_rules! require_class_files {
+    () => {
+        if !class_files_available() {
+            eprintln!("Skipping: ExceptionEdgeCases.class not available");
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Edge-case tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_finally_on_normal_return() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testFinallyOnNormalReturn",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testFinallyOnNormalReturn failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_finally_on_exception() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testFinallyOnException",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testFinallyOnException failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_exception_in_finally() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testExceptionInFinally",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testExceptionInFinally failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2]);
+}
+
+#[test]
+fn test_deep_unwinding() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testDeepUnwinding",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testDeepUnwinding failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2]);
+}
+
+#[test]
+fn test_catch_superclass() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testCatchSuperclass",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testCatchSuperclass failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1]);
+}
+
+#[test]
+fn test_first_matching_catch() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testFirstMatchingCatch",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testFirstMatchingCatch failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1]);
+}
+
+#[test]
+fn test_return_from_try_with_finally() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testReturnFromTryWithFinally",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+    assert_eq!(printed_ints(&vm), vec![1]);
+}
+
+#[test]
+fn test_return_from_catch_with_finally() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testReturnFromCatchWithFinally",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(99))) => {}
+        other => panic!("Expected Ok(Some(Int(99))), got: {other:?}"),
+    }
+    assert_eq!(printed_ints(&vm), vec![1, 2]);
+}
+
+#[test]
+fn test_catch_all_after_specific() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testCatchAllAfterSpecific",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testCatchAllAfterSpecific failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2]);
+}
+
+#[test]
+fn test_null_check_in_catch() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testNullCheckInCatch",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testNullCheckInCatch failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2]);
+}
+
+#[test]
+fn test_rethrow_preserves_identity() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testRethrowPreservesIdentity",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testRethrowPreservesIdentity failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2]);
+}
+
+#[test]
+fn test_clinit_exception() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testClinitException",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testClinitException failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1]);
+}
+
+#[test]
+fn test_finally_in_loop() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testFinallyInLoop",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testFinallyInLoop failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_chained_exceptions() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ExceptionEdgeCases",
+        "testChainedExceptions",
+        "()V",
+        &[],
+    );
+    assert!(result.is_ok(), "testChainedExceptions failed: {result:?}");
+    assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for refs_equal (if_acmpeq/if_acmpne correctness)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_refs_equal_same_object() {
+    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    let vm = test_vm();
+    let obj = vm.shared.heap.alloc_object(
+        rustjvm_vm::classloading::ClassId::new(0),
+        0,
+    );
+    let a = Value::Object(Some(obj));
+    let b = Value::Object(Some(obj));
+    assert!(test_refs_equal(&a, &b), "same object should be equal");
+}
+
+#[test]
+fn test_refs_equal_different_objects() {
+    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    let vm = test_vm();
+    let obj1 = vm.shared.heap.alloc_object(
+        rustjvm_vm::classloading::ClassId::new(0),
+        0,
+    );
+    let obj2 = vm.shared.heap.alloc_object(
+        rustjvm_vm::classloading::ClassId::new(0),
+        0,
+    );
+    let a = Value::Object(Some(obj1));
+    let b = Value::Object(Some(obj2));
+    assert!(!test_refs_equal(&a, &b), "different objects should not be equal");
+}
+
+#[test]
+fn test_refs_equal_both_null() {
+    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    let a = Value::Object(None);
+    let b = Value::Object(None);
+    assert!(test_refs_equal(&a, &b), "both null should be equal");
+}
+
+#[test]
+fn test_refs_equal_null_vs_nonnull() {
+    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    let vm = test_vm();
+    let obj = vm.shared.heap.alloc_object(
+        rustjvm_vm::classloading::ClassId::new(0),
+        0,
+    );
+    let a = Value::Object(None);
+    let b = Value::Object(Some(obj));
+    assert!(!test_refs_equal(&a, &b), "null vs non-null should not be equal");
+    assert!(!test_refs_equal(&b, &a), "non-null vs null should not be equal");
+}
+
+#[test]
+fn test_refs_equal_int_zero_vs_null() {
+    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    let a = Value::Int(0);
+    let b = Value::Object(None);
+    assert!(test_refs_equal(&a, &b), "Int(0) should equal null in autoboxed context");
+}

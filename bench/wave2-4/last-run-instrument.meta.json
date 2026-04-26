@@ -1,0 +1,16 @@
+﻿{
+    "probe":  "instrument",
+    "generated_at":  "2026-04-26T14:29:56Z",
+    "rustjvm_bin":  "C:\\craton\\rust-jvm\\target\\release\\rustjvm.exe",
+    "rustjvm_rev":  "unknown",
+    "main_class":  "Main",
+    "classpath":  "C:\\craton\\rust-jvm\\bench\\wave2-4\\staged-instrument\\classes",
+    "javaagent":  "-javaagent:C:\\craton\\rust-jvm\\bench\\wave2-4\\staged-instrument\\agent.jar",
+    "rc":  0,
+    "status":  "ran",
+    "skipped_real_jar":  "no",
+    "timeout_sec":  60,
+    "jacoco_exec_present":  false,
+    "jacoco_exec_size":  0,
+    "jacoco_magic_ok":  false
+}

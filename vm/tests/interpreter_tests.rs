@@ -1,0 +1,3505 @@
+//! Integration tests for the bytecode interpreter.
+//!
+//! These tests compile Java test classes and run them through the VM,
+//! verifying that the interpreter produces correct results.
+//!
+//! **Prerequisites:**
+//! - Java test classes are compiled automatically by `build.rs` if `javac`
+//!   is on the PATH. If not, tests will be skipped at runtime.
+
+use rustjvm_vm::config::VmConfig;
+use rustjvm_vm::types::Value;
+use rustjvm_vm::vm::Vm;
+
+/// Path to the test resources directory.
+fn test_resources_dir() -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    format!("{manifest_dir}/tests/resources")
+}
+
+/// Check if compiled .class files are available.
+fn class_files_available() -> bool {
+    let dir = test_resources_dir();
+    let class_path = format!("{dir}/rustjvm/SimpleReturn.class");
+    std::path::Path::new(&class_path).exists()
+}
+
+/// Create a VM configured for testing (classpath pointing to test resources).
+fn test_vm() -> Vm {
+    let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
+    Vm::new(config)
+}
+
+/// Skip guard — returns early if .class files are not available.
+macro_rules! require_class_files {
+    () => {
+        if !class_files_available() {
+            eprintln!("Skipping: .class files not available (javac not on PATH?)");
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Basic arithmetic and control flow tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_simple_return() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SimpleReturn", "test", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_arithmetic_add() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/Arithmetic", "test", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(30))) => {}
+        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_arithmetic_mul() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/Arithmetic", "testMul", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_arithmetic_div() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/Arithmetic", "testDiv", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(25))) => {}
+        other => panic!("Expected Ok(Some(Int(25))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_arithmetic_neg() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/Arithmetic", "testNeg", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(-42))) => {}
+        other => panic!("Expected Ok(Some(Int(-42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_control_flow_if_else() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ControlFlow", "testIfElse", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_control_flow_loop() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ControlFlow", "testLoop", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(45))) => {}
+        other => panic!("Expected Ok(Some(Int(45))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_control_flow_while() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ControlFlow", "testWhile", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1024))) => {}
+        other => panic!("Expected Ok(Some(Int(1024))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_control_flow_switch() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/ControlFlow",
+        "testSwitch",
+        "(I)I",
+        &[Value::Int(2)],
+    );
+    match result {
+        Ok(Some(Value::Int(20))) => {}
+        other => panic!("Expected Ok(Some(Int(20))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exception tests (now work without RT_JAR via synthetic class hierarchy)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_division_by_zero() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/Arithmetic", "testDivByZero", "()I", &[]);
+    assert!(
+        result.is_err(),
+        "Division by zero should fail, got: {result:?}"
+    );
+}
+
+#[test]
+fn test_basic_exception_catch() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ExceptionTest", "testBasicCatch", "()V", &[]);
+    assert!(result.is_ok(), "testBasicCatch failed: {result:?}");
+
+    let printed_ints: Vec<i32> = vm
+        .main_thread
+        .printed
+        .iter()
+        .filter_map(|v| v.as_int())
+        .collect();
+    assert_eq!(printed_ints, vec![1, 2]);
+}
+
+#[test]
+fn test_exception_propagation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ExceptionTest", "testPropagation", "()V", &[]);
+    assert!(result.is_ok(), "testPropagation failed: {result:?}");
+
+    let printed_ints: Vec<i32> = vm
+        .main_thread
+        .printed
+        .iter()
+        .filter_map(|v| v.as_int())
+        .collect();
+    assert_eq!(printed_ints, vec![1, 3]);
+}
+
+#[test]
+fn test_finally_block() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ExceptionTest", "testFinally", "()V", &[]);
+    assert!(result.is_ok(), "testFinally failed: {result:?}");
+
+    let printed_ints: Vec<i32> = vm
+        .main_thread
+        .printed
+        .iter()
+        .filter_map(|v| v.as_int())
+        .collect();
+    assert_eq!(printed_ints, vec![1, 2, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 83: Pattern Matching Completeness
+// ---------------------------------------------------------------------------
+
+// -- 83.1: Primitive Patterns in Switch --
+
+#[test]
+fn test_pattern_switch_exact_match() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testExactMatch", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_pattern_switch_widening() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testWidening", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(107))) => {}
+        other => panic!("Expected Ok(Some(Int(107))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_pattern_switch_narrowing() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testNarrowing", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(15))) => {}
+        other => panic!("Expected Ok(Some(Int(15))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_pattern_switch_out_of_range() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testOutOfRange", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(314))) => {}
+        other => panic!("Expected Ok(Some(Int(314))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_pattern_switch_null() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testNull", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(99))) => {}
+        other => panic!("Expected Ok(Some(Int(99))), got: {other:?}"),
+    }
+}
+
+// -- 83.2: Record Patterns --
+
+#[test]
+fn test_record_pattern_simple() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordPatterns", "testSimpleRecord", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(7))) => {}
+        other => panic!("Expected Ok(Some(Int(7))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_pattern_nested() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordPatterns", "testNestedRecord", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(10))) => {}
+        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_pattern_with_guard() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordPatterns", "testRecordWithGuard", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(2))) => {}
+        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_pattern_null() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordPatterns", "testRecordNull", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(77))) => {}
+        other => panic!("Expected Ok(Some(Int(77))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_pattern_in_box() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordPatterns", "testRecordInBox", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+// -- 83.3: Guard Expressions --
+
+#[test]
+fn test_guard_true() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testGuardTrue", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(43))) => {}
+        other => panic!("Expected Ok(Some(Int(43))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_guard_false() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testGuardFalse", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(103))) => {}
+        other => panic!("Expected Ok(Some(Int(103))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_guard_side_effect() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/PatternSwitch", "testGuardSideEffect", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(56))) => {}
+        other => panic!("Expected Ok(Some(Int(56))), got: {other:?}"),
+    }
+}
+
+// -- 83.4: Sealed Class Exhaustiveness --
+
+#[test]
+fn test_sealed_exhaustive_circle() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SealedSwitch", "testExhaustive", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(5))) => {}
+        other => panic!("Expected Ok(Some(Int(5))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_sealed_exhaustive_rect() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SealedSwitch", "testExhaustiveRect", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(12))) => {}
+        other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_sealed_with_default() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SealedSwitch", "testWithDefault", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(12))) => {}
+        other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 84: Records & Sealed Classes Runtime
+// ---------------------------------------------------------------------------
+
+// -- 84.1: Record Canonical Constructor & Accessors --
+
+#[test]
+fn test_record_canonical_ctor() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testCanonicalCtor", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(30))) => {}
+        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_accessor_generation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testAccessorGeneration", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+// -- 84.2: Record equals/hashCode/toString --
+
+#[test]
+fn test_record_equals_true() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testEqualsTrue", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_equals_false() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testEqualsFalse", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(0))) => {}
+        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_equals_null() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testEqualsNull", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(0))) => {}
+        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_hashcode_consistent() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testHashCodeConsistent", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_hashcode_different() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testHashCodeDifferent", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_record_tostring() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/RecordRuntime", "testToString", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// -- 84.3: Sealed Class Verification --
+
+#[test]
+fn test_sealed_permitted_loads() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SealedVerify", "testPermittedSubclassLoads", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_sealed_multiple_permitted() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SealedVerify", "testMultiplePermitted", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(3))) => {}
+        other => panic!("Expected Ok(Some(Int(3))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_sealed_verify_with_default() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SealedVerify", "testSealedWithDefault", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(10))) => {}
+        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 88: Reflection Completeness
+// ---------------------------------------------------------------------------
+
+// -- 88.1: Method.invoke on User Bytecode --
+
+#[test]
+fn test_reflect_method_static() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectMethod", "testStaticMethod", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(30))) => {}
+        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_method_instance() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectMethod", "testInstanceMethod", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_method_string_return() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectMethod", "testStringReturn", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_method_private_accessible() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectMethod", "testPrivateSetAccessible", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(777))) => {}
+        other => panic!("Expected Ok(Some(Int(777))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_method_exception_wrapping() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectMethod", "testExceptionWrapping", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// -- 88.2: Field Get/Set on User Classes --
+
+#[test]
+fn test_reflect_field_get_int() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectField", "testGetIntField", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_field_get_string() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectField", "testGetStringField", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_field_static() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectField", "testStaticField", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(300))) => {}
+        other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_field_set_int() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectField", "testSetIntField", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(123))) => {}
+        other => panic!("Expected Ok(Some(Int(123))), got: {other:?}"),
+    }
+}
+
+// -- 88.3: Constructor.newInstance --
+
+#[test]
+fn test_reflect_constructor_noarg() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectConstructor", "testNoArgConstructor", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(10))) => {}
+        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_constructor_param() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectConstructor", "testParamConstructor", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_constructor_exception() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectConstructor", "testExceptionInConstructor", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// -- 88.4: Annotation Runtime Retention --
+
+#[test]
+fn test_reflect_annotation_class() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectAnnotation", "testClassAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_annotation_method() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectAnnotation", "testMethodAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_annotation_absent() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectAnnotation", "testNoAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reflect_annotation_is_present() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectAnnotation", "testIsAnnotationPresent", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 91: Serialization & ClassLoader
+// ---------------------------------------------------------------------------
+
+// 91.1+91.2: Simple object round-trip via OOS → byte[] → OIS
+#[test]
+fn test_serialize_simple_round_trip() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SerializeBasic", "testSimpleRoundTrip", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+// 91.1: Nested object serialization
+#[test]
+fn test_serialize_nested_object() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SerializeBasic", "testNestedObject", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(30))) => {}
+        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+    }
+}
+
+// 91.1: Transient field is skipped during serialization
+#[test]
+fn test_serialize_transient_field() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SerializeBasic", "testTransientField", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 91.1: Non-serializable class throws exception
+#[test]
+fn test_serialize_non_serializable_throws() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/SerializeBasic", "testNonSerializableThrows", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 91.3: Thread.getContextClassLoader returns non-null
+#[test]
+fn test_context_class_loader() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testContextClassLoader", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 91.3: Parent delegation chain
+#[test]
+fn test_parent_delegation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testParentDelegation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 91.3: Set/get context class loader round-trip
+#[test]
+fn test_set_context_class_loader() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testSetContextClassLoader", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 91.3: Class.getClassLoader for user classes
+#[test]
+fn test_class_get_class_loader() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testClassGetClassLoader", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session 3: ClassLoader Parent Delegation Fix
+// ---------------------------------------------------------------------------
+
+// Session 3: Bootstrap classes (Object, String) return null from getClassLoader()
+#[test]
+fn test_bootstrap_class_loader_is_null() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testBootstrapClassLoaderIsNull", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_string_bootstrap_loader() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testStringBootstrapLoader", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: Loader name correctness
+#[test]
+fn test_loader_name() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoaderName", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_platform_loader_name() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testPlatformLoaderName", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: System class loader has correct parent chain (app → platform → null)
+#[test]
+fn test_system_class_loader_chain() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testSystemClassLoaderChain", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: loadClass delegation to parent works for bootstrap classes
+#[test]
+fn test_load_class_delegation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoadClassDelegation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: loadClass works for user-defined classes
+#[test]
+fn test_load_class_for_user_class() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoadClassForUserClass", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: getClassLoader() returns same object each call (singleton identity)
+#[test]
+fn test_class_loader_identity() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testClassLoaderIdentity", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: getSystemClassLoader() returns same instance each call
+#[test]
+fn test_system_class_loader_identity() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testSystemClassLoaderIdentity", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 3: Loader isolation — bootstrap classes vs app classes have different loaders
+#[test]
+fn test_loader_isolation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoaderIsolation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session 4: MethodHandle and VarHandle Completeness
+// ---------------------------------------------------------------------------
+
+// Session 4: Static method invocation via MethodHandle
+#[test]
+fn test_method_handle_static() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testStaticMethodHandle", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: Virtual method invocation via MethodHandle
+#[test]
+fn test_method_handle_virtual() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testVirtualMethodHandle", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: Constructor invocation via MethodHandle
+#[test]
+fn test_method_handle_constructor() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testConstructorMethodHandle", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: MethodHandle.bindTo bound receiver
+#[test]
+fn test_method_handle_bind_to() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testBindTo", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: Lookup.in(targetClass)
+#[test]
+fn test_lookup_in() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testLookupIn", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: VarHandle.get() and VarHandle.set() for instance fields
+#[test]
+fn test_var_handle_get_set() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testVarHandleGetSet", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: VarHandle.compareAndSet()
+#[test]
+fn test_var_handle_cas() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testVarHandleCAS", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Session 4: MethodHandle.type() returns valid MethodType
+#[test]
+fn test_method_handle_type() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/MethodHandleTest", "testMethodHandleType", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 97: OpenJDK TCK Preparation
+// ---------------------------------------------------------------------------
+
+// 97.1: JTReg directive parsing — compile test
+#[test]
+fn test_jtreg_parse_compile() {
+    use rustjvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
+
+    let source = r#"
+/*
+ * @test
+ * @summary Tests basic compilation
+ * @compile TestCompile.java
+ * @run main TestCompile
+ */
+public class TestCompile {
+    public static void main(String[] args) {
+        System.out.println("OK");
+    }
+}
+"#;
+    let desc = JtregTestDescriptor::parse("TestCompile.java", source);
+    assert!(desc.is_test, "Should detect @test");
+    assert_eq!(desc.summary.as_deref(), Some("Tests basic compilation"));
+    assert!(desc.compile_files.contains(&"TestCompile.java".to_string()));
+    assert_eq!(desc.main_class.as_deref(), Some("TestCompile"));
+    // Check that Run directive was parsed
+    let has_run = desc.directives.iter().any(|d| matches!(d,
+        JtregDirective::Run { mode: JtregRunMode::Main, class_name, .. }
+        if class_name == "TestCompile"
+    ));
+    assert!(has_run, "Should have @run main TestCompile directive");
+}
+
+// 97.1: JTReg directive parsing — run test with othervm
+#[test]
+fn test_jtreg_parse_run() {
+    use rustjvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
+
+    let source = r#"
+/* @test
+ * @bug 1234567
+ * @summary Tests othervm mode
+ * @run main/othervm -Xmx256m TestOther arg1 arg2
+ */
+public class TestOther {
+    public static void main(String[] args) {}
+}
+"#;
+    let desc = JtregTestDescriptor::parse("TestOther.java", source);
+    assert!(desc.is_test);
+    // Check for othervm mode
+    let has_othervm = desc.directives.iter().any(|d| matches!(d,
+        JtregDirective::Run { mode: JtregRunMode::OtherVm, .. }
+    ));
+    assert!(has_othervm, "Should detect main/othervm mode");
+    // Check bug directive
+    let has_bug = desc.directives.iter().any(|d| matches!(d,
+        JtregDirective::Bug(id) if id == "1234567"
+    ));
+    assert!(has_bug, "Should parse @bug directive");
+}
+
+// 97.1: JTReg output comparison
+#[test]
+fn test_jtreg_compare_output() {
+    use rustjvm_vm::runtime::tck::compare_output;
+
+    let actual = vec!["hello".to_string(), "world".to_string()];
+    let expected = vec!["hello".to_string(), "world".to_string()];
+    assert!(compare_output(&actual, &expected));
+
+    let mismatched = vec!["hello".to_string(), "WORLD".to_string()];
+    assert!(!compare_output(&actual, &mismatched));
+
+    let short = vec!["hello".to_string()];
+    assert!(!compare_output(&actual, &short));
+
+    // Trimming whitespace
+    let padded = vec!["  hello  ".to_string(), " world ".to_string()];
+    assert!(compare_output(&padded, &expected));
+}
+
+// 97.2: TCK Chapter 4 — Class file format (magic, version, constant pool, fields, methods)
+#[test]
+fn test_tck_class_file_magic() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckClassFile", "testMagicNumber", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_class_file_version() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckClassFile", "testClassVersion", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_class_file_constant_pool() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckClassFile", "testConstantPool", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_class_file_field_access() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckClassFile", "testFieldAccess", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_class_file_method_access() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckClassFile", "testMethodAccess", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 97.2: TCK Chapter 5 — Loading, Linking, Initialization
+#[test]
+fn test_tck_loading_class_loading() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckLoading", "testClassLoading", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_loading_static_init() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckLoading", "testStaticInit", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_loading_interface_init() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckLoading", "testInterfaceInit", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_loading_array_creation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckLoading", "testArrayCreation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_loading_inheritance() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckLoading", "testInheritance", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// 97.2: TCK Chapter 6 — Instruction Set
+#[test]
+fn test_tck_instructions_int_arithmetic() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testIntArithmetic", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_long_arithmetic() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testLongArithmetic", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_float_arithmetic() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testFloatArithmetic", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_comparisons() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testComparisons", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_tableswitch() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testTableswitch", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_lookupswitch() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testLookupswitch", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_field_ops() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testFieldOps", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_array_ops() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testArrayOps", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_invoke_virtual() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testInvokeVirtual", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_invoke_static() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testInvokeStatic", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_exception_handling() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testExceptionHandling", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_checkcast() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testCheckcast", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_instructions_instanceof() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/TckInstructions", "testInstanceof", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// =========================================================================
+// Session 17: Reflection Completeness
+// =========================================================================
+
+#[test]
+fn test_s17_method_invoke_private() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodInvokePrivateViaReflection", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(49))) => {}
+        other => panic!("Expected Ok(Some(Int(49))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_invoke_instance() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodInvokeInstance", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_invoke_type_coercion() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodInvokeTypeCoercion", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(36))) => {}
+        other => panic!("Expected Ok(Some(Int(36))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_field_get_private() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldGetPrivate", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_field_set_private() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldSetPrivate", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(999))) => {}
+        other => panic!("Expected Ok(Some(Int(999))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_field_static_get_set() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldStaticGetSet", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_constructor_noarg() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testConstructorNoArg", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(0))) => {}
+        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_constructor_with_args() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testConstructorWithArgs", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_constructor_set_accessible() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testConstructorSetAccessible", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(300))) => {}
+        other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_proxy_basic() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testProxyBasic", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_proxy_is_proxy_class() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testProxyIsProxyClass", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_proxy_get_handler() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testProxyGetHandler", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_get_declared_methods() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredMethods", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(0))) => {}
+        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_get_declared_fields() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredFields", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(2))) => {}
+        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_get_declared_constructors() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredConstructors", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(2))) => {}
+        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_get_declared_method_by_name() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredMethodByName", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_modifiers() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodModifiers", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_field_modifiers() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldModifiers", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_return_type() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodReturnType", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_parameter_types() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodParameterTypes", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_parameter_count() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodParameterCount", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(2))) => {}
+        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_field_type() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldType", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_field_declaring_class() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldDeclaringClass", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s17_method_declaring_class() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodDeclaringClass", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// ============================================================
+// Session 18: Annotation Processing
+// ============================================================
+
+#[test]
+fn test_s18_custom_annotation_values() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testCustomAnnotationValues", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_inherited_annotation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testInheritedAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_non_inherited_not_present() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testNonInheritedNotPresent", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_get_inherited_annotation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testGetInheritedAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_declared_annotations_no_inherited() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testDeclaredAnnotationsNoInherited", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_overriding_inherited_annotation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testOverridingInheritedAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_method_annotation_present() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testMethodAnnotationPresent", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_method_no_annotation() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testMethodNoAnnotation", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_parameter_annotation_count() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testParameterAnnotationCount", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s18_parameter_annotation_empty() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/AnnotationTest", "testParameterAnnotationEmpty", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// ============================================================
+// Session 19: Generics and Type Erasure Support
+// ============================================================
+
+#[test]
+fn test_s19_class_type_params() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testClassTypeParams", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_multiple_type_params() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMultipleTypeParams", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_bounded_type_param() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testBoundedTypeParam", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_generic_superclass() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testGenericSuperclass", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_non_generic_superclass() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testNonGenericSuperclass", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_method_type_params() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMethodTypeParams", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_method_generic_return_type() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMethodGenericReturnType", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_method_generic_param_types() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMethodGenericParamTypes", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_field_generic_type() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testFieldGenericType", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_s19_no_type_params() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// =========================================================================
+// Session 20: Full java.util.stream Support
+// =========================================================================
+
+macro_rules! s20_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/StreamComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s20_test!(test_s20_filter_map_collect_to_list, "testFilterMapCollectToList", 3);
+s20_test!(test_s20_stream_of_count, "testStreamOfCount", 5);
+s20_test!(test_s20_reduce_with_identity, "testReduceWithIdentity", 15);
+s20_test!(test_s20_for_each, "testForEach", 60);
+s20_test!(test_s20_collect_to_set, "testCollectToSet", 3);
+s20_test!(test_s20_find_first, "testFindFirst", 10);
+s20_test!(test_s20_any_match, "testAnyMatch", 1);
+s20_test!(test_s20_all_match, "testAllMatch", 1);
+s20_test!(test_s20_none_match, "testNoneMatch", 1);
+s20_test!(test_s20_sorted, "testSorted", 1134);
+s20_test!(test_s20_distinct, "testDistinct", 3);
+s20_test!(test_s20_limit_skip, "testLimitSkip", 12);
+s20_test!(test_s20_to_array, "testToArray", 3);
+s20_test!(test_s20_flat_map, "testFlatMap", 10);
+s20_test!(test_s20_collectors_joining, "testCollectorsJoining", 1);
+s20_test!(test_s20_collectors_to_map, "testCollectorsToMap", 5);
+s20_test!(test_s20_collectors_grouping_by, "testCollectorsGroupingBy", 32);
+s20_test!(test_s20_stream_empty, "testStreamEmpty", 0);
+s20_test!(test_s20_reduce_optional, "testReduceOptional", 10);
+s20_test!(test_s20_grouping_by_counting, "testGroupingByCounting", 3);
+s20_test!(test_s20_stream_concat, "testStreamConcat", 4);
+s20_test!(test_s20_stream_to_list, "testStreamToList", 2);
+s20_test!(test_s20_min_max, "testMinMax", 15);
+s20_test!(test_s20_peek, "testPeek", 33);
+s20_test!(test_s20_chained_pipeline, "testChainedPipeline", 56);
+s20_test!(test_s20_partitioning_by, "testPartitioningBy", 23);
+s20_test!(test_s20_int_stream_range_sum, "testIntStreamRangeSum", 15);
+s20_test!(test_s20_map_to_int_sum, "testMapToIntSum", 10);
+s20_test!(test_s20_stream_of_single, "testStreamOfSingle", 1);
+s20_test!(test_s20_parallel_stream, "testParallelStream", 1);
+
+// ===========================================================================
+// Session 21: String Concat and Formatting
+// ===========================================================================
+
+macro_rules! s21_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/StringFormatComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s21_test!(test_s21_string_concat, "testStringConcat", 1);
+s21_test!(test_s21_concat_with_primitives, "testConcatWithPrimitives", 1);
+s21_test!(test_s21_concat_with_null, "testConcatWithNull", 1);
+s21_test!(test_s21_format_string, "testFormatString", 1);
+s21_test!(test_s21_format_int, "testFormatInt", 1);
+s21_test!(test_s21_format_float, "testFormatFloat", 1);
+s21_test!(test_s21_format_hex, "testFormatHex", 1);
+s21_test!(test_s21_format_octal, "testFormatOctal", 1);
+s21_test!(test_s21_format_boolean, "testFormatBoolean", 1);
+s21_test!(test_s21_format_char, "testFormatChar", 1);
+s21_test!(test_s21_format_width, "testFormatWidth", 1);
+s21_test!(test_s21_format_left_justify, "testFormatLeftJustify", 1);
+s21_test!(test_s21_format_zero_pad, "testFormatZeroPad", 1);
+s21_test!(test_s21_format_percent, "testFormatPercent", 1);
+s21_test!(test_s21_format_newline, "testFormatNewline", 1);
+s21_test!(test_s21_format_multiple_args, "testFormatMultipleArgs", 1);
+s21_test!(test_s21_format_scientific, "testFormatScientific", 1);
+s21_test!(test_s21_format_upper_hex, "testFormatUpperHex", 1);
+s21_test!(test_s21_format_formatted, "testStringFormatted", 1);
+s21_test!(test_s21_formatter_object, "testFormatterObject", 1);
+s21_test!(test_s21_formatter_append, "testFormatterAppend", 1);
+s21_test!(test_s21_message_format, "testMessageFormat", 1);
+s21_test!(test_s21_message_format_multiple, "testMessageFormatMultiple", 1);
+s21_test!(test_s21_decimal_format_basic, "testDecimalFormatBasic", 1);
+s21_test!(test_s21_decimal_format_integer, "testDecimalFormatInteger", 1);
+s21_test!(test_s21_decimal_format_no_grouping, "testDecimalFormatNoGrouping", 1);
+s21_test!(test_s21_concat_with_char, "testConcatWithChar", 1);
+s21_test!(test_s21_format_plus_sign, "testFormatPlusSign", 1);
+s21_test!(test_s21_concat_in_loop, "testConcatInLoop", 1);
+s21_test!(test_s21_string_builder_with_format, "testStringBuilderWithFormat", 1);
+
+// ===========================================================================
+// Session 22: Properties and Resource Loading
+// ===========================================================================
+
+macro_rules! s22_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/PropertiesComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s22_test!(test_s22_os_name, "testOsName", 1);
+s22_test!(test_s22_file_separator, "testFileSeparator", 1);
+s22_test!(test_s22_line_separator, "testLineSeparator", 1);
+s22_test!(test_s22_path_separator, "testPathSeparator", 1);
+s22_test!(test_s22_user_dir, "testUserDir", 1);
+s22_test!(test_s22_user_home, "testUserHome", 1);
+s22_test!(test_s22_file_encoding, "testFileEncoding", 1);
+s22_test!(test_s22_java_version, "testJavaVersion", 1);
+s22_test!(test_s22_java_vendor, "testJavaVendor", 1);
+s22_test!(test_s22_get_property_default, "testGetPropertyDefault", 1);
+s22_test!(test_s22_get_property_null, "testGetPropertyNull", 1);
+s22_test!(test_s22_set_property, "testSetProperty", 1);
+s22_test!(test_s22_set_property_returns_old, "testSetPropertyReturnsOld", 1);
+s22_test!(test_s22_properties_basic, "testPropertiesBasic", 1);
+s22_test!(test_s22_properties_default, "testPropertiesDefault", 1);
+s22_test!(test_s22_properties_load, "testPropertiesLoad", 1);
+s22_test!(test_s22_properties_load_comments, "testPropertiesLoadComments", 1);
+s22_test!(test_s22_properties_load_colon, "testPropertiesLoadColon", 1);
+s22_test!(test_s22_properties_size, "testPropertiesSize", 3);
+s22_test!(test_s22_properties_contains_key, "testPropertiesContainsKey", 1);
+s22_test!(test_s22_properties_remove, "testPropertiesRemove", 1);
+s22_test!(test_s22_properties_overwrite, "testPropertiesOverwrite", 1);
+s22_test!(test_s22_properties_empty, "testPropertiesEmpty", 1);
+s22_test!(test_s22_properties_clear, "testPropertiesClear", 1);
+s22_test!(test_s22_system_line_separator, "testSystemLineSeparator", 1);
+s22_test!(test_s22_tmp_dir, "testTmpDir", 1);
+s22_test!(test_s22_properties_load_empty, "testPropertiesLoadEmpty", 1);
+s22_test!(test_s22_properties_load_spaces, "testPropertiesLoadSpaces", 1);
+s22_test!(test_s22_get_env, "testGetEnv", 1);
+s22_test!(test_s22_get_env_missing, "testGetEnvMissing", 1);
+
+// ===========================================================================
+// Session 23: Java Memory Model Compliance
+// ===========================================================================
+
+macro_rules! s23_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/MemoryModelTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+            }
+        }
+    };
+}
+
+#[test]
+fn test_s23_thread_basic() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/ThreadBasicTest", "testThreadBasic", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+s23_test!(test_s23_volatile_visibility, "testVolatileVisibility");
+s23_test!(test_s23_join_happens_before, "testJoinHappensBefore");
+s23_test!(test_s23_start_happens_before, "testStartHappensBefore");
+s23_test!(test_s23_synchronized_happens_before, "testSynchronizedHappensBefore");
+s23_test!(test_s23_double_checked_locking, "testDoubleCheckedLocking");
+s23_test!(test_s23_dekker_mutual_exclusion, "testDekkerMutualExclusion");
+s23_test!(test_s23_volatile_counter, "testVolatileCounter");
+s23_test!(test_s23_monitor_wait_notify, "testMonitorWaitNotify");
+s23_test!(test_s23_synchronized_counter, "testSynchronizedCounter");
+s23_test!(test_s23_volatile_store_load, "testVolatileStoreLoad");
+
+// ===========================================================================
+// Session 23b: JMM Complete (JmmComplete.java) — 30 tests
+// ===========================================================================
+
+macro_rules! s23b_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/JmmComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s23b_test!(test_s23b_thread_start_join, "testThreadStartJoin", 42);
+s23b_test!(test_s23b_multiple_threads_join, "testMultipleThreadsJoin", 30);
+s23b_test!(test_s23b_volatile_visibility, "testVolatileVisibility", 1);
+s23b_test!(test_s23b_synchronized_mutex, "testSynchronizedMutex", 500);
+s23b_test!(test_s23b_current_thread, "testCurrentThread", 1);
+s23b_test!(test_s23b_thread_sleep, "testThreadSleep", 1);
+s23b_test!(test_s23b_atomic_integer_basic, "testAtomicIntegerBasic", 10);
+s23b_test!(test_s23b_atomic_integer_cas, "testAtomicIntegerCAS", 1);
+s23b_test!(test_s23b_atomic_integer_increment, "testAtomicIntegerIncrement", 6);
+s23b_test!(test_s23b_atomic_integer_get_and_add, "testAtomicIntegerGetAndAdd", 25);
+s23b_test!(test_s23b_atomic_boolean, "testAtomicBoolean", 1);
+s23b_test!(test_s23b_atomic_long, "testAtomicLong", 1);
+s23b_test!(test_s23b_synchronized_method, "testSynchronizedMethod", 150);
+s23b_test!(test_s23b_thread_computation, "testThreadComputation", 55);
+s23b_test!(test_s23b_atomic_concurrent_increment, "testAtomicConcurrentIncrement", 100);
+s23b_test!(test_s23b_double_checked_locking, "testDoubleCheckedLocking", 1);
+s23b_test!(test_s23b_wait_notify, "testWaitNotify", 1);
+s23b_test!(test_s23b_thread_name, "testThreadName", 1);
+s23b_test!(test_s23b_thread_is_alive, "testThreadIsAlive", 1);
+s23b_test!(test_s23b_volatile_ordering, "testVolatileOrdering", 1);
+s23b_test!(test_s23b_atomic_reference, "testAtomicReference", 1);
+s23b_test!(test_s23b_reentrant_sync, "testReentrantSync", 3);
+s23b_test!(test_s23b_thread_with_runnable, "testThreadWithRunnable", 77);
+s23b_test!(test_s23b_atomic_decrement, "testAtomicDecrement", 17);
+s23b_test!(test_s23b_nano_time_monotonic, "testNanoTimeMonotonic", 1);
+s23b_test!(test_s23b_volatile_array, "testVolatileArray", 99);
+s23b_test!(test_s23b_atomic_get_and_set, "testAtomicGetAndSet", 142);
+s23b_test!(test_s23b_join_timeout, "testJoinTimeout", 1);
+s23b_test!(test_s23b_sync_block_return, "testSyncBlockReturn", 42);
+s23b_test!(test_s23b_thread_start_join_multiple, "testThreadStartJoinMultiple", 55);
+
+// =============================================================================
+// Session 24: Thread.interrupt() and Timed Waits
+// =============================================================================
+
+macro_rules! s24_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/InterruptComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s24_test!(test_s24_interrupt_sleeping_thread, "interrupt_sleeping_thread", 1);
+s24_test!(test_s24_interrupt_waiting_thread, "interrupt_waiting_thread", 1);
+s24_test!(test_s24_interrupt_parked_thread, "interrupt_parked_thread", 1);
+s24_test!(test_s24_is_interrupted_no_clear, "is_interrupted_no_clear", 1);
+s24_test!(test_s24_interrupted_clears_flag, "interrupted_clears_flag", 1);
+s24_test!(test_s24_interrupt_before_sleep, "interrupt_before_sleep", 1);
+s24_test!(test_s24_interrupt_before_wait, "interrupt_before_wait", 1);
+s24_test!(test_s24_interrupt_before_park, "interrupt_before_park", 1);
+s24_test!(test_s24_timed_wait_normal, "timed_wait_normal", 1);
+s24_test!(test_s24_timed_wait_interrupted, "timed_wait_interrupted", 1);
+s24_test!(test_s24_thread_interrupt_self, "thread_interrupt_self", 1);
+s24_test!(test_s24_multiple_interrupts, "multiple_interrupts", 1);
+s24_test!(test_s24_wait_notify_no_interrupt, "wait_notify_no_interrupt", 1);
+s24_test!(test_s24_park_unpark_no_interrupt, "park_unpark_no_interrupt", 1);
+s24_test!(test_s24_unpark_before_park, "unpark_before_park", 1);
+s24_test!(test_s24_park_nanos_timeout, "park_nanos_timeout", 1);
+s24_test!(test_s24_sleep_nanos_interrupt, "sleep_nanos_interrupt", 1);
+s24_test!(test_s24_interrupt_clears_on_exception, "interrupt_clears_on_exception", 1);
+s24_test!(test_s24_wait_reacquires_monitor, "wait_reacquires_monitor", 1);
+s24_test!(test_s24_interrupt_during_timed_park, "interrupt_during_timed_park", 1);
+s24_test!(test_s24_notify_all_wakes_waiters, "notify_all_wakes_waiters", 2);
+s24_test!(test_s24_park_after_interrupt_repeated, "park_after_interrupt_repeated", 1);
+s24_test!(test_s24_sleep_zero_no_interrupt_check, "sleep_zero_no_interrupt_check", 1);
+s24_test!(test_s24_timed_join, "timed_join", 1);
+s24_test!(test_s24_interrupt_not_alive, "interrupt_not_alive", 1);
+s24_test!(test_s24_wait_with_notify_all_and_interrupt, "wait_with_notify_all_and_interrupt", 1);
+s24_test!(test_s24_concurrent_interrupt_and_join, "concurrent_interrupt_and_join", 1);
+s24_test!(test_s24_park_unpark_multiple_threads, "park_unpark_multiple_threads", 5);
+s24_test!(test_s24_wait_interrupt_reacquires_monitor, "wait_interrupt_reacquires_monitor", 1);
+s24_test!(test_s24_interrupt_flag_survives_park, "interrupt_flag_survives_park", 1);
+
+// =============================================================================
+// Session 25: Virtual Threads Integration
+// =============================================================================
+
+macro_rules! s25_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/VirtualThreadTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s25_test!(test_s25_single_virtual_thread, "testSingleVirtualThread", 1);
+s25_test!(test_s25_is_virtual, "testIsVirtual", 1);
+s25_test!(test_s25_is_not_virtual_platform, "testIsNotVirtualPlatform", 1);
+s25_test!(test_s25_hundred_virtual_threads, "testHundredVirtualThreads", 100);
+s25_test!(test_s25_thousand_virtual_threads, "testThousandVirtualThreads", 1000);
+s25_test!(test_s25_builder_virtual_start, "testBuilderVirtualStart", 1);
+s25_test!(test_s25_builder_platform_start, "testBuilderPlatformStart", 1);
+s25_test!(test_s25_virtual_join_happens_before, "testVirtualJoinHappensBefore", 42);
+s25_test!(test_s25_mixed_virtual_platform, "testMixedVirtualPlatform", 4);
+s25_test!(test_s25_virtual_start_happens_before, "testVirtualStartHappensBefore", 100);
+
+// =============================================================================
+// Session 27: GC Finalizer Support
+// =============================================================================
+
+macro_rules! s27_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/FinalizerTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s27_test!(test_s27_finalize_runs, "testFinalizeRuns", 42);
+s27_test!(test_s27_finalize_multiple, "testFinalizeMultiple", 3);
+s27_test!(test_s27_resurrection, "testResurrection", 77);
+s27_test!(test_s27_no_finalize_on_live, "testNoFinalizeOnLive", 1);
+s27_test!(test_s27_no_finalize_on_plain, "testNoFinalizeOnPlain", 1);
+s27_test!(test_s27_system_gc_collects, "testSystemGcCollects", 1);
+s27_test!(test_s27_finalize_side_effect, "testFinalizeSideEffect", 60);
+
+// =============================================================================
+// Session 32: JIT Escape Analysis — Scalar Replacement
+// =============================================================================
+
+macro_rules! s32_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/EscapeAnalysisTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s32_test!(test_s32_point_sum, "testPointSum", 30);
+s32_test!(test_s32_point_distance_squared, "testPointDistanceSquared", 500);
+s32_test!(test_s32_multiple_objects, "testMultipleObjects", 60);
+s32_test!(test_s32_point_3d, "testPoint3D", 600);
+s32_test!(test_s32_field_overwrite, "testFieldOverwrite", 99);
+s32_test!(test_s32_escaping_object, "testEscapingObject", 42);
+s32_test!(test_s32_loop_local_object, "testLoopLocalObject", 285);
+s32_test!(test_s32_default_zero, "testDefaultZero", 0);
+
+// ---------------------------------------------------------------------------
+// Session 31: JIT Method Inlining
+// ---------------------------------------------------------------------------
+macro_rules! s31_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/InlineComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s31_test!(test_s31_inline_const, "inline_const", 5);
+s31_test!(test_s31_inline_const_neg, "inline_const_neg", 1);
+s31_test!(test_s31_inline_identity, "inline_identity", 42);
+s31_test!(test_s31_inline_add, "inline_add", 42);
+s31_test!(test_s31_inline_sub, "inline_sub", 42);
+s31_test!(test_s31_inline_mul, "inline_mul", 42);
+s31_test!(test_s31_inline_negate, "inline_negate", 42);
+s31_test!(test_s31_inline_chain, "inline_chain", 42);
+s31_test!(test_s31_inline_nested, "inline_nested", 42);
+s31_test!(test_s31_inline_square, "inline_square", 36);
+s31_test!(test_s31_inline_double, "inline_double", 42);
+s31_test!(test_s31_inline_incr_decr, "inline_incr_decr", 83);
+s31_test!(test_s31_inline_max, "inline_max", 42);
+s31_test!(test_s31_inline_min, "inline_min", 42);
+s31_test!(test_s31_inline_abs_positive, "inline_abs_positive", 42);
+s31_test!(test_s31_inline_abs_negative, "inline_abs_negative", 42);
+s31_test!(test_s31_inline_clamp_in_range, "inline_clamp_in_range", 42);
+s31_test!(test_s31_inline_clamp_below, "inline_clamp_below", 42);
+s31_test!(test_s31_inline_clamp_above, "inline_clamp_above", 42);
+s31_test!(test_s31_inline_bitand, "inline_bitand", 42);
+s31_test!(test_s31_inline_bitor, "inline_bitor", 42);
+s31_test!(test_s31_inline_bitxor, "inline_bitxor", 42);
+s31_test!(test_s31_inline_shift_left, "inline_shift_left", 42);
+s31_test!(test_s31_inline_shift_right, "inline_shift_right", 42);
+s31_test!(test_s31_inline_getter_setter, "inline_getter_setter", 42);
+s31_test!(test_s31_inline_multi_field, "inline_multi_field", 42);
+s31_test!(test_s31_inline_static_field, "inline_static_field", 42);
+s31_test!(test_s31_inline_long_add, "inline_long_add", 42);
+s31_test!(test_s31_inline_loop_body, "inline_loop_with_inlined_body", 42);
+s31_test!(test_s31_inline_complex_expr, "inline_complex_expr", 42);
+
+// ---------------------------------------------------------------------------
+// Session 33: JIT Inline Caching
+// ---------------------------------------------------------------------------
+macro_rules! s33_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/InlineCacheTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s33_test!(test_s33_monomorphic_call_site, "testMonomorphicCallSite", 1);
+s33_test!(test_s33_polymorphic_call_site, "testPolymorphicCallSite", 1);
+s33_test!(test_s33_megamorphic_call_site, "testMegamorphicCallSite", 1);
+s33_test!(test_s33_virtual_dispatch_correctness, "testVirtualDispatchCorrectness", 1);
+s33_test!(test_s33_interface_dispatch, "testInterfaceDispatch", 1);
+s33_test!(test_s33_cache_miss_recovery, "testCacheMissRecovery", 1);
+s33_test!(test_s33_hot_loop_monomorphic, "testHotLoopMonomorphic", 1);
+s33_test!(test_s33_inlined_getter_setter, "testInlinedGetterSetter", 1);
+s33_test!(test_s33_concurrent_dispatch, "testConcurrentDispatch", 1);
+s33_test!(test_s33_deep_hierarchy, "testDeepHierarchy", 1);
+
+// ---------------------------------------------------------------------------
+// Session 35: JIT OSR (On-Stack Replacement)
+// ---------------------------------------------------------------------------
+macro_rules! s35_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/OsrComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+s35_test!(test_s35_osr_simple_sum, "osr_simple_sum", 5000);
+s35_test!(test_s35_osr_accumulator, "osr_accumulator", 1);
+s35_test!(test_s35_osr_while_loop, "osr_while_loop", 1);
+s35_test!(test_s35_osr_countdown, "osr_countdown", 5000);
+s35_test!(test_s35_osr_multiply_accumulate, "osr_multiply_accumulate", 1);
+s35_test!(test_s35_osr_nested_loop, "osr_nested_loop", 5000);
+s35_test!(test_s35_osr_branch_in_loop, "osr_branch_in_loop", 1);
+s35_test!(test_s35_osr_local_variables, "osr_local_variables", 1);
+s35_test!(test_s35_osr_long_arithmetic, "osr_long_arithmetic", 1);
+s35_test!(test_s35_osr_bitwise_ops, "osr_bitwise_ops", 1);
+s35_test!(test_s35_osr_array_sum, "osr_array_sum", 1);
+s35_test!(test_s35_osr_post_loop_correctness, "osr_post_loop_correctness", 1);
+s35_test!(test_s35_osr_method_call_after, "osr_method_call_after", 5000);
+s35_test!(test_s35_osr_shift_operations, "osr_shift_operations", 1);
+s35_test!(test_s35_osr_comparison_loop, "osr_comparison_loop", 1);
+s35_test!(test_s35_osr_do_while, "osr_do_while", 1);
+s35_test!(test_s35_osr_fibonacci_iterative, "osr_fibonacci_iterative", 1);
+s35_test!(test_s35_osr_static_field_in_loop, "osr_static_field_in_loop", 1);
+s35_test!(test_s35_osr_negative_step, "osr_negative_step", 1);
+s35_test!(test_s35_osr_multiple_exits, "osr_multiple_exits", 5000);
+s35_test!(test_s35_osr_return_from_loop, "osr_return_from_loop", 1);
+s35_test!(test_s35_osr_two_counters, "osr_two_counters", 1);
+s35_test!(test_s35_osr_conditional_increment, "osr_conditional_increment", 1);
+s35_test!(test_s35_osr_early_exit_not_taken, "osr_early_exit_not_taken", 5000);
+s35_test!(test_s35_osr_gauss_sum, "osr_gauss_sum", 1);
+s35_test!(test_s35_osr_min_max_tracking, "osr_min_max_tracking", 1);
+s35_test!(test_s35_osr_char_loop, "osr_char_loop", 1);
+s35_test!(test_s35_osr_modular_arithmetic, "osr_modular_arithmetic", 1);
+s35_test!(test_s35_osr_large_iteration, "osr_large_iteration", 1);
+s35_test!(test_s35_osr_triangular_number, "osr_triangular_number", 1);
+
+// ---------------------------------------------------------------------------
+// Session 37 — JIT Floating-Point Completeness
+// ---------------------------------------------------------------------------
+
+macro_rules! s37_test_int {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/FPCompletenessTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+macro_rules! s37_test_long {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/FPCompletenessTest", $method, "()J", &[]);
+            match result {
+                Ok(Some(Value::Long(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Long({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// NaN / overflow conversions
+s37_test_int!(test_s37_d2i_nan, "testD2iNaN", 0);
+s37_test_int!(test_s37_d2i_pos_overflow, "testD2iPosOverflow", 2147483647);
+s37_test_int!(test_s37_d2i_neg_overflow, "testD2iNegOverflow", -2147483648);
+s37_test_long!(test_s37_d2l_nan, "testD2lNaN", 0);
+s37_test_long!(test_s37_d2l_pos_overflow, "testD2lPosOverflow", 9223372036854775807i64);
+s37_test_long!(test_s37_d2l_neg_overflow, "testD2lNegOverflow", -9223372036854775808i64);
+s37_test_int!(test_s37_f2i_nan, "testF2iNaN", 0);
+s37_test_int!(test_s37_f2i_pos_overflow, "testF2iPosOverflow", 2147483647);
+s37_test_long!(test_s37_f2l_nan, "testF2lNaN", 0);
+
+// Normal conversions
+s37_test_int!(test_s37_d2i_normal, "testD2iNormal", 42);
+s37_test_long!(test_s37_d2l_normal, "testD2lNormal", 123456789);
+s37_test_int!(test_s37_f2i_normal, "testF2iNormal", -7);
+s37_test_long!(test_s37_f2l_normal, "testF2lNormal", 100000);
+
+// Math.floor / ceil / rint
+s37_test_long!(test_s37_math_floor, "testMathFloor", 2);
+s37_test_long!(test_s37_math_floor_neg, "testMathFloorNeg", -3);
+s37_test_long!(test_s37_math_ceil, "testMathCeil", 3);
+s37_test_long!(test_s37_math_ceil_neg, "testMathCeilNeg", -2);
+s37_test_long!(test_s37_math_rint, "testMathRint", 2);
+s37_test_long!(test_s37_math_rint_odd, "testMathRintOdd", 4);
+
+// Math.abs
+s37_test_long!(test_s37_abs_double, "testMathAbsDouble", 42);
+s37_test_long!(test_s37_abs_double_pos, "testMathAbsDoublePos", 99);
+s37_test_int!(test_s37_abs_int, "testMathAbsInt", 123);
+s37_test_int!(test_s37_abs_int_pos, "testMathAbsIntPos", 456);
+s37_test_long!(test_s37_abs_long, "testMathAbsLong", 9876543210i64);
+s37_test_long!(test_s37_abs_long_pos, "testMathAbsLongPos", 1234567890);
+s37_test_int!(test_s37_abs_float, "testMathAbsFloat", 314);
+
+// Combined N-Body style
+s37_test_long!(test_s37_nbody_style, "testNBodyStyle", 5);
+
+// ---------------------------------------------------------------------------
+// Session 39: JDWP Debugger Protocol
+// ---------------------------------------------------------------------------
+macro_rules! s39_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/JdwpComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// Local variable inspection targets
+s39_test!(test_s39_locals_int, "locals_int", 30);
+s39_test!(test_s39_locals_long, "locals_long", 3);
+s39_test!(test_s39_locals_float, "locals_float", 4);
+s39_test!(test_s39_locals_double, "locals_double", 31);
+s39_test!(test_s39_locals_mixed, "locals_mixed", 20);
+
+// Control flow
+s39_test!(test_s39_control_if_else, "control_if_else", 1);
+s39_test!(test_s39_control_switch, "control_switch", 20);
+s39_test!(test_s39_control_for_loop, "control_for_loop", 55);
+s39_test!(test_s39_control_while, "control_while", 6);
+s39_test!(test_s39_control_nested, "control_nested", 25);
+
+// Array access
+s39_test!(test_s39_array_basic, "array_basic", 30);
+s39_test!(test_s39_array_sum, "array_sum", 15);
+
+// Object interaction
+s39_test!(test_s39_object_string_len, "object_string_len", 12);
+s39_test!(test_s39_object_string_concat, "object_string_concat", 11);
+s39_test!(test_s39_object_null_ref, "object_null_ref", 1);
+
+// Arithmetic
+s39_test!(test_s39_arith_bitwise, "arith_bitwise", 510);
+s39_test!(test_s39_arith_shifts, "arith_shifts", 256);
+s39_test!(test_s39_arith_divmod, "arith_divmod", 142);
+
+// Method calls
+s39_test!(test_s39_method_call_loop, "method_call_loop", 30);
+s39_test!(test_s39_method_recursive, "method_recursive", 55);
+
+// Exception handling
+s39_test!(test_s39_exception_trycatch, "exception_trycatch", 42);
+s39_test!(test_s39_exception_finally, "exception_finally", 15);
+
+// Ternary / conditional
+s39_test!(test_s39_ternary_expr, "ternary_expr", 10);
+
+// Stack depth / many locals
+s39_test!(test_s39_many_locals, "many_locals", 55);
+s39_test!(test_s39_deep_stack, "deep_stack", 21);
+
+// ---------------------------------------------------------------------------
+// Session 44: JNI Completeness — Remaining 71 Functions
+// ---------------------------------------------------------------------------
+macro_rules! s44_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/JniComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// Static field access
+s44_test!(test_s44_static_int_field, "static_int_field", 100);
+s44_test!(test_s44_static_long_field, "static_long_field", 200);
+s44_test!(test_s44_static_string_field_len, "static_string_field_len", 5);
+
+// Instance field/method access
+s44_test!(test_s44_instance_create_get, "instance_create_get", 42);
+s44_test!(test_s44_instance_set_get, "instance_set_get", 99);
+
+// Array operations
+s44_test!(test_s44_array_int_create, "array_int_create", 10);
+s44_test!(test_s44_array_int_set_get, "array_int_set_get", 30);
+s44_test!(test_s44_array_int_sum, "array_int_sum", 55);
+s44_test!(test_s44_array_long_ops, "array_long_ops", 600);
+s44_test!(test_s44_array_byte_ops, "array_byte_ops", 100);
+s44_test!(test_s44_array_boolean_ops, "array_boolean_ops", 2);
+s44_test!(test_s44_array_double_ops, "array_double_ops", 7);
+s44_test!(test_s44_array_object_ops, "array_object_ops", 11);
+
+// String operations
+s44_test!(test_s44_string_new_utf, "string_new_utf", 9);
+s44_test!(test_s44_string_concat, "string_concat", 11);
+s44_test!(test_s44_string_char_at, "string_char_at", 67);
+s44_test!(test_s44_string_index_of, "string_index_of", 6);
+
+// Object creation and references
+s44_test!(test_s44_object_alloc, "object_alloc", 1);
+s44_test!(test_s44_object_class_check, "object_class_check", 1);
+s44_test!(test_s44_object_null_check, "object_null_check", 1);
+
+// Method call types
+s44_test!(test_s44_call_static_method, "call_static_method", 42);
+s44_test!(test_s44_call_instance_method, "call_instance_method", 42);
+
+// Arithmetic
+s44_test!(test_s44_arith_add, "arith_add", 1);
+s44_test!(test_s44_arith_long_math, "arith_long_math", 3);
+s44_test!(test_s44_arith_float_cast, "arith_float_cast", 31);
+s44_test!(test_s44_arith_double_cast, "arith_double_cast", 271);
+
+// Exception handling
+s44_test!(test_s44_exception_throw_catch, "exception_throw_catch", 1);
+
+// Monitor
+s44_test!(test_s44_monitor_basic, "monitor_basic", 42);
+
+// Multi-dimensional arrays
+s44_test!(test_s44_array_2d, "array_2d", 5);
+
+// Complex: Fibonacci
+s44_test!(test_s44_fib_iterative, "fib_iterative", 610);
+
+// ---------------------------------------------------------------------------
+// Session 46: TCK — java.lang Tests
+// ---------------------------------------------------------------------------
+macro_rules! s46_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/TckLang", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// Object
+s46_test!(test_s46_obj_hashCode_consistent, "obj_hashCode_consistent", 1);
+s46_test!(test_s46_obj_equals_identity, "obj_equals_identity", 1);
+s46_test!(test_s46_obj_equals_different, "obj_equals_different", 1);
+s46_test!(test_s46_obj_getClass, "obj_getClass", 1);
+s46_test!(test_s46_obj_toString, "obj_toString", 1);
+
+// String
+s46_test!(test_s46_str_length, "str_length", 5);
+s46_test!(test_s46_str_charAt, "str_charAt", 68);
+s46_test!(test_s46_str_equals, "str_equals", 1);
+s46_test!(test_s46_str_compareTo, "str_compareTo", 1);
+s46_test!(test_s46_str_substring, "str_substring", 5);
+s46_test!(test_s46_str_indexOf, "str_indexOf", 6);
+s46_test!(test_s46_str_contains, "str_contains", 1);
+s46_test!(test_s46_str_isEmpty, "str_isEmpty", 1);
+s46_test!(test_s46_str_trim, "str_trim", 5);
+s46_test!(test_s46_str_toLowerCase, "str_toLowerCase", 1);
+s46_test!(test_s46_str_toUpperCase, "str_toUpperCase", 1);
+s46_test!(test_s46_str_startsEndsWith, "str_startsEndsWith", 1);
+s46_test!(test_s46_str_replace, "str_replace", 1);
+s46_test!(test_s46_str_toCharArray, "str_toCharArray", 1);
+s46_test!(test_s46_str_valueOf_int, "str_valueOf_int", 1);
+s46_test!(test_s46_str_valueOf_bool, "str_valueOf_bool", 1);
+s46_test!(test_s46_str_concat_op, "str_concat_op", 11);
+
+// Integer
+s46_test!(test_s46_int_parseInt, "int_parseInt", 42);
+s46_test!(test_s46_int_parseInt_neg, "int_parseInt_neg", -100);
+s46_test!(test_s46_int_valueOf, "int_valueOf", 42);
+s46_test!(test_s46_int_toString, "int_toString", 1);
+s46_test!(test_s46_int_toHexString, "int_toHexString", 1);
+s46_test!(test_s46_int_constants, "int_constants", 1);
+s46_test!(test_s46_int_autobox_cache, "int_autobox_cache", 1);
+s46_test!(test_s46_int_compareTo, "int_compareTo", 1);
+
+// Long
+s46_test!(test_s46_long_parseLong, "long_parseLong", 1);
+s46_test!(test_s46_long_valueOf, "long_valueOf", 99);
+s46_test!(test_s46_long_toString, "long_toString", 1);
+s46_test!(test_s46_long_maxValue, "long_maxValue", 1);
+
+// Double
+s46_test!(test_s46_double_parseDouble, "double_parseDouble", 1);
+s46_test!(test_s46_double_isNaN, "double_isNaN", 1);
+s46_test!(test_s46_double_isInfinite, "double_isInfinite", 1);
+s46_test!(test_s46_double_toString, "double_toString", 1);
+s46_test!(test_s46_double_bits_roundtrip, "double_bits_roundtrip", 1);
+
+// Float
+s46_test!(test_s46_float_parseFloat, "float_parseFloat", 1);
+s46_test!(test_s46_float_isNaN, "float_isNaN", 1);
+s46_test!(test_s46_float_bits_roundtrip, "float_bits_roundtrip", 1);
+
+// Boolean
+s46_test!(test_s46_bool_parseBoolean, "bool_parseBoolean", 1);
+s46_test!(test_s46_bool_valueOf, "bool_valueOf", 1);
+s46_test!(test_s46_bool_toString, "bool_toString", 1);
+
+// Byte
+s46_test!(test_s46_byte_constants, "byte_constants", 1);
+s46_test!(test_s46_byte_parseByte, "byte_parseByte", 42);
+
+// Short
+s46_test!(test_s46_short_constants, "short_constants", 1);
+s46_test!(test_s46_short_parseShort, "short_parseShort", 1000);
+
+// Character
+s46_test!(test_s46_char_isDigit, "char_isDigit", 1);
+s46_test!(test_s46_char_isLetter, "char_isLetter", 1);
+s46_test!(test_s46_char_case, "char_case", 1);
+s46_test!(test_s46_char_convert, "char_convert", 1);
+s46_test!(test_s46_char_isWhitespace, "char_isWhitespace", 1);
+
+// Math
+s46_test!(test_s46_math_abs, "math_abs", 1);
+s46_test!(test_s46_math_maxMin, "math_maxMin", 1);
+s46_test!(test_s46_math_sqrt, "math_sqrt", 1);
+s46_test!(test_s46_math_pow, "math_pow", 1);
+s46_test!(test_s46_math_floorCeil, "math_floorCeil", 1);
+s46_test!(test_s46_math_round, "math_round", 1);
+s46_test!(test_s46_math_constants, "math_constants", 1);
+s46_test!(test_s46_math_sinCos, "math_sinCos", 1);
+s46_test!(test_s46_math_logExp, "math_logExp", 1);
+
+// System
+s46_test!(test_s46_sys_currentTimeMillis, "sys_currentTimeMillis", 1);
+s46_test!(test_s46_sys_nanoTime, "sys_nanoTime", 1);
+s46_test!(test_s46_sys_arraycopy, "sys_arraycopy", 1);
+s46_test!(test_s46_sys_identityHashCode, "sys_identityHashCode", 1);
+
+// StringBuilder
+s46_test!(test_s46_sb_basic, "sb_basic", 11);
+s46_test!(test_s46_sb_appendInt, "sb_appendInt", 1);
+s46_test!(test_s46_sb_chain, "sb_chain", 1);
+s46_test!(test_s46_sb_length, "sb_length", 5);
+s46_test!(test_s46_sb_reverse, "sb_reverse", 1);
+s46_test!(test_s46_sb_delete, "sb_delete", 1);
+
+// Throwable / Exceptions
+s46_test!(test_s46_exc_getMessage, "exc_getMessage", 1);
+s46_test!(test_s46_exc_getCause, "exc_getCause", 1);
+s46_test!(test_s46_exc_tryCatch, "exc_tryCatch", 1);
+s46_test!(test_s46_exc_hierarchy, "exc_hierarchy", 1);
+s46_test!(test_s46_exc_npe_class, "exc_npe_class", 1);
+s46_test!(test_s46_exc_finally, "exc_finally", 15);
+
+// Class
+s46_test!(test_s46_cls_getName, "cls_getName", 1);
+s46_test!(test_s46_cls_isInterface, "cls_isInterface", 1);
+s46_test!(test_s46_cls_isPrimitive, "cls_isPrimitive", 1);
+s46_test!(test_s46_cls_isArray, "cls_isArray", 1);
+s46_test!(test_s46_cls_getSuperclass, "cls_getSuperclass", 1);
+
+// Runtime
+s46_test!(test_s46_rt_availableProcessors, "rt_availableProcessors", 1);
+s46_test!(test_s46_rt_memory, "rt_memory", 1);
+
+// Thread
+s46_test!(test_s46_thread_currentThread, "thread_currentThread", 1);
+s46_test!(test_s46_thread_isAlive, "thread_isAlive", 1);
+
+// Type casting
+s46_test!(test_s46_cast_int_to_long, "cast_int_to_long", 1);
+s46_test!(test_s46_cast_long_to_int, "cast_long_to_int", 42);
+s46_test!(test_s46_cast_int_to_float, "cast_int_to_float", 1);
+s46_test!(test_s46_cast_double_to_int, "cast_double_to_int", 3);
+s46_test!(test_s46_cast_char_to_int, "cast_char_to_int", 65);
+
+// Autoboxing
+s46_test!(test_s46_autobox_int, "autobox_int", 42);
+s46_test!(test_s46_autobox_double, "autobox_double", 1);
+s46_test!(test_s46_autobox_boolean, "autobox_boolean", 1);
+
+// ---------------------------------------------------------------------------
+// Session 50: TCK — Reflection and Annotation Tests
+// ---------------------------------------------------------------------------
+macro_rules! s50_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/TckReflect", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// Class metadata
+s50_test!(test_s50_cls_forName, "cls_forName", 1);
+s50_test!(test_s50_cls_getName, "cls_getName", 1);
+s50_test!(test_s50_cls_getSimpleName, "cls_getSimpleName", 1);
+s50_test!(test_s50_cls_getSuperclass, "cls_getSuperclass", 1);
+s50_test!(test_s50_cls_objectSuperclassNull, "cls_objectSuperclassNull", 1);
+s50_test!(test_s50_cls_isInterface, "cls_isInterface", 1);
+s50_test!(test_s50_cls_isPrimitive, "cls_isPrimitive", 1);
+s50_test!(test_s50_cls_isArray, "cls_isArray", 1);
+s50_test!(test_s50_cls_isEnum, "cls_isEnum", 1);
+s50_test!(test_s50_cls_isAnnotation, "cls_isAnnotation", 1);
+s50_test!(test_s50_cls_getModifiers, "cls_getModifiers", 1);
+s50_test!(test_s50_cls_isAssignableFrom, "cls_isAssignableFrom", 1);
+s50_test!(test_s50_cls_isInstance, "cls_isInstance", 1);
+s50_test!(test_s50_cls_getInterfaces, "cls_getInterfaces", 1);
+s50_test!(test_s50_cls_getComponentType, "cls_getComponentType", 1);
+s50_test!(test_s50_cls_cast, "cls_cast", 1);
+s50_test!(test_s50_cls_newInstance, "cls_newInstance", 1);
+
+// Method reflection
+s50_test!(test_s50_meth_getDeclaredMethod, "meth_getDeclaredMethod", 1);
+s50_test!(test_s50_meth_invokeInstance, "meth_invokeInstance", 1);
+s50_test!(test_s50_meth_invokeStatic, "meth_invokeStatic", 1);
+s50_test!(test_s50_meth_invokePrivate, "meth_invokePrivate", 1);
+s50_test!(test_s50_meth_getReturnType, "meth_getReturnType", 1);
+s50_test!(test_s50_meth_getParameterTypes, "meth_getParameterTypes", 1);
+s50_test!(test_s50_meth_getParameterCount, "meth_getParameterCount", 1);
+s50_test!(test_s50_meth_getModifiers, "meth_getModifiers", 1);
+s50_test!(test_s50_meth_getDeclaringClass, "meth_getDeclaringClass", 1);
+s50_test!(test_s50_meth_getDeclaredMethods, "meth_getDeclaredMethods", 1);
+
+// Field reflection
+s50_test!(test_s50_fld_getDeclaredField, "fld_getDeclaredField", 1);
+s50_test!(test_s50_fld_get, "fld_get", 1);
+s50_test!(test_s50_fld_set, "fld_set", 1);
+s50_test!(test_s50_fld_getPrivate, "fld_getPrivate", 1);
+s50_test!(test_s50_fld_getInt, "fld_getInt", 1);
+s50_test!(test_s50_fld_setInt, "fld_setInt", 1);
+s50_test!(test_s50_fld_getType, "fld_getType", 1);
+s50_test!(test_s50_fld_getModifiers, "fld_getModifiers", 1);
+s50_test!(test_s50_fld_getDeclaringClass, "fld_getDeclaringClass", 1);
+s50_test!(test_s50_fld_getDeclaredFields, "fld_getDeclaredFields", 1);
+
+// Constructor reflection
+s50_test!(test_s50_ctor_getDeclaredConstructor, "ctor_getDeclaredConstructor", 1);
+s50_test!(test_s50_ctor_newInstanceNoArgs, "ctor_newInstanceNoArgs", 1);
+s50_test!(test_s50_ctor_newInstanceWithArgs, "ctor_newInstanceWithArgs", 1);
+s50_test!(test_s50_ctor_newInstancePrivate, "ctor_newInstancePrivate", 1);
+s50_test!(test_s50_ctor_getParameterTypes, "ctor_getParameterTypes", 1);
+s50_test!(test_s50_ctor_getModifiers, "ctor_getModifiers", 1);
+s50_test!(test_s50_ctor_getDeclaringClass, "ctor_getDeclaringClass", 1);
+s50_test!(test_s50_ctor_getDeclaredConstructors, "ctor_getDeclaredConstructors", 1);
+
+// Annotations — class level
+s50_test!(test_s50_ann_classPresent, "ann_classPresent", 1);
+s50_test!(test_s50_ann_classAbsent, "ann_classAbsent", 1);
+s50_test!(test_s50_ann_classValue, "ann_classValue", 1);
+s50_test!(test_s50_ann_inherited, "ann_inherited", 1);
+s50_test!(test_s50_ann_inheritedValue, "ann_inheritedValue", 1);
+s50_test!(test_s50_ann_declaredExcludesInherited, "ann_declaredExcludesInherited", 1);
+s50_test!(test_s50_ann_getAnnotationsIncludesInherited, "ann_getAnnotationsIncludesInherited", 1);
+
+// Annotations — method level
+s50_test!(test_s50_ann_methodPresent, "ann_methodPresent", 1);
+s50_test!(test_s50_ann_methodValue, "ann_methodValue", 1);
+s50_test!(test_s50_ann_methodDefault, "ann_methodDefault", 1);
+s50_test!(test_s50_ann_methodAbsent, "ann_methodAbsent", 1);
+
+// Annotations — field level
+s50_test!(test_s50_ann_fieldPresent, "ann_fieldPresent", 1);
+s50_test!(test_s50_ann_fieldValue, "ann_fieldValue", 1);
+
+// Array reflection
+s50_test!(test_s50_arr_newInstance, "arr_newInstance", 1);
+s50_test!(test_s50_arr_getLength, "arr_getLength", 1);
+s50_test!(test_s50_arr_getSet, "arr_getSet", 1);
+s50_test!(test_s50_arr_getObject, "arr_getObject", 1);
+s50_test!(test_s50_arr_setObject, "arr_setObject", 1);
+s50_test!(test_s50_arr_newInstanceRef, "arr_newInstanceRef", 1);
+
+// Proxy
+s50_test!(test_s50_proxy_create, "proxy_create", 1);
+s50_test!(test_s50_proxy_isProxyClass, "proxy_isProxyClass", 1);
+s50_test!(test_s50_proxy_getHandler, "proxy_getHandler", 1);
+s50_test!(test_s50_proxy_objectMethods, "proxy_objectMethods", 1);
+
+// Modifier
+s50_test!(test_s50_mod_isPublic, "mod_isPublic", 1);
+s50_test!(test_s50_mod_isStatic, "mod_isStatic", 1);
+s50_test!(test_s50_mod_isFinal, "mod_isFinal", 1);
+s50_test!(test_s50_mod_isAbstract, "mod_isAbstract", 1);
+s50_test!(test_s50_mod_isInterface, "mod_isInterface", 1);
+s50_test!(test_s50_mod_isPrivate, "mod_isPrivate", 1);
+s50_test!(test_s50_mod_toString, "mod_toString", 1);
+
+// Hierarchy
+s50_test!(test_s50_hier_isInstance, "hier_isInstance", 1);
+s50_test!(test_s50_hier_isAssignableFromInterface, "hier_isAssignableFromInterface", 1);
+s50_test!(test_s50_hier_superclassChain, "hier_superclassChain", 1);
+
+// Miscellaneous
+s50_test!(test_s50_misc_invokeReturnBoxed, "misc_invokeReturnBoxed", 1);
+s50_test!(test_s50_misc_multiFieldRead, "misc_multiFieldRead", 1);
+s50_test!(test_s50_misc_ctorThenInvoke, "misc_ctorThenInvoke", 1);
+s50_test!(test_s50_misc_getMethodInherited, "misc_getMethodInherited", 1);
+s50_test!(test_s50_misc_noSuchField, "misc_noSuchField", 1);
+s50_test!(test_s50_misc_noSuchMethod, "misc_noSuchMethod", 1);
+s50_test!(test_s50_misc_invocationTargetException, "misc_invocationTargetException", 1);
+s50_test!(test_s50_misc_getPublicFields, "misc_getPublicFields", 1);
+s50_test!(test_s50_misc_getPublicMethods, "misc_getPublicMethods", 1);
+s50_test!(test_s50_misc_getPublicConstructors, "misc_getPublicConstructors", 1);
+s50_test!(test_s50_misc_primitiveClass, "misc_primitiveClass", 1);
+s50_test!(test_s50_misc_voidClass, "misc_voidClass", 1);
+
+// ---------------------------------------------------------------------------
+// Session 38 — JIT Profile-Guided Optimization
+// ---------------------------------------------------------------------------
+
+macro_rules! s38_test {
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/PgoTest", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// Branch profiling
+s38_test!(test_s38_gauss_sum, "testGaussSum", 4950);
+s38_test!(test_s38_repeated_hot_loop, "testRepeatedHotLoop", 247500);
+s38_test!(test_s38_biased_branch, "testBiasedBranch", 9135);
+
+// Loop trip count profiling
+s38_test!(test_s38_short_loop_repeated, "testShortLoopRepeated", 5600);
+s38_test!(test_s38_medium_loop_repeated, "testMediumLoopRepeated", 19000);
+
+// Receiver type profiling
+s38_test!(test_s38_monomorphic_dispatch, "testMonomorphicDispatch", 2500);
+s38_test!(test_s38_bimorphic_dispatch, "testBimorphicDispatch", 1450);
+
+// Combined PGO scenario
+s38_test!(test_s38_combined_pgo, "testCombinedPgo", 955);
+
+// Correctness after JIT with PGO data
+s38_test!(test_s38_gauss_sum_large, "testGaussSumLarge", 499500);
+s38_test!(test_s38_nested_loops, "testNestedLoops", 2025);
+
+// ---------------------------------------------------------------------------
+// Session 45 — Run a Real Application (-jar launch, ManifestInfo, ClassPath)
+// ---------------------------------------------------------------------------
+
+/// Test that HelloWorld.check() returns 42 (basic sanity for the test class).
+#[test]
+fn test_s45_hello_world_check() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke("rustjvm/HelloWorld", "check", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+/// Test ManifestInfo parsing including Class-Path attribute.
+#[test]
+fn test_s45_manifest_class_path_parsing() {
+    use rustjvm_vm::ManifestInfo;
+
+    let manifest = b"Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\nClass-Path: lib/foo.jar lib/bar.jar\r\n";
+    let info = ManifestInfo::parse(manifest);
+    assert_eq!(info.main_class.as_deref(), Some("com.example.Main"));
+    assert_eq!(info.class_path.as_deref(), Some("lib/foo.jar lib/bar.jar"));
+}
+
+/// Test resolve_class_path resolves relative to JAR parent directory.
+#[test]
+fn test_s45_resolve_class_path() {
+    use rustjvm_vm::ManifestInfo;
+
+    let manifest = b"Manifest-Version: 1.0\r\nMain-Class: Main\r\nClass-Path: lib/dep.jar other.jar\r\n";
+    let info = ManifestInfo::parse(manifest);
+    let jar_path = std::path::Path::new("/app/myapp.jar");
+    let resolved = info.resolve_class_path(jar_path);
+    // Should resolve relative to /app/
+    assert_eq!(resolved.len(), 2);
+    assert!(resolved[0].contains("lib"));
+    assert!(resolved[0].contains("dep.jar"));
+    assert!(resolved[1].contains("other.jar"));
+}
+
+/// Test resolve_class_path returns empty vec when no Class-Path attribute.
+#[test]
+fn test_s45_resolve_class_path_empty() {
+    use rustjvm_vm::ManifestInfo;
+
+    let manifest = b"Manifest-Version: 1.0\r\nMain-Class: Main\r\n";
+    let info = ManifestInfo::parse(manifest);
+    let jar_path = std::path::Path::new("/app/myapp.jar");
+    let resolved = info.resolve_class_path(jar_path);
+    assert!(resolved.is_empty());
+}
+
+/// Test read_jar_manifest reads Main-Class and Class-Path from a real JAR file.
+#[test]
+fn test_s45_read_jar_manifest() {
+    use rustjvm_vm::ClassPath;
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join("rustjvm_test_s45_manifest");
+    let _ = std::fs::create_dir_all(&dir);
+    let jar_path = dir.join("test.jar");
+
+    // Create a JAR with a manifest
+    let file = std::fs::File::create(&jar_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+    zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: com.example.App\r\nClass-Path: lib/util.jar\r\n")
+        .unwrap();
+    zip.start_file("com/example/App.class", opts).unwrap();
+    zip.write_all(b"\xCA\xFE\xBA\xBE_fake").unwrap();
+    zip.finish().unwrap();
+
+    let manifest = ClassPath::read_jar_manifest(&jar_path);
+    assert!(manifest.is_some());
+    let manifest = manifest.unwrap();
+    assert_eq!(manifest.main_class.as_deref(), Some("com.example.App"));
+    assert_eq!(manifest.class_path.as_deref(), Some("lib/util.jar"));
+
+    // resolve_class_path should resolve relative to the JAR's dir
+    let resolved = manifest.resolve_class_path(&jar_path);
+    assert_eq!(resolved.len(), 1);
+    assert!(resolved[0].ends_with("lib/util.jar") || resolved[0].ends_with("lib\\util.jar"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Test loading and executing a class from a JAR file via ClassPath.
+#[test]
+fn test_s45_run_class_from_jar() {
+    require_class_files!();
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join("rustjvm_test_s45_jar_run");
+    let _ = std::fs::create_dir_all(&dir);
+    let jar_path = dir.join("hello.jar");
+
+    // Read the compiled HelloWorld.class from test resources
+    let resources = test_resources_dir();
+    let class_file = format!("{resources}/rustjvm/HelloWorld.class");
+    let class_bytes = match std::fs::read(&class_file) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("Skipping: HelloWorld.class not found");
+            return;
+        }
+    };
+
+    // Create a JAR with the class and a manifest
+    let file = std::fs::File::create(&jar_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+    zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: rustjvm.HelloWorld\r\n")
+        .unwrap();
+    zip.start_file("rustjvm/HelloWorld.class", opts).unwrap();
+    zip.write_all(&class_bytes).unwrap();
+    zip.finish().unwrap();
+
+    // Load the class from the JAR and invoke check()
+    let config = rustjvm_vm::config::VmConfig::new()
+        .with_classpath(vec![jar_path.to_string_lossy().into_owned()]);
+    let mut vm = rustjvm_vm::vm::Vm::new(config);
+    let result = vm.invoke("rustjvm/HelloWorld", "check", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Test that read_jar_manifest returns None for a JAR with no manifest.
+#[test]
+fn test_s45_read_jar_no_manifest() {
+    use rustjvm_vm::ClassPath;
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join("rustjvm_test_s45_no_manifest");
+    let _ = std::fs::create_dir_all(&dir);
+    let jar_path = dir.join("nomanifest.jar");
+
+    let file = std::fs::File::create(&jar_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("com/Foo.class", opts).unwrap();
+    zip.write_all(b"\xCA\xFE\xBA\xBE_fake").unwrap();
+    zip.finish().unwrap();
+
+    // read_jar_manifest should still return Some (with empty fields), since the
+    // archive was readable — ManifestInfo::default() has main_class=None
+    let manifest = ClassPath::read_jar_manifest(&jar_path);
+    assert!(manifest.is_some());
+    assert!(manifest.unwrap().main_class.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Test that nonexistent JAR returns None from read_jar_manifest.
+#[test]
+fn test_s45_read_jar_nonexistent() {
+    use rustjvm_vm::ClassPath;
+    let manifest = ClassPath::read_jar_manifest(std::path::Path::new("/nonexistent/path.jar"));
+    assert!(manifest.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Session 47 — TCK java.util Tests
+// ---------------------------------------------------------------------------
+
+macro_rules! s47_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/TckUtil", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+            }
+        }
+    };
+}
+
+// ArrayList
+s47_test!(test_s47_arraylist_basic, "testArrayListBasic");
+s47_test!(test_s47_arraylist_mutations, "testArrayListMutations");
+s47_test!(test_s47_arraylist_grow, "testArrayListGrow");
+s47_test!(test_s47_arraylist_iterator, "testArrayListIterator");
+s47_test!(test_s47_arraylist_insert, "testArrayListInsert");
+s47_test!(test_s47_arraylist_last_index_of, "testArrayListLastIndexOf");
+s47_test!(test_s47_arraylist_capacity, "testArrayListCapacity");
+s47_test!(test_s47_arraylist_to_array, "testArrayListToArray");
+
+// HashMap
+s47_test!(test_s47_hashmap_basic, "testHashMapBasic");
+s47_test!(test_s47_hashmap_mutations, "testHashMapMutations");
+s47_test!(test_s47_hashmap_integer_keys, "testHashMapIntegerKeys");
+s47_test!(test_s47_hashmap_get_or_default, "testHashMapGetOrDefault");
+s47_test!(test_s47_hashmap_put_if_absent, "testHashMapPutIfAbsent");
+s47_test!(test_s47_hashmap_null_key, "testHashMapNullKey");
+s47_test!(test_s47_hashmap_key_set, "testHashMapKeySet");
+s47_test!(test_s47_hashmap_capacity, "testHashMapCapacity");
+
+// HashSet
+s47_test!(test_s47_hashset_basic, "testHashSetBasic");
+s47_test!(test_s47_hashset_iterator, "testHashSetIterator");
+
+// Arrays
+s47_test!(test_s47_arrays_sort, "testArraysSort");
+s47_test!(test_s47_arrays_copy_of, "testArraysCopyOf");
+s47_test!(test_s47_arrays_as_list, "testArraysAsList");
+
+// Collections utility
+s47_test!(test_s47_collections_empty_list, "testCollectionsEmptyList");
+s47_test!(test_s47_collections_singleton_list, "testCollectionsSingletonList");
+s47_test!(test_s47_collections_reverse, "testCollectionsReverse");
+
+// Optional
+s47_test!(test_s47_optional_basic, "testOptionalBasic");
+s47_test!(test_s47_optional_or_else, "testOptionalOrElse");
+
+// Integration / combined
+s47_test!(test_s47_frequency_map, "testFrequencyMap");
+s47_test!(test_s47_deduplication, "testDeduplication");
+
+// ===========================================================================
+// Session 49 — TCK: java.util.concurrent
+// ===========================================================================
+
+macro_rules! s49_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/JucComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+            }
+        }
+    };
+    ($name:ident, $method:expr, $expected:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/JucComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(v))) if v == $expected => {}
+                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+            }
+        }
+    };
+}
+
+// --- Atomics ---
+s49_test!(test_s49_atomic_int_cas, "testAtomicIntCas");
+s49_test!(test_s49_atomic_int_incr_decr, "testAtomicIntIncrDecr");
+s49_test!(test_s49_atomic_int_pre_incr_decr, "testAtomicIntPreIncrDecr");
+s49_test!(test_s49_atomic_int_add_ops, "testAtomicIntAddOps");
+s49_test!(test_s49_atomic_int_get_and_set, "testAtomicIntGetAndSet");
+s49_test!(test_s49_atomic_long_basic, "testAtomicLongBasic");
+s49_test!(test_s49_atomic_boolean_cas, "testAtomicBooleanCas");
+s49_test!(test_s49_atomic_boolean_get_and_set, "testAtomicBooleanGetAndSet");
+s49_test!(test_s49_atomic_ref_cas, "testAtomicRefCas");
+s49_test!(test_s49_atomic_ref_get_and_set, "testAtomicRefGetAndSet");
+s49_test!(test_s49_atomic_int_concurrent_incr, "testAtomicIntConcurrentIncr", 100);
+s49_test!(test_s49_atomic_int_lazy_set, "testAtomicIntLazySet", 99);
+s49_test!(test_s49_atomic_long_lazy_set, "testAtomicLongLazySet");
+
+// --- ReentrantLock ---
+s49_test!(test_s49_reentrant_lock_basic, "testReentrantLockBasic");
+s49_test!(test_s49_reentrant_lock_try_lock, "testReentrantLockTryLock");
+s49_test!(test_s49_reentrant_lock_reentrant, "testReentrantLockReentrant");
+s49_test!(test_s49_reentrant_lock_condition, "testReentrantLockCondition");
+s49_test!(test_s49_read_write_lock_basic, "testReadWriteLockBasic");
+
+// --- CountDownLatch ---
+s49_test!(test_s49_count_down_latch_basic, "testCountDownLatchBasic");
+s49_test!(test_s49_count_down_latch_get_count, "testCountDownLatchGetCount");
+s49_test!(test_s49_count_down_latch_extra_countdown, "testCountDownLatchExtraCountDown");
+s49_test!(test_s49_count_down_latch_to_string, "testCountDownLatchToString");
+s49_test!(test_s49_count_down_latch_await_timeout, "testCountDownLatchAwaitTimeout");
+
+// --- Semaphore ---
+s49_test!(test_s49_semaphore_basic, "testSemaphoreBasic");
+s49_test!(test_s49_semaphore_try_acquire, "testSemaphoreTryAcquire");
+s49_test!(test_s49_semaphore_drain, "testSemaphoreDrain");
+s49_test!(test_s49_semaphore_release_above_init, "testSemaphoreReleaseAboveInit");
+s49_test!(test_s49_semaphore_acquire_n, "testSemaphoreAcquireN");
+s49_test!(test_s49_semaphore_is_fair, "testSemaphoreIsFair");
+
+// --- CyclicBarrier ---
+s49_test!(test_s49_cyclic_barrier_get_parties, "testCyclicBarrierGetParties");
+s49_test!(test_s49_cyclic_barrier_is_broken, "testCyclicBarrierIsBroken");
+s49_test!(test_s49_cyclic_barrier_get_number_waiting, "testCyclicBarrierGetNumberWaiting");
+s49_test!(test_s49_cyclic_barrier_reset, "testCyclicBarrierReset");
+
+// --- ConcurrentHashMap ---
+s49_test!(test_s49_concurrent_hashmap_put_get, "testConcurrentHashMapPutGet");
+s49_test!(test_s49_concurrent_hashmap_contains_key, "testConcurrentHashMapContainsKey");
+s49_test!(test_s49_concurrent_hashmap_remove, "testConcurrentHashMapRemove");
+s49_test!(test_s49_concurrent_hashmap_put_if_absent, "testConcurrentHashMapPutIfAbsent");
+s49_test!(test_s49_concurrent_hashmap_is_empty, "testConcurrentHashMapIsEmpty");
+s49_test!(test_s49_concurrent_hashmap_get_or_default, "testConcurrentHashMapGetOrDefault");
+s49_test!(test_s49_concurrent_hashmap_replace, "testConcurrentHashMapReplace");
+s49_test!(test_s49_concurrent_hashmap_contains_value, "testConcurrentHashMapContainsValue");
+s49_test!(test_s49_concurrent_hashmap_clear, "testConcurrentHashMapClear");
+
+// --- CopyOnWriteArrayList ---
+s49_test!(test_s49_cowal_add_get, "testCOWALAddGet");
+s49_test!(test_s49_cowal_contains, "testCOWALContains");
+s49_test!(test_s49_cowal_remove, "testCOWALRemove");
+s49_test!(test_s49_cowal_is_empty, "testCOWALIsEmpty");
+
+// --- LinkedBlockingQueue ---
+s49_test!(test_s49_lbq_offer_poll, "testLinkedBlockingQueueOfferPoll");
+s49_test!(test_s49_lbq_put_take, "testLinkedBlockingQueuePutTake");
+s49_test!(test_s49_lbq_peek, "testLinkedBlockingQueuePeek");
+s49_test!(test_s49_lbq_is_empty_size, "testLinkedBlockingQueueIsEmptySize");
+s49_test!(test_s49_lbq_capacity, "testLinkedBlockingQueueCapacity");
+s49_test!(test_s49_lbq_clear, "testLinkedBlockingQueueClear");
+
+// --- ArrayBlockingQueue ---
+s49_test!(test_s49_abq_offer_poll, "testArrayBlockingQueueOfferPoll");
+s49_test!(test_s49_abq_capacity, "testArrayBlockingQueueCapacity");
+s49_test!(test_s49_abq_remaining_capacity, "testArrayBlockingQueueRemainingCapacity");
+
+// --- CompletableFuture ---
+s49_test!(test_s49_cf_complete, "testCompletableFutureComplete");
+s49_test!(test_s49_cf_completed_future, "testCompletableFutureCompletedFuture");
+s49_test!(test_s49_cf_then_apply, "testCompletableFutureThenApply");
+s49_test!(test_s49_cf_then_accept, "testCompletableFutureThenAccept");
+s49_test!(test_s49_cf_state, "testCompletableFutureState");
+s49_test!(test_s49_cf_cancel, "testCompletableFutureCancel");
+s49_test!(test_s49_cf_exceptionally, "testCompletableFutureExceptionally");
+s49_test!(test_s49_cf_is_completed_exceptionally, "testCompletableFutureIsCompletedExceptionally");
+
+// --- Multi-threaded synchronizer tests ---
+s49_test!(test_s49_count_down_latch_threaded, "testCountDownLatchThreaded", 6);
+s49_test!(test_s49_semaphore_threaded, "testSemaphoreThreaded", 3);
+s49_test!(test_s49_reentrant_lock_threaded, "testReentrantLockThreaded", 100);
+s49_test!(test_s49_concurrent_hashmap_threaded, "testConcurrentHashMapThreaded", 50);
+s49_test!(test_s49_blocking_queue_producer_consumer, "testBlockingQueueProducerConsumer", 15);
+s49_test!(test_s49_cowal_threaded, "testCOWALThreaded", 4);
+s49_test!(test_s49_synchronizer_composition, "testSynchronizerComposition", 10);
+
+// ============================================================================
+// Session 51 – JDK 25: Scoped Values (JEP 487)
+// ============================================================================
+
+macro_rules! s51_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/ScopedValueComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+            }
+        }
+    };
+}
+
+// Basic operations
+s51_test!(test_s51_new_instance, "testNewInstance");
+s51_test!(test_s51_where_run, "testWhereRun");
+s51_test!(test_s51_unbound_after_run, "testUnboundAfterRun");
+s51_test!(test_s51_where_call, "testWhereCall");
+s51_test!(test_s51_get_unbound_throws, "testGetUnboundThrows");
+s51_test!(test_s51_is_bound_initially_false, "testIsBoundInitiallyFalse");
+s51_test!(test_s51_is_bound_inside, "testIsBoundInside");
+
+// orElse / orElseThrow
+s51_test!(test_s51_or_else_bound, "testOrElseBound");
+s51_test!(test_s51_or_else_unbound, "testOrElseUnbound");
+s51_test!(test_s51_or_else_null, "testOrElseNull");
+s51_test!(test_s51_or_else_throw_bound, "testOrElseThrowBound");
+s51_test!(test_s51_or_else_throw_unbound, "testOrElseThrowUnbound");
+
+// Nested / rebinding
+s51_test!(test_s51_nested_rebinding, "testNestedRebinding");
+s51_test!(test_s51_outer_restored_after_nested, "testOuterRestoredAfterNested");
+s51_test!(test_s51_triple_nesting, "testTripleNesting");
+
+// Multiple ScopedValues
+s51_test!(test_s51_two_scoped_values, "testTwoScopedValues");
+s51_test!(test_s51_chained_where, "testChainedWhere");
+s51_test!(test_s51_partial_rebind, "testPartialRebind");
+
+// Call with return values
+s51_test!(test_s51_call_return, "testCallReturn");
+s51_test!(test_s51_call_string_concat, "testCallStringConcat");
+
+// Exception handling
+s51_test!(test_s51_exception_in_run_unbinds, "testExceptionInRunUnbinds");
+s51_test!(test_s51_exception_in_call_unbinds, "testExceptionInCallUnbinds");
+
+// hashCode
+s51_test!(test_s51_hash_code_stable, "testHashCodeStable");
+s51_test!(test_s51_hash_code_different, "testHashCodeDifferent");
+
+// Null binding
+s51_test!(test_s51_bind_null, "testBindNull");
+
+// Thread inheritance
+s51_test!(test_s51_thread_visibility, "testThreadVisibility");
+s51_test!(test_s51_child_rebind_no_affect_parent, "testChildRebindNoAffectParent");
+
+// Carrier operations
+s51_test!(test_s51_carrier_get, "testCarrierGet");
+s51_test!(test_s51_multiple_runs, "testMultipleRuns");
+s51_test!(test_s51_carrier_reuse_after_exception, "testCarrierReuseAfterException");
+
+// ==========================================================================
+// ---------------------------------------------------------------------------
+// Session 48 — TCK: java.io / java.nio Tests
+// ---------------------------------------------------------------------------
+macro_rules! s48_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/TckIo", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+            }
+        }
+    };
+}
+
+// File operations
+s48_test!(test_s48_file_createDeleteExists, "file_createDeleteExists");
+s48_test!(test_s48_file_isFileIsDirectory, "file_isFileIsDirectory");
+s48_test!(test_s48_file_mkdir, "file_mkdir");
+s48_test!(test_s48_file_length, "file_length");
+s48_test!(test_s48_file_absolutePath, "file_absolutePath");
+s48_test!(test_s48_file_canReadWrite, "file_canReadWrite");
+
+// FileOutputStream / FileInputStream
+s48_test!(test_s48_fos_writeSingleByte, "fos_writeSingleByte");
+s48_test!(test_s48_fos_writeBulk, "fos_writeBulk");
+s48_test!(test_s48_fos_appendMode, "fos_appendMode");
+s48_test!(test_s48_fis_readEof, "fis_readEof");
+s48_test!(test_s48_fis_available, "fis_available");
+s48_test!(test_s48_fis_skip, "fis_skip");
+s48_test!(test_s48_fis_closeIdempotent, "fis_closeIdempotent");
+
+// ByteArrayStreams
+s48_test!(test_s48_baos_basic, "baos_basic");
+s48_test!(test_s48_baos_size, "baos_size");
+s48_test!(test_s48_baos_reset, "baos_reset");
+s48_test!(test_s48_bais_readAll, "bais_readAll");
+s48_test!(test_s48_bais_available, "bais_available");
+s48_test!(test_s48_bais_skip, "bais_skip");
+s48_test!(test_s48_baos_toString, "baos_toString");
+
+// StringReader / StringWriter
+s48_test!(test_s48_sw_basic, "sw_basic");
+s48_test!(test_s48_sr_readChar, "sr_readChar");
+
+// ByteBuffer
+s48_test!(test_s48_bb_allocateCapacity, "bb_allocateCapacity");
+s48_test!(test_s48_bb_putGetFlip, "bb_putGetFlip");
+s48_test!(test_s48_bb_putGetAbsolute, "bb_putGetAbsolute");
+s48_test!(test_s48_bb_wrap, "bb_wrap");
+s48_test!(test_s48_bb_clearRewind, "bb_clearRewind");
+s48_test!(test_s48_bb_markReset, "bb_markReset");
+s48_test!(test_s48_bb_putGetInt, "bb_putGetInt");
+s48_test!(test_s48_bb_putGetLong, "bb_putGetLong");
+s48_test!(test_s48_bb_putGetShort, "bb_putGetShort");
+s48_test!(test_s48_bb_putGetFloat, "bb_putGetFloat");
+s48_test!(test_s48_bb_putGetDouble, "bb_putGetDouble");
+s48_test!(test_s48_bb_putGetChar, "bb_putGetChar");
+s48_test!(test_s48_bb_hasArray, "bb_hasArray");
+s48_test!(test_s48_bb_array, "bb_array");
+s48_test!(test_s48_bb_remaining, "bb_remaining");
+s48_test!(test_s48_bb_compact, "bb_compact");
+s48_test!(test_s48_bb_slice, "bb_slice");
+s48_test!(test_s48_bb_duplicate, "bb_duplicate");
+
+// CharBuffer
+s48_test!(test_s48_cb_allocatePutGet, "cb_allocatePutGet");
+s48_test!(test_s48_cb_wrapCharSequence, "cb_wrapCharSequence");
+
+// IntBuffer / LongBuffer
+s48_test!(test_s48_ib_allocatePutGet, "ib_allocatePutGet");
+s48_test!(test_s48_ib_wrapArray, "ib_wrapArray");
+s48_test!(test_s48_lb_allocatePutGet, "lb_allocatePutGet");
+
+// End-to-end
+s48_test!(test_s48_e2e_writeReadRoundtrip, "e2e_writeReadRoundtrip");
+s48_test!(test_s48_e2e_byteBufferToArray, "e2e_byteBufferToArray");
+s48_test!(test_s48_e2e_baosToInputStream, "e2e_baosToInputStream");
+
+// ==========================================================================
+// NEW-14 — TCK: java.sql (JDBC) end-to-end tests.
+// Exercises every NEW-14 JDBC native (DriverManager, Connection,
+// Statement, PreparedStatement, CallableStatement, ResultSet, Blob,
+// Clob, Savepoint, DatabaseMetaData) from real Java bytecode.
+// ==========================================================================
+macro_rules! new14_jdbc_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/TckJdbc", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!(
+                    "TckJdbc::{} — expected Ok(Some(Int(1))), got: {other:?}",
+                    $method
+                ),
+            }
+        }
+    };
+}
+
+new14_jdbc_test!(test_new14_jdbc_open_inmemory, "open_inmemory_connection");
+new14_jdbc_test!(test_new14_jdbc_statement_ddl_dml_query, "statement_ddl_dml_query");
+new14_jdbc_test!(
+    test_new14_jdbc_prepared_statement_binds,
+    "prepared_statement_binds_and_executes"
+);
+new14_jdbc_test!(test_new14_jdbc_rollback_discards, "rollback_discards_changes");
+new14_jdbc_test!(test_new14_jdbc_savepoint_roundtrip, "savepoint_rollback_and_release");
+new14_jdbc_test!(test_new14_jdbc_blob_round_trip, "blob_round_trip");
+new14_jdbc_test!(test_new14_jdbc_clob_round_trip, "clob_round_trip");
+new14_jdbc_test!(test_new14_jdbc_callable_inherits_prepared, "callable_inherits_prepared");
+new14_jdbc_test!(test_new14_jdbc_metadata_identifies_sqlite, "metadata_identifies_sqlite");
+new14_jdbc_test!(test_new14_jdbc_driver_register_list_deregister, "driver_register_list_deregister");
+new14_jdbc_test!(test_new14_jdbc_e2e_mini_app, "e2e_mini_app");
+
+// Session 53 — Pattern Matching Completeness (JEP 441, 395, 409, 507)
+// ==========================================================================
+
+macro_rules! s53_test {
+    ($name:ident, $method:expr) => {
+        #[test]
+        fn $name() {
+            require_class_files!();
+            let mut vm = test_vm();
+            let result = vm.invoke("rustjvm/PatternComplete", $method, "()I", &[]);
+            match result {
+                Ok(Some(Value::Int(1))) => {}
+                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+            }
+        }
+    };
+}
+
+// Type patterns
+s53_test!(test_s53_string_pattern, "testStringPattern");
+s53_test!(test_s53_supertype_match, "testSupertypeMatch");
+s53_test!(test_s53_default_case, "testDefaultCase");
+s53_test!(test_s53_null_vs_default, "testNullVsDefault");
+s53_test!(test_s53_null_in_middle, "testNullInMiddle");
+
+// Guard expressions
+s53_test!(test_s53_guard_pass, "testGuardPass");
+s53_test!(test_s53_guard_fail, "testGuardFail");
+s53_test!(test_s53_multiple_guards, "testMultipleGuards");
+
+// Record patterns
+s53_test!(test_s53_record_decon, "testRecordDecon");
+s53_test!(test_s53_record_guard, "testRecordGuard");
+s53_test!(test_s53_record_object_component, "testRecordObjectComponent");
+s53_test!(test_s53_nested_records, "testNestedRecords");
+s53_test!(test_s53_record_null, "testRecordNull");
+
+// Sealed class patterns
+s53_test!(test_s53_sealed_switch, "testSealedSwitch");
+s53_test!(test_s53_sealed_rect, "testSealedRect");
+s53_test!(test_s53_sealed_decon, "testSealedDecon");
+
+// instanceof patterns
+s53_test!(test_s53_instanceof_pattern, "testInstanceofPattern");
+s53_test!(test_s53_instanceof_no_match, "testInstanceofNoMatch");
+s53_test!(test_s53_instanceof_null, "testInstanceofNull");
+s53_test!(test_s53_instanceof_chain, "testInstanceofChain");
+
+// Mixed / integration
+s53_test!(test_s53_mixed_dispatch, "testMixedDispatch");
+s53_test!(test_s53_area_calc, "testAreaCalc");
+

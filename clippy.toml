@@ -1,0 +1,8 @@
+# Clippy configuration for RustJVM
+# See https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# MSRV — clippy uses this to avoid suggesting features unavailable on older toolchains
+msrv = "1.75"
+
+# Allow slightly complex types in the JIT and GC crates
+type-complexity-threshold = 300

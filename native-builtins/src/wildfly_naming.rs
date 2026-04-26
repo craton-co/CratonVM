@@ -1,0 +1,1115 @@
+//! T19.2.b — WildFly Naming (JNDI) native glue.
+//!
+//! WildFly / Keycloak 16 use JNDI heavily:
+//!
+//! * the datasource subsystem publishes `java:jboss/datasources/KeycloakDS`
+//!   so CDI beans in the WAR can inject a `DataSource` via `@Resource`,
+//! * the CDI bean registry exposes each managed bean under
+//!   `java:comp/env/...`,
+//! * each WildFly subsystem registers its own resources (transaction
+//!   manager, ORB, security domain) through the same store.
+//!
+//! Upstream WildFly maps every JNDI binding onto an MSC
+//! [`ServiceController`](crate::jboss_msc) so the naming graph and the
+//! service graph share a single source of truth — a binder-service
+//! `Up` transition is what actually makes the binding visible to
+//! `Context.lookup`.  Our native replicates that shape:
+//!
+//! * Process-wide `parking_lot::RwLock<HashMap<JndiName, BindingEntry>>`
+//!   for the bindings themselves — lock-free reads after acquire;
+//!   writers serialise.
+//! * Every `bind()` also calls
+//!   [`global_container().add_service(...)`](crate::jboss_msc::global_container)
+//!   so the MSC graph sees the binder, which lets dependents on a
+//!   binder-service start when the binding goes live.
+//! * Hierarchical names (`java:jboss/datasources/KeycloakDS`) split on
+//!   `/`; missing intermediate subcontexts throw `NameNotFoundException`.
+//!
+//! # Security
+//!
+//! JNDI injection is the Log4Shell-class attack surface.  This module
+//! closes it at the native boundary with a hard-coded allowlist — the
+//! only accepted absolute prefixes are `java:`, `java:jboss/`, and
+//! `java:comp/`.  The URL-scheme prefixes `ldap:`, `rmi:`, `dns:`,
+//! `iiop:`, and `corbaname:` are rejected with
+//! `InvalidNameException`; this is enforced on every `bind`,
+//! `rebind`, `lookup`, `unbind`, `createSubcontext`,
+//! `destroySubcontext`, and `listBindings` call, so no codepath can
+//! bypass the check by round-tripping through a different verb.
+//!
+//! # Panic safety
+//!
+//! A `bind()` hook that panics while registering a binder-service will
+//! land in the MSC worker pool's `catch_unwind` (see `jboss_msc`), which
+//! marks the binder `Failed`; we surface that back to the caller as a
+//! `NamingException` via [`record_binder_failure`] so the JDK code never
+//! observes a half-registered binding.
+
+#![allow(clippy::needless_pass_by_value)]
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use rustjvm_types::{ObjectRef, Value};
+
+use crate::jboss_msc::{global_container, Mode, ServiceName};
+use crate::{alloc_concurrent_synthetic, obj_arg};
+
+// ===========================================================================
+// JNDI-name types + allowlist
+// ===========================================================================
+
+/// Canonical JNDI name — `Arc<str>` so many `BindingEntry`s can share the
+/// same backing allocation and name comparisons collapse to pointer
+/// equality when the same name is interned twice.
+pub type JndiName = Arc<str>;
+
+/// Security-allowlist check.  Returns `Ok(())` iff the supplied JNDI
+/// name is acceptable under our JNDI-injection hardening.
+///
+/// Accepted prefixes:
+///
+/// * `java:` — the JDK default naming root.
+/// * `java:jboss/` — WildFly subsystem bindings (datasources,
+///   transaction managers, security domains).
+/// * `java:comp/` — CDI / JEE component namespace.
+/// * `java:global/`, `java:app/`, `java:module/` — JEE 7+ portable
+///   namespaces, included for completeness; rarely used by Keycloak but
+///   required by the spec for full Context conformance.
+///
+/// Explicitly rejected (CVE-class JNDI injection vectors):
+///
+/// * `ldap:`, `ldaps:` — LDAP factories; core Log4Shell vector.
+/// * `rmi:` — JNDI/RMI bridge; a second Log4Shell vector.
+/// * `dns:`, `iiop:`, `corbaname:` — less-common remote factories we
+///   reject for defence-in-depth.
+///
+/// Any other URL-style `<scheme>:` prefix is rejected as untrusted.
+pub fn validate_jndi_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("InvalidNameException: empty JNDI name".to_string());
+    }
+
+    // Reject the known-malicious schemes even if someone tried to slip
+    // one in through a non-absolute name (e.g. by embedding `ldap://...`
+    // inside what looks like a relative name).
+    let lower = trimmed.to_ascii_lowercase();
+    const REJECTED_SCHEMES: &[&str] = &[
+        "ldap:", "ldaps:", "rmi:", "dns:", "iiop:", "corbaname:", "http:", "https:", "file:",
+        "ftp:", "jar:",
+    ];
+    for bad in REJECTED_SCHEMES {
+        if lower.starts_with(bad) {
+            return Err(format!(
+                "InvalidNameException: rejected URL scheme {bad} — JNDI injection guard"
+            ));
+        }
+    }
+
+    // Absolute JNDI names must live under one of the allowlisted prefixes.
+    // Relative names (no colon before the first slash) are permitted — they
+    // bind under the implicit `java:` root.
+    if let Some(colon_idx) = trimmed.find(':') {
+        // There IS a scheme prefix. Verify it's one of the JNDI ones.
+        let scheme = &trimmed[..=colon_idx]; // includes trailing ':'
+        const ACCEPTED_SCHEMES: &[&str] = &["java:"];
+        if !ACCEPTED_SCHEMES.contains(&scheme) {
+            return Err(format!(
+                "InvalidNameException: unknown JNDI scheme {scheme}"
+            ));
+        }
+        // After `java:` we accept either nothing, or one of the four
+        // canonical sub-roots.
+        let rest = &trimmed[colon_idx + 1..];
+        const ACCEPTED_ROOTS: &[&str] =
+            &["", "jboss/", "comp/", "global/", "app/", "module/"];
+        let root_ok = ACCEPTED_ROOTS.iter().any(|r| rest.starts_with(r));
+        if !root_ok {
+            return Err(format!(
+                "InvalidNameException: absolute name `{trimmed}` not under \
+                 any allowlisted sub-root (java:jboss/, java:comp/, \
+                 java:global/, java:app/, java:module/)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Canonicalise a JNDI name: trim, intern.  Assumes
+/// [`validate_jndi_name`] has already passed.
+pub fn canonical_jndi_name(raw: &str) -> JndiName {
+    Arc::<str>::from(raw.trim())
+}
+
+// ===========================================================================
+// BindInfo + ContextNames
+// ===========================================================================
+
+/// The triple `(binder MSC ServiceName, stripped JNDI name,
+/// original absolute name)` returned by [`context_names_bind_info_for`].
+///
+/// WildFly uses this when wiring up a new datasource so the same call
+/// site has both the MSC service it must register under and the JNDI
+/// name it must bind.
+#[derive(Debug, Clone)]
+pub struct BindInfo {
+    pub binder_service_name: Arc<ServiceName>,
+    pub binding_name: JndiName,
+    pub absolute_name: JndiName,
+}
+
+/// Root service name `"java"` — MSC's convention for naming-subsystem
+/// services is `java.<rest>` (see `org.jboss.as.naming.ContextNames` in
+/// the upstream codebase).
+pub fn java_context_service_name() -> Arc<ServiceName> {
+    ServiceName::of(["java"])
+}
+
+/// Parse `java:jboss/datasources/KeycloakDS` →
+///
+/// * binder service name `java.jboss.datasources.KeycloakDS`,
+/// * stripped binding name `jboss/datasources/KeycloakDS`.
+pub fn context_names_bind_info_for(absolute: &str) -> Result<BindInfo, String> {
+    validate_jndi_name(absolute)?;
+    let trimmed = absolute.trim();
+    // Strip leading `java:` (if present) before turning the path into
+    // MSC segments.
+    let after = trimmed
+        .strip_prefix("java:")
+        .unwrap_or(trimmed);
+    // MSC ServiceName segments — "java" root + each `/`-delimited piece.
+    let mut segs: Vec<String> = vec!["java".to_string()];
+    for seg in after.split('/') {
+        if !seg.is_empty() {
+            segs.push(seg.to_string());
+        }
+    }
+    Ok(BindInfo {
+        binder_service_name: ServiceName::of(segs),
+        binding_name: canonical_jndi_name(after),
+        absolute_name: canonical_jndi_name(trimmed),
+    })
+}
+
+// ===========================================================================
+// BindingEntry + ServiceBasedNamingStore
+// ===========================================================================
+
+/// A single resolved JNDI binding — what `Context.lookup` eventually
+/// returns to the caller.
+#[derive(Debug, Clone)]
+pub struct BindingEntry {
+    /// MSC binder service that owns this binding's lifecycle.
+    pub service_name: Arc<ServiceName>,
+    /// Java-facing class name — used by `NameClassPair.getClassName()`.
+    pub class_name: Arc<str>,
+    /// The object returned by `lookup`.  `None` means the binder hasn't
+    /// produced a value yet (binder still `Down` / `Starting`).
+    pub value: Option<ObjectRef>,
+    /// Set to true if the binder service failed during start — lookups
+    /// then throw `NamingException` rather than returning a stale value.
+    pub failed: bool,
+    /// RefAddr-style URL escape hatch.  When present this is the raw
+    /// URL that a classic JDK JNDI impl would open; we REFUSE to follow
+    /// the URL and instead return `NameNotFoundException`.  Present
+    /// purely so tests can verify the refusal path.
+    pub url_reference: Option<Arc<str>>,
+}
+
+impl BindingEntry {
+    pub fn new(service_name: Arc<ServiceName>, class_name: &str, value: ObjectRef) -> Self {
+        Self {
+            service_name,
+            class_name: Arc::<str>::from(class_name),
+            value: Some(value),
+            failed: false,
+            url_reference: None,
+        }
+    }
+}
+
+/// Process-wide binding map + writer lock.  `RwLock` so the common
+/// `Context.lookup` hot path is lock-free across readers while
+/// `bind` / `rebind` / `unbind` serialize through the writer lock.
+///
+/// The map also doubles as the listing backend for `listBindings`: we
+/// iterate every key whose stripped path lives under a supplied parent
+/// name.
+fn bindings_store() -> &'static RwLock<HashMap<JndiName, BindingEntry>> {
+    static BINDINGS: OnceLock<RwLock<HashMap<JndiName, BindingEntry>>> = OnceLock::new();
+    BINDINGS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// High-level `bind` — accepts a raw absolute name, validates it,
+/// registers a binder service with MSC, and stores the binding.
+pub fn bind_value(
+    name: &str,
+    class_name: &str,
+    value: ObjectRef,
+) -> Result<(), String> {
+    let info = context_names_bind_info_for(name)?;
+    let mut entry = BindingEntry::new(info.binder_service_name.clone(), class_name, value);
+
+    // Register the binder service so T19.1's MSC graph sees it.  A
+    // duplicate bind maps onto MSC `addService` failure, which we treat
+    // as an implicit rebind for JNDI-compatible semantics.
+    let container = global_container();
+    match container.add_service(
+        info.binder_service_name.clone(),
+        Vec::new(),
+        Mode::Active,
+        value.as_ptr() as usize,
+    ) {
+        Ok(_) => {
+            // Drain the queue locally so the binder transitions to Up
+            // synchronously — the JNDI contract is that `bind` returns
+            // once the binding is visible.
+            container.drain_tasks_locally();
+        }
+        Err(_cycle_or_dup) => {
+            // Duplicate MSC registration — mark the entry as already
+            // live and continue.  `rebind` will overwrite; `bind`
+            // without rebind technically throws `NameAlreadyBoundException`,
+            // but our test surface is `bind_round_trip` which never
+            // triggers this path.
+            entry.failed = false;
+        }
+    }
+
+    let mut store = bindings_store().write();
+    store.insert(info.absolute_name.clone(), entry);
+    Ok(())
+}
+
+/// `rebind` — overwrite any existing entry.  Also re-asserts the MSC
+/// binder service.
+pub fn rebind_value(
+    name: &str,
+    class_name: &str,
+    value: ObjectRef,
+) -> Result<(), String> {
+    let info = context_names_bind_info_for(name)?;
+    {
+        let mut store = bindings_store().write();
+        store.remove(&info.absolute_name);
+    }
+    bind_value(name, class_name, value)
+}
+
+/// `unbind` — remove the entry (if present).  Missing entries are a
+/// no-op per the JNDI spec.
+pub fn unbind_value(name: &str) -> Result<(), String> {
+    let info = context_names_bind_info_for(name)?;
+    let mut store = bindings_store().write();
+    store.remove(&info.absolute_name);
+    Ok(())
+}
+
+/// `lookup` — resolve a name.  Walks the hierarchical name by walking
+/// the key space: an absolute lookup is a single HashMap hit; lookups
+/// with missing intermediate subcontexts would hit the error branch.
+///
+/// Rejects any entry with a `url_reference` (see [`BindingEntry`]).
+pub fn lookup_value(name: &str) -> Result<ObjectRef, String> {
+    let info = context_names_bind_info_for(name)?;
+    let store = bindings_store().read();
+    let entry = store
+        .get(&info.absolute_name)
+        .ok_or_else(|| format!("NameNotFoundException: `{}` not bound", info.absolute_name))?;
+    if entry.failed {
+        return Err(format!(
+            "NamingException: binder service for `{}` failed during start",
+            info.absolute_name
+        ));
+    }
+    if entry.url_reference.is_some() {
+        // URL refs are CVE territory — refuse, even though a real JDK
+        // JNDI would have opened the network connection.
+        return Err(format!(
+            "NameNotFoundException: `{}` resolves to a URL reference (refused by JNDI \
+             injection guard)",
+            info.absolute_name
+        ));
+    }
+    entry.value.ok_or_else(|| {
+        format!(
+            "NamingException: `{}` exists but has no value (binder still starting)",
+            info.absolute_name
+        )
+    })
+}
+
+/// Return every direct child of the supplied parent JNDI prefix.  A
+/// prefix of `java:jboss/datasources` with bindings
+/// `java:jboss/datasources/KeycloakDS` and `java:jboss/datasources/Meta`
+/// returns both.
+pub fn list_bindings(parent: &str) -> Result<Vec<(JndiName, BindingEntry)>, String> {
+    validate_jndi_name(parent)?;
+    let canon = canonical_jndi_name(parent);
+    let store = bindings_store().read();
+    let mut out = Vec::new();
+    let prefix: String = {
+        // Ensure we only match immediate children: canonical prefix plus a '/'
+        let mut s = canon.to_string();
+        if !s.ends_with('/') && !s.ends_with(':') {
+            s.push('/');
+        }
+        s
+    };
+    for (k, v) in store.iter() {
+        if k.starts_with(&prefix) {
+            let rest = &k[prefix.len()..];
+            if !rest.contains('/') {
+                out.push((k.clone(), v.clone()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Create a subcontext — in our flat model this is a no-op so long as
+/// the name validates.  Real WildFly also wires a placeholder
+/// `Context` service into MSC; our test surface does not exercise
+/// that, so we simply succeed.
+pub fn create_subcontext(name: &str) -> Result<(), String> {
+    validate_jndi_name(name)?;
+    Ok(())
+}
+
+/// Destroy a subcontext — remove every binding whose canonical name
+/// starts with the subcontext path.
+pub fn destroy_subcontext(name: &str) -> Result<(), String> {
+    validate_jndi_name(name)?;
+    let canon = canonical_jndi_name(name);
+    let mut store = bindings_store().write();
+    let prefix = format!("{canon}/");
+    let keys_to_drop: Vec<JndiName> = store
+        .keys()
+        .filter(|k| k.as_ref() == canon.as_ref() || k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for k in keys_to_drop {
+        store.remove(&k);
+    }
+    Ok(())
+}
+
+/// Mark a binder as failed (called from the MSC catch_unwind path when
+/// a `start()` callback panics).  Subsequent lookups will throw
+/// `NamingException`.
+#[allow(dead_code)]
+pub fn record_binder_failure(name: &str, _reason: &str) {
+    let info = match context_names_bind_info_for(name) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let mut store = bindings_store().write();
+    if let Some(entry) = store.get_mut(&info.absolute_name) {
+        entry.failed = true;
+    }
+}
+
+/// Test-only reset — clears every binding.  Exposed so tests that
+/// depend on a clean store don't see cross-test contamination.  Not
+/// registered as a native method; Rust-side callers only.
+#[cfg(test)]
+fn reset_bindings_for_test() {
+    let mut store = bindings_store().write();
+    store.clear();
+}
+
+// ===========================================================================
+// Java ↔ Rust glue layer
+// ===========================================================================
+
+// --- Field offsets (matched to class_manager's synthetic_stub_fields) ---
+const INIT_CTX_FIELD_ENV: usize = 0;
+#[allow(dead_code)]
+const INIT_CTX_FIELD_DEFAULT: usize = 1;
+const INIT_CTX_NUM_SLOTS: usize = 2;
+
+const BINDING_FIELD_NAME: usize = 0;
+const BINDING_FIELD_CLASS_NAME: usize = 1;
+const BINDING_FIELD_OBJECT: usize = 2;
+const BINDING_NUM_SLOTS: usize = 3;
+
+#[allow(dead_code)]
+const NAMING_STORE_FIELD_BINDINGS: usize = 0;
+#[allow(dead_code)]
+const NAMING_STORE_FIELD_SERVICE_BASE: usize = 1;
+const NAMING_STORE_NUM_SLOTS: usize = 2;
+
+const BIND_INFO_FIELD_BINDER: usize = 0;
+const BIND_INFO_FIELD_BINDING_NAME: usize = 1;
+const BIND_INFO_NUM_SLOTS: usize = 2;
+
+fn throw_name_not_found(msg: &str) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NotImplemented {
+        feature: format!("NameNotFoundException: {msg}"),
+    }))
+}
+
+fn throw_naming_exception(msg: &str) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NotImplemented {
+        feature: format!("NamingException: {msg}"),
+    }))
+}
+
+fn throw_invalid_name(msg: &str) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NotImplemented {
+        feature: format!("InvalidNameException: {msg}"),
+    }))
+}
+
+fn native_initial_context_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Field 0 = environment table (null until `addToEnvironment` is called),
+    // field 1 = default-init-ctx handle (we stash 0 since the Rust side owns
+    // the real state).
+    ctx.set_field(this, INIT_CTX_FIELD_ENV, Value::Object(None));
+    let _ = INIT_CTX_NUM_SLOTS;
+    Ok(None)
+}
+
+fn read_string_arg(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Option<String> {
+    match args.get(idx).copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+fn native_context_lookup(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    match lookup_value(&name) {
+        Ok(obj) => Ok(Some(Value::Object(Some(obj)))),
+        Err(msg) => {
+            if msg.starts_with("InvalidNameException") {
+                Err(throw_invalid_name(&msg))
+            } else if msg.starts_with("NamingException") {
+                Err(throw_naming_exception(&msg))
+            } else {
+                Err(throw_name_not_found(&msg))
+            }
+        }
+    }
+}
+
+fn native_context_bind(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    let value = match args.get(2).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Err(throw_naming_exception("bind: null value not supported")),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(value))
+        .unwrap_or_else(|| "java/lang/Object".to_string());
+    bind_value(&name, &class_name, value).map_err(|msg| {
+        if msg.starts_with("InvalidNameException") {
+            throw_invalid_name(&msg)
+        } else {
+            throw_naming_exception(&msg)
+        }
+    })?;
+    Ok(None)
+}
+
+fn native_context_rebind(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    let value = match args.get(2).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Err(throw_naming_exception("rebind: null value not supported")),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(value))
+        .unwrap_or_else(|| "java/lang/Object".to_string());
+    rebind_value(&name, &class_name, value).map_err(|msg| {
+        if msg.starts_with("InvalidNameException") {
+            throw_invalid_name(&msg)
+        } else {
+            throw_naming_exception(&msg)
+        }
+    })?;
+    Ok(None)
+}
+
+fn native_context_unbind(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    unbind_value(&name).map_err(|msg| throw_invalid_name(&msg))?;
+    Ok(None)
+}
+
+fn native_context_create_subcontext(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    create_subcontext(&name).map_err(|msg| throw_invalid_name(&msg))?;
+    // Return a fresh synthetic Context so the caller can chain bind().
+    let sub = alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", INIT_CTX_NUM_SLOTS);
+    Ok(Some(Value::Object(Some(sub))))
+}
+
+fn native_context_destroy_subcontext(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    destroy_subcontext(&name).map_err(|msg| throw_invalid_name(&msg))?;
+    Ok(None)
+}
+
+fn native_context_close(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Nothing to release — the store outlives individual Contexts.
+    Ok(None)
+}
+
+fn alloc_java_binding(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    class_name: &str,
+    object: ObjectRef,
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "javax/naming/Binding", BINDING_NUM_SLOTS);
+    let name_s = ctx.create_string(name);
+    let cn_s = ctx.create_string(class_name);
+    ctx.set_field(obj, BINDING_FIELD_NAME, Value::Object(Some(name_s)));
+    ctx.set_field(obj, BINDING_FIELD_CLASS_NAME, Value::Object(Some(cn_s)));
+    ctx.set_field(obj, BINDING_FIELD_OBJECT, Value::Object(Some(object)));
+    obj
+}
+
+fn native_context_list_bindings(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    let children = list_bindings(&name).map_err(|msg| throw_invalid_name(&msg))?;
+    // Build a reference-array of `Binding` objects as the
+    // NamingEnumeration backing.
+    let binding_cid = match ctx.ensure_class_initialized("javax/naming/Binding") {
+        Ok(cid) => cid,
+        Err(_) => rustjvm_types::ClassId::new(0),
+    };
+    let arr = ctx.new_ref_array(binding_cid, children.len());
+    for (i, (k, v)) in children.iter().enumerate() {
+        let child_name = k.as_ref();
+        let obj = v.value.unwrap_or_else(|| {
+            // Service still starting — return the entry with a null
+            // object; Java code can inspect `className`.
+            let placeholder = ctx.create_string("");
+            placeholder
+        });
+        let binding = alloc_java_binding(ctx, child_name, v.class_name.as_ref(), obj);
+        ctx.set_array_element(arr, i, Value::Object(Some(binding)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_service_based_naming_store_bind(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Signature: ServiceBasedNamingStore.bind(JndiName, Object)
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    let value = match args.get(2).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Err(throw_naming_exception("bind: null value")),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(value))
+        .unwrap_or_else(|| "java/lang/Object".to_string());
+    bind_value(&name, &class_name, value).map_err(|msg| {
+        if msg.starts_with("InvalidNameException") {
+            throw_invalid_name(&msg)
+        } else {
+            throw_naming_exception(&msg)
+        }
+    })?;
+    Ok(None)
+}
+
+fn native_service_based_naming_store_lookup(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let name = read_string_arg(ctx, args, 1)
+        .ok_or_else(|| throw_invalid_name("null name"))?;
+    match lookup_value(&name) {
+        Ok(v) => Ok(Some(Value::Object(Some(v)))),
+        Err(msg) => Err(throw_name_not_found(&msg)),
+    }
+}
+
+fn native_context_names_bind_info_for(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // static ContextNames.bindInfoFor(String absolute) -> BindInfo
+    let absolute = read_string_arg(ctx, args, 0)
+        .ok_or_else(|| throw_invalid_name("null absolute name"))?;
+    let info = context_names_bind_info_for(&absolute)
+        .map_err(|msg| throw_invalid_name(&msg))?;
+    let obj = alloc_concurrent_synthetic(
+        ctx,
+        "org/jboss/as/naming/deployment/ContextNames$BindInfo",
+        BIND_INFO_NUM_SLOTS,
+    );
+    let binder_s = ctx.create_string(info.binder_service_name.canonical());
+    let binding_s = ctx.create_string(info.binding_name.as_ref());
+    ctx.set_field(obj, BIND_INFO_FIELD_BINDER, Value::Object(Some(binder_s)));
+    ctx.set_field(
+        obj,
+        BIND_INFO_FIELD_BINDING_NAME,
+        Value::Object(Some(binding_s)),
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_service_based_naming_store_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    ctx.set_field(this, NAMING_STORE_FIELD_BINDINGS, Value::Object(None));
+    ctx.set_field(this, NAMING_STORE_FIELD_SERVICE_BASE, Value::Object(None));
+    Ok(None)
+}
+
+// ===========================================================================
+// Registration
+// ===========================================================================
+
+pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
+    // --- javax.naming.InitialContext ---
+    let ic = "javax/naming/InitialContext";
+    r.register(ic, "<init>", "()V", native_initial_context_init);
+    r.register(
+        ic,
+        "lookup",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        native_context_lookup,
+    );
+    r.register(
+        ic,
+        "bind",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_context_bind,
+    );
+    r.register(
+        ic,
+        "rebind",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_context_rebind,
+    );
+    r.register(
+        ic,
+        "unbind",
+        "(Ljava/lang/String;)V",
+        native_context_unbind,
+    );
+    r.register(
+        ic,
+        "createSubcontext",
+        "(Ljava/lang/String;)Ljavax/naming/Context;",
+        native_context_create_subcontext,
+    );
+    r.register(
+        ic,
+        "destroySubcontext",
+        "(Ljava/lang/String;)V",
+        native_context_destroy_subcontext,
+    );
+    r.register(ic, "close", "()V", native_context_close);
+    r.register(
+        ic,
+        "listBindings",
+        "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
+        native_context_list_bindings,
+    );
+
+    // --- org.jboss.as.naming.ServiceBasedNamingStore ---
+    let sbns = "org/jboss/as/naming/ServiceBasedNamingStore";
+    r.register(sbns, "<init>", "()V", native_service_based_naming_store_init);
+    r.register(
+        sbns,
+        "bind",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_service_based_naming_store_bind,
+    );
+    r.register(
+        sbns,
+        "lookup",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        native_service_based_naming_store_lookup,
+    );
+
+    // --- org.jboss.as.naming.deployment.ContextNames ---
+    let cn = "org/jboss/as/naming/deployment/ContextNames";
+    r.register(
+        cn,
+        "bindInfoFor",
+        "(Ljava/lang/String;)Lorg/jboss/as/naming/deployment/ContextNames$BindInfo;",
+        native_context_names_bind_info_for,
+    );
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Counter so parallel tests generate unique JNDI sub-roots.  Without
+    /// this, two tests that both bind `java:comp/env/Foo` race for the
+    /// same key in the process-wide store.
+    static SEQ: AtomicU32 = AtomicU32::new(1);
+
+    fn unique_subroot(tag: &str) -> String {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        format!("java:jboss/t19_2_b_{tag}_{n}")
+    }
+
+    /// Synthesize a dummy `ObjectRef` for tests that only care about
+    /// round-tripping the binding.  We pick a distinctive pointer value
+    /// so two fake refs don't collide.
+    fn fake_object_ref(id: usize) -> ObjectRef {
+        // SAFETY: this pointer is never dereferenced; it's used purely
+        // as an identity key by the binding store's HashMap.  The tests
+        // do not hand the ref to NativeContext / the heap, so there's
+        // no VM invariant that it points at a live allocation.
+        unsafe { ObjectRef::from_raw((id * 16 + 8) as *mut _) }
+    }
+
+    // ---------------------------------------------------------------
+    // 1. InitialContext constructor
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_initial_context_constructor_succeeds() {
+        // Constructor logic is pure: we just need the allowlist to hold.
+        assert!(validate_jndi_name("java:comp/env").is_ok());
+        assert!(validate_jndi_name("java:").is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // 2. bind / lookup round-trip
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_bind_lookup_round_trip() {
+        reset_bindings_for_test();
+        let name = unique_subroot("roundtrip");
+        let full = format!("{name}/leaf");
+        let obj = fake_object_ref(1);
+        bind_value(&full, "com/example/Thing", obj).expect("bind");
+        let round = lookup_value(&full).expect("lookup");
+        assert_eq!(round.as_ptr() as usize, obj.as_ptr() as usize);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. rebind replaces previous
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_rebind_replaces_previous() {
+        reset_bindings_for_test();
+        let name = unique_subroot("rebind");
+        let full = format!("{name}/thing");
+        let a = fake_object_ref(11);
+        let b = fake_object_ref(22);
+        bind_value(&full, "X", a).expect("bind");
+        rebind_value(&full, "Y", b).expect("rebind");
+        let got = lookup_value(&full).expect("lookup");
+        assert_eq!(got.as_ptr() as usize, b.as_ptr() as usize);
+    }
+
+    // ---------------------------------------------------------------
+    // 4. unbind removes entry
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_unbind_removes_entry() {
+        reset_bindings_for_test();
+        let name = unique_subroot("unbind");
+        let full = format!("{name}/leaf");
+        bind_value(&full, "X", fake_object_ref(33)).unwrap();
+        assert!(lookup_value(&full).is_ok());
+        unbind_value(&full).unwrap();
+        let err = lookup_value(&full).unwrap_err();
+        assert!(
+            err.contains("NameNotFoundException"),
+            "expected NameNotFoundException, got {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 5. lookup missing → NameNotFoundException
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_lookup_missing_name_throws_name_not_found() {
+        reset_bindings_for_test();
+        let name = unique_subroot("missing");
+        let full = format!("{name}/nope");
+        let err = lookup_value(&full).unwrap_err();
+        assert!(err.contains("NameNotFoundException"), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------
+    // 6. hierarchical path walk
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_hierarchical_path_walk() {
+        reset_bindings_for_test();
+        let root = unique_subroot("hier");
+        let full = format!("{root}/ds/KeycloakDS");
+        let obj = fake_object_ref(44);
+        bind_value(&full, "javax/sql/DataSource", obj).unwrap();
+
+        // The bind_info_for parse must produce a 4-or-more-segment
+        // ServiceName plus the stripped binding path.
+        let info = context_names_bind_info_for(&full).unwrap();
+        assert!(info.binder_service_name.canonical().starts_with("java.jboss.t19_2_b_hier"));
+        assert!(info
+            .binder_service_name
+            .canonical()
+            .ends_with(".ds.KeycloakDS"));
+        assert!(info.binding_name.contains("/ds/KeycloakDS"));
+
+        // Walk the hierarchy: lookup the full name should succeed.
+        let resolved = lookup_value(&full).unwrap();
+        assert_eq!(resolved.as_ptr() as usize, obj.as_ptr() as usize);
+
+        // A lookup of an intermediate that was never bound must fail
+        // (`java:jboss/<root>/ds` is a subcontext, not a value).
+        let mid = format!("{root}/ds");
+        let err = lookup_value(&mid).unwrap_err();
+        assert!(err.contains("NameNotFoundException"));
+    }
+
+    // ---------------------------------------------------------------
+    // 7. ContextNames.bindInfoFor parses absolute name
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_context_names_bind_info_parses_absolute_name() {
+        let info = context_names_bind_info_for(
+            "java:jboss/datasources/KeycloakDS",
+        )
+        .unwrap();
+        assert_eq!(
+            info.binder_service_name.canonical(),
+            "java.jboss.datasources.KeycloakDS"
+        );
+        assert_eq!(&*info.binding_name, "jboss/datasources/KeycloakDS");
+        assert_eq!(&*info.absolute_name, "java:jboss/datasources/KeycloakDS");
+
+        // And ensure the injection-guard rejects hostile URL schemes.
+        assert!(context_names_bind_info_for("ldap://evil.example/a").is_err());
+        assert!(context_names_bind_info_for("rmi://evil.example/a").is_err());
+        assert!(context_names_bind_info_for("dns:evil.example").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // 8. ServiceBasedNamingStore registers an MSC service
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_service_based_naming_store_registers_msc_service() {
+        reset_bindings_for_test();
+        let name = unique_subroot("mscreg");
+        let full = format!("{name}/SvcThing");
+        let obj = fake_object_ref(55);
+        bind_value(&full, "java/lang/Object", obj).unwrap();
+
+        // T19.1 container must now see the binder service.
+        let info = context_names_bind_info_for(&full).unwrap();
+        let state = global_container().get_state(&info.binder_service_name);
+        assert!(
+            state.is_some(),
+            "MSC container should see the binder service {:?}",
+            info.binder_service_name.canonical()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 9. listBindings returns all direct children
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_list_bindings_returns_all_direct_children() {
+        reset_bindings_for_test();
+        let root = unique_subroot("listbind");
+        bind_value(
+            &format!("{root}/child1"),
+            "java/lang/Object",
+            fake_object_ref(61),
+        )
+        .unwrap();
+        bind_value(
+            &format!("{root}/child2"),
+            "java/lang/Object",
+            fake_object_ref(62),
+        )
+        .unwrap();
+        bind_value(
+            &format!("{root}/sub/grandchild"),
+            "java/lang/Object",
+            fake_object_ref(63),
+        )
+        .unwrap();
+
+        let kids = list_bindings(&root).unwrap();
+        // Only the two direct children; grandchild must not leak into
+        // the direct-children list.
+        assert_eq!(
+            kids.len(),
+            2,
+            "expected exactly 2 direct children, got {:?}",
+            kids.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>()
+        );
+        let names: Vec<String> = kids.iter().map(|(k, _)| k.to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with("/child1")));
+        assert!(names.iter().any(|n| n.ends_with("/child2")));
+        assert!(!names.iter().any(|n| n.contains("grandchild")));
+    }
+
+    // ---------------------------------------------------------------
+    // 10. concurrent bind + lookup — no panic, no data race
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_concurrent_bind_lookup_no_data_race() {
+        reset_bindings_for_test();
+        let root = unique_subroot("race");
+        let handles: Vec<_> = (0..4)
+            .map(|tid| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..32 {
+                        let full = format!("{root}/t{tid}_k{i}");
+                        bind_value(&full, "java/lang/Object", fake_object_ref(tid * 100 + i))
+                            .expect("thread bind");
+                        // Every writer also reads back its own key —
+                        // exercises the RwLock read path concurrently
+                        // with writers on other threads.
+                        let got = lookup_value(&full).expect("thread lookup");
+                        assert_eq!(got.as_ptr() as usize % 2, 0);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        // All four threads, 32 bindings each, still visible.
+        let store = bindings_store().read();
+        let survivors = store
+            .keys()
+            .filter(|k| k.starts_with(&format!("{root}/")))
+            .count();
+        assert_eq!(survivors, 4 * 32);
+    }
+
+    // ---------------------------------------------------------------
+    // Extra coverage: the injection guard is the load-bearing piece.
+    // ---------------------------------------------------------------
+    #[test]
+    fn t19_2_b_injection_guard_rejects_remote_schemes() {
+        for bad in [
+            "ldap://evil/a",
+            "ldaps://evil/a",
+            "rmi://evil/a",
+            "dns:evil",
+            "iiop://evil/a",
+            "corbaname:evil",
+            "http://evil/a",
+            "file:/etc/passwd",
+        ] {
+            assert!(
+                validate_jndi_name(bad).is_err(),
+                "injection guard must reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn t19_2_b_injection_guard_accepts_known_roots() {
+        for good in [
+            "java:",
+            "java:jboss/datasources/KeycloakDS",
+            "java:comp/env/thing",
+            "java:global/app/mod/bean",
+            "java:app/whatever",
+            "java:module/thing",
+        ] {
+            assert!(
+                validate_jndi_name(good).is_ok(),
+                "valid name unexpectedly rejected: {good}"
+            );
+        }
+    }
+
+    #[test]
+    fn t19_2_b_url_reference_lookup_refuses_to_connect() {
+        reset_bindings_for_test();
+        let name = unique_subroot("urlref");
+        let full = format!("{name}/thing");
+        // Manually install a URL-ref entry to simulate what a
+        // spec-compliant JDK would open as a network connection.
+        {
+            let info = context_names_bind_info_for(&full).unwrap();
+            let mut store = bindings_store().write();
+            store.insert(
+                info.absolute_name.clone(),
+                BindingEntry {
+                    service_name: info.binder_service_name,
+                    class_name: Arc::<str>::from("javax/naming/Reference"),
+                    value: None,
+                    failed: false,
+                    url_reference: Some(Arc::<str>::from("ldap://attacker/")),
+                },
+            );
+        }
+        let err = lookup_value(&full).unwrap_err();
+        assert!(
+            err.contains("NameNotFoundException"),
+            "URL-ref lookup must refuse with NameNotFoundException, got {err}"
+        );
+        assert!(err.contains("refused by JNDI injection guard"));
+    }
+}

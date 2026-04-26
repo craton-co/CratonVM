@@ -1,0 +1,548 @@
+//! Real-JDK-mode native implementations for `java.util.zip.Inflater` and
+//! `java.util.zip.Deflater`, backed by the `flate2` crate.
+//!
+//! Context: the JDK 25 pure-Java ZIP parser (`java.util.zip.ZipFile$Source`,
+//! `Inflater`) compiles into bytecode that calls natives such as
+//! `Inflater.inflateBytesBytes(J[BII[BII)J`. If the native returns 0 or is
+//! missing, the Java wrapper dereferences a zero `jzstream` handle and the
+//! process SIGSEGVs. This module wires those natives up to real DEFLATE
+//! state machines.
+//!
+//! Bit packing of the returned `long` from `inflateBytesBytes` (confirmed by
+//! disassembling `java.util.zip.Inflater.inflate([BII)I` in JDK 25):
+//!   bits  0..30  = inputConsumed   (mask 0x7FFFFFFF)
+//!   bits 31..61  = outputConsumed  (packed >> 31) & 0x7FFFFFFF
+//!   bit    62    = finished        (packed >> 62) & 1
+//!   bit    63    = needDict        (packed >> 63) & 1
+//!
+//! Only runs in real-JDK mode. Synthetic mode registers Java-level overrides
+//! in `phases_late.rs::register_phase71_natives` against a 4-field synthetic
+//! Inflater layout; those run AFTER us (essential -> synthetic in
+//! `register_builtins`), so last-writer-wins makes synthetic take over.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+
+// ---------------------------------------------------------------------------
+// Handle tables
+// ---------------------------------------------------------------------------
+
+struct InflaterState {
+    decomp: Decompress,
+    // zlib_header: true means the stream has a zlib header (nowrap == false).
+    // Tracked here so that `reset(long)` can recreate the stream in the same
+    // mode, since flate2's `Decompress::reset` takes the header flag as an arg.
+    zlib_header: bool,
+}
+
+struct DeflaterState {
+    comp: Compress,
+}
+
+fn inflater_table() -> &'static Mutex<HashMap<i64, InflaterState>> {
+    static T: OnceLock<Mutex<HashMap<i64, InflaterState>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn deflater_table() -> &'static Mutex<HashMap<i64, DeflaterState>> {
+    static T: OnceLock<Mutex<HashMap<i64, DeflaterState>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_handle() -> i64 {
+    static COUNTER: AtomicI64 = AtomicI64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Argument / value helpers
+// ---------------------------------------------------------------------------
+
+fn arg_long(args: &[Value], idx: usize) -> i64 {
+    match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+fn arg_int(args: &[Value], idx: usize) -> i32 {
+    match args.get(idx) {
+        Some(Value::Int(v)) => *v,
+        Some(Value::Long(v)) => *v as i32,
+        _ => 0,
+    }
+}
+
+fn arg_bool(args: &[Value], idx: usize) -> bool {
+    match args.get(idx) {
+        Some(Value::Int(0)) => false,
+        Some(Value::Int(_)) => true,
+        _ => false,
+    }
+}
+
+fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
+    match args.get(idx) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    }
+}
+
+fn read_byte_array(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    off: usize,
+    len: usize,
+) -> Vec<u8> {
+    let arr_len = ctx.array_length(arr);
+    let end = (off + len).min(arr_len);
+    let start = off.min(arr_len);
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        match ctx.get_array_element(arr, i) {
+            Value::Int(v) => out.push(v as u8),
+            _ => out.push(0),
+        }
+    }
+    out
+}
+
+fn write_byte_array(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    off: usize,
+    data: &[u8],
+) -> usize {
+    let arr_len = ctx.array_length(arr);
+    let mut written = 0usize;
+    for (i, b) in data.iter().enumerate() {
+        let idx = off + i;
+        if idx >= arr_len {
+            break;
+        }
+        ctx.set_array_element(arr, idx, Value::Int(*b as i8 as i32));
+        written += 1;
+    }
+    written
+}
+
+// ---------------------------------------------------------------------------
+// Pack result
+// ---------------------------------------------------------------------------
+
+fn pack_inflate_result(
+    input_consumed: u32,
+    output_consumed: u32,
+    finished: bool,
+    need_dict: bool,
+) -> i64 {
+    let mut p: u64 = 0;
+    p |= (input_consumed as u64) & 0x7FFF_FFFF;
+    p |= ((output_consumed as u64) & 0x7FFF_FFFF) << 31;
+    if finished {
+        p |= 1u64 << 62;
+    }
+    if need_dict {
+        p |= 1u64 << 63;
+    }
+    p as i64
+}
+
+fn pack_deflate_result(input_consumed: u32, output_consumed: u32, finished: bool) -> i64 {
+    // Deflater uses the same low-bits layout; we leave dict/other flag bits at 0.
+    let mut p: u64 = 0;
+    p |= (input_consumed as u64) & 0x7FFF_FFFF;
+    p |= ((output_consumed as u64) & 0x7FFF_FFFF) << 31;
+    if finished {
+        p |= 1u64 << 62;
+    }
+    p as i64
+}
+
+// ---------------------------------------------------------------------------
+// Inflater natives
+// ---------------------------------------------------------------------------
+
+fn infl_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+fn infl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // static init(boolean nowrap) -> long
+    let nowrap = arg_bool(args, 0);
+    let zlib_header = !nowrap;
+    let state = InflaterState {
+        decomp: Decompress::new(zlib_header),
+        zlib_header,
+    };
+    let handle = next_handle();
+    inflater_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, state);
+    Ok(Some(Value::Long(handle)))
+}
+
+fn infl_set_dictionary(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // static setDictionary(long, byte[], int off, int len)
+    // flate2's `Decompress::set_dictionary` is gated behind a zlib backend
+    // feature we don't enable; preset dictionaries are not used by any
+    // JAR/ZIP entry encountered on the bootstrap path, so we no-op here.
+    Ok(None)
+}
+
+fn infl_set_dictionary_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Direct buffer setDictionary — not essential for bootstrap; no-op.
+    Ok(None)
+}
+
+fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // this, long addr, byte[] in, int inOff, int inLen, byte[] out, int outOff, int outLen
+    // args[0] = this (receiver)
+    let addr = arg_long(args, 1);
+    let input_arr = arg_obj(args, 2);
+    let in_off = arg_int(args, 3).max(0) as usize;
+    let in_len = arg_int(args, 4).max(0) as usize;
+    let output_arr = arg_obj(args, 5);
+    let out_off = arg_int(args, 6).max(0) as usize;
+    let out_len = arg_int(args, 7).max(0) as usize;
+
+    let input_data = match input_arr {
+        Some(a) => read_byte_array(ctx, a, in_off, in_len),
+        None => Vec::new(),
+    };
+    let mut output_buf = vec![0u8; out_len];
+
+    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match tbl.get_mut(&addr) {
+        Some(s) => s,
+        None => {
+            // Zero handle / closed stream. Return all-zero so Java sees no progress.
+            return Ok(Some(Value::Long(0)));
+        }
+    };
+
+    let total_in_before = st.decomp.total_in();
+    let total_out_before = st.decomp.total_out();
+    let status = st.decomp.decompress(&input_data, &mut output_buf, FlushDecompress::None);
+    let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
+    let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
+
+    let (finished, need_dict) = match status {
+        Ok(flate2::Status::StreamEnd) => (true, false),
+        Ok(flate2::Status::Ok) => (false, false),
+        Ok(flate2::Status::BufError) => (false, false),
+        Err(e) => {
+            // A "needs dictionary" error from flate2 carries an Adler-32 on
+            // `DecompressError`; surface it via the needDict bit so Java
+            // throws the right exception.
+            let needs = e.needs_dictionary().is_some();
+            (false, needs)
+        }
+    };
+
+    drop(tbl);
+
+    if let Some(a) = output_arr {
+        if output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        }
+    }
+
+    Ok(Some(Value::Long(pack_inflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+        need_dict,
+    ))))
+}
+
+fn infl_inflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Output is a direct buffer (long address) — we don't have raw memory for
+    // direct buffers in this VM. Fall back to a no-progress return so Java
+    // loops around to an array-backed path. (In practice the JDK prefers
+    // array paths when `isDirect() == false`.)
+    let _ = (ctx, args);
+    Ok(Some(Value::Long(0)))
+}
+
+fn infl_inflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let _ = (ctx, args);
+    Ok(Some(Value::Long(0)))
+}
+
+fn infl_inflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let _ = (ctx, args);
+    Ok(Some(Value::Long(0)))
+}
+
+fn infl_get_adler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    let tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    // flate2::Decompress doesn't directly expose adler; return 1 (initial
+    // zlib adler-32 seed / placeholder). Adler is only consulted when the
+    // stream is zlib-wrapped and we'd want to surface a checksum; JARs use
+    // raw deflate (nowrap=true) so this is unused in the bootstrap path.
+    let _ = tbl.get(&addr);
+    Ok(Some(Value::Int(1)))
+}
+
+fn infl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = tbl.get_mut(&addr) {
+        st.decomp.reset(st.zlib_header);
+    }
+    Ok(None)
+}
+
+fn infl_end(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    inflater_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&addr);
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Deflater natives
+// ---------------------------------------------------------------------------
+
+fn defl_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+fn defl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // static init(int level, int strategy, boolean nowrap) -> long
+    let level_raw = arg_int(args, 0);
+    let _strategy = arg_int(args, 1);
+    let nowrap = arg_bool(args, 2);
+    let level = if (0..=9).contains(&level_raw) {
+        Compression::new(level_raw as u32)
+    } else {
+        Compression::default()
+    };
+    let zlib_header = !nowrap;
+    let state = DeflaterState {
+        comp: Compress::new(level, zlib_header),
+    };
+    let handle = next_handle();
+    deflater_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, state);
+    Ok(Some(Value::Long(handle)))
+}
+
+fn defl_set_dictionary(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Preset dictionaries not needed for the bootstrap JAR path; see
+    // infl_set_dictionary for rationale.
+    Ok(None)
+}
+
+fn defl_set_dictionary_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // this, long addr, byte[] in, int inOff, int inLen, byte[] out, int outOff, int outLen,
+    // int flush, int params
+    let addr = arg_long(args, 1);
+    let input_arr = arg_obj(args, 2);
+    let in_off = arg_int(args, 3).max(0) as usize;
+    let in_len = arg_int(args, 4).max(0) as usize;
+    let output_arr = arg_obj(args, 5);
+    let out_off = arg_int(args, 6).max(0) as usize;
+    let out_len = arg_int(args, 7).max(0) as usize;
+    let flush_code = arg_int(args, 8);
+    // params (level + strategy) ignored for now.
+
+    let flush = match flush_code {
+        0 => FlushCompress::None,
+        2 => FlushCompress::Sync,
+        3 => FlushCompress::Full,
+        4 => FlushCompress::Finish,
+        _ => FlushCompress::None,
+    };
+    let input_data = match input_arr {
+        Some(a) => read_byte_array(ctx, a, in_off, in_len),
+        None => Vec::new(),
+    };
+    let mut output_buf = vec![0u8; out_len];
+
+    let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match tbl.get_mut(&addr) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Long(0))),
+    };
+
+    let total_in_before = st.comp.total_in();
+    let total_out_before = st.comp.total_out();
+    let status = st.comp.compress(&input_data, &mut output_buf, flush);
+    let input_consumed = (st.comp.total_in() - total_in_before) as u32;
+    let output_consumed = (st.comp.total_out() - total_out_before) as u32;
+    let finished = matches!(status, Ok(flate2::Status::StreamEnd));
+
+    drop(tbl);
+
+    if let Some(a) = output_arr {
+        if output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        }
+    }
+    Ok(Some(Value::Long(pack_deflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+    ))))
+}
+
+fn defl_deflate_stub(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Long(0)))
+}
+
+fn defl_get_adler(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+fn defl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = tbl.get_mut(&addr) {
+        st.comp.reset();
+    }
+    Ok(None)
+}
+
+fn defl_end(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    deflater_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&addr);
+    Ok(None)
+}
+
+// Silence warnings for the RuntimeError import (kept for future error paths).
+#[allow(dead_code)]
+fn _unused_runtime_error() -> RuntimeError {
+    RuntimeError::NotImplemented {
+        feature: String::new(),
+    }
+}
+#[allow(dead_code)]
+fn _unused_ret() -> ObjectRef {
+    unreachable!()
+}
+#[allow(dead_code)]
+fn _unused_aet() -> ArrayElementType {
+    ArrayElementType::Byte
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
+    // Inflater
+    let il = "java/util/zip/Inflater";
+    r.register(il, "initIDs", "()V", infl_init_ids);
+    r.register(il, "init", "(Z)J", infl_init);
+    r.register(il, "setDictionary", "(J[BII)V", infl_set_dictionary);
+    r.register(il, "setDictionaryBuffer", "(JJI)V", infl_set_dictionary_buffer);
+    r.register(
+        il,
+        "inflateBytesBytes",
+        "(J[BII[BII)J",
+        infl_inflate_bytes_bytes,
+    );
+    r.register(il, "inflateBytesBuffer", "(J[BIIJI)J", infl_inflate_bytes_buffer);
+    r.register(il, "inflateBufferBytes", "(JJI[BII)J", infl_inflate_buffer_bytes);
+    r.register(il, "inflateBufferBuffer", "(JJIJI)J", infl_inflate_buffer_buffer);
+    r.register(il, "getAdler", "(J)I", infl_get_adler);
+    r.register(il, "reset", "(J)V", infl_reset);
+    r.register(il, "end", "(J)V", infl_end);
+
+    // Deflater
+    let dl = "java/util/zip/Deflater";
+    r.register(dl, "initIDs", "()V", defl_init_ids);
+    r.register(dl, "init", "(IIZ)J", defl_init);
+    r.register(dl, "setDictionary", "(J[BII)V", defl_set_dictionary);
+    r.register(dl, "setDictionaryBuffer", "(JJI)V", defl_set_dictionary_buffer);
+    r.register(
+        dl,
+        "deflateBytesBytes",
+        "(J[BII[BIIII)J",
+        defl_deflate_bytes_bytes,
+    );
+    r.register(dl, "deflateBytesBuffer", "(J[BIIJIII)J", defl_deflate_stub);
+    r.register(dl, "deflateBufferBytes", "(JJI[BIIII)J", defl_deflate_stub);
+    r.register(dl, "deflateBufferBuffer", "(JJIJIII)J", defl_deflate_stub);
+    r.register(dl, "getAdler", "(J)I", defl_get_adler);
+    r.register(dl, "reset", "(J)V", defl_reset);
+    r.register(dl, "end", "(J)V", defl_end);
+
+    // Note: java.util.zip.ZipFile and ZipFile$Source have NO native methods in
+    // JDK 25 — the central-directory parser is pure Java backed by
+    // RandomAccessFile. Nothing to register here.
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compression, write::DeflateEncoder};
+    use std::io::Write;
+
+    #[test]
+    fn round_trip_inflate_raw() {
+        let original = b"hello hello hello hello hello world world world";
+
+        // Produce raw DEFLATE (no zlib header) of the payload.
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(original).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        // init with nowrap=true (raw deflate).
+        let mut decomp = Decompress::new(false);
+        let mut out = vec![0u8; 1024];
+        let status = decomp
+            .decompress(&compressed, &mut out, FlushDecompress::Finish)
+            .expect("decompress ok");
+        let produced = decomp.total_out() as usize;
+        assert_eq!(&out[..produced], original);
+        assert!(matches!(status, flate2::Status::StreamEnd));
+    }
+
+    #[test]
+    fn pack_layout_matches_jdk_unpacking() {
+        // JDK unpacks:
+        //   inputConsumed  = (packed & 0x7FFFFFFF)
+        //   outputConsumed = ((packed >>> 31) & 0x7FFFFFFF)
+        //   finished       = ((packed >>> 62) & 1) != 0
+        //   needDict       = ((packed >>> 63) & 1) != 0
+        let p = pack_inflate_result(42, 1000, true, false) as u64;
+        assert_eq!(p & 0x7FFF_FFFF, 42);
+        assert_eq!((p >> 31) & 0x7FFF_FFFF, 1000);
+        assert_eq!((p >> 62) & 1, 1);
+        assert_eq!((p >> 63) & 1, 0);
+
+        let p2 = pack_inflate_result(0x7FFF_FFFF, 0x7FFF_FFFF, false, true) as u64;
+        assert_eq!(p2 & 0x7FFF_FFFF, 0x7FFF_FFFF);
+        assert_eq!((p2 >> 31) & 0x7FFF_FFFF, 0x7FFF_FFFF);
+        assert_eq!((p2 >> 62) & 1, 0);
+        assert_eq!((p2 >> 63) & 1, 1);
+    }
+}

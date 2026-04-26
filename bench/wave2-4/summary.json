@@ -1,0 +1,19 @@
+﻿{
+    "generated_at":  "2026-04-26T14:29:56Z",
+    "rustjvm_bin":  "C:\\craton\\rust-jvm\\target\\release\\rustjvm.exe",
+    "rustjvm_rev":  "unknown",
+    "probes":  {
+                   "instrument":  {
+                                      "rc":  0,
+                                      "skipped_real_jar":  "no"
+                                  },
+                   "jacoco":  {
+                                  "rc":  0,
+                                  "skipped_real_jar":  "no"
+                              },
+                   "mockito":  {
+                                   "rc":  -1073741819,
+                                   "skipped_real_jar":  "no"
+                               }
+               }
+}

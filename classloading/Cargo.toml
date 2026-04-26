@@ -1,0 +1,24 @@
+[package]
+name = "rustjvm-classloading"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Class loading subsystem for RustJVM"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustjvm-types = { path = "../types" }
+rustjvm-reader = { path = "../reader" }
+rustjvm-native-api = { path = "../native-api" }
+rustjvm-jit-api = { path = "../jit-api" }
+rustjvm-jit = { path = "../jit" }
+tracing.workspace = true
+parking_lot = "0.12"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+rustc-hash = "1.1"
+
+[lints]
+workspace = true

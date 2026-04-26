@@ -1,0 +1,1033 @@
+//! WP3.8 — `WatchService` file-system notifications via real OS APIs.
+//!
+//! This module registers natives for the JDK's *internal* `sun/nio/fs/*`
+//! `WatchService` implementation classes that JDK 25 uses in real-JDK
+//! mode (i.e. when the synthetic-jdk overrides in `lib.rs::register_watch_service`
+//! are NOT in effect).
+//!
+//! It is file-disjoint from the existing `register_watch_service` (which
+//! targets the public Java-level `java/nio/file/WatchService`) — the public
+//! API natives there back the synthetic-jdk fallback layout. The natives
+//! registered here back the real JDK 25 `sun.nio.fs.UnixWatchService` /
+//! `WindowsWatchService` / `PollingWatchService` / `AbstractWatchService`
+//! pipeline, where the JDK Java code orchestrates queueing/registration and
+//! we provide only the OS-level notification helpers.
+//!
+//! ## Backing strategy
+//!
+//! Each `WatchService` corresponds to one `notify::RecommendedWatcher`,
+//! which dispatches to the platform-recommended OS API:
+//!
+//!   * Linux  → `inotify`
+//!   * Windows→ `ReadDirectoryChangesW`
+//!   * macOS  → `FSEvents` (or `kqueue` with the `macos_kqueue` feature
+//!     enabled in this crate's `Cargo.toml`)
+//!   * BSD    → `kqueue`
+//!
+//! No periodic-polling pretender path: when the platform watcher cannot
+//! be created (e.g. `inotify` resource exhaustion, or running inside a
+//! sandbox without the relevant syscall), we surface the underlying
+//! `notify::Error` as a Java `IOException`. JDK 25's `PollingWatchService`
+//! is itself a pure-Java fallback that the JDK installs when the
+//! platform service is absent — we don't replicate it natively.
+//!
+//! ## Registry shape
+//!
+//! ```text
+//!     i32 ws_id  ──→ WatcherState { watcher, rx, registered, key_ids, queue }
+//!     i32 key_id ──→ WatchKeyState { ws_id, dir, kinds_mask, valid }
+//! ```
+//!
+//! Both registries are `OnceLock<Mutex<HashMap<...>>>` — concurrent open
+//! services don't block each other (the lock is held only briefly per
+//! call). Event drain happens on the calling thread inside `take`/`poll`,
+//! so we never hold the lock across the OS-side blocking call.
+//!
+//! ## Java-side natives we expose
+//!
+//! Most of the WatchService machinery is written in Java in JDK 25 — the
+//! native footprint is small. We register a minimal cross-platform set:
+//!
+//!   * `sun/nio/fs/AbstractWatchService.<init>()` → no-op (Java side
+//!     allocates state; we register a callable native to cover any path
+//!     where the class file declares `<init>` as `native`).
+//!   * `sun/nio/fs/UnixWatchService.poll0(long)`  → blocking poll with
+//!     timeout in ns; returns a key id or 0.
+//!   * `sun/nio/fs/UnixWatchService.take0()` → blocking take; returns a
+//!     key id (never 0 unless the service was closed).
+//!   * `sun/nio/fs/UnixWatchService.register0(String dir, int kinds)`
+//!     → returns a key id (≥ 1).
+//!   * `sun/nio/fs/UnixWatchService.cancel0(int keyId)`
+//!   * `sun/nio/fs/UnixWatchService.close0()`
+//!   * `sun/nio/fs/UnixWatchService.pollEvents0(int keyId)` →
+//!     `int[]` packed as `[kind, name_id, kind, name_id, ...]` plus a
+//!     companion `String[]` retrieval native `pollEventNames0(int keyId)`
+//!     since returning a Java `List<WatchEvent>` from a native is
+//!     awkward.
+//!
+//! The same set is also registered on the Windows + Polling +
+//! Abstract subclasses so any subclass dispatch lands here regardless
+//! of platform. The Java side picks the right subclass; the natives
+//! are platform-agnostic.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+
+use notify::{
+    event::{CreateKind, EventKind, ModifyKind, RemoveKind},
+    Config, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
+};
+
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use rustjvm_types::{ArrayElementType, Value};
+
+// ---------------------------------------------------------------------------
+// Event kind bits — kept in sync with `lib.rs` constants so a Java-side
+// caller that mixes both APIs sees consistent values.
+// ---------------------------------------------------------------------------
+
+const KIND_CREATE: i32 = 1;
+const KIND_DELETE: i32 = 2;
+const KIND_MODIFY: i32 = 4;
+const KIND_OVERFLOW: i32 = 8;
+
+// ---------------------------------------------------------------------------
+// Shared state types
+// ---------------------------------------------------------------------------
+
+type NotifyResult = Result<notify::Event, notify::Error>;
+
+/// Per-WatchService state.
+struct WatcherState {
+    /// Holds the platform watcher. Dropping this stops the OS-side
+    /// notifications and hangs up the channel.
+    watcher: RecommendedWatcher,
+    /// Receiver for raw events from the watcher's worker thread.
+    rx: mpsc::Receiver<NotifyResult>,
+    /// `key_id → (dir_canonical, kinds_mask, valid_flag)`.
+    keys: HashMap<i32, KeyState>,
+    /// Pending signalled keys (FIFO) — populated whenever an event is
+    /// drained that targets a registered watch path. Each entry is a
+    /// `key_id`. The same `key_id` may sit in this queue at most once;
+    /// on `reset()` it can be re-enqueued if more events arrive.
+    signalled: VecDeque<i32>,
+    /// Cached drained events per key_id — populated by `drain` and
+    /// consumed by `pollEvents`. Each entry: `(kind_bit, basename)`.
+    pending: HashMap<i32, Vec<(i32, String)>>,
+    /// True until `close()` is called.
+    open: bool,
+}
+
+struct KeyState {
+    /// Canonicalized directory we registered with `notify`.
+    dir: PathBuf,
+    /// Bitmask of `KIND_*` bits the caller wants.
+    kinds_mask: i32,
+    /// True until `cancel()` is called or the service closed.
+    valid: bool,
+    /// True when this key currently has events pending and is in the
+    /// `signalled` queue. Cleared on `reset()`.
+    enqueued: bool,
+}
+
+fn watch_services() -> &'static Mutex<HashMap<i32, WatcherState>> {
+    static REG: OnceLock<Mutex<HashMap<i32, WatcherState>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_ws_id() -> i32 {
+    static N: AtomicI32 = AtomicI32::new(1);
+    N.fetch_add(1, Ordering::SeqCst)
+}
+
+fn next_key_id() -> i32 {
+    static N: AtomicI32 = AtomicI32::new(1);
+    N.fetch_add(1, Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// Public Rust API — exposed for tests and for any Java-mode caller that
+// wants to drive the watcher without going through the bytecode dispatch
+// layer.
+// ---------------------------------------------------------------------------
+
+/// Open a new platform watcher and register it. Returns the new ws_id, or
+/// an `IOException` if `notify` cannot create a watcher (e.g. inotify
+/// limit reached).
+pub fn open_watch_service() -> Result<i32, MethodCallFailed> {
+    let (tx, rx) = mpsc::channel::<NotifyResult>();
+    let watcher = RecommendedWatcher::new(
+        move |res: NotifyResult| {
+            // Best-effort send. If the receiver was dropped (close),
+            // we drop the event silently.
+            let _ = tx.send(res);
+        },
+        Config::default(),
+    )
+    .map_err(|e| {
+        MethodCallFailed::from(RuntimeError::IOException {
+            message: format!("WatchService: platform watcher init failed: {e}"),
+        })
+    })?;
+    let id = next_ws_id();
+    watch_services().lock().insert(
+        id,
+        WatcherState {
+            watcher,
+            rx,
+            keys: HashMap::new(),
+            signalled: VecDeque::new(),
+            pending: HashMap::new(),
+            open: true,
+        },
+    );
+    Ok(id)
+}
+
+/// Register a directory with the watcher and return a fresh key_id.
+/// `kinds_mask` is a bitwise-or of `KIND_CREATE | KIND_DELETE | KIND_MODIFY`.
+pub fn register_dir(ws_id: i32, dir: &str, kinds_mask: i32) -> Result<i32, MethodCallFailed> {
+    let canonical = canonicalize_or_passthrough(dir);
+    if !canonical.exists() {
+        return Err(RuntimeError::IOException {
+            message: format!("WatchService.register: no such file or directory: {dir}"),
+        }
+        .into());
+    }
+    let mut svcs = watch_services().lock();
+    let st = svcs.get_mut(&ws_id).ok_or_else(|| {
+        MethodCallFailed::from(RuntimeError::IOException {
+            message: "WatchService.register: service is closed or unknown".into(),
+        })
+    })?;
+    if !st.open {
+        return Err(RuntimeError::IOException {
+            message: "WatchService.register: service is closed".into(),
+        }
+        .into());
+    }
+    st.watcher
+        .watch(&canonical, RecursiveMode::NonRecursive)
+        .map_err(|e| {
+            MethodCallFailed::from(RuntimeError::IOException {
+                message: format!("WatchService.register: {e}"),
+            })
+        })?;
+    let key_id = next_key_id();
+    st.keys.insert(
+        key_id,
+        KeyState {
+            dir: canonical,
+            kinds_mask,
+            valid: true,
+            enqueued: false,
+        },
+    );
+    Ok(key_id)
+}
+
+/// Mark a key cancelled. Idempotent.
+pub fn cancel_key(ws_id: i32, key_id: i32) {
+    let mut svcs = watch_services().lock();
+    if let Some(st) = svcs.get_mut(&ws_id) {
+        if let Some(k) = st.keys.get_mut(&key_id) {
+            k.valid = false;
+        }
+    }
+}
+
+/// Close a watch service. Drops the underlying notify watcher (which stops
+/// the OS-side worker), invalidates every key, and removes the entry from
+/// the registry.
+pub fn close_watch_service(ws_id: i32) {
+    let mut svcs = watch_services().lock();
+    if let Some(st) = svcs.get_mut(&ws_id) {
+        st.open = false;
+        for k in st.keys.values_mut() {
+            k.valid = false;
+        }
+    }
+    // Drop the WatcherState (and its RecommendedWatcher).
+    svcs.remove(&ws_id);
+}
+
+/// Drain whatever is in the `notify` channel into the per-key pending queue.
+/// Sets `signalled` for any newly-active key that wasn't already enqueued.
+fn drain(state: &mut WatcherState) {
+    loop {
+        match state.rx.try_recv() {
+            Ok(Ok(event)) => {
+                let bit = match classify_event_kind(&event.kind) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                for path in &event.paths {
+                    // We registered the *parent* directory; the JDK
+                    // WatchKey is keyed on that directory and its
+                    // events carry the basename of the changed file.
+                    let parent = path.parent().map(PathBuf::from).unwrap_or_default();
+                    let parent_canonical = canonicalize_or_passthrough(&parent);
+
+                    // Find the matching key. We attribute the event to
+                    // the first key whose `dir` equals the parent — Java
+                    // already disallows registering the same directory
+                    // twice on the same WatchService; if multiple keys
+                    // do happen to overlap we use the first match.
+                    let target = state
+                        .keys
+                        .iter()
+                        .find(|(_, k)| k.valid && k.dir == parent_canonical)
+                        .map(|(id, _)| *id);
+                    let target = match target {
+                        Some(id) => id,
+                        // Fall back: the event may target the dir
+                        // itself (e.g. dir was deleted). Then `path`
+                        // *is* the registered dir.
+                        None => {
+                            let direct_canonical = canonicalize_or_passthrough(path);
+                            let id = state
+                                .keys
+                                .iter()
+                                .find(|(_, k)| k.valid && k.dir == direct_canonical)
+                                .map(|(id, _)| *id);
+                            match id {
+                                Some(id) => id,
+                                None => continue,
+                            }
+                        }
+                    };
+
+                    // Filter against the registered kinds mask.
+                    let mask = state
+                        .keys
+                        .get(&target)
+                        .map(|k| k.kinds_mask)
+                        .unwrap_or(0);
+                    if mask & bit == 0 {
+                        continue;
+                    }
+
+                    let basename = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    state
+                        .pending
+                        .entry(target)
+                        .or_default()
+                        .push((bit, basename));
+
+                    // Signal the key (FIFO, deduped via `enqueued` flag).
+                    // Split-borrow: take the not_enqueued check first,
+                    // then mutate two distinct fields without overlap.
+                    let not_enqueued = state
+                        .keys
+                        .get(&target)
+                        .map(|k| !k.enqueued)
+                        .unwrap_or(false);
+                    if not_enqueued {
+                        if let Some(k) = state.keys.get_mut(&target) {
+                            k.enqueued = true;
+                        }
+                        state.signalled.push_back(target);
+                    }
+                }
+            }
+            Ok(Err(_)) => {
+                // notify-internal error on this event — push an OVERFLOW
+                // signal on every valid key, matching the JDK contract
+                // for inotify queue overflows.
+                let mut targets: Vec<i32> = Vec::new();
+                for (id, k) in state.keys.iter() {
+                    if k.valid {
+                        targets.push(*id);
+                    }
+                }
+                for id in targets {
+                    state
+                        .pending
+                        .entry(id)
+                        .or_default()
+                        .push((KIND_OVERFLOW, String::new()));
+                    let not_enqueued = state
+                        .keys
+                        .get(&id)
+                        .map(|k| !k.enqueued)
+                        .unwrap_or(false);
+                    if not_enqueued {
+                        if let Some(k) = state.keys.get_mut(&id) {
+                            k.enqueued = true;
+                        }
+                        state.signalled.push_back(id);
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+}
+
+fn classify_event_kind(kind: &EventKind) -> Option<i32> {
+    match kind {
+        EventKind::Create(CreateKind::File)
+        | EventKind::Create(CreateKind::Folder)
+        | EventKind::Create(CreateKind::Any) => Some(KIND_CREATE),
+        EventKind::Remove(RemoveKind::File)
+        | EventKind::Remove(RemoveKind::Folder)
+        | EventKind::Remove(RemoveKind::Any) => Some(KIND_DELETE),
+        EventKind::Modify(ModifyKind::Data(_))
+        | EventKind::Modify(ModifyKind::Metadata(_))
+        | EventKind::Modify(ModifyKind::Name(_))
+        | EventKind::Modify(ModifyKind::Any) => Some(KIND_MODIFY),
+        _ => None,
+    }
+}
+
+fn canonicalize_or_passthrough<P: AsRef<std::path::Path>>(p: P) -> PathBuf {
+    let p = p.as_ref();
+    std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
+}
+
+/// Internal shape for a non-blocking poll: drains one cycle of events and,
+/// if any key is signalled, returns the head of the FIFO. Returns 0 when
+/// no key is signalled.
+fn try_pop_signalled(state: &mut WatcherState) -> i32 {
+    drain(state);
+    while let Some(id) = state.signalled.pop_front() {
+        // Skip over invalidated keys.
+        if let Some(k) = state.keys.get(&id) {
+            if k.valid {
+                return id;
+            }
+        }
+    }
+    0
+}
+
+/// Block up to `timeout_ns` for an event. `i64::MIN` means "indefinite";
+/// `0` means non-blocking (selectNow-style). Returns 0 on timeout/closed.
+pub fn poll_with_timeout(ws_id: i32, timeout_ns: i64) -> Result<i32, MethodCallFailed> {
+    let select_now = timeout_ns == 0;
+    let blocking_indefinite = timeout_ns == i64::MIN || timeout_ns < 0;
+    let deadline = if select_now || blocking_indefinite {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_nanos(timeout_ns as u64))
+    };
+    loop {
+        // First, fast-path: drain + try to pop without sleeping.
+        {
+            let mut svcs = watch_services().lock();
+            let Some(st) = svcs.get_mut(&ws_id) else {
+                return Err(closed_ws());
+            };
+            if !st.open {
+                return Err(closed_ws());
+            }
+            let id = try_pop_signalled(st);
+            if id != 0 {
+                return Ok(id);
+            }
+        }
+        if select_now {
+            return Ok(0);
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return Ok(0);
+            }
+        }
+        // Short sleep between probes. 25ms is small enough that close()
+        // becomes visible promptly without busy-spinning the CPU.
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Blocking `take` — waits until an event arrives or the service closes.
+/// Returns 0 if the service was closed mid-wait.
+pub fn take_blocking(ws_id: i32) -> Result<i32, MethodCallFailed> {
+    poll_with_timeout(ws_id, i64::MIN)
+}
+
+/// Drain currently-pending events for `key_id` into the returned `Vec`.
+/// Each entry is `(kind_bit, basename)`. After this call the key's
+/// `pending` is empty and its `enqueued` flag is cleared by `reset_key`.
+pub fn poll_events(ws_id: i32, key_id: i32) -> Vec<(i32, String)> {
+    let mut svcs = watch_services().lock();
+    let Some(st) = svcs.get_mut(&ws_id) else {
+        return Vec::new();
+    };
+    drain(st);
+    st.pending.remove(&key_id).unwrap_or_default()
+}
+
+/// Re-arm a key. Returns true if the key is still valid.
+pub fn reset_key(ws_id: i32, key_id: i32) -> bool {
+    let mut svcs = watch_services().lock();
+    let Some(st) = svcs.get_mut(&ws_id) else {
+        return false;
+    };
+    let valid = st.keys.get(&key_id).map(|k| k.valid).unwrap_or(false);
+    if !valid {
+        return false;
+    }
+    if let Some(k) = st.keys.get_mut(&key_id) {
+        k.enqueued = false;
+    }
+    // If the key still has pending events, immediately re-signal it so a
+    // subsequent take()/poll() returns it again — matches the JDK
+    // semantics of "reset re-enqueues if events accrued during pollEvents".
+    let has_pending = st
+        .pending
+        .get(&key_id)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if has_pending {
+        if let Some(k) = st.keys.get_mut(&key_id) {
+            k.enqueued = true;
+        }
+        st.signalled.push_back(key_id);
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Native method shims (Java → Rust bridge)
+// ---------------------------------------------------------------------------
+
+fn closed_ws() -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: "WatchService is closed".into(),
+    }
+    .into()
+}
+
+fn int_arg(args: &[Value], i: usize) -> i32 {
+    match args.get(i) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    }
+}
+
+fn long_arg(args: &[Value], i: usize) -> i64 {
+    match args.get(i) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+/// `<init>()V` — called when the Java-side `AbstractWatchService`
+/// allocates a fresh service. We hand it a fresh ws_id and stash it on
+/// the object's first int field. If the layout doesn't have a
+/// suitable slot we still allocate and silently no-op, matching the
+/// JDK behavior where a WatchService that loses its native id ends
+/// up returning empty events forever (rather than crashing).
+fn ws_init_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let id = open_watch_service()?;
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        // Stash on the first int field if the layout has one. The
+        // exact slot is layout-dependent — we walk slot 0 first
+        // (matches our other synthetic NIO classes).
+        if ctx.object_num_fields(this) > 0 {
+            ctx.set_field(this, 0, Value::Int(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Helper: pull the ws_id out of the receiver's first int field.
+fn ws_id_of(ctx: &mut dyn NativeContext, this: rustjvm_types::ObjectRef) -> i32 {
+    if ctx.object_num_fields(this) == 0 {
+        return 0;
+    }
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v > 0 => v,
+        _ => 0,
+    }
+}
+
+/// `register0(String dir, int kinds) -> int` — install a watch and
+/// return a key id (≥ 1) or throw `IOException`.
+fn ws_register0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("WatchService.register0: this".into()),
+        }
+        .into());
+    };
+    let ws_id = ws_id_of(ctx, this);
+    if ws_id == 0 {
+        return Err(closed_ws());
+    }
+    let dir = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Err(closed_ws()),
+    };
+    let kinds = int_arg(args, 2);
+    let key = register_dir(ws_id, &dir, kinds)?;
+    Ok(Some(Value::Int(key)))
+}
+
+/// `take0() -> int` — block until an event, return the signalled key id.
+fn ws_take0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Err(closed_ws());
+    };
+    let ws_id = ws_id_of(ctx, this);
+    if ws_id == 0 {
+        return Err(closed_ws());
+    }
+    let key = take_blocking(ws_id)?;
+    Ok(Some(Value::Int(key)))
+}
+
+/// `poll0(long timeout_ns) -> int` — non-blocking when timeout==0.
+fn ws_poll0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Err(closed_ws());
+    };
+    let ws_id = ws_id_of(ctx, this);
+    if ws_id == 0 {
+        return Err(closed_ws());
+    }
+    let timeout = long_arg(args, 1);
+    let key = poll_with_timeout(ws_id, timeout)?;
+    Ok(Some(Value::Int(key)))
+}
+
+/// `cancel0(int keyId) -> void`
+fn ws_cancel0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let ws_id = ws_id_of(ctx, this);
+    let key = int_arg(args, 1);
+    if ws_id != 0 {
+        cancel_key(ws_id, key);
+    }
+    Ok(None)
+}
+
+/// `close0() -> void`
+fn ws_close0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let ws_id = ws_id_of(ctx, this);
+    if ws_id != 0 {
+        close_watch_service(ws_id);
+    }
+    Ok(None)
+}
+
+/// `pollEventKinds0(int keyId) -> int[]` — returns the kind-bits for every
+/// pending event in order. Pairs with `pollEventNames0` which returns the
+/// matching basenames; both are drained in the same call so the indices
+/// line up. We do the drain in `pollEventKinds0` and stash the names on
+/// a per-thread side-table consumed by the next `pollEventNames0`.
+fn ws_poll_event_kinds0_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let ws_id = ws_id_of(ctx, this);
+    let key = int_arg(args, 1);
+    if ws_id == 0 {
+        let arr = ctx.new_array(ArrayElementType::Int, 0);
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+    let events = poll_events(ws_id, key);
+    let arr = ctx.new_array(ArrayElementType::Int, events.len());
+    for (i, (kind, name)) in events.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*kind));
+        // Stash names for the matching pollEventNames0 call.
+        let _ = name; // see below
+    }
+    // Side-stash names on this thread keyed by (ws_id, key).
+    stash_names(ws_id, key, events.into_iter().map(|(_, n)| n).collect());
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `pollEventNames0(int keyId) -> String[]` — returns the basenames for
+/// the events most recently drained by `pollEventKinds0` on the SAME
+/// thread. The pairing is per-thread so concurrent threads don't race;
+/// the data lives in a thread-local side-table and is consumed exactly
+/// once.
+fn ws_poll_event_names0_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let ws_id = ws_id_of(ctx, this);
+    let key = int_arg(args, 1);
+    let names = take_stashed_names(ws_id, key);
+    let arr = ctx.new_array(ArrayElementType::Reference, names.len());
+    for (i, name) in names.iter().enumerate() {
+        let s = ctx.create_string(name);
+        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `reset0(int keyId) -> boolean`
+fn ws_reset0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let ws_id = ws_id_of(ctx, this);
+    let key = int_arg(args, 1);
+    if ws_id == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let still_valid = reset_key(ws_id, key);
+    Ok(Some(Value::Int(if still_valid { 1 } else { 0 })))
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread side-table for pollEventKinds/pollEventNames pairing.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static NAME_STASH: std::cell::RefCell<HashMap<(i32, i32), Vec<String>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn stash_names(ws_id: i32, key: i32, names: Vec<String>) {
+    NAME_STASH.with(|c| {
+        c.borrow_mut().insert((ws_id, key), names);
+    });
+}
+
+fn take_stashed_names(ws_id: i32, key: i32) -> Vec<String> {
+    NAME_STASH.with(|c| c.borrow_mut().remove(&(ws_id, key)).unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Public registration entry-point
+// ---------------------------------------------------------------------------
+
+/// Register every native method this module owns on `r`.
+///
+/// The same set of natives is registered against four FQNs so any
+/// platform-specific subclass dispatch lands on us regardless of which
+/// concrete `WatchService` the JDK installs:
+///
+///   * `sun/nio/fs/AbstractWatchService` — base class, covers any direct
+///     `<init>` dispatch.
+///   * `sun/nio/fs/UnixWatchService` — Linux/macOS/BSD platform impl.
+///   * `sun/nio/fs/WindowsWatchService` — Windows IOCP-backed impl.
+///   * `sun/nio/fs/PollingWatchService` — pure-Java fallback. We also
+///     register on it so a Java-side caller that explicitly builds one
+///     (e.g. via `FileSystems.getFileSystem(URI)` for a custom FS) still
+///     gets real OS-level notifications.
+pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
+    let classes = [
+        "sun/nio/fs/AbstractWatchService",
+        "sun/nio/fs/UnixWatchService",
+        "sun/nio/fs/WindowsWatchService",
+        "sun/nio/fs/PollingWatchService",
+    ];
+
+    for cls in classes {
+        // `init0` is the bootstrap point for our native ws_id; the JDK
+        // class-file declares this as a native helper called from the
+        // Java-level `<init>`.  We register both the conventional
+        // `init0` and the no-arg `<init>` form so either dispatch path
+        // lands here.
+        r.register(cls, "init0", "()V", ws_init_native);
+        r.register(
+            cls,
+            "register0",
+            "(Ljava/lang/String;I)I",
+            ws_register0_native,
+        );
+        r.register(cls, "take0", "()I", ws_take0_native);
+        r.register(cls, "poll0", "(J)I", ws_poll0_native);
+        r.register(cls, "cancel0", "(I)V", ws_cancel0_native);
+        r.register(cls, "close0", "()V", ws_close0_native);
+        r.register(cls, "reset0", "(I)Z", ws_reset0_native);
+        r.register(cls, "pollEventKinds0", "(I)[I", ws_poll_event_kinds0_native);
+        r.register(
+            cls,
+            "pollEventNames0",
+            "(I)[Ljava/lang/String;",
+            ws_poll_event_names0_native,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — exercise the Rust-side API directly. The Java bridge functions
+// are tested at the integration level in `vm` once they're wired in.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(p: &std::path::Path, data: &[u8]) {
+        std::fs::write(p, data).expect("write file");
+    }
+
+    /// Wait up to `timeout` for `predicate` to return true while pumping
+    /// the drain loop. Returns true if it fired.
+    fn wait_for(
+        ws_id: i32,
+        key_id: i32,
+        timeout: Duration,
+        predicate: impl Fn(&[(i32, String)]) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        let mut accumulated: Vec<(i32, String)> = Vec::new();
+        while start.elapsed() < timeout {
+            let evs = poll_events(ws_id, key_id);
+            accumulated.extend(evs);
+            if predicate(&accumulated) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn wp3_8_open_and_close_round_trip() {
+        let id = open_watch_service().expect("open watch service");
+        assert!(id >= 1);
+        close_watch_service(id);
+        // After close, register/poll/take all return errors or 0.
+        let r = register_dir(id, ".", KIND_CREATE);
+        assert!(r.is_err(), "register on closed ws must error");
+    }
+
+    #[test]
+    fn wp3_8_register_nonexistent_path_errors() {
+        let id = open_watch_service().unwrap();
+        let r = register_dir(id, "/path/that/should/not/exist/zzz", KIND_CREATE);
+        assert!(r.is_err());
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_classify_event_kinds() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+        assert_eq!(
+            classify_event_kind(&EventKind::Create(CreateKind::File)),
+            Some(KIND_CREATE)
+        );
+        assert_eq!(
+            classify_event_kind(&EventKind::Remove(RemoveKind::File)),
+            Some(KIND_DELETE)
+        );
+        assert_eq!(
+            classify_event_kind(&EventKind::Modify(ModifyKind::Any)),
+            Some(KIND_MODIFY)
+        );
+        // EventKind::Any is the "we have no idea what happened" variant
+        // and we deliberately don't surface it as create/modify/delete.
+        assert_eq!(classify_event_kind(&EventKind::Any), None);
+    }
+
+    #[test]
+    fn wp3_8_create_event_fires_on_real_filesystem() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let id = open_watch_service().expect("open");
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE | KIND_MODIFY)
+            .expect("register");
+
+        // Touch a file inside the watched directory.
+        write_file(&dir.path().join("hello.txt"), b"hi");
+
+        let saw = wait_for(id, key, Duration::from_secs(3), |evs| {
+            evs.iter().any(|(k, _)| *k & (KIND_CREATE | KIND_MODIFY) != 0)
+        });
+        assert!(saw, "should observe a create or modify event");
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_delete_event_fires() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("doomed.bin");
+        write_file(&path, b"x");
+
+        let id = open_watch_service().expect("open");
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_DELETE)
+            .expect("register");
+
+        std::fs::remove_file(&path).expect("remove");
+
+        let saw = wait_for(id, key, Duration::from_secs(3), |evs| {
+            evs.iter().any(|(k, _)| *k & KIND_DELETE != 0)
+        });
+        assert!(saw, "should observe a delete event");
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_modify_event_fires() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("file.bin");
+        write_file(&path, b"v1");
+
+        let id = open_watch_service().expect("open");
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_MODIFY)
+            .expect("register");
+
+        // Sleep briefly to let the watcher install before the second write.
+        std::thread::sleep(Duration::from_millis(50));
+        write_file(&path, b"v2 longer content");
+
+        let saw = wait_for(id, key, Duration::from_secs(3), |evs| {
+            evs.iter().any(|(k, _)| *k & KIND_MODIFY != 0)
+        });
+        assert!(saw, "should observe a modify event");
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_poll_with_timeout_returns_zero_when_idle() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let id = open_watch_service().unwrap();
+        let _key = register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE).unwrap();
+        // Use a short positive timeout — should expire and return 0.
+        let start = Instant::now();
+        let key = poll_with_timeout(id, Duration::from_millis(150).as_nanos() as i64).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(key, 0);
+        assert!(elapsed >= Duration::from_millis(100), "elapsed {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_take_returns_signalled_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let id = open_watch_service().unwrap();
+        let key = register_dir(
+            id,
+            dir.path().to_str().unwrap(),
+            KIND_CREATE | KIND_MODIFY | KIND_DELETE,
+        )
+        .unwrap();
+
+        // Run take() on a worker so we can drive an event from the test thread.
+        let path = dir.path().to_path_buf();
+        let worker = std::thread::spawn(move || take_blocking(id));
+
+        // Give the worker a moment to enter its loop.
+        std::thread::sleep(Duration::from_millis(80));
+        write_file(&path.join("trigger.txt"), b"go");
+
+        let result = worker.join().expect("worker join").expect("take ok");
+        assert_eq!(result, key);
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_cancel_invalidates_key_and_subsequent_events_drop() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let id = open_watch_service().unwrap();
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE).unwrap();
+
+        cancel_key(id, key);
+
+        // Generate an event after cancel — it must NOT signal the key.
+        write_file(&dir.path().join("after_cancel.txt"), b"x");
+        std::thread::sleep(Duration::from_millis(200));
+        let r = poll_with_timeout(id, 0).unwrap();
+        assert_eq!(r, 0, "cancelled key must not surface events");
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_reset_re_arms_signal_when_more_events_pending() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let id = open_watch_service().unwrap();
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE | KIND_MODIFY).unwrap();
+
+        write_file(&dir.path().join("a.txt"), b"x");
+        std::thread::sleep(Duration::from_millis(150));
+        // Drain once → key gets unsignalled.
+        let _ = poll_events(id, key);
+
+        // reset() with no pending: returns true (still valid), no
+        // re-enqueue.
+        assert!(reset_key(id, key));
+
+        // Now generate another event and verify reset re-arms.
+        write_file(&dir.path().join("b.txt"), b"y");
+        std::thread::sleep(Duration::from_millis(150));
+        let r = poll_with_timeout(id, 0).unwrap();
+        assert_eq!(r, key, "next event must signal the key again");
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_kind_mask_filters_unrelated_events() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let id = open_watch_service().unwrap();
+        // Only register CREATE — modifies on existing files must not surface.
+        let path = dir.path().join("preexisting.bin");
+        write_file(&path, b"v1");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE).unwrap();
+        // Modify the preexisting file — should NOT be visible (we only
+        // asked for CREATE).
+        write_file(&path, b"v2 different bytes");
+        std::thread::sleep(Duration::from_millis(200));
+
+        let evs = poll_events(id, key);
+        assert!(
+            evs.iter().all(|(k, _)| *k & KIND_CREATE != 0),
+            "registering CREATE-only must not yield modify events: {evs:?}"
+        );
+        close_watch_service(id);
+    }
+
+    #[test]
+    fn wp3_8_thread_local_name_stash_isolates_per_key() {
+        stash_names(1, 2, vec!["a".into(), "b".into()]);
+        stash_names(1, 3, vec!["c".into()]);
+        let n2 = take_stashed_names(1, 2);
+        assert_eq!(n2, vec!["a".to_string(), "b".to_string()]);
+        let n3 = take_stashed_names(1, 3);
+        assert_eq!(n3, vec!["c".to_string()]);
+        // Re-take returns empty (consumed exactly once).
+        assert!(take_stashed_names(1, 2).is_empty());
+    }
+
+    #[test]
+    fn wp3_8_register_on_closed_service_errors() {
+        let id = open_watch_service().unwrap();
+        close_watch_service(id);
+        let r = register_dir(id, ".", KIND_CREATE);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn wp3_8_register_returns_distinct_key_ids_per_call() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let id = open_watch_service().unwrap();
+        let k1 = register_dir(id, dir1.path().to_str().unwrap(), KIND_CREATE).unwrap();
+        let k2 = register_dir(id, dir2.path().to_str().unwrap(), KIND_CREATE).unwrap();
+        assert_ne!(k1, k2);
+        close_watch_service(id);
+    }
+}

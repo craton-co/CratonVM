@@ -1,0 +1,3917 @@
+//! JVMTI (JVM Tool Interface) implementation.
+//!
+//! Provides the complete JVMTI function table, agent loading support,
+//! event delivery infrastructure, and capabilities management as specified
+//! by the JVMTI specification (JSR-163 / JVM TI 11.0+).
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+
+// ---------------------------------------------------------------------------
+// JVMTI Version Constants
+// ---------------------------------------------------------------------------
+
+/// JVMTI version 11.0 encoded as per spec: major.minor.micro
+const JVMTI_VERSION_11: u32 = 0x3000_0000 | (11 << 16) | (0 << 8) | 0;
+
+// ---------------------------------------------------------------------------
+// Error Types
+// ---------------------------------------------------------------------------
+
+/// All JVMTI error codes as defined by the specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum JvmtiError {
+    None = 0,
+    InvalidThread = 10,
+    InvalidThreadGroup = 11,
+    InvalidPriority = 12,
+    ThreadNotSuspended = 13,
+    ThreadSuspended = 14,
+    ThreadNotAlive = 15,
+    InvalidObject = 20,
+    InvalidClass = 21,
+    ClassNotPrepared = 22,
+    InvalidMethodId = 23,
+    InvalidLocation = 24,
+    InvalidFieldId = 25,
+    NoMoreFrames = 31,
+    OpaqueFrame = 32,
+    TypeMismatch = 34,
+    InvalidSlot = 35,
+    Duplicate = 40,
+    NotFound = 41,
+    InvalidMonitor = 50,
+    NotMonitorOwner = 51,
+    Interrupt = 52,
+    InvalidClassFormat = 60,
+    CircularClassDefinition = 61,
+    FailsVerification = 62,
+    UnsupportedRedefinitionMethodAdded = 63,
+    UnsupportedRedefinitionSchemaChanged = 64,
+    InvalidTypeState = 65,
+    UnsupportedRedefinitionHierarchyChanged = 66,
+    UnsupportedRedefinitionMethodDeleted = 67,
+    UnsupportedVersion = 68,
+    NamesDontMatch = 69,
+    UnsupportedRedefinitionClassModifiersChanged = 70,
+    UnsupportedRedefinitionMethodModifiersChanged = 71,
+    MustPossessCapability = 99,
+    NullPointer = 100,
+    AbsentInformation = 101,
+    InvalidEnvironment = 116,
+    WrongPhase = 112,
+    Internal = 113,
+    UnattachedThread = 115,
+    NotAvailable = 98,
+    AccessDenied = 111,
+    OutOfMemory = 110,
+    IllegalArgument = 103,
+}
+
+impl fmt::Display for JvmtiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+impl std::error::Error for JvmtiError {}
+
+impl JvmtiError {
+    /// Return the standard JVMTI error name string.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "JVMTI_ERROR_NONE",
+            Self::InvalidThread => "JVMTI_ERROR_INVALID_THREAD",
+            Self::InvalidThreadGroup => "JVMTI_ERROR_INVALID_THREAD_GROUP",
+            Self::InvalidPriority => "JVMTI_ERROR_INVALID_PRIORITY",
+            Self::ThreadNotSuspended => "JVMTI_ERROR_THREAD_NOT_SUSPENDED",
+            Self::ThreadSuspended => "JVMTI_ERROR_THREAD_SUSPENDED",
+            Self::ThreadNotAlive => "JVMTI_ERROR_THREAD_NOT_ALIVE",
+            Self::InvalidObject => "JVMTI_ERROR_INVALID_OBJECT",
+            Self::InvalidClass => "JVMTI_ERROR_INVALID_CLASS",
+            Self::ClassNotPrepared => "JVMTI_ERROR_CLASS_NOT_PREPARED",
+            Self::InvalidMethodId => "JVMTI_ERROR_INVALID_METHODID",
+            Self::InvalidLocation => "JVMTI_ERROR_INVALID_LOCATION",
+            Self::InvalidFieldId => "JVMTI_ERROR_INVALID_FIELDID",
+            Self::NoMoreFrames => "JVMTI_ERROR_NO_MORE_FRAMES",
+            Self::OpaqueFrame => "JVMTI_ERROR_OPAQUE_FRAME",
+            Self::TypeMismatch => "JVMTI_ERROR_TYPE_MISMATCH",
+            Self::InvalidSlot => "JVMTI_ERROR_INVALID_SLOT",
+            Self::Duplicate => "JVMTI_ERROR_DUPLICATE",
+            Self::NotFound => "JVMTI_ERROR_NOT_FOUND",
+            Self::InvalidMonitor => "JVMTI_ERROR_INVALID_MONITOR",
+            Self::NotMonitorOwner => "JVMTI_ERROR_NOT_MONITOR_OWNER",
+            Self::Interrupt => "JVMTI_ERROR_INTERRUPT",
+            Self::InvalidClassFormat => "JVMTI_ERROR_INVALID_CLASS_FORMAT",
+            Self::CircularClassDefinition => "JVMTI_ERROR_CIRCULAR_CLASS_DEFINITION",
+            Self::FailsVerification => "JVMTI_ERROR_FAILS_VERIFICATION",
+            Self::UnsupportedRedefinitionMethodAdded => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_ADDED",
+            Self::UnsupportedRedefinitionSchemaChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_SCHEMA_CHANGED",
+            Self::InvalidTypeState => "JVMTI_ERROR_INVALID_TYPESTATE",
+            Self::UnsupportedRedefinitionHierarchyChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_HIERARCHY_CHANGED",
+            Self::UnsupportedRedefinitionMethodDeleted => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_DELETED",
+            Self::UnsupportedVersion => "JVMTI_ERROR_UNSUPPORTED_VERSION",
+            Self::NamesDontMatch => "JVMTI_ERROR_NAMES_DONT_MATCH",
+            Self::UnsupportedRedefinitionClassModifiersChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_CLASS_MODIFIERS_CHANGED",
+            Self::UnsupportedRedefinitionMethodModifiersChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_MODIFIERS_CHANGED",
+            Self::MustPossessCapability => "JVMTI_ERROR_MUST_POSSESS_CAPABILITY",
+            Self::NullPointer => "JVMTI_ERROR_NULL_POINTER",
+            Self::AbsentInformation => "JVMTI_ERROR_ABSENT_INFORMATION",
+            Self::InvalidEnvironment => "JVMTI_ERROR_INVALID_ENVIRONMENT",
+            Self::WrongPhase => "JVMTI_ERROR_WRONG_PHASE",
+            Self::Internal => "JVMTI_ERROR_INTERNAL",
+            Self::UnattachedThread => "JVMTI_ERROR_UNATTACHED_THREAD",
+            Self::NotAvailable => "JVMTI_ERROR_NOT_AVAILABLE",
+            Self::AccessDenied => "JVMTI_ERROR_ACCESS_DENIED",
+            Self::OutOfMemory => "JVMTI_ERROR_OUT_OF_MEMORY",
+            Self::IllegalArgument => "JVMTI_ERROR_ILLEGAL_ARGUMENT",
+        }
+    }
+
+    /// Convert a raw error code to a JvmtiError.
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::None,
+            10 => Self::InvalidThread,
+            11 => Self::InvalidThreadGroup,
+            12 => Self::InvalidPriority,
+            13 => Self::ThreadNotSuspended,
+            14 => Self::ThreadSuspended,
+            15 => Self::ThreadNotAlive,
+            20 => Self::InvalidObject,
+            21 => Self::InvalidClass,
+            22 => Self::ClassNotPrepared,
+            23 => Self::InvalidMethodId,
+            24 => Self::InvalidLocation,
+            25 => Self::InvalidFieldId,
+            31 => Self::NoMoreFrames,
+            32 => Self::OpaqueFrame,
+            34 => Self::TypeMismatch,
+            35 => Self::InvalidSlot,
+            40 => Self::Duplicate,
+            41 => Self::NotFound,
+            50 => Self::InvalidMonitor,
+            51 => Self::NotMonitorOwner,
+            52 => Self::Interrupt,
+            60 => Self::InvalidClassFormat,
+            61 => Self::CircularClassDefinition,
+            62 => Self::FailsVerification,
+            63 => Self::UnsupportedRedefinitionMethodAdded,
+            64 => Self::UnsupportedRedefinitionSchemaChanged,
+            65 => Self::InvalidTypeState,
+            66 => Self::UnsupportedRedefinitionHierarchyChanged,
+            67 => Self::UnsupportedRedefinitionMethodDeleted,
+            68 => Self::UnsupportedVersion,
+            69 => Self::NamesDontMatch,
+            70 => Self::UnsupportedRedefinitionClassModifiersChanged,
+            71 => Self::UnsupportedRedefinitionMethodModifiersChanged,
+            98 => Self::NotAvailable,
+            99 => Self::MustPossessCapability,
+            100 => Self::NullPointer,
+            101 => Self::AbsentInformation,
+            103 => Self::IllegalArgument,
+            110 => Self::OutOfMemory,
+            111 => Self::AccessDenied,
+            112 => Self::WrongPhase,
+            113 => Self::Internal,
+            115 => Self::UnattachedThread,
+            116 => Self::InvalidEnvironment,
+            _ => Self::Internal,
+        }
+    }
+}
+
+pub type JvmtiResult<T> = Result<T, JvmtiError>;
+
+// ---------------------------------------------------------------------------
+// Event Kinds
+// ---------------------------------------------------------------------------
+
+/// All JVMTI event kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum JvmtiEventKind {
+    VmInit = 50,
+    VmDeath = 51,
+    ThreadStart = 52,
+    ThreadEnd = 53,
+    ClassFileLoadHook = 54,
+    ClassLoad = 55,
+    ClassPrepare = 56,
+    MethodEntry = 64,
+    MethodExit = 65,
+    Exception = 58,
+    ExceptionCatch = 59,
+    FieldAccess = 63,
+    FieldModification = 62,
+    Breakpoint = 60,
+    SingleStep = 61,
+    FramePop = 66,
+    GarbageCollectionStart = 75,
+    GarbageCollectionFinish = 76,
+    MonitorContendedEnter = 77,
+    MonitorContendedEntered = 78,
+    MonitorWait = 79,
+    MonitorWaited = 80,
+    CompiledMethodLoad = 68,
+    CompiledMethodUnload = 69,
+    DynamicCodeGenerated = 70,
+    NativeMethodBind = 67,
+    /// Fired when a tagged object is garbage-collected. One-shot per object.
+    ObjectFree = 83,
+    /// Fired for every Java object allocation. Requires the
+    /// `can_generate_vm_object_alloc_events` capability.
+    VMObjectAlloc = 84,
+    /// Fired per heap-sampling interval (default 512 KB of allocation).
+    /// Mirrors the JFR allocation sampler used by async-profiler.
+    SampledObjectAlloc = 86,
+    /// Fired when an external debugger requests a heap dump.
+    DataDumpRequest = 71,
+}
+
+impl JvmtiEventKind {
+    /// All known event kinds for iteration.
+    pub const ALL: &'static [JvmtiEventKind] = &[
+        Self::VmInit,
+        Self::VmDeath,
+        Self::ThreadStart,
+        Self::ThreadEnd,
+        Self::ClassFileLoadHook,
+        Self::ClassLoad,
+        Self::ClassPrepare,
+        Self::MethodEntry,
+        Self::MethodExit,
+        Self::Exception,
+        Self::ExceptionCatch,
+        Self::FieldAccess,
+        Self::FieldModification,
+        Self::Breakpoint,
+        Self::SingleStep,
+        Self::FramePop,
+        Self::GarbageCollectionStart,
+        Self::GarbageCollectionFinish,
+        Self::MonitorContendedEnter,
+        Self::MonitorContendedEntered,
+        Self::MonitorWait,
+        Self::MonitorWaited,
+        Self::CompiledMethodLoad,
+        Self::CompiledMethodUnload,
+        Self::DynamicCodeGenerated,
+        Self::NativeMethodBind,
+        Self::ObjectFree,
+        Self::VMObjectAlloc,
+        Self::SampledObjectAlloc,
+        Self::DataDumpRequest,
+    ];
+
+    /// Convert from raw u32 event number.
+    pub fn from_raw(val: u32) -> Option<Self> {
+        Self::ALL.iter().find(|k| **k as u32 == val).copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notification Mode
+// ---------------------------------------------------------------------------
+
+/// Whether an event is enabled or disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventMode {
+    Enable,
+    Disable,
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+/// JVMTI capability bitfield. Each field represents a capability that can be
+/// requested, granted, and relinquished at runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JvmtiCapabilities {
+    pub can_tag_objects: bool,
+    pub can_generate_field_modification_events: bool,
+    pub can_generate_field_access_events: bool,
+    pub can_get_bytecodes: bool,
+    pub can_get_synthetic_attribute: bool,
+    pub can_get_owned_monitor_info: bool,
+    pub can_get_current_contended_monitor: bool,
+    pub can_get_monitor_info: bool,
+    pub can_pop_frame: bool,
+    pub can_redefine_classes: bool,
+    pub can_signal_thread: bool,
+    pub can_get_source_file_name: bool,
+    pub can_get_line_numbers: bool,
+    pub can_get_source_debug_extension: bool,
+    pub can_access_local_variables: bool,
+    pub can_maintain_original_method_order: bool,
+    pub can_generate_single_step_events: bool,
+    pub can_generate_exception_events: bool,
+    pub can_generate_frame_pop_events: bool,
+    pub can_generate_breakpoint_events: bool,
+    pub can_suspend: bool,
+    pub can_redefine_any_class: bool,
+    pub can_get_current_thread_cpu_time: bool,
+    pub can_get_thread_cpu_time: bool,
+    pub can_generate_method_entry_events: bool,
+    pub can_generate_method_exit_events: bool,
+    pub can_generate_all_class_hook_events: bool,
+    pub can_generate_compiled_method_load_events: bool,
+    pub can_generate_monitor_events: bool,
+    pub can_generate_vm_object_alloc_events: bool,
+    pub can_generate_native_method_bind_events: bool,
+    pub can_generate_garbage_collection_events: bool,
+    pub can_generate_object_free_events: bool,
+    pub can_force_early_return: bool,
+    pub can_get_owned_monitor_stack_depth_info: bool,
+    pub can_get_constant_pool: bool,
+    pub can_set_native_method_prefix: bool,
+    pub can_retransform_classes: bool,
+    pub can_retransform_any_class: bool,
+    pub can_generate_resource_exhaustion_heap_events: bool,
+    pub can_generate_resource_exhaustion_threads_events: bool,
+}
+
+impl JvmtiCapabilities {
+    /// Merge capabilities: result has a capability if either input has it.
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            can_tag_objects: self.can_tag_objects || other.can_tag_objects,
+            can_generate_field_modification_events: self.can_generate_field_modification_events || other.can_generate_field_modification_events,
+            can_generate_field_access_events: self.can_generate_field_access_events || other.can_generate_field_access_events,
+            can_get_bytecodes: self.can_get_bytecodes || other.can_get_bytecodes,
+            can_get_synthetic_attribute: self.can_get_synthetic_attribute || other.can_get_synthetic_attribute,
+            can_get_owned_monitor_info: self.can_get_owned_monitor_info || other.can_get_owned_monitor_info,
+            can_get_current_contended_monitor: self.can_get_current_contended_monitor || other.can_get_current_contended_monitor,
+            can_get_monitor_info: self.can_get_monitor_info || other.can_get_monitor_info,
+            can_pop_frame: self.can_pop_frame || other.can_pop_frame,
+            can_redefine_classes: self.can_redefine_classes || other.can_redefine_classes,
+            can_signal_thread: self.can_signal_thread || other.can_signal_thread,
+            can_get_source_file_name: self.can_get_source_file_name || other.can_get_source_file_name,
+            can_get_line_numbers: self.can_get_line_numbers || other.can_get_line_numbers,
+            can_get_source_debug_extension: self.can_get_source_debug_extension || other.can_get_source_debug_extension,
+            can_access_local_variables: self.can_access_local_variables || other.can_access_local_variables,
+            can_maintain_original_method_order: self.can_maintain_original_method_order || other.can_maintain_original_method_order,
+            can_generate_single_step_events: self.can_generate_single_step_events || other.can_generate_single_step_events,
+            can_generate_exception_events: self.can_generate_exception_events || other.can_generate_exception_events,
+            can_generate_frame_pop_events: self.can_generate_frame_pop_events || other.can_generate_frame_pop_events,
+            can_generate_breakpoint_events: self.can_generate_breakpoint_events || other.can_generate_breakpoint_events,
+            can_suspend: self.can_suspend || other.can_suspend,
+            can_redefine_any_class: self.can_redefine_any_class || other.can_redefine_any_class,
+            can_get_current_thread_cpu_time: self.can_get_current_thread_cpu_time || other.can_get_current_thread_cpu_time,
+            can_get_thread_cpu_time: self.can_get_thread_cpu_time || other.can_get_thread_cpu_time,
+            can_generate_method_entry_events: self.can_generate_method_entry_events || other.can_generate_method_entry_events,
+            can_generate_method_exit_events: self.can_generate_method_exit_events || other.can_generate_method_exit_events,
+            can_generate_all_class_hook_events: self.can_generate_all_class_hook_events || other.can_generate_all_class_hook_events,
+            can_generate_compiled_method_load_events: self.can_generate_compiled_method_load_events || other.can_generate_compiled_method_load_events,
+            can_generate_monitor_events: self.can_generate_monitor_events || other.can_generate_monitor_events,
+            can_generate_vm_object_alloc_events: self.can_generate_vm_object_alloc_events || other.can_generate_vm_object_alloc_events,
+            can_generate_native_method_bind_events: self.can_generate_native_method_bind_events || other.can_generate_native_method_bind_events,
+            can_generate_garbage_collection_events: self.can_generate_garbage_collection_events || other.can_generate_garbage_collection_events,
+            can_generate_object_free_events: self.can_generate_object_free_events || other.can_generate_object_free_events,
+            can_force_early_return: self.can_force_early_return || other.can_force_early_return,
+            can_get_owned_monitor_stack_depth_info: self.can_get_owned_monitor_stack_depth_info || other.can_get_owned_monitor_stack_depth_info,
+            can_get_constant_pool: self.can_get_constant_pool || other.can_get_constant_pool,
+            can_set_native_method_prefix: self.can_set_native_method_prefix || other.can_set_native_method_prefix,
+            can_retransform_classes: self.can_retransform_classes || other.can_retransform_classes,
+            can_retransform_any_class: self.can_retransform_any_class || other.can_retransform_any_class,
+            can_generate_resource_exhaustion_heap_events: self.can_generate_resource_exhaustion_heap_events || other.can_generate_resource_exhaustion_heap_events,
+            can_generate_resource_exhaustion_threads_events: self.can_generate_resource_exhaustion_threads_events || other.can_generate_resource_exhaustion_threads_events,
+        }
+    }
+
+    /// Remove capabilities present in `other` from self.
+    pub fn subtract(&self, other: &Self) -> Self {
+        Self {
+            can_tag_objects: self.can_tag_objects && !other.can_tag_objects,
+            can_generate_field_modification_events: self.can_generate_field_modification_events && !other.can_generate_field_modification_events,
+            can_generate_field_access_events: self.can_generate_field_access_events && !other.can_generate_field_access_events,
+            can_get_bytecodes: self.can_get_bytecodes && !other.can_get_bytecodes,
+            can_get_synthetic_attribute: self.can_get_synthetic_attribute && !other.can_get_synthetic_attribute,
+            can_get_owned_monitor_info: self.can_get_owned_monitor_info && !other.can_get_owned_monitor_info,
+            can_get_current_contended_monitor: self.can_get_current_contended_monitor && !other.can_get_current_contended_monitor,
+            can_get_monitor_info: self.can_get_monitor_info && !other.can_get_monitor_info,
+            can_pop_frame: self.can_pop_frame && !other.can_pop_frame,
+            can_redefine_classes: self.can_redefine_classes && !other.can_redefine_classes,
+            can_signal_thread: self.can_signal_thread && !other.can_signal_thread,
+            can_get_source_file_name: self.can_get_source_file_name && !other.can_get_source_file_name,
+            can_get_line_numbers: self.can_get_line_numbers && !other.can_get_line_numbers,
+            can_get_source_debug_extension: self.can_get_source_debug_extension && !other.can_get_source_debug_extension,
+            can_access_local_variables: self.can_access_local_variables && !other.can_access_local_variables,
+            can_maintain_original_method_order: self.can_maintain_original_method_order && !other.can_maintain_original_method_order,
+            can_generate_single_step_events: self.can_generate_single_step_events && !other.can_generate_single_step_events,
+            can_generate_exception_events: self.can_generate_exception_events && !other.can_generate_exception_events,
+            can_generate_frame_pop_events: self.can_generate_frame_pop_events && !other.can_generate_frame_pop_events,
+            can_generate_breakpoint_events: self.can_generate_breakpoint_events && !other.can_generate_breakpoint_events,
+            can_suspend: self.can_suspend && !other.can_suspend,
+            can_redefine_any_class: self.can_redefine_any_class && !other.can_redefine_any_class,
+            can_get_current_thread_cpu_time: self.can_get_current_thread_cpu_time && !other.can_get_current_thread_cpu_time,
+            can_get_thread_cpu_time: self.can_get_thread_cpu_time && !other.can_get_thread_cpu_time,
+            can_generate_method_entry_events: self.can_generate_method_entry_events && !other.can_generate_method_entry_events,
+            can_generate_method_exit_events: self.can_generate_method_exit_events && !other.can_generate_method_exit_events,
+            can_generate_all_class_hook_events: self.can_generate_all_class_hook_events && !other.can_generate_all_class_hook_events,
+            can_generate_compiled_method_load_events: self.can_generate_compiled_method_load_events && !other.can_generate_compiled_method_load_events,
+            can_generate_monitor_events: self.can_generate_monitor_events && !other.can_generate_monitor_events,
+            can_generate_vm_object_alloc_events: self.can_generate_vm_object_alloc_events && !other.can_generate_vm_object_alloc_events,
+            can_generate_native_method_bind_events: self.can_generate_native_method_bind_events && !other.can_generate_native_method_bind_events,
+            can_generate_garbage_collection_events: self.can_generate_garbage_collection_events && !other.can_generate_garbage_collection_events,
+            can_generate_object_free_events: self.can_generate_object_free_events && !other.can_generate_object_free_events,
+            can_force_early_return: self.can_force_early_return && !other.can_force_early_return,
+            can_get_owned_monitor_stack_depth_info: self.can_get_owned_monitor_stack_depth_info && !other.can_get_owned_monitor_stack_depth_info,
+            can_get_constant_pool: self.can_get_constant_pool && !other.can_get_constant_pool,
+            can_set_native_method_prefix: self.can_set_native_method_prefix && !other.can_set_native_method_prefix,
+            can_retransform_classes: self.can_retransform_classes && !other.can_retransform_classes,
+            can_retransform_any_class: self.can_retransform_any_class && !other.can_retransform_any_class,
+            can_generate_resource_exhaustion_heap_events: self.can_generate_resource_exhaustion_heap_events && !other.can_generate_resource_exhaustion_heap_events,
+            can_generate_resource_exhaustion_threads_events: self.can_generate_resource_exhaustion_threads_events && !other.can_generate_resource_exhaustion_threads_events,
+        }
+    }
+
+    /// The set of all capabilities that can potentially be granted.
+    pub fn potentially_available() -> Self {
+        Self {
+            can_tag_objects: true,
+            can_generate_field_modification_events: true,
+            can_generate_field_access_events: true,
+            can_get_bytecodes: true,
+            can_get_synthetic_attribute: true,
+            can_get_owned_monitor_info: true,
+            can_get_current_contended_monitor: true,
+            can_get_monitor_info: true,
+            can_pop_frame: true,
+            can_redefine_classes: true,
+            can_signal_thread: true,
+            can_get_source_file_name: true,
+            can_get_line_numbers: true,
+            can_get_source_debug_extension: true,
+            can_access_local_variables: true,
+            can_maintain_original_method_order: true,
+            can_generate_single_step_events: true,
+            can_generate_exception_events: true,
+            can_generate_frame_pop_events: true,
+            can_generate_breakpoint_events: true,
+            can_suspend: true,
+            can_redefine_any_class: true,
+            can_get_current_thread_cpu_time: true,
+            can_get_thread_cpu_time: true,
+            can_generate_method_entry_events: true,
+            can_generate_method_exit_events: true,
+            can_generate_all_class_hook_events: true,
+            can_generate_compiled_method_load_events: true,
+            can_generate_monitor_events: true,
+            can_generate_vm_object_alloc_events: true,
+            can_generate_native_method_bind_events: true,
+            can_generate_garbage_collection_events: true,
+            can_generate_object_free_events: true,
+            can_force_early_return: true,
+            can_get_owned_monitor_stack_depth_info: true,
+            can_get_constant_pool: true,
+            can_set_native_method_prefix: true,
+            can_retransform_classes: true,
+            can_retransform_any_class: true,
+            can_generate_resource_exhaustion_heap_events: true,
+            can_generate_resource_exhaustion_threads_events: true,
+        }
+    }
+
+    /// Returns true if no capabilities are set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal VM-model types (self-contained, no external deps)
+// ---------------------------------------------------------------------------
+
+/// Unique thread identifier within the JVMTI environment.
+pub type ThreadId = u64;
+
+/// Unique class identifier.
+pub type ClassId = u64;
+
+/// Unique method identifier.
+pub type MethodId = u64;
+
+/// Unique field identifier.
+pub type FieldId = u64;
+
+/// Thread state flags matching JVMTI spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadState(pub u32);
+
+impl ThreadState {
+    pub const ALIVE: u32 = 0x0001;
+    pub const TERMINATED: u32 = 0x0002;
+    pub const RUNNABLE: u32 = 0x0004;
+    pub const BLOCKED_ON_MONITOR: u32 = 0x0400;
+    pub const WAITING: u32 = 0x0080;
+    pub const WAITING_INDEFINITELY: u32 = 0x0010;
+    pub const WAITING_WITH_TIMEOUT: u32 = 0x0020;
+    pub const SLEEPING: u32 = 0x0040;
+    pub const SUSPENDED: u32 = 0x100000;
+    pub const INTERRUPTED: u32 = 0x200000;
+    pub const IN_NATIVE: u32 = 0x400000;
+}
+
+/// Information about a thread.
+#[derive(Debug, Clone)]
+pub struct ThreadInfo {
+    pub name: String,
+    pub priority: i32,
+    pub is_daemon: bool,
+    pub thread_group_name: String,
+    pub state: ThreadState,
+}
+
+/// A single frame in a stack trace.
+#[derive(Debug, Clone)]
+pub struct FrameInfo {
+    pub method_id: MethodId,
+    pub class_id: ClassId,
+    pub location: i64,
+    pub method_name: String,
+    pub class_name: String,
+}
+
+/// A value that can be stored in a local variable slot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalValue {
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Object(Option<u64>), // object reference or null
+}
+
+/// Information about a field.
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub field_id: FieldId,
+    pub name: String,
+    pub signature: String,
+    pub modifiers: u32,
+}
+
+/// Information about a method.
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub method_id: MethodId,
+    pub name: String,
+    pub signature: String,
+    pub modifiers: u32,
+    pub declaring_class: ClassId,
+}
+
+/// Information about a class.
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    pub class_id: ClassId,
+    pub name: String,
+    pub bytecode: Vec<u8>,
+    pub is_prepared: bool,
+    pub fields: Vec<FieldInfo>,
+    pub methods: Vec<MethodInfo>,
+}
+
+/// A breakpoint location.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BreakpointLocation {
+    pub class_id: ClassId,
+    pub method_id: MethodId,
+    pub location: i64,
+}
+
+/// A field watch (for access or modification).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldWatch {
+    pub class_id: ClassId,
+    pub field_id: FieldId,
+}
+
+// ---------------------------------------------------------------------------
+// Event Callbacks
+// ---------------------------------------------------------------------------
+
+/// Callback function types for each event kind. These mirror the JVMTI
+/// jvmtiEventCallbacks structure, adapted to Rust closures.
+pub struct EventCallbacks {
+    pub vm_init: Option<Box<dyn Fn() + Send + Sync>>,
+    pub vm_death: Option<Box<dyn Fn() + Send + Sync>>,
+    pub thread_start: Option<Box<dyn Fn(ThreadId) + Send + Sync>>,
+    pub thread_end: Option<Box<dyn Fn(ThreadId) + Send + Sync>>,
+    pub class_file_load_hook: Option<Box<dyn Fn(ClassId, &str, &[u8]) -> Option<Vec<u8>> + Send + Sync>>,
+    pub class_load: Option<Box<dyn Fn(ThreadId, ClassId) + Send + Sync>>,
+    pub class_prepare: Option<Box<dyn Fn(ThreadId, ClassId) + Send + Sync>>,
+    pub method_entry: Option<Box<dyn Fn(ThreadId, MethodId) + Send + Sync>>,
+    pub method_exit: Option<Box<dyn Fn(ThreadId, MethodId, bool, LocalValue) + Send + Sync>>,
+    pub exception: Option<Box<dyn Fn(ThreadId, MethodId, i64) + Send + Sync>>,
+    pub exception_catch: Option<Box<dyn Fn(ThreadId, MethodId, i64) + Send + Sync>>,
+    pub field_access: Option<Box<dyn Fn(ThreadId, MethodId, FieldId) + Send + Sync>>,
+    pub field_modification: Option<Box<dyn Fn(ThreadId, MethodId, FieldId) + Send + Sync>>,
+    pub breakpoint: Option<Box<dyn Fn(ThreadId, MethodId, i64) + Send + Sync>>,
+    pub single_step: Option<Box<dyn Fn(ThreadId, MethodId, i64) + Send + Sync>>,
+    pub frame_pop: Option<Box<dyn Fn(ThreadId, MethodId, bool) + Send + Sync>>,
+    pub gc_start: Option<Box<dyn Fn() + Send + Sync>>,
+    pub gc_finish: Option<Box<dyn Fn() + Send + Sync>>,
+    pub monitor_contended_enter: Option<Box<dyn Fn(ThreadId, u64) + Send + Sync>>,
+    pub monitor_contended_entered: Option<Box<dyn Fn(ThreadId, u64) + Send + Sync>>,
+    pub monitor_wait: Option<Box<dyn Fn(ThreadId, u64, i64) + Send + Sync>>,
+    pub monitor_waited: Option<Box<dyn Fn(ThreadId, u64, bool) + Send + Sync>>,
+    pub compiled_method_load: Option<Box<dyn Fn(MethodId, usize) + Send + Sync>>,
+    pub compiled_method_unload: Option<Box<dyn Fn(MethodId) + Send + Sync>>,
+    pub dynamic_code_generated: Option<Box<dyn Fn(&str, usize) + Send + Sync>>,
+    pub native_method_bind: Option<Box<dyn Fn(ThreadId, MethodId) + Send + Sync>>,
+    /// ObjectFree(tag) — called one-shot per tagged object that was collected.
+    pub object_free: Option<Box<dyn Fn(i64) + Send + Sync>>,
+    /// VMObjectAlloc(thread, obj_addr, class, size_bytes).
+    pub vm_object_alloc: Option<Box<dyn Fn(ThreadId, u64, ClassId, usize) + Send + Sync>>,
+    /// SampledObjectAlloc(thread, obj_addr, class, size_bytes).
+    pub sampled_object_alloc: Option<Box<dyn Fn(ThreadId, u64, ClassId, usize) + Send + Sync>>,
+    /// DataDumpRequest — parameterless heap-dump trigger.
+    pub data_dump_request: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl Default for EventCallbacks {
+    fn default() -> Self {
+        Self {
+            vm_init: None,
+            vm_death: None,
+            thread_start: None,
+            thread_end: None,
+            class_file_load_hook: None,
+            class_load: None,
+            class_prepare: None,
+            method_entry: None,
+            method_exit: None,
+            exception: None,
+            exception_catch: None,
+            field_access: None,
+            field_modification: None,
+            breakpoint: None,
+            single_step: None,
+            frame_pop: None,
+            gc_start: None,
+            gc_finish: None,
+            monitor_contended_enter: None,
+            monitor_contended_entered: None,
+            monitor_wait: None,
+            monitor_waited: None,
+            compiled_method_load: None,
+            compiled_method_unload: None,
+            dynamic_code_generated: None,
+            native_method_bind: None,
+            object_free: None,
+            vm_object_alloc: None,
+            sampled_object_alloc: None,
+            data_dump_request: None,
+        }
+    }
+}
+
+impl fmt::Debug for EventCallbacks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventCallbacks")
+            .field("vm_init", &self.vm_init.is_some())
+            .field("vm_death", &self.vm_death.is_some())
+            .field("thread_start", &self.thread_start.is_some())
+            .field("thread_end", &self.thread_end.is_some())
+            .field("class_file_load_hook", &self.class_file_load_hook.is_some())
+            .field("class_load", &self.class_load.is_some())
+            .field("class_prepare", &self.class_prepare.is_some())
+            .field("method_entry", &self.method_entry.is_some())
+            .field("method_exit", &self.method_exit.is_some())
+            .field("exception", &self.exception.is_some())
+            .field("breakpoint", &self.breakpoint.is_some())
+            .field("gc_start", &self.gc_start.is_some())
+            .field("gc_finish", &self.gc_finish.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event Manager
+// ---------------------------------------------------------------------------
+
+/// Tracks which events are enabled globally and per-thread, and delivers
+/// events to registered callbacks.
+///
+/// In addition to the manager's own callback table, extra `JvmtiEnv`s may be
+/// attached via [`JvmtiEventManager::register_env`]. When a fire_ method runs
+/// it dispatches to every attached env's callback table in turn, matching the
+/// JVMTI spec semantics where multiple agents may subscribe to the same event.
+///
+/// A per-manager [`AtomicBool`] is used as the no-agent fast path: when no
+/// environment has enabled any event and no callback is registered, the flag
+/// is false and fire_ methods exit in a single atomic load. This keeps the
+/// hot-path cost at O(1) (a single relaxed load + branch) when no tool is
+/// attached, which is the overwhelming common case.
+pub struct JvmtiEventManager {
+    /// Global event enable/disable state.
+    global_events: RwLock<HashSet<JvmtiEventKind>>,
+    /// Per-thread event enable/disable state.
+    thread_events: RwLock<HashMap<ThreadId, HashSet<JvmtiEventKind>>>,
+    /// Registered callbacks for event delivery.
+    callbacks: RwLock<EventCallbacks>,
+    /// Count of events fired, for diagnostics.
+    event_counts: Mutex<HashMap<JvmtiEventKind, u64>>,
+    /// Attached JVMTI environments (weak refs so envs may be dropped).
+    attached_envs: RwLock<Vec<Weak<JvmtiEnv>>>,
+    /// Fast-path flag: true iff any event is enabled OR any env is attached OR
+    /// any callback is registered. Checked first in every fire_ method so the
+    /// no-agent case costs a single atomic load.
+    any_listener: AtomicBool,
+    // T17.Δ — per-event fast-path flags. These let hot-path interpreter
+    // sites branch on a single `Acquire` load per dispatch without touching
+    // the manager's global maps. Set on Enable of the corresponding kind,
+    // cleared by `recompute_per_event_flags` when mode → Disable.
+    /// True iff any listener is interested in `MethodEntry`.
+    any_method_entry_listener: AtomicBool,
+    /// True iff any listener is interested in `MethodExit`.
+    any_method_exit_listener: AtomicBool,
+    /// True iff any listener is interested in `SingleStep`.
+    any_single_step_listener: AtomicBool,
+    /// True iff any listener is interested in `FieldAccess`.
+    any_field_access_listener: AtomicBool,
+    /// True iff any listener is interested in `FieldModification`.
+    any_field_modification_listener: AtomicBool,
+    /// True iff any listener is interested in `FramePop`.
+    any_frame_pop_listener: AtomicBool,
+    /// Bytes-allocated since last SampledObjectAlloc fire. Used by the
+    /// sampling sub-system to decide when to emit an event; reset by
+    /// fire_sampled_object_alloc when the sample threshold is reached.
+    sampling_bytes: AtomicU64,
+    /// Threshold (in bytes) for SampledObjectAlloc events. Default 512 KB.
+    sampling_threshold: AtomicU64,
+}
+
+/// Default sampling threshold for `SampledObjectAlloc`: 512 KB between fires.
+/// Matches the HotSpot `HeapMonitor` / `-XX:SamplingInterval=524288` default.
+pub const DEFAULT_SAMPLING_INTERVAL_BYTES: u64 = 512 * 1024;
+
+impl JvmtiEventManager {
+    pub fn new() -> Self {
+        Self {
+            global_events: RwLock::new(HashSet::new()),
+            thread_events: RwLock::new(HashMap::new()),
+            callbacks: RwLock::new(EventCallbacks::default()),
+            event_counts: Mutex::new(HashMap::new()),
+            attached_envs: RwLock::new(Vec::new()),
+            any_listener: AtomicBool::new(false),
+            any_method_entry_listener: AtomicBool::new(false),
+            any_method_exit_listener: AtomicBool::new(false),
+            any_single_step_listener: AtomicBool::new(false),
+            any_field_access_listener: AtomicBool::new(false),
+            any_field_modification_listener: AtomicBool::new(false),
+            any_frame_pop_listener: AtomicBool::new(false),
+            sampling_bytes: AtomicU64::new(0),
+            sampling_threshold: AtomicU64::new(DEFAULT_SAMPLING_INTERVAL_BYTES),
+        }
+    }
+
+    /// Recompute per-event fast-path flags from the current event-enable
+    /// state. Called after Enable / Disable of a relevant event kind so the
+    /// interpreter's per-opcode hot-path load sees the correct value.
+    fn recompute_per_event_flag(&self, kind: JvmtiEventKind) {
+        let global = self.global_events.read()
+            .map(|g| g.contains(&kind))
+            .unwrap_or(false);
+        let per_thread = self.thread_events.read()
+            .map(|t| t.values().any(|s| s.contains(&kind)))
+            .unwrap_or(false);
+        let enabled = global || per_thread;
+        match kind {
+            JvmtiEventKind::MethodEntry => self.any_method_entry_listener.store(enabled, Ordering::Release),
+            JvmtiEventKind::MethodExit => self.any_method_exit_listener.store(enabled, Ordering::Release),
+            JvmtiEventKind::SingleStep => self.any_single_step_listener.store(enabled, Ordering::Release),
+            JvmtiEventKind::FieldAccess => self.any_field_access_listener.store(enabled, Ordering::Release),
+            JvmtiEventKind::FieldModification => self.any_field_modification_listener.store(enabled, Ordering::Release),
+            JvmtiEventKind::FramePop => self.any_frame_pop_listener.store(enabled, Ordering::Release),
+            _ => {}
+        }
+    }
+
+    /// Fast-path query for `MethodEntry` listener. Single Acquire load.
+    #[inline]
+    pub fn has_method_entry_listener(&self) -> bool {
+        self.any_method_entry_listener.load(Ordering::Acquire)
+    }
+    /// Fast-path query for `MethodExit` listener.
+    #[inline]
+    pub fn has_method_exit_listener(&self) -> bool {
+        self.any_method_exit_listener.load(Ordering::Acquire)
+    }
+    /// Fast-path query for `SingleStep` listener.
+    #[inline]
+    pub fn has_single_step_listener(&self) -> bool {
+        self.any_single_step_listener.load(Ordering::Acquire)
+    }
+    /// Fast-path query for `FieldAccess` listener.
+    #[inline]
+    pub fn has_field_access_listener(&self) -> bool {
+        self.any_field_access_listener.load(Ordering::Acquire)
+    }
+    /// Fast-path query for `FieldModification` listener.
+    #[inline]
+    pub fn has_field_modification_listener(&self) -> bool {
+        self.any_field_modification_listener.load(Ordering::Acquire)
+    }
+    /// Fast-path query for `FramePop` listener.
+    #[inline]
+    pub fn has_frame_pop_listener(&self) -> bool {
+        self.any_frame_pop_listener.load(Ordering::Acquire)
+    }
+
+    /// Attach a JvmtiEnv so its callbacks are invoked when fire_ methods run.
+    /// The env is held by Weak<JvmtiEnv> so dropping the env does not keep
+    /// the manager from garbage-collecting it.
+    pub fn register_env(&self, env: &Arc<JvmtiEnv>) -> JvmtiResult<()> {
+        let mut list = self.attached_envs.write().map_err(|_| JvmtiError::Internal)?;
+        list.push(Arc::downgrade(env));
+        self.any_listener.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove an attached JvmtiEnv. Used during agent unload.
+    pub fn unregister_env(&self, env: &Arc<JvmtiEnv>) -> JvmtiResult<()> {
+        let any_env_left: bool;
+        {
+            let mut list = self.attached_envs.write().map_err(|_| JvmtiError::Internal)?;
+            let target = Arc::as_ptr(env) as usize;
+            list.retain(|w| {
+                w.upgrade()
+                    .map(|e| Arc::as_ptr(&e) as usize != target)
+                    .unwrap_or(false)
+            });
+            any_env_left = list.iter().any(|w| w.strong_count() > 0);
+        }
+        // Lock released above — now safe to re-check global/thread event state.
+        let have_global = self.global_events.read()
+            .map(|g| !g.is_empty())
+            .unwrap_or(false);
+        let have_thread = self.thread_events.read()
+            .map(|t| t.values().any(|s| !s.is_empty()))
+            .unwrap_or(false);
+        self.any_listener.store(any_env_left || have_global || have_thread, Ordering::Release);
+        Ok(())
+    }
+
+    /// Recompute the `any_listener` flag from the current state.
+    /// Called after env detach or event-mode disable operations.
+    fn recompute_any_listener(&self) {
+        let have_env = self.attached_envs.read()
+            .map(|l| l.iter().any(|w| w.strong_count() > 0))
+            .unwrap_or(false);
+        let have_global = self.global_events.read()
+            .map(|g| !g.is_empty())
+            .unwrap_or(false);
+        let have_thread = self.thread_events.read()
+            .map(|t| t.values().any(|s| !s.is_empty()))
+            .unwrap_or(false);
+        self.any_listener.store(have_env || have_global || have_thread, Ordering::Release);
+    }
+
+    /// Fast-path check: is any listener attached at all?
+    /// Single atomic load — O(1) when no agent is subscribed.
+    #[inline]
+    pub fn has_any_listener(&self) -> bool {
+        self.any_listener.load(Ordering::Acquire)
+    }
+
+    /// Configure the `SampledObjectAlloc` threshold (bytes between fires).
+    /// Setting to 0 means "fire on every allocation" (debug only).
+    pub fn set_sampling_interval(&self, bytes: u64) {
+        self.sampling_threshold.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Current `SampledObjectAlloc` threshold in bytes.
+    pub fn sampling_interval(&self) -> u64 {
+        self.sampling_threshold.load(Ordering::Relaxed)
+    }
+
+    /// Set event notification mode globally or for a specific thread.
+    pub fn set_event_notification_mode(
+        &self,
+        mode: EventMode,
+        event_kind: JvmtiEventKind,
+        thread: Option<ThreadId>,
+    ) -> JvmtiResult<()> {
+        match thread {
+            None => {
+                let mut global = self.global_events.write()
+                    .map_err(|_| JvmtiError::Internal)?;
+                match mode {
+                    EventMode::Enable => { global.insert(event_kind); }
+                    EventMode::Disable => { global.remove(&event_kind); }
+                }
+                // Lock dropped at end of scope.
+            }
+            Some(tid) => {
+                let mut per_thread = self.thread_events.write()
+                    .map_err(|_| JvmtiError::Internal)?;
+                let set = per_thread.entry(tid).or_default();
+                match mode {
+                    EventMode::Enable => { set.insert(event_kind); }
+                    EventMode::Disable => { set.remove(&event_kind); }
+                }
+            }
+        }
+        // Fast-path flag must reflect the new state. Locks above have been
+        // released; `recompute_any_listener` re-takes read locks safely.
+        match mode {
+            EventMode::Enable => self.any_listener.store(true, Ordering::Release),
+            EventMode::Disable => self.recompute_any_listener(),
+        }
+        // T17.Δ — keep the per-event flag in sync regardless of mode so the
+        // hot-path interpreter sites see the correct value on both enable
+        // and disable transitions.
+        self.recompute_per_event_flag(event_kind);
+        Ok(())
+    }
+
+    /// Check if an event is enabled (globally or for the given thread).
+    pub fn is_event_enabled(&self, event_kind: JvmtiEventKind, thread: Option<ThreadId>) -> bool {
+        let global = match self.global_events.read() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if global.contains(&event_kind) {
+            return true;
+        }
+        if let Some(tid) = thread {
+            let per_thread = match self.thread_events.read() {
+                Ok(pt) => pt,
+                Err(_) => return false,
+            };
+            if let Some(set) = per_thread.get(&tid) {
+                return set.contains(&event_kind);
+            }
+        }
+        false
+    }
+
+    /// Set the full callback table. Replaces all previous callbacks.
+    pub fn set_event_callbacks(&self, cbs: EventCallbacks) -> JvmtiResult<()> {
+        let mut current = self.callbacks.write().map_err(|_| JvmtiError::Internal)?;
+        *current = cbs;
+        drop(current);
+        // Installing callbacks implies the caller wants events to be delivered
+        // (even if mode is not yet Enabled — match existing tests that call
+        // fire_* directly). Setting the flag is safe: fire_ methods still
+        // gate on is_event_enabled before recording/dispatching.
+        self.any_listener.store(true, Ordering::Release);
+        // T17.Δ — refresh all per-event flags.  set_event_callbacks installs
+        // callbacks but doesn't necessarily Enable a mode; however,  tests
+        // that skip set_event_notification_mode and invoke fire_ directly
+        // (see test_event_callbacks_fire) expect dispatch even so. Keep each
+        // per-event flag in sync with the *actual* enabled state so the
+        // interpreter fast path remains correct.
+        for kind in JvmtiEventKind::ALL {
+            self.recompute_per_event_flag(*kind);
+        }
+        Ok(())
+    }
+
+    /// Increment the event counter for the given kind.
+    fn record_event(&self, kind: JvmtiEventKind) {
+        if let Ok(mut counts) = self.event_counts.lock() {
+            *counts.entry(kind).or_insert(0) += 1;
+        }
+    }
+
+    /// Get the total number of events fired for a given kind.
+    pub fn event_count(&self, kind: JvmtiEventKind) -> u64 {
+        self.event_counts.lock()
+            .map(|c| c.get(&kind).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    // --- Event firing methods ---
+
+    pub fn fire_vm_init(&self) {
+        if !self.is_event_enabled(JvmtiEventKind::VmInit, None) { return; }
+        self.record_event(JvmtiEventKind::VmInit);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.vm_init { cb(); }
+        }
+    }
+
+    pub fn fire_vm_death(&self) {
+        if !self.is_event_enabled(JvmtiEventKind::VmDeath, None) { return; }
+        self.record_event(JvmtiEventKind::VmDeath);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.vm_death { cb(); }
+        }
+    }
+
+    pub fn fire_thread_start(&self, thread: ThreadId) {
+        if !self.is_event_enabled(JvmtiEventKind::ThreadStart, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::ThreadStart);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.thread_start { cb(thread); }
+        }
+    }
+
+    pub fn fire_thread_end(&self, thread: ThreadId) {
+        if !self.is_event_enabled(JvmtiEventKind::ThreadEnd, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::ThreadEnd);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.thread_end { cb(thread); }
+        }
+    }
+
+    /// Fire ClassFileLoadHook. Returns transformed bytes if the callback
+    /// provides a replacement, otherwise None.
+    pub fn fire_class_file_load_hook(
+        &self,
+        class_id: ClassId,
+        class_name: &str,
+        bytecode: &[u8],
+    ) -> Option<Vec<u8>> {
+        if !self.is_event_enabled(JvmtiEventKind::ClassFileLoadHook, None) { return None; }
+        self.record_event(JvmtiEventKind::ClassFileLoadHook);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.class_file_load_hook {
+                return cb(class_id, class_name, bytecode);
+            }
+        }
+        None
+    }
+
+    pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
+        if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::ClassLoad);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.class_load { cb(thread, class_id); }
+        }
+    }
+
+    pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
+        if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::ClassPrepare);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.class_prepare { cb(thread, class_id); }
+        }
+    }
+
+    pub fn fire_method_entry(&self, thread: ThreadId, method: MethodId) {
+        if !self.is_event_enabled(JvmtiEventKind::MethodEntry, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::MethodEntry);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.method_entry {
+                // Panic-safe: agent callbacks may panic, don't bring down VM.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.method_entry {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method)));
+                }
+            }
+        }
+    }
+
+    pub fn fire_method_exit(&self, thread: ThreadId, method: MethodId, was_popped_by_exception: bool, return_value: LocalValue) {
+        if !self.is_event_enabled(JvmtiEventKind::MethodExit, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::MethodExit);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.method_exit {
+                let rv = return_value.clone();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception, rv)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.method_exit {
+                    let rv = return_value.clone();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception, rv)));
+                }
+            }
+        }
+    }
+
+    pub fn fire_exception(&self, thread: ThreadId, method: MethodId, location: i64) {
+        if !self.is_event_enabled(JvmtiEventKind::Exception, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::Exception);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.exception { cb(thread, method, location); }
+        }
+    }
+
+    pub fn fire_exception_catch(&self, thread: ThreadId, method: MethodId, location: i64) {
+        if !self.is_event_enabled(JvmtiEventKind::ExceptionCatch, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::ExceptionCatch);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.exception_catch { cb(thread, method, location); }
+        }
+    }
+
+    pub fn fire_field_access(&self, thread: ThreadId, method: MethodId, field: FieldId) {
+        if !self.is_event_enabled(JvmtiEventKind::FieldAccess, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::FieldAccess);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.field_access {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.field_access {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+                }
+            }
+        }
+    }
+
+    pub fn fire_field_modification(&self, thread: ThreadId, method: MethodId, field: FieldId) {
+        if !self.is_event_enabled(JvmtiEventKind::FieldModification, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::FieldModification);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.field_modification {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.field_modification {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+                }
+            }
+        }
+    }
+
+    pub fn fire_breakpoint(&self, thread: ThreadId, method: MethodId, location: i64) {
+        if !self.is_event_enabled(JvmtiEventKind::Breakpoint, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::Breakpoint);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.breakpoint { cb(thread, method, location); }
+        }
+    }
+
+    pub fn fire_single_step(&self, thread: ThreadId, method: MethodId, location: i64) {
+        if !self.is_event_enabled(JvmtiEventKind::SingleStep, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::SingleStep);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.single_step {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, location)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.single_step {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, location)));
+                }
+            }
+        }
+    }
+
+    pub fn fire_frame_pop(&self, thread: ThreadId, method: MethodId, was_popped_by_exception: bool) {
+        if !self.is_event_enabled(JvmtiEventKind::FramePop, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::FramePop);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.frame_pop {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.frame_pop {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception)));
+                }
+            }
+        }
+    }
+
+    pub fn fire_gc_start(&self) {
+        if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionStart, None) { return; }
+        self.record_event(JvmtiEventKind::GarbageCollectionStart);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.gc_start { cb(); }
+        }
+    }
+
+    pub fn fire_gc_finish(&self) {
+        if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionFinish, None) { return; }
+        self.record_event(JvmtiEventKind::GarbageCollectionFinish);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.gc_finish { cb(); }
+        }
+    }
+
+    pub fn fire_monitor_contended_enter(&self, thread: ThreadId, object: u64) {
+        if !self.is_event_enabled(JvmtiEventKind::MonitorContendedEnter, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::MonitorContendedEnter);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.monitor_contended_enter { cb(thread, object); }
+        }
+    }
+
+    pub fn fire_monitor_contended_entered(&self, thread: ThreadId, object: u64) {
+        if !self.is_event_enabled(JvmtiEventKind::MonitorContendedEntered, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::MonitorContendedEntered);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.monitor_contended_entered { cb(thread, object); }
+        }
+    }
+
+    pub fn fire_monitor_wait(&self, thread: ThreadId, object: u64, timeout: i64) {
+        if !self.is_event_enabled(JvmtiEventKind::MonitorWait, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::MonitorWait);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.monitor_wait { cb(thread, object, timeout); }
+        }
+    }
+
+    pub fn fire_monitor_waited(&self, thread: ThreadId, object: u64, timed_out: bool) {
+        if !self.is_event_enabled(JvmtiEventKind::MonitorWaited, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::MonitorWaited);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.monitor_waited { cb(thread, object, timed_out); }
+        }
+    }
+
+    pub fn fire_compiled_method_load(&self, method: MethodId, code_size: usize) {
+        if !self.is_event_enabled(JvmtiEventKind::CompiledMethodLoad, None) { return; }
+        self.record_event(JvmtiEventKind::CompiledMethodLoad);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.compiled_method_load { cb(method, code_size); }
+        }
+    }
+
+    pub fn fire_compiled_method_unload(&self, method: MethodId) {
+        if !self.is_event_enabled(JvmtiEventKind::CompiledMethodUnload, None) { return; }
+        self.record_event(JvmtiEventKind::CompiledMethodUnload);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.compiled_method_unload { cb(method); }
+        }
+    }
+
+    pub fn fire_dynamic_code_generated(&self, name: &str, code_size: usize) {
+        if !self.is_event_enabled(JvmtiEventKind::DynamicCodeGenerated, None) { return; }
+        self.record_event(JvmtiEventKind::DynamicCodeGenerated);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.dynamic_code_generated { cb(name, code_size); }
+        }
+    }
+
+    pub fn fire_native_method_bind(&self, thread: ThreadId, method: MethodId) {
+        if !self.is_event_enabled(JvmtiEventKind::NativeMethodBind, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::NativeMethodBind);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.native_method_bind { cb(thread, method); }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // T6.3.1 — New event kinds wired to real safepoints
+    // ------------------------------------------------------------------
+
+    /// Snapshot the set of currently-attached envs, pruning dead weak refs.
+    ///
+    /// The returned vector holds strong [`Arc<JvmtiEnv>`] handles so the list
+    /// remains valid for the duration of callback dispatch even if the
+    /// manager's `attached_envs` list is concurrently mutated. Pruning of
+    /// dropped envs is piggy-backed onto this call so the manager amortizes
+    /// cleanup cost across fire_ invocations (no separate sweep thread).
+    fn snapshot_envs(&self) -> Vec<Arc<JvmtiEnv>> {
+        // Read-lock first: typical case is empty or unchanged list.
+        if let Ok(list) = self.attached_envs.read() {
+            let strong: Vec<Arc<JvmtiEnv>> =
+                list.iter().filter_map(|w| w.upgrade()).collect();
+            if strong.len() == list.len() {
+                return strong;
+            }
+        }
+        // Some entries died — take write lock and prune.
+        if let Ok(mut list) = self.attached_envs.write() {
+            list.retain(|w| w.strong_count() > 0);
+            list.iter().filter_map(|w| w.upgrade()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Dispatch the ObjectFree callback registered on each attached env.
+    /// Intentionally separate from the self-callbacks path so agent-specific
+    /// tags are delivered via the env whose JVMTI instance issued SetTag.
+    fn dispatch_object_free(&self, tag: i64) {
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.object_free { cb(tag); }
+            }
+        }
+    }
+
+    /// Fire ObjectFree — called once per tagged object that was collected.
+    ///
+    /// `tag` is the user-defined tag installed via SetTag. A tag of 0 means
+    /// "no tag" and should not normally reach this path; callers (the GC's
+    /// tag-sweep step) are expected to filter those out.
+    pub fn fire_object_free(&self, tag: i64) {
+        if !self.has_any_listener() { return; }
+        if !self.is_event_enabled(JvmtiEventKind::ObjectFree, None) { return; }
+        self.record_event(JvmtiEventKind::ObjectFree);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.object_free { cb(tag); }
+        }
+        self.dispatch_object_free(tag);
+    }
+
+    /// Fire VMObjectAlloc — called on every Java object allocation when the
+    /// agent holds `can_generate_vm_object_alloc_events`. This is on the
+    /// allocation hot path; callers MUST consult `has_any_listener` first
+    /// (the method itself checks again but inlining the fast-path check at
+    /// the call site lets the caller skip building the arguments too).
+    pub fn fire_vm_object_alloc(
+        &self,
+        thread: ThreadId,
+        object_addr: u64,
+        class_id: ClassId,
+        size: usize,
+    ) {
+        if !self.has_any_listener() { return; }
+        if !self.is_event_enabled(JvmtiEventKind::VMObjectAlloc, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::VMObjectAlloc);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.vm_object_alloc { cb(thread, object_addr, class_id, size); }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.vm_object_alloc { cb(thread, object_addr, class_id, size); }
+            }
+        }
+    }
+
+    /// Record an allocation of `bytes` bytes and, if the running sum crosses
+    /// the sampling threshold, fire a SampledObjectAlloc event and reset the
+    /// counter. Returns true iff an event was fired.
+    ///
+    /// This is the intended entry point for the allocation fast path: it
+    /// is a single relaxed fetch_add plus a branch when no agent has
+    /// requested sampling, making it cheap enough to call per-allocation.
+    pub fn record_allocation_sample(
+        &self,
+        thread: ThreadId,
+        object_addr: u64,
+        class_id: ClassId,
+        size: usize,
+    ) -> bool {
+        // Hot-path: no listener → single atomic load + return.
+        if !self.has_any_listener() { return false; }
+        if !self.is_event_enabled(JvmtiEventKind::SampledObjectAlloc, Some(thread)) {
+            return false;
+        }
+        let threshold = self.sampling_threshold.load(Ordering::Relaxed);
+        let prev = self.sampling_bytes.fetch_add(size as u64, Ordering::Relaxed);
+        if threshold == 0 || prev.wrapping_add(size as u64) < threshold {
+            return false;
+        }
+        // Reached threshold — reset and fire.
+        self.sampling_bytes.store(0, Ordering::Relaxed);
+        self.fire_sampled_object_alloc(thread, object_addr, class_id, size);
+        true
+    }
+
+    /// Fire SampledObjectAlloc directly, bypassing the rate-limiting counter.
+    /// Normally callers should prefer [`record_allocation_sample`] which
+    /// enforces the sampling interval.
+    pub fn fire_sampled_object_alloc(
+        &self,
+        thread: ThreadId,
+        object_addr: u64,
+        class_id: ClassId,
+        size: usize,
+    ) {
+        if !self.is_event_enabled(JvmtiEventKind::SampledObjectAlloc, Some(thread)) { return; }
+        self.record_event(JvmtiEventKind::SampledObjectAlloc);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.sampled_object_alloc {
+                cb(thread, object_addr, class_id, size);
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.sampled_object_alloc {
+                    cb(thread, object_addr, class_id, size);
+                }
+            }
+        }
+    }
+
+    /// Fire DataDumpRequest — called when a debugger asks for a heap dump.
+    /// Parameterless by spec; the agent is expected to call into IterateOverHeap
+    /// (or similar) from inside the callback to materialize the dump.
+    pub fn fire_data_dump_request(&self) {
+        if !self.has_any_listener() { return; }
+        if !self.is_event_enabled(JvmtiEventKind::DataDumpRequest, None) { return; }
+        self.record_event(JvmtiEventKind::DataDumpRequest);
+        if let Ok(cbs) = self.callbacks.read() {
+            if let Some(ref cb) = cbs.data_dump_request { cb(); }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.data_dump_request { cb(); }
+            }
+        }
+    }
+}
+
+impl Default for JvmtiEventManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent Loading Support
+// ---------------------------------------------------------------------------
+
+/// A registered agent (native or Java).
+#[derive(Debug, Clone)]
+pub struct AgentEntry {
+    pub name: String,
+    pub path: String,
+    pub options: String,
+    pub is_java_agent: bool,
+    pub loaded: bool,
+}
+
+/// Registry of JVMTI agents loaded via command-line options.
+pub struct AgentRegistry {
+    agents: Vec<AgentEntry>,
+    /// Callbacks invoked during Agent_OnLoad (indexed by agent name).
+    on_load_callbacks: HashMap<String, Box<dyn Fn(&str) -> i32 + Send + Sync>>,
+    /// Callbacks invoked during Agent_OnUnload (indexed by agent name).
+    on_unload_callbacks: HashMap<String, Box<dyn Fn() + Send + Sync>>,
+}
+
+impl fmt::Debug for AgentRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentRegistry")
+            .field("agents", &self.agents)
+            .field("on_load_count", &self.on_load_callbacks.len())
+            .field("on_unload_count", &self.on_unload_callbacks.len())
+            .finish()
+    }
+}
+
+impl AgentRegistry {
+    pub fn new() -> Self {
+        Self {
+            agents: Vec::new(),
+            on_load_callbacks: HashMap::new(),
+            on_unload_callbacks: HashMap::new(),
+        }
+    }
+
+    /// Parse a command-line agent option and register the agent.
+    ///
+    /// Supported formats:
+    /// - `-agentlib:name[=options]`
+    /// - `-agentpath:path[=options]`
+    /// - `-javaagent:jarpath[=options]`
+    pub fn parse_agent_option(&mut self, arg: &str) -> JvmtiResult<()> {
+        if let Some(rest) = arg.strip_prefix("-agentlib:") {
+            let (name, options) = split_agent_arg(rest);
+            // For agentlib, the path is platform-dependent library lookup
+            let path = format!("lib{}.so", name); // simplified; real impl uses platform search
+            self.agents.push(AgentEntry {
+                name: name.to_string(),
+                path,
+                options: options.to_string(),
+                is_java_agent: false,
+                loaded: false,
+            });
+            Ok(())
+        } else if let Some(rest) = arg.strip_prefix("-agentpath:") {
+            let (path, options) = split_agent_arg(rest);
+            let name = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path)
+                .to_string();
+            self.agents.push(AgentEntry {
+                name,
+                path: path.to_string(),
+                options: options.to_string(),
+                is_java_agent: false,
+                loaded: false,
+            });
+            Ok(())
+        } else if let Some(rest) = arg.strip_prefix("-javaagent:") {
+            let (jar_path, options) = split_agent_arg(rest);
+            let name = std::path::Path::new(jar_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(jar_path)
+                .to_string();
+            self.agents.push(AgentEntry {
+                name,
+                path: jar_path.to_string(),
+                options: options.to_string(),
+                is_java_agent: true,
+                loaded: false,
+            });
+            Ok(())
+        } else {
+            Err(JvmtiError::IllegalArgument)
+        }
+    }
+
+    /// Register an Agent_OnLoad callback for testing or embedded agents.
+    pub fn register_on_load<F>(&mut self, name: &str, callback: F)
+    where
+        F: Fn(&str) -> i32 + Send + Sync + 'static,
+    {
+        self.on_load_callbacks.insert(name.to_string(), Box::new(callback));
+    }
+
+    /// Register an Agent_OnUnload callback.
+    pub fn register_on_unload<F>(&mut self, name: &str, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_unload_callbacks.insert(name.to_string(), Box::new(callback));
+    }
+
+    /// Load all registered agents by invoking their Agent_OnLoad callbacks.
+    /// Returns the number of successfully loaded agents.
+    pub fn load_agents(&mut self) -> JvmtiResult<usize> {
+        let mut loaded_count = 0usize;
+        for agent in &mut self.agents {
+            if agent.loaded {
+                continue;
+            }
+            // For native agents with registered callbacks, invoke them.
+            // For agents without callbacks (real dlopen case), mark them as loaded
+            // since actual native library loading requires OS-level dlopen which
+            // is handled at the VM bootstrap level.
+            agent.loaded = true;
+            loaded_count += 1;
+        }
+        // Now invoke on_load callbacks for agents that have them registered
+        let agent_snapshot: Vec<(String, String)> = self.agents.iter()
+            .map(|a| (a.name.clone(), a.options.clone()))
+            .collect();
+        for (name, options) in &agent_snapshot {
+            if let Some(cb) = self.on_load_callbacks.get(name.as_str()) {
+                let result = cb(options);
+                if result != 0 {
+                    // Non-zero return means agent load failed; mark it unloaded
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a.name == *name) {
+                        agent.loaded = false;
+                        loaded_count = loaded_count.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        Ok(loaded_count)
+    }
+
+    /// Unload all loaded agents by invoking their Agent_OnUnload callbacks.
+    pub fn unload_agents(&mut self) {
+        let names: Vec<String> = self.agents.iter()
+            .filter(|a| a.loaded)
+            .map(|a| a.name.clone())
+            .collect();
+        for name in &names {
+            if let Some(cb) = self.on_unload_callbacks.get(name.as_str()) {
+                cb();
+            }
+        }
+        for agent in &mut self.agents {
+            agent.loaded = false;
+        }
+    }
+
+    /// Get all registered agents.
+    pub fn agents(&self) -> &[AgentEntry] {
+        &self.agents
+    }
+
+    /// Get loaded agent count.
+    pub fn loaded_count(&self) -> usize {
+        self.agents.iter().filter(|a| a.loaded).count()
+    }
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Split an agent argument at the first `=` sign into (name_or_path, options).
+fn split_agent_arg(s: &str) -> (&str, &str) {
+    match s.find('=') {
+        Some(idx) => (&s[..idx], &s[idx + 1..]),
+        None => (s, ""),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JVMTI Environment — the main function table
+// ---------------------------------------------------------------------------
+
+/// The JVMTI environment, exposing all major JVMTI functions.
+/// This is the central struct that agents interact with.
+pub struct JvmtiEnv {
+    /// Current capabilities granted to this environment.
+    capabilities: RwLock<JvmtiCapabilities>,
+    /// Event management.
+    pub event_manager: Arc<JvmtiEventManager>,
+    /// Agent registry.
+    pub agent_registry: Mutex<AgentRegistry>,
+    /// Thread registry: maps thread IDs to their info.
+    threads: RwLock<HashMap<ThreadId, ThreadInfo>>,
+    /// Suspended threads set.
+    suspended_threads: RwLock<HashSet<ThreadId>>,
+    /// Stack traces per thread (most recent snapshot).
+    stack_traces: RwLock<HashMap<ThreadId, Vec<FrameInfo>>>,
+    /// Active breakpoints.
+    breakpoints: RwLock<HashSet<BreakpointLocation>>,
+    /// Active field access watches.
+    field_access_watches: RwLock<HashSet<FieldWatch>>,
+    /// Active field modification watches.
+    field_modification_watches: RwLock<HashSet<FieldWatch>>,
+    /// Class registry for introspection.
+    classes: RwLock<HashMap<ClassId, ClassInfo>>,
+    /// Local variable table per thread per frame depth.
+    local_variables: RwLock<HashMap<(ThreadId, u32), HashMap<u32, LocalValue>>>,
+    /// System properties.
+    system_properties: RwLock<HashMap<String, String>>,
+    /// Retransform bytecode transformer callback.
+    retransform_hook: Mutex<Option<Box<dyn Fn(ClassId, &[u8]) -> Vec<u8> + Send + Sync>>>,
+    /// GC trigger callback (delegates to VM's GC subsystem).
+    gc_trigger: Mutex<Option<Box<dyn Fn() -> bool + Send + Sync>>>,
+}
+
+impl JvmtiEnv {
+    /// Create a new JVMTI environment with default (empty) capabilities.
+    pub fn new() -> Self {
+        Self {
+            capabilities: RwLock::new(JvmtiCapabilities::default()),
+            event_manager: Arc::new(JvmtiEventManager::new()),
+            agent_registry: Mutex::new(AgentRegistry::new()),
+            threads: RwLock::new(HashMap::new()),
+            suspended_threads: RwLock::new(HashSet::new()),
+            stack_traces: RwLock::new(HashMap::new()),
+            breakpoints: RwLock::new(HashSet::new()),
+            field_access_watches: RwLock::new(HashSet::new()),
+            field_modification_watches: RwLock::new(HashSet::new()),
+            classes: RwLock::new(HashMap::new()),
+            local_variables: RwLock::new(HashMap::new()),
+            system_properties: RwLock::new(HashMap::new()),
+            retransform_hook: Mutex::new(None),
+            gc_trigger: Mutex::new(None),
+        }
+    }
+
+    // --- Version & Error ---
+
+    /// GetVersionNumber: return the JVMTI version.
+    pub fn get_version_number(&self) -> u32 {
+        JVMTI_VERSION_11
+    }
+
+    /// GetErrorName: return the standard name for an error code.
+    pub fn get_error_name(&self, error: JvmtiError) -> &'static str {
+        error.name()
+    }
+
+    // --- Event Notification ---
+
+    /// SetEventNotificationMode: enable or disable an event globally or per-thread.
+    pub fn set_event_notification_mode(
+        &self,
+        mode: EventMode,
+        event_kind: JvmtiEventKind,
+        thread: Option<ThreadId>,
+    ) -> JvmtiResult<()> {
+        self.event_manager.set_event_notification_mode(mode, event_kind, thread)
+    }
+
+    // --- Thread Functions ---
+
+    /// Register a thread with the JVMTI environment (called by VM on thread creation).
+    pub fn register_thread(&self, id: ThreadId, info: ThreadInfo) -> JvmtiResult<()> {
+        let mut threads = self.threads.write().map_err(|_| JvmtiError::Internal)?;
+        threads.insert(id, info);
+        Ok(())
+    }
+
+    /// Unregister a thread (called by VM on thread death).
+    pub fn unregister_thread(&self, id: ThreadId) -> JvmtiResult<()> {
+        let mut threads = self.threads.write().map_err(|_| JvmtiError::Internal)?;
+        threads.remove(&id);
+        let mut suspended = self.suspended_threads.write().map_err(|_| JvmtiError::Internal)?;
+        suspended.remove(&id);
+        let mut traces = self.stack_traces.write().map_err(|_| JvmtiError::Internal)?;
+        traces.remove(&id);
+        Ok(())
+    }
+
+    /// GetAllThreads: return all live thread IDs.
+    pub fn get_all_threads(&self) -> JvmtiResult<Vec<ThreadId>> {
+        let threads = self.threads.read().map_err(|_| JvmtiError::Internal)?;
+        Ok(threads.keys().copied().collect())
+    }
+
+    /// GetThreadInfo: return information about a thread.
+    pub fn get_thread_info(&self, thread: ThreadId) -> JvmtiResult<ThreadInfo> {
+        let threads = self.threads.read().map_err(|_| JvmtiError::Internal)?;
+        threads.get(&thread).cloned().ok_or(JvmtiError::InvalidThread)
+    }
+
+    /// GetThreadState: return the state of a thread.
+    pub fn get_thread_state(&self, thread: ThreadId) -> JvmtiResult<ThreadState> {
+        let threads = self.threads.read().map_err(|_| JvmtiError::Internal)?;
+        let info = threads.get(&thread).ok_or(JvmtiError::InvalidThread)?;
+        let suspended = self.suspended_threads.read().map_err(|_| JvmtiError::Internal)?;
+        let mut state = info.state.0;
+        if suspended.contains(&thread) {
+            state |= ThreadState::SUSPENDED;
+        }
+        Ok(ThreadState(state))
+    }
+
+    /// SuspendThread: suspend a thread's execution.
+    pub fn suspend_thread(&self, thread: ThreadId) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_suspend {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        let threads = self.threads.read().map_err(|_| JvmtiError::Internal)?;
+        if !threads.contains_key(&thread) {
+            return Err(JvmtiError::InvalidThread);
+        }
+        drop(threads);
+        let mut suspended = self.suspended_threads.write().map_err(|_| JvmtiError::Internal)?;
+        if suspended.contains(&thread) {
+            return Err(JvmtiError::ThreadSuspended);
+        }
+        suspended.insert(thread);
+        Ok(())
+    }
+
+    /// ResumeThread: resume a suspended thread.
+    pub fn resume_thread(&self, thread: ThreadId) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_suspend {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        let mut suspended = self.suspended_threads.write().map_err(|_| JvmtiError::Internal)?;
+        if !suspended.remove(&thread) {
+            return Err(JvmtiError::ThreadNotSuspended);
+        }
+        Ok(())
+    }
+
+    // --- Stack Trace ---
+
+    /// Update the stack trace for a thread (called by VM during execution).
+    pub fn set_stack_trace(&self, thread: ThreadId, frames: Vec<FrameInfo>) -> JvmtiResult<()> {
+        let mut traces = self.stack_traces.write().map_err(|_| JvmtiError::Internal)?;
+        traces.insert(thread, frames);
+        Ok(())
+    }
+
+    /// GetStackTrace: return the stack trace for a thread, limited to max_count frames.
+    pub fn get_stack_trace(&self, thread: ThreadId, start_depth: u32, max_count: u32) -> JvmtiResult<Vec<FrameInfo>> {
+        let traces = self.stack_traces.read().map_err(|_| JvmtiError::Internal)?;
+        let frames = traces.get(&thread).ok_or(JvmtiError::InvalidThread)?;
+        let start = start_depth as usize;
+        if start >= frames.len() && !frames.is_empty() {
+            return Err(JvmtiError::NoMoreFrames);
+        }
+        let end = std::cmp::min(start + max_count as usize, frames.len());
+        Ok(frames[start..end].to_vec())
+    }
+
+    /// GetFrameCount: return the number of frames on a thread's stack.
+    pub fn get_frame_count(&self, thread: ThreadId) -> JvmtiResult<u32> {
+        let traces = self.stack_traces.read().map_err(|_| JvmtiError::Internal)?;
+        let frames = traces.get(&thread).ok_or(JvmtiError::InvalidThread)?;
+        Ok(frames.len() as u32)
+    }
+
+    // --- GC ---
+
+    /// Register a GC trigger callback. The VM provides this to connect JVMTI
+    /// ForceGarbageCollection to the real GC subsystem.
+    pub fn set_gc_trigger<F>(&self, trigger: F) -> JvmtiResult<()>
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        let mut gc = self.gc_trigger.lock().map_err(|_| JvmtiError::Internal)?;
+        *gc = Some(Box::new(trigger));
+        Ok(())
+    }
+
+    /// ForceGarbageCollection: request a GC cycle.
+    pub fn force_garbage_collection(&self) -> JvmtiResult<()> {
+        let gc = self.gc_trigger.lock().map_err(|_| JvmtiError::Internal)?;
+        match gc.as_ref() {
+            Some(trigger) => {
+                trigger();
+                Ok(())
+            }
+            None => {
+                // No GC subsystem connected; this is valid per spec (best-effort).
+                Ok(())
+            }
+        }
+    }
+
+    // --- Breakpoints ---
+
+    /// SetBreakpoint: set a breakpoint at the given location.
+    pub fn set_breakpoint(&self, location: BreakpointLocation) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_generate_breakpoint_events {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        let mut bps = self.breakpoints.write().map_err(|_| JvmtiError::Internal)?;
+        if !bps.insert(location) {
+            return Err(JvmtiError::Duplicate);
+        }
+        Ok(())
+    }
+
+    /// ClearBreakpoint: remove a breakpoint at the given location.
+    pub fn clear_breakpoint(&self, location: &BreakpointLocation) -> JvmtiResult<()> {
+        let mut bps = self.breakpoints.write().map_err(|_| JvmtiError::Internal)?;
+        if !bps.remove(location) {
+            return Err(JvmtiError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Check if a breakpoint is set at the given location.
+    pub fn has_breakpoint(&self, location: &BreakpointLocation) -> bool {
+        self.breakpoints.read()
+            .map(|bps| bps.contains(location))
+            .unwrap_or(false)
+    }
+
+    // --- Field Watches ---
+
+    /// SetFieldAccessWatch: register a watch on field access.
+    pub fn set_field_access_watch(&self, watch: FieldWatch) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_generate_field_access_events {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        let mut watches = self.field_access_watches.write().map_err(|_| JvmtiError::Internal)?;
+        if !watches.insert(watch) {
+            return Err(JvmtiError::Duplicate);
+        }
+        Ok(())
+    }
+
+    /// ClearFieldAccessWatch: remove a field access watch.
+    pub fn clear_field_access_watch(&self, watch: &FieldWatch) -> JvmtiResult<()> {
+        let mut watches = self.field_access_watches.write().map_err(|_| JvmtiError::Internal)?;
+        if !watches.remove(watch) {
+            return Err(JvmtiError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// SetFieldModificationWatch: register a watch on field modification.
+    pub fn set_field_modification_watch(&self, watch: FieldWatch) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_generate_field_modification_events {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        let mut watches = self.field_modification_watches.write().map_err(|_| JvmtiError::Internal)?;
+        if !watches.insert(watch) {
+            return Err(JvmtiError::Duplicate);
+        }
+        Ok(())
+    }
+
+    /// ClearFieldModificationWatch: remove a field modification watch.
+    pub fn clear_field_modification_watch(&self, watch: &FieldWatch) -> JvmtiResult<()> {
+        let mut watches = self.field_modification_watches.write().map_err(|_| JvmtiError::Internal)?;
+        if !watches.remove(watch) {
+            return Err(JvmtiError::NotFound);
+        }
+        Ok(())
+    }
+
+    // --- Local Variables ---
+
+    /// Set local variable values for a given thread and frame depth.
+    pub fn set_local_variable_table(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        vars: HashMap<u32, LocalValue>,
+    ) -> JvmtiResult<()> {
+        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        locals.insert((thread, depth), vars);
+        Ok(())
+    }
+
+    /// GetLocalVariableInt
+    pub fn get_local_int(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i32> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        match frame.get(&slot) {
+            Some(LocalValue::Int(v)) => Ok(*v),
+            Some(_) => Err(JvmtiError::TypeMismatch),
+            None => Err(JvmtiError::InvalidSlot),
+        }
+    }
+
+    /// GetLocalVariableLong
+    pub fn get_local_long(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i64> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        match frame.get(&slot) {
+            Some(LocalValue::Long(v)) => Ok(*v),
+            Some(_) => Err(JvmtiError::TypeMismatch),
+            None => Err(JvmtiError::InvalidSlot),
+        }
+    }
+
+    /// GetLocalVariableFloat
+    pub fn get_local_float(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f32> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        match frame.get(&slot) {
+            Some(LocalValue::Float(v)) => Ok(*v),
+            Some(_) => Err(JvmtiError::TypeMismatch),
+            None => Err(JvmtiError::InvalidSlot),
+        }
+    }
+
+    /// GetLocalVariableDouble
+    pub fn get_local_double(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f64> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        match frame.get(&slot) {
+            Some(LocalValue::Double(v)) => Ok(*v),
+            Some(_) => Err(JvmtiError::TypeMismatch),
+            None => Err(JvmtiError::InvalidSlot),
+        }
+    }
+
+    /// GetLocalVariableObject
+    pub fn get_local_object(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<Option<u64>> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        match frame.get(&slot) {
+            Some(LocalValue::Object(v)) => Ok(*v),
+            Some(_) => Err(JvmtiError::TypeMismatch),
+            None => Err(JvmtiError::InvalidSlot),
+        }
+    }
+
+    /// SetLocalVariableInt
+    pub fn set_local_int(&self, thread: ThreadId, depth: u32, slot: u32, value: i32) -> JvmtiResult<()> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.entry((thread, depth)).or_default();
+        frame.insert(slot, LocalValue::Int(value));
+        Ok(())
+    }
+
+    /// SetLocalVariableLong
+    pub fn set_local_long(&self, thread: ThreadId, depth: u32, slot: u32, value: i64) -> JvmtiResult<()> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.entry((thread, depth)).or_default();
+        frame.insert(slot, LocalValue::Long(value));
+        Ok(())
+    }
+
+    /// SetLocalVariableFloat
+    pub fn set_local_float(&self, thread: ThreadId, depth: u32, slot: u32, value: f32) -> JvmtiResult<()> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.entry((thread, depth)).or_default();
+        frame.insert(slot, LocalValue::Float(value));
+        Ok(())
+    }
+
+    /// SetLocalVariableDouble
+    pub fn set_local_double(&self, thread: ThreadId, depth: u32, slot: u32, value: f64) -> JvmtiResult<()> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.entry((thread, depth)).or_default();
+        frame.insert(slot, LocalValue::Double(value));
+        Ok(())
+    }
+
+    /// SetLocalVariableObject
+    pub fn set_local_object(&self, thread: ThreadId, depth: u32, slot: u32, value: Option<u64>) -> JvmtiResult<()> {
+        self.require_capability(|c| c.can_access_local_variables)?;
+        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let frame = locals.entry((thread, depth)).or_default();
+        frame.insert(slot, LocalValue::Object(value));
+        Ok(())
+    }
+
+    // --- Class Retransformation & Redefinition ---
+
+    /// Register a bytecode transformer for RetransformClasses.
+    pub fn set_retransform_hook<F>(&self, hook: F) -> JvmtiResult<()>
+    where
+        F: Fn(ClassId, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let mut h = self.retransform_hook.lock().map_err(|_| JvmtiError::Internal)?;
+        *h = Some(Box::new(hook));
+        Ok(())
+    }
+
+    /// RetransformClasses: apply the registered bytecode transformer to a class.
+    pub fn retransform_classes(&self, class_ids: &[ClassId]) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_retransform_classes {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        drop(caps);
+
+        let hook = self.retransform_hook.lock().map_err(|_| JvmtiError::Internal)?;
+        let transformer = hook.as_ref().ok_or(JvmtiError::NotAvailable)?;
+
+        for &cid in class_ids {
+            let classes = self.classes.write().map_err(|_| JvmtiError::Internal)?;
+            let class = classes.get(&cid).ok_or(JvmtiError::InvalidClass)?;
+            let original_bytes = class.bytecode.clone();
+            let class_name = class.name.clone();
+            drop(classes);
+
+            let new_bytes = transformer(cid, &original_bytes);
+
+            // Also fire ClassFileLoadHook if enabled
+            let final_bytes = self.event_manager
+                .fire_class_file_load_hook(cid, &class_name, &new_bytes)
+                .unwrap_or(new_bytes);
+
+            let mut classes2 = self.classes.write().map_err(|_| JvmtiError::Internal)?;
+            if let Some(class) = classes2.get_mut(&cid) {
+                class.bytecode = final_bytes;
+            }
+        }
+        Ok(())
+    }
+
+    /// RedefineClasses: replace the bytecode of a class entirely.
+    pub fn redefine_classes(&self, redefinitions: &[(ClassId, Vec<u8>)]) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if !caps.can_redefine_classes {
+            return Err(JvmtiError::MustPossessCapability);
+        }
+        drop(caps);
+
+        let mut classes = self.classes.write().map_err(|_| JvmtiError::Internal)?;
+        for (cid, new_bytes) in redefinitions {
+            let class = classes.get_mut(cid).ok_or(JvmtiError::InvalidClass)?;
+            if new_bytes.len() < 4 {
+                return Err(JvmtiError::InvalidClassFormat);
+            }
+            // Basic magic number check for classfile (0xCAFEBABE)
+            if new_bytes.len() >= 4 && (new_bytes[0] != 0xCA || new_bytes[1] != 0xFE || new_bytes[2] != 0xBA || new_bytes[3] != 0xBE) {
+                return Err(JvmtiError::InvalidClassFormat);
+            }
+            class.bytecode = new_bytes.clone();
+        }
+        Ok(())
+    }
+
+    // --- Class Introspection ---
+
+    /// Register a class with the JVMTI environment.
+    pub fn register_class(&self, info: ClassInfo) -> JvmtiResult<()> {
+        let mut classes = self.classes.write().map_err(|_| JvmtiError::Internal)?;
+        classes.insert(info.class_id, info);
+        Ok(())
+    }
+
+    /// GetClassFields: return field IDs for a class.
+    pub fn get_class_fields(&self, class_id: ClassId) -> JvmtiResult<Vec<FieldId>> {
+        let classes = self.classes.read().map_err(|_| JvmtiError::Internal)?;
+        let class = classes.get(&class_id).ok_or(JvmtiError::InvalidClass)?;
+        Ok(class.fields.iter().map(|f| f.field_id).collect())
+    }
+
+    /// GetClassMethods: return method IDs for a class.
+    pub fn get_class_methods(&self, class_id: ClassId) -> JvmtiResult<Vec<MethodId>> {
+        let classes = self.classes.read().map_err(|_| JvmtiError::Internal)?;
+        let class = classes.get(&class_id).ok_or(JvmtiError::InvalidClass)?;
+        Ok(class.methods.iter().map(|m| m.method_id).collect())
+    }
+
+    /// GetMethodName: return the name of a method.
+    pub fn get_method_name(&self, method_id: MethodId) -> JvmtiResult<String> {
+        let classes = self.classes.read().map_err(|_| JvmtiError::Internal)?;
+        for class in classes.values() {
+            if let Some(m) = class.methods.iter().find(|m| m.method_id == method_id) {
+                return Ok(m.name.clone());
+            }
+        }
+        Err(JvmtiError::InvalidMethodId)
+    }
+
+    /// GetFieldName: return the name of a field.
+    pub fn get_field_name(&self, field_id: FieldId) -> JvmtiResult<String> {
+        let classes = self.classes.read().map_err(|_| JvmtiError::Internal)?;
+        for class in classes.values() {
+            if let Some(f) = class.fields.iter().find(|f| f.field_id == field_id) {
+                return Ok(f.name.clone());
+            }
+        }
+        Err(JvmtiError::InvalidFieldId)
+    }
+
+    /// GetMethodDeclaringClass: return the class that declares a method.
+    pub fn get_method_declaring_class(&self, method_id: MethodId) -> JvmtiResult<ClassId> {
+        let classes = self.classes.read().map_err(|_| JvmtiError::Internal)?;
+        for class in classes.values() {
+            if class.methods.iter().any(|m| m.method_id == method_id) {
+                return Ok(class.class_id);
+            }
+        }
+        Err(JvmtiError::InvalidMethodId)
+    }
+
+    // --- Capabilities ---
+
+    /// AddCapabilities: request additional capabilities.
+    pub fn add_capabilities(&self, requested: &JvmtiCapabilities) -> JvmtiResult<()> {
+        let mut caps = self.capabilities.write().map_err(|_| JvmtiError::Internal)?;
+        *caps = caps.union(requested);
+        Ok(())
+    }
+
+    /// RelinquishCapabilities: give up previously acquired capabilities.
+    pub fn relinquish_capabilities(&self, to_relinquish: &JvmtiCapabilities) -> JvmtiResult<()> {
+        let mut caps = self.capabilities.write().map_err(|_| JvmtiError::Internal)?;
+        *caps = caps.subtract(to_relinquish);
+        Ok(())
+    }
+
+    /// GetCapabilities: return the currently held capabilities.
+    pub fn get_capabilities(&self) -> JvmtiResult<JvmtiCapabilities> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        Ok(caps.clone())
+    }
+
+    /// Helper to check a capability is held.
+    fn require_capability<F: Fn(&JvmtiCapabilities) -> bool>(&self, check: F) -> JvmtiResult<()> {
+        let caps = self.capabilities.read().map_err(|_| JvmtiError::Internal)?;
+        if check(&caps) {
+            Ok(())
+        } else {
+            Err(JvmtiError::MustPossessCapability)
+        }
+    }
+
+    // --- System Properties ---
+
+    /// GetSystemProperty: retrieve a VM system property.
+    pub fn get_system_property(&self, key: &str) -> JvmtiResult<String> {
+        let props = self.system_properties.read().map_err(|_| JvmtiError::Internal)?;
+        props.get(key).cloned().ok_or(JvmtiError::NotFound)
+    }
+
+    /// SetSystemProperty: set a VM system property.
+    pub fn set_system_property(&self, key: &str, value: &str) -> JvmtiResult<()> {
+        let mut props = self.system_properties.write().map_err(|_| JvmtiError::Internal)?;
+        props.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    /// Bulk-load system properties (called during VM init).
+    pub fn load_system_properties(&self, props: &[(String, String)]) -> JvmtiResult<()> {
+        let mut sp = self.system_properties.write().map_err(|_| JvmtiError::Internal)?;
+        for (k, v) in props {
+            sp.insert(k.clone(), v.clone());
+        }
+        Ok(())
+    }
+}
+
+impl Default for JvmtiEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for JvmtiEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JvmtiEnv")
+            .field("version", &self.get_version_number())
+            .field("capabilities", &self.capabilities)
+            .field("thread_count", &self.threads.read().map(|t| t.len()).unwrap_or(0))
+            .field("breakpoint_count", &self.breakpoints.read().map(|b| b.len()).unwrap_or(0))
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global JVMTI Event Manager (T6.3 wiring)
+// ---------------------------------------------------------------------------
+//
+// The global manager lets crates that must not depend on `rustjvm-vm`
+// (classloading, gc) fire JVMTI events without carrying a back-reference
+// to the VM. The VM installs a manager at `SharedVm::new`; every other
+// component calls the free `fire_*` functions in this module.
+//
+// The hot-path invariant is: when no manager is installed, every fire_*
+// function returns after a single `OnceLock::get()` + branch. When a
+// manager is installed but no agent is attached, the manager's own
+// `has_any_listener` fast-path returns after a single atomic load.
+
+static GLOBAL_MANAGER: OnceLock<Arc<JvmtiEventManager>> = OnceLock::new();
+
+/// Install the process-wide JVMTI event manager. Idempotent — only the
+/// first install wins. Callers should treat this as a one-shot setup at
+/// VM construction time.
+pub fn install_global_manager(mgr: Arc<JvmtiEventManager>) {
+    let _ = GLOBAL_MANAGER.set(mgr);
+}
+
+/// Return a clone of the installed manager if one exists. Callers that just
+/// want to fire an event should use the thin wrappers in this module
+/// (e.g. [`fire_gc_start`]) — those already perform the null check.
+pub fn global_manager() -> Option<Arc<JvmtiEventManager>> {
+    GLOBAL_MANAGER.get().cloned()
+}
+
+/// `true` iff a global manager is installed AND at least one listener
+/// (env, global event, or direct callback) is active. Hot-path callers
+/// should branch on this before building event arguments.
+#[inline]
+pub fn any_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_any_listener(),
+        None => false,
+    }
+}
+
+/// Fire VMInit at the global level. No-op if no manager is installed.
+pub fn fire_vm_init() {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_vm_init(); }
+}
+
+/// Fire VMDeath at the global level. Called from VM shutdown / drop.
+pub fn fire_vm_death() {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_vm_death(); }
+}
+
+/// Fire ClassLoad at the global level. Called from the class manager
+/// after a new class has been registered.
+pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_class_load(thread, class_id); }
+}
+
+/// Fire ClassPrepare at the global level. Called from the class manager
+/// after the class has been linked / prepared.
+pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_class_prepare(thread, class_id); }
+}
+
+/// Fire GarbageCollectionStart at the global level. Called from the GC
+/// driver immediately before the collection phase.
+pub fn fire_gc_start() {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_gc_start(); }
+}
+
+/// Fire GarbageCollectionFinish at the global level.
+pub fn fire_gc_finish() {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_gc_finish(); }
+}
+
+/// Fire Exception at the global level.
+pub fn fire_exception(thread: ThreadId, method: MethodId, location: i64) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_exception(thread, method, location); }
+}
+
+/// Fire ExceptionCatch at the global level. Called from the interpreter
+/// when a matching exception handler is resolved.
+pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_exception_catch(thread, method, location); }
+}
+
+// ---------------------------------------------------------------------------
+// T17.Δ — interpreter-side event free functions
+// ---------------------------------------------------------------------------
+//
+// The interpreter dispatch loop and opcode handlers call these at the sites
+// listed in docs/roadmap-100.md §T17.Δ. The hot-path contract for each of
+// these is:
+//
+//   1. One `OnceLock::get()` branch to see whether a manager is installed
+//      (in practice the branch is perfectly predicted).
+//   2. A single `AtomicBool::Acquire` load on the per-event flag — skipped
+//      when there's no manager, noted on the fast-path assembly as one
+//      `mov`+`test`.
+//   3. If the flag is set the function enters the full manager.fire_* path
+//      which takes the event's map read-locks, records the count, and
+//      dispatches to callbacks under `catch_unwind`.
+//
+// When no JVMTI agent is attached the flag is false and each call bottoms
+// out in about 3 instructions after inlining. That satisfies the < 2 ns
+// per-site budget documented in the roadmap.
+
+/// Fast-path query: any listener interested in `MethodEntry`?
+#[inline]
+pub fn any_method_entry_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_method_entry_listener(),
+        None => false,
+    }
+}
+
+/// Fast-path query: any listener interested in `MethodExit`?
+#[inline]
+pub fn any_method_exit_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_method_exit_listener(),
+        None => false,
+    }
+}
+
+/// Fast-path query: any listener interested in `SingleStep`?
+#[inline]
+pub fn any_single_step_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_single_step_listener(),
+        None => false,
+    }
+}
+
+/// Fast-path query: any listener interested in `FieldAccess`?
+#[inline]
+pub fn any_field_access_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_field_access_listener(),
+        None => false,
+    }
+}
+
+/// Fast-path query: any listener interested in `FieldModification`?
+#[inline]
+pub fn any_field_modification_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_field_modification_listener(),
+        None => false,
+    }
+}
+
+/// Fast-path query: any listener interested in `FramePop`?
+#[inline]
+pub fn any_frame_pop_listener_active() -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.has_frame_pop_listener(),
+        None => false,
+    }
+}
+
+/// Fire MethodEntry at the global level. Called from every frame-push in the
+/// interpreter. Gate on [`any_method_entry_listener_active`] at the caller
+/// so arg computation (method id synthesis) is skipped on the common no-agent
+/// path.
+#[inline]
+pub fn fire_method_entry(thread: ThreadId, method: MethodId) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_method_entry(thread, method); }
+}
+
+/// Fire MethodExit at the global level. Called from every return-opcode and
+/// from the exception-unwind path when a frame pops. Gate on
+/// [`any_method_exit_listener_active`] at the caller.
+#[inline]
+pub fn fire_method_exit(
+    thread: ThreadId,
+    method: MethodId,
+    was_popped_by_exception: bool,
+    return_value: LocalValue,
+) {
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_method_exit(thread, method, was_popped_by_exception, return_value);
+    }
+}
+
+/// Fire SingleStep at the global level. Called from the top of the bytecode
+/// dispatch loop when the thread's single-step flag is set.
+#[inline]
+pub fn fire_single_step(thread: ThreadId, method: MethodId, location: i64) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_single_step(thread, method, location); }
+}
+
+/// Fire FieldAccess at the global level. Called from getfield / getstatic
+/// when a watchpoint exists for the resolved (class_id, field_index) tuple.
+#[inline]
+pub fn fire_field_access(thread: ThreadId, method: MethodId, field: FieldId) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_field_access(thread, method, field); }
+}
+
+/// Fire FieldModification at the global level. Called from putfield /
+/// putstatic when a watchpoint exists.
+#[inline]
+pub fn fire_field_modification(thread: ThreadId, method: MethodId, field: FieldId) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_field_modification(thread, method, field); }
+}
+
+/// Fire FramePop at the global level. Called before a frame is dropped when
+/// that frame's depth has a registered `NotifyFramePop` request.
+#[inline]
+pub fn fire_frame_pop(thread: ThreadId, method: MethodId, was_popped_by_exception: bool) {
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_frame_pop(thread, method, was_popped_by_exception);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T17.Δ.4 — Field access / modification watchpoint registry
+// ---------------------------------------------------------------------------
+//
+// A JVMTI agent calls `SetFieldAccessWatch(class, field_id)` /
+// `SetFieldModificationWatch` to register interest in reads/writes of a
+// specific field. The interpreter consults the registry from `getfield` /
+// `getstatic` / `putfield` / `putstatic` handlers before the field access
+// and fires the matching event when a registered watchpoint matches the
+// resolved `(class_id, field_index)` tuple.
+//
+// The registry is keyed by a tuple of the declaring class id and the field
+// index (matching the interpreter's `ResolvedField`). Lookup is a single
+// HashMap read; on the zero-watchpoint common case the read returns None
+// and the interpreter skips the rest of the path.
+
+/// A single field watchpoint. A field may be watched for access only,
+/// modification only, or both; booleans disambiguate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldWatchpoint {
+    /// Declaring class id (same encoding as `ResolvedField.declaring_class_id`).
+    pub class_id: u64,
+    /// Field index within the declaring class's field list.
+    pub field_index: usize,
+    /// If true, FieldAccess events fire on read.
+    pub access_watched: bool,
+    /// If true, FieldModification events fire on write.
+    pub modification_watched: bool,
+}
+
+/// Global watchpoint registry. Keyed by `(class_id, field_index)`. Empty on
+/// VM start; populated by JVMTI `SetFieldAccessWatch` /
+/// `SetFieldModificationWatch` calls.
+static FIELD_WATCHPOINTS: RwLock<Option<HashMap<(u64, usize), FieldWatchpoint>>> =
+    RwLock::new(None);
+
+fn watchpoints_read_inner() -> std::sync::RwLockReadGuard<'static, Option<HashMap<(u64, usize), FieldWatchpoint>>> {
+    // Panic-safe: on poison we would otherwise block the interpreter; fall
+    // back by returning an already-poisoned guard which tests consult with
+    // caution.  Callers simply treat a poisoned lock as "no watchpoints".
+    match FIELD_WATCHPOINTS.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+/// Register a field access / modification watchpoint.
+///
+/// `access` and `modification` are additive: calling with
+/// `(true, false)` then `(false, true)` on the same field enables both.
+pub fn set_field_watchpoint(
+    class_id: u64,
+    field_index: usize,
+    access: bool,
+    modification: bool,
+) -> JvmtiResult<()> {
+    let mut guard = FIELD_WATCHPOINTS.write().map_err(|_| JvmtiError::Internal)?;
+    let map = guard.get_or_insert_with(HashMap::new);
+    let entry = map
+        .entry((class_id, field_index))
+        .or_insert(FieldWatchpoint {
+            class_id,
+            field_index,
+            access_watched: false,
+            modification_watched: false,
+        });
+    entry.access_watched = entry.access_watched || access;
+    entry.modification_watched = entry.modification_watched || modification;
+    Ok(())
+}
+
+/// Clear a field watchpoint's access / modification flags. If both become
+/// false the entry is removed from the map. Returns Ok even if the
+/// watchpoint wasn't previously registered.
+pub fn clear_field_watchpoint(
+    class_id: u64,
+    field_index: usize,
+    access: bool,
+    modification: bool,
+) -> JvmtiResult<()> {
+    let mut guard = FIELD_WATCHPOINTS.write().map_err(|_| JvmtiError::Internal)?;
+    let Some(map) = guard.as_mut() else { return Ok(()); };
+    let key = (class_id, field_index);
+    if let Some(entry) = map.get_mut(&key) {
+        if access { entry.access_watched = false; }
+        if modification { entry.modification_watched = false; }
+        if !entry.access_watched && !entry.modification_watched {
+            map.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+/// Look up a field watchpoint by `(class_id, field_index)`. Returns `None`
+/// when no watchpoint matches — the common interpreter hot-path result.
+///
+/// The `field_index` is a zero-based index into the declaring class's own
+/// field list.  Callers that receive an arbitrary caller-supplied index
+/// should validate it via [`field_watchpoint_is_valid`] first.
+#[inline]
+pub fn field_watchpoint_for(class_id: u64, field_index: usize) -> Option<FieldWatchpoint> {
+    let guard = watchpoints_read_inner();
+    guard.as_ref()?.get(&(class_id, field_index)).copied()
+}
+
+/// True iff there is at least one registered field watchpoint.
+///
+/// Interpreter callers branch on this before doing a watchpoint lookup so
+/// the zero-agent common case is a single Option::is_some check.
+#[inline]
+pub fn any_field_watchpoint_active() -> bool {
+    let guard = watchpoints_read_inner();
+    guard.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
+}
+
+/// Validate that `field_index` is within bounds for the class identified by
+/// `class_id`.  Used as a guard when registering a watchpoint from a JVMTI
+/// agent call so malformed input returns `JVMTI_ERROR_INVALID_FIELDID`
+/// instead of silently succeeding.
+///
+/// `class_field_count` is the number of declared fields in the class; it is
+/// the caller's responsibility to fetch this from the class manager.
+pub fn field_watchpoint_is_valid(field_index: usize, class_field_count: usize) -> bool {
+    field_index < class_field_count
+}
+
+/// Fire FieldAccess only if a watchpoint exists for (class_id, field_index)
+/// AND the watchpoint has `access_watched` set. Combines the lookup, fast
+/// path, and fire into one call so the interpreter dispatch site stays
+/// compact.
+#[inline]
+pub fn fire_field_access_if_watched(
+    thread: ThreadId,
+    method: MethodId,
+    class_id: u64,
+    field_index: usize,
+) {
+    if !any_field_watchpoint_active() { return; }
+    if let Some(wp) = field_watchpoint_for(class_id, field_index) {
+        if wp.access_watched {
+            let field_id = encode_field_id(class_id, field_index);
+            fire_field_access(thread, method, field_id);
+        }
+    }
+}
+
+/// Fire FieldModification only if a watchpoint exists AND has
+/// `modification_watched` set.
+#[inline]
+pub fn fire_field_modification_if_watched(
+    thread: ThreadId,
+    method: MethodId,
+    class_id: u64,
+    field_index: usize,
+) {
+    if !any_field_watchpoint_active() { return; }
+    if let Some(wp) = field_watchpoint_for(class_id, field_index) {
+        if wp.modification_watched {
+            let field_id = encode_field_id(class_id, field_index);
+            fire_field_modification(thread, method, field_id);
+        }
+    }
+}
+
+/// Pack a (class_id, field_index) pair into a single `FieldId` u64.  The
+/// JVMTI spec treats field ids as opaque to agents; we pick a packing that
+/// keeps both halves decodable (upper 32 bits = class id, lower 32 bits =
+/// field index). Class ids currently fit in 32 bits in `types::ClassId`.
+#[inline]
+pub fn encode_field_id(class_id: u64, field_index: usize) -> FieldId {
+    (class_id << 32) | ((field_index as u64) & 0xFFFF_FFFF)
+}
+
+/// Inverse of [`encode_field_id`].
+#[inline]
+pub fn decode_field_id(field_id: FieldId) -> (u64, usize) {
+    (field_id >> 32, (field_id & 0xFFFF_FFFF) as usize)
+}
+
+/// Fire ObjectFree at the global level. Called from the GC after a
+/// tagged object is reclaimed.
+pub fn fire_object_free(tag: i64) {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_object_free(tag); }
+}
+
+/// Fire VMObjectAlloc at the global level. Called from the allocator
+/// fast path; caller should branch on [`any_listener_active`] first.
+pub fn fire_vm_object_alloc(thread: ThreadId, object_addr: u64, class_id: ClassId, size: usize) {
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_vm_object_alloc(thread, object_addr, class_id, size);
+    }
+}
+
+/// Record an allocation for the sampled-allocation event stream. Returns
+/// true if a SampledObjectAlloc event was fired.
+pub fn record_allocation_sample(
+    thread: ThreadId,
+    object_addr: u64,
+    class_id: ClassId,
+    size: usize,
+) -> bool {
+    match GLOBAL_MANAGER.get() {
+        Some(m) => m.record_allocation_sample(thread, object_addr, class_id, size),
+        None => false,
+    }
+}
+
+/// Fire DataDumpRequest at the global level.
+pub fn fire_data_dump_request() {
+    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_data_dump_request(); }
+}
+
+/// Test-only reset hook: drop the installed global manager and install a
+/// fresh one. Used by tests that need a clean state; not wired into any
+/// production path. The `OnceLock` itself cannot be reset, so we drain the
+/// existing manager's enabled events instead.
+#[cfg(test)]
+pub(crate) fn reset_global_manager_for_tests() {
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        // Best-effort clear of enabled state so tests don't see stale fires.
+        if let Ok(mut g) = m.global_events.write() { g.clear(); }
+        if let Ok(mut t) = m.thread_events.write() { t.clear(); }
+        if let Ok(mut c) = m.callbacks.write() { *c = EventCallbacks::default(); }
+        if let Ok(mut e) = m.attached_envs.write() { e.clear(); }
+        if let Ok(mut n) = m.event_counts.lock() { n.clear(); }
+        m.any_listener.store(false, Ordering::Release);
+        m.any_method_entry_listener.store(false, Ordering::Release);
+        m.any_method_exit_listener.store(false, Ordering::Release);
+        m.any_single_step_listener.store(false, Ordering::Release);
+        m.any_field_access_listener.store(false, Ordering::Release);
+        m.any_field_modification_listener.store(false, Ordering::Release);
+        m.any_frame_pop_listener.store(false, Ordering::Release);
+        m.sampling_bytes.store(0, Ordering::Relaxed);
+    }
+    // Also clear the T17.Δ field-watchpoint registry so watch-dependent
+    // tests start from an empty table.
+    if let Ok(mut w) = FIELD_WATCHPOINTS.write() {
+        if let Some(m) = w.as_mut() { m.clear(); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn make_test_env() -> JvmtiEnv {
+        JvmtiEnv::new()
+    }
+
+    fn make_thread_info(name: &str) -> ThreadInfo {
+        ThreadInfo {
+            name: name.to_string(),
+            priority: 5,
+            is_daemon: false,
+            thread_group_name: "main".to_string(),
+            state: ThreadState(ThreadState::ALIVE | ThreadState::RUNNABLE),
+        }
+    }
+
+    fn make_test_class(id: ClassId) -> ClassInfo {
+        ClassInfo {
+            class_id: id,
+            name: format!("TestClass{}", id),
+            bytecode: vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34],
+            is_prepared: true,
+            fields: vec![
+                FieldInfo { field_id: id * 100 + 1, name: "field1".to_string(), signature: "I".to_string(), modifiers: 1 },
+                FieldInfo { field_id: id * 100 + 2, name: "field2".to_string(), signature: "Ljava/lang/String;".to_string(), modifiers: 1 },
+            ],
+            methods: vec![
+                MethodInfo { method_id: id * 100 + 10, name: "method1".to_string(), signature: "()V".to_string(), modifiers: 1, declaring_class: id },
+                MethodInfo { method_id: id * 100 + 11, name: "method2".to_string(), signature: "(I)I".to_string(), modifiers: 1, declaring_class: id },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_version_number() {
+        let env = make_test_env();
+        let version = env.get_version_number();
+        assert_eq!(version, JVMTI_VERSION_11);
+    }
+
+    #[test]
+    fn test_error_names() {
+        let env = make_test_env();
+        assert_eq!(env.get_error_name(JvmtiError::None), "JVMTI_ERROR_NONE");
+        assert_eq!(env.get_error_name(JvmtiError::InvalidThread), "JVMTI_ERROR_INVALID_THREAD");
+        assert_eq!(env.get_error_name(JvmtiError::OutOfMemory), "JVMTI_ERROR_OUT_OF_MEMORY");
+        assert_eq!(env.get_error_name(JvmtiError::MustPossessCapability), "JVMTI_ERROR_MUST_POSSESS_CAPABILITY");
+    }
+
+    #[test]
+    fn test_error_from_code_roundtrip() {
+        assert_eq!(JvmtiError::from_code(0), JvmtiError::None);
+        assert_eq!(JvmtiError::from_code(10), JvmtiError::InvalidThread);
+        assert_eq!(JvmtiError::from_code(99), JvmtiError::MustPossessCapability);
+        assert_eq!(JvmtiError::from_code(9999), JvmtiError::Internal);
+    }
+
+    #[test]
+    fn test_event_notification_mode_global() {
+        let env = make_test_env();
+        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::VmInit, None));
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None).unwrap();
+        assert!(env.event_manager.is_event_enabled(JvmtiEventKind::VmInit, None));
+        env.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::VmInit, None).unwrap();
+        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::VmInit, None));
+    }
+
+    #[test]
+    fn test_event_notification_mode_per_thread() {
+        let env = make_test_env();
+        let tid = 42;
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        assert!(env.event_manager.is_event_enabled(JvmtiEventKind::MethodEntry, Some(tid)));
+        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::MethodEntry, Some(99)));
+        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::MethodEntry, None));
+    }
+
+    #[test]
+    fn test_thread_lifecycle() {
+        let env = make_test_env();
+        env.register_thread(1, make_thread_info("main")).unwrap();
+        env.register_thread(2, make_thread_info("worker")).unwrap();
+
+        let threads = env.get_all_threads().unwrap();
+        assert_eq!(threads.len(), 2);
+
+        let info = env.get_thread_info(1).unwrap();
+        assert_eq!(info.name, "main");
+
+        env.unregister_thread(1).unwrap();
+        assert!(env.get_thread_info(1).is_err());
+        assert_eq!(env.get_all_threads().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_thread_suspend_resume() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_suspend: true, ..Default::default() }).unwrap();
+        env.register_thread(1, make_thread_info("main")).unwrap();
+
+        env.suspend_thread(1).unwrap();
+        let state = env.get_thread_state(1).unwrap();
+        assert_ne!(state.0 & ThreadState::SUSPENDED, 0);
+
+        // Double suspend should fail
+        assert_eq!(env.suspend_thread(1), Err(JvmtiError::ThreadSuspended));
+
+        env.resume_thread(1).unwrap();
+        let state = env.get_thread_state(1).unwrap();
+        assert_eq!(state.0 & ThreadState::SUSPENDED, 0);
+
+        // Resume without suspend should fail
+        assert_eq!(env.resume_thread(1), Err(JvmtiError::ThreadNotSuspended));
+    }
+
+    #[test]
+    fn test_suspend_requires_capability() {
+        let env = make_test_env();
+        env.register_thread(1, make_thread_info("main")).unwrap();
+        assert_eq!(env.suspend_thread(1), Err(JvmtiError::MustPossessCapability));
+    }
+
+    #[test]
+    fn test_stack_trace() {
+        let env = make_test_env();
+        env.register_thread(1, make_thread_info("main")).unwrap();
+
+        let frames = vec![
+            FrameInfo { method_id: 100, class_id: 1, location: 0, method_name: "main".to_string(), class_name: "App".to_string() },
+            FrameInfo { method_id: 101, class_id: 1, location: 5, method_name: "run".to_string(), class_name: "App".to_string() },
+            FrameInfo { method_id: 102, class_id: 2, location: 10, method_name: "execute".to_string(), class_name: "Executor".to_string() },
+        ];
+        env.set_stack_trace(1, frames).unwrap();
+
+        assert_eq!(env.get_frame_count(1).unwrap(), 3);
+
+        let trace = env.get_stack_trace(1, 0, 2).unwrap();
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].method_name, "main");
+        assert_eq!(trace[1].method_name, "run");
+
+        let trace = env.get_stack_trace(1, 2, 10).unwrap();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].method_name, "execute");
+    }
+
+    #[test]
+    fn test_breakpoints() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_generate_breakpoint_events: true, ..Default::default() }).unwrap();
+
+        let loc = BreakpointLocation { class_id: 1, method_id: 100, location: 5 };
+        env.set_breakpoint(loc.clone()).unwrap();
+        assert!(env.has_breakpoint(&loc));
+
+        // Duplicate should fail
+        assert_eq!(env.set_breakpoint(loc.clone()), Err(JvmtiError::Duplicate));
+
+        env.clear_breakpoint(&loc).unwrap();
+        assert!(!env.has_breakpoint(&loc));
+
+        // Clear non-existent should fail
+        assert_eq!(env.clear_breakpoint(&loc), Err(JvmtiError::NotFound));
+    }
+
+    #[test]
+    fn test_field_watches() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_generate_field_access_events: true,
+            can_generate_field_modification_events: true,
+            ..Default::default()
+        }).unwrap();
+
+        let watch = FieldWatch { class_id: 1, field_id: 10 };
+        env.set_field_access_watch(watch.clone()).unwrap();
+        assert_eq!(env.set_field_access_watch(watch.clone()), Err(JvmtiError::Duplicate));
+        env.clear_field_access_watch(&watch).unwrap();
+
+        env.set_field_modification_watch(watch.clone()).unwrap();
+        assert_eq!(env.set_field_modification_watch(watch.clone()), Err(JvmtiError::Duplicate));
+        env.clear_field_modification_watch(&watch).unwrap();
+    }
+
+    #[test]
+    fn test_local_variables() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_access_local_variables: true, ..Default::default() }).unwrap();
+
+        let mut vars = HashMap::new();
+        vars.insert(0, LocalValue::Int(42));
+        vars.insert(1, LocalValue::Long(123456789));
+        vars.insert(2, LocalValue::Float(3.14));
+        vars.insert(3, LocalValue::Double(2.718281828));
+        vars.insert(4, LocalValue::Object(Some(0xDEAD)));
+        env.set_local_variable_table(1, 0, vars).unwrap();
+
+        assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 42);
+        assert_eq!(env.get_local_long(1, 0, 1).unwrap(), 123456789);
+        assert!((env.get_local_float(1, 0, 2).unwrap() - 3.14).abs() < 0.001);
+        assert!((env.get_local_double(1, 0, 3).unwrap() - 2.718281828).abs() < 0.0001);
+        assert_eq!(env.get_local_object(1, 0, 4).unwrap(), Some(0xDEAD));
+
+        // Type mismatch
+        assert_eq!(env.get_local_int(1, 0, 1), Err(JvmtiError::TypeMismatch));
+        // Invalid slot
+        assert_eq!(env.get_local_int(1, 0, 99), Err(JvmtiError::InvalidSlot));
+    }
+
+    #[test]
+    fn test_local_variable_set() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_access_local_variables: true, ..Default::default() }).unwrap();
+
+        env.set_local_int(1, 0, 0, 99).unwrap();
+        assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 99);
+
+        env.set_local_long(1, 0, 1, 999).unwrap();
+        assert_eq!(env.get_local_long(1, 0, 1).unwrap(), 999);
+
+        env.set_local_float(1, 0, 2, 1.5).unwrap();
+        assert!((env.get_local_float(1, 0, 2).unwrap() - 1.5).abs() < 0.001);
+
+        env.set_local_double(1, 0, 3, 2.5).unwrap();
+        assert!((env.get_local_double(1, 0, 3).unwrap() - 2.5).abs() < 0.001);
+
+        env.set_local_object(1, 0, 4, None).unwrap();
+        assert_eq!(env.get_local_object(1, 0, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn test_local_variables_require_capability() {
+        let env = make_test_env(); // no capabilities
+        assert_eq!(env.get_local_int(1, 0, 0), Err(JvmtiError::MustPossessCapability));
+        assert_eq!(env.set_local_int(1, 0, 0, 1), Err(JvmtiError::MustPossessCapability));
+    }
+
+    #[test]
+    fn test_capabilities_add_and_relinquish() {
+        let env = make_test_env();
+        let caps = env.get_capabilities().unwrap();
+        assert!(caps.is_empty());
+
+        let requested = JvmtiCapabilities {
+            can_generate_breakpoint_events: true,
+            can_suspend: true,
+            ..Default::default()
+        };
+        env.add_capabilities(&requested).unwrap();
+
+        let caps = env.get_capabilities().unwrap();
+        assert!(caps.can_generate_breakpoint_events);
+        assert!(caps.can_suspend);
+        assert!(!caps.can_redefine_classes);
+
+        let to_drop = JvmtiCapabilities { can_suspend: true, ..Default::default() };
+        env.relinquish_capabilities(&to_drop).unwrap();
+
+        let caps = env.get_capabilities().unwrap();
+        assert!(caps.can_generate_breakpoint_events);
+        assert!(!caps.can_suspend);
+    }
+
+    #[test]
+    fn test_class_introspection() {
+        let env = make_test_env();
+        env.register_class(make_test_class(1)).unwrap();
+
+        let fields = env.get_class_fields(1).unwrap();
+        assert_eq!(fields.len(), 2);
+
+        let methods = env.get_class_methods(1).unwrap();
+        assert_eq!(methods.len(), 2);
+
+        assert_eq!(env.get_method_name(110).unwrap(), "method1");
+        assert_eq!(env.get_field_name(101).unwrap(), "field1");
+        assert_eq!(env.get_method_declaring_class(110).unwrap(), 1);
+
+        assert_eq!(env.get_method_name(999), Err(JvmtiError::InvalidMethodId));
+        assert_eq!(env.get_field_name(999), Err(JvmtiError::InvalidFieldId));
+        assert_eq!(env.get_class_fields(999), Err(JvmtiError::InvalidClass));
+    }
+
+    #[test]
+    fn test_redefine_classes() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_redefine_classes: true, ..Default::default() }).unwrap();
+        env.register_class(make_test_class(1)).unwrap();
+
+        let new_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x37, 0xFF];
+        env.redefine_classes(&[(1, new_bytes.clone())]).unwrap();
+
+        let classes = env.classes.read().unwrap();
+        assert_eq!(classes.get(&1).unwrap().bytecode, new_bytes);
+    }
+
+    #[test]
+    fn test_redefine_invalid_classfile() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_redefine_classes: true, ..Default::default() }).unwrap();
+        env.register_class(make_test_class(1)).unwrap();
+
+        // Invalid magic number
+        let bad_bytes = vec![0x00, 0x00, 0x00, 0x00];
+        assert_eq!(env.redefine_classes(&[(1, bad_bytes)]), Err(JvmtiError::InvalidClassFormat));
+
+        // Too short
+        let short_bytes = vec![0xCA, 0xFE];
+        assert_eq!(env.redefine_classes(&[(1, short_bytes)]), Err(JvmtiError::InvalidClassFormat));
+    }
+
+    #[test]
+    fn test_retransform_classes() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities { can_retransform_classes: true, ..Default::default() }).unwrap();
+        env.register_class(make_test_class(1)).unwrap();
+
+        // Set a transformer that appends a byte
+        env.set_retransform_hook(|_class_id, bytes| {
+            let mut new = bytes.to_vec();
+            new.push(0xAA);
+            new
+        }).unwrap();
+
+        env.retransform_classes(&[1]).unwrap();
+
+        let classes = env.classes.read().unwrap();
+        let bytecode = &classes.get(&1).unwrap().bytecode;
+        assert_eq!(bytecode.last(), Some(&0xAA));
+    }
+
+    #[test]
+    fn test_system_properties() {
+        let env = make_test_env();
+        env.set_system_property("java.version", "11.0.1").unwrap();
+        env.set_system_property("os.name", "Linux").unwrap();
+
+        assert_eq!(env.get_system_property("java.version").unwrap(), "11.0.1");
+        assert_eq!(env.get_system_property("os.name").unwrap(), "Linux");
+        assert_eq!(env.get_system_property("nonexistent"), Err(JvmtiError::NotFound));
+
+        env.set_system_property("java.version", "17.0.1").unwrap();
+        assert_eq!(env.get_system_property("java.version").unwrap(), "17.0.1");
+    }
+
+    #[test]
+    fn test_system_properties_bulk_load() {
+        let env = make_test_env();
+        env.load_system_properties(&[
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]).unwrap();
+        assert_eq!(env.get_system_property("a").unwrap(), "1");
+        assert_eq!(env.get_system_property("b").unwrap(), "2");
+    }
+
+    #[test]
+    fn test_event_callbacks_fire() {
+        let env = make_test_env();
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None).unwrap();
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ThreadStart, None).unwrap();
+
+        let init_count = Arc::new(AtomicU32::new(0));
+        let thread_count = Arc::new(AtomicU32::new(0));
+        let ic = init_count.clone();
+        let tc = thread_count.clone();
+
+        let cbs = EventCallbacks {
+            vm_init: Some(Box::new(move || { ic.fetch_add(1, Ordering::SeqCst); })),
+            thread_start: Some(Box::new(move |_tid| { tc.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        };
+        env.event_manager.set_event_callbacks(cbs).unwrap();
+
+        env.event_manager.fire_vm_init();
+        env.event_manager.fire_vm_init();
+        env.event_manager.fire_thread_start(1);
+
+        assert_eq!(init_count.load(Ordering::SeqCst), 2);
+        assert_eq!(thread_count.load(Ordering::SeqCst), 1);
+        assert_eq!(env.event_manager.event_count(JvmtiEventKind::VmInit), 2);
+        assert_eq!(env.event_manager.event_count(JvmtiEventKind::ThreadStart), 1);
+    }
+
+    #[test]
+    fn test_event_disabled_does_not_fire() {
+        let env = make_test_env();
+        // Do NOT enable VmDeath
+        let count = Arc::new(AtomicU32::new(0));
+        let c = count.clone();
+        let cbs = EventCallbacks {
+            vm_death: Some(Box::new(move || { c.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        };
+        env.event_manager.set_event_callbacks(cbs).unwrap();
+        env.event_manager.fire_vm_death();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(env.event_manager.event_count(JvmtiEventKind::VmDeath), 0);
+    }
+
+    #[test]
+    fn test_class_file_load_hook_transform() {
+        let env = make_test_env();
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassFileLoadHook, None).unwrap();
+
+        let cbs = EventCallbacks {
+            class_file_load_hook: Some(Box::new(|_cid, _name, bytes| {
+                let mut new = bytes.to_vec();
+                new.push(0xBB);
+                Some(new)
+            })),
+            ..Default::default()
+        };
+        env.event_manager.set_event_callbacks(cbs).unwrap();
+
+        let original = vec![1, 2, 3];
+        let result = env.event_manager.fire_class_file_load_hook(1, "TestClass", &original);
+        assert_eq!(result, Some(vec![1, 2, 3, 0xBB]));
+    }
+
+    #[test]
+    fn test_agent_parse_agentlib() {
+        let mut registry = AgentRegistry::new();
+        registry.parse_agent_option("-agentlib:jdwp=transport=dt_socket,server=y").unwrap();
+
+        assert_eq!(registry.agents().len(), 1);
+        let agent = &registry.agents()[0];
+        assert_eq!(agent.name, "jdwp");
+        assert_eq!(agent.options, "transport=dt_socket,server=y");
+        assert!(!agent.is_java_agent);
+    }
+
+    #[test]
+    fn test_agent_parse_agentpath() {
+        let mut registry = AgentRegistry::new();
+        registry.parse_agent_option("-agentpath:/opt/lib/myagent.so=debug").unwrap();
+
+        let agent = &registry.agents()[0];
+        assert_eq!(agent.path, "/opt/lib/myagent.so");
+        assert_eq!(agent.options, "debug");
+        assert!(!agent.is_java_agent);
+    }
+
+    #[test]
+    fn test_agent_parse_javaagent() {
+        let mut registry = AgentRegistry::new();
+        registry.parse_agent_option("-javaagent:agent.jar=premain_opt").unwrap();
+
+        let agent = &registry.agents()[0];
+        assert_eq!(agent.path, "agent.jar");
+        assert_eq!(agent.options, "premain_opt");
+        assert!(agent.is_java_agent);
+    }
+
+    #[test]
+    fn test_agent_parse_invalid() {
+        let mut registry = AgentRegistry::new();
+        assert_eq!(registry.parse_agent_option("-Xms512m"), Err(JvmtiError::IllegalArgument));
+        assert_eq!(registry.parse_agent_option("garbage"), Err(JvmtiError::IllegalArgument));
+    }
+
+    #[test]
+    fn test_agent_load_unload() {
+        let mut registry = AgentRegistry::new();
+        registry.parse_agent_option("-agentlib:test").unwrap();
+
+        let load_count = Arc::new(AtomicU32::new(0));
+        let unload_count = Arc::new(AtomicU32::new(0));
+        let lc = load_count.clone();
+        let uc = unload_count.clone();
+
+        registry.register_on_load("test", move |_opts| {
+            lc.fetch_add(1, Ordering::SeqCst);
+            0 // success
+        });
+        registry.register_on_unload("test", move || {
+            uc.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let loaded = registry.load_agents().unwrap();
+        assert_eq!(loaded, 1);
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.loaded_count(), 1);
+
+        registry.unload_agents();
+        assert_eq!(unload_count.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.loaded_count(), 0);
+    }
+
+    #[test]
+    fn test_agent_load_failure() {
+        let mut registry = AgentRegistry::new();
+        registry.parse_agent_option("-agentlib:badagent").unwrap();
+        registry.register_on_load("badagent", |_opts| -1); // non-zero = failure
+
+        let loaded = registry.load_agents().unwrap();
+        assert_eq!(loaded, 0);
+        assert_eq!(registry.loaded_count(), 0);
+    }
+
+    #[test]
+    fn test_force_gc_with_trigger() {
+        let env = make_test_env();
+        let triggered = Arc::new(AtomicU32::new(0));
+        let t = triggered.clone();
+        env.set_gc_trigger(move || { t.fetch_add(1, Ordering::SeqCst); true }).unwrap();
+
+        env.force_garbage_collection().unwrap();
+        assert_eq!(triggered.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_force_gc_without_trigger() {
+        let env = make_test_env();
+        // No GC trigger registered — should succeed (best-effort)
+        assert!(env.force_garbage_collection().is_ok());
+    }
+
+    #[test]
+    fn test_capabilities_potentially_available() {
+        let all = JvmtiCapabilities::potentially_available();
+        assert!(all.can_redefine_classes);
+        assert!(all.can_retransform_classes);
+        assert!(all.can_access_local_variables);
+        assert!(all.can_suspend);
+        assert!(all.can_generate_breakpoint_events);
+    }
+
+    #[test]
+    fn test_capabilities_union_and_subtract() {
+        let a = JvmtiCapabilities { can_suspend: true, can_redefine_classes: true, ..Default::default() };
+        let b = JvmtiCapabilities { can_suspend: true, can_retransform_classes: true, ..Default::default() };
+
+        let union = a.union(&b);
+        assert!(union.can_suspend);
+        assert!(union.can_redefine_classes);
+        assert!(union.can_retransform_classes);
+
+        let diff = union.subtract(&b);
+        assert!(!diff.can_suspend);
+        assert!(diff.can_redefine_classes);
+        assert!(!diff.can_retransform_classes);
+    }
+
+    #[test]
+    fn test_event_kind_from_raw() {
+        assert_eq!(JvmtiEventKind::from_raw(50), Some(JvmtiEventKind::VmInit));
+        assert_eq!(JvmtiEventKind::from_raw(51), Some(JvmtiEventKind::VmDeath));
+        assert_eq!(JvmtiEventKind::from_raw(60), Some(JvmtiEventKind::Breakpoint));
+        assert_eq!(JvmtiEventKind::from_raw(0), None);
+        assert_eq!(JvmtiEventKind::from_raw(9999), None);
+    }
+
+    #[test]
+    fn test_event_kind_all_count() {
+        // Verify ALL contains every variant
+        assert_eq!(JvmtiEventKind::ALL.len(), 30);
+    }
+
+    #[test]
+    fn test_jvmti_env_debug_format() {
+        let env = make_test_env();
+        let debug = format!("{:?}", env);
+        assert!(debug.contains("JvmtiEnv"));
+        assert!(debug.contains("version"));
+    }
+
+    #[test]
+    fn test_agent_parse_no_options() {
+        let mut registry = AgentRegistry::new();
+        registry.parse_agent_option("-agentlib:simple").unwrap();
+        let agent = &registry.agents()[0];
+        assert_eq!(agent.name, "simple");
+        assert_eq!(agent.options, "");
+    }
+
+    #[test]
+    fn test_multiple_events_independently_tracked() {
+        let em = JvmtiEventManager::new();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionStart, None).unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionFinish, None).unwrap();
+
+        let cbs = EventCallbacks {
+            gc_start: Some(Box::new(|| {})),
+            gc_finish: Some(Box::new(|| {})),
+            ..Default::default()
+        };
+        em.set_event_callbacks(cbs).unwrap();
+
+        em.fire_gc_start();
+        em.fire_gc_start();
+        em.fire_gc_finish();
+
+        assert_eq!(em.event_count(JvmtiEventKind::GarbageCollectionStart), 2);
+        assert_eq!(em.event_count(JvmtiEventKind::GarbageCollectionFinish), 1);
+    }
+
+    // ----------------------------------------------------------------
+    // T6.3.1 — Tests for the four newly added event kinds and the
+    // global manager wiring used by the vm/gc/classloading crates.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_new_event_kinds_in_all() {
+        // The four new kinds must appear in the ALL iteration set.
+        assert!(JvmtiEventKind::ALL.contains(&JvmtiEventKind::ObjectFree));
+        assert!(JvmtiEventKind::ALL.contains(&JvmtiEventKind::VMObjectAlloc));
+        assert!(JvmtiEventKind::ALL.contains(&JvmtiEventKind::SampledObjectAlloc));
+        assert!(JvmtiEventKind::ALL.contains(&JvmtiEventKind::DataDumpRequest));
+    }
+
+    #[test]
+    fn test_new_event_kinds_from_raw_roundtrip() {
+        // Round-trip the four new kinds through the raw u32 encoding.
+        assert_eq!(JvmtiEventKind::from_raw(83), Some(JvmtiEventKind::ObjectFree));
+        assert_eq!(JvmtiEventKind::from_raw(84), Some(JvmtiEventKind::VMObjectAlloc));
+        assert_eq!(JvmtiEventKind::from_raw(86), Some(JvmtiEventKind::SampledObjectAlloc));
+        assert_eq!(JvmtiEventKind::from_raw(71), Some(JvmtiEventKind::DataDumpRequest));
+
+        assert_eq!(JvmtiEventKind::ObjectFree as u32, 83);
+        assert_eq!(JvmtiEventKind::VMObjectAlloc as u32, 84);
+        assert_eq!(JvmtiEventKind::SampledObjectAlloc as u32, 86);
+        assert_eq!(JvmtiEventKind::DataDumpRequest as u32, 71);
+    }
+
+    #[test]
+    fn test_new_event_kinds_debug_eq_hash() {
+        use std::collections::HashSet;
+        let mut set: HashSet<JvmtiEventKind> = HashSet::new();
+        set.insert(JvmtiEventKind::ObjectFree);
+        set.insert(JvmtiEventKind::VMObjectAlloc);
+        set.insert(JvmtiEventKind::SampledObjectAlloc);
+        set.insert(JvmtiEventKind::DataDumpRequest);
+        assert_eq!(set.len(), 4);
+        // Debug round-trip sanity.
+        assert_eq!(format!("{:?}", JvmtiEventKind::ObjectFree), "ObjectFree");
+        assert_eq!(format!("{:?}", JvmtiEventKind::DataDumpRequest), "DataDumpRequest");
+    }
+
+    #[test]
+    fn test_fire_object_free() {
+        let em = JvmtiEventManager::new();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ObjectFree, None).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let s = seen.clone();
+        let cbs = EventCallbacks {
+            object_free: Some(Box::new(move |tag| s.lock().unwrap().push(tag))),
+            ..Default::default()
+        };
+        em.set_event_callbacks(cbs).unwrap();
+        em.fire_object_free(42);
+        em.fire_object_free(7);
+        assert_eq!(*seen.lock().unwrap(), vec![42, 7]);
+        assert_eq!(em.event_count(JvmtiEventKind::ObjectFree), 2);
+    }
+
+    #[test]
+    fn test_fire_vm_object_alloc() {
+        let em = JvmtiEventManager::new();
+        let tid: ThreadId = 1;
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VMObjectAlloc, Some(tid)).unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let total_size = Arc::new(Mutex::new(0usize));
+        let c = count.clone();
+        let t = total_size.clone();
+        let cbs = EventCallbacks {
+            vm_object_alloc: Some(Box::new(move |_tid, _addr, _cls, sz| {
+                c.fetch_add(1, Ordering::SeqCst);
+                *t.lock().unwrap() += sz;
+            })),
+            ..Default::default()
+        };
+        em.set_event_callbacks(cbs).unwrap();
+        em.fire_vm_object_alloc(tid, 0xdead, 10, 32);
+        em.fire_vm_object_alloc(tid, 0xbeef, 11, 48);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(*total_size.lock().unwrap(), 80);
+    }
+
+    #[test]
+    fn test_sampled_alloc_threshold_rate_limits() {
+        let em = JvmtiEventManager::new();
+        let tid: ThreadId = 1;
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SampledObjectAlloc, Some(tid)).unwrap();
+        em.set_sampling_interval(1024);
+        let count = Arc::new(AtomicU32::new(0));
+        let c = count.clone();
+        let cbs = EventCallbacks {
+            sampled_object_alloc: Some(Box::new(move |_t, _a, _c, _s| {
+                c.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..Default::default()
+        };
+        em.set_event_callbacks(cbs).unwrap();
+
+        // 8 × 128 B = 1024 B — crosses threshold exactly once.
+        let mut fired = 0u32;
+        for _ in 0..8 {
+            if em.record_allocation_sample(tid, 0x1000, 1, 128) { fired += 1; }
+        }
+        assert_eq!(fired, 1, "threshold of 1024 should fire exactly once for 8×128 B");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Reset counter — 4 × 256 B hits threshold once more.
+        for _ in 0..4 {
+            em.record_allocation_sample(tid, 0x2000, 2, 256);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_fire_data_dump_request() {
+        let em = JvmtiEventManager::new();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::DataDumpRequest, None).unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let c = count.clone();
+        let cbs = EventCallbacks {
+            data_dump_request: Some(Box::new(move || { c.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        };
+        em.set_event_callbacks(cbs).unwrap();
+        em.fire_data_dump_request();
+        em.fire_data_dump_request();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_no_listener_fast_path() {
+        let em = JvmtiEventManager::new();
+        // No agents, no events enabled, no callbacks set — has_any_listener
+        // must be false and fire_ methods must be cheap no-ops.
+        assert!(!em.has_any_listener());
+        em.fire_vm_object_alloc(1, 0, 5, 32);
+        em.fire_object_free(99);
+        em.fire_data_dump_request();
+        assert_eq!(em.event_count(JvmtiEventKind::VMObjectAlloc), 0);
+        assert_eq!(em.event_count(JvmtiEventKind::ObjectFree), 0);
+        assert_eq!(em.event_count(JvmtiEventKind::DataDumpRequest), 0);
+    }
+
+    #[test]
+    fn test_env_registration_broadcasts_callbacks() {
+        let em = JvmtiEventManager::new();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ObjectFree, None).unwrap();
+
+        // Attached env with its own ObjectFree callback.
+        let env = Arc::new(JvmtiEnv::new());
+        let agent_tags = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let t = agent_tags.clone();
+        env.event_manager.set_event_callbacks(EventCallbacks {
+            object_free: Some(Box::new(move |tag| t.lock().unwrap().push(tag))),
+            ..Default::default()
+        }).unwrap();
+
+        em.register_env(&env).unwrap();
+        em.fire_object_free(123);
+        em.fire_object_free(456);
+
+        // The attached env's callback should have received both tags.
+        assert_eq!(*agent_tags.lock().unwrap(), vec![123, 456]);
+
+        // Unregister — further fires should not reach the env.
+        em.unregister_env(&env).unwrap();
+        em.fire_object_free(789);
+        assert_eq!(*agent_tags.lock().unwrap(), vec![123, 456]);
+    }
+
+    #[test]
+    fn test_env_dropped_envs_pruned() {
+        let em = JvmtiEventManager::new();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::DataDumpRequest, None).unwrap();
+
+        {
+            let env = Arc::new(JvmtiEnv::new());
+            em.register_env(&env).unwrap();
+            // Env drops here.
+        }
+        // Snapshot after drop should be empty; no panic.
+        let snap = em.snapshot_envs();
+        assert!(snap.is_empty(), "dropped envs must be pruned from attached list");
+
+        em.fire_data_dump_request(); // no listener callback, just no panic.
+    }
+
+    // ----------------------------------------------------------------
+    // Global manager & wired-safepoint tests
+    // ----------------------------------------------------------------
+
+    /// Serialize test access to the global manager since it's a process-wide
+    /// singleton installed via `install_global_manager`.
+    fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    /// Ensure the process-wide manager exists, and return a handle. Tests
+    /// that mutate global state must call `reset_global_manager_for_tests`
+    /// after acquiring the test lock to get a clean slate.
+    fn ensure_global_manager() -> Arc<JvmtiEventManager> {
+        install_global_manager(Arc::new(JvmtiEventManager::new()));
+        // `install_global_manager` is idempotent: if another test got
+        // there first, `global_manager()` returns the existing one.
+        global_manager().expect("global manager must be installed")
+    }
+
+    #[test]
+    fn test_global_manager_no_install_is_noop() {
+        // Even without a manager being touched, the free wrappers must not
+        // panic and any_listener_active should return false OR true depending
+        // on prior tests. We assert only the no-panic and the fires being
+        // harmless.
+        fire_gc_start();
+        fire_gc_finish();
+        fire_vm_init();
+        fire_vm_death();
+        fire_class_load(1, 1);
+        fire_class_prepare(1, 1);
+        fire_exception(1, 1, 0);
+        fire_exception_catch(1, 1, 0);
+        fire_object_free(0);
+        fire_vm_object_alloc(1, 0, 1, 0);
+        fire_data_dump_request();
+        let _ = record_allocation_sample(1, 0, 1, 0);
+        let _ = any_listener_active();
+    }
+
+    #[test]
+    fn test_global_wired_class_load_fires() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 7;
+        let cid: ClassId = 42;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid)).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, ClassId)>::new()));
+        let s = seen.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            class_load: Some(Box::new(move |t, c| s.lock().unwrap().push((t, c)))),
+            ..Default::default()
+        }).unwrap();
+
+        // Free function drives through the global manager.
+        fire_class_load(tid, cid);
+        assert_eq!(*seen.lock().unwrap(), vec![(tid, cid)]);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassLoad), 1);
+    }
+
+    #[test]
+    fn test_global_wired_gc_pair_fires_in_order() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionStart, None).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionFinish, None).unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let lg1 = log.clone();
+        let lg2 = log.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            gc_start: Some(Box::new(move || lg1.lock().unwrap().push("start"))),
+            gc_finish: Some(Box::new(move || lg2.lock().unwrap().push("finish"))),
+            ..Default::default()
+        }).unwrap();
+
+        fire_gc_start();
+        fire_gc_finish();
+
+        assert_eq!(*log.lock().unwrap(), vec!["start", "finish"]);
+    }
+
+    #[test]
+    fn test_global_wired_vm_init_vm_death_one_shot() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmDeath, None).unwrap();
+        let init = Arc::new(AtomicU32::new(0));
+        let death = Arc::new(AtomicU32::new(0));
+        let ic = init.clone();
+        let dc = death.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            vm_init: Some(Box::new(move || { ic.fetch_add(1, Ordering::SeqCst); })),
+            vm_death: Some(Box::new(move || { dc.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        }).unwrap();
+
+        fire_vm_init();
+        fire_vm_death();
+        assert_eq!(init.load(Ordering::SeqCst), 1);
+        assert_eq!(death.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_global_wired_exception_catch_fires() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 3;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ExceptionCatch, Some(tid)).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, i64)>::new()));
+        let s = seen.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            exception_catch: Some(Box::new(move |t, m, l| s.lock().unwrap().push((t, m, l)))),
+            ..Default::default()
+        }).unwrap();
+        fire_exception_catch(tid, 99, 10);
+        fire_exception_catch(tid, 99, 11);
+        assert_eq!(*seen.lock().unwrap(), vec![(tid, 99, 10), (tid, 99, 11)]);
+    }
+
+    // ----------------------------------------------------------------
+    // T17.Δ — interpreter event-firing tests
+    // ----------------------------------------------------------------
+
+    /// T17.Δ.1 — registering and firing `MethodEntry` through the free
+    /// function must deliver exactly one callback with the given method id.
+    #[test]
+    fn t17_d_method_entry_fires_on_invocation() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 7;
+        let mid: MethodId = 0x12345;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId)>::new()));
+        let s = seen.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            method_entry: Some(Box::new(move |t, m| s.lock().unwrap().push((t, m)))),
+            ..Default::default()
+        }).unwrap();
+
+        assert!(any_method_entry_listener_active());
+        fire_method_entry(tid, mid);
+        assert_eq!(*seen.lock().unwrap(), vec![(tid, mid)]);
+        assert_eq!(mgr.event_count(JvmtiEventKind::MethodEntry), 1);
+    }
+
+    /// T17.Δ.2 — MethodExit on a normal return fires with
+    /// `was_popped_by_exception=false` and the correct return value.
+    #[test]
+    fn t17_d_method_exit_fires_on_normal_return() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 8;
+        let mid: MethodId = 0x22222;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, Some(tid)).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, bool, LocalValue)>::new()));
+        let s = seen.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            method_exit: Some(Box::new(move |t, m, exc, rv| s.lock().unwrap().push((t, m, exc, rv)))),
+            ..Default::default()
+        }).unwrap();
+
+        fire_method_exit(tid, mid, false, LocalValue::Int(42));
+        assert_eq!(*seen.lock().unwrap(), vec![(tid, mid, false, LocalValue::Int(42))]);
+        assert_eq!(mgr.event_count(JvmtiEventKind::MethodExit), 1);
+    }
+
+    /// T17.Δ.2 — MethodExit on exception unwind fires with
+    /// `was_popped_by_exception=true`.
+    #[test]
+    fn t17_d_method_exit_fires_on_exception_unwind() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 9;
+        let mid: MethodId = 0x33333;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, Some(tid)).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, bool)>::new()));
+        let s = seen.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            method_exit: Some(Box::new(move |t, m, exc, _rv| s.lock().unwrap().push((t, m, exc)))),
+            ..Default::default()
+        }).unwrap();
+
+        fire_method_exit(tid, mid, true, LocalValue::Object(None));
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, tid);
+        assert_eq!(got[0].1, mid);
+        assert!(got[0].2, "abrupt-completion indicator must be true");
+    }
+
+    /// T17.Δ.3 — SingleStep fires once per bytecode dispatched when the
+    /// corresponding event is enabled.
+    #[test]
+    fn t17_d_single_step_fires_per_bytecode() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 10;
+        let mid: MethodId = 0x44444;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SingleStep, Some(tid)).unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let c = count.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            single_step: Some(Box::new(move |_t, _m, _l| { c.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        }).unwrap();
+
+        for pc in 0..10 {
+            fire_single_step(tid, mid, pc);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 10);
+        assert!(any_single_step_listener_active());
+    }
+
+    /// T17.Δ.4 — registering a FieldAccess/FieldModification watchpoint on
+    /// (class, field) must cause the corresponding event to fire when the
+    /// `fire_field_*_if_watched` helper is invoked.
+    #[test]
+    fn t17_d_field_access_watch() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 11;
+        let mid: MethodId = 0x55555;
+        let class_id: u64 = 99;
+        let field_index: usize = 3;
+
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldAccess, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldModification, Some(tid)).unwrap();
+
+        set_field_watchpoint(class_id, field_index, true, true).unwrap();
+        assert!(any_field_watchpoint_active());
+        assert_eq!(
+            field_watchpoint_for(class_id, field_index),
+            Some(FieldWatchpoint {
+                class_id,
+                field_index,
+                access_watched: true,
+                modification_watched: true,
+            })
+        );
+
+        let accesses = Arc::new(AtomicU32::new(0));
+        let mods = Arc::new(AtomicU32::new(0));
+        let a = accesses.clone();
+        let m = mods.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            field_access: Some(Box::new(move |_t, _m, _f| { a.fetch_add(1, Ordering::SeqCst); })),
+            field_modification: Some(Box::new(move |_t, _m, _f| { m.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        }).unwrap();
+
+        fire_field_access_if_watched(tid, mid, class_id, field_index);
+        fire_field_modification_if_watched(tid, mid, class_id, field_index);
+        // Unwatched tuple — must not fire.
+        fire_field_access_if_watched(tid, mid, class_id, field_index + 1);
+        fire_field_modification_if_watched(tid, mid, class_id + 1, field_index);
+
+        assert_eq!(accesses.load(Ordering::SeqCst), 1);
+        assert_eq!(mods.load(Ordering::SeqCst), 1);
+
+        clear_field_watchpoint(class_id, field_index, true, true).unwrap();
+        assert_eq!(field_watchpoint_for(class_id, field_index), None);
+        assert!(!any_field_watchpoint_active());
+    }
+
+    /// T17.Δ.4 — watchpoint validation helper rejects out-of-range indices.
+    #[test]
+    fn t17_d_field_watchpoint_bounds_check() {
+        assert!(field_watchpoint_is_valid(0, 1));
+        assert!(field_watchpoint_is_valid(4, 5));
+        assert!(!field_watchpoint_is_valid(5, 5));
+        assert!(!field_watchpoint_is_valid(100, 0));
+    }
+
+    /// T17.Δ.4 — encode/decode round-trip for FieldId.
+    #[test]
+    fn t17_d_field_id_encode_decode_roundtrip() {
+        let fid = encode_field_id(0xCAFE_BABE, 17);
+        assert_eq!(decode_field_id(fid), (0xCAFE_BABE, 17));
+    }
+
+    /// T17.Δ.5 — FramePop fires exactly once for the target depth.
+    #[test]
+    fn t17_d_frame_pop_fires_at_target_depth() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 12;
+        let mid: MethodId = 0x66666;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FramePop, Some(tid)).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, bool)>::new()));
+        let s = seen.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            frame_pop: Some(Box::new(move |t, m, exc| s.lock().unwrap().push((t, m, exc)))),
+            ..Default::default()
+        }).unwrap();
+
+        // Fire once for a normal return and once for an exception unwind.
+        fire_frame_pop(tid, mid, false);
+        fire_frame_pop(tid, mid, true);
+        assert_eq!(*seen.lock().unwrap(), vec![(tid, mid, false), (tid, mid, true)]);
+        assert_eq!(mgr.event_count(JvmtiEventKind::FramePop), 2);
+    }
+
+    /// T17.Δ.∗ — the no-agent hot path must be a single Acquire load + one
+    /// predicted branch for each event kind. We can't directly measure
+    /// that in a test, but we can assert the per-event flags are false on
+    /// a fresh manager — proving the fast path short-circuits correctly.
+    #[test]
+    fn t17_d_no_agent_zero_cost() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        // All flags must start false.
+        assert!(!mgr.has_method_entry_listener());
+        assert!(!mgr.has_method_exit_listener());
+        assert!(!mgr.has_single_step_listener());
+        assert!(!mgr.has_field_access_listener());
+        assert!(!mgr.has_field_modification_listener());
+        assert!(!mgr.has_frame_pop_listener());
+        assert!(!any_method_entry_listener_active());
+        assert!(!any_method_exit_listener_active());
+        assert!(!any_single_step_listener_active());
+        assert!(!any_field_access_listener_active());
+        assert!(!any_field_modification_listener_active());
+        assert!(!any_frame_pop_listener_active());
+
+        // Firing with no agents attached must be harmless and record 0.
+        for i in 0..10_000u32 {
+            fire_method_entry(1, i as u64);
+            fire_method_exit(1, i as u64, false, LocalValue::Int(0));
+            fire_single_step(1, i as u64, i as i64);
+            fire_frame_pop(1, i as u64, false);
+        }
+        assert_eq!(mgr.event_count(JvmtiEventKind::MethodEntry), 0);
+        assert_eq!(mgr.event_count(JvmtiEventKind::MethodExit), 0);
+        assert_eq!(mgr.event_count(JvmtiEventKind::SingleStep), 0);
+        assert_eq!(mgr.event_count(JvmtiEventKind::FramePop), 0);
+    }
+
+    /// T17.Δ.∗ — per-event flag flips to true on Enable, back to false on
+    /// Disable.
+    #[test]
+    fn t17_d_per_event_flag_lifecycle() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 13;
+        // MethodEntry
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        assert!(mgr.has_method_entry_listener());
+        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        assert!(!mgr.has_method_entry_listener());
+
+        // MethodExit
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, None).unwrap();
+        assert!(mgr.has_method_exit_listener());
+        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodExit, None).unwrap();
+        assert!(!mgr.has_method_exit_listener());
+
+        // SingleStep (per-thread)
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SingleStep, Some(tid)).unwrap();
+        assert!(mgr.has_single_step_listener());
+        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::SingleStep, Some(tid)).unwrap();
+        assert!(!mgr.has_single_step_listener());
+    }
+
+    /// T17.Δ.∗ — agent callbacks that panic must not bring down the VM.
+    /// The panic is caught inside each fire_* path; subsequent fires
+    /// keep delivering events.
+    #[test]
+    fn t17_d_agent_panic_does_not_crash_vm() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 14;
+        let mid: MethodId = 0x77777;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+
+        let ok_count = Arc::new(AtomicU32::new(0));
+        let c = ok_count.clone();
+        mgr.set_event_callbacks(EventCallbacks {
+            method_entry: Some(Box::new(move |_t, m| {
+                c.fetch_add(1, Ordering::SeqCst);
+                if m == 999 { panic!("agent panic"); }
+            })),
+            ..Default::default()
+        }).unwrap();
+
+        fire_method_entry(tid, mid);     // normal
+        fire_method_entry(tid, 999);     // agent panics
+        fire_method_entry(tid, mid + 1); // must still deliver
+        assert_eq!(ok_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// T17.Δ.4 — registering a watchpoint idempotently sets access and
+    /// modification flags additively.
+    #[test]
+    fn t17_d_field_watch_additive_flags() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        set_field_watchpoint(5, 2, true, false).unwrap();
+        let wp1 = field_watchpoint_for(5, 2).unwrap();
+        assert!(wp1.access_watched);
+        assert!(!wp1.modification_watched);
+
+        set_field_watchpoint(5, 2, false, true).unwrap();
+        let wp2 = field_watchpoint_for(5, 2).unwrap();
+        assert!(wp2.access_watched);
+        assert!(wp2.modification_watched);
+
+        clear_field_watchpoint(5, 2, true, false).unwrap();
+        let wp3 = field_watchpoint_for(5, 2).unwrap();
+        assert!(!wp3.access_watched);
+        assert!(wp3.modification_watched);
+
+        clear_field_watchpoint(5, 2, false, true).unwrap();
+        assert!(field_watchpoint_for(5, 2).is_none());
+    }
+}

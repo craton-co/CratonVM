@@ -1,0 +1,1740 @@
+//! Compact 64-bit object headers per JEP 519 / Project Lilliput.
+//!
+//! Reduces the per-object header from 32 bytes ([`ObjectHeader`]) to 8 bytes,
+//! saving 24 bytes per live object. Identity hash codes are stored in a
+//! separate side table so the common case (no hash requested) pays nothing.
+//!
+//! ## Bit layout (64 bits)
+//!
+//! ```text
+//! 63       32 31    25 24 23 22 21 20      4 3      0
+//! +---------+--------+-----+--+--+----------+--------+
+//! | NKlass  | GC age | Lck |H |A | varied   | flags  |
+//! +---------+--------+-----+--+--+----------+--------+
+//!   32 bits   7 bits  2 b  1  1    17 bits    4 bits
+//! ```
+//!
+//! * **NKlass (63-32):** Compressed class pointer (`NarrowKlass`).
+//! * **GC age (31-25):** Survivor age, max 127.
+//! * **Lock (24-23):** `00` unlocked, `01` thin-lock, `10` inflated, `11` GC-forwarded.
+//! * **H (22):** Has identity hash code in the side table.
+//! * **A (21):** 1 = array, 0 = object.
+//! * **Varied (20-4):** Reserved / array-length low bits / forwarding bits.
+//! * **Flags (3-0):** GC flags or array element type.
+//!
+//! When the lock state is `11` (forwarded), bits 31-2 encode a forwarding
+//! pointer shifted right by 3 (object-aligned).
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
+
+// ---------------------------------------------------------------------------
+// LockState
+// ---------------------------------------------------------------------------
+
+/// Two-bit lock state stored in the compact header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LockState {
+    /// No lock held.
+    Unlocked = 0b00,
+    /// Thin (biased/stack) lock.
+    ThinLocked = 0b01,
+    /// Inflated heavyweight monitor.
+    Inflated = 0b10,
+    /// GC forwarding pointer installed; bits 31-2 hold the target address >> 3.
+    Forwarded = 0b11,
+}
+
+impl LockState {
+    fn from_bits(bits: u8) -> Self {
+        match bits & 0b11 {
+            0b00 => Self::Unlocked,
+            0b01 => Self::ThinLocked,
+            0b10 => Self::Inflated,
+            0b11 => Self::Forwarded,
+            _ => unreachable!(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CompactHeader
+// ---------------------------------------------------------------------------
+
+/// 64-bit compact object header (Project Lilliput / JEP 519).
+///
+/// See module-level docs for the bit layout.
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct CompactHeader(u64);
+
+impl CompactHeader {
+    // -- Bit-field geometry -------------------------------------------------
+
+    pub const SIZE: usize = 8;
+    pub const MAX_GC_AGE: u8 = 127; // 7 bits
+
+    pub const KLASS_SHIFT: u32 = 32;
+    pub const AGE_SHIFT: u32 = 25;
+    pub const AGE_MASK: u64 = 0x7F << 25;
+    pub const LOCK_SHIFT: u32 = 23;
+    pub const LOCK_MASK: u64 = 0x3 << 23;
+    pub const HASH_BIT: u64 = 1 << 22;
+    pub const ARRAY_BIT: u64 = 1 << 21;
+    pub const ELEM_TYPE_MASK: u64 = 0xF;
+    /// Bits used for the forwarding pointer: bits 31-25 and 22-0 (excludes
+    /// the lock-state bits 24-23 which are set to `11` as the forwarded tag).
+    /// 30 bits total; with 8-byte alignment (>> 3) this addresses 8 GB.
+    pub const FORWARD_MASK: u64 = 0xFE7F_FFFF; // bits 31-25 | bits 22-0
+
+    // -- Construction -------------------------------------------------------
+
+    /// Create a header for a regular (non-array) object.
+    pub fn new_object(narrow_klass: u32, gc_age: u8) -> Self {
+        let age = (gc_age.min(Self::MAX_GC_AGE) as u64) << Self::AGE_SHIFT;
+        let klass = (narrow_klass as u64) << Self::KLASS_SHIFT;
+        Self(klass | age)
+    }
+
+    /// Create a header for an array object.
+    ///
+    /// `element_type` occupies the lowest 4 bits (values 0-15).
+    pub fn new_array(narrow_klass: u32, element_type: u8, gc_age: u8) -> Self {
+        let age = (gc_age.min(Self::MAX_GC_AGE) as u64) << Self::AGE_SHIFT;
+        let klass = (narrow_klass as u64) << Self::KLASS_SHIFT;
+        let elem = (element_type & 0xF) as u64;
+        Self(klass | age | Self::ARRAY_BIT | elem)
+    }
+
+    // -- Compressed class pointer (NarrowKlass) -----------------------------
+
+    /// Upper 32 bits: compressed class pointer.
+    #[inline]
+    pub fn narrow_klass(&self) -> u32 {
+        (self.0 >> Self::KLASS_SHIFT) as u32
+    }
+
+    /// Replace the compressed class pointer.
+    #[inline]
+    pub fn set_narrow_klass(&mut self, klass: u32) {
+        // Clear upper 32 bits, then set.
+        self.0 = (self.0 & 0x0000_0000_FFFF_FFFF) | ((klass as u64) << Self::KLASS_SHIFT);
+    }
+
+    // -- GC age -------------------------------------------------------------
+
+    /// Bits 31-25: GC survivor age (0..=127).
+    #[inline]
+    pub fn gc_age(&self) -> u8 {
+        ((self.0 & Self::AGE_MASK) >> Self::AGE_SHIFT) as u8
+    }
+
+    /// Set the GC survivor age (clamped to [`MAX_GC_AGE`]).
+    #[inline]
+    pub fn set_gc_age(&mut self, age: u8) {
+        let clamped = age.min(Self::MAX_GC_AGE) as u64;
+        self.0 = (self.0 & !Self::AGE_MASK) | (clamped << Self::AGE_SHIFT);
+    }
+
+    /// Increment the GC age by one, capping at [`MAX_GC_AGE`]. Returns the new age.
+    #[inline]
+    pub fn increment_age(&mut self) -> u8 {
+        let new_age = (self.gc_age() + 1).min(Self::MAX_GC_AGE);
+        self.set_gc_age(new_age);
+        new_age
+    }
+
+    // -- Lock state ---------------------------------------------------------
+
+    /// Bits 24-23: lock state.
+    #[inline]
+    pub fn lock_state(&self) -> LockState {
+        let bits = ((self.0 & Self::LOCK_MASK) >> Self::LOCK_SHIFT) as u8;
+        LockState::from_bits(bits)
+    }
+
+    /// Set the lock state.
+    #[inline]
+    pub fn set_lock_state(&mut self, state: LockState) {
+        self.0 = (self.0 & !Self::LOCK_MASK) | ((state as u64) << Self::LOCK_SHIFT);
+    }
+
+    // -- Identity hash code flag --------------------------------------------
+
+    /// Bit 22: whether this object has a hash code in the side table.
+    #[inline]
+    pub fn has_hash_code(&self) -> bool {
+        self.0 & Self::HASH_BIT != 0
+    }
+
+    /// Set the identity-hash-code-present bit.
+    #[inline]
+    pub fn set_has_hash_code(&mut self) {
+        self.0 |= Self::HASH_BIT;
+    }
+
+    // -- Array flag ---------------------------------------------------------
+
+    /// Bit 21: 1 if this object is an array.
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        self.0 & Self::ARRAY_BIT != 0
+    }
+
+    /// Element type for arrays (lower 4 bits). Meaningless for non-arrays.
+    #[inline]
+    pub fn element_type(&self) -> u8 {
+        (self.0 & Self::ELEM_TYPE_MASK) as u8
+    }
+
+    // -- GC forwarding ------------------------------------------------------
+
+    /// Returns `true` when the header encodes a forwarding pointer
+    /// (lock state == `Forwarded`).
+    #[inline]
+    pub fn is_forwarded(&self) -> bool {
+        self.lock_state() == LockState::Forwarded
+    }
+
+    /// Install a forwarding pointer. The address **must** be 8-byte aligned.
+    ///
+    /// This overwrites the lower 32 bits. The upper 32 bits (klass) are
+    /// preserved so the GC can still identify the class of the forwarded
+    /// object. The shifted address is split around the lock-state bits
+    /// (24-23) which are set to `11` as the forwarded tag.
+    pub fn set_forwarding_ptr(&mut self, addr: usize) {
+        debug_assert!(addr & 0x7 == 0, "forwarding address must be 8-byte aligned");
+        let shifted = (addr >> 3) as u64;
+        // Split the 30-bit shifted value into two parts around lock bits:
+        //   low part  = bits 22-0 of the shifted value -> header bits 22-0
+        //   high part = bits 29-23 of the shifted value -> header bits 31-25
+        let low = shifted & 0x7F_FFFF; // 23 bits
+        let high = (shifted >> 23) & 0x7F; // 7 bits
+        let lock_bits = (LockState::Forwarded as u64) << Self::LOCK_SHIFT;
+        let upper = self.0 & 0xFFFF_FFFF_0000_0000;
+        self.0 = upper | (high << 25) | lock_bits | low;
+    }
+
+    /// Read the forwarding pointer. Only valid when [`is_forwarded`] is true.
+    pub fn forwarding_ptr(&self) -> usize {
+        let low = self.0 & 0x7F_FFFF; // bits 22-0: 23 bits
+        let high = (self.0 >> 25) & 0x7F; // bits 31-25: 7 bits
+        let shifted = (high << 23) | low;
+        (shifted << 3) as usize
+    }
+
+    // -- Raw access ---------------------------------------------------------
+
+    /// Get the raw 64-bit backing value.
+    #[inline]
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
+
+    /// Construct from a raw 64-bit value (for deserialization / testing).
+    #[inline]
+    pub fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashCodeTable -- side table for identity hash codes
+// ---------------------------------------------------------------------------
+
+/// Side table for identity hash codes.
+///
+/// Most Java objects never have `System.identityHashCode()` called on them.
+/// Storing the hash in the header wastes 4 bytes per object. Instead we
+/// lazily allocate an entry here only when the hash is first requested.
+/// T10.9.B: FxHashMap — keys are object pointer addresses (internal).
+pub struct HashCodeTable {
+    table: RwLock<FxHashMap<usize, i32>>,
+    next_hash: AtomicI32,
+}
+
+impl HashCodeTable {
+    /// Create an empty hash code table. The first generated hash will be `1`.
+    pub fn new() -> Self {
+        Self {
+            table: RwLock::new(FxHashMap::default()),
+            next_hash: AtomicI32::new(1),
+        }
+    }
+
+    /// Get or assign an identity hash code for the object at `obj_addr`.
+    ///
+    /// If no hash has been assigned yet a new one is generated atomically.
+    /// Subsequent calls with the same address return the same value.
+    pub fn get_or_assign(&self, obj_addr: usize) -> i32 {
+        // Fast path: already assigned.
+        {
+            let read = self.table.read();
+            if let Some(&hash) = read.get(&obj_addr) {
+                return hash;
+            }
+        }
+
+        // Slow path: generate and insert.
+        let mut write = self.table.write();
+        // Double-check after acquiring write lock.
+        if let Some(&hash) = write.get(&obj_addr) {
+            return hash;
+        }
+        let hash = self.next_hash.fetch_add(1, Ordering::Relaxed);
+        write.insert(obj_addr, hash);
+        hash
+    }
+
+    /// Does the object at `obj_addr` have a hash code in this table?
+    pub fn has_hash(&self, obj_addr: usize) -> bool {
+        self.table.read().contains_key(&obj_addr)
+    }
+
+    /// Return the hash code if one has been assigned.
+    pub fn get(&self, obj_addr: usize) -> Option<i32> {
+        self.table.read().get(&obj_addr).copied()
+    }
+
+    /// After a GC relocation, remap all stored addresses according to
+    /// `pointer_map` (old address -> new address).
+    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+        let mut write = self.table.write();
+        let old: Vec<(usize, i32)> = write.drain().collect();
+        for (addr, hash) in old {
+            let new_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
+            write.insert(new_addr, hash);
+        }
+    }
+
+    /// Remove entries for dead objects. `is_live` returns `true` for addresses
+    /// that survived the current GC cycle.
+    pub fn remove_dead(&self, is_live: &dyn Fn(usize) -> bool) {
+        let mut write = self.table.write();
+        write.retain(|&addr, _| is_live(addr));
+    }
+
+    /// Number of hash codes stored.
+    pub fn len(&self) -> usize {
+        self.table.read().len()
+    }
+
+    /// `true` if no hash codes are stored.
+    pub fn is_empty(&self) -> bool {
+        self.table.read().is_empty()
+    }
+
+    /// Discard all entries.
+    pub fn clear(&self) {
+        self.table.write().clear();
+    }
+
+    /// Estimate the memory saved by *not* storing hash codes in the header.
+    ///
+    /// If every object kept a 4-byte hash in its header, the cost would be
+    /// `total_objects * 4`. With the side table we only pay for objects that
+    /// actually requested a hash: `self.len() * (size_of_entry)`. The savings
+    /// are approximate.
+    pub fn savings_bytes(&self, total_objects: usize) -> usize {
+        let hash_size = 4usize; // i32
+        let cost_if_inline = total_objects * hash_size;
+        // Each HashMap entry: key (usize=8) + value (i32=4) + overhead (~16).
+        let entry_overhead = 8 + 4 + 16;
+        let actual_cost = self.len() * entry_overhead;
+        cost_if_inline.saturating_sub(actual_cost)
+    }
+}
+
+impl Default for HashCodeTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy interop -- migration helpers
+// ---------------------------------------------------------------------------
+
+/// Fields extracted from a [`CompactHeader`] in a flat struct, matching the
+/// shape expected by code written against the old 32-byte header.
+#[derive(Debug, Clone)]
+pub struct LegacyHeaderFields {
+    pub narrow_klass: u32,
+    pub is_array: bool,
+    pub element_type: u8,
+    pub gc_age: u8,
+    pub lock_state: LockState,
+    pub has_hash: bool,
+    pub is_forwarded: bool,
+    pub forwarding_addr: usize,
+}
+
+/// Convert a legacy 32-byte [`ObjectHeader`](crate::heap::ObjectHeader) into
+/// a [`CompactHeader`], migrating the identity hash code into `hash_table`
+/// when present.
+pub fn migrate_to_compact(
+    old: &crate::heap::ObjectHeader,
+    narrow_klass: u32,
+    hash_table: &HashCodeTable,
+    obj_addr: usize,
+) -> CompactHeader {
+    let is_array = old.kind == crate::heap::ObjectKind::Array;
+    let mut header = if is_array {
+        CompactHeader::new_array(narrow_klass, old.element_type as u8, old.gc_age)
+    } else {
+        CompactHeader::new_object(narrow_klass, old.gc_age)
+    };
+
+    // Migrate identity hash code to side table if non-zero.
+    if old.identity_hash_code != 0 {
+        // Force the same hash value into the table.
+        let mut write = hash_table.table.write();
+        write.insert(obj_addr, old.identity_hash_code);
+        drop(write);
+        header.set_has_hash_code();
+    }
+
+    // Migrate GC flags into the lower 4 bits for non-arrays.
+    // (For arrays the element_type already occupies those bits.)
+    if !is_array {
+        // Preserve gc_flags in the lowest nibble.
+        let flags = (old.gc_flags & 0xF) as u64;
+        header.0 = (header.0 & !CompactHeader::ELEM_TYPE_MASK) | flags;
+    }
+
+    // Migrate forwarding pointer.
+    if !old.forwarding_ptr.is_null() {
+        header.set_forwarding_ptr(old.forwarding_ptr as usize);
+    }
+
+    header
+}
+
+/// Extract legacy-style fields from a compact header.
+pub fn to_legacy_fields(header: CompactHeader) -> LegacyHeaderFields {
+    LegacyHeaderFields {
+        narrow_klass: header.narrow_klass(),
+        is_array: header.is_array(),
+        element_type: header.element_type(),
+        gc_age: header.gc_age(),
+        lock_state: header.lock_state(),
+        has_hash: header.has_hash_code(),
+        is_forwarded: header.is_forwarded(),
+        forwarding_addr: if header.is_forwarded() {
+            header.forwarding_ptr()
+        } else {
+            0
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NarrowKlassTable — bidirectional ClassId <-> u32 narrow klass mapping
+// ---------------------------------------------------------------------------
+
+/// Bidirectional mapping between [`ClassId`] (the VM's opaque class identifier)
+/// and a 32-bit `NarrowKlass` value used inside [`CompactHeader`].
+///
+/// In a traditional JVM the narrow klass encodes a pointer into the metaspace
+/// (compressed by a shift + base). Our synthetic model uses a simpler scheme:
+/// each ClassId is assigned a sequential u32 narrow ID starting at 1.
+/// ID 0 is reserved for "no class" / uninitialized.
+/// T10.9.B: FxHashMap — internal u32 keys.
+pub struct NarrowKlassTable {
+    /// ClassId → NarrowKlass (sequential u32).
+    to_narrow: RwLock<FxHashMap<u32, u32>>,
+    /// NarrowKlass → ClassId (reverse lookup).
+    to_class_id: RwLock<FxHashMap<u32, u32>>,
+    /// Next narrow klass ID to assign.
+    next_id: std::sync::atomic::AtomicU32,
+}
+
+impl NarrowKlassTable {
+    /// Create an empty table. IDs start at 1 (0 is reserved).
+    pub fn new() -> Self {
+        Self {
+            to_narrow: RwLock::new(FxHashMap::default()),
+            to_class_id: RwLock::new(FxHashMap::default()),
+            next_id: std::sync::atomic::AtomicU32::new(1),
+        }
+    }
+
+    /// Get or assign a narrow klass ID for the given [`ClassId`].
+    ///
+    /// Thread-safe: concurrent calls for the same ClassId return the same value.
+    pub fn get_or_assign(&self, class_id: rustjvm_types::ClassId) -> u32 {
+        let raw = class_id.as_u32();
+        // Fast path: already assigned.
+        {
+            let read = self.to_narrow.read();
+            if let Some(&nk) = read.get(&raw) {
+                return nk;
+            }
+        }
+        // Slow path: assign a new ID.
+        let mut write = self.to_narrow.write();
+        if let Some(&nk) = write.get(&raw) {
+            return nk;
+        }
+        let nk = self.next_id.fetch_add(1, Ordering::Relaxed);
+        write.insert(raw, nk);
+        drop(write);
+        self.to_class_id.write().insert(nk, raw);
+        nk
+    }
+
+    /// Look up the ClassId for a narrow klass value. Returns `None` if the
+    /// narrow klass has never been assigned.
+    pub fn resolve(&self, narrow_klass: u32) -> Option<rustjvm_types::ClassId> {
+        self.to_class_id
+            .read()
+            .get(&narrow_klass)
+            .map(|&raw| rustjvm_types::ClassId::new(raw))
+    }
+
+    /// Number of registered class mappings.
+    pub fn len(&self) -> usize {
+        self.to_narrow.read().len()
+    }
+
+    /// Whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.to_narrow.read().is_empty()
+    }
+
+    /// Check if a ClassId already has a narrow klass assignment.
+    pub fn contains(&self, class_id: rustjvm_types::ClassId) -> bool {
+        self.to_narrow.read().contains_key(&class_id.as_u32())
+    }
+}
+
+impl Default for NarrowKlassTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeaderView — unified read API for both header formats
+// ---------------------------------------------------------------------------
+
+/// A read-only view into an object's header, abstracting over the legacy
+/// 32-byte [`ObjectHeader`] and the compact 8-byte [`CompactHeader`].
+///
+/// This allows VM code to be header-format-agnostic.
+#[derive(Debug, Clone)]
+pub enum HeaderView {
+    /// The legacy 32-byte header (direct reference).
+    Legacy {
+        class_id: rustjvm_types::ClassId,
+        is_array: bool,
+        element_type: u8,
+        array_length: u32,
+        num_slots: u32,
+        identity_hash_code: i32,
+        gc_age: u8,
+        gc_flags: u8,
+        is_forwarded: bool,
+    },
+    /// An 8-byte compact header with side-table hash.
+    Compact {
+        narrow_klass: u32,
+        is_array: bool,
+        element_type: u8,
+        gc_age: u8,
+        lock_state: LockState,
+        has_hash: bool,
+        is_forwarded: bool,
+    },
+}
+
+impl HeaderView {
+    /// Build a HeaderView from a legacy ObjectHeader.
+    pub fn from_legacy(h: &crate::heap::ObjectHeader) -> Self {
+        HeaderView::Legacy {
+            class_id: h.class_id,
+            is_array: h.kind == crate::heap::ObjectKind::Array,
+            element_type: h.element_type as u8,
+            array_length: h.array_length,
+            num_slots: h.num_slots,
+            identity_hash_code: h.identity_hash_code,
+            gc_age: h.gc_age,
+            gc_flags: h.gc_flags,
+            is_forwarded: !h.forwarding_ptr.is_null(),
+        }
+    }
+
+    /// Build a HeaderView from a CompactHeader.
+    pub fn from_compact(h: CompactHeader) -> Self {
+        HeaderView::Compact {
+            narrow_klass: h.narrow_klass(),
+            is_array: h.is_array(),
+            element_type: h.element_type(),
+            gc_age: h.gc_age(),
+            lock_state: h.lock_state(),
+            has_hash: h.has_hash_code(),
+            is_forwarded: h.is_forwarded(),
+        }
+    }
+
+    /// Is this an array object?
+    pub fn is_array(&self) -> bool {
+        match self {
+            HeaderView::Legacy { is_array, .. } => *is_array,
+            HeaderView::Compact { is_array, .. } => *is_array,
+        }
+    }
+
+    /// GC survivor age.
+    pub fn gc_age(&self) -> u8 {
+        match self {
+            HeaderView::Legacy { gc_age, .. } => *gc_age,
+            HeaderView::Compact { gc_age, .. } => *gc_age,
+        }
+    }
+
+    /// Element type (meaningful only for arrays).
+    pub fn element_type(&self) -> u8 {
+        match self {
+            HeaderView::Legacy { element_type, .. } => *element_type,
+            HeaderView::Compact { element_type, .. } => *element_type,
+        }
+    }
+
+    /// Is the object forwarded by GC?
+    pub fn is_forwarded(&self) -> bool {
+        match self {
+            HeaderView::Legacy { is_forwarded, .. } => *is_forwarded,
+            HeaderView::Compact { is_forwarded, .. } => *is_forwarded,
+        }
+    }
+
+    /// Header size in bytes.
+    pub fn header_size(&self) -> usize {
+        match self {
+            HeaderView::Legacy { .. } => crate::heap::HEADER_SIZE,
+            HeaderView::Compact { .. } => CompactHeader::SIZE,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CompactAllocator — bump-pointer allocator using 8-byte compact headers
+// ---------------------------------------------------------------------------
+
+/// A simple bump-pointer allocator that creates objects with 8-byte compact
+/// headers instead of 32-byte legacy headers.
+///
+/// This demonstrates the compact header allocation path. The VM can use this
+/// alongside the existing `GenerationalHeap` when `use_compact_headers` is
+/// enabled.
+pub struct CompactAllocator {
+    /// Backing storage.
+    storage: Vec<u8>,
+    /// Bump pointer (offset into storage).
+    offset: std::sync::atomic::AtomicUsize,
+    /// Narrow klass table for ClassId compression.
+    klass_table: NarrowKlassTable,
+    /// Identity hash code side table.
+    hash_table: HashCodeTable,
+    /// Total number of objects allocated.
+    object_count: std::sync::atomic::AtomicUsize,
+    /// Total bytes saved vs. legacy 32-byte headers.
+    bytes_saved: std::sync::atomic::AtomicUsize,
+}
+
+/// Size of each value slot (matches the legacy slot size for compatibility).
+const COMPACT_SLOT_SIZE: usize = 16;
+
+impl CompactAllocator {
+    /// Create a new compact allocator with the given capacity in bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            storage: vec![0u8; capacity],
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            klass_table: NarrowKlassTable::new(),
+            hash_table: HashCodeTable::new(),
+            object_count: std::sync::atomic::AtomicUsize::new(0),
+            bytes_saved: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Allocate an object with compact header + field slots.
+    ///
+    /// Returns `Some(ptr)` on success, `None` on OOM.
+    /// The returned pointer points to the start of the compact header (8 bytes)
+    /// followed by `num_fields * COMPACT_SLOT_SIZE` bytes of field data.
+    pub fn alloc_object(
+        &self,
+        class_id: rustjvm_types::ClassId,
+        num_fields: usize,
+    ) -> Option<*mut u8> {
+        let nk = self.klass_table.get_or_assign(class_id);
+        let total_size = CompactHeader::SIZE + num_fields * COMPACT_SLOT_SIZE;
+        let aligned = (total_size + 7) & !7; // 8-byte align
+
+        let start = self
+            .offset
+            .fetch_add(aligned, Ordering::Relaxed);
+        if start + aligned > self.storage.len() {
+            // OOM — roll back (best-effort; doesn't handle races perfectly)
+            self.offset.fetch_sub(aligned, Ordering::Relaxed);
+            return None;
+        }
+
+        let ptr = unsafe { (self.storage.as_ptr() as *mut u8).add(start) };
+
+        // Write the compact header
+        let header = CompactHeader::new_object(nk, 0);
+        unsafe {
+            std::ptr::write(ptr as *mut u64, header.raw());
+            // Zero field data
+            std::ptr::write_bytes(ptr.add(CompactHeader::SIZE), 0, num_fields * COMPACT_SLOT_SIZE);
+        }
+
+        self.object_count.fetch_add(1, Ordering::Relaxed);
+        // Savings: 32 - 8 = 24 bytes per object
+        self.bytes_saved.fetch_add(24, Ordering::Relaxed);
+
+        Some(ptr)
+    }
+
+    /// Allocate an array with compact header + element data.
+    ///
+    /// Returns `Some(ptr)` on success, `None` on OOM.
+    pub fn alloc_array(
+        &self,
+        class_id: rustjvm_types::ClassId,
+        element_type: crate::heap::ArrayElementType,
+        length: usize,
+    ) -> Option<*mut u8> {
+        let nk = self.klass_table.get_or_assign(class_id);
+        let elem_size = element_byte_size(element_type);
+        let data_size = length.checked_mul(elem_size)?;
+        let data_aligned = (data_size + 7) & !7;
+        // For arrays, we store the length as a u32 immediately after the 8-byte header
+        // Layout: [CompactHeader:8][array_length:4][padding:4][data...]
+        let total_size = CompactHeader::SIZE + 8 + data_aligned; // 8 for length+padding
+
+        let start = self.offset.fetch_add(total_size, Ordering::Relaxed);
+        if start + total_size > self.storage.len() {
+            self.offset.fetch_sub(total_size, Ordering::Relaxed);
+            return None;
+        }
+
+        let ptr = unsafe { (self.storage.as_ptr() as *mut u8).add(start) };
+        let header = CompactHeader::new_array(nk, element_type as u8, 0);
+        unsafe {
+            std::ptr::write(ptr as *mut u64, header.raw());
+            // Write array length at offset 8
+            std::ptr::write((ptr.add(8)) as *mut u32, length as u32);
+            // Zero the data region
+            std::ptr::write_bytes(ptr.add(CompactHeader::SIZE + 8), 0, data_aligned);
+        }
+
+        self.object_count.fetch_add(1, Ordering::Relaxed);
+        self.bytes_saved.fetch_add(24, Ordering::Relaxed);
+
+        Some(ptr)
+    }
+
+    /// Read the compact header at the given pointer.
+    pub fn read_header(&self, ptr: *const u8) -> CompactHeader {
+        unsafe { CompactHeader::from_raw(std::ptr::read(ptr as *const u64)) }
+    }
+
+    /// Get the array length stored after the compact header.
+    pub fn read_array_length(&self, ptr: *const u8) -> u32 {
+        unsafe { std::ptr::read(ptr.add(8) as *const u32) }
+    }
+
+    /// Resolve the ClassId from a compact header at the given pointer.
+    pub fn class_id_at(&self, ptr: *const u8) -> Option<rustjvm_types::ClassId> {
+        let header = self.read_header(ptr);
+        self.klass_table.resolve(header.narrow_klass())
+    }
+
+    /// Get or assign the identity hash code for the object at `obj_addr`.
+    pub fn identity_hash_code(&self, obj_addr: usize) -> i32 {
+        self.hash_table.get_or_assign(obj_addr)
+    }
+
+    /// Get a HeaderView for the object at the given pointer.
+    pub fn header_view(&self, ptr: *const u8) -> HeaderView {
+        HeaderView::from_compact(self.read_header(ptr))
+    }
+
+    /// Access the narrow klass table.
+    pub fn klass_table(&self) -> &NarrowKlassTable {
+        &self.klass_table
+    }
+
+    /// Access the hash code side table.
+    pub fn hash_table(&self) -> &HashCodeTable {
+        &self.hash_table
+    }
+
+    /// Total number of objects allocated.
+    pub fn object_count(&self) -> usize {
+        self.object_count.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes saved vs. legacy 32-byte headers.
+    pub fn bytes_saved(&self) -> usize {
+        self.bytes_saved.load(Ordering::Relaxed)
+    }
+
+    /// Current allocation offset (bytes used).
+    pub fn used_bytes(&self) -> usize {
+        self.offset.load(Ordering::Relaxed)
+    }
+
+    /// Total capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Generate a memory savings report.
+    pub fn savings_report(&self) -> CompactHeaderSavingsReport {
+        let obj_count = self.object_count();
+        let bytes_saved = self.bytes_saved();
+        let hash_entries = self.hash_table.len();
+        let hash_savings = self.hash_table.savings_bytes(obj_count);
+        CompactHeaderSavingsReport {
+            object_count: obj_count,
+            header_bytes_saved: bytes_saved,
+            hash_table_entries: hash_entries,
+            hash_table_savings: hash_savings,
+            total_savings: bytes_saved + hash_savings,
+            klass_table_entries: self.klass_table.len(),
+        }
+    }
+}
+
+/// Report of memory savings from compact headers.
+#[derive(Debug, Clone)]
+pub struct CompactHeaderSavingsReport {
+    /// Number of objects allocated with compact headers.
+    pub object_count: usize,
+    /// Bytes saved from 32→8 byte header reduction.
+    pub header_bytes_saved: usize,
+    /// Number of identity hash codes in the side table.
+    pub hash_table_entries: usize,
+    /// Bytes saved by lazy hash code allocation.
+    pub hash_table_savings: usize,
+    /// Total bytes saved (header + hash).
+    pub total_savings: usize,
+    /// Number of class entries in the narrow klass table.
+    pub klass_table_entries: usize,
+}
+
+impl CompactHeaderSavingsReport {
+    /// Format the report as a human-readable string.
+    pub fn format(&self) -> String {
+        format!(
+            "Compact Object Headers Report:\n  \
+             Objects:           {}\n  \
+             Header savings:    {} bytes ({} bytes/obj)\n  \
+             Hash table:        {} entries ({} bytes saved)\n  \
+             Klass table:       {} entries\n  \
+             Total savings:     {} bytes",
+            self.object_count,
+            self.header_bytes_saved,
+            if self.object_count > 0 {
+                self.header_bytes_saved / self.object_count
+            } else {
+                0
+            },
+            self.hash_table_entries,
+            self.hash_table_savings,
+            self.klass_table_entries,
+            self.total_savings,
+        )
+    }
+}
+
+/// Helper: element byte size for a given array element type.
+fn element_byte_size(et: crate::heap::ArrayElementType) -> usize {
+    match et {
+        crate::heap::ArrayElementType::Boolean | crate::heap::ArrayElementType::Byte => 1,
+        crate::heap::ArrayElementType::Char | crate::heap::ArrayElementType::Short => 2,
+        crate::heap::ArrayElementType::Int | crate::heap::ArrayElementType::Float => 4,
+        crate::heap::ArrayElementType::Long
+        | crate::heap::ArrayElementType::Double
+        | crate::heap::ArrayElementType::Reference => 8,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- CompactHeader construction -----------------------------------------
+
+    #[test]
+    fn new_object_basic() {
+        let h = CompactHeader::new_object(42, 0);
+        assert_eq!(h.narrow_klass(), 42);
+        assert_eq!(h.gc_age(), 0);
+        assert!(!h.is_array());
+        assert_eq!(h.lock_state(), LockState::Unlocked);
+        assert!(!h.has_hash_code());
+    }
+
+    #[test]
+    fn new_object_with_age() {
+        let h = CompactHeader::new_object(100, 15);
+        assert_eq!(h.narrow_klass(), 100);
+        assert_eq!(h.gc_age(), 15);
+    }
+
+    #[test]
+    fn new_object_max_klass() {
+        let h = CompactHeader::new_object(u32::MAX, 0);
+        assert_eq!(h.narrow_klass(), u32::MAX);
+    }
+
+    #[test]
+    fn new_array_with_element_type() {
+        let h = CompactHeader::new_array(7, 5, 3);
+        assert!(h.is_array());
+        assert_eq!(h.narrow_klass(), 7);
+        assert_eq!(h.element_type(), 5);
+        assert_eq!(h.gc_age(), 3);
+    }
+
+    // -- NarrowKlass roundtrip ----------------------------------------------
+
+    #[test]
+    fn narrow_klass_roundtrip() {
+        for klass in [0, 1, 255, 65535, 0xDEAD_BEEF, u32::MAX] {
+            let h = CompactHeader::new_object(klass, 0);
+            assert_eq!(h.narrow_klass(), klass, "klass={klass:#x}");
+        }
+    }
+
+    #[test]
+    fn set_narrow_klass_preserves_lower_bits() {
+        let mut h = CompactHeader::new_array(1, 9, 7);
+        h.set_narrow_klass(0xABCD_1234);
+        assert_eq!(h.narrow_klass(), 0xABCD_1234);
+        // Lower bits unchanged.
+        assert_eq!(h.gc_age(), 7);
+        assert!(h.is_array());
+        assert_eq!(h.element_type(), 9);
+    }
+
+    // -- GC age -------------------------------------------------------------
+
+    #[test]
+    fn gc_age_zero() {
+        let h = CompactHeader::new_object(1, 0);
+        assert_eq!(h.gc_age(), 0);
+    }
+
+    #[test]
+    fn gc_age_fifteen() {
+        let h = CompactHeader::new_object(1, 15);
+        assert_eq!(h.gc_age(), 15);
+    }
+
+    #[test]
+    fn gc_age_max_127() {
+        let h = CompactHeader::new_object(1, 127);
+        assert_eq!(h.gc_age(), 127);
+    }
+
+    #[test]
+    fn gc_age_clamped_above_max() {
+        let h = CompactHeader::new_object(1, 200);
+        assert_eq!(h.gc_age(), CompactHeader::MAX_GC_AGE);
+    }
+
+    #[test]
+    fn increment_age_caps_at_max() {
+        let mut h = CompactHeader::new_object(1, 126);
+        assert_eq!(h.increment_age(), 127);
+        assert_eq!(h.increment_age(), 127); // stays capped
+        assert_eq!(h.gc_age(), 127);
+    }
+
+    // -- Lock state ---------------------------------------------------------
+
+    #[test]
+    fn lock_state_transitions() {
+        let mut h = CompactHeader::new_object(1, 0);
+        assert_eq!(h.lock_state(), LockState::Unlocked);
+
+        h.set_lock_state(LockState::ThinLocked);
+        assert_eq!(h.lock_state(), LockState::ThinLocked);
+
+        h.set_lock_state(LockState::Inflated);
+        assert_eq!(h.lock_state(), LockState::Inflated);
+
+        h.set_lock_state(LockState::Forwarded);
+        assert_eq!(h.lock_state(), LockState::Forwarded);
+
+        h.set_lock_state(LockState::Unlocked);
+        assert_eq!(h.lock_state(), LockState::Unlocked);
+    }
+
+    // -- Hash code flag -----------------------------------------------------
+
+    #[test]
+    fn has_hash_code_flag() {
+        let mut h = CompactHeader::new_object(1, 0);
+        assert!(!h.has_hash_code());
+        h.set_has_hash_code();
+        assert!(h.has_hash_code());
+        // Other fields untouched.
+        assert_eq!(h.narrow_klass(), 1);
+        assert_eq!(h.gc_age(), 0);
+    }
+
+    // -- Array flag ---------------------------------------------------------
+
+    #[test]
+    fn is_array_flag() {
+        let obj = CompactHeader::new_object(1, 0);
+        assert!(!obj.is_array());
+        let arr = CompactHeader::new_array(1, 0, 0);
+        assert!(arr.is_array());
+    }
+
+    // -- Element type -------------------------------------------------------
+
+    #[test]
+    fn element_type_values() {
+        for et in 0u8..=15 {
+            let h = CompactHeader::new_array(1, et, 0);
+            assert_eq!(h.element_type(), et, "element_type={et}");
+        }
+    }
+
+    // -- Forwarding pointer -------------------------------------------------
+
+    #[test]
+    fn forwarding_ptr_roundtrip() {
+        let addrs: Vec<usize> = vec![0, 8, 64, 0x1000, 0x0FFF_FFF8];
+        for &addr in &addrs {
+            let mut h = CompactHeader::new_object(42, 5);
+            h.set_forwarding_ptr(addr);
+            assert!(h.is_forwarded(), "addr={addr:#x}");
+            assert_eq!(h.forwarding_ptr(), addr, "addr={addr:#x}");
+            // Klass preserved.
+            assert_eq!(h.narrow_klass(), 42);
+        }
+    }
+
+    #[test]
+    fn forwarding_clears_other_lower_fields() {
+        let mut h = CompactHeader::new_array(10, 7, 12);
+        h.set_has_hash_code();
+        // After installing forwarding pointer the lower 32 bits are overwritten.
+        h.set_forwarding_ptr(0x8000);
+        assert!(h.is_forwarded());
+        assert_eq!(h.lock_state(), LockState::Forwarded);
+        // Klass survives.
+        assert_eq!(h.narrow_klass(), 10);
+    }
+
+    #[test]
+    fn is_forwarded_check() {
+        let mut h = CompactHeader::new_object(1, 0);
+        assert!(!h.is_forwarded());
+        h.set_lock_state(LockState::Forwarded);
+        assert!(h.is_forwarded());
+    }
+
+    // -- Raw roundtrip ------------------------------------------------------
+
+    #[test]
+    fn raw_roundtrip() {
+        let h = CompactHeader::new_array(0xCAFE, 11, 99);
+        let raw = h.raw();
+        let h2 = CompactHeader::from_raw(raw);
+        assert_eq!(h2.narrow_klass(), 0xCAFE);
+        assert_eq!(h2.element_type(), 11);
+        assert_eq!(h2.gc_age(), 99);
+        assert!(h2.is_array());
+    }
+
+    // -- Size constant ------------------------------------------------------
+
+    #[test]
+    fn size_is_8_bytes() {
+        assert_eq!(CompactHeader::SIZE, 8);
+        assert_eq!(std::mem::size_of::<CompactHeader>(), 8);
+    }
+
+    #[test]
+    fn memory_savings_vs_old_header() {
+        // Old ObjectHeader is 32 bytes, compact is 8 => 24 bytes saved.
+        let old_size: usize = 32;
+        let new_size = CompactHeader::SIZE;
+        assert_eq!(old_size - new_size, 24);
+    }
+
+    // -- HashCodeTable ------------------------------------------------------
+
+    #[test]
+    fn hash_table_get_or_assign_unique() {
+        let ht = HashCodeTable::new();
+        let h1 = ht.get_or_assign(0x1000);
+        let h2 = ht.get_or_assign(0x2000);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_table_get_or_assign_stable() {
+        let ht = HashCodeTable::new();
+        let h1 = ht.get_or_assign(0x1000);
+        let h2 = ht.get_or_assign(0x1000);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_table_has_hash() {
+        let ht = HashCodeTable::new();
+        assert!(!ht.has_hash(0x1000));
+        ht.get_or_assign(0x1000);
+        assert!(ht.has_hash(0x1000));
+        assert!(!ht.has_hash(0x2000));
+    }
+
+    #[test]
+    fn hash_table_get() {
+        let ht = HashCodeTable::new();
+        assert_eq!(ht.get(0x1000), None);
+        let assigned = ht.get_or_assign(0x1000);
+        assert_eq!(ht.get(0x1000), Some(assigned));
+    }
+
+    #[test]
+    fn hash_table_update_after_gc() {
+        let ht = HashCodeTable::new();
+        let hash = ht.get_or_assign(0x1000);
+        let mut map = HashMap::new();
+        map.insert(0x1000usize, 0x5000usize);
+        ht.update_after_gc(&map);
+        // Old address gone, new address has the same hash.
+        assert!(!ht.has_hash(0x1000));
+        assert_eq!(ht.get(0x5000), Some(hash));
+    }
+
+    #[test]
+    fn hash_table_remove_dead() {
+        let ht = HashCodeTable::new();
+        ht.get_or_assign(0x1000);
+        ht.get_or_assign(0x2000);
+        ht.get_or_assign(0x3000);
+        assert_eq!(ht.len(), 3);
+
+        ht.remove_dead(&|addr| addr == 0x2000); // only 0x2000 is live
+        assert_eq!(ht.len(), 1);
+        assert!(ht.has_hash(0x2000));
+        assert!(!ht.has_hash(0x1000));
+    }
+
+    #[test]
+    fn hash_table_savings_bytes() {
+        let ht = HashCodeTable::new();
+        // 1000 objects, no hashes requested: saves 1000*4 = 4000 bytes.
+        assert_eq!(ht.savings_bytes(1000), 4000);
+
+        // Assign one hash -- savings decrease slightly.
+        ht.get_or_assign(0x1000);
+        let savings = ht.savings_bytes(1000);
+        assert!(savings < 4000);
+        assert!(savings > 0);
+    }
+
+    #[test]
+    fn hash_table_len_and_empty() {
+        let ht = HashCodeTable::new();
+        assert!(ht.is_empty());
+        assert_eq!(ht.len(), 0);
+        ht.get_or_assign(0x1000);
+        assert!(!ht.is_empty());
+        assert_eq!(ht.len(), 1);
+    }
+
+    #[test]
+    fn hash_table_clear() {
+        let ht = HashCodeTable::new();
+        ht.get_or_assign(0x1000);
+        ht.get_or_assign(0x2000);
+        assert_eq!(ht.len(), 2);
+        ht.clear();
+        assert!(ht.is_empty());
+    }
+
+    // -- Migration helpers --------------------------------------------------
+
+    #[test]
+    fn migrate_preserves_class_and_age() {
+        let old = crate::heap::ObjectHeader {
+            class_id: rustjvm_types::ClassId::new(77),
+            kind: crate::heap::ObjectKind::Object,
+            element_type: crate::heap::ArrayElementType::Reference,
+            _padding: [0; 2],
+            identity_hash_code: 0,
+            array_length: 0,
+            num_slots: 2,
+            gc_age: 9,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+        let ht = HashCodeTable::new();
+        let compact = migrate_to_compact(&old, 77, &ht, 0x4000);
+        assert_eq!(compact.narrow_klass(), 77);
+        assert_eq!(compact.gc_age(), 9);
+        assert!(!compact.is_array());
+        assert!(!compact.has_hash_code());
+    }
+
+    #[test]
+    fn migrate_array_preserves_element_type() {
+        let old = crate::heap::ObjectHeader {
+            class_id: rustjvm_types::ClassId::new(10),
+            kind: crate::heap::ObjectKind::Array,
+            element_type: crate::heap::ArrayElementType::Int,
+            _padding: [0; 2],
+            identity_hash_code: 0,
+            array_length: 5,
+            num_slots: 5,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+        let ht = HashCodeTable::new();
+        let compact = migrate_to_compact(&old, 10, &ht, 0x5000);
+        assert!(compact.is_array());
+        assert_eq!(compact.element_type(), crate::heap::ArrayElementType::Int as u8);
+    }
+
+    #[test]
+    fn migrate_hash_code_to_side_table() {
+        let old = crate::heap::ObjectHeader {
+            class_id: rustjvm_types::ClassId::new(1),
+            kind: crate::heap::ObjectKind::Object,
+            element_type: crate::heap::ArrayElementType::Reference,
+            _padding: [0; 2],
+            identity_hash_code: 42,
+            array_length: 0,
+            num_slots: 0,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+        let ht = HashCodeTable::new();
+        let compact = migrate_to_compact(&old, 1, &ht, 0x6000);
+        assert!(compact.has_hash_code());
+        assert_eq!(ht.get(0x6000), Some(42));
+    }
+
+    #[test]
+    fn to_legacy_fields_roundtrip() {
+        let h = CompactHeader::new_array(55, 3, 10);
+        let lf = to_legacy_fields(h);
+        assert_eq!(lf.narrow_klass, 55);
+        assert!(lf.is_array);
+        assert_eq!(lf.element_type, 3);
+        assert_eq!(lf.gc_age, 10);
+        assert_eq!(lf.lock_state, LockState::Unlocked);
+        assert!(!lf.has_hash);
+        assert!(!lf.is_forwarded);
+        assert_eq!(lf.forwarding_addr, 0);
+    }
+
+    #[test]
+    fn to_legacy_fields_forwarded() {
+        let mut h = CompactHeader::new_object(99, 0);
+        h.set_forwarding_ptr(0x8000);
+        let lf = to_legacy_fields(h);
+        assert!(lf.is_forwarded);
+        assert_eq!(lf.forwarding_addr, 0x8000);
+        assert_eq!(lf.narrow_klass, 99);
+    }
+
+    #[test]
+    fn legacy_fields_all_populated() {
+        let mut h = CompactHeader::new_array(200, 7, 42);
+        h.set_has_hash_code();
+        h.set_lock_state(LockState::Inflated);
+        let lf = to_legacy_fields(h);
+        assert_eq!(lf.narrow_klass, 200);
+        assert!(lf.is_array);
+        assert_eq!(lf.element_type, 7);
+        assert_eq!(lf.gc_age, 42);
+        assert_eq!(lf.lock_state, LockState::Inflated);
+        assert!(lf.has_hash);
+        assert!(!lf.is_forwarded);
+    }
+
+    // =======================================================================
+    // Session 54 — Compact Object Headers (JEP 450)
+    // =======================================================================
+
+    // -- 54.1: NarrowKlassTable --
+
+    #[test]
+    fn s54_narrow_klass_table_new_empty() {
+        let t = NarrowKlassTable::new();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_assign_sequential() {
+        let t = NarrowKlassTable::new();
+        let nk1 = t.get_or_assign(rustjvm_types::ClassId::new(100));
+        let nk2 = t.get_or_assign(rustjvm_types::ClassId::new(200));
+        assert_ne!(nk1, nk2);
+        assert!(nk1 >= 1);
+        assert!(nk2 >= 1);
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_idempotent() {
+        let t = NarrowKlassTable::new();
+        let nk1 = t.get_or_assign(rustjvm_types::ClassId::new(42));
+        let nk2 = t.get_or_assign(rustjvm_types::ClassId::new(42));
+        assert_eq!(nk1, nk2);
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_resolve() {
+        let t = NarrowKlassTable::new();
+        let nk = t.get_or_assign(rustjvm_types::ClassId::new(77));
+        let resolved = t.resolve(nk);
+        assert_eq!(resolved, Some(rustjvm_types::ClassId::new(77)));
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_resolve_unknown() {
+        let t = NarrowKlassTable::new();
+        assert_eq!(t.resolve(999), None);
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_contains() {
+        let t = NarrowKlassTable::new();
+        let cid = rustjvm_types::ClassId::new(55);
+        assert!(!t.contains(cid));
+        t.get_or_assign(cid);
+        assert!(t.contains(cid));
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_many_classes() {
+        let t = NarrowKlassTable::new();
+        for i in 0..500 {
+            let cid = rustjvm_types::ClassId::new(i);
+            let nk = t.get_or_assign(cid);
+            assert!(nk > 0);
+            assert_eq!(t.resolve(nk), Some(cid));
+        }
+        assert_eq!(t.len(), 500);
+    }
+
+    #[test]
+    fn s54_narrow_klass_table_thread_safe() {
+        use std::sync::Arc;
+        let t = Arc::new(NarrowKlassTable::new());
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    for j in 0..50 {
+                        let cid = rustjvm_types::ClassId::new(i * 50 + j);
+                        let nk = t.get_or_assign(cid);
+                        assert_eq!(t.resolve(nk), Some(cid));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(t.len(), 500);
+    }
+
+    // -- 54.2: HeaderView --
+
+    #[test]
+    fn s54_header_view_from_legacy() {
+        let old = crate::heap::ObjectHeader {
+            class_id: rustjvm_types::ClassId::new(10),
+            kind: crate::heap::ObjectKind::Object,
+            element_type: crate::heap::ArrayElementType::Reference,
+            _padding: [0; 2],
+            identity_hash_code: 42,
+            array_length: 0,
+            num_slots: 3,
+            gc_age: 5,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+        };
+        let view = HeaderView::from_legacy(&old);
+        assert!(!view.is_array());
+        assert_eq!(view.gc_age(), 5);
+        assert!(!view.is_forwarded());
+        assert_eq!(view.header_size(), crate::heap::HEADER_SIZE);
+    }
+
+    #[test]
+    fn s54_header_view_from_compact() {
+        let h = CompactHeader::new_array(99, 10, 7);
+        let view = HeaderView::from_compact(h);
+        assert!(view.is_array());
+        assert_eq!(view.gc_age(), 7);
+        assert_eq!(view.element_type(), 10);
+        assert!(!view.is_forwarded());
+        assert_eq!(view.header_size(), 8);
+    }
+
+    #[test]
+    fn s54_header_view_legacy_forwarded() {
+        let old = crate::heap::ObjectHeader {
+            class_id: rustjvm_types::ClassId::new(1),
+            kind: crate::heap::ObjectKind::Object,
+            element_type: crate::heap::ArrayElementType::Reference,
+            _padding: [0; 2],
+            identity_hash_code: 0,
+            array_length: 0,
+            num_slots: 0,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: 0x1234 as *mut u8,
+        };
+        let view = HeaderView::from_legacy(&old);
+        assert!(view.is_forwarded());
+    }
+
+    #[test]
+    fn s54_header_view_compact_forwarded() {
+        let mut h = CompactHeader::new_object(50, 3);
+        h.set_forwarding_ptr(0x8000);
+        let view = HeaderView::from_compact(h);
+        assert!(view.is_forwarded());
+    }
+
+    // -- 54.3: CompactAllocator --
+
+    #[test]
+    fn s54_compact_allocator_new() {
+        let alloc = CompactAllocator::new(1024);
+        assert_eq!(alloc.capacity(), 1024);
+        assert_eq!(alloc.used_bytes(), 0);
+        assert_eq!(alloc.object_count(), 0);
+    }
+
+    #[test]
+    fn s54_compact_allocator_alloc_object() {
+        let alloc = CompactAllocator::new(4096);
+        let cid = rustjvm_types::ClassId::new(42);
+        let ptr = alloc.alloc_object(cid, 3);
+        assert!(ptr.is_some());
+        let ptr = ptr.unwrap();
+
+        // Verify the header
+        let header = alloc.read_header(ptr);
+        assert!(!header.is_array());
+        assert_eq!(header.gc_age(), 0);
+
+        // Verify class ID resolution
+        let resolved = alloc.class_id_at(ptr);
+        assert_eq!(resolved, Some(cid));
+
+        assert_eq!(alloc.object_count(), 1);
+        assert_eq!(alloc.bytes_saved(), 24); // 32 - 8
+    }
+
+    #[test]
+    fn s54_compact_allocator_alloc_array() {
+        let alloc = CompactAllocator::new(4096);
+        let cid = rustjvm_types::ClassId::new(10);
+        let ptr = alloc.alloc_array(cid, crate::heap::ArrayElementType::Int, 5);
+        assert!(ptr.is_some());
+        let ptr = ptr.unwrap();
+
+        let header = alloc.read_header(ptr);
+        assert!(header.is_array());
+        assert_eq!(header.element_type(), crate::heap::ArrayElementType::Int as u8);
+
+        let length = alloc.read_array_length(ptr);
+        assert_eq!(length, 5);
+
+        assert_eq!(alloc.object_count(), 1);
+    }
+
+    #[test]
+    fn s54_compact_allocator_oom() {
+        let alloc = CompactAllocator::new(16); // Too small for a 3-field object
+        let cid = rustjvm_types::ClassId::new(1);
+        // 8 header + 3*16 fields = 56 bytes, won't fit in 16
+        let ptr = alloc.alloc_object(cid, 3);
+        assert!(ptr.is_none());
+    }
+
+    #[test]
+    fn s54_compact_allocator_multiple_objects() {
+        let alloc = CompactAllocator::new(1024 * 1024);
+        for i in 0..100 {
+            let cid = rustjvm_types::ClassId::new(i);
+            let ptr = alloc.alloc_object(cid, 2);
+            assert!(ptr.is_some(), "Failed to alloc object {}", i);
+        }
+        assert_eq!(alloc.object_count(), 100);
+        assert_eq!(alloc.bytes_saved(), 100 * 24);
+    }
+
+    #[test]
+    fn s54_compact_allocator_identity_hash() {
+        let alloc = CompactAllocator::new(4096);
+        let cid = rustjvm_types::ClassId::new(1);
+        let ptr = alloc.alloc_object(cid, 1).unwrap();
+
+        let h1 = alloc.identity_hash_code(ptr as usize);
+        let h2 = alloc.identity_hash_code(ptr as usize);
+        assert_eq!(h1, h2, "Identity hash should be stable");
+
+        let ptr2 = alloc.alloc_object(cid, 1).unwrap();
+        let h3 = alloc.identity_hash_code(ptr2 as usize);
+        assert_ne!(h1, h3, "Different objects should have different hashes");
+    }
+
+    #[test]
+    fn s54_compact_allocator_header_view() {
+        let alloc = CompactAllocator::new(4096);
+        let cid = rustjvm_types::ClassId::new(5);
+        let ptr = alloc.alloc_object(cid, 2).unwrap();
+
+        let view = alloc.header_view(ptr);
+        assert!(!view.is_array());
+        assert_eq!(view.gc_age(), 0);
+        assert_eq!(view.header_size(), 8);
+    }
+
+    // -- 54.4: Savings report --
+
+    #[test]
+    fn s54_savings_report_empty() {
+        let alloc = CompactAllocator::new(4096);
+        let report = alloc.savings_report();
+        assert_eq!(report.object_count, 0);
+        assert_eq!(report.header_bytes_saved, 0);
+        assert_eq!(report.total_savings, 0);
+    }
+
+    #[test]
+    fn s54_savings_report_with_objects() {
+        let alloc = CompactAllocator::new(1024 * 1024);
+        for i in 0..50 {
+            alloc.alloc_object(rustjvm_types::ClassId::new(i), 1).unwrap();
+        }
+        let report = alloc.savings_report();
+        assert_eq!(report.object_count, 50);
+        assert_eq!(report.header_bytes_saved, 50 * 24);
+        assert_eq!(report.klass_table_entries, 50);
+        assert_eq!(report.hash_table_entries, 0); // no hash codes requested
+    }
+
+    #[test]
+    fn s54_savings_report_format() {
+        let alloc = CompactAllocator::new(4096);
+        alloc.alloc_object(rustjvm_types::ClassId::new(1), 2).unwrap();
+        let report = alloc.savings_report();
+        let formatted = report.format();
+        assert!(formatted.contains("Compact Object Headers Report"));
+        assert!(formatted.contains("Objects:"));
+        assert!(formatted.contains("Header savings:"));
+        assert!(formatted.contains("Total savings:"));
+    }
+
+    #[test]
+    fn s54_savings_report_with_hash_codes() {
+        let alloc = CompactAllocator::new(4096);
+        let ptr = alloc.alloc_object(rustjvm_types::ClassId::new(1), 1).unwrap();
+        alloc.identity_hash_code(ptr as usize);
+        let report = alloc.savings_report();
+        assert_eq!(report.hash_table_entries, 1);
+    }
+
+    // -- 54.5: element_byte_size helper --
+
+    #[test]
+    fn s54_element_byte_size_values() {
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Boolean), 1);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Byte), 1);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Char), 2);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Short), 2);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Int), 4);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Float), 4);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Long), 8);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Double), 8);
+        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Reference), 8);
+    }
+
+    // -- 54.6: Integration with CompactHeader --
+
+    #[test]
+    fn s54_compact_header_8_vs_legacy_32() {
+        assert_eq!(CompactHeader::SIZE, 8);
+        assert_eq!(crate::heap::HEADER_SIZE, 32);
+        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 24);
+    }
+
+    #[test]
+    fn s54_compact_allocator_klass_table_access() {
+        let alloc = CompactAllocator::new(4096);
+        let cid = rustjvm_types::ClassId::new(99);
+        alloc.alloc_object(cid, 1).unwrap();
+
+        let kt = alloc.klass_table();
+        assert_eq!(kt.len(), 1);
+        assert!(kt.contains(cid));
+    }
+
+    #[test]
+    fn s54_compact_allocator_hash_table_access() {
+        let alloc = CompactAllocator::new(4096);
+        let ht = alloc.hash_table();
+        assert!(ht.is_empty());
+    }
+
+    // -- 54.7: Mixed array element types --
+
+    #[test]
+    fn s54_compact_array_all_element_types() {
+        let alloc = CompactAllocator::new(1024 * 1024);
+        let cid = rustjvm_types::ClassId::new(1);
+        let types = [
+            crate::heap::ArrayElementType::Boolean,
+            crate::heap::ArrayElementType::Byte,
+            crate::heap::ArrayElementType::Char,
+            crate::heap::ArrayElementType::Short,
+            crate::heap::ArrayElementType::Int,
+            crate::heap::ArrayElementType::Float,
+            crate::heap::ArrayElementType::Long,
+            crate::heap::ArrayElementType::Double,
+            crate::heap::ArrayElementType::Reference,
+        ];
+        for et in &types {
+            let ptr = alloc.alloc_array(cid, *et, 10);
+            assert!(ptr.is_some(), "Failed to alloc array of type {:?}", et);
+            let ptr = ptr.unwrap();
+            let header = alloc.read_header(ptr);
+            assert!(header.is_array());
+            assert_eq!(header.element_type(), *et as u8);
+            assert_eq!(alloc.read_array_length(ptr), 10);
+        }
+    }
+
+    // -- 54.8: Klass table + compact header roundtrip --
+
+    #[test]
+    fn s54_klass_roundtrip_through_header() {
+        let alloc = CompactAllocator::new(4096);
+        let cid = rustjvm_types::ClassId::new(12345);
+        let ptr = alloc.alloc_object(cid, 0).unwrap();
+        let header = alloc.read_header(ptr);
+        let nk = header.narrow_klass();
+        let resolved = alloc.klass_table().resolve(nk);
+        assert_eq!(resolved, Some(cid));
+    }
+
+    // -- 54.9: Large allocation stress --
+
+    #[test]
+    fn s54_compact_allocator_stress() {
+        let alloc = CompactAllocator::new(16 * 1024 * 1024); // 16 MB
+        let mut ptrs = Vec::new();
+        for i in 0..10_000 {
+            let cid = rustjvm_types::ClassId::new(i % 100);
+            if let Some(ptr) = alloc.alloc_object(cid, 2) {
+                ptrs.push(ptr);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(ptrs.len(), 10_000);
+        assert_eq!(alloc.object_count(), 10_000);
+        assert_eq!(alloc.bytes_saved(), 10_000 * 24);
+
+        // Verify all objects have correct class IDs
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let cid = alloc.class_id_at(*ptr);
+            assert_eq!(cid, Some(rustjvm_types::ClassId::new(i as u32 % 100)));
+        }
+    }
+
+    // -- 54.10: Memory layout verification --
+
+    #[test]
+    fn s54_compact_object_layout_size() {
+        // Object with 2 fields: 8 (header) + 2*16 (slots) = 40, aligned to 8
+        let alloc = CompactAllocator::new(4096);
+        let p1 = alloc.alloc_object(rustjvm_types::ClassId::new(1), 2).unwrap();
+        let p2 = alloc.alloc_object(rustjvm_types::ClassId::new(1), 2).unwrap();
+        let diff = (p2 as usize) - (p1 as usize);
+        // 8 + 2*16 = 40, 8-byte aligned
+        assert_eq!(diff, 40);
+    }
+
+    #[test]
+    fn s54_compact_array_layout_size() {
+        let alloc = CompactAllocator::new(4096);
+        // int[5]: 8 (header) + 8 (length+pad) + 5*4 = 36, aligned to 8 → 40
+        let p1 = alloc.alloc_array(
+            rustjvm_types::ClassId::new(1),
+            crate::heap::ArrayElementType::Int,
+            5,
+        ).unwrap();
+        let p2 = alloc.alloc_array(
+            rustjvm_types::ClassId::new(1),
+            crate::heap::ArrayElementType::Int,
+            5,
+        ).unwrap();
+        let diff = (p2 as usize) - (p1 as usize);
+        // 8 + 8 + ceil(20/8)*8 = 8 + 8 + 24 = 40
+        assert_eq!(diff, 40);
+    }
+
+    /// T10.9.B — smoke test: HashCodeTable and NarrowKlassTable use FxHashMap.
+    /// Verifies insert/lookup works after the HashMap → FxHashMap swap.
+    #[test]
+    fn t10_9_b_fx_hashmap_swap_smoke() {
+        // HashCodeTable insertion
+        let tbl = HashCodeTable::new();
+        let h1 = tbl.get_or_assign(0x1000);
+        let h2 = tbl.get_or_assign(0x2000);
+        let h1_again = tbl.get_or_assign(0x1000);
+        assert_eq!(h1, h1_again, "same address returns same hash");
+        assert_ne!(h1, h2, "different addresses get different hashes");
+
+        // NarrowKlassTable round-trip
+        let nk = NarrowKlassTable::new();
+        let id1 = nk.get_or_assign(rustjvm_types::ClassId::new(42));
+        let id2 = nk.get_or_assign(rustjvm_types::ClassId::new(43));
+        let id1_again = nk.get_or_assign(rustjvm_types::ClassId::new(42));
+        assert_eq!(id1, id1_again, "same ClassId returns same narrow id");
+        assert_ne!(id1, id2, "different ClassId gets distinct narrow id");
+    }
+}

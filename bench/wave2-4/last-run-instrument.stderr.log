@@ -1,0 +1,4 @@
+﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+[2m2026-04-26T14:29:59.456665Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::diagnostics[0m[2m:[0m B6: silent-swallow — error suppressed to keep VM running [3msite[0m[2m=[0m<clinit> [3mcategory[0m[2m=[0mnon-critical-exception [3mdetail[0m[2m=[0mclass=sun/instrument/InstrumentationImpl exc=java/lang/UnsatisfiedLinkError
+WARN: main() completed with 1 swallowed VM error(s) (class-init / invokedynamic / native). Re-run with RUST_LOG=warn (already default) to see each site, or RUSTJVM_STRICT_SWALLOWS=1 to escalate the first swallow to a panic for diagnosis.
+

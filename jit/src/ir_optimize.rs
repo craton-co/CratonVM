@@ -1,0 +1,430 @@
+//! Optimization passes on the Sea-of-Nodes IR graph.
+//!
+//! Each pass takes `&mut Graph` and transforms it in place.
+//! Passes are safe to compose in any order (idempotent).
+
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
+use super::ir::{CmpOp, Graph, IrType, Node, NodeId, Op, NO_NODE};
+
+// ── Public API ───────────────────────────────────────────────────────
+
+/// Run all optimization passes on the graph.
+pub fn optimize(graph: &mut Graph) {
+    // Run passes in a fixed-point loop until no more changes.
+    for _ in 0..8 {
+        let before = graph.live_count();
+        fold_constants(graph);
+        algebraic_simplify(graph);
+        gvn(graph);
+        eliminate_dead_nodes(graph);
+        if graph.live_count() == before {
+            break;
+        }
+    }
+}
+
+// ── Constant Folding ─────────────────────────────────────────────────
+
+/// Evaluate nodes whose inputs are all constants.
+fn fold_constants(graph: &mut Graph) {
+    let len = graph.nodes.len();
+    for id in 0..len {
+        if graph.nodes[id].op == Op::Dead {
+            continue;
+        }
+        if let Some(folded) = try_fold(&graph.nodes, id as NodeId) {
+            let ty = graph.nodes[id].ty;
+            let pc = graph.nodes[id].bytecode_pc;
+            // Replace with constant
+            graph.nodes[id].op = Op::Const(folded);
+            graph.nodes[id].ty = ty;
+            graph.nodes[id].inputs.clear();
+            graph.nodes[id].bytecode_pc = pc;
+        }
+    }
+}
+
+fn try_fold(nodes: &[Node], id: NodeId) -> Option<i64> {
+    let node = &nodes[id as usize];
+    match &node.op {
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::And | Op::Or | Op::Xor
+        | Op::Shl | Op::Shr | Op::UShr => {
+            let a = const_value(nodes, node.inputs[0])?;
+            let b = const_value(nodes, node.inputs[1])?;
+            let result = match &node.op {
+                Op::Add => a.wrapping_add(b),
+                Op::Sub => a.wrapping_sub(b),
+                Op::Mul => a.wrapping_mul(b),
+                Op::Div => {
+                    if b == 0 {
+                        return None;
+                    }
+                    a.wrapping_div(b)
+                }
+                Op::Rem => {
+                    if b == 0 {
+                        return None;
+                    }
+                    a.wrapping_rem(b)
+                }
+                Op::And => a & b,
+                Op::Or => a | b,
+                Op::Xor => a ^ b,
+                Op::Shl => {
+                    if node.ty == IrType::Int {
+                        ((a as i32).wrapping_shl(b as u32)) as i64
+                    } else {
+                        a.wrapping_shl(b as u32)
+                    }
+                }
+                Op::Shr => {
+                    if node.ty == IrType::Int {
+                        ((a as i32).wrapping_shr(b as u32)) as i64
+                    } else {
+                        a.wrapping_shr(b as u32)
+                    }
+                }
+                Op::UShr => {
+                    if node.ty == IrType::Int {
+                        ((a as u32).wrapping_shr(b as u32)) as i64
+                    } else {
+                        (a as u64).wrapping_shr(b as u32) as i64
+                    }
+                }
+                _ => unreachable!(),
+            };
+            Some(result)
+        }
+        Op::Neg => {
+            let a = const_value(nodes, node.inputs[0])?;
+            Some(a.wrapping_neg())
+        }
+        Op::Cmp(cc) => {
+            let a = const_value(nodes, node.inputs[0])?;
+            let b = const_value(nodes, node.inputs[1])?;
+            let result = match cc {
+                CmpOp::Eq => a == b,
+                CmpOp::Ne => a != b,
+                CmpOp::Lt => a < b,
+                CmpOp::Le => a <= b,
+                CmpOp::Gt => a > b,
+                CmpOp::Ge => a >= b,
+            };
+            Some(if result { 1 } else { 0 })
+        }
+        _ => None,
+    }
+}
+
+fn const_value(nodes: &[Node], id: NodeId) -> Option<i64> {
+    if let Op::Const(v) = nodes[id as usize].op {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+// ── Algebraic Simplification ─────────────────────────────────────────
+
+/// Simplify expressions using algebraic identities.
+fn algebraic_simplify(graph: &mut Graph) {
+    // Ensure a zero constant exists for identity replacements.
+    let zero = find_const(&graph.nodes, 0)
+        .unwrap_or_else(|| graph.add(Op::Const(0), IrType::Int, vec![], None));
+    let len = graph.nodes.len();
+    for id in 0..len {
+        if graph.nodes[id].op == Op::Dead {
+            continue;
+        }
+        if let Some(replacement) = try_simplify(&graph.nodes, id as NodeId, zero) {
+            graph.replace_all_uses(id as NodeId, replacement);
+            graph.kill(id as NodeId);
+        }
+    }
+}
+
+fn try_simplify(nodes: &[Node], id: NodeId, zero: NodeId) -> Option<NodeId> {
+    let node = &nodes[id as usize];
+    let inputs = &node.inputs;
+    match &node.op {
+        // x + 0 → x
+        Op::Add => {
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[0]);
+            }
+            if is_const_val(nodes, inputs[0], 0) {
+                return Some(inputs[1]);
+            }
+            None
+        }
+        // x - 0 → x, x - x → 0
+        Op::Sub => {
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[0]);
+            }
+            if inputs[0] == inputs[1] {
+                return Some(zero);
+            }
+            None
+        }
+        // x * 1 → x, x * 0 → 0
+        Op::Mul => {
+            if is_const_val(nodes, inputs[1], 1) {
+                return Some(inputs[0]);
+            }
+            if is_const_val(nodes, inputs[0], 1) {
+                return Some(inputs[1]);
+            }
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[1]); // the zero const
+            }
+            if is_const_val(nodes, inputs[0], 0) {
+                return Some(inputs[0]); // the zero const
+            }
+            None
+        }
+        // x & 0 → 0, x & -1 → x
+        Op::And => {
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[1]);
+            }
+            if is_const_val(nodes, inputs[0], 0) {
+                return Some(inputs[0]);
+            }
+            if is_const_val(nodes, inputs[1], -1) {
+                return Some(inputs[0]);
+            }
+            if is_const_val(nodes, inputs[0], -1) {
+                return Some(inputs[1]);
+            }
+            None
+        }
+        // x | 0 → x
+        Op::Or => {
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[0]);
+            }
+            if is_const_val(nodes, inputs[0], 0) {
+                return Some(inputs[1]);
+            }
+            None
+        }
+        // x ^ 0 → x, x ^ x → 0
+        Op::Xor => {
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[0]);
+            }
+            if is_const_val(nodes, inputs[0], 0) {
+                return Some(inputs[1]);
+            }
+            if inputs[0] == inputs[1] {
+                return Some(zero);
+            }
+            None
+        }
+        // x << 0 → x, x >> 0 → x, x >>> 0 → x
+        Op::Shl | Op::Shr | Op::UShr => {
+            if is_const_val(nodes, inputs[1], 0) {
+                return Some(inputs[0]);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_const_val(nodes: &[Node], id: NodeId, val: i64) -> bool {
+    matches!(nodes[id as usize].op, Op::Const(v) if v == val)
+}
+
+fn find_const(nodes: &[Node], val: i64) -> Option<NodeId> {
+    nodes
+        .iter()
+        .position(|n| n.op == Op::Const(val))
+        .map(|i| i as NodeId)
+}
+
+// ── Global Value Numbering (GVN) ─────────────────────────────────────
+
+/// Deduplicate nodes that compute the same value.
+///
+/// Uses a pre-computed hash of (op, ty, inputs) as the map key to avoid
+/// cloning the inputs Vec on every lookup.
+fn gvn(graph: &mut Graph) {
+    let mut value_map: HashMap<u64, NodeId> = HashMap::new();
+    let len = graph.nodes.len();
+    for id in 0..len {
+        let node = &graph.nodes[id];
+        if node.op == Op::Dead || !node.op.is_pure() {
+            continue;
+        }
+        let hash = gvn_hash(&node.op, node.ty, &node.inputs);
+        if let Some(&existing) = value_map.get(&hash) {
+            // Verify it is actually the same node (hash collision check).
+            let existing_node = &graph.nodes[existing as usize];
+            if existing != id as NodeId
+                && existing_node.op == node.op
+                && existing_node.ty == node.ty
+                && existing_node.inputs == node.inputs
+            {
+                graph.replace_all_uses(id as NodeId, existing);
+                graph.kill(id as NodeId);
+            }
+        } else {
+            value_map.insert(hash, id as NodeId);
+        }
+    }
+}
+
+/// Compute a hash of (op, ty, inputs) for GVN without cloning the inputs Vec.
+fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    op.hash(&mut hasher);
+    ty.hash(&mut hasher);
+    inputs.hash(&mut hasher);
+    hasher.finish()
+}
+
+// ── Dead Node Elimination ────────────────────────────────────────────
+
+/// Remove nodes not reachable from the exit (Return).
+fn eliminate_dead_nodes(graph: &mut Graph) {
+    if graph.exit == NO_NODE {
+        return;
+    }
+
+    let mut reachable = HashSet::new();
+    let mut worklist = vec![graph.exit];
+
+    // Also keep all control nodes reachable from exit
+    while let Some(id) = worklist.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        let node = &graph.nodes[id as usize];
+        for &inp in &node.inputs {
+            if inp != NO_NODE && (inp as usize) < graph.nodes.len() {
+                worklist.push(inp);
+            }
+        }
+    }
+
+    // Kill unreachable nodes (except Start which is always kept)
+    for id in 0..graph.nodes.len() {
+        if !reachable.contains(&(id as NodeId)) && graph.nodes[id].op != Op::Dead {
+            // Keep Start alive always
+            if id as NodeId == graph.entry {
+                continue;
+            }
+            graph.kill(id as NodeId);
+        }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::IrBuilder;
+
+    fn build_and_optimize(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
+        let builder = IrBuilder::new(num_params, num_locals);
+        let mut graph = builder.build(code, code_len).expect("build failed");
+        optimize(&mut graph);
+        graph
+    }
+
+    #[test]
+    fn test_constant_folding_add() {
+        // return 3 + 4  →  should fold to return 7
+        let code = [0x06, 0x07, 0x60, 0xac, 0, 0]; // iconst_3; iconst_4; iadd; ireturn
+        let graph = build_and_optimize(&code, 4, 0, 0);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        // After folding, the return value should be Const(7)
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Const(7));
+    }
+
+    #[test]
+    fn test_constant_folding_mul() {
+        // return 5 * 6  →  should fold to 30
+        let code = [0x08, 0x06, 0x68, 0xac, 0, 0]; // iconst_5; iconst_3; imul; ireturn
+        let graph = build_and_optimize(&code, 4, 0, 0);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Const(15));
+    }
+
+    #[test]
+    fn test_algebraic_add_zero() {
+        // return x + 0  →  should simplify to return x
+        // iload_0; iconst_0; iadd; ireturn
+        let code = [0x1a, 0x03, 0x60, 0xac, 0, 0];
+        let graph = build_and_optimize(&code, 4, 1, 1);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        // After simplification, return value should be Param(0) directly
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Param(0));
+    }
+
+    #[test]
+    fn test_algebraic_mul_one() {
+        // return x * 1  →  should simplify to return x
+        // iload_0; iconst_1; imul; ireturn
+        let code = [0x1a, 0x04, 0x68, 0xac, 0, 0];
+        let graph = build_and_optimize(&code, 4, 1, 1);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Param(0));
+    }
+
+    #[test]
+    fn test_algebraic_sub_self() {
+        // return x - x  →  should simplify to return 0
+        // iload_0; iload_0; isub; ireturn
+        let code = [0x1a, 0x1a, 0x64, 0xac, 0, 0];
+        let graph = build_and_optimize(&code, 4, 1, 1);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Const(0));
+    }
+
+    #[test]
+    fn test_gvn_deduplicates() {
+        // return (x + y) + (x + y) → should GVN the two (x+y) computations
+        // iload_0; iload_1; iadd; iload_0; iload_1; iadd; iadd; ireturn
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x1b, 0x60, 0x60, 0xac, 0, 0];
+        let graph = build_and_optimize(&code, 8, 2, 2);
+        // Count Add nodes — should be 2 (one for x+y, one for (x+y)+(x+y))
+        // not 3 (the duplicate x+y should be eliminated)
+        let add_count = graph.nodes.iter().filter(|n| n.op == Op::Add).count();
+        assert_eq!(add_count, 2, "GVN should deduplicate the duplicate x+y");
+    }
+
+    #[test]
+    fn test_dead_node_elimination() {
+        // int f(int x) { int y = x + 1; return x; }
+        // iload_0; iconst_1; iadd; istore_1; iload_0; ireturn
+        let code = [0x1a, 0x04, 0x60, 0x3c, 0x1a, 0xac, 0, 0];
+        let graph = build_and_optimize(&code, 6, 1, 2);
+        // The x+1 computation is dead (result stored but never used in return)
+        // After DCE, the Add node should be killed
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Param(0));
+    }
+
+    #[test]
+    fn test_chained_constant_folding() {
+        // return (2 + 3) * 4  →  should fold to 20
+        // iconst_2; iconst_3; iadd; iconst_4; imul; ireturn
+        let code = [0x05, 0x06, 0x60, 0x07, 0x68, 0xac, 0, 0];
+        let graph = build_and_optimize(&code, 6, 0, 0);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val_id = ret.inputs[1];
+        assert_eq!(graph.nodes[val_id as usize].op, Op::Const(20));
+    }
+}

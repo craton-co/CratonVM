@@ -1,0 +1,887 @@
+//! Verification types for the bytecode verifier (JVM spec 4.10.1).
+//!
+//! `VType` is the type domain used during bytecode verification — it is separate
+//! from runtime `Value` because verification reasons about types, not values.
+//! For example, `VType::Int` represents "any integer value" rather than a specific
+//! integer.
+//!
+//! The `ClassHierarchy` trait decouples the verifier from `ClassStore`, enabling
+//! mock testing.
+
+use rustjvm_reader::constant_pool::ConstantPool;
+use rustjvm_reader::stack_map::VerificationTypeInfo;
+
+use rustjvm_types::error::LinkageError;
+
+// ---------------------------------------------------------------------------
+// ClassHierarchy trait — abstraction over class hierarchy queries
+// ---------------------------------------------------------------------------
+
+/// Provides class hierarchy information to the verifier.
+///
+/// Decouples the verifier from `ClassStore` so it can be tested with mock
+/// hierarchies.
+pub trait ClassHierarchy {
+    /// Is `child` a subclass of (or implements) `parent`?
+    /// Both names are internal form (e.g. `"java/lang/String"`).
+    fn is_subclass(&self, child: &str, parent: &str) -> bool;
+
+    /// Find the nearest common superclass of `a` and `b`.
+    /// Returns `"java/lang/Object"` if no better common ancestor exists.
+    fn common_superclass(&self, a: &str, b: &str) -> String;
+
+    /// Is the named class an interface?
+    fn is_interface(&self, name: &str) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// VType — verification type domain
+// ---------------------------------------------------------------------------
+
+/// A verification type — the type of a single local variable slot or stack entry.
+///
+/// Unlike runtime `Value`, `VType` represents type categories for verification:
+/// - `Top` = undefined/unusable (e.g. second slot of long/double)
+/// - `Int` = any int-category-1 type (int, short, byte, char, boolean)
+/// - `Float`, `Long`, `Double` = their respective types
+/// - `Null` = the null reference
+/// - `ObjectRef("java/lang/String")` = a reference to a class instance
+/// - `ArrayRef("[I")` = a reference to an array
+/// - `UninitializedThis` = `this` before `<init>` call in constructor
+/// - `Uninitialized(offset)` = object created by `new` at bytecode offset
+/// - `ReturnAddress(offset)` = target of `jsr` (legacy, pre-Java-7)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VType {
+    /// Undefined / unusable slot (second half of Long/Double).
+    Top,
+    /// Integer (includes boolean, byte, char, short).
+    Int,
+    /// Float.
+    Float,
+    /// Long (category-2, occupies two slots).
+    Long,
+    /// Double (category-2, occupies two slots).
+    Double,
+    /// The null reference (assignable to any reference type).
+    Null,
+    /// A reference to an instance of the named class.
+    /// Name is in internal form: `"java/lang/Object"`.
+    ObjectRef(String),
+    /// A reference to an array type.
+    /// Descriptor is in field descriptor form: `"[I"`, `"[Ljava/lang/String;"`.
+    ArrayRef(String),
+    /// The uninitialized `this` reference in a constructor (before `<init>` call).
+    UninitializedThis,
+    /// A reference to an uninitialized object created by `new` at the given offset.
+    Uninitialized(u16),
+    /// Return address for `jsr/ret` (legacy, Java < 7).
+    ReturnAddress(u16),
+}
+
+impl VType {
+    /// Is this a category-2 type (Long or Double)?
+    pub fn is_category2(&self) -> bool {
+        matches!(self, VType::Long | VType::Double)
+    }
+
+    /// Is this a reference type (Object, Array, Null, UninitializedThis, Uninitialized)?
+    pub fn is_reference(&self) -> bool {
+        matches!(
+            self,
+            VType::ObjectRef(_)
+                | VType::ArrayRef(_)
+                | VType::Null
+                | VType::UninitializedThis
+                | VType::Uninitialized(_)
+        )
+    }
+
+    /// Convert a `VerificationTypeInfo` from a StackMapTable frame into a `VType`.
+    ///
+    /// For `Object` types, resolves the constant pool index to a class name.
+    pub fn from_verification_type_info(
+        info: &VerificationTypeInfo,
+        cp: &ConstantPool,
+    ) -> Result<Self, LinkageError> {
+        match info {
+            VerificationTypeInfo::Top => Ok(VType::Top),
+            VerificationTypeInfo::Integer => Ok(VType::Int),
+            VerificationTypeInfo::Float => Ok(VType::Float),
+            VerificationTypeInfo::Double => Ok(VType::Double),
+            VerificationTypeInfo::Long => Ok(VType::Long),
+            VerificationTypeInfo::Null => Ok(VType::Null),
+            VerificationTypeInfo::UninitializedThis => Ok(VType::UninitializedThis),
+            VerificationTypeInfo::Object { cpool_index } => {
+                let class_name =
+                    cp.get_class_name(*cpool_index)
+                        .ok_or_else(|| LinkageError::VerifyError {
+                            class_name: String::new(),
+                            method_name: String::new(),
+                            message: format!(
+                                "invalid class reference at constant pool index {cpool_index}"
+                            ),
+                        })?;
+                // Determine if it's an array type or object type
+                if class_name.starts_with('[') {
+                    Ok(VType::ArrayRef(class_name.to_string()))
+                } else {
+                    Ok(VType::ObjectRef(class_name.to_string()))
+                }
+            }
+            VerificationTypeInfo::Uninitialized { offset } => Ok(VType::Uninitialized(*offset)),
+        }
+    }
+
+    /// Convert a field descriptor to a `VType`.
+    ///
+    /// Examples:
+    /// - `"I"` → `Int`
+    /// - `"J"` → `Long`
+    /// - `"D"` → `Double`
+    /// - `"F"` → `Float`
+    /// - `"B"` / `"C"` / `"S"` / `"Z"` → `Int`
+    /// - `"Ljava/lang/String;"` → `ObjectRef("java/lang/String")`
+    /// - `"[I"` → `ArrayRef("[I")`
+    /// - `"[[Ljava/lang/Object;"` → `ArrayRef("[[Ljava/lang/Object;")`
+    pub fn from_field_descriptor(descriptor: &str) -> Self {
+        match descriptor.as_bytes().first() {
+            Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => VType::Int,
+            Some(b'J') => VType::Long,
+            Some(b'F') => VType::Float,
+            Some(b'D') => VType::Double,
+            Some(b'L') => {
+                // Strip 'L' prefix and ';' suffix to get the class name
+                let class_name = &descriptor[1..descriptor.len() - 1];
+                VType::ObjectRef(class_name.to_string())
+            }
+            Some(b'[') => VType::ArrayRef(descriptor.to_string()),
+            _ => VType::Top, // invalid descriptor → Top (verification will fail later)
+        }
+    }
+
+    /// Check if this type is assignable to `target` in the verification type lattice.
+    ///
+    /// Per JVM spec 4.10.1.2:
+    /// - `Top` is assignable to `Top`
+    /// - `Null` is assignable to any reference type
+    /// - Subclass is assignable to superclass
+    /// - Any type is assignable to itself
+    /// - Array types: `[Child` assignable to `[Parent` (covariant for references)
+    /// - All reference types assignable to `Object`
+    pub fn is_assignable_to(&self, target: &VType, hierarchy: &dyn ClassHierarchy) -> bool {
+        // Same type is always assignable
+        if self == target {
+            return true;
+        }
+
+        match (self, target) {
+            // Per JVMS §4.10.1.2, Top is the top of the verification type
+            // lattice — every verification type is assignable to Top.
+            // StackMapTable frames use Top to mark slots whose runtime value
+            // is unused past this merge point; a narrower type on one incoming
+            // path must therefore widen to Top when the declared frame says so.
+            (_, VType::Top) => true,
+
+            // Top is only assignable to Top (handled by the case above).
+            (VType::Top, _) => false,
+
+            // Null is assignable to any reference type
+            (VType::Null, VType::ObjectRef(_)) => true,
+            (VType::Null, VType::ArrayRef(_)) => true,
+            (VType::Null, VType::Null) => true, // handled by equality but explicit
+
+            // Object subtyping.
+            //
+            // Per JVMS §4.10.1.2: "The verifier does not distinguish between
+            // interface types and java.lang.Object in its tracking of
+            // reference types." When the target is an interface, any
+            // reference type is assignable to it at verify time — runtime
+            // checkcast / invokeinterface enforce the actual type.
+            (VType::ObjectRef(child), VType::ObjectRef(parent)) => {
+                hierarchy.is_subclass(child, parent) || hierarchy.is_interface(parent)
+            }
+
+            // Array to Object: all arrays are subclasses of java/lang/Object.
+            // Also: arrays are reference types; if the target is any
+            // interface, accept it under the JVMS verifier relaxation —
+            // runtime will enforce the actual type.
+            (VType::ArrayRef(_), VType::ObjectRef(parent)) => {
+                parent == "java/lang/Object"
+                    || parent == "java/io/Serializable"
+                    || parent == "java/lang/Cloneable"
+                    || hierarchy.is_interface(parent)
+            }
+
+            // Array covariance for reference arrays
+            (VType::ArrayRef(a), VType::ArrayRef(b)) => array_is_assignable(a, b, hierarchy),
+
+            // UninitializedThis → UninitializedThis (equality handled above)
+            // Uninitialized(n) → Uninitialized(n) (equality handled above)
+
+            // UninitializedThis is assignable to any ObjectRef.
+            // In practice, `this` before super.<init>() should only be used
+            // as the receiver of the upcoming invokespecial.  Relaxing this
+            // to any ObjectRef avoids false verification errors when the
+            // StackMapTable declares the resolved type at a merge point
+            // that our verifier reaches with UninitializedThis still live.
+            (VType::UninitializedThis, VType::ObjectRef(_)) => true,
+
+            // Uninitialized(n) → ObjectRef: accept during frame merge.
+            // This handles cases where the StackMapTable frame is declared after
+            // new+init but the verifier hasn't fully tracked initialization yet.
+            (VType::Uninitialized(_), VType::ObjectRef(_)) => true,
+
+            _ => false,
+        }
+    }
+
+    /// Merge two verification types, finding their common supertype.
+    ///
+    /// Used at control flow merge points where two execution paths meet.
+    /// Returns the least upper bound in the verification type lattice.
+    pub fn merge(&self, other: &VType, hierarchy: &dyn ClassHierarchy) -> VType {
+        // Same type → itself
+        if self == other {
+            return self.clone();
+        }
+
+        match (self, other) {
+            // Null merged with any reference type → the reference type
+            (VType::Null, ref_type) if ref_type.is_reference() => ref_type.clone(),
+            (ref_type, VType::Null) if ref_type.is_reference() => ref_type.clone(),
+
+            // Two object references → common superclass
+            (VType::ObjectRef(a), VType::ObjectRef(b)) => {
+                VType::ObjectRef(hierarchy.common_superclass(a, b))
+            }
+
+            // Array + Object → Object
+            (VType::ArrayRef(_), VType::ObjectRef(_))
+            | (VType::ObjectRef(_), VType::ArrayRef(_)) => {
+                VType::ObjectRef("java/lang/Object".to_string())
+            }
+
+            // Two arrays → merge element types if both are reference arrays;
+            // otherwise Object
+            (VType::ArrayRef(a), VType::ArrayRef(b)) => merge_arrays(a, b, hierarchy),
+
+            // Incompatible types → Top
+            _ => VType::Top,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Array type helpers
+// ---------------------------------------------------------------------------
+
+/// Check if array type `child_desc` is assignable to array type `parent_desc`.
+///
+/// Arrays are covariant for reference element types:
+/// - `[Ljava/lang/String;` is assignable to `[Ljava/lang/Object;`
+/// - `[I` is NOT assignable to `[J` (primitive arrays are invariant)
+/// - `[[I` is assignable to `[Ljava/lang/Object;` (array of array → array of Object)
+fn array_is_assignable(
+    child_desc: &str,
+    parent_desc: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> bool {
+    if child_desc == parent_desc {
+        return true;
+    }
+
+    // Both must start with '['
+    let child_elem = &child_desc[1..];
+    let parent_elem = &parent_desc[1..];
+
+    // If both are reference arrays, check element type assignability
+    match (
+        child_elem.as_bytes().first(),
+        parent_elem.as_bytes().first(),
+    ) {
+        // Both reference arrays (L or [)
+        (Some(b'L'), Some(b'L')) => {
+            let child_class = &child_elem[1..child_elem.len() - 1];
+            let parent_class = &parent_elem[1..parent_elem.len() - 1];
+            hierarchy.is_subclass(child_class, parent_class)
+        }
+        // Both nested arrays
+        (Some(b'['), Some(b'[')) => array_is_assignable(child_elem, parent_elem, hierarchy),
+        // Nested array assignable to Object array
+        (Some(b'['), Some(b'L')) => {
+            let parent_class = &parent_elem[1..parent_elem.len() - 1];
+            parent_class == "java/lang/Object"
+                || parent_class == "java/io/Serializable"
+                || parent_class == "java/lang/Cloneable"
+        }
+        // Primitive arrays: only equal types (handled by equality check above)
+        _ => false,
+    }
+}
+
+/// Merge two array types.
+fn merge_arrays(a: &str, b: &str, hierarchy: &dyn ClassHierarchy) -> VType {
+    if a == b {
+        return VType::ArrayRef(a.to_string());
+    }
+
+    let a_elem = &a[1..];
+    let b_elem = &b[1..];
+
+    match (a_elem.as_bytes().first(), b_elem.as_bytes().first()) {
+        // Both reference arrays
+        (Some(b'L'), Some(b'L')) => {
+            let a_class = &a_elem[1..a_elem.len() - 1];
+            let b_class = &b_elem[1..b_elem.len() - 1];
+            let common = hierarchy.common_superclass(a_class, b_class);
+            VType::ArrayRef(format!("[L{common};"))
+        }
+        // Both nested arrays
+        (Some(b'['), Some(b'[')) => match merge_arrays(a_elem, b_elem, hierarchy) {
+            VType::ArrayRef(inner) => VType::ArrayRef(format!("[{inner}")),
+            _ => VType::ObjectRef("java/lang/Object".to_string()),
+        },
+        // Otherwise → Object (arrays of different primitive types, etc.)
+        _ => VType::ObjectRef("java/lang/Object".to_string()),
+    }
+}
+
+/// Parse a method descriptor's return type into a VType.
+///
+/// Returns `None` for void (`V`).
+pub fn return_type_from_descriptor(descriptor: &str) -> Option<VType> {
+    // Find the ')' that separates params from return type
+    let ret_start = descriptor.rfind(')').map(|i| i + 1)?;
+    let ret_desc = &descriptor[ret_start..];
+
+    if ret_desc == "V" {
+        None
+    } else {
+        Some(VType::from_field_descriptor(ret_desc))
+    }
+}
+
+/// Parse method parameter types from a descriptor.
+///
+/// E.g., `"(ILjava/lang/String;[D)V"` → `[Int, ObjectRef("java/lang/String"), ArrayRef("[D")]`
+pub fn param_types_from_descriptor(descriptor: &str) -> Vec<VType> {
+    let mut types = Vec::new();
+
+    // Skip the opening '('
+    let inner = &descriptor[1..descriptor.rfind(')').unwrap_or(descriptor.len())];
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'B' | b'C' | b'I' | b'S' | b'Z' => {
+                types.push(VType::Int);
+                i += 1;
+            }
+            b'J' => {
+                types.push(VType::Long);
+                i += 1;
+            }
+            b'F' => {
+                types.push(VType::Float);
+                i += 1;
+            }
+            b'D' => {
+                types.push(VType::Double);
+                i += 1;
+            }
+            b'L' => {
+                let semi = inner[i..].find(';').unwrap_or(inner.len() - i);
+                let desc = &inner[i..i + semi + 1];
+                types.push(VType::from_field_descriptor(desc));
+                i += semi + 1;
+            }
+            b'[' => {
+                // Find the end of the array descriptor
+                let start = i;
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    match bytes[i] {
+                        b'L' => {
+                            let semi = inner[i..].find(';').unwrap_or(inner.len() - i);
+                            i += semi + 1;
+                        }
+                        _ => {
+                            i += 1; // primitive element type
+                        }
+                    }
+                }
+                types.push(VType::ArrayRef(inner[start..i].to_string()));
+            }
+            _ => {
+                i += 1; // skip unknown
+            }
+        }
+    }
+
+    types
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mock class hierarchy for testing.
+    struct MockHierarchy;
+
+    impl ClassHierarchy for MockHierarchy {
+        fn is_subclass(&self, child: &str, parent: &str) -> bool {
+            // Simple hierarchy: String <: Object, ArrayList <: Object, Integer <: Number <: Object
+            if child == parent {
+                return true;
+            }
+            // Every reference type (including interfaces) is a subclass of
+            // java.lang.Object.  The real ClassStoreHierarchy mirrors this.
+            if parent == "java/lang/Object" {
+                return true;
+            }
+            matches!(
+                (child, parent),
+                ("java/lang/String", "java/lang/Object")
+                    | ("java/util/ArrayList", "java/lang/Object")
+                    | ("java/lang/Integer", "java/lang/Number")
+                    | ("java/lang/Integer", "java/lang/Object")
+                    | ("java/lang/Number", "java/lang/Object")
+            )
+        }
+
+        fn common_superclass(&self, a: &str, b: &str) -> String {
+            if a == b {
+                return a.to_string();
+            }
+            if self.is_subclass(a, b) {
+                return b.to_string();
+            }
+            if self.is_subclass(b, a) {
+                return a.to_string();
+            }
+            // For our mock, everything meets at Object
+            "java/lang/Object".to_string()
+        }
+
+        fn is_interface(&self, name: &str) -> bool {
+            name == "java/io/Serializable" || name == "java/lang/Cloneable"
+        }
+    }
+
+    // --- from_field_descriptor ---
+
+    #[test]
+    fn from_descriptor_int() {
+        assert_eq!(VType::from_field_descriptor("I"), VType::Int);
+    }
+
+    #[test]
+    fn from_descriptor_byte() {
+        assert_eq!(VType::from_field_descriptor("B"), VType::Int);
+    }
+
+    #[test]
+    fn from_descriptor_char() {
+        assert_eq!(VType::from_field_descriptor("C"), VType::Int);
+    }
+
+    #[test]
+    fn from_descriptor_short() {
+        assert_eq!(VType::from_field_descriptor("S"), VType::Int);
+    }
+
+    #[test]
+    fn from_descriptor_boolean() {
+        assert_eq!(VType::from_field_descriptor("Z"), VType::Int);
+    }
+
+    #[test]
+    fn from_descriptor_long() {
+        assert_eq!(VType::from_field_descriptor("J"), VType::Long);
+    }
+
+    #[test]
+    fn from_descriptor_float() {
+        assert_eq!(VType::from_field_descriptor("F"), VType::Float);
+    }
+
+    #[test]
+    fn from_descriptor_double() {
+        assert_eq!(VType::from_field_descriptor("D"), VType::Double);
+    }
+
+    #[test]
+    fn from_descriptor_object() {
+        assert_eq!(
+            VType::from_field_descriptor("Ljava/lang/String;"),
+            VType::ObjectRef("java/lang/String".to_string())
+        );
+    }
+
+    #[test]
+    fn from_descriptor_int_array() {
+        assert_eq!(
+            VType::from_field_descriptor("[I"),
+            VType::ArrayRef("[I".to_string())
+        );
+    }
+
+    #[test]
+    fn from_descriptor_object_array() {
+        assert_eq!(
+            VType::from_field_descriptor("[Ljava/lang/Object;"),
+            VType::ArrayRef("[Ljava/lang/Object;".to_string())
+        );
+    }
+
+    #[test]
+    fn from_descriptor_2d_array() {
+        assert_eq!(
+            VType::from_field_descriptor("[[I"),
+            VType::ArrayRef("[[I".to_string())
+        );
+    }
+
+    // --- is_category2 ---
+
+    #[test]
+    fn category2_long() {
+        assert!(VType::Long.is_category2());
+    }
+
+    #[test]
+    fn category2_double() {
+        assert!(VType::Double.is_category2());
+    }
+
+    #[test]
+    fn category2_int_is_not() {
+        assert!(!VType::Int.is_category2());
+    }
+
+    // --- is_reference ---
+
+    #[test]
+    fn is_reference_object() {
+        assert!(VType::ObjectRef("Foo".to_string()).is_reference());
+    }
+
+    #[test]
+    fn is_reference_null() {
+        assert!(VType::Null.is_reference());
+    }
+
+    #[test]
+    fn is_reference_array() {
+        assert!(VType::ArrayRef("[I".to_string()).is_reference());
+    }
+
+    #[test]
+    fn is_reference_int_is_not() {
+        assert!(!VType::Int.is_reference());
+    }
+
+    // --- is_assignable_to ---
+
+    #[test]
+    fn assignable_same_type() {
+        let h = MockHierarchy;
+        assert!(VType::Int.is_assignable_to(&VType::Int, &h));
+        assert!(VType::Long.is_assignable_to(&VType::Long, &h));
+    }
+
+    #[test]
+    fn null_assignable_to_object() {
+        let h = MockHierarchy;
+        assert!(VType::Null.is_assignable_to(&VType::ObjectRef("java/lang/Object".to_string()), &h));
+    }
+
+    #[test]
+    fn null_assignable_to_array() {
+        let h = MockHierarchy;
+        assert!(VType::Null.is_assignable_to(&VType::ArrayRef("[I".to_string()), &h));
+    }
+
+    #[test]
+    fn subclass_assignable_to_superclass() {
+        let h = MockHierarchy;
+        assert!(VType::ObjectRef("java/lang/String".to_string())
+            .is_assignable_to(&VType::ObjectRef("java/lang/Object".to_string()), &h));
+    }
+
+    #[test]
+    fn superclass_not_assignable_to_subclass() {
+        let h = MockHierarchy;
+        assert!(!VType::ObjectRef("java/lang/Object".to_string())
+            .is_assignable_to(&VType::ObjectRef("java/lang/String".to_string()), &h));
+    }
+
+    #[test]
+    fn array_assignable_to_object() {
+        let h = MockHierarchy;
+        assert!(VType::ArrayRef("[I".to_string())
+            .is_assignable_to(&VType::ObjectRef("java/lang/Object".to_string()), &h));
+    }
+
+    #[test]
+    fn array_assignable_to_serializable() {
+        let h = MockHierarchy;
+        assert!(VType::ArrayRef("[I".to_string())
+            .is_assignable_to(&VType::ObjectRef("java/io/Serializable".to_string()), &h));
+    }
+
+    #[test]
+    fn covariant_reference_array() {
+        let h = MockHierarchy;
+        // [String is assignable to [Object
+        assert!(VType::ArrayRef("[Ljava/lang/String;".to_string())
+            .is_assignable_to(&VType::ArrayRef("[Ljava/lang/Object;".to_string()), &h));
+    }
+
+    #[test]
+    fn primitive_array_not_covariant() {
+        let h = MockHierarchy;
+        assert!(!VType::ArrayRef("[I".to_string())
+            .is_assignable_to(&VType::ArrayRef("[J".to_string()), &h));
+    }
+
+    #[test]
+    fn int_not_assignable_to_long() {
+        let h = MockHierarchy;
+        assert!(!VType::Int.is_assignable_to(&VType::Long, &h));
+    }
+
+    #[test]
+    fn top_not_assignable_to_int() {
+        let h = MockHierarchy;
+        assert!(!VType::Top.is_assignable_to(&VType::Int, &h));
+    }
+
+    #[test]
+    fn any_type_assignable_to_top() {
+        // Per JVMS 4.10.1.2, Top is the top of the verification type lattice.
+        // StackMapTable frames may declare a slot as Top to indicate the value
+        // is unused past this merge point; any incoming type must widen to Top.
+        let h = MockHierarchy;
+        assert!(VType::Int.is_assignable_to(&VType::Top, &h));
+        assert!(VType::Long.is_assignable_to(&VType::Top, &h));
+        assert!(VType::Null.is_assignable_to(&VType::Top, &h));
+        assert!(VType::ObjectRef("java/lang/String".to_string())
+            .is_assignable_to(&VType::Top, &h));
+        assert!(VType::ArrayRef("[I".to_string()).is_assignable_to(&VType::Top, &h));
+    }
+
+    // --- Interface relaxation (JVMS §4.10.1.2) ----------------------------
+    //
+    // The verifier does not distinguish between interface types and
+    // java.lang.Object in its tracking of reference types. Therefore:
+    //   * Object.is_assignable_to(SomeInterface) → true
+    //   * SomeClass.is_assignable_to(SomeInterface-it-does-not-implement)
+    //       → true
+    //   * SomeInterface.is_assignable_to(Object) → true (always did)
+    // Runtime checkcast / invokeinterface enforce the actual type.
+
+    #[test]
+    fn object_assignable_to_interface() {
+        // Object.is_assignable_to(SomeInterface) → true (relaxation rule).
+        let h = MockHierarchy;
+        let obj = VType::ObjectRef("java/lang/Object".to_string());
+        let iface = VType::ObjectRef("java/io/Serializable".to_string());
+        assert!(obj.is_assignable_to(&iface, &h));
+    }
+
+    #[test]
+    fn interface_assignable_to_object() {
+        // SomeInterface.is_assignable_to(Object) → true (always was).
+        let h = MockHierarchy;
+        let iface = VType::ObjectRef("java/io/Serializable".to_string());
+        let obj = VType::ObjectRef("java/lang/Object".to_string());
+        assert!(iface.is_assignable_to(&obj, &h));
+    }
+
+    #[test]
+    fn class_assignable_to_unrelated_interface() {
+        // SomeClass.is_assignable_to(Interface it doesn't implement) → true
+        // at verify time per JVMS §4.10.1.2 relaxation.
+        //
+        // In MockHierarchy, "java/lang/String" is NOT declared as
+        // implementing "java/lang/Cloneable" via is_subclass, yet verify-
+        // time assignment must still succeed because the target is an
+        // interface.
+        let h = MockHierarchy;
+        let s = VType::ObjectRef("java/lang/String".to_string());
+        let iface = VType::ObjectRef("java/lang/Cloneable".to_string());
+        // Sanity: MockHierarchy does NOT model String <: Cloneable.
+        assert!(!h.is_subclass("java/lang/String", "java/lang/Cloneable"));
+        // Yet is_assignable_to must accept it (interface relaxation).
+        assert!(s.is_assignable_to(&iface, &h));
+    }
+
+    #[test]
+    fn array_assignable_to_arbitrary_interface() {
+        // Arrays are reference types; assignment to ANY interface is
+        // accepted at verify time. The existing Serializable/Cloneable
+        // paths were already accepted; this ensures generic interface
+        // targets also succeed via is_interface().
+        struct OnlyInterfaceHierarchy;
+        impl ClassHierarchy for OnlyInterfaceHierarchy {
+            fn is_subclass(&self, c: &str, p: &str) -> bool {
+                c == p || p == "java/lang/Object"
+            }
+            fn common_superclass(&self, _a: &str, _b: &str) -> String {
+                "java/lang/Object".to_string()
+            }
+            fn is_interface(&self, name: &str) -> bool {
+                name == "my/pkg/IFoo"
+            }
+        }
+        let h = OnlyInterfaceHierarchy;
+        let arr = VType::ArrayRef("[I".to_string());
+        let iface = VType::ObjectRef("my/pkg/IFoo".to_string());
+        assert!(arr.is_assignable_to(&iface, &h));
+    }
+
+    // --- merge ---
+
+    #[test]
+    fn merge_same_type() {
+        let h = MockHierarchy;
+        assert_eq!(VType::Int.merge(&VType::Int, &h), VType::Int);
+    }
+
+    #[test]
+    fn merge_null_with_object() {
+        let h = MockHierarchy;
+        let obj = VType::ObjectRef("java/lang/String".to_string());
+        assert_eq!(VType::Null.merge(&obj, &h), obj);
+        assert_eq!(obj.merge(&VType::Null, &h), obj);
+    }
+
+    #[test]
+    fn merge_two_objects() {
+        let h = MockHierarchy;
+        let s = VType::ObjectRef("java/lang/String".to_string());
+        let al = VType::ObjectRef("java/util/ArrayList".to_string());
+        assert_eq!(
+            s.merge(&al, &h),
+            VType::ObjectRef("java/lang/Object".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_subclass_with_superclass() {
+        let h = MockHierarchy;
+        let integer = VType::ObjectRef("java/lang/Integer".to_string());
+        let number = VType::ObjectRef("java/lang/Number".to_string());
+        assert_eq!(
+            integer.merge(&number, &h),
+            VType::ObjectRef("java/lang/Number".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_int_with_long_is_top() {
+        let h = MockHierarchy;
+        assert_eq!(VType::Int.merge(&VType::Long, &h), VType::Top);
+    }
+
+    #[test]
+    fn merge_array_with_object_is_object() {
+        let h = MockHierarchy;
+        let arr = VType::ArrayRef("[I".to_string());
+        let obj = VType::ObjectRef("java/lang/String".to_string());
+        assert_eq!(
+            arr.merge(&obj, &h),
+            VType::ObjectRef("java/lang/Object".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_two_reference_arrays() {
+        let h = MockHierarchy;
+        let a = VType::ArrayRef("[Ljava/lang/String;".to_string());
+        let b = VType::ArrayRef("[Ljava/util/ArrayList;".to_string());
+        assert_eq!(
+            a.merge(&b, &h),
+            VType::ArrayRef("[Ljava/lang/Object;".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_different_primitive_arrays() {
+        let h = MockHierarchy;
+        let a = VType::ArrayRef("[I".to_string());
+        let b = VType::ArrayRef("[J".to_string());
+        assert_eq!(
+            a.merge(&b, &h),
+            VType::ObjectRef("java/lang/Object".to_string())
+        );
+    }
+
+    // --- param_types_from_descriptor ---
+
+    #[test]
+    fn param_types_empty() {
+        assert!(param_types_from_descriptor("()V").is_empty());
+    }
+
+    #[test]
+    fn param_types_single_int() {
+        assert_eq!(param_types_from_descriptor("(I)V"), vec![VType::Int]);
+    }
+
+    #[test]
+    fn param_types_mixed() {
+        let types = param_types_from_descriptor("(ILjava/lang/String;[DJ)V");
+        assert_eq!(
+            types,
+            vec![
+                VType::Int,
+                VType::ObjectRef("java/lang/String".to_string()),
+                VType::ArrayRef("[D".to_string()),
+                VType::Long,
+            ]
+        );
+    }
+
+    #[test]
+    fn param_types_2d_array() {
+        let types = param_types_from_descriptor("([[I)V");
+        assert_eq!(types, vec![VType::ArrayRef("[[I".to_string())]);
+    }
+
+    // --- return_type_from_descriptor ---
+
+    #[test]
+    fn return_type_void() {
+        assert_eq!(return_type_from_descriptor("()V"), None);
+    }
+
+    #[test]
+    fn return_type_int() {
+        assert_eq!(return_type_from_descriptor("()I"), Some(VType::Int));
+    }
+
+    #[test]
+    fn return_type_object() {
+        assert_eq!(
+            return_type_from_descriptor("()Ljava/lang/String;"),
+            Some(VType::ObjectRef("java/lang/String".to_string()))
+        );
+    }
+
+    #[test]
+    fn return_type_array() {
+        assert_eq!(
+            return_type_from_descriptor("()[I"),
+            Some(VType::ArrayRef("[I".to_string()))
+        );
+    }
+}

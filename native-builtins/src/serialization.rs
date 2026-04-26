@@ -1,0 +1,3396 @@
+//! Java Object Serialization native method implementations.
+//!
+//! Covers ObjectOutputStream, ObjectInputStream, ObjectStreamClass,
+//! ObjectStreamField, serialization filters (JEP 290), and related
+//! exception types.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use rustjvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
+use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
+use crate::lang_class::{create_constructor_object, create_method_object};
+
+fn serialization_not_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Err(RuntimeError::UnsupportedOperationException {
+        message: "Java object serialization is not yet supported".into(),
+    }.into())
+}
+
+// ---------------------------------------------------------------------------
+// Serialization byte-buffer registry (M24)
+//
+// Each ObjectOutputStream / ObjectInputStream instance gets a Rust-side
+// Vec<u8> keyed by the object's raw pointer address.  Writers append
+// protocol-compliant bytes; readers consume them.
+// ---------------------------------------------------------------------------
+
+fn oos_buffers() -> &'static Mutex<HashMap<usize, Vec<u8>>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, Vec<u8>>>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ois_buffers() -> &'static Mutex<HashMap<usize, (Vec<u8>, usize)>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, (Vec<u8>, usize)>>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Wire handle registry for object reference tracking during serialization.
+/// Maps OOS/OIS address -> (next_handle, handle_to_address map, address_to_handle map)
+fn handle_registry() -> &'static Mutex<HashMap<usize, HandleState>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, HandleState>>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reader-side wire handle table. Maps an ObjectInputStream's address to
+/// the ordered list of objects that have been materialized from the stream
+/// so far. The index into the vec plus `BASE_WIRE_HANDLE` gives the wire
+/// handle that a future `TC_REFERENCE` can use to refer back to the same
+/// object instance — that's how the JDK round-trips cyclic graphs.
+///
+/// We keep it separate from the writer-side `handle_registry` because the
+/// writer stores sender-side raw addresses while the reader stores the
+/// freshly allocated `ObjectRef` that lives on the *reader's* heap.
+fn ois_handles() -> &'static Mutex<HashMap<usize, Vec<Option<ObjectRef>>>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, Vec<Option<ObjectRef>>>>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Assign the next wire handle (post-`BASE_WIRE_HANDLE`) to `obj` on the
+/// reader side. The handle must be assigned *before* the object's field
+/// contents are read so that cyclic graphs (a field that refers back to its
+/// enclosing object) resolve via `TC_REFERENCE` to the same instance.
+fn ois_push_handle(ois_addr: usize, obj: Option<ObjectRef>) -> u32 {
+    let mut map = ois_handles().lock().unwrap_or_else(|e| e.into_inner());
+    let v = map.entry(ois_addr).or_default();
+    let idx = v.len() as u32;
+    v.push(obj);
+    BASE_WIRE_HANDLE + idx
+}
+
+/// Patch a previously-reserved handle slot. Used when we allocate the
+/// target object before we know what it actually is (e.g. arrays whose
+/// length/element type we need to read first).
+fn ois_set_handle(ois_addr: usize, handle: u32, obj: Option<ObjectRef>) {
+    let mut map = ois_handles().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = map.get_mut(&ois_addr) {
+        let idx = handle.saturating_sub(BASE_WIRE_HANDLE) as usize;
+        if idx < v.len() {
+            v[idx] = obj;
+        }
+    }
+}
+
+/// Look up a previously-deserialized object by wire handle.
+fn ois_lookup_handle(ois_addr: usize, handle: u32) -> Option<ObjectRef> {
+    let map = ois_handles().lock().unwrap_or_else(|e| e.into_inner());
+    let v = map.get(&ois_addr)?;
+    let idx = handle.checked_sub(BASE_WIRE_HANDLE)? as usize;
+    v.get(idx).copied().flatten()
+}
+
+/// Reset the reader-side handle table for a given stream.
+fn ois_clear_handles(ois_addr: usize) {
+    let mut map = ois_handles().lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(&ois_addr);
+}
+
+struct HandleState {
+    next_handle: u32,
+    addr_to_handle: HashMap<usize, u32>,
+    handle_to_addr: HashMap<u32, usize>,
+    /// Maximum nesting depth allowed (ObjectInputFilter enforcement)
+    max_depth: i32,
+    /// Maximum reference count allowed
+    max_references: i32,
+}
+
+impl HandleState {
+    fn new() -> Self {
+        HandleState {
+            next_handle: BASE_WIRE_HANDLE,
+            addr_to_handle: HashMap::new(),
+            handle_to_addr: HashMap::new(),
+            max_depth: 256,
+            max_references: 10000,
+        }
+    }
+
+    fn assign_handle(&mut self, obj_addr: usize) -> u32 {
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.addr_to_handle.insert(obj_addr, h);
+        self.handle_to_addr.insert(h, obj_addr);
+        h
+    }
+
+    fn lookup_handle(&self, obj_addr: usize) -> Option<u32> {
+        self.addr_to_handle.get(&obj_addr).copied()
+    }
+}
+
+/// Get (or create) the write buffer for an ObjectOutputStream.
+fn oos_buf_write(addr: usize, data: &[u8]) {
+    let mut map = oos_buffers().lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(addr).or_default().extend_from_slice(data);
+}
+
+/// Snapshot the current buffer for an OOS.
+fn oos_buf_snapshot(addr: usize) -> Vec<u8> {
+    let map = oos_buffers().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&addr).cloned().unwrap_or_default()
+}
+
+/// Reset the OOS buffer (used by reset()).
+fn oos_buf_reset(addr: usize) {
+    let mut map = oos_buffers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(buf) = map.get_mut(&addr) {
+        buf.clear();
+    }
+}
+
+/// Load bytes into an OIS read buffer.
+fn ois_buf_load(addr: usize, data: Vec<u8>) {
+    let mut map = ois_buffers().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(addr, (data, 0));
+}
+
+/// Read `n` bytes from an OIS buffer.  Returns empty vec if not enough data.
+fn ois_buf_read(addr: usize, n: usize) -> Vec<u8> {
+    let mut map = ois_buffers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((buf, pos)) = map.get_mut(&addr) {
+        if *pos + n <= buf.len() {
+            let slice = buf[*pos..*pos + n].to_vec();
+            *pos += n;
+            return slice;
+        }
+    }
+    vec![0u8; n] // return zeroes if no data
+}
+
+/// Peek at remaining bytes in an OIS buffer.
+fn ois_buf_remaining(addr: usize) -> usize {
+    let map = ois_buffers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((buf, pos)) = map.get(&addr) {
+        buf.len().saturating_sub(*pos)
+    } else {
+        0
+    }
+}
+
+/// Write the Java serialization stream header: 0xACED 0005.
+fn write_stream_header(addr: usize) {
+    oos_buf_write(addr, &STREAM_MAGIC.to_be_bytes());
+    oos_buf_write(addr, &STREAM_VERSION.to_be_bytes());
+}
+
+/// Write a class descriptor with real field information.
+fn write_class_desc(addr: usize, class_name: &str, svuid: i64, flags: u8, fields: &[(char, &str)]) {
+    oos_buf_write(addr, &[TC_CLASSDESC]);
+    // Class name as modified UTF-8 (length as u16, then bytes)
+    let name_bytes = class_name.as_bytes();
+    oos_buf_write(addr, &(name_bytes.len() as u16).to_be_bytes());
+    oos_buf_write(addr, name_bytes);
+    // serialVersionUID as i64 big-endian
+    oos_buf_write(addr, &svuid.to_be_bytes());
+    // classDescFlags
+    oos_buf_write(addr, &[flags]);
+    // fields count
+    oos_buf_write(addr, &(fields.len() as u16).to_be_bytes());
+    // Write field descriptors: type_code (u8) + field_name (modified UTF-8)
+    for &(type_code, field_name) in fields {
+        oos_buf_write(addr, &[type_code as u8]);
+        let fname_bytes = field_name.as_bytes();
+        oos_buf_write(addr, &(fname_bytes.len() as u16).to_be_bytes());
+        oos_buf_write(addr, fname_bytes);
+        // For object/array type codes, write a type string
+        if type_code == 'L' || type_code == '[' {
+            // Write TC_STRING with the class name as type string
+            write_string_token(addr, "Ljava/lang/Object;");
+        }
+    }
+    // classAnnotation: TC_ENDBLOCKDATA
+    oos_buf_write(addr, &[TC_ENDBLOCKDATA]);
+    // superClassDesc: TC_NULL (no super for simplified protocol)
+    oos_buf_write(addr, &[TC_NULL]);
+}
+
+/// Write a TC_OBJECT token with a class descriptor.
+fn write_object_header(addr: usize, class_name: &str) {
+    oos_buf_write(addr, &[TC_OBJECT]);
+    let svuid = compute_default_svuid(class_name);
+    // Default: no field descriptors in header (fields written separately by writeObject)
+    write_class_desc(addr, class_name, svuid, SC_SERIALIZABLE, &[]);
+}
+
+/// Write a TC_STRING with modified UTF-8 encoding.
+fn write_string_token(addr: usize, s: &str) {
+    oos_buf_write(addr, &[TC_STRING]);
+    let bytes = s.as_bytes();
+    oos_buf_write(addr, &(bytes.len() as u16).to_be_bytes());
+    oos_buf_write(addr, bytes);
+}
+
+/// Write TC_NULL.
+fn write_null_token(addr: usize) {
+    oos_buf_write(addr, &[TC_NULL]);
+}
+
+/// Validate Java serialization stream header on an OIS buffer.
+fn validate_stream_header(addr: usize) -> bool {
+    let data = ois_buf_read(addr, 4);
+    if data.len() < 4 { return false; }
+    let magic = u16::from_be_bytes([data[0], data[1]]);
+    let version = u16::from_be_bytes([data[2], data[3]]);
+    magic == STREAM_MAGIC && version == STREAM_VERSION
+}
+
+/// Skip a class descriptor in the OIS buffer (TC_CLASSDESC format).
+/// Consumes: TC_CLASSDESC + u16 name len + name bytes + i64 SVUID + u8 flags
+///           + u16 field count + TC_ENDBLOCKDATA + TC_NULL
+fn skip_class_desc(addr: usize) {
+    let tc = ois_buf_read(addr, 1);
+    if tc[0] != TC_CLASSDESC { return; }
+    // class name (u16 len + bytes)
+    let len_bytes = ois_buf_read(addr, 2);
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let _ = ois_buf_read(addr, len); // name bytes
+    let _ = ois_buf_read(addr, 8);   // serialVersionUID
+    let _ = ois_buf_read(addr, 1);   // flags
+    let field_count_bytes = ois_buf_read(addr, 2);
+    let field_count = u16::from_be_bytes([field_count_bytes[0], field_count_bytes[1]]) as usize;
+    // Skip field descriptors
+    for _ in 0..field_count {
+        let tc_byte = ois_buf_read(addr, 1); // type code
+        let fname_len_bytes = ois_buf_read(addr, 2);
+        let fname_len = u16::from_be_bytes([fname_len_bytes[0], fname_len_bytes[1]]) as usize;
+        let _ = ois_buf_read(addr, fname_len); // field name
+        // For object/array type codes, there's a TC_STRING type descriptor
+        let type_code = tc_byte[0] as char;
+        if type_code == 'L' || type_code == '[' {
+            let peek = ois_buf_read(addr, 1);
+            if peek[0] == TC_STRING {
+                let ts_len_bytes = ois_buf_read(addr, 2);
+                let ts_len = u16::from_be_bytes([ts_len_bytes[0], ts_len_bytes[1]]) as usize;
+                let _ = ois_buf_read(addr, ts_len);
+            }
+        }
+    }
+    let _ = ois_buf_read(addr, 1);   // TC_ENDBLOCKDATA
+    let _ = ois_buf_read(addr, 1);   // TC_NULL (super class desc)
+}
+
+/// Read a class descriptor from OIS buffer and return the class name.
+/// Also consumes the descriptor bytes.
+fn read_class_desc_name(addr: usize) -> String {
+    let tc = ois_buf_read(addr, 1);
+    if tc[0] != TC_CLASSDESC { return "java/lang/Object".to_string(); }
+    // class name (u16 len + bytes)
+    let len_bytes = ois_buf_read(addr, 2);
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let name_bytes = ois_buf_read(addr, len);
+    let class_name = String::from_utf8_lossy(&name_bytes).to_string();
+    let _ = ois_buf_read(addr, 8);   // serialVersionUID
+    let _ = ois_buf_read(addr, 1);   // flags
+    let field_count_bytes = ois_buf_read(addr, 2);
+    let field_count = u16::from_be_bytes([field_count_bytes[0], field_count_bytes[1]]) as usize;
+    // Skip field descriptors
+    for _ in 0..field_count {
+        let tc_byte = ois_buf_read(addr, 1); // type code
+        let fname_len_bytes = ois_buf_read(addr, 2);
+        let fname_len = u16::from_be_bytes([fname_len_bytes[0], fname_len_bytes[1]]) as usize;
+        let _ = ois_buf_read(addr, fname_len); // field name
+        // For object/array type codes, there's a TC_STRING type descriptor
+        let type_code = tc_byte[0] as char;
+        if type_code == 'L' || type_code == '[' {
+            let peek = ois_buf_read(addr, 1);
+            if peek[0] == TC_STRING {
+                let ts_len_bytes = ois_buf_read(addr, 2);
+                let ts_len = u16::from_be_bytes([ts_len_bytes[0], ts_len_bytes[1]]) as usize;
+                let _ = ois_buf_read(addr, ts_len);
+            }
+        }
+    }
+    let _ = ois_buf_read(addr, 1);   // TC_ENDBLOCKDATA
+    let _ = ois_buf_read(addr, 1);   // TC_NULL (super class desc)
+    class_name
+}
+
+/// Parsed class descriptor from the serialization stream.
+struct ClassDescriptor {
+    class_name: String,
+    serial_version_uid: i64,
+    /// Field type codes: 'I', 'J', 'F', 'D', 'Z', 'B', 'S', 'C', 'L'
+    field_types: Vec<char>,
+    field_names: Vec<String>,
+}
+
+/// Read a full class descriptor from the OIS buffer, returning structured info.
+fn read_class_descriptor(addr: usize) -> Option<ClassDescriptor> {
+    let tc = ois_buf_read(addr, 1);
+    if tc[0] != TC_CLASSDESC { return None; }
+    // class name
+    let len_bytes = ois_buf_read(addr, 2);
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let name_bytes = ois_buf_read(addr, len);
+    let class_name = String::from_utf8_lossy(&name_bytes).to_string();
+    // serialVersionUID
+    let svuid_bytes = ois_buf_read(addr, 8);
+    let serial_version_uid = i64::from_be_bytes([
+        svuid_bytes[0], svuid_bytes[1], svuid_bytes[2], svuid_bytes[3],
+        svuid_bytes[4], svuid_bytes[5], svuid_bytes[6], svuid_bytes[7],
+    ]);
+    let _ = ois_buf_read(addr, 1);   // flags
+    let field_count_bytes = ois_buf_read(addr, 2);
+    let field_count = u16::from_be_bytes([field_count_bytes[0], field_count_bytes[1]]) as usize;
+    let mut field_types = Vec::with_capacity(field_count);
+    let mut field_names = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let tc_byte = ois_buf_read(addr, 1);
+        let type_code = tc_byte[0] as char;
+        let fname_len_bytes = ois_buf_read(addr, 2);
+        let fname_len = u16::from_be_bytes([fname_len_bytes[0], fname_len_bytes[1]]) as usize;
+        let fname_bytes = ois_buf_read(addr, fname_len);
+        let fname = String::from_utf8_lossy(&fname_bytes).to_string();
+        // For object/array type codes, consume TC_STRING type descriptor
+        if type_code == 'L' || type_code == '[' {
+            let peek = ois_buf_read(addr, 1);
+            if peek[0] == TC_STRING {
+                let ts_len_bytes = ois_buf_read(addr, 2);
+                let ts_len = u16::from_be_bytes([ts_len_bytes[0], ts_len_bytes[1]]) as usize;
+                let _ = ois_buf_read(addr, ts_len);
+            }
+        }
+        field_types.push(type_code);
+        field_names.push(fname);
+    }
+    let _ = ois_buf_read(addr, 1);   // TC_ENDBLOCKDATA
+    let _ = ois_buf_read(addr, 1);   // TC_NULL (super class desc)
+    Some(ClassDescriptor { class_name, serial_version_uid, field_types, field_names })
+}
+
+#[cfg(test)]
+pub(crate) fn reset_serialization_globals() {
+    oos_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    ois_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    handle_registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+// ---------------------------------------------------------------------------
+// Serialization Protocol Constants
+// ---------------------------------------------------------------------------
+
+const STREAM_MAGIC: u16 = 0xACED;
+const STREAM_VERSION: u16 = 5;
+
+// Type codes (TC_*)
+const TC_NULL: u8 = 0x70;
+const TC_REFERENCE: u8 = 0x71;
+const TC_CLASSDESC: u8 = 0x72;
+const TC_OBJECT: u8 = 0x73;
+const TC_STRING: u8 = 0x74;
+const TC_ARRAY: u8 = 0x75;
+const TC_CLASS: u8 = 0x76;
+const TC_BLOCKDATA: u8 = 0x77;
+const TC_ENDBLOCKDATA: u8 = 0x78;
+const TC_RESET: u8 = 0x79;
+const TC_BLOCKDATALONG: u8 = 0x7A;
+const TC_EXCEPTION: u8 = 0x7B;
+const TC_LONGSTRING: u8 = 0x7C;
+const TC_PROXYCLASSDESC: u8 = 0x7D;
+const TC_ENUM: u8 = 0x7E;
+const BASE_WIRE_HANDLE: u32 = 0x7E0000;
+
+// Object stream flags
+const SC_WRITE_METHOD: u8 = 0x01;
+const SC_SERIALIZABLE: u8 = 0x02;
+
+// Field access flags
+const ACC_TRANSIENT: u16 = 0x0080;
+const SC_EXTERNALIZABLE: u8 = 0x04;
+const SC_BLOCK_DATA: u8 = 0x08;
+const SC_ENUM: u8 = 0x10;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Simple cycle detector for object graph serialization.
+fn detect_cycle(written_objects: &[usize], obj_addr: usize) -> bool {
+    written_objects.contains(&obj_addr)
+}
+
+/// Simple hash-based SVUID for stub purposes.
+fn compute_default_svuid(class_name: &str) -> i64 {
+    let mut hash: i64 = 0;
+    for b in class_name.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as i64);
+    }
+    hash
+}
+
+/// Type-code character to descriptor mapping helper.
+fn type_code_is_primitive(code: i32) -> bool {
+    matches!(code as u8 as char, 'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z')
+}
+
+/// Read a single field value from the OIS buffer based on its type code.
+fn read_field_value(ctx: &mut dyn NativeContext, addr: usize, type_code: char) -> Value {
+    match type_code {
+        'I' => {
+            let bytes = ois_buf_read(addr, 4);
+            Value::Int(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        'J' => {
+            let bytes = ois_buf_read(addr, 8);
+            Value::Long(i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]))
+        }
+        'F' => {
+            let bytes = ois_buf_read(addr, 4);
+            Value::Float(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        'D' => {
+            let bytes = ois_buf_read(addr, 8);
+            Value::Double(f64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]))
+        }
+        'Z' => {
+            let bytes = ois_buf_read(addr, 4); // written as int
+            Value::Int(if bytes[3] != 0 { 1 } else { 0 })
+        }
+        'B' => {
+            let bytes = ois_buf_read(addr, 4); // written as int
+            Value::Int(bytes[3] as i8 as i32)
+        }
+        'S' => {
+            let bytes = ois_buf_read(addr, 4); // written as int
+            Value::Int(i16::from_be_bytes([bytes[2], bytes[3]]) as i32)
+        }
+        'C' => {
+            let bytes = ois_buf_read(addr, 4); // written as int
+            Value::Int(u16::from_be_bytes([bytes[2], bytes[3]]) as i32)
+        }
+        'L' | '[' => {
+            // Object (or array) field — dispatch to the recursive reader so
+            // that nested objects, arrays, and back-references all work.
+            ois_read_value(ctx, addr)
+        }
+        _ => {
+            let bytes = ois_buf_read(addr, 4);
+            Value::Int(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+    }
+}
+
+/// Allocate a stub ObjectStreamClass with default values.
+fn alloc_stream_class_stub(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+    let desc = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 6);
+    let name = ctx.create_string(class_name);
+    ctx.set_field(desc, 0, Value::Object(Some(name)));
+    ctx.set_field(desc, 1, Value::Long(compute_default_svuid(class_name)));
+    ctx.set_field(desc, 2, Value::Int(0));
+    ctx.set_field(desc, 3, Value::Int(SC_SERIALIZABLE as i32));
+    ctx.set_field(desc, 4, Value::Int(0));
+    ctx.set_field(desc, 5, Value::Int(0));
+    desc
+}
+
+// ---------------------------------------------------------------------------
+// ObjectOutputStream  (6-field synthetic)
+//   0: stream_ref, 1: protocol_version, 2: depth,
+//   3: objects_written, 4: block_mode, 5: enable_replace
+// ---------------------------------------------------------------------------
+
+fn register_object_output_stream(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectOutputStream";
+
+    // <init>(OutputStream)V
+    r.register(cls, "<init>", "(Ljava/io/OutputStream;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(stream))) = args.get(1) {
+            ctx.set_field(this, 0, Value::Object(Some(*stream)));
+        }
+        ctx.set_field(this, 1, Value::Int(2)); // protocol version 2
+        ctx.set_field(this, 2, Value::Int(0)); // depth
+        ctx.set_field(this, 3, Value::Int(0)); // objects_written
+        ctx.set_field(this, 4, Value::Int(1)); // block_mode on
+        ctx.set_field(this, 5, Value::Int(0)); // enable_replace off
+        write_stream_header(this.as_ptr() as usize);
+        // Initialize handle tracking for this stream
+        {
+            let mut registry = handle_registry().lock().unwrap_or_else(|e| e.into_inner());
+            registry.insert(this.as_ptr() as usize, HandleState::new());
+        }
+        Ok(None)
+    });
+
+    // writeObject(Object)V — writes TC_OBJECT / TC_NULL / TC_STRING with field values
+    r.register(cls, "writeObject", "(Ljava/lang/Object;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        let depth = match ctx.get_field(this, 2) { Value::Int(d) => d, _ => 0 };
+
+        // Enforce max depth limit
+        {
+            let registry = handle_registry().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = registry.get(&addr) {
+                if depth + 1 > state.max_depth {
+                    return Err(RuntimeError::IOException {
+                        message: format!("Serialization depth {} exceeds maximum {}", depth + 1, state.max_depth),
+                    }.into());
+                }
+            }
+        }
+
+        ctx.set_field(this, 2, Value::Int(depth + 1));
+        let count = match ctx.get_field(this, 3) { Value::Int(c) => c, _ => 0 };
+
+        // Enforce max references limit
+        {
+            let registry = handle_registry().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = registry.get(&addr) {
+                if count + 1 > state.max_references {
+                    return Err(RuntimeError::IOException {
+                        message: format!("Serialization reference count {} exceeds maximum {}", count + 1, state.max_references),
+                    }.into());
+                }
+            }
+        }
+
+        ctx.set_field(this, 3, Value::Int(count + 1));
+
+        match args.get(1) {
+            Some(Value::Object(None)) | None => write_null_token(addr),
+            Some(Value::Object(Some(obj))) => {
+                let obj_addr = obj.as_ptr() as usize;
+
+                // Check for back-reference (cycle detection)
+                {
+                    let mut registry = handle_registry().lock().unwrap_or_else(|e| e.into_inner());
+                    let state = registry.entry(addr).or_insert_with(HandleState::new);
+                    if let Some(handle) = state.lookup_handle(obj_addr) {
+                        // Write TC_REFERENCE instead of re-serializing
+                        oos_buf_write(addr, &[TC_REFERENCE]);
+                        oos_buf_write(addr, &handle.to_be_bytes());
+                        ctx.set_field(this, 2, Value::Int(depth));
+                        return Ok(None);
+                    }
+                    state.assign_handle(obj_addr);
+                }
+
+                let class_id = ctx.class_id_of_object(*obj);
+                let class_name = ctx.class_name_of_id(class_id)
+                    .unwrap_or_else(|| "java/lang/Object".to_string());
+
+                if class_name == "java/lang/String" {
+                    let s = ctx.read_string(*obj).unwrap_or_default();
+                    write_string_token(addr, &s);
+                } else {
+                    // Check Serializable — throw NotSerializableException if not
+                    if let Some(ser_id) = ctx.class_id_by_name("java/io/Serializable") {
+                        if !ctx.is_subclass(class_id, ser_id) {
+                            return Err(RuntimeError::IOException {
+                                message: format!("java.io.NotSerializableException: {}", class_name.replace('/', ".")),
+                            }.into());
+                        }
+                    }
+
+                    // Collect field metadata to skip transient fields
+                    let fields = ctx.declared_fields(class_id);
+                    let serializable_fields: Vec<_> = fields.iter()
+                        .filter(|f| !f.is_static && (f.access_flags & ACC_TRANSIENT) == 0)
+                        .collect();
+
+                    // Build field type descriptors for the class descriptor
+                    let field_descs: Vec<(char, String)> = serializable_fields.iter()
+                        .map(|f| {
+                            let tc = match f.descriptor.as_str() {
+                                "I" => 'I', "J" => 'J', "F" => 'F', "D" => 'D',
+                                "Z" => 'Z', "B" => 'B', "S" => 'S', "C" => 'C',
+                                s if s.starts_with('L') || s.starts_with('[') => 'L',
+                                _ => 'I',
+                            };
+                            (tc, f.name.clone())
+                        })
+                        .collect();
+                    let field_refs: Vec<(char, &str)> = field_descs.iter()
+                        .map(|(tc, name)| (*tc, name.as_str()))
+                        .collect();
+
+                    // Write object header with real field metadata
+                    let svuid = compute_default_svuid(&class_name);
+                    oos_buf_write(addr, &[TC_OBJECT]);
+                    write_class_desc(addr, &class_name, svuid, SC_SERIALIZABLE, &field_refs);
+
+                    // Write field values (skipping transient + static)
+                    for f in &serializable_fields {
+                        let val = ctx.get_field(*obj, f.slot_index);
+                        match val {
+                            Value::Int(v) => oos_buf_write(addr, &v.to_be_bytes()),
+                            Value::Long(v) => oos_buf_write(addr, &v.to_be_bytes()),
+                            Value::Float(v) => oos_buf_write(addr, &v.to_be_bytes()),
+                            Value::Double(v) => oos_buf_write(addr, &v.to_be_bytes()),
+                            Value::Object(None) => write_null_token(addr),
+                            Value::Object(Some(ref_obj)) => {
+                                let nested_cid = ctx.class_id_of_object(ref_obj);
+                                let nested_name = ctx.class_name_of_id(nested_cid)
+                                    .unwrap_or_else(|| "java/lang/Object".to_string());
+                                if nested_name == "java/lang/String" {
+                                    let s = ctx.read_string(ref_obj).unwrap_or_default();
+                                    write_string_token(addr, &s);
+                                } else {
+                                    write_null_token(addr);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => write_null_token(addr),
+        }
+        ctx.set_field(this, 2, Value::Int(depth));
+        Ok(None)
+    });
+
+    // writeUnshared(Object)V
+    r.register(cls, "writeUnshared", "(Ljava/lang/Object;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        let count = match ctx.get_field(this, 3) { Value::Int(c) => c, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(count + 1));
+        match args.get(1) {
+            Some(Value::Object(None)) | None => write_null_token(addr),
+            Some(Value::Object(Some(obj))) => {
+                let class_id = ctx.class_id_of_object(*obj);
+                let class_name = ctx.class_name_of_id(class_id)
+                    .unwrap_or_else(|| "java/lang/Object".to_string());
+                write_object_header(addr, &class_name);
+            }
+            _ => write_null_token(addr),
+        }
+        Ok(None)
+    });
+
+    // Primitive/data writers — write actual big-endian bytes to the buffer.
+    r.register(cls, "writeInt", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+        oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeLong", "(J)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeFloat", "(F)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Float(v)) => *v, _ => 0.0 };
+        oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeDouble", "(D)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Double(v)) => *v, _ => 0.0 };
+        oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeBoolean", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val: u8 = match args.get(1) { Some(Value::Int(v)) if *v != 0 => 1, _ => 0 };
+        oos_buf_write(this.as_ptr() as usize, &[val]);
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeByte", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Int(v)) => *v as u8, _ => 0u8 };
+        oos_buf_write(this.as_ptr() as usize, &[val]);
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeShort", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Int(v)) => *v as i16, _ => 0i16 };
+        oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeChar", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) { Some(Value::Int(v)) => *v as u16, _ => 0u16 };
+        oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeUTF", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        let s = match args.get(1) {
+            Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let bytes = s.as_bytes();
+        oos_buf_write(addr, &(bytes.len() as u16).to_be_bytes());
+        oos_buf_write(addr, bytes);
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeBytes", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = match args.get(1) {
+            Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+            _ => String::new(),
+        };
+        oos_buf_write(this.as_ptr() as usize, s.as_bytes());
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "writeChars", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        let s = match args.get(1) {
+            Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+            _ => String::new(),
+        };
+        for ch in s.encode_utf16() { oos_buf_write(addr, &ch.to_be_bytes()); }
+        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        ctx.set_field(this, 3, Value::Int(c + 1));
+        Ok(None)
+    });
+    r.register(cls, "defaultWriteObject", "()V", |_ctx, _args| {
+        // Our serialization protocol writes fields explicitly. The "default" path
+        // that walks reflectable fields via classDesc is a no-op here.
+        Ok(None)
+    });
+    // flush() — copy internal buffer into underlying ByteArrayOutputStream if present
+    r.register(cls, "flush", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+            let class_id = ctx.class_id_of_object(stream);
+            let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if class_name == "java/io/ByteArrayOutputStream" {
+                let buf = oos_buf_snapshot(addr);
+                let arr = ctx.new_array(ArrayElementType::Byte, buf.len());
+                for (i, &b) in buf.iter().enumerate() {
+                    ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+                }
+                ctx.set_field(stream, 0, Value::Object(Some(arr)));
+                ctx.set_field(stream, 1, Value::Int(buf.len() as i32));
+            }
+        }
+        Ok(None)
+    });
+    r.register(cls, "close", "()V", |ctx, args| {
+        // Flush internal buffer to underlying stream, then close it.
+        let this = obj_arg(args, 0)?;
+        let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
+        if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+        }
+        Ok(None)
+    });
+
+    // reset()V
+    r.register(cls, "reset", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 3, Value::Int(0)); // reset objects_written
+        Ok(None)
+    });
+
+    // useProtocolVersion(int)V
+    r.register(cls, "useProtocolVersion", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let version = match args.get(1) { Some(Value::Int(v)) => *v, _ => 2 };
+        ctx.set_field(this, 1, Value::Int(version));
+        Ok(None)
+    });
+
+    // writeFields()V
+    r.register(cls, "writeFields", "()V", |_ctx, _args| Ok(None));
+
+    // putFields() -> ObjectOutputStream.PutField
+    r.register(
+        cls,
+        "putFields",
+        "()Ljava/io/ObjectOutputStream$PutField;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2);
+            ctx.set_field(obj, 0, Value::Int(0)); // field count
+            ctx.set_field(obj, 1, Value::Int(0)); // written flag
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // writeStreamHeader()V
+    r.register(cls, "writeStreamHeader", "()V", |_ctx, _args| Ok(None));
+}
+
+// ---------------------------------------------------------------------------
+// ObjectInputStream  (6-field synthetic)
+//   0: stream_ref, 1: depth, 2: objects_read,
+//   3: enable_resolve, 4: block_mode, 5: closed
+// ---------------------------------------------------------------------------
+
+/// Read one serialized value from an `ObjectInputStream`'s byte buffer,
+/// recursively. This is the core of `readObject` and is also invoked from
+/// `read_field_value` so that a class's object-typed fields can themselves
+/// be full `TC_OBJECT` / `TC_REFERENCE` / `TC_ARRAY` tokens.
+fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
+    if ois_buf_remaining(addr) == 0 {
+        return Value::Object(None);
+    }
+    let tc = ois_buf_read(addr, 1);
+    match tc[0] {
+        TC_NULL => Value::Object(None),
+        TC_REFERENCE => {
+            let h = ois_buf_read(addr, 4);
+            let handle = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+            match ois_lookup_handle(addr, handle) {
+                Some(o) => Value::Object(Some(o)),
+                None => Value::Object(None),
+            }
+        }
+        TC_STRING => {
+            let len_bytes = ois_buf_read(addr, 2);
+            let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+            let str_bytes = ois_buf_read(addr, len);
+            let s = String::from_utf8_lossy(&str_bytes).to_string();
+            let obj = ctx.create_string(&s);
+            ois_push_handle(addr, Some(obj));
+            Value::Object(Some(obj))
+        }
+        TC_LONGSTRING => {
+            let lb = ois_buf_read(addr, 8);
+            let len = u64::from_be_bytes([
+                lb[0], lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7],
+            ]) as usize;
+            let str_bytes = ois_buf_read(addr, len);
+            let s = String::from_utf8_lossy(&str_bytes).to_string();
+            let obj = ctx.create_string(&s);
+            ois_push_handle(addr, Some(obj));
+            Value::Object(Some(obj))
+        }
+        TC_CLASS => {
+            skip_class_desc(addr);
+            ois_push_handle(addr, None);
+            Value::Object(None)
+        }
+        TC_ENUM => {
+            skip_class_desc(addr);
+            let name_val = ois_read_value(ctx, addr);
+            ois_push_handle(
+                addr,
+                match name_val {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                },
+            );
+            name_val
+        }
+        TC_ARRAY => ois_read_array(ctx, addr),
+        TC_OBJECT => ois_read_object(ctx, addr),
+        _ => Value::Object(None),
+    }
+}
+
+/// Materialize a `TC_OBJECT` whose opening tag has already been consumed.
+/// Reserves the wire handle **before** reading field values so that a
+/// self-referential field decodes back to the same instance.
+fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
+    let desc = match read_class_descriptor(addr) {
+        Some(d) => d,
+        None => return Value::Object(None),
+    };
+    let resolved = ctx.ensure_class_initialized(&desc.class_name);
+    let serialized_count = desc.field_types.len().max(2);
+    let obj = if let Ok(class_id) = resolved {
+        let class_field_count = ctx
+            .declared_fields(class_id)
+            .iter()
+            .filter(|f| !f.is_static)
+            .count()
+            .max(serialized_count);
+        ctx.alloc_object(class_id, class_field_count)
+    } else {
+        alloc_concurrent_synthetic(ctx, &desc.class_name, serialized_count)
+    };
+
+    ois_push_handle(addr, Some(obj));
+
+    if let Ok(class_id) = resolved {
+        for f in ctx
+            .declared_fields(class_id)
+            .iter()
+            .filter(|f| !f.is_static)
+        {
+            let default = match f.descriptor.as_str() {
+                "J" => Value::Long(0),
+                "F" => Value::Float(0.0),
+                "D" => Value::Double(0.0),
+                d if d.starts_with('L') || d.starts_with('[') => Value::Object(None),
+                _ => Value::Int(0),
+            };
+            ctx.set_field(obj, f.slot_index, default);
+        }
+    }
+
+    if let Ok(class_id) = resolved {
+        let names_snapshot: Vec<(String, usize)> = ctx
+            .declared_fields(class_id)
+            .iter()
+            .filter(|f| !f.is_static)
+            .map(|f| (f.name.clone(), f.slot_index))
+            .collect();
+        for (i, tc) in desc.field_types.clone().iter().enumerate() {
+            let val = read_field_value(ctx, addr, *tc);
+            if let Some((_, slot)) =
+                names_snapshot.iter().find(|(n, _)| n == &desc.field_names[i])
+            {
+                ctx.set_field(obj, *slot, val);
+            } else {
+                ctx.set_field(obj, i, val);
+            }
+        }
+    } else {
+        for (i, tc) in desc.field_types.iter().enumerate() {
+            let val = read_field_value(ctx, addr, *tc);
+            ctx.set_field(obj, i, val);
+        }
+    }
+    Value::Object(Some(obj))
+}
+
+/// Materialize a `TC_ARRAY` whose opening tag has already been consumed.
+/// The class descriptor carries the element type (`"[I"`, `"[Ljava/...;"`).
+fn ois_read_array(ctx: &mut dyn NativeContext, addr: usize) -> Value {
+    let desc = match read_class_descriptor(addr) {
+        Some(d) => d,
+        None => return Value::Object(None),
+    };
+    let len_bytes = ois_buf_read(addr, 4);
+    let length =
+        i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
+            as usize;
+
+    let elem_type = array_element_type_from_class(&desc.class_name);
+    let arr = ctx.new_array(elem_type, length);
+    ois_push_handle(addr, Some(arr));
+
+    let elem_char: char = match desc.class_name.as_bytes().get(1).copied() {
+        Some(b) => b as char,
+        None => 'L',
+    };
+    for i in 0..length {
+        let v = match elem_char {
+            'B' => {
+                let b = ois_buf_read(addr, 1);
+                Value::Int(b[0] as i8 as i32)
+            }
+            'Z' => {
+                let b = ois_buf_read(addr, 1);
+                Value::Int(if b[0] != 0 { 1 } else { 0 })
+            }
+            'C' => {
+                let b = ois_buf_read(addr, 2);
+                Value::Int(u16::from_be_bytes([b[0], b[1]]) as i32)
+            }
+            'S' => {
+                let b = ois_buf_read(addr, 2);
+                Value::Int(i16::from_be_bytes([b[0], b[1]]) as i32)
+            }
+            'I' => {
+                let b = ois_buf_read(addr, 4);
+                Value::Int(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            }
+            'J' => {
+                let b = ois_buf_read(addr, 8);
+                Value::Long(i64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]))
+            }
+            'F' => {
+                let b = ois_buf_read(addr, 4);
+                Value::Float(f32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            }
+            'D' => {
+                let b = ois_buf_read(addr, 8);
+                Value::Double(f64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]))
+            }
+            _ => ois_read_value(ctx, addr),
+        };
+        ctx.set_array_element(arr, i, v);
+    }
+    Value::Object(Some(arr))
+}
+
+fn array_element_type_from_class(name: &str) -> ArrayElementType {
+    let b = name.as_bytes();
+    if b.len() < 2 || b[0] != b'[' {
+        return ArrayElementType::Reference;
+    }
+    match b[1] {
+        b'B' => ArrayElementType::Byte,
+        b'Z' => ArrayElementType::Boolean,
+        b'C' => ArrayElementType::Char,
+        b'S' => ArrayElementType::Short,
+        b'I' => ArrayElementType::Int,
+        b'J' => ArrayElementType::Long,
+        b'F' => ArrayElementType::Float,
+        b'D' => ArrayElementType::Double,
+        _ => ArrayElementType::Reference,
+    }
+}
+
+fn register_object_input_stream(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectInputStream";
+
+    // <init>(InputStream)V — if wrapping a ByteArrayInputStream, pre-load data
+    r.register(cls, "<init>", "(Ljava/io/InputStream;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(stream))) = args.get(1) {
+            ctx.set_field(this, 0, Value::Object(Some(*stream)));
+            // Bridge: load bytes from ByteArrayInputStream into OIS buffer
+            let class_id = ctx.class_id_of_object(*stream);
+            let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if class_name == "java/io/ByteArrayInputStream" {
+                if let Value::Object(Some(arr)) = ctx.get_field(*stream, 0) {
+                    let pos = ctx.get_field(*stream, 1).as_int().unwrap_or(0) as usize;
+                    let count = ctx.get_field(*stream, 3).as_int().unwrap_or(0) as usize;
+                    let mut bytes = Vec::with_capacity(count.saturating_sub(pos));
+                    for i in pos..count {
+                        let b = ctx.get_array_element(arr, i).as_int().unwrap_or(0);
+                        bytes.push(b as u8);
+                    }
+                    let addr = this.as_ptr() as usize;
+                    ois_buf_load(addr, bytes);
+                    // Validate stream header
+                    if ois_buf_remaining(addr) >= 4 {
+                        if !validate_stream_header(addr) {
+                            return Err(RuntimeError::IOException {
+                                message: "invalid stream header".into(),
+                            }.into());
+                        }
+                    }
+                }
+            }
+        }
+        ctx.set_field(this, 1, Value::Int(0)); // depth
+        ctx.set_field(this, 2, Value::Int(0)); // objects_read
+        ctx.set_field(this, 3, Value::Int(0)); // enable_resolve off
+        ctx.set_field(this, 4, Value::Int(1)); // block_mode on
+        ctx.set_field(this, 5, Value::Int(0)); // closed = false
+        Ok(None)
+    });
+
+    // readObject() -> Object
+    //
+    // Dispatches to the recursive `ois_read_value` helper which handles
+    // `TC_NULL`, `TC_STRING`, `TC_LONGSTRING`, `TC_OBJECT` (recursive, with
+    // wire-handle tracking for cycles), `TC_REFERENCE`, `TC_ARRAY`,
+    // `TC_CLASS`, and `TC_ENUM`. Depth / reference-count ceilings are
+    // enforced here rather than inside the helper so that we fail loudly
+    // on adversarial streams before ever allocating.
+    r.register(cls, "readObject", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+
+        let count = match ctx.get_field(this, 2) {
+            Value::Int(c) => c,
+            _ => 0,
+        };
+        ctx.set_field(this, 2, Value::Int(count + 1));
+
+        // Filter limits from ObjectInputStream.setObjectInputFilter(...):
+        // enforced here via the shared handle_registry. Missing entry
+        // means "no filter installed", so use permissive defaults.
+        {
+            let registry = handle_registry().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = registry.get(&addr) {
+                if count + 1 > state.max_references {
+                    return Err(RuntimeError::IOException {
+                        message: format!(
+                            "Deserialization reference count {} exceeds maximum {}",
+                            count + 1,
+                            state.max_references
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        Ok(Some(ois_read_value(ctx, addr)))
+    });
+
+    // readUnshared() -> Object
+    r.register(cls, "readUnshared", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        let count = match ctx.get_field(this, 2) { Value::Int(c) => c, _ => 0 };
+        ctx.set_field(this, 2, Value::Int(count + 1));
+        let remaining = ois_buf_remaining(addr);
+        if remaining == 0 {
+            return Ok(Some(Value::Object(None)));
+        }
+        let tc = ois_buf_read(addr, 1);
+        match tc[0] {
+            TC_NULL => Ok(Some(Value::Object(None))),
+            TC_STRING => {
+                let len_bytes = ois_buf_read(addr, 2);
+                let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                let str_bytes = ois_buf_read(addr, len);
+                let s = String::from_utf8_lossy(&str_bytes).to_string();
+                let obj = ctx.create_string(&s);
+                Ok(Some(Value::Object(Some(obj))))
+            }
+            TC_OBJECT => {
+                skip_class_desc(addr);
+                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Object", 2);
+                Ok(Some(Value::Object(Some(obj))))
+            }
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
+
+    // Primitive readers — read actual big-endian bytes from OIS buffer
+    r.register(cls, "readInt", "()I", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 4);
+        let val = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Ok(Some(Value::Int(val)))
+    });
+    r.register(cls, "readLong", "()J", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 8);
+        let val = i64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
+                                       bytes[4], bytes[5], bytes[6], bytes[7]]);
+        Ok(Some(Value::Long(val)))
+    });
+    r.register(cls, "readFloat", "()F", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 4);
+        let val = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Ok(Some(Value::Float(val)))
+    });
+    r.register(cls, "readDouble", "()D", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 8);
+        let val = f64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
+                                       bytes[4], bytes[5], bytes[6], bytes[7]]);
+        Ok(Some(Value::Double(val)))
+    });
+    r.register(cls, "readBoolean", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 1);
+        let val = if bytes[0] != 0 { 1 } else { 0 };
+        Ok(Some(Value::Int(val)))
+    });
+    r.register(cls, "readByte", "()B", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 1);
+        Ok(Some(Value::Int(bytes[0] as i8 as i32)))
+    });
+    r.register(cls, "readShort", "()S", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 2);
+        let val = i16::from_be_bytes([bytes[0], bytes[1]]);
+        Ok(Some(Value::Int(val as i32)))
+    });
+    r.register(cls, "readChar", "()C", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bytes = ois_buf_read(this.as_ptr() as usize, 2);
+        let val = u16::from_be_bytes([bytes[0], bytes[1]]);
+        Ok(Some(Value::Int(val as i32)))
+    });
+    r.register(cls, "readUTF", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        let len_bytes = ois_buf_read(addr, 2);
+        let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        let str_bytes = ois_buf_read(addr, len);
+        let s = String::from_utf8_lossy(&str_bytes).to_string();
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
+    });
+    // readFully([B)V — interface delegation; concrete subclasses provide the
+    // real read loop. The synthetic ObjectInputStream backing layer doesn't
+    // need to do anything here since data is consumed via readObject paths.
+    r.register(cls, "readFully", "([B)V", native_noop_with_this);
+    // defaultReadObject()V — also implemented by phases_late.rs default-field
+    // restore path; this stub is the fallback for plain synthetic streams.
+    r.register(cls, "defaultReadObject", "()V", native_noop_with_this);
+
+    // readFields() -> GetField
+    r.register(cls, "readFields", "()Ljava/io/ObjectInputStream$GetField;", |ctx, _args| {
+        let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2);
+        ctx.set_field(obj, 0, Value::Int(0));
+        ctx.set_field(obj, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(obj))))
+    });
+
+    r.register(cls, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 5, Value::Int(1));
+        // Drop the wire-handle table so a reused stream address doesn't
+        // observe dangling entries from a prior ObjectInputStream.
+        ois_clear_handles(this.as_ptr() as usize);
+        Ok(None)
+    });
+
+    r.register(cls, "available", "()I", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let remaining = ois_buf_remaining(this.as_ptr() as usize) as i32;
+        Ok(Some(Value::Int(remaining)))
+    });
+    r.register(cls, "readStreamHeader", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        if ois_buf_remaining(addr) >= 4 {
+            if !validate_stream_header(addr) {
+                return Err(RuntimeError::IOException {
+                    message: "invalid stream header".into(),
+                }.into());
+            }
+        }
+        Ok(None)
+    });
+
+    r.register(cls, "readClassDescriptor", "()Ljava/io/ObjectStreamClass;", |ctx, _args| {
+        let desc = alloc_stream_class_stub(ctx, "java/lang/Object");
+        Ok(Some(Value::Object(Some(desc))))
+    });
+
+    r.register(cls, "resolveClass", "(Ljava/io/ObjectStreamClass;)Ljava/lang/Class;",
+        |_ctx, _args| Ok(Some(Value::Object(None))));
+
+    r.register(cls, "readObjectOverride", "()Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))));
+}
+
+// ---------------------------------------------------------------------------
+// ObjectStreamClass  (8-field synthetic — WP0.2)
+//   0: class_name_ref (String),     — "getName"
+//   1: serial_version_uid (Long),   — "getSerialVersionUID"
+//   2: field_count (Int),
+//   3: flags (Int; SC_* bits),
+//   4: has_write_object (Int; 0/1),
+//   5: has_read_object (Int; 0/1),
+//   6: fields_array (ObjectStreamField[]),   [added WP0.2]
+//   7: class_mirror (Class),                  [added WP0.2]
+//
+// The legacy slots 0..5 match the pre-WP0.2 layout so any call site that
+// read via raw slot indices continues to work; the two new slots (6,7)
+// are visible only via the new `getFields0` / `forClass0` getters.
+//
+// In addition — and this is the load-bearing change for WP0.2 — every
+// descriptor returned by `lookup` / `lookupAny` has the following real
+// JDK-named fields populated via `set_field_by_name`:
+//
+//   name                      String
+//   cl                        Class       (aka "forClass" target)
+//   suid                      Long        (boxed)
+//   serializable              boolean
+//   externalizable            boolean
+//   isEnum                    boolean
+//   hasWriteObjectData        boolean
+//   hasBlockExternalData      boolean
+//   fields                    ObjectStreamField[]   (declaration order)
+//   cons                      Constructor           (= serializableConstructor)
+//   serializableConstructor   Constructor
+//   writeObjectMethod         Method  (or null)
+//   readObjectMethod          Method  (or null)
+//   readObjectNoDataMethod    Method  (or null)
+//   readResolveMethod         Method  (or null)
+//   writeReplaceMethod        Method  (or null)
+//
+// Writes to unknown named fields are silently no-ops (see
+// `NativeContextImpl::set_field_by_name`), so when the real JDK
+// `ObjectStreamClass` class has only a subset of these names the extras
+// are ignored. Synthetic-jdk mode ignores all of them and uses the
+// indexed slots above.
+// ---------------------------------------------------------------------------
+
+/// Bit 0 of OSC-internal flags field: target class implements Serializable.
+const OSC_FLAG_SERIALIZABLE: i32 = 0x01;
+/// Bit 1: target class implements Externalizable.
+const OSC_FLAG_EXTERNALIZABLE: i32 = 0x02;
+/// Bit 2: target class is an enum.
+const OSC_FLAG_ENUM: i32 = 0x04;
+
+/// Access flags we care about for field / method filtering.
+/// (Kept local rather than importing from reader so serialization.rs
+/// stays self-contained.)
+const ACC_STATIC: u16 = 0x0008;
+const ACC_PRIVATE: u16 = 0x0002;
+const ACC_ENUM: u16 = 0x4000;
+
+/// Find a no-arg constructor in `class_id` with the given access-flag
+/// mask (`ACC_PRIVATE` accepted — callers are usually looking for
+/// something specific). Returns the matching `MethodMetadata` or None.
+fn find_no_arg_constructor(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+) -> Option<MethodMetadata> {
+    for m in ctx.declared_methods(class_id) {
+        if m.name == "<init>" && m.descriptor == "()V" {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// Walk the super-class chain from `class_id` upward looking for the
+/// closest ancestor that is **not** Serializable. That class's no-arg
+/// constructor is the "serializableConstructor" per JLS 17 §1.10 (and
+/// real-JDK `ObjectStreamClass#getSerializableConstructor`).
+///
+/// Returns `None` when:
+///  * The class has no non-Serializable ancestor (e.g. `Object` isn't
+///    loaded, which shouldn't happen in practice).
+///  * The ancestor's no-arg constructor doesn't exist (in the real JDK
+///    this surfaces later as `InvalidClassException: no valid
+///    constructor`).
+fn find_serializable_constructor(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+) -> Option<(ClassId, MethodMetadata)> {
+    let serializable_id = ctx.class_id_by_name("java/io/Serializable")?;
+    // Walk up from `class_id.superclass` to the first ancestor NOT
+    // subtyping Serializable. Its no-arg ctor is the one we want.
+    let mut cur = ctx.superclass_of(class_id);
+    while let Some(cid) = cur {
+        if !ctx.is_subclass(cid, serializable_id) {
+            if let Some(ctor) = find_no_arg_constructor(ctx, cid) {
+                return Some((cid, ctor));
+            }
+            // Found a non-Serializable ancestor but it has no no-arg
+            // ctor — per spec this class isn't really deserializable,
+            // but real JDK still populates the field with the Object
+            // default ctor if available. Fall back to keep walking —
+            // the closest non-Serializable ancestor is what we want,
+            // but if its ctor is missing we punt on the whole field.
+            return None;
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
+}
+
+/// Find a private instance method with exactly the given name+desc.
+/// Returns the matching `MethodMetadata`.  Serialization hook methods
+/// (`writeObject`, `readObject`, `readObjectNoData`) are spec-required
+/// to be `private`; this matches real-JDK `ObjectStreamClass#
+/// getPrivateMethod`.
+fn find_private_method(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+    descriptor: &str,
+) -> Option<MethodMetadata> {
+    for m in ctx.declared_methods(class_id) {
+        if m.name == name
+            && m.descriptor == descriptor
+            && (m.access_flags & ACC_PRIVATE) != 0
+            && (m.access_flags & ACC_STATIC) == 0
+        {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// Find an "inheritable" instance method for the serialization hooks
+/// `writeReplace` / `readResolve`. Real-JDK semantics: the method can
+/// be declared anywhere in the class hierarchy with any accessibility
+/// — walking up until we find one. Non-static only.
+fn find_inheritable_method(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+    descriptor: &str,
+) -> Option<MethodMetadata> {
+    let mut cur = Some(class_id);
+    while let Some(cid) = cur {
+        for m in ctx.declared_methods(cid) {
+            if m.name == name
+                && m.descriptor == descriptor
+                && (m.access_flags & ACC_STATIC) == 0
+            {
+                return Some(m);
+            }
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
+}
+
+/// Build an `ObjectStreamField` representing one declared field.
+/// Real-JDK layout (synthetic 4-slot matching pre-WP0.2):
+///   0: name (String)
+///   1: type code (char)
+///   2: type string (String)
+///   3: offset (int)
+fn build_object_stream_field(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+    field_descriptor: &str,
+) -> ObjectRef {
+    let osf = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamField", 4);
+    let name = ctx.create_string(field_name);
+    ctx.set_field(osf, 0, Value::Object(Some(name)));
+    let tc: char = match field_descriptor.chars().next() {
+        Some(c @ ('B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z')) => c,
+        Some('L' | '[') => 'L',
+        _ => 'I',
+    };
+    ctx.set_field(osf, 1, Value::Int(tc as i32));
+    let ts = ctx.create_string(field_descriptor);
+    ctx.set_field(osf, 2, Value::Object(Some(ts)));
+    ctx.set_field(osf, 3, Value::Int(0));
+    // Also populate the JDK-named slots if the class has them.
+    ctx.set_field_by_name(osf, "name", Value::Object(Some(name)));
+    ctx.set_field_by_name(osf, "type", Value::Object(None));
+    ctx.set_field_by_name(osf, "signature", Value::Object(Some(ts)));
+    ctx.set_field_by_name(osf, "offset", Value::Int(0));
+    osf
+}
+
+/// Build a fully-populated `ObjectStreamClass` for `class_id`. This is
+/// the heart of WP0.2 — called by both `lookup` and `lookupAny`.
+///
+/// `treat_nonserial_as_serial` mirrors the real-JDK split:
+///   * `lookup(cls)`     — returns null for non-Serializable classes.
+///   * `lookupAny(cls)`  — returns a descriptor anyway, with `fields`
+///     empty and the Serializable-related flags cleared.
+fn build_object_stream_class(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    include_non_serializable: bool,
+) -> Option<ObjectRef> {
+    // Fast-path: cached descriptor already exists for this class.
+    if let Some(cached) = ctx.osc_cache_get(class_id) {
+        return Some(cached);
+    }
+
+    let class_name = ctx.class_name_of_id(class_id)?;
+    let serializable_id = ctx.class_id_by_name("java/io/Serializable");
+    let externalizable_id = ctx.class_id_by_name("java/io/Externalizable");
+    let is_serializable = serializable_id
+        .map(|sid| ctx.is_subclass(class_id, sid) || class_id == sid)
+        .unwrap_or(false);
+    let is_externalizable = externalizable_id
+        .map(|eid| ctx.is_subclass(class_id, eid))
+        .unwrap_or(false);
+    let is_enum = (ctx.class_access_flags(class_id) & ACC_ENUM) != 0;
+
+    if !is_serializable && !include_non_serializable {
+        // lookup(cls) returns null for non-Serializable classes.
+        return None;
+    }
+
+    // ----- Allocate the descriptor object -----
+    // We request 8 slots minimum (the WP0.2 layout above). In real-JDK
+    // mode `alloc_concurrent_synthetic` bumps this to the real-JDK
+    // field count if larger, so named-field writes below still hit the
+    // right slots either way.
+    let desc = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 8);
+
+    // ----- Legacy indexed-slot population (preserved for back-compat) -----
+    let name_obj = ctx.create_string(&class_name);
+    let svuid = compute_default_svuid(&class_name);
+    let class_mirror = ctx.get_class_mirror(class_id);
+
+    // Collect declared instance fields in declaration order.
+    // Note: we keep the original `declared_fields` order — real JDK
+    // sorts primitives before objects, but the roadmap explicitly
+    // requires *declaration* order (and `serialPersistentFields`
+    // overrides anyway for real-JDK sorted semantics; out of scope
+    // for WP0.2). Static and transient fields are excluded.
+    let owned_osf_fields: Vec<(String, String)> = if is_serializable {
+        ctx.declared_fields(class_id)
+            .into_iter()
+            .filter(|f| !f.is_static && (f.access_flags & ACC_TRANSIENT) == 0)
+            .map(|f| (f.name, f.descriptor))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let field_count = owned_osf_fields.len() as i32;
+
+    let mut flags = 0;
+    if is_serializable {
+        flags |= OSC_FLAG_SERIALIZABLE;
+    }
+    if is_externalizable {
+        flags |= OSC_FLAG_EXTERNALIZABLE;
+    }
+    if is_enum {
+        flags |= OSC_FLAG_ENUM;
+    }
+
+    let has_write_object = if is_serializable {
+        find_private_method(ctx, class_id, "writeObject", "(Ljava/io/ObjectOutputStream;)V")
+            .is_some() as i32
+    } else {
+        0
+    };
+    let has_read_object = if is_serializable {
+        find_private_method(ctx, class_id, "readObject", "(Ljava/io/ObjectInputStream;)V")
+            .is_some() as i32
+    } else {
+        0
+    };
+
+    ctx.set_field(desc, 0, Value::Object(Some(name_obj)));
+    ctx.set_field(desc, 1, Value::Long(svuid));
+    ctx.set_field(desc, 2, Value::Int(field_count));
+    ctx.set_field(desc, 3, Value::Int(flags));
+    ctx.set_field(desc, 4, Value::Int(has_write_object));
+    ctx.set_field(desc, 5, Value::Int(has_read_object));
+
+    // ----- Slot 6: fields[] (declaration order) -----
+    //
+    // Allocate the ObjectStreamField[] up-front so the set_field into
+    // slot 6 lands before the loop populates the array. An empty array
+    // (length 0) is fine for non-Serializable / lookupAny lookups.
+    let osf_arr = ctx.new_ref_array(ClassId::new(0), owned_osf_fields.len());
+    for (i, (fname, fdesc)) in owned_osf_fields.iter().enumerate() {
+        let osf = build_object_stream_field(ctx, fname, fdesc);
+        ctx.set_array_element(osf_arr, i, Value::Object(Some(osf)));
+    }
+    ctx.set_field(desc, 6, Value::Object(Some(osf_arr)));
+
+    // ----- Slot 7: class mirror -----
+    ctx.set_field(desc, 7, Value::Object(Some(class_mirror)));
+
+    // ----- JDK-named slot population -----
+    //
+    // `set_field_by_name` is a no-op when the class doesn't have a
+    // field by that name, so populating all of the real-JDK field
+    // names is always safe — synthetic-jdk mode simply ignores them.
+    ctx.set_field_by_name(desc, "name", Value::Object(Some(name_obj)));
+    ctx.set_field_by_name(desc, "cl", Value::Object(Some(class_mirror)));
+    // In real JDK, `suid` is a boxed `Long` not a primitive long. For
+    // synthetic-jdk the field doesn't exist so the write is a no-op;
+    // for real-JDK we still populate the primitive form because the
+    // bytecode reader handles both paths via the descriptor-aware
+    // `get_field_as`.
+    ctx.set_field_by_name(desc, "suid", Value::Long(svuid));
+    ctx.set_field_by_name(
+        desc,
+        "serializable",
+        Value::Int(is_serializable as i32),
+    );
+    ctx.set_field_by_name(
+        desc,
+        "externalizable",
+        Value::Int(is_externalizable as i32),
+    );
+    ctx.set_field_by_name(desc, "isEnum", Value::Int(is_enum as i32));
+    ctx.set_field_by_name(
+        desc,
+        "hasWriteObjectData",
+        Value::Int(has_write_object),
+    );
+    ctx.set_field_by_name(
+        desc,
+        "hasBlockExternalData",
+        Value::Int(is_externalizable as i32),
+    );
+    ctx.set_field_by_name(desc, "fields", Value::Object(Some(osf_arr)));
+
+    // ----- Reflective method / constructor hooks -----
+    //
+    // `serializableConstructor` / `cons` is the load-bearing field —
+    // JUnit4 `Result.<clinit>` calls this with `getDeclaredConstructor`
+    // and throws NPE if it's null. We always populate it (via the
+    // non-Serializable ancestor's no-arg ctor, matching real JDK
+    // behavior) whenever we can find one.
+    if let Some((anc_id, ctor_meta)) = find_serializable_constructor(ctx, class_id) {
+        let _ = anc_id;
+        let ctor_obj = create_constructor_object(ctx, &ctor_meta);
+        ctx.set_field_by_name(desc, "cons", Value::Object(Some(ctor_obj)));
+        ctx.set_field_by_name(
+            desc,
+            "serializableConstructor",
+            Value::Object(Some(ctor_obj)),
+        );
+        ctx.set_field_by_name(
+            desc,
+            "deserializationConstructor",
+            Value::Object(Some(ctor_obj)),
+        );
+    } else {
+        // Leave as Value::Object(None) — callers already handle null
+        // hook (the field defaults to 0/null on allocation). Be
+        // explicit so the descriptor's `null` state is unambiguous.
+        ctx.set_field_by_name(desc, "cons", Value::Object(None));
+        ctx.set_field_by_name(desc, "serializableConstructor", Value::Object(None));
+        ctx.set_field_by_name(desc, "deserializationConstructor", Value::Object(None));
+    }
+
+    // writeObjectMethod / readObjectMethod / readObjectNoDataMethod —
+    // these are all spec-required to be `private`; `findPrivateMethod`
+    // matches real-JDK `ObjectStreamClass#getPrivateMethod`.
+    let wo = find_private_method(ctx, class_id, "writeObject", "(Ljava/io/ObjectOutputStream;)V")
+        .map(|m| create_method_object(ctx, &m));
+    let ro = find_private_method(ctx, class_id, "readObject", "(Ljava/io/ObjectInputStream;)V")
+        .map(|m| create_method_object(ctx, &m));
+    let rond = find_private_method(ctx, class_id, "readObjectNoData", "()V")
+        .map(|m| create_method_object(ctx, &m));
+    ctx.set_field_by_name(desc, "writeObjectMethod", Value::Object(wo));
+    ctx.set_field_by_name(desc, "readObjectMethod", Value::Object(ro));
+    ctx.set_field_by_name(desc, "readObjectNoDataMethod", Value::Object(rond));
+
+    // writeReplaceMethod / readResolveMethod — inheritable, any
+    // accessibility. `findInheritableMethod` walks up the hierarchy.
+    let wr = find_inheritable_method(ctx, class_id, "writeReplace", "()Ljava/lang/Object;")
+        .map(|m| create_method_object(ctx, &m));
+    let rr = find_inheritable_method(ctx, class_id, "readResolve", "()Ljava/lang/Object;")
+        .map(|m| create_method_object(ctx, &m));
+    ctx.set_field_by_name(desc, "writeReplaceMethod", Value::Object(wr));
+    ctx.set_field_by_name(desc, "readResolveMethod", Value::Object(rr));
+
+    // Install in the cache so the next call returns this same ref.
+    let cached = ctx.osc_cache_put(class_id, desc);
+    Some(cached)
+}
+
+/// Helper: resolve `Class` mirror arg to its `ClassId`. Falls back to
+/// the contextual class-id-of-object if the mirror isn't in the
+/// reverse map (this shouldn't happen for well-formed mirrors but the
+/// fallback keeps this defensively correct under synthetic-jdk).
+fn class_id_of_mirror(ctx: &dyn NativeContext, mirror: ObjectRef) -> Option<ClassId> {
+    if let Some(id) = ctx.class_id_from_mirror(mirror) {
+        return Some(id);
+    }
+    // Synthetic-jdk fallback: Class mirror has the target class name in
+    // a field. Read field "name" and look up by name.
+    let name_val = ctx.get_field_by_name(mirror, "name");
+    if let Value::Object(Some(s)) = name_val {
+        if let Some(n) = ctx.read_string(s) {
+            return ctx.class_id_by_name(&n.replace('.', "/"));
+        }
+    }
+    None
+}
+
+fn register_object_stream_class(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectStreamClass";
+
+    // initNative() — no-op in modern OpenJDK (legacy native state moved to Java).
+    // Must be registered so ObjectStreamClass.<clinit> succeeds; otherwise later
+    // reflection into serialVersionUID throws InternalError.
+    r.register(cls, "initNative", "()V", |_ctx, _args| Ok(None));
+
+    // hasStaticInitializer(Class, boolean) -> boolean
+    // Conservative: return false (0). Callers only use this to decide whether
+    // to include the static initializer in serialVersionUID computation.
+    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;Z)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+
+    // Older single-arg form seen in some JDKs.
+    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+
+    // lookup(Class) -> ObjectStreamClass (static)
+    // WP0.2: returns a fully-populated descriptor cached per-ClassId.
+    r.register(cls, "lookup", "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;", |ctx, args| {
+        let mirror = obj_arg(args, 0)?;
+        let class_id = match class_id_of_mirror(ctx, mirror) {
+            Some(id) => id,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        match build_object_stream_class(ctx, class_id, false) {
+            Some(desc) => Ok(Some(Value::Object(Some(desc)))),
+            None => Ok(Some(Value::Object(None))), // non-Serializable -> null
+        }
+    });
+
+    // lookupAny(Class) -> ObjectStreamClass (static)
+    // WP0.2: returns a descriptor even for non-Serializable classes —
+    // real-JDK uses this during (de)serialization to reason about a
+    // superclass that may or may not itself be Serializable.
+    r.register(cls, "lookupAny", "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;", |ctx, args| {
+        let mirror = obj_arg(args, 0)?;
+        let class_id = match class_id_of_mirror(ctx, mirror) {
+            Some(id) => id,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        match build_object_stream_class(ctx, class_id, true) {
+            Some(desc) => Ok(Some(Value::Object(Some(desc)))),
+            None => Ok(Some(Value::Object(None))),
+        }
+    });
+
+    // getName() -> String
+    r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name_ref = ctx.get_field(this, 0);
+        Ok(Some(name_ref))
+    });
+
+    // getSerialVersionUID() -> long
+    r.register(cls, "getSerialVersionUID", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let uid = ctx.get_field(this, 1);
+        Ok(Some(uid))
+    });
+
+    // getField(String) -> ObjectStreamField
+    // WP0.2: consult the fields[] slot (6) and linear-scan by name.
+    r.register(cls, "getField", "(Ljava/lang/String;)Ljava/io/ObjectStreamField;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fields_val = ctx.get_field(this, 6);
+        let arr = match fields_val {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let target_name = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(osf)) = ctx.get_array_element(arr, i) {
+                let fname = ctx.get_field(osf, 0);
+                if let Value::Object(Some(fs)) = fname {
+                    if ctx.read_string(fs).as_deref() == Some(target_name.as_str()) {
+                        return Ok(Some(Value::Object(Some(osf))));
+                    }
+                }
+            }
+        }
+        Ok(Some(Value::Object(None)))
+    });
+
+    // getFields() -> ObjectStreamField[]
+    // WP0.2: returns the cached fields[] array built by `lookup`.
+    r.register(cls, "getFields", "()[Ljava/io/ObjectStreamField;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 6)))
+    });
+
+    // forClass() -> Class
+    // WP0.2: returns the cached Class mirror (slot 7).
+    r.register(cls, "forClass", "()Ljava/lang/Class;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 7)))
+    });
+
+    // toString() -> String
+    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name_val = ctx.get_field(this, 0);
+        Ok(Some(name_val))
+    });
+}
+
+// ---------------------------------------------------------------------------
+// ObjectStreamField  (4-field synthetic)
+//   0: name_ref, 1: type_code, 2: type_string_ref, 3: offset
+// ---------------------------------------------------------------------------
+
+fn register_object_stream_field(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectStreamField";
+
+    // getName() -> String
+    r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = ctx.get_field(this, 0);
+        Ok(Some(name))
+    });
+
+    // getType() -> Class
+    r.register(
+        cls,
+        "getType",
+        "()Ljava/lang/Class;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // getTypeCode() -> char
+    r.register(cls, "getTypeCode", "()C", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let code = ctx.get_field(this, 1);
+        Ok(Some(code))
+    });
+
+    // getTypeString() -> String
+    r.register(cls, "getTypeString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ts = ctx.get_field(this, 2);
+        Ok(Some(ts))
+    });
+
+    // getOffset() -> int
+    r.register(cls, "getOffset", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let off = ctx.get_field(this, 3);
+        Ok(Some(off))
+    });
+
+    // isPrimitive() -> boolean
+    r.register(cls, "isPrimitive", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let code = match ctx.get_field(this, 1) { Value::Int(c) => c, _ => 0 };
+        let prim = if type_code_is_primitive(code) { 1 } else { 0 };
+        Ok(Some(Value::Int(prim)))
+    });
+
+    // isUnshared() -> boolean
+    r.register(cls, "isUnshared", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+
+    // compareTo(Object) -> int
+    r.register(cls, "compareTo", "(Ljava/lang/Object;)I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Serializable / Externalizable marker interfaces
+// ---------------------------------------------------------------------------
+
+fn register_serializable(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/Serializable";
+    // Marker interface — registerNatives is a static no-op stub.
+    r.register(cls, "registerNatives", "()V", native_noop);
+}
+
+fn register_externalizable(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/Externalizable";
+    // Interface contract methods — concrete subclasses override these to
+    // perform their own serialization. Default no-op for the abstract base.
+    r.register(cls, "writeExternal", "(Ljava/io/ObjectOutput;)V", native_noop_with_this);
+    r.register(cls, "readExternal", "(Ljava/io/ObjectInput;)V", native_noop_with_this);
+}
+
+// ---------------------------------------------------------------------------
+// ObjectInputFilter (JEP 290) — 4-field synthetic
+//   0: status (0=UNDECIDED, 1=ALLOWED, 2=REJECTED)
+//   1: max_depth, 2: max_references, 3: max_bytes
+// ---------------------------------------------------------------------------
+
+fn alloc_filter(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
+    let filter = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter", 4);
+    ctx.set_field(filter, 0, Value::Int(status));
+    ctx.set_field(filter, 1, Value::Int(256));
+    ctx.set_field(filter, 2, Value::Int(10000));
+    ctx.set_field(filter, 3, Value::Long(0));
+    filter
+}
+
+fn register_object_input_filter(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectInputFilter";
+
+    // checkInput(FilterInfo) -> Status
+    r.register(
+        cls, "checkInput",
+        "(Ljava/io/ObjectInputFilter$FilterInfo;)Ljava/io/ObjectInputFilter$Status;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let status = match ctx.get_field(this, 0) { Value::Int(s) => s, _ => 0 };
+            let status_obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1);
+            ctx.set_field(status_obj, 0, Value::Int(status));
+            Ok(Some(Value::Object(Some(status_obj))))
+        },
+    );
+
+    // allowFilter (static)
+    r.register(
+        cls, "allowFilter",
+        "(Ljava/util/function/Predicate;Ljava/io/ObjectInputFilter$Status;)Ljava/io/ObjectInputFilter;",
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 1))))),
+    );
+
+    // rejectFilter (static)
+    r.register(
+        cls, "rejectFilter",
+        "(Ljava/util/function/Predicate;Ljava/io/ObjectInputFilter$Status;)Ljava/io/ObjectInputFilter;",
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 2))))),
+    );
+
+    // merge (static)
+    r.register(
+        cls, "merge",
+        "(Ljava/io/ObjectInputFilter;Ljava/io/ObjectInputFilter;)Ljava/io/ObjectInputFilter;",
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 0))))),
+    );
+
+    // Config.getSerialFilter (static)
+    r.register(
+        "java/io/ObjectInputFilter$Config", "getSerialFilter",
+        "()Ljava/io/ObjectInputFilter;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // Config.setSerialFilter (static)
+    r.register(
+        "java/io/ObjectInputFilter$Config", "setSerialFilter",
+        "(Ljava/io/ObjectInputFilter;)V",
+        |_ctx, _args| Ok(None),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ObjectOutput / ObjectInput  (interface stubs)
+// ---------------------------------------------------------------------------
+
+fn register_object_output(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectOutput";
+    // Static interface initializer — true static no-op.
+    r.register(cls, "registerNatives", "()V", native_noop);
+    // Interface defaults — concrete subclasses (ObjectOutputStream) provide the
+    // real implementations dispatched via virtual dispatch.
+    r.register(cls, "writeObject", "(Ljava/lang/Object;)V", native_noop_with_this);
+    r.register(cls, "flush", "()V", native_noop_with_this);
+    r.register(cls, "close", "()V", native_noop_with_this);
+}
+
+fn register_object_input(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ObjectInput";
+    // Static interface initializer — true static no-op.
+    r.register(cls, "registerNatives", "()V", native_noop);
+    r.register(cls, "readObject", "()Ljava/lang/Object;", |_ctx, _args| {
+        Err(RuntimeError::UnsupportedOperationException {
+            message: "Java object serialization is not yet supported".into(),
+        }.into())
+    });
+    r.register(cls, "available", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    // Interface default close — concrete subclasses provide real implementations.
+    r.register(cls, "close", "()V", native_noop_with_this);
+}
+
+// ---------------------------------------------------------------------------
+// Exception types  (3-field synthetic each)
+//   0: message_ref, 1: classname_ref, 2: detail_ref
+// ---------------------------------------------------------------------------
+
+fn register_invalid_class_exception(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/InvalidClassException";
+
+    r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            ctx.set_field(this, 0, Value::Object(Some(*msg)));
+        }
+        Ok(None)
+    });
+
+    r.register(cls, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(cname))) = args.get(1) {
+            ctx.set_field(this, 1, Value::Object(Some(*cname)));
+        }
+        if let Some(Value::Object(Some(msg))) = args.get(2) {
+            ctx.set_field(this, 0, Value::Object(Some(*msg)));
+        }
+        Ok(None)
+    });
+
+    r.register(cls, "getMessage", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+
+    r.register(cls, "getClassname", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+}
+
+fn register_exception_type(r: &mut NativeMethodRegistry, cls: &str) {
+    r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            ctx.set_field(this, 0, Value::Object(Some(*msg)));
+        }
+        Ok(None)
+    });
+    r.register(cls, "getMessage", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+}
+
+fn register_not_serializable_exception(r: &mut NativeMethodRegistry) {
+    register_exception_type(r, "java/io/NotSerializableException");
+}
+
+fn register_stream_corrupted_exception(r: &mut NativeMethodRegistry) {
+    register_exception_type(r, "java/io/StreamCorruptedException");
+    // No-arg constructor — exception fields default to null/empty.
+    r.register("java/io/StreamCorruptedException", "<init>", "()V", native_noop_with_this);
+}
+
+// ---------------------------------------------------------------------------
+// Registration entry point
+// ---------------------------------------------------------------------------
+
+pub(crate) fn register_serialization_natives(r: &mut NativeMethodRegistry) {
+    register_object_output_stream(r);
+    register_object_input_stream(r);
+    register_object_stream_class(r);
+    register_object_stream_field(r);
+    register_serializable(r);
+    register_externalizable(r);
+    register_object_input_filter(r);
+    register_object_output(r);
+    register_object_input(r);
+    register_invalid_class_exception(r);
+    register_not_serializable_exception(r);
+    register_stream_corrupted_exception(r);
+    register_byte_array_output_stream(r);
+}
+
+/// WP0.2 — public forwarder used by `phases_late::objectstreamclass_natives`.
+/// Exposes only the OSC subset so a future sharded registration path can
+/// install just this group. Callers that want the full serialization
+/// surface should use `register_serialization_natives`.
+pub(crate) fn register_object_stream_class_for_phases_late(r: &mut NativeMethodRegistry) {
+    register_object_stream_class(r);
+}
+
+// ---------------------------------------------------------------------------
+// ByteArrayOutputStream  (2-field synthetic)
+//   0: data (byte[]), 1: size (Int)
+// ---------------------------------------------------------------------------
+
+fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
+    let cls = "java/io/ByteArrayOutputStream";
+
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let buf = ctx.new_array(ArrayElementType::Byte, 32);
+        ctx.set_field(this, 0, Value::Object(Some(buf)));
+        ctx.set_field(this, 1, Value::Int(0));
+        Ok(None)
+    });
+    r.register(cls, "<init>", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let capacity = args.get(1).and_then(|v| v.as_int()).unwrap_or(32).max(1) as usize;
+        let buf = ctx.new_array(ArrayElementType::Byte, capacity);
+        ctx.set_field(this, 0, Value::Object(Some(buf)));
+        ctx.set_field(this, 1, Value::Int(0));
+        Ok(None)
+    });
+    r.register(cls, "write", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
+        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(None),
+        };
+        let cap = ctx.array_length(arr);
+        if size >= cap {
+            // Grow: allocate new array of double capacity
+            let new_cap = (cap * 2).max(size + 1);
+            let new_arr = ctx.new_array(ArrayElementType::Byte, new_cap);
+            for i in 0..size {
+                let v = ctx.get_array_element(arr, i);
+                ctx.set_array_element(new_arr, i, v);
+            }
+            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+            ctx.set_array_element(new_arr, size, Value::Int(byte as i8 as i32));
+        } else {
+            ctx.set_array_element(arr, size, Value::Int(byte as i8 as i32));
+        }
+        ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+        Ok(None)
+    });
+    r.register(cls, "write", "([BII)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let src = obj_arg(args, 1)?;
+        let off = args[2].as_int().unwrap_or(0) as usize;
+        let len = args[3].as_int().unwrap_or(0) as usize;
+        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(None),
+        };
+        let cap = ctx.array_length(arr);
+        let needed = size + len;
+        let dest_arr = if needed > cap {
+            let new_cap = (cap * 2).max(needed);
+            let new_arr = ctx.new_array(ArrayElementType::Byte, new_cap);
+            for i in 0..size {
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+            }
+            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+            new_arr
+        } else {
+            arr
+        };
+        for i in 0..len {
+            let v = ctx.get_array_element(src, off + i);
+            ctx.set_array_element(dest_arr, size + i, v);
+        }
+        ctx.set_field(this, 1, Value::Int(needed as i32));
+        Ok(None)
+    });
+    r.register(cls, "toByteArray", "()[B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => {
+                let empty = ctx.new_array(ArrayElementType::Byte, 0);
+                return Ok(Some(Value::Object(Some(empty))));
+            }
+        };
+        let result = ctx.new_array(ArrayElementType::Byte, size);
+        for i in 0..size {
+            let v = ctx.get_array_element(arr, i);
+            ctx.set_array_element(result, i, v);
+        }
+        Ok(Some(Value::Object(Some(result))))
+    });
+    r.register(cls, "size", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(cls, "reset", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 1, Value::Int(0));
+        Ok(None)
+    });
+    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        };
+        let mut bytes = Vec::with_capacity(size);
+        for i in 0..size {
+            let b = ctx.get_array_element(arr, i).as_int().unwrap_or(0);
+            bytes.push(b as u8);
+        }
+        let s = String::from_utf8_lossy(&bytes).to_string();
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
+    r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+    use rustjvm_native_api::NativeMethodRegistry;
+
+    // --- Protocol constants ---
+
+    #[test]
+    fn test_stream_magic_and_version() {
+        assert_eq!(STREAM_MAGIC, 0xACED);
+        assert_eq!(STREAM_VERSION, 5);
+    }
+
+    #[test]
+    fn test_tc_constants_range() {
+        assert_eq!(TC_NULL, 0x70);
+        assert_eq!(TC_REFERENCE, 0x71);
+        assert_eq!(TC_CLASSDESC, 0x72);
+        assert_eq!(TC_OBJECT, 0x73);
+        assert_eq!(TC_STRING, 0x74);
+        assert_eq!(TC_ARRAY, 0x75);
+        assert_eq!(TC_CLASS, 0x76);
+        assert_eq!(TC_BLOCKDATA, 0x77);
+        assert_eq!(TC_ENDBLOCKDATA, 0x78);
+        assert_eq!(TC_RESET, 0x79);
+        assert_eq!(TC_BLOCKDATALONG, 0x7A);
+        assert_eq!(TC_EXCEPTION, 0x7B);
+        assert_eq!(TC_LONGSTRING, 0x7C);
+        assert_eq!(TC_PROXYCLASSDESC, 0x7D);
+        assert_eq!(TC_ENUM, 0x7E);
+    }
+
+    #[test]
+    fn test_base_wire_handle() {
+        assert_eq!(BASE_WIRE_HANDLE, 0x7E0000);
+    }
+
+    #[test]
+    fn test_sc_flags() {
+        assert_eq!(SC_WRITE_METHOD, 0x01);
+        assert_eq!(SC_SERIALIZABLE, 0x02);
+        assert_eq!(SC_EXTERNALIZABLE, 0x04);
+        assert_eq!(SC_BLOCK_DATA, 0x08);
+        assert_eq!(SC_ENUM, 0x10);
+    }
+
+    // --- SVUID computation ---
+
+    #[test]
+    fn test_svuid_deterministic() {
+        let a = compute_default_svuid("java/lang/String");
+        let b = compute_default_svuid("java/lang/String");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_svuid_different_classes() {
+        let a = compute_default_svuid("java/lang/String");
+        let b = compute_default_svuid("java/lang/Integer");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_svuid_empty_class() {
+        let v = compute_default_svuid("");
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_svuid_single_char() {
+        let v = compute_default_svuid("A");
+        assert_eq!(v, 65); // 'A' = 65
+    }
+
+    // --- Cycle detection ---
+
+    #[test]
+    fn test_detect_cycle_found() {
+        let written = vec![100, 200, 300];
+        assert!(detect_cycle(&written, 200));
+    }
+
+    #[test]
+    fn test_detect_cycle_not_found() {
+        let written = vec![100, 200, 300];
+        assert!(!detect_cycle(&written, 400));
+    }
+
+    #[test]
+    fn test_detect_cycle_empty() {
+        let written: Vec<usize> = vec![];
+        assert!(!detect_cycle(&written, 42));
+    }
+
+    // --- Type code helper ---
+
+    #[test]
+    fn test_type_code_primitives() {
+        for c in ['B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z'] {
+            assert!(type_code_is_primitive(c as i32), "expected primitive: {}", c);
+        }
+    }
+
+    #[test]
+    fn test_type_code_non_primitives() {
+        for c in ['L', '[', 'X', 'Q'] {
+            assert!(!type_code_is_primitive(c as i32), "expected non-primitive: {}", c);
+        }
+    }
+
+    // --- Registration tests ---
+
+    #[test]
+    fn test_oos_init_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectOutputStream", "<init>", "(Ljava/io/OutputStream;)V").is_some());
+    }
+
+    #[test]
+    fn test_oos_write_object_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectOutputStream", "writeObject", "(Ljava/lang/Object;)V").is_some());
+    }
+
+    #[test]
+    fn test_oos_primitive_writers_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectOutputStream", "writeInt", "(I)V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "writeLong", "(J)V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "writeFloat", "(F)V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "writeDouble", "(D)V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "writeBoolean", "(Z)V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "writeUTF", "(Ljava/lang/String;)V").is_some());
+    }
+
+    #[test]
+    fn test_ois_init_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectInputStream", "<init>", "(Ljava/io/InputStream;)V").is_some());
+    }
+
+    #[test]
+    fn test_ois_read_object_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;").is_some());
+    }
+
+    #[test]
+    fn test_osc_lookup_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectStreamClass",
+            "lookup",
+            "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_osf_get_name_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamField", "getName", "()Ljava/lang/String;").is_some());
+    }
+
+    #[test]
+    fn test_serializable_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/Serializable", "registerNatives", "()V").is_some());
+    }
+
+    #[test]
+    fn test_externalizable_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/Externalizable", "writeExternal", "(Ljava/io/ObjectOutput;)V").is_some());
+    }
+
+    #[test]
+    fn test_filter_check_input_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectInputFilter",
+            "checkInput",
+            "(Ljava/io/ObjectInputFilter$FilterInfo;)Ljava/io/ObjectInputFilter$Status;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_filter_config_get_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectInputFilter$Config",
+            "getSerialFilter",
+            "()Ljava/io/ObjectInputFilter;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_invalid_class_exception_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/InvalidClassException", "getMessage", "()Ljava/lang/String;").is_some());
+    }
+
+    #[test]
+    fn test_not_serializable_exception_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/NotSerializableException", "<init>", "(Ljava/lang/String;)V").is_some());
+    }
+
+    #[test]
+    fn test_stream_corrupted_exception_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/StreamCorruptedException", "<init>", "(Ljava/lang/String;)V").is_some());
+    }
+
+    #[test]
+    fn test_oos_control_methods_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectOutputStream", "reset", "()V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "flush", "()V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "close", "()V").is_some());
+        assert!(r.find("java/io/ObjectOutputStream", "useProtocolVersion", "(I)V").is_some());
+        assert!(r.find(
+            "java/io/ObjectOutputStream", "putFields",
+            "()Ljava/io/ObjectOutputStream$PutField;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_ois_additional_methods_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectInputStream", "close", "()V").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "available", "()I").is_some());
+        assert!(r.find(
+            "java/io/ObjectInputStream", "readFields",
+            "()Ljava/io/ObjectInputStream$GetField;"
+        ).is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readStreamHeader", "()V").is_some());
+    }
+
+    #[test]
+    fn test_osc_accessors_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamClass", "getSerialVersionUID", "()J").is_some());
+        assert!(r.find("java/io/ObjectStreamClass", "getName", "()Ljava/lang/String;").is_some());
+        assert!(r.find("java/io/ObjectStreamClass", "toString", "()Ljava/lang/String;").is_some());
+    }
+
+    #[test]
+    fn test_osf_accessors_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamField", "isPrimitive", "()Z").is_some());
+        assert!(r.find("java/io/ObjectStreamField", "getTypeCode", "()C").is_some());
+        assert!(r.find("java/io/ObjectStreamField", "getOffset", "()I").is_some());
+    }
+
+    #[test]
+    fn test_object_output_interface_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectOutput", "writeObject", "(Ljava/lang/Object;)V").is_some());
+    }
+
+    #[test]
+    fn test_object_input_interface_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectInput", "readObject", "()Ljava/lang/Object;").is_some());
+    }
+
+    #[test]
+    fn test_invalid_class_getclassname_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/InvalidClassException", "getClassname", "()Ljava/lang/String;").is_some());
+    }
+
+    #[test]
+    fn test_ois_read_class_descriptor_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectInputStream", "readClassDescriptor",
+            "()Ljava/io/ObjectStreamClass;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_svuid_wrapping_mul() {
+        // Verify wrapping arithmetic does not panic on long class names
+        let long_name = "a".repeat(1000);
+        let _ = compute_default_svuid(&long_name);
+    }
+
+    #[test]
+    fn test_filter_config_set_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectInputFilter$Config", "setSerialFilter",
+            "(Ljava/io/ObjectInputFilter;)V"
+        ).is_some());
+    }
+
+    // --- serialization_not_supported returns UnsupportedOperationException ---
+
+    #[test]
+    fn test_serialization_not_supported_returns_err() {
+        // The function should always return Err (UnsupportedOperationException)
+        // We cannot call it directly without a NativeContext, but we can verify
+        // the error type by constructing the same RuntimeError.
+        let err = RuntimeError::UnsupportedOperationException {
+            message: "Java object serialization is not yet supported".into(),
+        };
+        assert!(matches!(err, RuntimeError::UnsupportedOperationException { .. }));
+    }
+
+    #[test]
+    fn test_unsupported_operation_exception_message() {
+        let err = RuntimeError::UnsupportedOperationException {
+            message: "Java object serialization is not yet supported".into(),
+        };
+        if let RuntimeError::UnsupportedOperationException { message } = err {
+            assert!(message.contains("serialization"), "Message should mention serialization");
+            assert!(message.contains("not yet supported"), "Message should say not yet supported");
+        } else {
+            panic!("Expected UnsupportedOperationException");
+        }
+    }
+
+    #[test]
+    fn test_deserialization_not_supported_message() {
+        let err = RuntimeError::UnsupportedOperationException {
+            message: "Java object deserialization is not supported (NotSerializableException)".into(),
+        };
+        if let RuntimeError::UnsupportedOperationException { message } = err {
+            assert!(message.contains("deserialization"), "Should mention deserialization");
+            assert!(message.contains("NotSerializableException"), "Should reference NotSerializableException");
+        } else {
+            panic!("Expected UnsupportedOperationException");
+        }
+    }
+
+    // --- SVUID computation edge cases ---
+
+    #[test]
+    fn test_svuid_known_classes_differ() {
+        let names = [
+            "java/lang/String",
+            "java/lang/Integer",
+            "java/util/ArrayList",
+            "java/util/HashMap",
+            "java/lang/Object",
+        ];
+        for i in 0..names.len() {
+            for j in (i + 1)..names.len() {
+                assert_ne!(
+                    compute_default_svuid(names[i]),
+                    compute_default_svuid(names[j]),
+                    "{} and {} should have different SVUIDs",
+                    names[i],
+                    names[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svuid_case_sensitive() {
+        let lower = compute_default_svuid("java/lang/string");
+        let upper = compute_default_svuid("java/lang/String");
+        assert_ne!(lower, upper, "SVUID should be case-sensitive");
+    }
+
+    #[test]
+    fn test_svuid_path_separator_matters() {
+        let slash = compute_default_svuid("java/lang/String");
+        let dot = compute_default_svuid("java.lang.String");
+        assert_ne!(slash, dot, "Path separator should affect SVUID");
+    }
+
+    // --- Cycle detection edge cases ---
+
+    #[test]
+    fn test_detect_cycle_first_element() {
+        let written = vec![42, 100, 200];
+        assert!(detect_cycle(&written, 42));
+    }
+
+    #[test]
+    fn test_detect_cycle_last_element() {
+        let written = vec![42, 100, 200];
+        assert!(detect_cycle(&written, 200));
+    }
+
+    #[test]
+    fn test_detect_cycle_single_element() {
+        let written = vec![99];
+        assert!(detect_cycle(&written, 99));
+        assert!(!detect_cycle(&written, 100));
+    }
+
+    #[test]
+    fn test_detect_cycle_large_set() {
+        let written: Vec<usize> = (0..1000).collect();
+        assert!(detect_cycle(&written, 500));
+        assert!(detect_cycle(&written, 999));
+        assert!(!detect_cycle(&written, 1000));
+    }
+
+    // --- Type code helpers ---
+
+    #[test]
+    fn test_type_code_all_non_primitive_object_types() {
+        // 'L' is object reference, '[' is array
+        assert!(!type_code_is_primitive('L' as i32));
+        assert!(!type_code_is_primitive('[' as i32));
+    }
+
+    #[test]
+    fn test_type_code_zero() {
+        assert!(!type_code_is_primitive(0));
+    }
+
+    #[test]
+    fn test_type_code_negative() {
+        assert!(!type_code_is_primitive(-1));
+    }
+
+    // --- Protocol constants consistency ---
+
+    #[test]
+    fn test_stream_magic_is_java_magic() {
+        // 0xACED is the documented Java serialization stream magic
+        assert_eq!(STREAM_MAGIC, 0xACED);
+    }
+
+    #[test]
+    fn test_stream_version_is_five() {
+        // Current Java serialization version is 5
+        assert_eq!(STREAM_VERSION, 5);
+    }
+
+    #[test]
+    fn test_tc_constants_contiguous() {
+        // TC constants should be contiguous from 0x70 to 0x7E
+        let expected: Vec<u8> = (0x70..=0x7E).collect();
+        let actual = [
+            TC_NULL, TC_REFERENCE, TC_CLASSDESC, TC_OBJECT, TC_STRING,
+            TC_ARRAY, TC_CLASS, TC_BLOCKDATA, TC_ENDBLOCKDATA, TC_RESET,
+            TC_BLOCKDATALONG, TC_EXCEPTION, TC_LONGSTRING, TC_PROXYCLASSDESC, TC_ENUM,
+        ];
+        assert_eq!(actual.len(), expected.len());
+        for (i, tc) in actual.iter().enumerate() {
+            assert_eq!(*tc, expected[i], "TC at index {} should be 0x{:02X}", i, expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_sc_flags_are_powers_of_two() {
+        // Each flag should be a distinct power of 2 (except SC_ENUM which is 0x10)
+        let flags = [SC_WRITE_METHOD, SC_SERIALIZABLE, SC_EXTERNALIZABLE, SC_BLOCK_DATA, SC_ENUM];
+        for flag in &flags {
+            assert!(flag.is_power_of_two(), "Flag 0x{:02X} should be power of 2", flag);
+        }
+    }
+
+    #[test]
+    fn test_sc_flags_no_overlap() {
+        let flags = [SC_WRITE_METHOD, SC_SERIALIZABLE, SC_EXTERNALIZABLE, SC_BLOCK_DATA, SC_ENUM];
+        for i in 0..flags.len() {
+            for j in (i + 1)..flags.len() {
+                assert_ne!(flags[i], flags[j], "Flags at {} and {} overlap", i, j);
+                assert_eq!(flags[i] & flags[j], 0, "Flags 0x{:02X} and 0x{:02X} share bits", flags[i], flags[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_base_wire_handle_value() {
+        // Base wire handle should be 0x7E0000 per the Java Object Serialization spec
+        assert_eq!(BASE_WIRE_HANDLE, 0x7E_0000);
+        assert!(BASE_WIRE_HANDLE > 0);
+    }
+
+    // --- OIS readObject/readUnshared throw ---
+
+    #[test]
+    fn test_ois_read_object_registered_throws() {
+        // readObject should be registered as a method that throws
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readUnshared", "()Ljava/lang/Object;").is_some());
+    }
+
+    // --- OIS primitive reader defaults ---
+
+    #[test]
+    fn test_ois_primitive_readers_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectInputStream", "readInt", "()I").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readLong", "()J").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readFloat", "()F").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readDouble", "()D").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readBoolean", "()Z").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readByte", "()B").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readShort", "()S").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readChar", "()C").is_some());
+        assert!(r.find("java/io/ObjectInputStream", "readUTF", "()Ljava/lang/String;").is_some());
+    }
+
+    // --- ObjectStreamClass method completeness ---
+
+    #[test]
+    fn test_osc_lookup_any_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectStreamClass", "lookupAny",
+            "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_osc_get_field_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectStreamClass", "getField",
+            "(Ljava/lang/String;)Ljava/io/ObjectStreamField;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_osc_get_fields_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectStreamClass", "getFields",
+            "()[Ljava/io/ObjectStreamField;"
+        ).is_some());
+    }
+
+    #[test]
+    fn test_osc_for_class_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find(
+            "java/io/ObjectStreamClass", "forClass",
+            "()Ljava/lang/Class;"
+        ).is_some());
+    }
+
+    // --- OSF completeness ---
+
+    #[test]
+    fn test_osf_is_unshared_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamField", "isUnshared", "()Z").is_some());
+    }
+
+    #[test]
+    fn test_osf_compare_to_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamField", "compareTo", "(Ljava/lang/Object;)I").is_some());
+    }
+
+    #[test]
+    fn test_osf_get_type_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamField", "getType", "()Ljava/lang/Class;").is_some());
+    }
+
+    #[test]
+    fn test_osf_get_type_string_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r.find("java/io/ObjectStreamField", "getTypeString", "()Ljava/lang/String;").is_some());
+    }
+
+    // ===== M24 Binary Protocol Tests =====
+
+    #[test]
+    fn m24_write_stream_header_bytes() {
+        let addr = 0xDEAD_0001;
+        write_stream_header(addr);
+        let buf = oos_buf_snapshot(addr);
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf[0], 0xAC);
+        assert_eq!(buf[1], 0xED);
+        assert_eq!(buf[2], 0x00);
+        assert_eq!(buf[3], 0x05);
+    }
+
+    #[test]
+    fn m24_write_null_token_byte() {
+        let addr = 0xDEAD_0002;
+        write_null_token(addr);
+        let buf = oos_buf_snapshot(addr);
+        assert_eq!(buf, vec![TC_NULL]);
+    }
+
+    #[test]
+    fn m24_write_string_token_bytes() {
+        let addr = 0xDEAD_0003;
+        write_string_token(addr, "hello");
+        let buf = oos_buf_snapshot(addr);
+        // TC_STRING(0x74) + u16 len(0,5) + "hello"
+        assert_eq!(buf[0], TC_STRING);
+        assert_eq!(u16::from_be_bytes([buf[1], buf[2]]), 5);
+        assert_eq!(&buf[3..], b"hello");
+    }
+
+    #[test]
+    fn m24_write_object_header_bytes() {
+        let addr = 0xDEAD_0004;
+        write_object_header(addr, "com/example/Foo");
+        let buf = oos_buf_snapshot(addr);
+        // TC_OBJECT + TC_CLASSDESC + class name + SVUID + flags + 0 fields + endblockdata + null
+        assert_eq!(buf[0], TC_OBJECT);
+        assert_eq!(buf[1], TC_CLASSDESC);
+        let name_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        assert_eq!(name_len, "com/example/Foo".len());
+        let name = std::str::from_utf8(&buf[4..4 + name_len]).unwrap();
+        assert_eq!(name, "com/example/Foo");
+        let after_name = 4 + name_len;
+        // 8 bytes SVUID + 1 byte flags + 2 bytes field count + 1 TC_ENDBLOCKDATA + 1 TC_NULL
+        assert_eq!(buf[after_name + 8], SC_SERIALIZABLE); // flags
+        assert_eq!(u16::from_be_bytes([buf[after_name + 9], buf[after_name + 10]]), 0); // 0 fields
+        assert_eq!(buf[after_name + 11], TC_ENDBLOCKDATA);
+        assert_eq!(buf[after_name + 12], TC_NULL);
+    }
+
+    #[test]
+    fn m24_write_class_desc_svuid() {
+        let addr = 0xDEAD_0005;
+        write_class_desc(addr, "Test", 12345, SC_SERIALIZABLE, &[]);
+        let buf = oos_buf_snapshot(addr);
+        assert_eq!(buf[0], TC_CLASSDESC);
+        let name_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+        assert_eq!(name_len, 4);
+        let svuid_start = 3 + name_len;
+        let svuid = i64::from_be_bytes(buf[svuid_start..svuid_start + 8].try_into().unwrap());
+        assert_eq!(svuid, 12345);
+    }
+
+    #[test]
+    fn m24_oos_buf_write_and_snapshot() {
+        let addr = 0xBEEF_0010;
+        oos_buf_reset(addr); // clear just this addr
+        oos_buf_write(addr, &[1, 2, 3]);
+        oos_buf_write(addr, &[4, 5]);
+        let buf = oos_buf_snapshot(addr);
+        assert_eq!(buf, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn m24_oos_buf_reset_clears() {
+        let addr = 0xDEAD_0011;
+        oos_buf_reset(addr); // ensure clean start
+        oos_buf_write(addr, &[1, 2, 3]);
+        oos_buf_reset(addr);
+        let buf = oos_buf_snapshot(addr);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn m24_ois_buf_load_and_read() {
+        let addr = 0xDEAD_0020;
+        ois_buf_load(addr, vec![0xAC, 0xED, 0x00, 0x05, 0x70]);
+        let header = ois_buf_read(addr, 4);
+        assert_eq!(header, vec![0xAC, 0xED, 0x00, 0x05]);
+        let tc = ois_buf_read(addr, 1);
+        assert_eq!(tc, vec![0x70]); // TC_NULL
+    }
+
+    #[test]
+    fn m24_ois_buf_remaining_tracks_position() {
+        let addr = 0xDEAD_0021;
+        ois_buf_load(addr, vec![1, 2, 3, 4, 5]);
+        assert_eq!(ois_buf_remaining(addr), 5);
+        let _ = ois_buf_read(addr, 2);
+        assert_eq!(ois_buf_remaining(addr), 3);
+        let _ = ois_buf_read(addr, 3);
+        assert_eq!(ois_buf_remaining(addr), 0);
+    }
+
+    #[test]
+    fn m24_validate_stream_header_valid() {
+        let addr = 0xDEAD_0030;
+        ois_buf_load(addr, vec![0xAC, 0xED, 0x00, 0x05]);
+        assert!(validate_stream_header(addr));
+    }
+
+    #[test]
+    fn m24_validate_stream_header_invalid_magic() {
+        let addr = 0xDEAD_0031;
+        ois_buf_load(addr, vec![0x00, 0x00, 0x00, 0x05]);
+        assert!(!validate_stream_header(addr));
+    }
+
+    #[test]
+    fn m24_validate_stream_header_invalid_version() {
+        let addr = 0xDEAD_0032;
+        ois_buf_load(addr, vec![0xAC, 0xED, 0x00, 0x03]);
+        assert!(!validate_stream_header(addr));
+    }
+
+    #[test]
+    fn m24_int_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0040;
+        let val: i32 = 0x12345678;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 4);
+        let read_val = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(read_val, val);
+    }
+
+    #[test]
+    fn m24_long_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0041;
+        let val: i64 = 0x0102030405060708;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 8);
+        let read_val = i64::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(read_val, val);
+    }
+
+    #[test]
+    fn m24_float_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0042;
+        let val: f32 = 3.14;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 4);
+        let read_val = f32::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(read_val, val);
+    }
+
+    #[test]
+    fn m24_double_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0043;
+        let val: f64 = 2.718281828;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 8);
+        let read_val = f64::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(read_val, val);
+    }
+
+    #[test]
+    fn m24_boolean_roundtrip_true() {
+        let addr = 0xDEAD_0044;
+        oos_buf_write(addr, &[1u8]);
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 1);
+        assert_eq!(bytes[0], 1);
+    }
+
+    #[test]
+    fn m24_boolean_roundtrip_false() {
+        let addr = 0xDEAD_0045;
+        oos_buf_write(addr, &[0u8]);
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 1);
+        assert_eq!(bytes[0], 0);
+    }
+
+    #[test]
+    fn m24_short_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0046;
+        let val: i16 = -1234;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 2);
+        let read_val = i16::from_be_bytes([bytes[0], bytes[1]]);
+        assert_eq!(read_val, val);
+    }
+
+    #[test]
+    fn m24_char_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0047;
+        let val: u16 = 'A' as u16;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 2);
+        let read_val = u16::from_be_bytes([bytes[0], bytes[1]]);
+        assert_eq!(read_val, val);
+    }
+
+    #[test]
+    fn m24_utf_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0048;
+        let s = "hello world";
+        let bytes = s.as_bytes();
+        oos_buf_write(addr, &(bytes.len() as u16).to_be_bytes());
+        oos_buf_write(addr, bytes);
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let len_bytes = ois_buf_read(addr, 2);
+        let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        let str_bytes = ois_buf_read(addr, len);
+        let read_s = String::from_utf8(str_bytes).unwrap();
+        assert_eq!(read_s, s);
+    }
+
+    #[test]
+    fn m24_byte_roundtrip_via_buffers() {
+        let addr = 0xDEAD_0049;
+        let val: u8 = 0xFE;
+        oos_buf_write(addr, &[val]);
+        let written = oos_buf_snapshot(addr);
+        ois_buf_load(addr, written);
+        let bytes = ois_buf_read(addr, 1);
+        assert_eq!(bytes[0], val);
+    }
+
+    #[test]
+    fn m24_negative_int_big_endian() {
+        let addr = 0xDEAD_0050;
+        let val: i32 = -1;
+        oos_buf_write(addr, &val.to_be_bytes());
+        let buf = oos_buf_snapshot(addr);
+        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn m24_skip_class_desc_consumes_bytes() {
+        let addr = 0xDEAD_0060;
+        // Build a class desc manually
+        let mut data = vec![TC_CLASSDESC];
+        let name = b"Test";
+        data.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        data.extend_from_slice(name);
+        data.extend_from_slice(&0i64.to_be_bytes()); // SVUID
+        data.push(SC_SERIALIZABLE); // flags
+        data.extend_from_slice(&0u16.to_be_bytes()); // 0 fields
+        data.push(TC_ENDBLOCKDATA);
+        data.push(TC_NULL);
+        data.push(0xFF); // sentinel
+        ois_buf_load(addr, data);
+        skip_class_desc(addr);
+        assert_eq!(ois_buf_remaining(addr), 1); // only sentinel left
+        let sentinel = ois_buf_read(addr, 1);
+        assert_eq!(sentinel[0], 0xFF);
+    }
+
+    #[test]
+    fn m24_stream_header_then_null_token() {
+        let addr = 0xDEAD_0070;
+        write_stream_header(addr);
+        write_null_token(addr);
+        let buf = oos_buf_snapshot(addr);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf[0..4], &[0xAC, 0xED, 0x00, 0x05]);
+        assert_eq!(buf[4], TC_NULL);
+    }
+
+    #[test]
+    fn m24_stream_header_then_string_token() {
+        let addr = 0xDEAD_0071;
+        write_stream_header(addr);
+        write_string_token(addr, "hi");
+        let buf = oos_buf_snapshot(addr);
+        // 4 header + 1 TC_STRING + 2 len + 2 "hi" = 9
+        assert_eq!(buf.len(), 9);
+        assert_eq!(buf[4], TC_STRING);
+        assert_eq!(u16::from_be_bytes([buf[5], buf[6]]), 2);
+        assert_eq!(&buf[7..9], b"hi");
+    }
+
+    #[test]
+    fn m24_multiple_primitives_sequential() {
+        let addr = 0xDEAD_0080;
+        let i_val: i32 = 42;
+        let l_val: i64 = 999;
+        oos_buf_write(addr, &i_val.to_be_bytes());
+        oos_buf_write(addr, &l_val.to_be_bytes());
+        let written = oos_buf_snapshot(addr);
+        assert_eq!(written.len(), 12); // 4 + 8
+        ois_buf_load(addr, written);
+        let i_bytes = ois_buf_read(addr, 4);
+        let read_i = i32::from_be_bytes(i_bytes.try_into().unwrap());
+        assert_eq!(read_i, 42);
+        let l_bytes = ois_buf_read(addr, 8);
+        let read_l = i64::from_be_bytes(l_bytes.try_into().unwrap());
+        assert_eq!(read_l, 999);
+    }
+
+    #[test]
+    fn m24_empty_string_utf() {
+        let addr = 0xDEAD_0090;
+        let s = "";
+        oos_buf_write(addr, &(s.len() as u16).to_be_bytes());
+        oos_buf_write(addr, s.as_bytes());
+        let written = oos_buf_snapshot(addr);
+        assert_eq!(written, vec![0x00, 0x00]); // just the zero-length u16
+    }
+
+    #[test]
+    fn m24_ois_read_returns_zeroes_when_empty() {
+        let addr = 0xDEAD_00A0;
+        // Don't load any data — read should return zeroes
+        let bytes = ois_buf_read(addr, 4);
+        assert_eq!(bytes, vec![0, 0, 0, 0]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP0.2 — build_object_stream_class tests
+// ---------------------------------------------------------------------------
+//
+// These exercise the descriptor builder end-to-end via the shared
+// `MockNativeContext` harness (extended with WP0.2 per-class field /
+// method / super / OSC-cache overrides in `test_utils.rs`).  That
+// keeps the WP0.2 test surface small and routed through the same mock
+// every other native-method test in this crate uses.
+
+#[cfg(test)]
+mod wp02_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use rustjvm_native_api::{FieldMetadata, MethodMetadata};
+    use rustjvm_types::ClassId;
+
+    const ACC_PUBLIC: u16 = 0x0001;
+    const ACC_PROTECTED: u16 = 0x0004;
+    const ACC_WP02_PRIVATE: u16 = 0x0002;
+    const ACC_WP02_TRANSIENT: u16 = 0x0080;
+
+    fn fm(name: &str, desc: &str, flags: u16, slot: usize, declaring: ClassId) -> FieldMetadata {
+        FieldMetadata {
+            name: name.to_string(),
+            descriptor: desc.to_string(),
+            access_flags: flags,
+            slot_index: slot,
+            declaring_class_id: declaring,
+            is_static: (flags & 0x0008) != 0,
+        }
+    }
+
+    fn mm(name: &str, desc: &str, flags: u16, declaring: ClassId) -> MethodMetadata {
+        MethodMetadata {
+            name: name.to_string(),
+            descriptor: desc.to_string(),
+            access_flags: flags,
+            declaring_class_id: declaring,
+        }
+    }
+
+    /// Build a Serializable class hierarchy on top of `MockNativeContext`:
+    ///
+    ///   Object (non-Serializable, no fields)
+    ///   └── Base (non-Serializable, has `<init>()V`)
+    ///        └── Foo (implements Serializable) { int a; int b; int c;
+    ///             transient int skip; private void writeObject(...); }
+    ///
+    /// Returns (ctx, foo_class_id).
+    fn build_foo_ctx() -> (MockNativeContext, ClassId) {
+        let mut ctx = MockNativeContext::new();
+        // Register via ensure_class_initialized so they all have ClassIds.
+        let object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
+        let serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
+        let _externalizable =
+            ctx.ensure_class_initialized("java/io/Externalizable").unwrap();
+        let _osc = ctx.ensure_class_initialized("java/io/ObjectStreamClass").unwrap();
+        let _osf = ctx.ensure_class_initialized("java/io/ObjectStreamField").unwrap();
+        let _method = ctx.ensure_class_initialized("java/lang/reflect/Method").unwrap();
+        let _ctor = ctx
+            .ensure_class_initialized("java/lang/reflect/Constructor")
+            .unwrap();
+        let base = ctx.ensure_class_initialized("Base").unwrap();
+        let foo = ctx.ensure_class_initialized("Foo").unwrap();
+
+        // Hierarchy.
+        ctx.set_superclass(base, object);
+        ctx.set_superclass(foo, base);
+        ctx.set_interfaces(foo, vec![serializable]);
+
+        // Base's no-arg ctor.
+        ctx.set_declared_methods(base, vec![mm("<init>", "()V", ACC_PUBLIC, base)]);
+        // Foo: fields in declaration order (a, b, c, transient skip).
+        ctx.set_declared_fields(
+            foo,
+            vec![
+                fm("a", "I", ACC_PUBLIC, 0, foo),
+                fm("b", "I", ACC_PUBLIC, 1, foo),
+                fm("c", "I", ACC_PUBLIC, 2, foo),
+                fm(
+                    "skip",
+                    "I",
+                    ACC_PUBLIC | ACC_WP02_TRANSIENT,
+                    3,
+                    foo,
+                ),
+            ],
+        );
+        // Foo's methods: private writeObject + protected writeReplace.
+        ctx.set_declared_methods(
+            foo,
+            vec![
+                mm(
+                    "writeObject",
+                    "(Ljava/io/ObjectOutputStream;)V",
+                    ACC_WP02_PRIVATE,
+                    foo,
+                ),
+                mm(
+                    "writeReplace",
+                    "()Ljava/lang/Object;",
+                    ACC_PROTECTED,
+                    foo,
+                ),
+            ],
+        );
+        (ctx, foo)
+    }
+
+    #[test]
+    fn osc_lookup_returns_non_null_for_serializable() {
+        let (mut ctx, foo) = build_foo_ctx();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .expect("lookup of a Serializable class must return a descriptor");
+        // Slot 2 is field_count = 3 (a, b, c — skip is transient).
+        assert_eq!(ctx.get_field(desc, 2), Value::Int(3));
+        // Slot 3 has SC_SERIALIZABLE bit.
+        let flags = match ctx.get_field(desc, 3) {
+            Value::Int(n) => n,
+            other => panic!("expected Int flags, got {:?}", other),
+        };
+        assert_eq!(flags & OSC_FLAG_SERIALIZABLE, OSC_FLAG_SERIALIZABLE);
+    }
+
+    #[test]
+    fn osc_lookup_returns_none_for_non_serializable() {
+        let (mut ctx, _foo) = build_foo_ctx();
+        let base = ctx.class_id_by_name("Base").unwrap();
+        let result = build_object_stream_class(&mut ctx, base, false);
+        assert!(
+            result.is_none(),
+            "lookup(non-Serializable) must return None"
+        );
+    }
+
+    #[test]
+    fn osc_lookup_any_returns_descriptor_for_non_serializable() {
+        let (mut ctx, _foo) = build_foo_ctx();
+        let base = ctx.class_id_by_name("Base").unwrap();
+        let desc = build_object_stream_class(&mut ctx, base, true)
+            .expect("lookupAny must return a descriptor even for non-Serializable");
+        // field_count == 0 for non-Serializable lookupAny.
+        assert_eq!(ctx.get_field(desc, 2), Value::Int(0));
+        assert_eq!(ctx.get_field(desc, 3), Value::Int(0));
+    }
+
+    #[test]
+    fn osc_fields_are_in_declaration_order() {
+        let (mut ctx, foo) = build_foo_ctx();
+        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let arr = match ctx.get_field(desc, 6) {
+            Value::Object(Some(a)) => a,
+            other => panic!("expected fields[] array, got {:?}", other),
+        };
+        assert_eq!(
+            ctx.array_length(arr),
+            3,
+            "transient field must be excluded from fields[]"
+        );
+        let expected = ["a", "b", "c"];
+        for (i, want) in expected.iter().enumerate() {
+            let osf = match ctx.get_array_element(arr, i) {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected ObjectStreamField at index {}, got {:?}", i, other),
+            };
+            let name = match ctx.get_field(osf, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                other => panic!("expected name string, got {:?}", other),
+            };
+            assert_eq!(name, *want, "fields[] must be in declaration order");
+        }
+    }
+
+    #[test]
+    fn osc_cache_identity_two_lookups_same_ref() {
+        let (mut ctx, foo) = build_foo_ctx();
+        let d1 = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let d2 = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        assert_eq!(
+            d1, d2,
+            "two lookup(cls) calls for the same class must return the same ObjectRef"
+        );
+    }
+
+    #[test]
+    fn osc_finds_serializable_constructor_on_base() {
+        // Foo's serializableConstructor should come from Base (the
+        // closest non-Serializable ancestor's no-arg ctor).
+        let (ctx, foo) = build_foo_ctx();
+        let base = ctx.class_id_by_name("Base").unwrap();
+        let result = find_serializable_constructor(&ctx, foo);
+        let (anc, ctor) = result.expect("must find ctor in non-Serializable ancestor");
+        assert_eq!(anc, base);
+        assert_eq!(ctor.name, "<init>");
+        assert_eq!(ctor.descriptor, "()V");
+    }
+
+    #[test]
+    fn osc_find_write_replace_method_when_present() {
+        let (ctx, foo) = build_foo_ctx();
+        let found =
+            find_inheritable_method(&ctx, foo, "writeReplace", "()Ljava/lang/Object;");
+        assert!(
+            found.is_some(),
+            "find_inheritable_method must locate writeReplace on Foo"
+        );
+    }
+
+    #[test]
+    fn osc_find_write_replace_absent_returns_none() {
+        let (ctx, _foo) = build_foo_ctx();
+        let base = ctx.class_id_by_name("Base").unwrap();
+        // Base has no writeReplace — walking up from Base also hits
+        // `Object` which has none. Must be None.
+        assert!(find_inheritable_method(
+            &ctx,
+            base,
+            "writeReplace",
+            "()Ljava/lang/Object;"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn osc_has_write_object_slot_set_when_present() {
+        let (mut ctx, foo) = build_foo_ctx();
+        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        assert_eq!(ctx.get_field(desc, 4), Value::Int(1)); // has_write_object
+        assert_eq!(ctx.get_field(desc, 5), Value::Int(0)); // has_read_object
+    }
+
+    #[test]
+    fn osc_for_class_returns_class_mirror() {
+        let (mut ctx, foo) = build_foo_ctx();
+        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let mirror_val = ctx.get_field(desc, 7);
+        assert!(
+            matches!(mirror_val, Value::Object(Some(_))),
+            "forClass slot (7) must be populated with the Class mirror"
+        );
+    }
+}

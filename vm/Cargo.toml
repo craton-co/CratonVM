@@ -1,0 +1,92 @@
+[package]
+name = "rustjvm-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Java Virtual Machine implementation in Rust"
+readme = "../README.md"
+
+[features]
+# NEW-11: `synthetic-jdk` is intentionally NOT in the default feature set.
+# The default build boots against real JDK bytecode loaded from
+# `$JAVA_HOME/lib/modules` (via the NEW-5 jimage reader) with the ~150
+# essential natives as the Rust support surface. To run the legacy
+# synthetic test suite or to debug against Rust-side stubs, pass
+# `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
+# for the rationale and the census-driven migration plan.
+default = ["experimental-tls", "legacy-synthetic-crypto", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug"]
+synthetic-jdk = ["rustjvm-native-builtins/synthetic-jdk", "rustjvm-native-collections/synthetic-jdk", "rustjvm-native-io/synthetic-jdk"]
+experimental-tls = ["rustjvm-native-builtins/experimental-tls"]
+legacy-synthetic-crypto = ["rustjvm-native-builtins/legacy-synthetic-crypto"]
+experimental-jmx = ["rustjvm-native-builtins/experimental-jmx"]
+experimental-serialization = ["rustjvm-native-builtins/experimental-serialization"]
+experimental-aot = ["rustjvm-native-builtins/experimental-aot"]
+experimental-debug = []
+# T19.H7 diagnostic logger. Off by default — these warn-level traces are
+# bring-up scaffolding that fired on every class-load, opcode dispatch, and
+# native call; building with this feature flag re-enables them only when an
+# operator is explicitly debugging a Wave-7 hang. Sessions 93-94 had to
+# revert two silent re-enables; gating behind a feature ensures it cannot
+# leak back into the default build.
+experimental-t19-diag = []
+
+[dependencies]
+rustjvm-reader = { path = "../reader" }
+rustjvm-types = { path = "../types" }
+rustjvm-native-api = { path = "../native-api" }
+rustjvm-native-collections = { path = "../native-collections" }
+rustjvm-native-io = { path = "../native-io" }
+rustjvm-native-builtins = { path = "../native-builtins" }
+rustjvm-jit-api = { path = "../jit-api" }
+rustjvm-jit = { path = "../jit" }
+rustjvm-classloading = { path = "../classloading" }
+rustjvm-gc = { path = "../gc" }
+rustjvm-jfr = { path = "../jfr" }
+rustjvm-native-awt = { path = "../native-awt" }
+thiserror.workspace = true
+tracing.workspace = true
+indexmap = "2"
+bitfield-struct = "0.9"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+parking_lot = "0.12"
+regex = "1"
+libloading = "0.8"
+rustc-hash = "1.1"
+# NEW-20: bench-gate binary uses serde to read criterion estimates.json
+# files and the committed bench/baseline.json file.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "vm_benchmarks"
+harness = false
+
+# NEW-20: benchmark-gate CLI. Compares the criterion run output in
+# target/criterion/ against the committed bench/baseline.json and
+# exits non-zero on regression > threshold.
+[[bin]]
+name = "bench-gate"
+path = "src/bin/bench_gate.rs"
+
+# T5.1.2: HotSpot C2 ratio comparator. Reads bench/baseline.json and
+# bench/hotspot-baseline.json, prints a per-metric ratio table plus
+# geomean, exits non-zero when the geomean exceeds the threshold (1.5×
+# by default per T5.8.1).
+[[bin]]
+name = "bench-hotspot-compare"
+path = "src/bin/bench_hotspot_compare.rs"
+
+[lints]
+workspace = true
