@@ -489,6 +489,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // RKC16N.9 RECON-STUB: JDKSpecific.addInternalPackages no-op.
+    // org/jboss/modules/Module.<clinit> PC 154 invokes
+    // JDKSpecific.addInternalPackages(list). JDKSpecific.<clinit> uses
+    // heavy MethodHandle reflection and likely half-fails on rustjvm,
+    // so its static `hack` field is null and the inner call NPEs.
+    // No-op mirrors HotSpot when --add-modules adds nothing extra:
+    // KC16 advances and resolves packages via its other paths.
+    // Drop when a proper JDKSpecific shim lands.
+    registry.register(
+        "org/jboss/modules/JDKSpecific", "addInternalPackages", "(Ljava/util/List;)V",
+        |_ctx, _args| Ok(None),
+    );
+
     // RKC16N-RECON: throwable / permission ctors that take a String message.
     // Real JDK has bytecode for these; the dispatcher fails to find them
     // (same root-cause as String — see RKC16N.7) so we register layout-

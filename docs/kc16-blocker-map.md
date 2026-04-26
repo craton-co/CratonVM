@@ -21,10 +21,34 @@ Exception in thread "main" java/lang/NullPointerException
 **RKC16N.9** — `org.jboss.modules.Module.<clinit>` NPE. The class init
 is silently swallowed (B6 path), leaving `Module` in a partially-
 initialised state, then `main()` references something that NPEs.
-Investigation needed: turn off B6 or run with `--noverify` (now
-identical without it) and capture the stack trace at NPE site.
-Likely a static field that requires a real `Module` instance or a
-`PathFilter`/`PathUtils` helper our minimal stubs don't return.
+
+**Recon completed (2026-04-26 PM, Session 94 fifth iteration):**
+- `RUSTJVM_STRICT_SWALLOWS=1` panics inside `common_superclass` →
+  `ensure_class_initialized_shared`, confirming the NPE is during a
+  cascading class-init triggered by `Module.<clinit>`.
+- `Module.<clinit>` clinit chain (via `RUST_LOG=...vm_util=debug`):
+  `Main` → `StartTimeHolder` → `StandardCharsets` →
+  `DefaultBootModuleLoaderHolder` → `ModuleLoader` →
+  `LocalModuleLoader` → `Module` (the NPE class).
+- The NPE message "null object argument" comes from the generic
+  `obj_arg` helper at `native-builtins/src/lib.rs:6036`, which means
+  some native method is being called with a `Value::Object(None)`
+  argument. Without a Java stack at the call site we can't tell which
+  native — adding a per-native eprintln in `obj_arg` or recording the
+  failing method name in `record_swallow` would expose this in <1
+  iteration.
+- `Module.<clinit>` bytecode (via `javap -c -p` on jboss-modules.jar):
+  PC 0..125 sets up `MAIN_METHOD_TYPE` + `log` + `BOOT_MODULE_LOADER`
+  + 6 RuntimePermission statics + 2 FastCopyHashSets. PC 128..156
+  reads `jboss.modules.system.pkgs` via PropertyReadAction +
+  AccessController.doPrivileged, allocates `ArrayList`, then calls
+  `JDKSpecific.addInternalPackages(list)` (PC 154). Stubbed as no-op
+  in Session 94 commit `<TBD>` — did not change the NPE, so the
+  triggering native is elsewhere.
+- Plausible remaining culprits: `MethodType.methodType(Class, Class)`
+  (PC 6) returning null then later invocation NPEs; `AccessController.doPrivileged`
+  arity mismatch; `FastCopyHashSet.<init>(I)V` taking null where it
+  expects `this`. Add a Java-stack log in `obj_arg` to find out.
 
 
 
