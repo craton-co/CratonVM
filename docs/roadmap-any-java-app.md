@@ -874,6 +874,20 @@ parallel, then D+E+F, then G+H, then I as continuous validation.
 | Constraints | Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
 | Notes | Likely a category-class bug: `String.length()`, `String.substring(II)`, `String.indexOf(I)` may all be in the same boat. Agent should grep `register_synthetic_overrides` for `"java/lang/String"` registrations and audit which are also reachable in real-JDK mode. |
 
+### RKC16N.9 — Investigate `org.jboss.modules.Module.<clinit>` NPE after RVERIF.2 lands
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.9 |
+| Title | `Module.<clinit>` silent-swallow NPE leaves Module class half-initialised; main() then NPEs |
+| Files | Investigation in `org.jboss.modules.Module` bytecode (extract from `/tmp/keycloak/keycloak-16.1.1/jboss-modules.jar`); fix likely in `native-builtins/src/jboss_module_loader.rs` (a missing-helper stub) or a new post-clinit fixup mirror to the existing `DefaultBootModuleLoaderHolder` one in `vm/src/vm/vm_util.rs`. |
+| Reproducer (after RVERIF.2 + RKC16N.1/3/5/8 + Session 94 recon hacks) | `target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"` → `B6: silent-swallow class=org/jboss/modules/Module exc=java/lang/NullPointerException: null object argument` then `Exception in thread "main" java/lang/NullPointerException`. |
+| Recon | (1) Run with `RUSTJVM_STRICT_SWALLOWS=1` to escalate the first swallow to a panic with a real stack trace. (2) `javap -c -p` on `org/jboss/modules/Module` (extract from `jboss-modules.jar`); find every static field initialiser. (3) Identify which static-init expression returns null. Common candidates in JBoss Modules: `LOG_MANAGER` lookup, `MODULE_DIR` / `JBOSS_HOME_DIR` from system properties, `PathFilters.acceptAll()` static initialisation, or the synthetic `defaultClassFilter`. (4) Check `org/jboss/modules/Main.<clinit>` (which already runs cleanly per `-version`) for state it sets that `Module.<clinit>` then expects. |
+| Fix direction | Two paths: (a) implement the missing helper(s) so the static init succeeds (e.g. register a native for `org/jboss/modules/PathFilters.acceptAll()` if it returns null today); (b) post-clinit fixup similar to `DefaultBootModuleLoaderHolder` (see `vm/src/vm/vm_util.rs`) — populate the field manually after the swallow. (a) is structurally correct; (b) is a session-bridging tactic. |
+| Success | KC16 standalone progresses past `Module.<clinit>` and enters `org.jboss.modules.Main.run` proper. Next failure (if any) is downstream — module.xml parsing or class-resolution against deployed modules. |
+| Parallel-safe with | Phase A–I items, RVERIF.2 (depends), RKC16N.1/3/5/8 (depend). |
+| Constraints | No emojis. Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
+
 ### RKC16N.4 — Capture next KC16 blocker after RKC16N.1 lands
 
 | Field | Value |

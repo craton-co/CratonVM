@@ -1,5 +1,33 @@
 # KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
+## Live status (2026-04-26, Session 94 — fourth iteration; RVERIF.2 landed)
+
+After RVERIF.2 (verifier subtype widening fix via JDK interface name table):
+
+```
+target/release/rustjvm.exe --java-home "C:/.../jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+→ verifier passes. Single failure (no NoSuchMethodError, no other warnings):
+```
+B6: silent-swallow class=org/jboss/modules/Module
+   exc=java/lang/NullPointerException: null object argument
+Exception in thread "main" java/lang/NullPointerException
+```
+
+**RKC16N.9** — `org.jboss.modules.Module.<clinit>` NPE. The class init
+is silently swallowed (B6 path), leaving `Module` in a partially-
+initialised state, then `main()` references something that NPEs.
+Investigation needed: turn off B6 or run with `--noverify` (now
+identical without it) and capture the stack trace at NPE site.
+Likely a static field that requires a real `Module` instance or a
+`PathFilter`/`PathUtils` helper our minimal stubs don't return.
+
+
+
 Keycloak 16.1.1 (WildFly / JBoss-Modules) under current `target/release/rustjvm.exe`
 on Windows 11, JDK 25.0.2 (Adoptium) for boot classpath, default flags.
 
