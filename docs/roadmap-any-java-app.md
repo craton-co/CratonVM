@@ -776,17 +776,113 @@ Each RI.N is a SINGLE AGENT task whose prompt is:
 | Blocks | Any app that (de)serializes via `ObjectStreamClass`, including JUnit 4, many logging/config frameworks, anything using default Java serialization. |
 | Parallel-safe with | All other items; isolated to native stub + class init. |
 
-## Current anchor counts
+## Current anchor counts (refreshed 2026-04-26, Session 94)
 
 - HelloWorld: PASS.
 - KC16 no-args: PASS.
-- KC16 `-mp <dir> -version`: PASS.
-- KC16 `-mp <dir> org.jboss.as.standalone`: fails at RA.1 (CharBuffer
-  AIOOBE) — downstream of that is RA.4, then iteratively RA.5 and
-  RA.7 per dependency module.
-- KC26 Quarkus: fails deeper (String internals / Quarkus classloader) —
-  covered by RI.17 + discovered items.
+- KC16 `-mp <dir> -version`: **REGRESSED** to fail at `Properties.load(Ljava/io/Reader;)V`
+  NoSuchMethodError before any module XML is touched — see **RKC16N.1** below.
+- KC16 `-mp <dir> org.jboss.as.standalone`: fails at the same RKC16N.1.
+  Once #1 ships, the CHM CAS livelock (RKC16N.2) is the next gate, then `[L…;`
+  array synthesis (RKC16N.3) for downstream module class loading.
+- KC26 Quarkus: also gated on RKC16N.2 (shared CHM livelock) per `kc26-blocker-map.md` #1.
+
+Resolved since previous anchor:
+- KC16 `initPhase1` synthetic-stream fallback (was Blocker #3) — runs as
+  a non-fatal `WARN`; bootstrap continues.
+- 9 static MISSING natives (was Blocker #4) — registered with real bodies.
+- Stack-dump watchdog (was Blocker #5) — `[rustjvm] stack-dump watchdog
+  armed: will dump + abort after 45s` now first line of every run. SIGTERM
+  audit-flush still TBD.
 
 Total items above: ~100, each ≤1 day for an isolated agent. Ship
 order: Phase A first (unblocks KC16 RC start), then Phase B+C in
 parallel, then D+E+F, then G+H, then I as continuous validation.
+
+---
+
+## Phase KC16N — fresh KC16 boot blockers (2026-04-26, Session 94)
+
+### RKC16N.1 — Implement `java/util/Properties.load(Ljava/io/Reader;)V`
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.1 |
+| Title | Properties.load(Reader) NoSuchMethodError aborts KC16 jboss-modules `Main.<clinit>` |
+| Files | `native-builtins/src/properties_sidetable.rs` (extend), `native-builtins/src/lib.rs` (no change unless registration moves) |
+| Reproducer | `target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- -version` → `linkage error: no such method: java/util/Properties.load(Ljava/io/Reader;)V`. |
+| Root cause | `register_properties_sidetable` registers `load(Ljava/io/InputStream;)V` but not `load(Ljava/io/Reader;)V`. JBoss Modules' `Main.<clinit>` reads `version.properties` via an `InputStreamReader` wrapping a `FileInputStream`, then calls `Properties.load(Reader)`. Real JDK has both overloads and shares parsing; ours only has the InputStream variant. |
+| Fix | Add `register_properties_sidetable` entry for `load(Ljava/io/Reader;)V`. New native drains the Reader by calling `ctx.invoke_virtual(reader, "read", "([CII)I", &[buf, 0, 4096])` in a loop into a scratch `char[]`, accumulates a `String`, then converts to ISO-8859-1 bytes (chars >255 → `?`) and reuses `parse_properties`. (Long-term cleanup: refactor `parse_properties` to take `&str`; not required for unblock.) |
+| Success | Reproducer no longer prints `no such method: …Properties.load(Ljava/io/Reader;)V`. Next failure (if any) is downstream — capture & file as RKC16N.4. |
+| Parallel-safe with | RKC16N.2, RKC16N.3, every Phase A–I item. Touches only `properties_sidetable.rs` + a unit test. |
+| Constraints | No emojis. Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
+
+### RKC16N.2 — Fix CHM `initTable()` CAS livelock (typed-default-slot zero-init)
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.2 |
+| Title | Primitive instance fields read as `Value::Object(None)` post-`alloc_object`, breaking `Unsafe.compareAndSetInt` |
+| Files | `gc/src/heap.rs` (`alloc_object`, `read_slot`), `vm/src/vm/vm_exec.rs` (`compare_and_swap_field`, `values_equal_for_cas`). Optional: `gc/src/gen_heap.rs` mirror. |
+| Reproducer | A Rust unit test at `gc/tests/`: allocate a class with one declared `int` field, read its slot via `read_slot`, assert `Value::Int(0)`. Currently returns `Value::Object(None)`. End-to-end reproducer: KC16 -version (post-RKC16N.1) and KC26 Quarkus, both deadlock at `ConcurrentHashMap.initTable` PC 0..41. |
+| Root cause | `gc::heap::read_slot` is `std::ptr::read::<Value>(ptr)` over zero-initialised bytes (from `alloc_zeroed`), which decodes as the zero-discriminant `Value` variant (likely `Object(None)`) regardless of declared field kind. `Unsafe.compareAndSetInt` reads through `read_slot` and compares against `Value::Int(0)` via `values_equal_for_cas`, never matching. |
+| Fix | Pick one of (a) tag every slot at `alloc_object` time with the declared field's default (`Int(0)`, `Long(0)`, `Object(None)`, etc.) using the class's field-descriptor list, OR (b) make `read_slot` carry the declared `BasicType` so it interprets zero bytes as the right discriminant. (a) is simpler and matches HotSpot semantics; (b) is more memory-efficient. |
+| Success | New unit test passes; CHM unit test (`new ConcurrentHashMap<>().put("a","b")`) returns within 100 iterations; KC16 -version (after RKC16N.1) progresses past `Main.<clinit>` and starts opening `module.xml`. |
+| Parallel-safe with | RKC16N.1, RKC16N.3, all Phase D except RD.1/RD.3 (which would test the fix). Heavily overlaps GC/VM ownership; coordinate with anyone touching `heap.rs`. |
+| Constraints | No emojis. Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
+
+### RKC16N.3 — Synthesize `[L…;` array classes on demand
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.3 |
+| Title | Array classes resolved by JMOD scan instead of synthesised from element class on demand |
+| Files | `classloading/src/class_manager.rs` (or wherever `Class.forName("[Lx;")` lookup lives), `classloading/src/array_class.rs` if present. |
+| Reproducer | Unit test: `class_manager.resolve_or_load("[Ljava/util/concurrent/ConcurrentHashMap$Node;")` should return an array `Class` with component = the inner Node class without scanning JMODs. End-to-end: identical to KC26 Blocker #3, observed during KC26 Quarkus boot when ~7 inner-class array types fall back to synthetic stub. |
+| Root cause | Array-class lookup reads the classpath/JMOD scan for `[Lx;` filenames, which obviously do not exist. JVMS §5.3.3 specifies array classes are *synthesised* by the bootstrap loader from the resolved component class. |
+| Fix | When the requested name starts with `[L` and ends with `;`, strip the wrapper, resolve the component class, then synthesise an array `Class` referencing it (set `array_dimension`, `component_class_id`, `name`) without filesystem I/O. Cache by `name` in the existing class table so subsequent `Class.forName` returns the same instance. |
+| Success | New unit test passes; KC26 boot trace no longer logs `synthetic stub fallback` for any `[L…;` name. |
+| Parallel-safe with | RKC16N.1, RKC16N.2, all RA/RB/RC/RD/RE/RF items. Single file, no GC interaction. |
+| Constraints | No emojis. Don't touch the restricted files. |
+
+### RKC16N.7 — Investigate why `find_method` returns None for JDK 25 `String.equals` / `String.charAt`
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.7 |
+| Title | Real-JDK `java/lang/String` class loaded but `find_method("equals", "(Ljava/lang/Object;)Z")` returns None at vm_exec.rs:4949 |
+| Files | `vm/src/vm/vm_exec.rs` (the `None` branch around line 4949 — receives `class_id` of the resolved String class but its method table doesn't expose `equals`); `classloading/src/class_manager.rs` (whatever loads `java/lang/String` from `lib/modules`); `classloading/src/method_table.rs` (or wherever `find_method` lives). |
+| Reproducer | After RKC16N.1 + the local recon hack registering `String.equals` in `register_essential_natives` (Session 94 worktree, see `native-builtins/src/lib.rs:316`), KC16 -version still emits `WARN NoSuchMethodError method="java/lang/String.equals(Ljava/lang/Object;)Z"`. The native IS registered; the dispatcher reaches the None arm at vm_exec.rs:4949, and the registry-walk lookup finds nothing because `cls.name` for our resolved String isn't matching, OR the resolved class's `methods` table is empty. |
+| Hypothesis | Either (a) JDK 25 `String` from `lib/modules` is loaded as a *partial* class (some methods absent — possibly due to JMOD parser skipping certain attributes); or (b) the dispatcher reaches 4949 with a `class_id` whose `cls.name` is something other than literal `"java/lang/String"` (e.g. an interned variant, or an internal stub). Add `eprintln!("class_name={} method={} {}", cls.name, method_name, descriptor)` at the top of the registry walk to see what's actually being queried. |
+| Workaround in place | Session 94 added `String` to the override-allowlist at `vm/src/vm/vm_exec.rs:4900` so the native registry consultation fires *before* the bytecode-resolution fallback. This works around RKC16N.7 by always preferring our native, but the underlying class-load / method-table issue remains. |
+| Success | Either: revert the override-allowlist hack and have the natural None-fallback path find the registered native; OR confirm the JDK 25 String loads with all expected methods and the bug was something else. Either way, document the root cause. |
+| Parallel-safe with | RKC16N.1 (lands), RKC16N.2, RKC16N.3, RKC16N.5, RKC16N.6 (depends on the resolution here). Single-investigation task, mostly read-only. |
+| Constraints | Don't touch restricted files. |
+
+### RKC16N.6 — `String.charAt(I)C` not registered in real-JDK essential natives
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.6 |
+| Title | `java/lang/String.charAt(I)C` NoSuchMethodError during `java/nio/charset/StandardCharsets.<clinit>` in real-JDK mode |
+| Files | `native-builtins/src/lib.rs` (move charAt registration into `register_essential_natives`), `native-builtins/src/lang_string.rs` (verify the JDK 25 byte[]+coder layout path of `native_string_char_at`). |
+| Reproducer | After RKC16N.1 (or local stub) is in place: `target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- -version` → `WARN NoSuchMethodError method="java/lang/String.charAt(I)C"` from `java/nio/charset/StandardCharsets.<clinit>`. |
+| Root cause | `String.charAt(I)C` is registered at `native-builtins/src/lib.rs:4261` inside `register_synthetic_overrides`. Real-JDK mode never calls that function (see lib.rs:2694 comment). The JDK 25 `String` class loaded from `lib/modules` *should* expose the bytecode method, but our class loader / dispatch fails to find it for this resolution path. Possibly an entry-point fast-path that consults the native registry first and short-circuits to NoSuchMethodError when not present, even though the bytecode exists. |
+| Fix | Two options: (a) **register a layout-neutral `String.charAt(I)C` in `register_essential_natives`** that uses `ctx.read_string` to be agnostic of JDK version (the recon hack uses this approach — see Session 94 worktree at `native-builtins/src/lib.rs:316`); (b) investigate why JMOD-loaded `java/lang/String` bytecode `charAt` is not being found by `find_method` and fix the dispatch. (a) is faster to ship; (b) is structurally correct and likely fixes a category of similar "essential natives only registered in synthetic mode" bugs. |
+| Success | Reproducer no longer prints `NoSuchMethodError method="java/lang/String.charAt(I)C"`. Capture next failure verbatim. |
+| Parallel-safe with | RKC16N.1, RKC16N.2, RKC16N.3, RKC16N.5. Single-file change (lib.rs) plus optionally one helper extraction in lang_string.rs. |
+| Constraints | Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
+| Notes | Likely a category-class bug: `String.length()`, `String.substring(II)`, `String.indexOf(I)` may all be in the same boat. Agent should grep `register_synthetic_overrides` for `"java/lang/String"` registrations and audit which are also reachable in real-JDK mode. |
+
+### RKC16N.4 — Capture next KC16 blocker after RKC16N.1 lands
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.4 |
+| Title | Re-run KC16 -version after RKC16N.1 ships and document the next NoSuchMethodError / livelock / NPE |
+| Files | `docs/kc16-blocker-map.md` (append "Live status (Session 95+)"). |
+| Reproducer | Same as RKC16N.1 reproducer, after that change is merged. Capture stderr to `/tmp/kc16_post_rkc16n1.txt`. |
+| Success | docs/kc16-blocker-map.md updated with new "Live status" section showing the next failure mode (expected: CHM CAS livelock per RKC16N.2 — but verify, do not assume). |
+| Blocks | Sequencing of any KC16N.5+ items. |
+| Parallel-safe with | All non-doc work; serialised after RKC16N.1. |
+| Constraints | Pure recon — no code changes. |

@@ -4918,7 +4918,40 @@ fn invoke_on_class_shared_inner(
                         // name unchanged (matching the OpenJDK fallback
                         // path when the engine lookup fails).
                         || (class_name == "java/security/Provider"
-                            && method_name == "getEngineName");
+                            && method_name == "getEngineName")
+                        // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
+                        // bytecode resolution is failing for these basic methods
+                        // during JDK class clinits like
+                        // java/nio/charset/StandardCharsets.<clinit>; route to
+                        // our layout-neutral natives (registered in
+                        // register_essential_natives) so the boot can advance
+                        // past String dispatch. Drop when RKC16N.6 lands a
+                        // permanent fix.
+                        || (class_name == "java/lang/String"
+                            && matches!(
+                                method_name,
+                                "charAt"
+                                | "length"
+                                | "isEmpty"
+                                | "equals"
+                                | "hashCode"
+                                | "indexOf"
+                                | "lastIndexOf"
+                                | "substring"
+                                | "startsWith"
+                                | "endsWith"
+                                | "trim"
+                                | "toString"
+                                | "concat"
+                                | "replace"
+                                | "toLowerCase"
+                                | "toUpperCase"
+                                | "compareTo"
+                                | "compareToIgnoreCase"
+                                | "equalsIgnoreCase"
+                                | "contains"
+                                | "split"
+                            ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }

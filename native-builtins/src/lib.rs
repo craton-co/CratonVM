@@ -316,6 +316,309 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
 
+    // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
+    // surface for real-JDK mode. Real-JDK mode bytecode resolution is
+    // failing for these basic String methods during JDK class clinits on
+    // KC16; the natives are registered today but only inside
+    // `register_synthetic_overrides` which real-JDK mode never calls.
+    // Register a universal set here using `read_string` so we do not
+    // depend on the synthetic vs JDK-25 byte[]+coder field layout.
+    // Drop these when RKC16N.6 lands a proper fix (move the originals
+    // into essentials, or fix bytecode dispatch).
+    registry.register(
+        "java/lang/String", "charAt", "(I)C",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("String.charAt on null".to_string()),
+                }.into()),
+            };
+            let index = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            if index < 0 || (index as usize) >= chars.len() {
+                return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
+            }
+            Ok(Some(Value::Int(chars[index as usize] as i32)))
+        },
+    );
+    registry.register(
+        "java/lang/String", "length", "()I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            Ok(Some(Value::Int(s.chars().count() as i32)))
+        },
+    );
+    registry.register(
+        "java/lang/String", "isEmpty", "()Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(1))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            Ok(Some(Value::Int(if s.is_empty() { 1 } else { 0 })))
+        },
+    );
+    registry.register(
+        "java/lang/String", "equals", "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this.as_ptr() == other.as_ptr() { return Ok(Some(Value::Int(1))); }
+            let a = ctx.read_string(this).unwrap_or_default();
+            let b = match ctx.read_string(other) { Some(s) => s, None => return Ok(Some(Value::Int(0))) };
+            Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
+        },
+    );
+    registry.register(
+        "java/lang/String", "hashCode", "()I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let mut h: i32 = 0;
+            for c in s.chars() {
+                h = h.wrapping_mul(31).wrapping_add(c as i32);
+            }
+            Ok(Some(Value::Int(h)))
+        },
+    );
+    registry.register(
+        "java/lang/String", "indexOf", "(I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let ch = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => return Ok(Some(Value::Int(-1))) };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = match char::from_u32(ch) { Some(c) => c, None => return Ok(Some(Value::Int(-1))) };
+            for (i, c) in s.chars().enumerate() {
+                if c == needle { return Ok(Some(Value::Int(i as i32))); }
+            }
+            Ok(Some(Value::Int(-1)))
+        },
+    );
+    registry.register(
+        "java/lang/String", "lastIndexOf", "(I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let ch = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => return Ok(Some(Value::Int(-1))) };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = match char::from_u32(ch) { Some(c) => c, None => return Ok(Some(Value::Int(-1))) };
+            let mut last = -1i32;
+            for (i, c) in s.chars().enumerate() {
+                if c == needle { last = i as i32; }
+            }
+            Ok(Some(Value::Int(last)))
+        },
+    );
+    registry.register(
+        "java/lang/String", "lastIndexOf", "(II)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let ch = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => return Ok(Some(Value::Int(-1))) };
+            let from = match args.get(2) { Some(Value::Int(v)) => *v as i32, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = match char::from_u32(ch) { Some(c) => c, None => return Ok(Some(Value::Int(-1))) };
+            let mut last = -1i32;
+            for (i, c) in s.chars().enumerate() {
+                let ii = i as i32;
+                if ii > from { break; }
+                if c == needle { last = ii; }
+            }
+            Ok(Some(Value::Int(last)))
+        },
+    );
+    registry.register(
+        "java/lang/String", "lastIndexOf", "(Ljava/lang/String;)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let needle_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = ctx.read_string(needle_obj).unwrap_or_default();
+            match s.rfind(&needle) {
+                Some(byte_idx) => Ok(Some(Value::Int(s[..byte_idx].chars().count() as i32))),
+                None => Ok(Some(Value::Int(-1))),
+            }
+        },
+    );
+    registry.register(
+        "java/lang/String", "indexOf", "(II)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let ch = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => return Ok(Some(Value::Int(-1))) };
+            let from = match args.get(2) { Some(Value::Int(v)) => *v as i32, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = match char::from_u32(ch) { Some(c) => c, None => return Ok(Some(Value::Int(-1))) };
+            for (i, c) in s.chars().enumerate() {
+                let ii = i as i32;
+                if ii < from { continue; }
+                if c == needle { return Ok(Some(Value::Int(ii))); }
+            }
+            Ok(Some(Value::Int(-1)))
+        },
+    );
+
+    // RKC16N-RECON: throwable / permission ctors that take a String message.
+    // Real JDK has bytecode for these; the dispatcher fails to find them
+    // (same root-cause as String — see RKC16N.7) so we register layout-
+    // neutral natives that just stash the message in field 0 (the
+    // canonical detailMessage slot for Throwable subclasses).
+    for cls in &[
+        "java/lang/RuntimePermission",
+        "java/lang/ClassCastException",
+        "java/lang/IllegalArgumentException",
+        "java/lang/IllegalStateException",
+        "java/lang/UnsupportedOperationException",
+        "java/lang/NullPointerException",
+        "java/lang/IndexOutOfBoundsException",
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "java/lang/StringIndexOutOfBoundsException",
+        "java/lang/NumberFormatException",
+        "java/lang/SecurityException",
+    ] {
+        let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
+        registry.register(
+            cls_static, "<init>", "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+                if let Some(Value::Object(Some(msg))) = args.get(1) {
+                    ctx.set_field(this, 0, Value::Object(Some(*msg)));
+                }
+                Ok(None)
+            },
+        );
+        registry.register(
+            cls_static, "<init>", "()V",
+            |_ctx, _args| Ok(None),
+        );
+    }
+    registry.register(
+        "java/lang/String", "indexOf", "(Ljava/lang/String;)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let needle_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = ctx.read_string(needle_obj).unwrap_or_default();
+            match s.find(&needle) {
+                Some(byte_idx) => {
+                    let char_idx = s[..byte_idx].chars().count();
+                    Ok(Some(Value::Int(char_idx as i32)))
+                }
+                None => Ok(Some(Value::Int(-1))),
+            }
+        },
+    );
+    registry.register(
+        "java/lang/String", "substring", "(II)Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let begin = match args.get(1) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            let end = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            if end > chars.len() || begin > end {
+                return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin as i32 }.into());
+            }
+            let slice: String = chars[begin..end].iter().collect();
+            Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
+        },
+    );
+    registry.register(
+        "java/lang/String", "substring", "(I)Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let begin = match args.get(1) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            if begin > chars.len() {
+                return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin as i32 }.into());
+            }
+            let slice: String = chars[begin..].iter().collect();
+            Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
+        },
+    );
+    registry.register(
+        "java/lang/String", "startsWith", "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let prefix = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let p = ctx.read_string(prefix).unwrap_or_default();
+            Ok(Some(Value::Int(if s.starts_with(&p) { 1 } else { 0 })))
+        },
+    );
+    registry.register(
+        "java/lang/String", "endsWith", "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let suffix = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let p = ctx.read_string(suffix).unwrap_or_default();
+            Ok(Some(Value::Int(if s.ends_with(&p) { 1 } else { 0 })))
+        },
+    );
+    registry.register(
+        "java/lang/String", "trim", "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let t = s.trim_matches(|c: char| (c as u32) <= 0x20).to_string();
+            Ok(Some(Value::Object(Some(ctx.create_string(&t)))))
+        },
+    );
+    registry.register(
+        "java/lang/String", "toString", "()Ljava/lang/String;",
+        |_ctx, args| {
+            match args.first() {
+                Some(Value::Object(Some(o))) => Ok(Some(Value::Object(Some(*o)))),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
+
     // Real-JDK-mode Inflater/Deflater natives backed by flate2. Registered
     // unconditionally; in synthetic-jdk mode the phase71 overrides run after
     // register_synthetic_overrides and supersede these.
