@@ -17,7 +17,7 @@ Download the latest release from [GitHub Releases](https://github.com/craton-co/
 tar xzf rustjvm-*.tar.gz
 
 # Move to a directory in your PATH
-sudo mv rustjvm-cli /usr/local/bin/rustjvm
+sudo mv rustjvm /usr/local/bin/rustjvm
 
 # Verify installation
 rustjvm --help
@@ -42,7 +42,8 @@ cd rust-jvm
 cargo build --release -p rustjvm-cli
 ```
 
-The binary is at `target/release/rustjvm-cli` (or `rustjvm-cli.exe` on Windows).
+The package is `rustjvm-cli` but the binary it produces is `rustjvm`, so the
+executable lands at `target/release/rustjvm` (or `rustjvm.exe` on Windows).
 
 See [BUILD_GUIDE.md](../BUILD_GUIDE.md) for detailed build instructions, testing, and benchmarking.
 

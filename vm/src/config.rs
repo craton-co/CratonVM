@@ -47,7 +47,15 @@ pub struct VmConfig {
     pub system_properties: Vec<(String, String)>,
 
     /// Skip bytecode verification (`-noverify` / `-Xverify:none`).
+    ///
+    /// This boolean stays as the verifier-dispatcher's read path for
+    /// backward compatibility; `xverify_mode` below carries the richer
+    /// `-Xverify:none|remote|all` selection. The two are kept in sync at
+    /// CLI parse time.
     pub skip_verification: bool,
+
+    /// `-Xverify:none|remote|all` selection. See [`XverifyMode`].
+    pub xverify_mode: XverifyMode,
 
     /// Which garbage collector algorithm to use (`-XX:+UseG1GC`, etc.).
     pub gc_algorithm: GcAlgorithm,
@@ -179,6 +187,50 @@ pub enum AotMode {
     Production,
 }
 
+/// `-Xverify:none|remote|all` policy.
+///
+/// The HotSpot semantics:
+///   - **None**   — skip Pass 3 (linking/typestate) verification entirely.
+///                  Equivalent to the legacy `-noverify`.
+///   - **Remote** — verify everything *except* boot classes (`java/`, `jdk/`,
+///                  `sun/`, `com/sun/`). This is HotSpot's default.
+///   - **All**    — verify boot classes too. Useful for compliance testing.
+///
+/// rust-jvm currently runs Pass 2 (structural) on every class and Pass 3
+/// (typestate) on non-boot classes by default; selecting `All` is honoured
+/// by the verifier dispatcher in `vm/src/vm/vm_util.rs`. `None` is wired
+/// through `skip_verification` for backward compatibility with the existing
+/// `--noverify` CLI flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XverifyMode {
+    /// Equivalent to `-Xverify:none` / `-noverify`.
+    None,
+    /// HotSpot default — verify non-boot classes only.
+    #[default]
+    Remote,
+    /// `-Xverify:all` — verify boot classes too.
+    All,
+}
+
+impl XverifyMode {
+    /// Parse the `-Xverify:<mode>` argument value. Returns `None` for an
+    /// unrecognised mode so the caller can issue a warning and fall back
+    /// to the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "remote" => Some(Self::Remote),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// True when this mode skips Pass 3 verification entirely.
+    pub fn skips_verification(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// CDS (Class Data Sharing) mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CdsMode {
@@ -210,6 +262,7 @@ impl Default for VmConfig {
             verbose_gc: false,
             system_properties: Vec::new(),
             skip_verification: false,
+            xverify_mode: XverifyMode::Remote,
             gc_algorithm: GcAlgorithm::Generational,
             use_compressed_oops: false,
             use_compact_headers: false,
@@ -302,6 +355,17 @@ impl VmConfig {
 
     pub fn with_skip_verification(mut self, skip: bool) -> Self {
         self.skip_verification = skip;
+        if skip {
+            self.xverify_mode = XverifyMode::None;
+        }
+        self
+    }
+
+    /// Select the `-Xverify:none|remote|all` policy. Keeps
+    /// `skip_verification` in sync with the legacy bool flag.
+    pub fn with_xverify_mode(mut self, mode: XverifyMode) -> Self {
+        self.xverify_mode = mode;
+        self.skip_verification = mode.skips_verification();
         self
     }
 

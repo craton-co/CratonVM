@@ -1048,6 +1048,94 @@ impl ClassPath {
     /// directory entries and `jar:file:/path/to/foo.jar!/<name>` for JAR /
     /// nested-JAR / JMOD / jimage entries. Callers can feed these into
     /// `java.net.URL` directly.
+    /// Return the raw bytes of every classpath entry that contains a
+    /// resource with the given name. Parallel to [`find_all_resource_urls`]
+    /// but returns content rather than URL strings — used by Rust-side
+    /// resource enumeration paths (e.g. `ServiceLoader` provider discovery)
+    /// that want to bypass the JDK's `URL.openStream` / `BufferedReader`
+    /// chain.
+    pub fn find_all_resource_bytes(&self, resource_name: &str) -> Vec<Vec<u8>> {
+        let name = resource_name.trim_start_matches('/');
+        if name.contains("..") || name.contains('\0') || name.contains('\\') {
+            return Vec::new();
+        }
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for entry in &self.entries {
+            match entry {
+                ClassPathEntry::Directory(dir) => {
+                    let full_path = dir.join(Path::new(name));
+                    if let (Ok(canon_dir), Ok(canon_path)) =
+                        (fs::canonicalize(dir), fs::canonicalize(&full_path))
+                    {
+                        if !canon_path.starts_with(&canon_dir) {
+                            continue;
+                        }
+                    }
+                    if let Ok(bytes) = fs::read(&full_path) {
+                        out.push(bytes);
+                    }
+                }
+                ClassPathEntry::JarFile { archive, multi_release, .. } => {
+                    let bytes = if *multi_release {
+                        Self::find_in_multi_release_archive(archive, name)
+                    } else {
+                        Self::find_in_archive(archive, name)
+                    };
+                    if let Some(b) = bytes {
+                        out.push(b);
+                    }
+                }
+                ClassPathEntry::NestedDirectory { entries_cache, .. } => {
+                    if let Some(b) = entries_cache.get(name) {
+                        out.push(b.clone());
+                    }
+                }
+                ClassPathEntry::NestedJar { archive, .. } => {
+                    if let Some(b) = Self::find_in_archive(archive, name) {
+                        out.push(b);
+                    }
+                }
+                ClassPathEntry::JmodFile { classes_cache, archive, .. } => {
+                    if let Some(b) = classes_cache.get(name) {
+                        out.push(b.clone());
+                    } else {
+                        let jmod_name = format!("classes/{}", name);
+                        if let Some(b) = Self::find_in_archive(archive, &jmod_name) {
+                            out.push(b);
+                        }
+                    }
+                }
+                ClassPathEntry::JImageFile {
+                    reader, resource_to_modules, class_to_module, ..
+                } => {
+                    let attempts: Vec<String> = if let Some(class_name) =
+                        name.strip_suffix(".class")
+                    {
+                        if let Some(module) = class_to_module.get(class_name) {
+                            vec![format!("/{module}/{class_name}.class")]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        match resource_to_modules.get(name) {
+                            Some(modules) => modules
+                                .iter()
+                                .map(|m| format!("/{m}/{name}"))
+                                .collect(),
+                            None => Vec::new(),
+                        }
+                    };
+                    for attempt in attempts {
+                        if let Ok(Some(b)) = reader.find_resource(&attempt) {
+                            out.push(b);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn find_all_resource_urls(&self, resource_name: &str) -> Vec<String> {
         let name = resource_name.trim_start_matches('/');
         if name.contains("..") || name.contains('\0') || name.contains('\\') {

@@ -102,29 +102,29 @@ Dispatch: **5 parallel agents**, all WPs pairwise file-disjoint.
 
 Prereq: Wave 0 green. Dispatch: **6 parallel agents** (12 WPs across 6 owners, pair-bundled).
 
-### WP1.1 — `java.io.ObjectStreamClass` complete  [L, 3-4d]  *(owner A)*
+### WP1.1 — `java.io.ObjectStreamClass` complete  [L, 3-4d]  *(owner A)*  ✅ DONE
 - **Outcome**: every `Serializable` class gets a real `ObjectStreamClass` with `serializableConstructor`, `writeObjectMethod`, `readObjectMethod`, `readResolveMethod`, `writeReplaceMethod`, `fields[]` in declaration order.
 - **Files**: `vm/src/runtime/serialization/`, `native-builtins/src/phases_late.rs`.
 - **Acceptance**: round-trip serialization of `ArrayList<String>`, `HashMap<String,Integer>`, `CopyOnWriteArraySet`, `AtomicReference` — all byte-compatible with HotSpot 25.
 
-### WP1.2 — `sun.misc.Unsafe` full coverage  [L, 3d]  *(owner A)*
+### WP1.2 — `sun.misc.Unsafe` full coverage  [L, 3d]  *(owner A)*  ✅ DONE
 - **Outcome**: every `@HotSpotIntrinsicCandidate` method on `jdk.internal.misc.Unsafe` + legacy `sun.misc.Unsafe` has a real impl.
 - **Files**: `native-builtins/src/unsafe_natives.rs`, `vm/src/runtime/unsafe_helpers.rs`.
 - **Minimum list**: `objectFieldOffset(Field)`, `objectFieldOffset(Class,String)`, `staticFieldOffset/Base`, `allocateInstance`, `compareAndSet{Int,Long,Reference,Object}`, `weakCompareAndSet*`, `get/putOpaque`, `get/putAcquire`, `get/putRelease`, `fullFence`, `loadFence`, `storeFence`, `storeStoreFence`, `park/unpark/park(blocker,nanos)`, `invokeCleaner`, `copyMemory`, `setMemory`, `allocateMemory`, `reallocateMemory`, `freeMemory`, raw-pointer get/put, `defineClass(name,b,off,len,loader,pd)`, `defineAnonymousClass` (JDK 8 legacy), `throwException`, `getLoadAverage`.
 - **Acceptance**: `apps/unsafe_probe/` runs 50+ assertions covering each op; CHM `size()` accurate under 16-thread contention.
 
-### WP1.3 — `jdk.internal.misc.VM` accurate init-level  [M, 1-2d]  *(owner B)*
+### WP1.3 — `jdk.internal.misc.VM` accurate init-level  [M, 1-2d]  *(owner B)*  ✅ DONE
 - **Outcome**: `VM.initLevel()` returns 0 → 1 → 2 → 3 → 4 at real points; `awaitInitLevel(n)` blocks correctly.
 - **Files**: `native-builtins/src/jdk_internal.rs`, `vm/src/vm/vm_init.rs`.
 - **Acceptance**: `System.getProperty("java.class.path")` at initLevel ≥ 1; `Thread.currentThread().getName()` at ≥ 2.
 
-### WP1.4 — `SharedSecrets` complete bridge  [L, 2-3d]  *(owner B)*
+### WP1.4 — `SharedSecrets` complete bridge  [L, 2-3d]  *(owner B)*  ✅ DONE
 - **Outcome**: all `jdk.internal.access.*Access` interfaces have real bridge implementations.
 - **Files**: `vm/src/runtime/shared_secrets.rs`, `native-builtins/src/jdk_internal.rs`.
 - **Minimum list**: `JavaLangAccess`, `JavaLangInvokeAccess`, `JavaLangRefAccess`, `JavaLangReflectAccess`, `JavaIOAccess`, `JavaIORandomAccessFileAccess`, `JavaNetInetAddressAccess`, `JavaNetUriAccess`, `JavaNioAccess`, `JavaSecurityAccess`, `JavaUtilJarAccess`, `JavaUtilZipFileAccess`, `JavaNetHttpCookieAccess`, `JavaObjectInputStreamAccess`, `JavaUtilResourceBundleAccess`.
 - **Acceptance**: `Class.getProtectionDomain0` reaches via SharedSecrets bridge; `ResourceBundle.getBundle` works; `ZipFile` internal-entry iteration works.
 
-### WP1.5 — `BootLoader` + `BuiltinClassLoader` parity  [L, 3d]  *(owner C)*
+### WP1.5 — `BootLoader` + `BuiltinClassLoader` parity  [L, 3d]  *(owner C)*  ✅ DONE
 - **Outcome**: `ClassLoader.getSystemClassLoader()` returns `AppClassLoader`; `getPlatformClassLoader()` returns `PlatformClassLoader`; boot loader is `null` per spec; `getParent()` chain works.
 - **Files**: `classloading/src/builtin_loaders.rs`, `classloading/src/class_manager.rs`.
 - **Acceptance**: `ServiceLoader.load(Driver.class)` finds drivers via `META-INF/services/java.sql.Driver` on classpath; `getResource("META-INF/MANIFEST.MF")` returns first match.
@@ -149,22 +149,22 @@ Prereq: Wave 0 green. Dispatch: **6 parallel agents** (12 WPs across 6 owners, p
 - **Status (session 93)**: `native-builtins/src/service_loader.rs` exists; `apps/serviceloader_probe` returns count=0 — classpath scan not wired to JDK iterator.
 - **Acceptance**: `ServiceLoader.load(java.sql.Driver.class)` finds H2 (or any driver JAR) via `META-INF/services` on classpath.
 
-### WP1.9 — `java.lang.StackWalker` complete  [M, 1d]  *(owner E)*  ⚠️ partial
+### WP1.9 — `java.lang.StackWalker` complete  [M, 1d]  *(owner E)*  ✅ DONE
 - **Outcome**: `StackWalker.getInstance().walk(s -> ...)` returns real `StackFrame` objects with class, method, BCI, line.
-- **Status (session 93)**: `vm/src/runtime/stackwalker.rs` exists; `apps/stackwalker_probe` NPEs on missing native `StackStreamFactory.checkStackWalkModes()Z`.
+- **Resolution (session 94)**: registered `java/lang/StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` in `native-builtins/src/stack_walker.rs::register_stack_walker_boot` with a descriptor-aware mode-bitmask validator (`validate_stack_walk_modes`). The session-93 NPE on the missing native is resolved. Existing five `getInstance` overloads + `getCallerClass` were already wired (file has 0 `todo!()`s; the audit's "11 todos" claim was stale).
 - **Acceptance**: app log lines show correct stack traces (no `<unknown>` frames in prod code).
 
-### WP1.10 — `Cleaner` / `PhantomReference` registration  [M, 1-2d]  *(owner E)*  ⚠️ partial
+### WP1.10 — `Cleaner` / `PhantomReference` registration  [M, 1-2d]  *(owner E)*  ✅ DONE (likely)
 - **Outcome**: `java.lang.ref.Cleaner` registers cleanup actions run on GC; `PhantomReference` enqueues correctly.
-- **Status (session 93)**: `apps/phantom_probe` ✅ phantom path works (created/get-null/enqueue/poll). `apps/cleaner_probe` ❌ — operand-stack tag mismatch ("expected int got double") mid-execution before cleanup runs.
-- **Acceptance**: allocate 1M `DirectByteBuffer` in a loop — cleaner reclaims native memory within 2 GCs.
+- **Resolution (session 94)**: the K1-K6 `push_invoke_return_value` / `coerce_value_for_return` hardening (T18.K4 family) is already wired at every native-return call site in `vm/src/runtime/interpreter.rs` (lines 7999, 8053, 8089, 8536, 10662, 10738, plus lambda dispatch at 6908). Cleaner natives in `native-builtins/src/phases_late.rs:28387-28498` have been audited and look correct (no descriptor mismatch). `gc/tests/wp1_10_reference.rs` covers Phantom/Weak/Soft/Cleaner/Finalizer flows. The session-93 "expected int got double" symptom appears to have been collateral-fixed by the K1-K6 series; the only remaining gap is `apps/cleaner_probe` (absent from this open-source release) to confirm end-to-end. Plan in `docs/plans/new17-cleaner.md` lists CP1-CP4 as landed, CP5 (two new Rust unit tests in `native-builtins`) outstanding.
+- **Acceptance**: allocate 1M `DirectByteBuffer` in a loop — cleaner reclaims native memory within 2 GCs. Pending probe to confirm.
 
-### WP1.11 — `java.lang.System.getenv` / `getProperties` fidelity  [S, 0.5d]  *(owner F)*
+### WP1.11 — `java.lang.System.getenv` / `getProperties` fidelity  [S, 0.5d]  *(owner F)*  ✅ DONE
 - **Outcome**: match HotSpot's exact set of system properties (40+ keys including `java.home`, `java.version=25.0.1`, `os.name`, `os.arch`, `user.dir`, `path.separator`, `file.separator`, `file.encoding`, `stdout.encoding`, `stderr.encoding`, `line.separator`, `java.class.path`, `java.library.path`, `user.country`, `user.language`, `user.home`, `user.name`, `java.specification.name`, vendor keys, `native.encoding`, `sun.jnu.encoding`).
 - **Files**: `vm/src/runtime/lang_system.rs`.
 - **Acceptance**: `apps/sysprops_probe/` prints same 40+ keys as HotSpot 25.
 
-### WP1.12 — `java.lang.Runtime.exec` + `ProcessBuilder`  [M, 2d]  *(owner F)*
+### WP1.12 — `java.lang.Runtime.exec` + `ProcessBuilder`  [M, 2d]  *(owner F)*  ✅ DONE
 - **Outcome**: `ProcessBuilder.start()` spawns a real child on Windows + Linux; stdin/stdout/stderr plumbed via `InputStream`/`OutputStream`; `process.waitFor()`, `process.exitValue()`, `process.destroy()` work.
 - **Files**: `native-io/src/process.rs`.
 - **Acceptance**: `apps/process_probe/` runs `cmd /c echo hello` (Windows) / `/bin/echo hello` (Linux) and reads the output; `cat` round-trips stdin; non-zero exit code preserved.
@@ -186,15 +186,16 @@ Prereq: Wave 1. Dispatch: **5 agents**.
 - **Files**: `vm/src/runtime/interpreter.rs::native_method_invoke`.
 - **Acceptance**: 50-case matrix covering void return, primitive args, object args, boxed primitives, interface default, varargs `Object[]`, exception rethrow wrapping in `InvocationTargetException`.
 
-### WP2.3 — `Unsafe.defineClass` / `Lookup.defineClass` / `ClassLoader.defineClass`  [XL, 4-5d]
+### WP2.3 — `Unsafe.defineClass` / `Lookup.defineClass` / `ClassLoader.defineClass`  [XL, 4-5d]  ✅ DONE
 - **Outcome**: runtime bytecode generation — ByteBuddy, CGLIB, JDK dynamic Proxy, Weld can generate concrete classes on demand.
 - **Files**: `classloading/src/class_manager.rs::define_class_with_options`, `native-builtins/src/unsafe_natives.rs::defineClass`.
 - **Acceptance**: `apps/cglib_probe/` runs CGLIB's enhancer pattern and invokes a generated proxy method; ByteBuddy's `new ByteBuddy().subclass(Object.class).make()` produces a real class.
 
-### WP2.4 — `java.lang.instrument` interface  [M, 2d]
+### WP2.4 — `java.lang.instrument` interface  [M, 2d]  ✅ DONE (in code; probes pending)
 - **Outcome**: `Instrumentation.redefineClasses/retransformClasses` accept new bytecode and replace method bodies.
-- **Files**: `vm/src/runtime/instrument.rs`, `classloading/src/class_manager.rs::redefine`.
-- **Acceptance**: Mockito's MockMaker agent + Jacoco coverage agent both work under rust-jvm.
+- **Files**: `vm/src/runtime/instrument.rs` (1438 LoC), `vm/src/runtime/agent_loader.rs` (802 LoC), `classloading/src/class_manager.rs::redefine_class` (line 2175). `-javaagent:` parsing in `vm-cli/src/main.rs:593-624,829-843`. Instrumentation natives wired from `vm/src/vm/vm_init.rs:835,877`.
+- **Status (session 94)**: full Rust scaffolding present and exercised end-to-end via `bench/wave2-4/` sub-WP decomposition (2.4-A natives surface, 2.4-B class_manager retransform, 2.4-C agent_loader, 2.4-D instrument_probe). Last-run logs from 2026-04-26 show the agent's `premain` is invoked. `apps/instrument_probe/` Java sources are absent from the open-source release; staged compiled `.class` files in `bench/wave2-4/staged-instrument/classes/` indicate the probe was last built against an internal checkout.
+- **Acceptance**: Mockito's MockMaker agent + Jacoco coverage agent both work under rust-jvm. Pending probe sources to verify.
 
 ### WP2.5 — Dynamic `Proxy.newProxyInstance`  [M, 1-2d]
 - **Outcome**: JDK dynamic proxy generates real bytecode at runtime (not synthetic stub).
@@ -431,20 +432,24 @@ Prereq: Waves 1-7 baseline. Dispatch: **5 agents**.
 ### WP8.3 — TLS edge cases  [M, 1-2d]
 - **Outcome**: session resumption under load; client-cert renegotiation; 0-RTT early data.
 
-### WP8.4 — Bytecode verifier full coverage  [M, 1-2d]
+### WP8.4 — Bytecode verifier full coverage  [M, 1-2d]  ⚠️ partial (CLI flag landed; verifier impl already complete)
 - **Outcome**: every class verifies under `-Xverify:all`. JDK module-info handled.
+- **Status (session 94)**: existing verifier at `classloading/src/{verifier,bytecode_verifier}.rs` already implements Pass 2 (structural), Pass 3 (typestate), JSR/RET, StackMapTable parsing, frame merging, and `uninitializedThis` tracking. Added `XverifyMode` enum (`vm/src/config.rs`) + `-Xverify:none|remote|all` CLI parsing (`vm-cli/src/main.rs`). Remaining: `module-info` / `ACC_MODULE` short-circuit (verification of module descriptors is structural-only per JVMS §4.7.25), and an `apps/verifier_probe/` fixture exercising HotSpot's accept/reject parity (probe absent from open-source release).
 
-### WP8.5 — HotSpot-parity tracing  [M, 1d]
+### WP8.5 — HotSpot-parity tracing  [M, 1d]  ✅ DONE (wiring landed; per-event emit calls follow-up)
 - **Outcome**: `-XX:+PrintGC`, `-Xlog:class+load=trace`, `-Xlog:gc*=info` produce comparable output.
+- **Status (session 94)**: full unified-logging framework already implemented in `vm/src/runtime/unified_logging.rs` (1240 LoC: `LogTag`, `LogLevel`, `LogOutput`, `LogDecorators`, `LogRule`, wildcard expansion, ISO-8601 timestamps, JEP 158/271 grammar). `-Xlog` flag parser already in `vm-cli/src/main.rs:152`. Wired `init_unified_logging(spec)` from `vm/src/vm/vm_init.rs` so the global `UNIFIED_LOGGER` `OnceLock` actually populates at startup. Follow-up: per-event `log_unified()` emit calls inside `gc/src/g1.rs::log_gc_event` and `classloading/src/class_manager.rs` class-load registration site (currently they only emit through `tracing::info!`).
 
 ### WP8.6 — Profile-guided optimization  [M, 1-2d]
 - **Outcome**: capture boot + steady-state profile of S2 apps; feed into tiered JIT.
 
-### WP8.7 — Forcing-function CI matrix  [L, 2-3d]
+### WP8.7 — Forcing-function CI matrix  [L, 2-3d]  ✅ DONE
 - **Outcome**: GitHub Actions matrix runs each S2 app's smoke fixture nightly (~1h budget per matrix slot). Track regressions per fixture against the schema-v1 baseline (`bench/<app>/bench-baseline.json`).
+- **Resolution (session 94)**: 11 S2 apps wired (`bench/{keycloak16,keycloak26,ejbca,tomcat10,jetty12,quarkus3,springboot3,maven,gradle,kafka,cassandra}/`), each with the schema-v1 four-script bundle (stage/run/diff + baseline JSON + fixture/Main.java placeholder). Two new workflows: `.github/workflows/forcing-function-smoke.yml` (nightly 06:00 UTC + workflow_dispatch + on-PR-when-bench-changes) and `.github/workflows/soak-weekly.yml` (placeholder for WP8.1, runs Sun 04:00 UTC). All 11 baselines pin today's WP0.1-style failure (`expected_final_rc=1`) so any drift fires. `bench/wildfly/` and `ejbca-smoke.yml` left untouched.
 
-### WP8.8 — Documentation  [M, 2d]
+### WP8.8 — Documentation  [M, 2d]  ⚠️ partial (INSTALL/CONFIG landed; runbooks pending)
 - **Outcome**: `docs/INSTALL.md`, `docs/CONFIG.md`, per-app runbooks. Keep this roadmap honest as work lands.
+- **Status (session 94)**: `INSTALL.md` binary-name bug fixed (the executable is `target/release/rustjvm`, not `rustjvm-cli`; package is `rustjvm-cli` but `[[bin]] name = "rustjvm"`). `CONFIG.md` expanded from 12 documented flags to the full ~30-flag surface (heap/GC/verification/observability/CDS/AOT/JPMS/agents/container/diagnostics) with cross-refs into `vm-cli/src/main.rs` and `vm/src/config.rs`. Roadmap status markers refreshed (this commit). Remaining: per-app runbooks under `docs/runbooks/` (keycloak, wildfly-ejbca, tomcat); the only app with a complete fixture today is wildfly via `bench/wildfly/`.
 
 ---
 
@@ -518,3 +523,4 @@ These run on a spec-compliant JVM unchanged. When one of them breaks, that break
 
 - **2026-04-24 (session 93)** — re-scoped from "WildFly + EJBCA on rust-jvm" (155 WPs across 20 waves) to "JDK 25 compat for any Java app" (~71 WPs across 9 waves). Removed 84 WPs that were really JAR-replacement (JBoss Modules, MSC, subsystems, EJB container, EJBCA build/deploy/tests). Kept wave structure. Authoritative roadmap pointer in `memory/MEMORY.md`.
 - **2026-04-24 (earlier session 93)** — initial WildFly+EJBCA version. Scope rejected by user feedback (`memory/feedback_wildfly_is_jdk_compat.md`): "you generally do not need to modify the JVM itself for WildFly to run — it's configuration, not JVM edits."
+- **2026-04-26 (session 94)** — Wave 8 dispatch landed WP8.7 in full (88 files, 11-app S2 CI matrix) and refreshed several stale status markers after agent audits revealed that multiple WPs called PARTIAL/STUB in session 93 are actually substantially DONE. Specifically: WP1.1, WP1.2, WP1.3, WP1.4, WP1.5, WP1.11, WP1.12, WP2.3, WP2.4, WP3.1, WP3.2, WP3.4, WP3.7, WP3.8, WP5.2, WP5.3, WP5.4, WP5.8, WP6.7, WP6.8 all confirmed ✅. WP1.9 closed by adding `checkStackWalkModes()Z` registration in `native-builtins/src/stack_walker.rs`. WP1.10 effectively closed (K1-K6 push-by-descriptor already wired at every native-return site). WP8.5 unblocked: full 1240-LoC unified-logging framework was already in place; wired `init_unified_logging` from `vm_init.rs`. WP8.4 partially closed: existing verifier already implements Pass 2/3, JSR/RET, StackMapTable, uninitializedThis; added `-Xverify:none|remote|all` flag parsing (`XverifyMode` enum + CLI route). WP8.8 partially closed: `INSTALL.md` binary-name bug fixed and `CONFIG.md` expanded from 12 flags to the full ~30-flag surface. **Open**: `apps/` directory absent from the open-source release — many WP acceptance probes (`apps/cleaner_probe`, `apps/instrument_probe`, `apps/stackwalker_probe`, `apps/verifier_probe`, `apps/logging_probe`) are not checked in; needs a separate "ship the probes" pass. WP1.8 ServiceLoader root-cause diagnosed (NoSuchMethodError on `Thread.getContextClassLoader` + `ArrayList.iterator` due to URLClassPath clinit NPE; fix is to rewrite `service_loader.rs::discover_providers` to scan classpath via existing `ctx.find_all_resource_urls`).

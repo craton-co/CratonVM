@@ -2024,6 +2024,18 @@ impl ClassManager {
         out
     }
 
+    /// Return the raw bytes of every classpath entry that contains a resource
+    /// with the given name. Parallel to [`find_all_resource_urls`] but
+    /// returns content instead of URLs — used by Rust-native resource
+    /// enumeration (e.g. `ServiceLoader` provider discovery) that wants to
+    /// avoid the JDK's `URL.openStream` / `BufferedReader` chain.
+    pub fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
+        let mut out = self.bootstrap.class_path().find_all_resource_bytes(name);
+        out.extend(self.extension.class_path().find_all_resource_bytes(name));
+        out.extend(self.application.class_path().find_all_resource_bytes(name));
+        out
+    }
+
     /// Find the filesystem path of the classpath entry that holds a given
     /// class.  Used by `Class.getProtectionDomain()` to build a CodeSource
     /// with a real location URL.  Searches application → extension → bootstrap.

@@ -2844,6 +2844,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.class_manager.read().find_all_resource_urls(name)
     }
 
+    fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
+        self.shared.class_manager.read().find_all_resource_bytes(name)
+    }
+
     fn find_class_source_path(&self, class_name: &str) -> Option<String> {
         self.shared.class_manager.read().find_class_source_path(class_name)
     }

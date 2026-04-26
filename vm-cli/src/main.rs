@@ -52,6 +52,13 @@ struct Args {
     #[arg(long = "noverify")]
     noverify: bool,
 
+    /// Bytecode verification policy (-Xverify:none|remote|all).
+    /// `none` skips verification entirely (equivalent to --noverify).
+    /// `remote` (HotSpot default) verifies non-boot classes only.
+    /// `all` verifies boot classes too.
+    #[arg(long = "Xverify", value_name = "MODE")]
+    xverify: Option<String>,
+
     /// CDS shared archive file path (-XX:SharedArchiveFile=path).
     #[arg(long = "XX:SharedArchiveFile", value_name = "PATH")]
     shared_archive_file: Option<String>,
@@ -461,11 +468,31 @@ fn run() -> Result<()> {
         (cn, cp)
     };
 
+    // -Xverify:* takes precedence over --noverify when both are present
+    // (matches HotSpot, where the more specific flag wins).
+    let xverify_mode = if let Some(spec) = args.xverify.as_deref() {
+        match rustjvm_vm::config::XverifyMode::parse(spec) {
+            Some(m) => Some(m),
+            None => {
+                eprintln!(
+                    "Warning: ignoring unknown -Xverify mode {spec:?}; expected none|remote|all"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut config = VmConfig::new()
         .with_classpath(classpath)
         .with_verbose_class_loading(args.verbose_class)
         .with_verbose_gc(args.verbose_gc)
         .with_skip_verification(args.noverify);
+
+    if let Some(mode) = xverify_mode {
+        config = config.with_xverify_mode(mode);
+    }
 
     if let Some(bcp) = &args.boot_classpath {
         config = config.with_boot_classpath(VmConfig::parse_classpath(bcp));

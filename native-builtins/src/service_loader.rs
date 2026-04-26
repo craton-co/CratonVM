@@ -91,8 +91,26 @@ fn build_service_loader(
 }
 
 /// Read provider FQNs for `sl.service` from every
-/// `META-INF/services/<fqcn>` resource visible to `sl.loader`.
-/// Each line in each resource file contributes one provider name.
+/// `META-INF/services/<fqcn>` resource on the classpath.
+///
+/// **Pre-WP1.8 behaviour** (kept here for context): this routine fetched
+/// the thread context class loader, called `ClassLoader.getResources` to
+/// get a `Enumeration<URL>`, and then walked each `URL.openStream` ->
+/// `InputStreamReader` -> `BufferedReader.readLine` chain. In real-JDK
+/// mode that chain hit `NoSuchMethodError`s on `Thread.getContextClassLoader`
+/// and `ArrayList.iterator` because several of the JDK class
+/// `<clinit>`s on the path (`URLClassPath`, the loader chain) NPE before
+/// completing — leaving `getResources` to silently return empty and
+/// downstream methods unresolvable.
+///
+/// **WP1.8 fix** — bypass the JDK entirely. We resolve the service's
+/// binary name through the VM's class registry (`class_id_from_mirror`
+/// + `class_name_of_id`, with a synthetic-mode fallback to
+/// `Class.getName()`) and then enumerate descriptor bytes via
+/// [`NativeContext::find_all_resource_bytes`], which already walks every
+/// classpath flavour (directory / JAR / nested JAR / JMOD / jimage) on
+/// the Rust side. Each descriptor is parsed line-by-line directly from
+/// its bytes, so no JDK I/O classes are touched.
 fn discover_providers(
     ctx: &mut dyn NativeContext,
     sl: rustjvm_types::ObjectRef,
@@ -108,158 +126,87 @@ fn discover_providers(
             }
         },
     };
-    let service_name_val = ctx.invoke(
-        "java/lang/Class",
-        "getName",
-        "()Ljava/lang/String;",
-        &[Value::Object(Some(service_class))],
-    )?;
-    let service_name = match service_name_val {
-        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+
+    // Resolve the service's binary name without round-tripping through
+    // `Class.getName()`. Real-JDK mode breaks that path during early
+    // bootstrap (URLClassPath clinit NPE leaves
+    // `Thread.getContextClassLoader` resolving to NoSuchMethodError).
+    let service_name = service_class_name(ctx, service_class).unwrap_or_default();
     if service_name.is_empty() {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
-            message: "ServiceLoader: service.getName() returned null".to_string(),
+            message: "ServiceLoader: cannot resolve service class name".to_string(),
         }));
     }
     let resource_name = format!("META-INF/services/{}", service_name);
-    let res_str = ctx.create_string(&resource_name);
 
-    // Pick a loader: prefer the stashed `loader`, fall back to the
-    // system loader.
-    let loader = match ctx.get_field_by_name(sl, "loader") {
-        Value::Object(Some(l)) => Value::Object(Some(l)),
-        _ => match ctx.get_field(sl, 1) {
-            Value::Object(Some(l)) => Value::Object(Some(l)),
-            _ => {
-                let sys = ctx
-                    .invoke(
-                        "java/lang/ClassLoader",
-                        "getSystemClassLoader",
-                        "()Ljava/lang/ClassLoader;",
-                        &[],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                sys
-            }
-        },
-    };
-
-    let loader_obj = match loader {
-        Value::Object(Some(l)) => l,
-        _ => {
-            // No loader at all — return empty provider list.
-            return Ok(Vec::new());
-        }
-    };
-
-    let urls_val = ctx.invoke(
-        "java/lang/ClassLoader",
-        "getResources",
-        "(Ljava/lang/String;)Ljava/util/Enumeration;",
-        &[
-            Value::Object(Some(loader_obj)),
-            Value::Object(Some(res_str)),
-        ],
-    )?;
-    let urls = match urls_val {
-        Some(Value::Object(Some(e))) => e,
-        _ => return Ok(Vec::new()),
-    };
-
+    // Rust-side classpath scan — see the function-level doc above.
     let mut providers: Vec<String> = Vec::new();
-    loop {
-        let has_more = ctx.invoke_virtual(
-            urls,
-            "hasMoreElements",
-            "()Z",
-            &[],
-        )?;
-        let stop = match has_more {
-            Some(Value::Int(0)) => true,
-            Some(Value::Int(_)) => false,
-            _ => true,
-        };
-        if stop {
-            break;
+    let descriptors = ctx.find_all_resource_bytes(&resource_name);
+    for bytes in &descriptors {
+        parse_provider_descriptor(bytes, &mut providers);
+    }
+
+    // Fall back to the single-resource lookup if `find_all_resource_bytes`
+    // returned nothing. This covers test mocks (which inherit the empty
+    // default impl) and `ctx.find_resource(name)` paths that succeed when
+    // the classpath enumeration would otherwise miss the entry.
+    if descriptors.is_empty() {
+        if let Some(bytes) = ctx.find_resource(&resource_name) {
+            parse_provider_descriptor(&bytes, &mut providers);
         }
-        let url = ctx.invoke_virtual(
-            urls,
-            "nextElement",
-            "()Ljava/lang/Object;",
-            &[],
-        )?;
-        let url_obj = match url {
-            Some(Value::Object(Some(u))) => u,
-            _ => continue,
-        };
-        let stream = ctx.invoke(
-            "java/net/URL",
-            "openStream",
-            "()Ljava/io/InputStream;",
-            &[Value::Object(Some(url_obj))],
-        )?;
-        let stream_obj = match stream {
-            Some(Value::Object(Some(s))) => s,
-            _ => continue,
-        };
-        let isr_cls = "java/io/InputStreamReader";
-        let isr_cid = ctx.ensure_class_initialized(isr_cls).map_err(|_| {
-            MethodCallFailed::InternalError(VmError::Internal {
-                message: "InputStreamReader: not loaded".to_string(),
-            })
-        })?;
-        let isr = ctx.alloc_object(isr_cid, ctx.class_num_total_fields(isr_cid).max(2));
-        let charset_name = ctx.create_string("UTF-8");
-        ctx.invoke(
-            isr_cls,
-            "<init>",
-            "(Ljava/io/InputStream;Ljava/lang/String;)V",
-            &[
-                Value::Object(Some(isr)),
-                Value::Object(Some(stream_obj)),
-                Value::Object(Some(charset_name)),
-            ],
-        )?;
-        let br_cls = "java/io/BufferedReader";
-        let br_cid = ctx.ensure_class_initialized(br_cls).map_err(|_| {
-            MethodCallFailed::InternalError(VmError::Internal {
-                message: "BufferedReader: not loaded".to_string(),
-            })
-        })?;
-        let br = ctx.alloc_object(br_cid, ctx.class_num_total_fields(br_cid).max(2));
-        ctx.invoke(
-            br_cls,
-            "<init>",
-            "(Ljava/io/Reader;)V",
-            &[Value::Object(Some(br)), Value::Object(Some(isr))],
-        )?;
-        loop {
-            let line_val = ctx.invoke(
-                br_cls,
-                "readLine",
-                "()Ljava/lang/String;",
-                &[Value::Object(Some(br))],
-            )?;
-            let line_obj = match line_val {
-                Some(Value::Object(Some(s))) => s,
-                _ => break,
-            };
-            let raw = ctx.read_string(line_obj).unwrap_or_default();
-            if let Some(token) = raw.split('#').next() {
-                let trimmed = token.trim();
-                if !trimmed.is_empty() && is_valid_provider_name(trimmed) {
-                    providers.push(trimmed.to_string());
-                }
-            }
-        }
-        let _ = ctx.invoke(br_cls, "close", "()V", &[Value::Object(Some(br))]);
     }
 
     providers.sort();
     providers.dedup();
     Ok(providers)
+}
+
+/// Resolve the binary name (`com.acme.Foo` form) of a `java.lang.Class`
+/// mirror without invoking `Class.getName()`. Returns `None` if neither
+/// the mirror lookup nor the fallback `Class.getName()` invocation
+/// succeeds.
+fn service_class_name(
+    ctx: &mut dyn NativeContext,
+    service_class: rustjvm_types::ObjectRef,
+) -> Option<String> {
+    if let Some(cid) = ctx.class_id_from_mirror(service_class) {
+        if let Some(internal) = ctx.class_name_of_id(cid) {
+            return Some(internal.replace('/', "."));
+        }
+    }
+    // Synthetic-mode fallback — `Class.getName()` works there even though
+    // it breaks in real-JDK mode pre-WP1.5 fixes.
+    let name_val = ctx
+        .invoke(
+            "java/lang/Class",
+            "getName",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(service_class))],
+        )
+        .ok()
+        .flatten();
+    if let Some(Value::Object(Some(s))) = name_val {
+        return ctx.read_string(s);
+    }
+    None
+}
+
+/// Parse a `META-INF/services/<svc>` descriptor's raw bytes and append
+/// every legal provider FQN to `out`. Comments (`#`-prefix) and blank
+/// lines are ignored. Invalid characters cause the line to be dropped
+/// (matching the JDK's tolerant parser — bad lines become a load-time
+/// `ServiceConfigurationError` only when the iterator hits them, but our
+/// strategy is to skip them at scan time).
+fn parse_provider_descriptor(bytes: &[u8], out: &mut Vec<String>) {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        if let Some(token) = line.split('#').next() {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() && is_valid_provider_name(trimmed) {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
 }
 
 fn is_valid_provider_name(s: &str) -> bool {
