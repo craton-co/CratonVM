@@ -1113,6 +1113,16 @@ impl ClassManager {
     /// 2. Ask bootstrap → extension → application to find the class
     /// 3. Parse, recursively load superclass/interfaces, and register
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+        // RKC16N.3: Reference- and primitive-array classes (`[X`) are
+        // *synthesised* by the bootstrap loader directly from the
+        // resolved component class — JVMS §5.3.3 explicitly says no
+        // class file is consulted. Short-circuit before any I/O so
+        // that `Class.forName("[Ljava/util/HashMap;")` succeeds without
+        // scanning JMOD/classpath and without producing the
+        // "synthetic stub" warning.
+        if name.starts_with('[') {
+            return self.synthesize_array_class(name);
+        }
         // Fast path: zero-allocation hash lookup via name_to_id
         if let Some(id) = self.get_loaded_class_id(name) {
             // If the class is a synthetic stub (no methods, no bytecode), try
@@ -2743,6 +2753,183 @@ impl ClassManager {
                 }
             }
         }
+
+        Ok(id)
+    }
+
+    /// RKC16N.3 — Synthesise a reference- or primitive-array class without
+    /// any classpath I/O.
+    ///
+    /// Per JVMS §5.3.3, an array class is *created* by the bootstrap class
+    /// loader directly from its component type — no `.class` file is ever
+    /// consulted. The synthesised `Class`:
+    /// * has the original descriptor as its name (e.g. `[Ljava/util/HashMap;`,
+    ///   `[I`, `[[Ljava/lang/Object;`),
+    /// * has `superclass = java/lang/Object`,
+    /// * implements `Cloneable` and `java.io.Serializable` (JLS §10.7),
+    /// * is *not* marked `is_synthetic_stub` (it is a fully-formed array class,
+    ///   not a stand-in for missing bytecode), and
+    /// * for reference-array types, recursively resolves the component class
+    ///   so that `[[Ljava/util/HashMap;` triggers loading of
+    ///   `[Ljava/util/HashMap;` and `java/util/HashMap`.
+    ///
+    /// The result is cached in the standard `loaded_classes` / `name_to_id`
+    /// maps under the bootstrap loader, so two calls with the same name
+    /// return the same `ClassId`.
+    fn synthesize_array_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+        debug_assert!(name.starts_with('['), "synthesize_array_class called with non-array name {name}");
+
+        // Cache hit — return the existing array `Class` so identity is stable.
+        if let Some(id) = self.get_loaded_class_id(name) {
+            return Ok(id);
+        }
+
+        // Recursively resolve the component class. We strip exactly one
+        // leading `[` and dispatch on the next character:
+        //   `[`  → another array (recurse via `load_class`, which routes back
+        //          here for `[`-prefixed names).
+        //   `L…;` → reference component, e.g. `Ljava/util/HashMap;`. Strip the
+        //           leading `L` and trailing `;` and load the named class.
+        //   else → primitive component (`I`, `J`, `Z`, `B`, `S`, `C`, `F`, `D`).
+        //          Primitive component classes have no `Class<?>` mirror in the
+        //          ClassStore yet (they are surfaced lazily by the VM's
+        //          `Class.getPrimitiveClass`), so we leave them unresolved
+        //          here. Anything that needs the component class (e.g.
+        //          `java.lang.Class.getComponentType()`) re-derives it from
+        //          the array name.
+        let rest = &name[1..];
+        if rest.is_empty() {
+            return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: name.to_string(),
+                message: "array descriptor with empty component".to_string(),
+            }));
+        }
+        match rest.as_bytes()[0] {
+            b'[' => {
+                // Multi-dim array — synthesise the inner array first.
+                self.load_class(rest)?;
+            }
+            b'L' => {
+                // Reference component: must end with ';'.
+                if !rest.ends_with(';') || rest.len() < 3 {
+                    return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
+                        class_name: name.to_string(),
+                        message: format!("malformed reference-array descriptor: {name}"),
+                    }));
+                }
+                let component_name = &rest[1..rest.len() - 1];
+                // Recursively resolve the component. Bubbling errors up
+                // matches the JVMS rule that resolution of an array class
+                // resolves its element type first.
+                self.load_class(component_name)?;
+            }
+            b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D' => {
+                // Primitive-array — nothing to recursively load.
+                if rest.len() != 1 {
+                    return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
+                        class_name: name.to_string(),
+                        message: format!("malformed primitive-array descriptor: {name}"),
+                    }));
+                }
+            }
+            _ => {
+                return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
+                    class_name: name.to_string(),
+                    message: format!("unrecognised array component tag in {name}"),
+                }));
+            }
+        }
+
+        // Re-check the cache: the recursive `load_class(component)` above
+        // can re-enter `synthesize_array_class` for the same `name` if the
+        // component descriptor is malformed and a caller had previously
+        // raced. Belt-and-braces.
+        if let Some(id) = self.get_loaded_class_id(name) {
+            return Ok(id);
+        }
+
+        // Resolve `java/lang/Object` and the JLS §10.7 array interfaces.
+        // These calls go through the normal `load_class` path (no array
+        // recursion because none of these names start with `[`), so they
+        // hit either the real classpath or `create_synthetic_stub` exactly
+        // as they would for any other JDK class.
+        let object_id = self.load_class("java/lang/Object")?;
+        let mut iface_ids = Vec::with_capacity(2);
+        if let Ok(id) = self.load_class("java/lang/Cloneable") {
+            iface_ids.push(id);
+        }
+        if let Ok(id) = self.load_class("java/io/Serializable") {
+            iface_ids.push(id);
+        }
+
+        let id = self.class_store.next_id();
+        // An array `Class` is `final`, `public`, and has the `ACC_ABSTRACT`
+        // bit cleared — same surface flags `java.lang.Class` reports for
+        // `int[].class.getModifiers()`. We mark it `SUPER` for parity with
+        // ordinary loaded classes; `FINAL` reflects that you cannot subclass
+        // an array type.
+        let access_flags = ClassAccessFlags::PUBLIC
+            | ClassAccessFlags::FINAL
+            | ClassAccessFlags::SUPER;
+
+        let class = Class {
+            id,
+            loader_id: ClassLoaderId::Bootstrap,
+            name: rustjvm_types::intern_arc(name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Initialized,
+            initializing_thread: None,
+            constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
+            access_flags,
+            superclass: Some(object_id),
+            interfaces: iface_ids,
+            fields: vec![],
+            methods: vec![],
+            // Array objects carry no Java-level instance fields — their
+            // length and elements live in the array header maintained by
+            // the GC, not in field slots.
+            first_field_index: self
+                .class_store
+                .get(object_id)
+                .map_or(0, |c| c.num_total_fields),
+            num_total_fields: self
+                .class_store
+                .get(object_id)
+                .map_or(0, |c| c.num_total_fields),
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: Some("java.base".to_string()),
+            // Crucially: an array class is NOT a synthetic stub — it is a
+            // fully-formed array class produced by the bootstrap loader.
+            // Marking it stub would (a) emit a misleading log line and
+            // (b) make `load_class` try to "upgrade" it from a non-existent
+            // .class file on the next call.
+            is_synthetic_stub: false,
+            has_finalizer: false,
+            signature: None,
+            code_source: None,
+        };
+
+        debug!(
+            class = %class.name,
+            id = %id,
+            superclass = ?class.superclass,
+            "Synthesised array class (RKC16N.3)",
+        );
+
+        let name_hash = class_name_hash(&class.name);
+        let key = (ClassLoaderId::Bootstrap, class.name.to_string());
+        self.loaded_classes.insert(key, id);
+        self.name_to_id.insert(name_hash, id);
+        self.class_store.add(class);
 
         Ok(id)
     }
@@ -4649,6 +4836,100 @@ mod tests {
         let debug = format!("{mgr:?}");
         assert!(debug.contains("ClassManager"));
         assert!(debug.contains("loaded_count"));
+    }
+
+    /// RKC16N.3 — `Class.forName("[Ljava/util/HashMap;")` resolves by
+    /// synthesis without classpath I/O. The component class is recursively
+    /// loaded, the array's superclass is `java/lang/Object`, the array
+    /// `Class` is *not* marked as a synthetic stub, and two calls return
+    /// the same `ClassId`.
+    #[test]
+    fn rkc16n3_synthesises_reference_array_class() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let id = mgr
+            .load_class("[Ljava/util/HashMap;")
+            .expect("array class synthesis must succeed without I/O");
+
+        // Array class metadata.
+        let array_class = mgr
+            .get_class(id)
+            .expect("array class must be registered in ClassStore");
+        assert_eq!(&*array_class.name, "[Ljava/util/HashMap;");
+        assert!(
+            !array_class.is_synthetic_stub,
+            "array classes are synthesised, not stubbed",
+        );
+        assert!(
+            array_class.superclass.is_some(),
+            "array superclass must be java/lang/Object",
+        );
+        let object_id = mgr
+            .get_loaded_class_id("java/lang/Object")
+            .expect("Object must be loaded as the array superclass");
+        assert_eq!(array_class.superclass, Some(object_id));
+
+        // Component class was recursively resolved (HashMap may be a
+        // synthetic stub here since no JMOD is on the test classpath, but
+        // its ClassId must exist).
+        assert!(
+            mgr.get_loaded_class_id("java/util/HashMap").is_some(),
+            "reference-array component must be recursively loaded",
+        );
+
+        // Idempotent caching: a second call returns the same `ClassId`.
+        let id2 = mgr
+            .load_class("[Ljava/util/HashMap;")
+            .expect("second resolution must succeed");
+        assert_eq!(id, id2, "array class identity must be stable across calls");
+    }
+
+    /// RKC16N.3 — Multi-dim reference arrays recursively synthesise the
+    /// inner array class. `[[Ljava/lang/Object;` resolves to a class that
+    /// has the inner array as part of the chain.
+    #[test]
+    fn rkc16n3_synthesises_multidim_reference_array() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let outer = mgr
+            .load_class("[[Ljava/lang/Object;")
+            .expect("multi-dim array synthesis must succeed");
+
+        // Both the outer and the inner array must be cached.
+        let outer_again = mgr
+            .load_class("[[Ljava/lang/Object;")
+            .expect("re-resolving multi-dim must succeed");
+        assert_eq!(outer, outer_again);
+
+        let inner_id = mgr
+            .get_loaded_class_id("[Ljava/lang/Object;")
+            .expect("inner array class must be cached during multi-dim synthesis");
+        let inner = mgr
+            .get_class(inner_id)
+            .expect("inner array class must be registered");
+        assert!(!inner.is_synthetic_stub);
+        assert_eq!(&*inner.name, "[Ljava/lang/Object;");
+    }
+
+    /// RKC16N.3 — Primitive arrays such as `[I` and multi-dim primitives
+    /// `[[I` synthesise without referring to the classpath.
+    #[test]
+    fn rkc16n3_synthesises_primitive_array_classes() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        let int_arr = mgr.load_class("[I").expect("[I synthesis must succeed");
+        let int_arr_class = mgr.get_class(int_arr).unwrap();
+        assert!(!int_arr_class.is_synthetic_stub);
+        assert_eq!(&*int_arr_class.name, "[I");
+
+        let int_arr_arr = mgr
+            .load_class("[[I")
+            .expect("[[I synthesis must succeed");
+        assert_ne!(int_arr, int_arr_arr);
+        let int_arr_arr_class = mgr.get_class(int_arr_arr).unwrap();
+        assert_eq!(&*int_arr_arr_class.name, "[[I");
+
+        // Idempotent.
+        let int_arr2 = mgr.load_class("[I").unwrap();
+        assert_eq!(int_arr, int_arr2);
     }
 
     /// T10.3 — Verify the FxHashMap swap on `name_to_id` preserves the
