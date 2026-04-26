@@ -1046,6 +1046,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         registry.register("java/lang/System", "initPhase3", "()V", lang_system::native_system_init_phase3);
     }
 
+    // RKC16N.8 — KC16 boot stubs (real-JDK mode, JDK 25):
+    //   - `Class.desiredAssertionStatus()Z` returns false (assertions disabled,
+    //     mirroring `-ea` not being on). The pre-existing
+    //     `desiredAssertionStatus0(Class)Z` native already returns false; this
+    //     adds the public `()Z` form that real JDK 25 calls during boot.
+    //   - `System.initPhase1()V` no-op fallback. The real JDK bytecode would
+    //     normally run, but on KC16 boot the method resolution does not see
+    //     the bytecode (synthetic class shape). The vm-cli explicit invocation
+    //     path (vm-cli/src/main.rs around line 766) treats a no-op as "fell
+    //     through to synthetic streams" — downstream init levels still bump.
+    registry.register(
+        "java/lang/Class", "desiredAssertionStatus", "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "java/lang/System", "initPhase1", "()V",
+        |_ctx, _args| Ok(None),
+    );
+
     // --- java.lang.String (native methods + overrides) ---
     // JDK 9+: String.intern() is the only ACC_NATIVE method in java.lang.String.
     registry.register("java/lang/String", "intern", "()Ljava/lang/String;", lang_string::native_string_intern);
