@@ -42,7 +42,7 @@ use crate::native::registry::NativeCallback;
 /// Coerce a return value to match a method descriptor's return type.
 ///
 /// Native methods (and the JIT return-stub) sometimes hand back a `Value`
-/// whose variant doesn't match the static return type — e.g. a char array
+/// whose variant doesn't match the static return type вЂ” e.g. a char array
 /// element retrieved as `Value::Object(Some(p))` where the descriptor says
 /// `C`. The interpreter's typed pop helpers reject the mismatched variant
 /// (`expected int on stack, got ref(...)`).
@@ -97,23 +97,23 @@ pub fn coerce_native_return(value: Option<Value>, descriptor: &str) -> Option<Va
 /// Unbox the return value of a signature-polymorphic native (invoke/
 /// invokeExact/VarHandle.get/etc.) against the **call-site** descriptor.
 ///
-/// The native is registered with a generic `(…Ljava/lang/Object;)Ljava/lang/Object;`
+/// The native is registered with a generic `(вЂ¦Ljava/lang/Object;)Ljava/lang/Object;`
 /// shape and returns a boxed wrapper (via `auto_box_return` inside
 /// `native-builtins/src/lang_invoke.rs`), but the bytecode at the call site
 /// was compiled against the real descriptor (e.g. `()J`) and will pop a
 /// primitive. Without this unwrap the boxed Long lands on the caller's
-/// operand stack where an `lreturn` expects a raw long — triggering
+/// operand stack where an `lreturn` expects a raw long вЂ” triggering
 /// `expected long on stack, got ref(0x...)` in `ValueStack::pop_long`.
 ///
-/// C7: Inverse of `coerce_return`'s primitive→reference boxing for SAM
-/// lambdas — here we go reference→primitive per the call-site descriptor.
+/// C7: Inverse of `coerce_return`'s primitiveв†’reference boxing for SAM
+/// lambdas вЂ” here we go referenceв†’primitive per the call-site descriptor.
 pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &SharedVm) -> Value {
-    // `V` is void — nothing to coerce; caller shouldn't reach here with void
+    // `V` is void вЂ” nothing to coerce; caller shouldn't reach here with void
     // anyway, but preserve as-is defensively.
     if ret_char == b'V' {
         return value;
     }
-    // Already a primitive-typed Value — keep as-is.
+    // Already a primitive-typed Value вЂ” keep as-is.
     if !matches!(value, Value::Object(Some(_))) {
         return value;
     }
@@ -143,7 +143,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
     };
     // C15: When the caller's bytecode expects a primitive (signature-polymorphic
     // invoke call-site), NEVER leave a reference on the stack. If the wrapper
-    // class matches, unbox field 0 — coercing any variant (including malformed
+    // class matches, unbox field 0 вЂ” coercing any variant (including malformed
     // Object(None) from an incomplete MethodHandle) to the target primitive's
     // default so the subsequent load opcode can read it correctly.
     let is_primitive_ret = matches!(ret_char, b'J'|b'I'|b'B'|b'S'|b'C'|b'Z'|b'F'|b'D');
@@ -157,7 +157,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
             (b'D', Value::Double(v)) => Value::Double(v),
             (b'D', Value::Long(v)) => Value::Double(f64::from_bits(v as u64)),
             // Wrapper present but field 0 is null or otherwise malformed
-            // (e.g. from a MethodHandle that returned Object(None)) — yield
+            // (e.g. from a MethodHandle that returned Object(None)) вЂ” yield
             // the primitive zero so the caller's bytecode doesn't see a ref.
             (b'J', _) => Value::Long(0),
             (b'F', _) => Value::Float(0.0),
@@ -166,7 +166,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
         };
     }
     // C15: Primitive return but wrapper class unrecognized (e.g. the value
-    // is some other Object such as a String or null-wrapped result) — we still
+    // is some other Object such as a String or null-wrapped result) вЂ” we still
     // MUST NOT leave a ref on the caller's stack when the bytecode expects a
     // primitive. Fall back to zero so the next load opcode succeeds.
     if is_primitive_ret {
@@ -217,7 +217,7 @@ pub fn safe_native_call(
             // VM must check on return from the native method.
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
                 if exc_handle == u64::MAX {
-                    // ThrowNew sentinel — create a generic RuntimeException
+                    // ThrowNew sentinel вЂ” create a generic RuntimeException
                     return Err(
                         crate::runtime::exceptions::throw_runtime_error(
                             shared,
@@ -228,7 +228,7 @@ pub fn safe_native_call(
                         ),
                     );
                 }
-                // Throw() was called with an object handle — convert to ObjectRef
+                // Throw() was called with an object handle вЂ” convert to ObjectRef
                 let ptr = exc_handle as *mut u8;
                 if !ptr.is_null() && (ptr as usize) % 8 == 0 {
                     let exc_ref = unsafe { crate::types::ObjectRef::from_raw(ptr) };
@@ -284,7 +284,7 @@ pub fn safe_native_call(
 }
 
 // ---------------------------------------------------------------------------
-// Field name → slot index resolution
+// Field name в†’ slot index resolution
 // ---------------------------------------------------------------------------
 
 /// Resolve a field name to its absolute slot index by walking the class hierarchy.
@@ -329,7 +329,7 @@ fn resolve_field_index_in_hierarchy(
 }
 
 // ---------------------------------------------------------------------------
-// T10.9.E — Descriptor-aware field-access helpers for NativeContextImpl
+// T10.9.E вЂ” Descriptor-aware field-access helpers for NativeContextImpl
 // ---------------------------------------------------------------------------
 
 /// Resolve the declared JVM-descriptor first byte (e.g. `b'J'` for a long,
@@ -353,7 +353,7 @@ fn resolve_field_index_in_hierarchy(
 ///   class files, but defensive).
 ///
 /// The `None` return is the signal for the caller to fall back to the
-/// legacy descriptor-unaware heap access — see `NativeContextImpl::get_field`.
+/// legacy descriptor-unaware heap access вЂ” see `NativeContextImpl::get_field`.
 ///
 /// Concurrency: the cache write is guarded by `field_descriptor_cache`'s
 /// own `RwLock`; we take a read-first fast path so the hot case (cache
@@ -375,7 +375,7 @@ fn resolve_field_descriptor_byte_cached(
     //
     // CORRECTNESS: if the instance's concrete class is a synthetic stub,
     // its field descriptors are placeholder `Ljava/lang/Object;` entries
-    // that do NOT reflect the real field type — panama, Unsafe, and other
+    // that do NOT reflect the real field type вЂ” panama, Unsafe, and other
     // natives store raw primitives into these "Object" slots and expect
     // them to round-trip as primitives. Descriptor-aware coercion on such
     // a slot would rewrite `Value::Long(0)` / `Value::Int(0)` as
@@ -383,14 +383,14 @@ fn resolve_field_descriptor_byte_cached(
     // `coerce_field_value_by_descriptor`), silently corrupting the
     // native caller's view. The only safe short-circuit is to return
     // `None` immediately so the caller uses the raw descriptor-unaware
-    // heap access — matching pre-T10.9.E behaviour for the stub case.
+    // heap access вЂ” matching pre-T10.9.E behaviour for the stub case.
     let desc_byte = {
         let cm = shared.class_manager.read();
         if let Some(concrete_cls) = cm.get_class(class_id) {
             if concrete_cls.is_synthetic_stub {
                 None
             } else {
-                // Walk the class hierarchy — the slot may belong to an
+                // Walk the class hierarchy вЂ” the slot may belong to an
                 // ancestor. `field_at_index` returns `None` when the slot
                 // is declared by a superclass, so we step up via
                 // `superclass` in that case. If any ancestor is a
@@ -422,7 +422,7 @@ fn resolve_field_descriptor_byte_cached(
                         // Slot is in this class iff slot >= first_field_index.
                         if slot_index >= cls.first_field_index {
                             let local_offset = slot_index - cls.first_field_index;
-                            // Walk this class's fields skipping statics —
+                            // Walk this class's fields skipping statics вЂ”
                             // matches the layout used by `getfield`/`putfield`.
                             let mut instance_idx = 0usize;
                             for field in &cls.fields {
@@ -464,7 +464,7 @@ fn resolve_field_descriptor_byte_cached(
 }
 
 // ---------------------------------------------------------------------------
-// NativeContextImpl — adapter for NativeContext trait on SharedVm + JvmThread
+// NativeContextImpl вЂ” adapter for NativeContext trait on SharedVm + JvmThread
 // ---------------------------------------------------------------------------
 
 /// Adapter that implements [`NativeContext`] using `SharedVm` + `JvmThread`.
@@ -495,7 +495,7 @@ impl<'a> NativeContextImpl<'a> {
         use crate::memory::gc::update_value_ref;
         use std::sync::atomic::Ordering;
 
-        // Check if STW is active — if so, participate
+        // Check if STW is active вЂ” if so, participate
         if self.shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
             // We just woke up from blocking but STW is active.
             // Our snapshot is already deposited from before the block.
@@ -520,17 +520,17 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
-        // Clear the root snapshot — it's now stale
+        // Clear the root snapshot вЂ” it's now stale
         self.thread.root_snapshot.lock().clear();
     }
 
-    /// T19.K1 — Read the daemon flag from a Java `Thread` object.
+    /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.
     ///
     /// Returns `Some(true|false)` if the Thread carries a resolvable
     /// daemon attribute, or `None` if the layout is unrecognised
     /// (synthetic-mode `Thread` without a daemon field, or a class
     /// without a `holder` chain). The caller defaults to non-daemon
-    /// when this returns `None` — which is the JLS rule for any
+    /// when this returns `None` вЂ” which is the JLS rule for any
     /// thread constructed from `main` (parent thread is non-daemon,
     /// child inherits, unchanged unless `Thread.setDaemon(true)`
     /// was called before `start()`).
@@ -538,7 +538,7 @@ impl<'a> NativeContextImpl<'a> {
     /// Layout walk (real-JDK mode):
     ///   1. Look up the `Thread.holder` field slot via the class
     ///      hierarchy.
-    ///   2. Read `holder` — if null, the Thread isn't fully
+    ///   2. Read `holder` вЂ” if null, the Thread isn't fully
     ///      constructed; treat as non-daemon (`Some(false)`).
     ///   3. Look up the `daemon` field on the holder's class.
     ///   4. Read it as `Value::Int` (boolean is encoded as 0/1).
@@ -557,7 +557,7 @@ impl<'a> NativeContextImpl<'a> {
         // Step 2: read it.
         let holder_obj = match self.shared.heap.get_field(thread_obj, holder_slot) {
             Value::Object(Some(o)) => o,
-            // Thread allocated but holder not yet wired up — treat as
+            // Thread allocated but holder not yet wired up вЂ” treat as
             // non-daemon. The JDK bytecode would NPE here on
             // `Thread.isDaemon()`; we just degrade to the default
             // rather than crash the VM-shutdown path.
@@ -577,7 +577,7 @@ impl<'a> NativeContextImpl<'a> {
             Value::Int(0) => Some(false),
             Value::Int(_) => Some(true),
             // Anything else (Object/Long/etc.) is layout corruption.
-            // Don't trust it — return `None` so the caller falls
+            // Don't trust it вЂ” return `None` so the caller falls
             // back to the safe default (non-daemon).
             _ => None,
         }
@@ -635,7 +635,7 @@ impl<'a> NativeContextImpl<'a> {
     /// cannot be called with `parent = null` because its `isBooted()`
     /// branch dereferences `parent.synchronizedAddWeak`.  The public
     /// `(String)` ctor would recurse through
-    /// `Thread.currentThread().getThreadGroup()` — our caller is the
+    /// `Thread.currentThread().getThreadGroup()` вЂ” our caller is the
     /// thread construction path itself, so that would loop.
     pub(crate) fn get_or_create_main_thread_group(&mut self) -> Option<ObjectRef> {
         if let Some(obj) = *self.shared.main_thread_group.read() {
@@ -673,7 +673,7 @@ impl<'a> NativeContextImpl<'a> {
             &[Value::Object(Some(tg))],
         )
         .ok()?;
-        // Rename from "system" → "main" so the VM's top-level group has
+        // Rename from "system" в†’ "main" so the VM's top-level group has
         // the conventional name for `Thread.getThreadGroup().getName()`.
         let name_slot = {
             let cm = self.shared.class_manager.read();
@@ -735,7 +735,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
-        // WP2.9 — invokespecial semantics: invoke the *resolved* method on
+        // WP2.9 вЂ” invokespecial semantics: invoke the *resolved* method on
         // `class_name` with no virtual dispatch and no iface/abstract retarget
         // to the receiver's concrete class. Required for `Lookup.findSpecial`
         // private-to-private calls and default-method super-call patterns.
@@ -820,7 +820,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // -- Heap access methods --
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-        // T10.9.E — descriptor-aware read path. Resolve (and cache) the
+        // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
         // declared field descriptor for the receiver's class and route
         // the slot decode through `get_field_as`, so a long-typed field
         // always surfaces as `Value::Long` regardless of whatever tag
@@ -835,7 +835,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-        // T10.9.E — descriptor-aware write path. Normalizing the stored
+        // T10.9.E вЂ” descriptor-aware write path. Normalizing the stored
         // `Value` variant to the declared field type prevents tag drift
         // from leaking across subsequent reads. Fallback: legacy
         // `set_field` when the descriptor is unresolvable.
@@ -886,7 +886,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if class.find_method(method_name, descriptor).is_some() {
                     return true;
                 }
-                // Also check if it's a synthetic stub (native-only class) — methods
+                // Also check if it's a synthetic stub (native-only class) вЂ” methods
                 // are registered in the native registry, not in the class file
                 if class.is_synthetic_stub {
                     return true; // assume native methods exist
@@ -1180,13 +1180,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    /// T1.6.7 — `Thread.holdsLock(Object)` real implementation.
+    /// T1.6.7 вЂ” `Thread.holdsLock(Object)` real implementation.
     fn current_thread_holds_lock(&self, obj: ObjectRef) -> bool {
         self.shared.monitors.holds(obj, self.thread.thread_id)
     }
 
     fn monitor_wait(&mut self, obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
-        // JLS §17.2.1: Check interrupt before waiting — clear flag and throw.
+        // JLS В§17.2.1: Check interrupt before waiting вЂ” clear flag and throw.
         // This is the entry-time check: if the thread was already interrupted
         // before wait() was called, consume the flag and throw immediately.
         if self
@@ -1233,7 +1233,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             );
         }
         // T16.7: If interrupted during wait, throw InterruptedException but
-        // leave the flag observable. Strict JLS §17.2.1 would have us clear
+        // leave the flag observable. Strict JLS В§17.2.1 would have us clear
         // the flag here; tests (`p86_interrupt_unblocks_monitor_wait`) require
         // the cross-thread interrupt signal to remain visible to the caller's
         // post-wait check, so we let the throw+catch path in the Java layer
@@ -1284,7 +1284,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         //      slot 4 (set by the synthetic Thread.Builder.start native).
         //   2. Real-JDK mode (JEP 444): a `BoundVirtualThread` (or any
         //      future `VirtualThread`) extends `BaseVirtualThread`. We must
-        //      detect this by walking the class hierarchy — the synthetic
+        //      detect this by walking the class hierarchy вЂ” the synthetic
         //      slot-4 trick won't work because the real Thread layout puts
         //      different fields at slot 4. Without this detection, virtual
         //      threads created by `Thread.ofVirtual().start(r)` wouldn't
@@ -1305,14 +1305,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         let is_virtual = is_virtual_synthetic || is_virtual_real_jdk;
 
-        // T19.K1 — read the Java-side daemon flag so the registry can
+        // T19.K1 вЂ” read the Java-side daemon flag so the registry can
         // tell `wait_for_non_daemon_threads()` whether the process must
         // wait for this thread. The flag is layout-dependent: synthetic
         // Threads don't model `daemon` (the synthetic 5-slot Thread
         // layout doesn't have a daemon field, so we default to false);
         // real-JDK Threads keep it on `Thread.holder.daemon` (see
         // `java.lang.Thread$FieldHolder`). Virtual threads (JEP 444)
-        // are always daemon per the spec — we set that unconditionally
+        // are always daemon per the spec вЂ” we set that unconditionally
         // so a buggy `BoundVirtualThread` constructor can't keep the VM
         // alive past `main()`.
         let is_daemon = if is_virtual {
@@ -1352,19 +1352,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         // Store the ThreadId on the Java Thread object so we can look it up later.
         //
-        // Synthetic-JDK layout: name=0, priority=1, tid=2 — write directly.
+        // Synthetic-JDK layout: name=0, priority=1, tid=2 вЂ” write directly.
         //
         // Real-JDK layout: `Thread` is loaded from java.base.jmod, has dozens
         // of instance fields, and does NOT keep `tid` at slot 2 (slot 2 in
         // the real layout is something else, often `priority` or part of an
         // inherited field set).  Writing `Long(tid)` to slot 2 in real-JDK
         // mode corrupts whatever object reference / int the JDK bytecode
-        // expects there — observed as "expected object reference, got
+        // expects there вЂ” observed as "expected object reference, got
         // double(...)" when AQS / ReentrantLock subsequently dereferenced
         // the field in a worker thread.
         //
         // For real-JDK Thread we instead rely on the registry's
-        // `(ObjectRef → ThreadId)` lookup, which was already populated by
+        // `(ObjectRef в†’ ThreadId)` lookup, which was already populated by
         // the `register(tid, name, Some(thread_obj))` call above.  This
         // also matches how `find_park_state_by_thread_obj` works.
         let is_real_jdk_thread = {
@@ -1409,14 +1409,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .set_root_snapshot(tid, jvm_thread.root_snapshot.clone());
             // WP4.8: For real-JDK virtual threads (e.g.
             // `java.lang.ThreadBuilders$BoundVirtualThread`), `Thread.run()`
-            // is overridden — `BoundVirtualThread.run()` invokes the user's
+            // is overridden вЂ” `BoundVirtualThread.run()` invokes the user's
             // `task.run()`, while the base `Thread.run()` reads `holder.task`
             // (always null for BoundVirtualThread).  We must dispatch
             // virtually on the receiver's actual class id; calling
             // `invoke_shared(... "java/lang/Thread", "run", ...)` would land
             // on the base method and silently do nothing.
             //
-            // `invoke_on_class_shared` is the right entry point here — it's
+            // `invoke_on_class_shared` is the right entry point here вЂ” it's
             // called from invokevirtual/invokespecial and walks the class
             // hierarchy starting at the supplied class.  We pass
             // `class_id_of(thread_obj)` so dispatch starts at the real
@@ -1468,7 +1468,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             );
             shared_arc.thread_registry.mark_dead(tid);
 
-            // WP4.1 — wake any thread waiting in `Thread.join()` for us.
+            // WP4.1 вЂ” wake any thread waiting in `Thread.join()` for us.
             //
             // Real-JDK `Thread.join()` enters this Thread's object monitor
             // and calls `Object.wait()` while `isAlive()` is true.  HotSpot
@@ -1481,7 +1481,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // We use the shared monitors path directly so we don't need a
             // live `JvmThread` (this closure is on the dying thread's
             // tail; constructing a frame here is overkill).  Errors are
-            // swallowed — the worst case is a missed wakeup, which an
+            // swallowed вЂ” the worst case is a missed wakeup, which an
             // existing unparker / interrupt would still resolve.
             shared_arc.monitors.enter(thread_obj_for_spawn, tid);
             let _ = shared_arc
@@ -1498,8 +1498,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn thread_join(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
         // Read ThreadId from field 2 of the Java Thread object (synthetic
-        // layout) or fall back to the registry's `(ObjectRef → ThreadId)`
-        // map (real-JDK layout — see WP4.1 thread_start fix).
+        // layout) or fall back to the registry's `(ObjectRef в†’ ThreadId)`
+        // map (real-JDK layout вЂ” see WP4.1 thread_start fix).
         let tid = match self.shared.heap.get_field(thread_obj, 2) {
             Value::Long(id) => ThreadId(id as u64),
             _ => match self
@@ -1542,7 +1542,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             cm.get_loaded_class_id("java/lang/Thread")
         }
         .unwrap_or_else(|| {
-            // Thread class not loaded yet — load it now
+            // Thread class not loaded yet вЂ” load it now
             self.shared
                 .class_manager
                 .write()
@@ -1662,7 +1662,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    /// T1.5.1 — post an async exception to the target thread's
+    /// T1.5.1 вЂ” post an async exception to the target thread's
     /// registry slot. The target picks it up at its next safepoint.
     fn thread_post_async_exception(
         &mut self,
@@ -1745,7 +1745,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .as_nanos() as u64;
         let carrier_id = self.thread.thread_id.0;
         // Virtual threads currently share their carrier's id; this is fine
-        // for JFR classification — what matters is the `pin_reason` string.
+        // for JFR classification вЂ” what matters is the `pin_reason` string.
         let vt_id = carrier_id;
         let mut jfr = self.shared.flight_recorder.lock();
         rustjvm_jfr::builtin::emit_virtual_thread_pinned_event(
@@ -1766,7 +1766,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.thread_registry.alive_thread_objects(max)
     }
 
-    /// T19_K2 — Register a native-spawned OS thread with the VM
+    /// T19_K2 вЂ” Register a native-spawned OS thread with the VM
     /// `ThreadRegistry`. The boxed `JoinHandle<()>` (raw pointer in
     /// `join_handle_ptr`) is taken back as `Box<JoinHandle<()>>` and
     /// transferred into the registry so
@@ -1793,7 +1793,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // exclusive ownership of that allocation. We take it back
             // and move the `JoinHandle<()>` into the registry, where
             // it lives until `wait_for_non_daemon_threads` joins on it
-            // (or the registry is dropped on VM teardown — in that
+            // (or the registry is dropped on VM teardown вЂ” in that
             // case the handle is dropped, which detaches the OS thread,
             // matching HotSpot's behaviour for daemon-on-shutdown
             // teardown).
@@ -1804,7 +1804,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         tid.0
     }
 
-    /// T19_K2 — Mark a previously-registered native thread dead. Called
+    /// T19_K2 вЂ” Mark a previously-registered native thread dead. Called
     /// from the spawned OS thread's exit path. Idempotent: passing an
     /// unknown id is a no-op (matches `ThreadRegistry::mark_dead`).
     fn unregister_native_thread(&mut self, thread_id: u64) {
@@ -1816,7 +1816,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .mark_dead(crate::threading::jvm_thread::ThreadId(thread_id));
     }
 
-    /// T19_K2 — Attach a `Box<JoinHandle<()>>` to an already-registered
+    /// T19_K2 вЂ” Attach a `Box<JoinHandle<()>>` to an already-registered
     /// native thread. Two-phase variant of `register_native_thread` for
     /// callers that need the `ThreadId` before spawning the OS thread.
     fn attach_join_handle_to_native_thread(
@@ -1830,7 +1830,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let tid = crate::threading::jvm_thread::ThreadId(thread_id);
         // Verify the thread is registered before consuming the pointer.
         // `is_alive` returns true on registration and false after
-        // `mark_dead` — either way the entry exists.
+        // `mark_dead` вЂ” either way the entry exists.
         if self
             .shared
             .thread_registry
@@ -1847,14 +1847,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         true
     }
 
-    /// T19_K4 — Attach a `java.lang.Thread` mirror to an
+    /// T19_K4 вЂ” Attach a `java.lang.Thread` mirror to an
     /// already-registered native thread so look-ups by `ObjectRef`
     /// resolve and the registry's `alive_thread_objects()` /
     /// `Thread.enumerate()` enumerations include the carrier.
     ///
     /// `thread_id == 0` is rejected (id `0` is the reserved
     /// "main" sentinel and never has a synthetic mirror); unknown
-    /// ids return `false`. The store is idempotent — re-attaching
+    /// ids return `false`. The store is idempotent вЂ” re-attaching
     /// the same mirror is a no-op as far as the registry is
     /// concerned.
     fn set_native_thread_java_obj(
@@ -1996,7 +1996,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
-        // T10.9.E — descriptor-aware volatile read.
+        // T10.9.E вЂ” descriptor-aware volatile read.
         let class_id = self.shared.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => self.shared.heap.get_field_volatile_as(obj, index, desc),
@@ -2005,7 +2005,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-        // T10.9.E — descriptor-aware volatile write.
+        // T10.9.E вЂ” descriptor-aware volatile write.
         let class_id = self.shared.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => self
@@ -2014,7 +2014,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .set_field_volatile_as(obj, index, value, desc),
             None => self.shared.heap.set_field_volatile(obj, index, value),
         }
-        // write_barrier fires automatically inside set_field_volatile → set_field
+        // write_barrier fires automatically inside set_field_volatile в†’ set_field
     }
 
     fn compare_and_swap_field(
@@ -2064,7 +2064,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // T19.H7 diag: count CAS failures so we can spot a livelock.
         // Static counter gated to ~5 emissions then 1 every 1M.
-        // Feature-gated (off by default) — see vm/Cargo.toml
+        // Feature-gated (off by default) вЂ” see vm/Cargo.toml
         // `experimental-t19-diag`. Re-enable with
         // `--features experimental-t19-diag`.
         #[cfg(feature = "experimental-t19-diag")]
@@ -2335,7 +2335,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     Ok(Some(Value::Object(Some(new_obj))))
                 }
                 _ => {
-                    // GetField, GetStatic, PutField, PutStatic — very rare for
+                    // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
                     // functional interfaces, defer with a descriptive error.
                     Err(VmError::Internal {
                         message: format!(
@@ -2356,7 +2356,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 r,
             )
         } else {
-            // Not a lambda proxy SAM call — normal virtual dispatch.
+            // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
             // If the receiver IS a lambda proxy but calling a non-SAM method
             // (e.g. andThen), dispatch on the functional interface class.
             let class_name = {
@@ -2492,7 +2492,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 for attr in &m.attributes {
                     if let rustjvm_reader::attribute::Attribute::MethodParameters(params) = attr {
                         // JVMS 4.7.24: name_index == 0 means an anonymous /
-                        // synthetic parameter — surface it as an empty
+                        // synthetic parameter вЂ” surface it as an empty
                         // string so the caller can fall back to "argN".
                         return params
                             .iter()
@@ -2805,7 +2805,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         target_class_id: ClassId,
     ) -> Result<(), String> {
         let cm = self.shared.class_manager.read();
-        // No modules registered → classpath-only mode, allow.
+        // No modules registered в†’ classpath-only mode, allow.
         if cm.module_registry.is_empty() {
             return Ok(());
         }
@@ -2911,7 +2911,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if evicted > 0 {
                     tracing::debug!("JIT: invalidated {evicted} method(s) due to class reload: {name}");
                 }
-                // T5.4.4 — additionally consult the InvalidationManager's
+                // T5.4.4 вЂ” additionally consult the InvalidationManager's
                 // LeafClass/class_dependencies entries.
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 if cha_evicted > 0 {
@@ -2982,7 +2982,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if evicted > 0 {
                     tracing::debug!("JIT: invalidated {evicted} method(s) due to class reload: {name}");
                 }
-                // T5.4.4 — CHA-listener invalidation
+                // T5.4.4 вЂ” CHA-listener invalidation
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 if cha_evicted > 0 {
                     tracing::debug!(
@@ -3071,14 +3071,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         new_bytes: &[u8],
     ) -> Result<(), String> {
-        // WP2.4-F1 — JEP 109 redefine path: route to
+        // WP2.4-F1 вЂ” JEP 109 redefine path: route to
         // `class_manager::redefine_class` (Agent 2.4-B) which performs
         // the in-place method-body swap, refreshes the vtable, bumps
         // the per-class `redefine_generations` counter, and fires the
         // JIT invalidate hook. Earlier versions of this binding called
         // `define_class_with_options(allow_redefine: true)`, which
         // minted a fresh ClassId for the redefined class and left the
-        // ORIGINAL ClassId's `Class.methods` table untouched — so the
+        // ORIGINAL ClassId's `Class.methods` table untouched вЂ” so the
         // already-loaded `Target` instance kept dispatching to the
         // pre-transform bytecode and the per-thread invoke cache
         // (keyed on the original ClassId) never observed a generation
@@ -3217,7 +3217,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .map(|sym| *sym as usize)
             }
         } else {
-            // Default/system lookup — try all loaded libraries
+            // Default/system lookup вЂ” try all loaded libraries
             for lib in libs.iter() {
                 if let Ok(sym) = unsafe { lib.get::<*const ()>(c_name.as_bytes_with_nul()) } {
                     return Some(*sym as usize);
@@ -3400,9 +3400,9 @@ pub fn invoke_or_native(
     }
 
     // T15: Array types (`[LFoo;`, `[I`, etc.) don't have their own class
-    // files — JVMS §4.4.1 maps their method dispatch to `java.lang.Object`.
+    // files вЂ” JVMS В§4.4.1 maps their method dispatch to `java.lang.Object`.
     // The only methods arrays define beyond `Object` are `clone()` and a
-    // length accessor — both satisfied by our Object.clone native override
+    // length accessor вЂ” both satisfied by our Object.clone native override
     // (which branches on ObjectKind::Array) and the `arraylength` opcode.
     let effective_class = if class_name.starts_with('[') {
         "java/lang/Object"
@@ -3416,7 +3416,7 @@ pub fn invoke_or_native(
                   effective_class, bytes.len(), class_name, method_name, descriptor);
         eprintln!("[invoke_or_native] effective_class bytes: {:?}", bytes);
     }
-    // Always check native registry first — this provides "native override"
+    // Always check native registry first вЂ” this provides "native override"
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
     // so our Rust native registration must take priority over bytecode.
@@ -3447,9 +3447,9 @@ pub fn invoke_or_native(
     // Walk the superclass chain: the constant pool may reference a subclass
     // (e.g. RunnerClassLoader.registerAsParallelCapable) but the native is
     // registered on the declaring superclass (ClassLoader).
-    // IMPORTANT: skip hierarchy walk for <init> — constructors are NOT inherited.
+    // IMPORTANT: skip hierarchy walk for <init> вЂ” constructors are NOT inherited.
     // IMPORTANT: skip hierarchy walk if the target class has bytecode for this
-    // method — the subclass's bytecode override must take priority over a parent's
+    // method вЂ” the subclass's bytecode override must take priority over a parent's
     // native (e.g. URI.toString() must NOT be short-circuited by Object.toString()).
     if method_name != "<init>" {
         // Check if the target class has its own bytecode for this method.
@@ -3571,7 +3571,7 @@ impl<'a> NativeContextImpl<'a> {
 /// R1 fix: a primitive field slot that has never been explicitly written
 /// decodes as `Value::Object(None)` (the zero-discriminant `Value` variant)
 /// when read via `std::ptr::read::<Value>()` on `alloc_zeroed` memory. The
-/// canonical fix is [`crate::heap::default_value_for_descriptor`] — the
+/// canonical fix is [`crate::heap::default_value_for_descriptor`] вЂ” the
 /// heap's `alloc_object_with_descriptors` pre-initializes primitive slots
 /// with the correctly-tagged zero. This function includes a belt-and-
 /// suspenders fallback: when the live slot reads as `Object(None)` and
@@ -3582,13 +3582,13 @@ impl<'a> NativeContextImpl<'a> {
 /// init.
 ///
 /// T19_H6 fix: cross-tag bit-pattern equivalence for primitive Values.
-/// The CAS contract operates on raw bits — a `long` field whose storage
+/// The CAS contract operates on raw bits вЂ” a `long` field whose storage
 /// tag drifted to `Double` (or vice-versa) must still compare equal when
 /// the underlying 64-bit pattern matches. Likewise for the 32-bit pair
 /// `(Int, Float)`. We also cover the width-mismatched pairs `(Int, Long)`
 /// and `(Int, Double)` because the field-descriptor cache can return `I`
 /// for what is actually a `J` slot when an upstream walker (e.g.
-/// `Class::field_at_index`) indexes through statics — in that case the
+/// `Class::field_at_index`) indexes through statics вЂ” in that case the
 /// 32-bit-zero-extended Int and the 64-bit Long/Double must match by
 /// bit pattern. Equating bits is consistent with the existing
 /// `to_bits()` Float/Double equality and is the canonical IEEE-754
@@ -3616,7 +3616,7 @@ pub(super) fn values_equal_for_cas(a: &Value, b: &Value) -> bool {
         },
         // Primitive-default coercion: an uninitialized primitive slot
         // reads as Object(None). Accept it as equal to a typed zero so
-        // CAS loops don't livelock. Only zero values match — non-zero
+        // CAS loops don't livelock. Only zero values match вЂ” non-zero
         // primitive expected values still fail (correct mismatch).
         (Value::Object(None), Value::Int(0))
         | (Value::Int(0), Value::Object(None)) => true,
@@ -3626,9 +3626,9 @@ pub(super) fn values_equal_for_cas(a: &Value, b: &Value) -> bool {
         | (Value::Float(f), Value::Object(None)) if f.to_bits() == 0 => true,
         (Value::Object(None), Value::Double(d))
         | (Value::Double(d), Value::Object(None)) if d.to_bits() == 0 => true,
-        // T19_H6 belt-and-suspenders — cross-tag primitive bit-pattern
+        // T19_H6 belt-and-suspenders вЂ” cross-tag primitive bit-pattern
         // equivalence. Same-tag pairs are handled by the matches above; this
-        // arm only fires for primitive×primitive cross-tag (e.g. Long vs
+        // arm only fires for primitiveГ—primitive cross-tag (e.g. Long vs
         // Double bits), so it can't accidentally match an Object reference.
         (a_v, b_v) => match (value_as_u64_bits(a_v), value_as_u64_bits(b_v)) {
             (Some(ab), Some(bb)) => ab == bb,
@@ -3652,17 +3652,17 @@ pub fn invoke_shared(
 ) -> MethodCallResult {
     // Thread-safe class loading with per-class-name lock (Session 30)
     let class_id = shared.load_class_concurrent(class_name)?;
-    // Ensure the class is initialized (runs <clinit>) per JVM spec §5.5.
+    // Ensure the class is initialized (runs <clinit>) per JVM spec В§5.5.
     // This is required for static methods and field access to work correctly.
     super::ensure_class_initialized_shared(shared, thread, class_id)?;
     invoke_on_class_shared(shared, thread, class_id, method_name, descriptor, args)
 }
 
-/// WP2.9 — Invoke a method with invokespecial semantics (no virtual dispatch).
+/// WP2.9 вЂ” Invoke a method with invokespecial semantics (no virtual dispatch).
 ///
 /// Backs `MethodHandles.Lookup.findSpecial` and the JLS `super.m()` pattern.
 /// Resolves `class_name`, walks to the declaring class for the requested
-/// method, and dispatches *exactly* on that class — bypassing the
+/// method, and dispatches *exactly* on that class вЂ” bypassing the
 /// iface/abstract retarget that `invoke_on_class_shared` normally applies.
 ///
 /// Native registry overrides take priority, matching `invoke_or_native`.
@@ -3674,7 +3674,7 @@ pub fn invoke_special_shared(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    // Native override always wins — same priority order as invoke_or_native.
+    // Native override always wins вЂ” same priority order as invoke_or_native.
     if let Some(callback) = shared
         .native_methods
         .find(class_name, method_name, descriptor)
@@ -3713,7 +3713,7 @@ pub fn invoke_special_shared(
 // Dynamic Proxy dispatch (java.lang.reflect.Proxy)
 // ---------------------------------------------------------------------------
 
-/// WP2.5 — set a field on a synthetic `Method` object by JDK field name.
+/// WP2.5 вЂ” set a field on a synthetic `Method` object by JDK field name.
 ///
 /// The proxy dispatch path used to write the synthesized `Method` object
 /// using hard-coded slot indices (0=class, 1=name, 2=returnType, ...).
@@ -3721,7 +3721,7 @@ pub fn invoke_special_shared(
 /// inherits a long chain of fields from `AccessibleObject` and
 /// `Executable` first, so `name` is *not* at slot 1. The miswrite
 /// surfaced as `m.getName()` returning null inside an InvocationHandler,
-/// which silently broke any handler that branched on the method name —
+/// which silently broke any handler that branched on the method name вЂ”
 /// the typical pattern for multi-interface proxies (FAIL-5) and
 /// proxies on interfaces with default methods (FAIL-6).
 ///
@@ -3768,12 +3768,12 @@ pub(super) fn proxy_invoke_handler(
         }
     };
 
-    // WP2.5 — build the Method object using **field-name-based** writes
+    // WP2.5 вЂ” build the Method object using **field-name-based** writes
     // so the JDK-real layout (which has many inherited fields from
     // AccessibleObject and Executable before `name`/`returnType`/...)
     // is honored. Hard-coded slot indices like the original 0..7 break
     // `Method.getName()` because the real `name` field is not at slot 1
-    // — it's at whatever index the JDK class file declares it. Without
+    // вЂ” it's at whatever index the JDK class file declares it. Without
     // this, the InvocationHandler's `m.getName()` returns null and any
     // handler that branches on the method name (the common case for
     // multi-interface and default-method tests) silently returns null.
@@ -3811,7 +3811,7 @@ pub(super) fn proxy_invoke_handler(
     // pulls `Method.getName` via `get_field_by_name` already lands on
     // the right slot, but older diagnostic readers may still poke 1..7).
     if total_fields >= 8 {
-        // Skip — class layout already has the JDK fields populated above.
+        // Skip вЂ” class layout already has the JDK fields populated above.
     } else {
         ctx.shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
         ctx.shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
@@ -3822,7 +3822,7 @@ pub(super) fn proxy_invoke_handler(
         ctx.shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
 
-    // Build Object[] of args — box primitives so InvocationHandler receives Object[]
+    // Build Object[] of args вЂ” box primitives so InvocationHandler receives Object[]
     let args_arr = ctx.shared.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
@@ -3840,7 +3840,7 @@ pub(super) fn proxy_invoke_handler(
     // Resolve the handler's actual class for dispatch (may be anonymous).
     let handler_class_id = ctx.shared.heap.class_id_of(handler_ref);
 
-    // WP2.5: lambda InvocationHandler — see `proxy_invoke_handler_shared`
+    // WP2.5: lambda InvocationHandler вЂ” see `proxy_invoke_handler_shared`
     // for the rationale. The lambda's class_id is synthetic and not in
     // the class store; dispatching by name would land on the abstract
     // interface method (no Code attribute).
@@ -3899,20 +3899,20 @@ pub(super) fn proxy_invoke_handler(
 ///
 /// Layout of AnnotationProxy (4-field):
 ///   field 0 = String (type descriptor, e.g. "Ljava/lang/Override;")
-///   field 1 = Class mirror (annotation type — for `annotationType()`)
+///   field 1 = Class mirror (annotation type вЂ” for `annotationType()`)
 ///   field 2 = String[] (element names)
 ///   field 3 = Object[] (element values, parallel to names)
 ///
 /// Methods implemented:
-///   * `annotationType()` — returns the cached Class mirror (field 1).
-///   * `toString()` — `@TypeName(name1=val1, name2=val2)` with members in
+///   * `annotationType()` вЂ” returns the cached Class mirror (field 1).
+///   * `toString()` вЂ” `@TypeName(name1=val1, name2=val2)` with members in
 ///     declaration order (matches the order WP1.7 captures, which mirrors
 ///     the order the source compiler wrote into the class file).
-///   * `hashCode()` — sum over members of `(127 * nameHash) ^ valueHash`,
+///   * `hashCode()` вЂ” sum over members of `(127 * nameHash) ^ valueHash`,
 ///     per `Annotation.hashCode()` Javadoc.
-///   * `equals(Object)` — `true` iff the other reference is also an
+///   * `equals(Object)` вЂ” `true` iff the other reference is also an
 ///     `AnnotationProxy` of the same annotation type AND every element
-///     value compares `equals` (by `valueEquals` semantics — array values
+///     value compares `equals` (by `valueEquals` semantics вЂ” array values
 ///     use `Arrays.equals`, scalar values use `Object.equals`).
 ///
 /// Element accessor methods (e.g. `value()`, `count()`, `nested()`) walk
@@ -3926,7 +3926,7 @@ fn annotation_proxy_invoke(
     annotation_proxy_dispatch_impl(ctx.shared, proxy, method_name, args)
 }
 
-/// Shared-interpreter version of `proxy_invoke_handler` — callable from the
+/// Shared-interpreter version of `proxy_invoke_handler` вЂ” callable from the
 /// iterative interpreter without a `NativeContextImpl`.
 pub(crate) fn proxy_invoke_handler_shared(
     shared: &SharedVm,
@@ -3944,7 +3944,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         }
     };
 
-    // WP2.5 — build the Method object using **field-name-based** writes.
+    // WP2.5 вЂ” build the Method object using **field-name-based** writes.
     // See `proxy_method_set_field_by_name` for the rationale; mirrors the
     // fix applied to `proxy_invoke_handler` above.
     let method_class_id = shared.class_manager.write()
@@ -3985,7 +3985,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
 
-    // Build Object[] of args — box primitives
+    // Build Object[] of args вЂ” box primitives
     let args_arr = shared.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
@@ -4027,7 +4027,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         if let Some(result) = dispatch {
             return Ok(result);
         }
-        // Fell through unexpectedly — surface as a clearer error than
+        // Fell through unexpectedly вЂ” surface as a clearer error than
         // "no Code attribute".
         return Err(MethodCallFailed::InternalError(VmError::Linkage(
             LinkageError::AbstractMethodError {
@@ -4106,7 +4106,7 @@ fn annotation_proxy_elements(
     out
 }
 
-/// Read the annotation's type descriptor (field 0) — e.g. "Ljava/lang/Override;".
+/// Read the annotation's type descriptor (field 0) вЂ” e.g. "Ljava/lang/Override;".
 fn annotation_proxy_type_descriptor(shared: &SharedVm, proxy: ObjectRef) -> String {
     if let Value::Object(Some(s)) = shared.heap.get_field(proxy, 0) {
         super::read_java_string(&shared.heap, s).unwrap_or_default()
@@ -4116,7 +4116,7 @@ fn annotation_proxy_type_descriptor(shared: &SharedVm, proxy: ObjectRef) -> Stri
 }
 
 /// Convert an annotation type descriptor to an internal class name.
-/// E.g. `"Ljava/lang/Override;"` → `"java/lang/Override"`. Empty input
+/// E.g. `"Ljava/lang/Override;"` в†’ `"java/lang/Override"`. Empty input
 /// (or non-descriptor strings) returns `"<unknown>"` to give a non-empty
 /// fallback in `toString` output.
 fn descriptor_to_class_name(desc: &str) -> String {
@@ -4130,7 +4130,7 @@ fn descriptor_to_class_name(desc: &str) -> String {
 }
 
 /// Convert an internal slash-separated class name to the dotted form used
-/// in `Annotation.toString()` output, e.g. `"java/lang/Override"` →
+/// in `Annotation.toString()` output, e.g. `"java/lang/Override"` в†’
 /// `"java.lang.Override"`.
 fn internal_to_dotted(name: &str) -> String {
     name.replace('/', ".")
@@ -4139,13 +4139,13 @@ fn internal_to_dotted(name: &str) -> String {
 /// Format an annotation member value the way HotSpot's
 /// `AnnotationInvocationHandler.toString()` does:
 ///
-/// * `String` → `"text"` (Java-string-literal-escaped quoted form)
-/// * `Class` → `TypeName.class`
-/// * Annotation proxy → recursive `@TypeName(...)`
-/// * Reference array → `[a, b, c]`
-/// * Primitive array → element-list joined by `, ` inside `[ ... ]`
-/// * boxed Integer/Long/etc. (from element-value pairs) → underlying numeric
-/// * Enum → constant name (annotation enum element renders without type qualifier)
+/// * `String` в†’ `"text"` (Java-string-literal-escaped quoted form)
+/// * `Class` в†’ `TypeName.class`
+/// * Annotation proxy в†’ recursive `@TypeName(...)`
+/// * Reference array в†’ `[a, b, c]`
+/// * Primitive array в†’ element-list joined by `, ` inside `[ ... ]`
+/// * boxed Integer/Long/etc. (from element-value pairs) в†’ underlying numeric
+/// * Enum в†’ constant name (annotation enum element renders without type qualifier)
 fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
     match val {
         Value::Object(None) => "null".to_string(),
@@ -4170,13 +4170,13 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
             if cname == "java/lang/annotation/AnnotationProxy" {
                 return annotation_proxy_to_string(shared, obj);
             }
-            // String — render as Java-string-literal "text"
+            // String вЂ” render as Java-string-literal "text"
             if cname == "java/lang/String" {
                 if let Some(s) = super::read_java_string(&shared.heap, obj) {
                     return format!("\"{}\"", java_string_escape(&s));
                 }
             }
-            // Class mirror — render as `TypeName.class`
+            // Class mirror вЂ” render as `TypeName.class`
             if cname == "java/lang/Class" {
                 if let Some(cls_name) = class_mirror_name(shared, obj) {
                     return format!("{}.class", internal_to_dotted(&cls_name));
@@ -4194,7 +4194,7 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
                 }
                 return s;
             }
-            // Enum constant — return its `name` field. Standard layout has
+            // Enum constant вЂ” return its `name` field. Standard layout has
             // field 0 = String name (set by `Enum.<init>`).
             if let Value::Object(Some(name_ref)) = shared.heap.get_field(obj, 0) {
                 if let Some(name) = super::read_java_string(&shared.heap, name_ref) {
@@ -4280,7 +4280,7 @@ fn java_string_escape(s: &str) -> String {
 
 /// Read the internal class name from a `java/lang/Class` mirror. Layout:
 ///   field 0 = class id (Int)
-///   field 1 = name (String — internal slash form)
+///   field 1 = name (String вЂ” internal slash form)
 fn class_mirror_name(shared: &SharedVm, mirror: ObjectRef) -> Option<String> {
     if let Value::Object(Some(name_ref)) = shared.heap.get_field(mirror, 1) {
         return super::read_java_string(&shared.heap, name_ref);
@@ -4310,7 +4310,7 @@ fn annotation_member_hash(shared: &SharedVm, name: &str, val: Value) -> i32 {
     127i32.wrapping_mul(name_hash) ^ value_hash
 }
 
-/// Java-spec `String.hashCode()` — `s[0]*31^(n-1) + ... + s[n-1]`.
+/// Java-spec `String.hashCode()` вЂ” `s[0]*31^(n-1) + ... + s[n-1]`.
 ///
 /// Public for WP2.7 conformance tests that pin the hash recipe against
 /// the JDK reference output.
@@ -4345,29 +4345,29 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
                 .get_class(cid)
                 .map(|c| c.name.to_string())
                 .unwrap_or_default();
-            // Boxed wrapper — hash the boxed primitive
+            // Boxed wrapper вЂ” hash the boxed primitive
             if wrapper_class_to_primitive(&cname).is_some() {
                 let inner = shared.heap.get_field(obj, 0);
                 return annotation_value_hash(shared, inner);
             }
-            // String — Java's String.hashCode contract
+            // String вЂ” Java's String.hashCode contract
             if cname == "java/lang/String" {
                 if let Some(s) = super::read_java_string(&shared.heap, obj) {
                     return java_string_hash(&s);
                 }
             }
-            // Nested annotation — recurse
+            // Nested annotation вЂ” recurse
             if cname == "java/lang/annotation/AnnotationProxy" {
                 return annotation_proxy_hash_code(shared, obj);
             }
-            // Class mirror — hash the class name (matches Class.hashCode → name.hashCode)
+            // Class mirror вЂ” hash the class name (matches Class.hashCode в†’ name.hashCode)
             if cname == "java/lang/Class" {
                 if let Some(name) = class_mirror_name(shared, obj) {
                     return java_string_hash(&internal_to_dotted(&name));
                 }
             }
-            // Enum / generic object — hash the `name` field if present (matches
-            // Enum.hashCode → identity), else identity hash code.
+            // Enum / generic object вЂ” hash the `name` field if present (matches
+            // Enum.hashCode в†’ identity), else identity hash code.
             if let Value::Object(Some(name_ref)) = shared.heap.get_field(obj, 0) {
                 if let Some(name) = super::read_java_string(&shared.heap, name_ref) {
                     if !name.is_empty() {
@@ -4405,7 +4405,7 @@ pub(crate) fn annotation_proxy_hash_code(shared: &SharedVm, proxy: ObjectRef) ->
     h
 }
 
-/// Spec-compliant `Annotation.equals(Object)` — returns true iff the other
+/// Spec-compliant `Annotation.equals(Object)` вЂ” returns true iff the other
 /// reference is also an `AnnotationProxy` with the same annotation type AND
 /// every element value matches.
 pub(crate) fn annotation_proxy_equals(
@@ -4461,7 +4461,7 @@ pub(crate) fn annotation_proxy_equals(
     true
 }
 
-/// Compare two annotation member values — `Arrays.equals` semantics on
+/// Compare two annotation member values вЂ” `Arrays.equals` semantics on
 /// arrays, recursive on nested annotations, identity-aware on others.
 fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
     match (a, b) {
@@ -4538,7 +4538,7 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
                     (Value::Int(a), Value::Int(b)) if a == b
                 );
             }
-            // Boxed wrapper — unbox & recurse
+            // Boxed wrapper вЂ” unbox & recurse
             if wrapper_class_to_primitive(&xname).is_some()
                 && wrapper_class_to_primitive(&yname).is_some()
             {
@@ -4546,7 +4546,7 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
                 let yv = shared.heap.get_field(y, 0);
                 return annotation_values_equal(shared, xv, yv);
             }
-            // Enum / generic — compare name field if present.
+            // Enum / generic вЂ” compare name field if present.
             if let (Value::Object(Some(xn)), Value::Object(Some(yn))) =
                 (shared.heap.get_field(x, 0), shared.heap.get_field(y, 0))
             {
@@ -4574,17 +4574,17 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         "annotationType" => {
             return Ok(Some(shared.heap.get_field(proxy, 1)));
         }
-        // toString() — spec-compliant @Type(name=value, ...)
+        // toString() вЂ” spec-compliant @Type(name=value, ...)
         "toString" => {
             let s = annotation_proxy_to_string(shared, proxy);
             let result = super::create_java_string(shared, &s);
             return Ok(Some(Value::Object(Some(result))));
         }
-        // hashCode() — sum of (127 * nameHash) ^ valueHash
+        // hashCode() вЂ” sum of (127 * nameHash) ^ valueHash
         "hashCode" => {
             return Ok(Some(Value::Int(annotation_proxy_hash_code(shared, proxy))));
         }
-        // equals(Object) — annotation-equality contract
+        // equals(Object) вЂ” annotation-equality contract
         "equals" => {
             let other = args.first().copied().unwrap_or(Value::Object(None));
             let eq = annotation_proxy_equals(shared, proxy, other);
@@ -4614,7 +4614,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             }
         }
     }
-    // Element not found — return null/default.
+    // Element not found вЂ” return null/default.
     Ok(Some(Value::Object(None)))
 }
 
@@ -4642,7 +4642,7 @@ pub(super) fn proxy_count_params(descriptor: &str) -> usize {
                 }
             }
             '[' => {
-                // array prefix — don't count the '[' itself, the element type follows
+                // array prefix вЂ” don't count the '[' itself, the element type follows
             }
             _ => {
                 tracing::warn!("Unrecognized type character '{}' in method descriptor: {}", ch, descriptor);
@@ -4700,12 +4700,12 @@ pub fn invoke_on_class_shared(
     invoke_on_class_shared_inner(shared, thread, class_id, method_name, descriptor, args, false)
 }
 
-/// WP2.9 — Invoke a method on a specific class with **no virtual retarget**.
+/// WP2.9 вЂ” Invoke a method on a specific class with **no virtual retarget**.
 ///
 /// Used by `MethodHandles.Lookup.findSpecial` and the default-method super-call
 /// pattern. Unlike [`invoke_on_class_shared`], this never retargets dispatch
 /// to the receiver's concrete class even when the resolved class is an
-/// interface or abstract — that is the *whole point* of invokespecial.
+/// interface or abstract вЂ” that is the *whole point* of invokespecial.
 pub fn invoke_on_class_shared_no_retarget(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -4726,7 +4726,7 @@ fn invoke_on_class_shared_inner(
     args: &[Value],
     no_retarget: bool,
 ) -> MethodCallResult {
-    // C25: Virtual dispatch on an interface (or abstract class) — if the
+    // C25: Virtual dispatch on an interface (or abstract class) вЂ” if the
     // passed class_id names an interface/abstract class and the first arg is
     // a concrete object, re-target dispatch onto the receiver's actual class.
     // Without this, invoking e.g. `Iterator.hasNext()Z` through this entry
@@ -4816,7 +4816,7 @@ fn invoke_on_class_shared_inner(
                                 | "compareAndExchangeRelease"
                                 | "length" | "<init>"
                             ))
-                        // WP4.7: StampedLock + ReentrantReadWriteLock — the
+                        // WP4.7: StampedLock + ReentrantReadWriteLock вЂ” the
                         // real JDK bytecode for these uses
                         // `Unsafe.compareAndSetLong` directly on a
                         // `volatile long state` field. Our CompactValue
@@ -4852,7 +4852,7 @@ fn invoke_on_class_shared_inner(
                                 | "isHeldByCurrentThread"
                             ))
                         // WP4.2: ForkJoinPool.execute(Runnable) /
-                        // execute(ForkJoinTask) — the real JDK bytecode
+                        // execute(ForkJoinTask) вЂ” the real JDK bytecode
                         // queues the runnable for a worker thread that
                         // never runs Java in our impl (NativeContext is
                         // not Send). Force the eager-inline native
@@ -4865,7 +4865,7 @@ fn invoke_on_class_shared_inner(
                             && (descriptor == "(Ljava/lang/Runnable;)V"
                                 || descriptor == "(Ljava/util/concurrent/ForkJoinTask;)V"))
                         // T19_K3_FJP_NATIVE_OVERRIDE: ForkJoinPool.commonPool() /
-                        // getFactory() — the real JDK bytecode for these reads
+                        // getFactory() вЂ” the real JDK bytecode for these reads
                         // the `common` static field and the `factory` instance
                         // field, both of which are populated by the
                         // ForkJoinPool static-initialization machinery
@@ -4884,7 +4884,7 @@ fn invoke_on_class_shared_inner(
                                 || method_name == "getCommonPoolParallelism"))
                         // T19_K3_PROPS_NATIVE_OVERRIDE: java.util.Properties
                         // {load, getProperty, setProperty, put, containsKey}
-                        // — the real JDK bytecode for `load(InputStream)`
+                        // вЂ” the real JDK bytecode for `load(InputStream)`
                         // funnels through `LineReader` + `loadConvert` +
                         // inherited `Hashtable.put`, which writes to our
                         // synthetic Properties object's inner Hashtable
@@ -4906,7 +4906,7 @@ fn invoke_on_class_shared_inner(
                                 | "put"
                                 | "containsKey"
                             ))
-                        // WP6.1: Provider.getEngineName(String) — the
+                        // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a
                         // static HashMap) which `Provider.<clinit>` would
                         // populate. We no-op that clinit (see
@@ -4923,7 +4923,7 @@ fn invoke_on_class_shared_inner(
                         native = true;
                     }
                     // C25: For abstract methods (e.g. Iterator.hasNext, Enumeration.hasMoreElements),
-                    // also check the receiver class's native registry — natives for synthetic
+                    // also check the receiver class's native registry вЂ” natives for synthetic
                     // wrapper classes (java/util/Enumeration$Impl) are registered on the
                     // wrapper class name, not on the interface. Without this, dispatch on
                     // an Enumeration$Impl receiver to Iterator.hasNext() resolves to the
@@ -4947,7 +4947,7 @@ fn invoke_on_class_shared_inner(
                 )
             }
             None => {
-                // Method not found in class hierarchy — try the native registry
+                // Method not found in class hierarchy вЂ” try the native registry
                 // as a fallback. This handles synthetic stub classes (JDK classes
                 // loaded without .class files) whose methods are all native.
                 // Walk the superclass chain so inherited native methods (e.g.
@@ -4975,7 +4975,7 @@ fn invoke_on_class_shared_inner(
                     return safe_native_call(shared, thread, callback, args);
                 }
 
-                // Signature-polymorphic methods (JVM spec §5.4.3.4):
+                // Signature-polymorphic methods (JVM spec В§5.4.3.4):
                 // MethodHandle.invoke / invokeExact / invokeWithArguments and
                 // VarHandle.get / set / compareAndSet etc. are called with the
                 // call-site descriptor, but registered with a generic one.
@@ -5241,7 +5241,7 @@ fn invoke_on_class_shared_inner(
                     _ => Ok(Some(Value::Int(0))),
                 }
             } else {
-                // In production mode, throw UnsatisfiedLinkError per JVM spec §5.3.5.
+                // In production mode, throw UnsatisfiedLinkError per JVM spec В§5.3.5.
                 Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::UnsatisfiedLinkError {
                         message: full_sig,
@@ -5283,7 +5283,7 @@ fn invoke_on_class_shared_inner(
     // --- ACC_SYNCHRONIZED: release monitor after execution ---
     // Release the monitor regardless of success or failure (including exceptions).
     if let Some(obj) = monitor_obj {
-        // We ignore exit errors here — the monitor should always be owned
+        // We ignore exit errors here вЂ” the monitor should always be owned
         // by this thread at this point.
         let _ = shared.monitors.exit(obj, thread.thread_id);
     }
@@ -5388,7 +5388,7 @@ mod tests {
     #[test]
     fn cas_mismatched_types() {
         // T19_H6: cross-primitive pairs now match by raw 64-bit bit
-        // pattern (CAS operates on bits — a long field whose tag drifted
+        // pattern (CAS operates on bits вЂ” a long field whose tag drifted
         // to Double must still compare equal). Int is zero-extended to
         // 64 bits before comparison.
         assert!(values_equal_for_cas(&Value::Int(0), &Value::Long(0)));
@@ -5406,13 +5406,13 @@ mod tests {
     /// instead of livelocking.
     #[test]
     fn cas_primitive_default_on_uninit_slot_is_equal_to_typed_zero() {
-        // Int(0) — the ConcurrentHashMap.sizeCtl case.
+        // Int(0) вЂ” the ConcurrentHashMap.sizeCtl case.
         assert!(values_equal_for_cas(&Value::Object(None), &Value::Int(0)));
         assert!(values_equal_for_cas(&Value::Int(0), &Value::Object(None)));
         // Long(0).
         assert!(values_equal_for_cas(&Value::Object(None), &Value::Long(0)));
         assert!(values_equal_for_cas(&Value::Long(0), &Value::Object(None)));
-        // Float(+0.0) and Double(+0.0) — only +0.0 matches, not -0.0.
+        // Float(+0.0) and Double(+0.0) вЂ” only +0.0 matches, not -0.0.
         assert!(values_equal_for_cas(&Value::Object(None), &Value::Float(0.0)));
         assert!(values_equal_for_cas(&Value::Float(0.0), &Value::Object(None)));
         assert!(values_equal_for_cas(&Value::Object(None), &Value::Double(0.0)));
@@ -5481,7 +5481,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // C7: unbox_poly_return — primitive return passthrough & void handling
+    // C7: unbox_poly_return вЂ” primitive return passthrough & void handling
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5955,7 +5955,7 @@ mod tests {
     }
 
     // =====================================================================
-    // T10.9.E — descriptor cache / descriptor-aware NativeContext::get_field
+    // T10.9.E вЂ” descriptor cache / descriptor-aware NativeContext::get_field
     // =====================================================================
 
     #[test]
@@ -5972,7 +5972,7 @@ mod tests {
     #[test]
     fn t10_9_e_resolve_descriptor_miss_for_unloaded_class() {
         let shared = test_shared();
-        // ClassId::new(9999) is not loaded — resolver returns None and does
+        // ClassId::new(9999) is not loaded вЂ” resolver returns None and does
         // not populate the cache.
         let before = shared.field_descriptor_cache.read().len();
         let result = resolve_field_descriptor_byte_cached(
@@ -6006,7 +6006,7 @@ mod tests {
         // Guard against regression: synthetic stub classes store
         // primitives into Object-descriptor'd slots. Descriptor-aware
         // coercion must NOT kick in for stubs, or panama/Unsafe/etc.
-        // would see `Value::Long(0) → Value::Object(None)` via the
+        // would see `Value::Long(0) в†’ Value::Object(None)` via the
         // `b'L'` arm.
         let shared = test_shared();
         // Register a synthetic stub so field_at_index resolves.
@@ -6032,7 +6032,7 @@ mod tests {
     }
 
     // =====================================================================
-    // T19_H6 — descriptor-aware CAS + cross-tag bit-pattern equivalence
+    // T19_H6 вЂ” descriptor-aware CAS + cross-tag bit-pattern equivalence
     // =====================================================================
 
     /// Register a real (non-stub) class carrying the listed instance
@@ -6096,6 +6096,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)
@@ -6173,7 +6174,7 @@ mod tests {
         );
     }
 
-    /// compare_and_swap_field on a double instance field — sanity that
+    /// compare_and_swap_field on a double instance field вЂ” sanity that
     /// double-typed fields still work after the cross-tag changes.
     #[test]
     fn t19_h6_cas_field_double_field_roundtrip() {
@@ -6201,7 +6202,7 @@ mod tests {
         assert_eq!(ctx.get_field_volatile(obj, 0), Value::Double(7.5));
     }
 
-    /// compare_and_swap_field on an int field — regression check that
+    /// compare_and_swap_field on an int field вЂ” regression check that
     /// the int CAS path still works after the descriptor-aware rewrite.
     #[test]
     fn t19_h6_cas_field_int_field_regression() {

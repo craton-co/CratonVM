@@ -1,7 +1,7 @@
-//! Class manager — loading, parsing, and caching of Java classes.
+//! Class manager вЂ” loading, parsing, and caching of Java classes.
 //!
 //! The `ClassManager` is the central component that:
-//! 1. Locates `.class` files via the parent-delegation model (bootstrap → extension → application)
+//! 1. Locates `.class` files via the parent-delegation model (bootstrap в†’ extension в†’ application)
 //! 2. Parses them via `rustjvm_reader::read_class`
 //! 3. Recursively loads superclasses and interfaces
 //! 4. Stores them in a `ClassStore` indexed by `ClassId`
@@ -20,8 +20,8 @@ use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use tracing::debug;
 
 use crate::class::{
-    Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, EnclosingMethodInfo,
-    InnerClassEntry, RecordComponentInfo,
+    ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
+    EnclosingMethodInfo, InnerClassEntry, RecordComponentInfo,
 };
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
@@ -33,7 +33,7 @@ use crate::module::{
 use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
 
 // ---------------------------------------------------------------------------
-// T6.3.1 — JVMTI class-lifecycle hook registry
+// T6.3.1 вЂ” JVMTI class-lifecycle hook registry
 // ---------------------------------------------------------------------------
 //
 // The class loader must notify JVMTI agents on two lifecycle events:
@@ -43,7 +43,7 @@ use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
 // `classloading` has no dependency on the VM crate where the JVMTI manager
 // lives, so the VM registers a pair of function pointers at boot time. When
 // no hook is registered the class loader's hot path pays a single
-// `AtomicBool` load and branches past the call — the cost of the hook is
+// `AtomicBool` load and branches past the call вЂ” the cost of the hook is
 // zero for embedded/test scenarios that do not attach an agent.
 //
 // The hooks receive `(class_id_u32, class_name, thread_id)`. Thread id is
@@ -63,7 +63,7 @@ static CLASS_LOAD_HOOK: OnceLock<JvmtiClassHook> = OnceLock::new();
 static CLASS_PREPARE_HOOK: OnceLock<JvmtiClassHook> = OnceLock::new();
 static CLASS_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Install the JVMTI `ClassLoad` hook. Idempotent — only the first install
+/// Install the JVMTI `ClassLoad` hook. Idempotent вЂ” only the first install
 /// wins. Called once by the VM during `SharedVm::new`.
 pub fn install_class_load_hook(hook: JvmtiClassHook) {
     if CLASS_LOAD_HOOK.set(hook).is_ok() {
@@ -102,7 +102,7 @@ fn fire_class_prepare_hook(class_id: u32, class_name: &str, thread_id: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// WP2.4-B — JVMTI ClassFileLoadHook hook registry
+// WP2.4-B вЂ” JVMTI ClassFileLoadHook hook registry
 // ---------------------------------------------------------------------------
 //
 // The JVMTI `ClassFileLoadHook` event fires whenever class bytes are about
@@ -114,7 +114,7 @@ fn fire_class_prepare_hook(class_id: u32, class_name: &str, thread_id: u64) {
 //
 // `Vec<u8>` is used instead of `&[u8]` for the return value so the hook can
 // hand back ownership of a freshly-allocated transformed buffer without a
-// borrow-vs-lifetime puzzle. An empty returned vec means "no transform —
+// borrow-vs-lifetime puzzle. An empty returned vec means "no transform вЂ”
 // keep the original new_bytes". The class loader detects this and skips
 // the substitution.
 
@@ -131,7 +131,7 @@ pub type ClassFileLoadHook = fn(u32, &str, &[u8], &[u8]) -> Option<Vec<u8>>;
 static CLASS_FILE_LOAD_HOOK: OnceLock<ClassFileLoadHook> = OnceLock::new();
 static CLASS_FILE_LOAD_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Install the JVMTI `ClassFileLoadHook`. Idempotent — only the first
+/// Install the JVMTI `ClassFileLoadHook`. Idempotent вЂ” only the first
 /// install wins. Called once by the VM during `SharedVm::new` if a JVMTI
 /// agent has registered for this event.
 pub fn install_class_file_load_hook(hook: ClassFileLoadHook) {
@@ -158,7 +158,7 @@ fn fire_class_file_load_hook(
     let hook = CLASS_FILE_LOAD_HOOK.get()?;
     let out = hook(class_id, class_name, old_bytes, new_bytes)?;
     if out.is_empty() {
-        // Hook returned an empty vec → "no transform". Treat as None so the
+        // Hook returned an empty vec в†’ "no transform". Treat as None so the
         // caller uses the original bytes (which are guaranteed non-empty
         // by the upstream `bytes.len() < 8` rejection).
         None
@@ -168,20 +168,20 @@ fn fire_class_file_load_hook(
 }
 
 // ---------------------------------------------------------------------------
-// WP2.4-B — JIT cache invalidation hook
+// WP2.4-B вЂ” JIT cache invalidation hook
 // ---------------------------------------------------------------------------
 //
 // When a class is redefined, every JIT-compiled body keyed on its old
 // (class_id, method_index) pair must be discarded so the next call
 // recompiles from the new bytecode. The VM owns the JIT cache; the class
-// loader knows when a redefine completes — a hook bridges the two.
+// loader knows when a redefine completes вЂ” a hook bridges the two.
 
 /// Signature of the JIT-invalidation hook fired by `redefine_class`.
 ///
 /// Parameter: the `ClassId` (as `u32`) whose JIT entries must be evicted.
 /// The VM-side adapter walks `shared.jit_cache`, `shared.tiered`, and any
 /// per-thread invoke caches that key by class id and removes matching
-/// entries. Method-index granularity is intentionally NOT exposed here —
+/// entries. Method-index granularity is intentionally NOT exposed here вЂ”
 /// at redefine time we conservatively evict every method body for the
 /// class because their bodies all changed.
 pub type JitInvalidateHook = fn(u32);
@@ -211,7 +211,7 @@ fn fire_jit_invalidate_hook(class_id: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// T10.5 — vtable install hook registry
+// T10.5 вЂ” vtable install hook registry
 // ---------------------------------------------------------------------------
 //
 // After a class is linked (after its methods are parsed and its superclass's
@@ -225,11 +225,11 @@ fn fire_jit_invalidate_hook(class_id: u32) {
 // re-walk the class_manager under any lock. This keeps the class-link path
 // and the vtable-install path fully decoupled.
 
-/// T10.9.A — dispatch-time snapshot carried inside each `VtableSlotDescriptor`.
+/// T10.9.A вЂ” dispatch-time snapshot carried inside each `VtableSlotDescriptor`.
 ///
 /// The link-time vtable installer captures everything the interpreter needs
 /// to execute a virtual call **without** re-entering `class_manager.read()`.
-/// A `None` variant means "no snapshot" (abstract or native method) — the
+/// A `None` variant means "no snapshot" (abstract or native method) вЂ” the
 /// caller falls through to the slower resolution path.
 ///
 /// Fields line up with `rustjvm_jit_api::CachedBytecodeMethod` so the VM
@@ -257,7 +257,7 @@ pub struct VtableMethodSnapshot {
     /// ACC_STATIC flag (always false for vtable slots, kept for parity
     /// with `CachedBytecodeMethod`).
     pub is_static: bool,
-    /// ACC_NATIVE flag — when true, `code` is empty and the interpreter
+    /// ACC_NATIVE flag вЂ” when true, `code` is empty and the interpreter
     /// must route through the native-method registry instead.
     pub is_native: bool,
 }
@@ -282,7 +282,7 @@ pub struct VtableSlotDescriptor {
     pub method_name: String,
     /// Method descriptor.
     pub descriptor: String,
-    /// T10.9.A — snapshot of everything the interpreter needs to execute
+    /// T10.9.A вЂ” snapshot of everything the interpreter needs to execute
     /// the method without re-entering the class manager. `None` for
     /// abstract methods (no Code attribute) or when the snapshot couldn't
     /// be built at link time (defensive fallback).
@@ -297,7 +297,7 @@ pub struct VtableSlotDescriptor {
 /// vec is fully self-contained.
 pub type VtableInstallHook = fn(u32, Vec<Option<VtableSlotDescriptor>>);
 
-/// T10.9.A — signature of the vtable-override hook.
+/// T10.9.A вЂ” signature of the vtable-override hook.
 ///
 /// Fired immediately after `VtableInstallHook` for each super-class slot
 /// that the newly defined class overrode. The hook drives
@@ -313,7 +313,7 @@ static VTABLE_INSTALL_HOOK: OnceLock<VtableInstallHook> = OnceLock::new();
 static VTABLE_OVERRIDE_HOOK: OnceLock<VtableOverrideHook> = OnceLock::new();
 static VTABLE_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Install the vtable-install hook. Idempotent — only the first install
+/// Install the vtable-install hook. Idempotent вЂ” only the first install
 /// wins. Called once by the VM during `SharedVm::new`.
 pub fn install_vtable_install_hook(hook: VtableInstallHook) {
     if VTABLE_INSTALL_HOOK.set(hook).is_ok() {
@@ -321,11 +321,11 @@ pub fn install_vtable_install_hook(hook: VtableInstallHook) {
     }
 }
 
-/// T10.9.A — install the vtable-override hook. Idempotent. Called once
+/// T10.9.A вЂ” install the vtable-override hook. Idempotent. Called once
 /// by the VM during `SharedVm::new` right after the install hook.
 pub fn install_vtable_override_hook(hook: VtableOverrideHook) {
     let _ = VTABLE_OVERRIDE_HOOK.set(hook);
-    // Share the HOOK_ACTIVE gate with the install hook — either hook
+    // Share the HOOK_ACTIVE gate with the install hook вЂ” either hook
     // registered is enough to turn on the check.
     VTABLE_HOOK_ACTIVE.store(true, Ordering::Release);
 }
@@ -343,7 +343,7 @@ fn fire_vtable_install_hook(class_id: u32, entries: Vec<Option<VtableSlotDescrip
     }
 }
 
-/// T10.9.A — Invoke the vtable-override hook if one is installed. Hot
+/// T10.9.A вЂ” Invoke the vtable-override hook if one is installed. Hot
 /// path is a single relaxed atomic load + branch when no hook is
 /// attached. Called by the class loader with each `(super_id, slot)`
 /// pair where a subclass just overrode an inherited method.
@@ -358,7 +358,7 @@ fn fire_vtable_override_hook(super_class_id: u32, slot: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// WP1.5 — built-in class-loader registration hook
+// WP1.5 вЂ” built-in class-loader registration hook
 // ---------------------------------------------------------------------------
 
 /// Boot-time hook that associates the three built-in class-loader names
@@ -373,7 +373,7 @@ fn fire_vtable_override_hook(super_class_id: u32, slot: usize) {
 /// `ClassLoaderId::BOOTSTRAP (0)` internally; the name registration
 /// merely increments a diagnostic counter that tests observe.
 ///
-/// Idempotent — safe to call from any number of initialization paths.
+/// Idempotent вЂ” safe to call from any number of initialization paths.
 pub fn register_builtin_classloaders() {
     crate::builtin_loaders::register_builtin_loader_aliases();
 }
@@ -422,7 +422,7 @@ pub struct DefineClassOptions {
     /// the redefinition to replace the old one in place. Used by
     /// `java.lang.instrument.Instrumentation.redefineClasses` (WP2.4).
     /// When `false` (default) a duplicate define returns
-    /// `LinkageError::IncompatibleClassChangeError` per JVMS §5.3.5.
+    /// `LinkageError::IncompatibleClassChangeError` per JVMS В§5.3.5.
     pub allow_redefine: bool,
     /// WP2.3: Nest-host attribution for hidden classes. When `Some`,
     /// the new class joins the named class's nest (i.e. its
@@ -435,7 +435,7 @@ pub struct DefineClassOptions {
 ///
 /// This is the JVMTI / JEP 109 in-place class redefinition entry point.
 /// `redefine_class` enforces strict structural equivalence (same name,
-/// superclass, interfaces, fields, and method declarations) — only
+/// superclass, interfaces, fields, and method declarations) вЂ” only
 /// method bodies, the constant pool, static initializers, and
 /// annotations may change. See the doc comment on
 /// [`ClassManager::redefine_class`] for the full constraint list.
@@ -447,7 +447,7 @@ pub struct RedefineOptions {
     /// Default: `false` (strict redefine).
     ///
     /// Even with this flag set, the new bytes MUST share the same
-    /// class name as the old class — replacing one class's bytes with
+    /// class name as the old class вЂ” replacing one class's bytes with
     /// another class's bytes is never legal under JEP 109.
     pub skip_structural_check: bool,
     /// Trace-flag for diagnostics. When `true`, the redefine path
@@ -459,28 +459,28 @@ pub struct RedefineOptions {
 /// Manages class loading for the VM.
 ///
 /// Maintains the `ClassStore` (all loaded classes), three built-in class finders
-/// (bootstrap, extension, application), and a `(loader_id, name) → ClassId` cache.
+/// (bootstrap, extension, application), and a `(loader_id, name) в†’ ClassId` cache.
 /// Loading a class follows the parent delegation model and automatically loads
 /// its superclass and interfaces recursively.
 pub struct ClassManager {
     /// Storage for all loaded classes (shared across all loaders).
     pub class_store: ClassStore,
 
-    /// Bootstrap class finder — loads from rt.jar / boot classpath.
+    /// Bootstrap class finder вЂ” loads from rt.jar / boot classpath.
     bootstrap: BootstrapClassFinder,
 
-    /// Extension class finder — loads from $JAVA_HOME/lib/ext.
+    /// Extension class finder вЂ” loads from $JAVA_HOME/lib/ext.
     extension: ExtensionClassFinder,
 
-    /// Application class finder — loads from the -classpath.
+    /// Application class finder вЂ” loads from the -classpath.
     application: ApplicationClassFinder,
 
-    /// (loader_id, name) → ClassId cache.
+    /// (loader_id, name) в†’ ClassId cache.
     /// T10.9.B: FxHashMap for internal hot-path lookups (keys are internal
     /// class names, never untrusted user input).
     loaded_classes: FxHashMap<(ClassLoaderId, String), ClassId>,
 
-    /// Fast name→ClassId lookup (hash-keyed, zero-allocation on lookup).
+    /// Fast nameв†’ClassId lookup (hash-keyed, zero-allocation on lookup).
     /// Populated alongside loaded_classes.
     name_to_id: FxHashMap<u64, ClassId>,
 
@@ -489,23 +489,23 @@ pub struct ClassManager {
 
     /// Raw class file bytes for each loaded class, keyed by internal name.
     /// Populated during define_class() for CDS dump support.
-    /// T10.9.B: FxHashMap — keys are class-file internal names.
+    /// T10.9.B: FxHashMap вЂ” keys are class-file internal names.
     pub class_bytes_cache: FxHashMap<String, Vec<u8>>,
 
     /// CDS-cached class bytes: class name -> raw .class bytes.
     /// Populated from the CDS archive at startup, checked before classpath delegation.
-    /// T10.9.B: FxHashMap — keys are internal class names loaded from a trusted
+    /// T10.9.B: FxHashMap вЂ” keys are internal class names loaded from a trusted
     /// CDS archive produced by this VM.
     pub cds_class_cache: FxHashMap<String, Vec<u8>>,
 
     /// Guard set for classes currently being loaded by `define_class`.
     /// If `load_class` encounters a class name already in this set, it means
     /// we have a circular class hierarchy (A extends B extends A) which is
-    /// forbidden by the JVM spec (§5.3.5).
-    /// T10.9.B: FxHashSet — keys are internal class names during loading.
+    /// forbidden by the JVM spec (В§5.3.5).
+    /// T10.9.B: FxHashSet вЂ” keys are internal class names during loading.
     loading_guard: FxHashSet<String>,
 
-    /// T10.5 — per-class vtable descriptor layout, indexed by ClassId.
+    /// T10.5 вЂ” per-class vtable descriptor layout, indexed by ClassId.
     /// Populated by `define_class_with_options` at link time and used by
     /// subclasses of the same class as the "parent vtable" when computing
     /// their own layout. The VM's installed `VtableInstallHook` receives a
@@ -516,12 +516,12 @@ pub struct ClassManager {
     /// for classes loaded by many different classloaders.
     vtable_descriptors: HashMap<ClassId, Vec<Option<VtableSlotDescriptor>>>,
 
-    /// WP2.3 — per-class "skip bytecode verification" flag, recorded when
+    /// WP2.3 вЂ” per-class "skip bytecode verification" flag, recorded when
     /// `define_class_with_options` is called with
     /// `DefineClassOptions::skip_verification = true`. Stored as a side
     /// table (rather than a field on `Class`) so that VM-side construction
     /// sites that build `Class` directly do not need to know about the
-    /// flag — only callers that route through `define_class_with_options`
+    /// flag вЂ” only callers that route through `define_class_with_options`
     /// (the hidden-class / runtime-bytecode-generation entry points) ever
     /// set it.  The verifier reads this through
     /// `class_skip_bytecode_verification(class_id)`.
@@ -533,14 +533,14 @@ pub struct ClassManager {
     /// HotSpot likewise does for trusted hidden classes).
     skip_bytecode_verification: FxHashSet<ClassId>,
 
-    /// WP2.3 — counter used to mangle hidden-class names when the
+    /// WP2.3 вЂ” counter used to mangle hidden-class names when the
     /// caller-supplied `override_name` collides with an already-loaded
     /// class. The counter is monotonic across the whole class manager so
     /// that `Foo/0x1`, `Foo/0x2`, ... never collide even across many
     /// hidden defines of the same template.
     hidden_name_counter: u64,
 
-    /// WP2.4-B — JEP 109 / JVMTI `RedefineClasses` generation counter,
+    /// WP2.4-B вЂ” JEP 109 / JVMTI `RedefineClasses` generation counter,
     /// keyed by [`ClassId`].  Bumped by [`ClassManager::redefine_class`]
     /// on each successful redefinition; never decremented.  Caches that
     /// snapshot a method-resolution at lookup time stamp the generation
@@ -550,7 +550,7 @@ pub struct ClassManager {
     ///
     /// Stored on the manager (not on `Class`) so existing `Class`
     /// construction sites in tests and bench fixtures don't need to be
-    /// touched.  An entry is created lazily — a class that has never
+    /// touched.  An entry is created lazily вЂ” a class that has never
     /// been redefined returns generation 0 from
     /// [`ClassManager::class_redefine_generation`] without allocating.
     /// The `Arc` is intentional: `class_redefine_generation_handle`
@@ -558,7 +558,7 @@ pub struct ClassManager {
     /// counter and check it later without reborrowing the
     /// [`ClassManager`].
     ///
-    /// WP2.4-F1 — wrapped in a `RwLock` so the hot per-thread invoke-cache
+    /// WP2.4-F1 вЂ” wrapped in a `RwLock` so the hot per-thread invoke-cache
     /// populate path can acquire a handle through a `&ClassManager`
     /// borrow (which is what `shared.class_manager.read()` provides) and
     /// share the *same* `Arc<AtomicU32>` that `redefine_class` will
@@ -692,7 +692,7 @@ impl ClassManager {
     /// native registrations rather than real JDK bytecode.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         if let Some(id) = self.get_loaded_class_id(name) {
-            // Already loaded — check if it's a real class with more fields.
+            // Already loaded вЂ” check if it's a real class with more fields.
             // If so, we can't replace it (other code may hold references).
             // For the System.out bootstrap, the caller handles this by
             // checking the field count before calling us.
@@ -731,6 +731,7 @@ impl ClassManager {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         };
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
@@ -747,7 +748,7 @@ impl ClassManager {
     /// List all JMOD module names on the boot classpath.
     ///
     /// Returns module names extracted from JMOD file stems
-    /// (e.g. `java.base.jmod` → `"java.base"`).
+    /// (e.g. `java.base.jmod` в†’ `"java.base"`).
     pub fn list_boot_modules(&self) -> Vec<String> {
         self.bootstrap.class_path().list_jmod_modules()
     }
@@ -801,7 +802,7 @@ impl ClassManager {
             "java/util/Iterator",
         ];
 
-        // Extended classes — loaded after core to provide common stdlib bytecode
+        // Extended classes вЂ” loaded after core to provide common stdlib bytecode
         let extended_classes = [
             "java/lang/Math",
             "java/lang/StrictMath",
@@ -846,7 +847,7 @@ impl ClassManager {
             "java/lang/AutoCloseable",
         ];
 
-        // Tier 3: Exception hierarchy — needed for catch handlers in real bytecode
+        // Tier 3: Exception hierarchy вЂ” needed for catch handlers in real bytecode
         let exception_classes = [
             "java/lang/NullPointerException",
             "java/lang/ArithmeticException",
@@ -1110,9 +1111,26 @@ impl ClassManager {
     ///
     /// Uses the parent delegation model:
     /// 1. Check if already loaded by any loader
-    /// 2. Ask bootstrap → extension → application to find the class
+    /// 2. Ask bootstrap в†’ extension в†’ application to find the class
     /// 3. Parse, recursively load superclass/interfaces, and register
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+        // RKC16N.3 — Array class fast path.
+        //
+        // Per JVMS §5.3.3 the bootstrap class loader synthesises array
+        // classes from their resolved component class — never by reading
+        // a `.class` file from the classpath. Without this fast path
+        // names like `[Ljava/util/HashMap;` would scan every JMOD/JAR on
+        // the classpath, miss, and fall through to the generic JDK
+        // synthetic-stub branch — losing the component-type linkage and
+        // re-running the I/O on every `Class.forName` call.
+        //
+        // We dispatch on the name prefix BEFORE the cache check so a
+        // pre-existing generic synthetic stub (left over from an older
+        // load through the JMOD-scan fallback) is replaced in place with
+        // a properly-shaped array class.
+        if name.starts_with('[') {
+            return self.resolve_or_synthesise_array_class(name);
+        }
         // Fast path: zero-allocation hash lookup via name_to_id
         if let Some(id) = self.get_loaded_class_id(name) {
             // If the class is a synthetic stub (no methods, no bytecode), try
@@ -1152,17 +1170,17 @@ impl ClassManager {
 
         debug!(class = name, "Loading class (parent delegation)");
 
-        // Parent delegation: try bootstrap → extension → application
+        // Parent delegation: try bootstrap в†’ extension в†’ application
         match self.find_class_bytes_delegated(name) {
             Ok((bytes, loader_id)) => {
                 // Parse and register with the loader that found it
                 self.define_class(name, &bytes, loader_id)
             }
             Err(_) if is_jdk_class(name) => {
-                // JDK class not found as a .class file — create a synthetic stub.
+                // JDK class not found as a .class file вЂ” create a synthetic stub.
                 // Our VM handles JDK classes natively, so we just need a minimal
                 // entry in the ClassStore for the type system to work.
-                debug!(class = name, "Falling back to synthetic stub — class not found in any classpath");
+                debug!(class = name, "Falling back to synthetic stub вЂ” class not found in any classpath");
                 self.create_synthetic_stub(name)
             }
             Err(e) => Err(e),
@@ -1171,7 +1189,7 @@ impl ClassManager {
 
     /// Find class bytes using parent delegation.
     fn find_class_bytes_delegated(&self, name: &str) -> Result<(Vec<u8>, ClassLoaderId), VmError> {
-        // CDS archive check — fastest path
+        // CDS archive check вЂ” fastest path
         if let Some(bytes) = self.cds_class_cache.get(name) {
             return Ok((bytes.clone(), ClassLoaderId::Bootstrap));
         }
@@ -1252,7 +1270,7 @@ impl ClassManager {
         // WP2.3: Class-name match check. If the caller asked for class
         // `name` but the class file's `this_class` says something
         // else, the JVMS requires a `NoClassDefFoundError`
-        // (§5.3.5#3.b). The `override_name` option (used by hidden
+        // (В§5.3.5#3.b). The `override_name` option (used by hidden
         // classes) bypasses this check because it deliberately mangles
         // the registered name.
         if options.override_name.is_none() && !name.is_empty() && class_file.this_class != name {
@@ -1317,7 +1335,7 @@ impl ClassManager {
             }
         };
 
-        // Loading guard no longer needed — class will be registered below
+        // Loading guard no longer needed вЂ” class will be registered below
         self.loading_guard.remove(name);
 
         // Sealed class enforcement (JEP 409, Java 17+):
@@ -1392,7 +1410,7 @@ impl ClassManager {
             }
         }
 
-        // Extract Signature attribute (JVMS §4.7.9)
+        // Extract Signature attribute (JVMS В§4.7.9)
         let signature = class_file.attributes.iter().find_map(|a| match a {
             Attribute::Signature(s) => Some(s.clone()),
             _ => None,
@@ -1472,7 +1490,7 @@ impl ClassManager {
             })
             .unwrap_or_default();
 
-        // Extract InnerClasses attribute (JVMS §4.7.6)
+        // Extract InnerClasses attribute (JVMS В§4.7.6)
         let inner_classes = class_file
             .attributes
             .iter()
@@ -1517,7 +1535,7 @@ impl ClassManager {
             })
             .unwrap_or_default();
 
-        // Extract EnclosingMethod attribute (JVMS §4.7.7)
+        // Extract EnclosingMethod attribute (JVMS В§4.7.7)
         let enclosing_method = class_file.attributes.iter().find_map(|a| match a {
             Attribute::EnclosingMethod {
                 class_index,
@@ -1609,7 +1627,7 @@ impl ClassManager {
             .unwrap_or_else(|| class_file.this_class.clone());
         if options.hidden {
             // The probe of duplicates must consider the (loader, name)
-            // composite key — two hidden classes with the same internal
+            // composite key вЂ” two hidden classes with the same internal
             // name in different loaders are fine.
             let mut probe_name = stored_name.clone();
             while self.loaded_classes.contains_key(&(loader_id, probe_name.clone())) {
@@ -1622,7 +1640,7 @@ impl ClassManager {
         // WP2.3: prefer caller-supplied CodeSource (from
         // `defineClass(... ProtectionDomain pd)`) over classpath
         // discovery. If neither is available (a class generated entirely
-        // in memory — e.g. CGLIB / ByteBuddy / dynamic proxies) we
+        // in memory вЂ” e.g. CGLIB / ByteBuddy / dynamic proxies) we
         // synthesize a stable `file:/runtime-defined/<class>.class` URL
         // so `Class.code_source` is *non-null* on every defined class.
         //
@@ -1631,7 +1649,7 @@ impl ClassManager {
         // unconditionally; if our `getProtectionDomain0()` native
         // returns null (which it does when `Class.code_source` is None)
         // any subsequent `pd.getCodeSource()` invocation NPEs with
-        // "Cannot invoke getCodeSource on null" — exactly the pre-fix
+        // "Cannot invoke getCodeSource on null" вЂ” exactly the pre-fix
         // behaviour observed by `apps/cglib_probe/cglib.trace.log`.
         //
         // A `file:/` URL satisfies the native's "non-bootstrap" filter
@@ -1671,11 +1689,11 @@ impl ClassManager {
             loader_id,
             // Intern the class name through the global pool. If the reader
             // already interned this exact `this_class` string (the common
-            // path), this is a hash-lookup + refcount bump — no allocation.
+            // path), this is a hash-lookup + refcount bump вЂ” no allocation.
             name: rustjvm_types::intern_arc(&stored_name),
             source_file,
             version: class_file.version,
-            // CDS-loaded classes are pre-verified — skip straight to Verified state.
+            // CDS-loaded classes are pre-verified вЂ” skip straight to Verified state.
             state: if self.cds_class_cache.contains_key(name) {
                 ClassState::Verified
             } else {
@@ -1710,10 +1728,11 @@ impl ClassManager {
             is_synthetic_stub: false,
             has_finalizer: false, // computed below
             code_source,
+            array_info: None,
         };
 
         // Compute has_finalizer: true if this class or any ancestor
-        // overrides Object.finalize() (JLS §12.6).
+        // overrides Object.finalize() (JLS В§12.6).
         let self_declares = class.declares_finalize();
         let parent_has = superclass_id
             .and_then(|sid| self.class_store.get(sid))
@@ -1764,7 +1783,7 @@ impl ClassManager {
         let class_id_for_hook = id.as_u32();
         self.class_store.add(class);
 
-        // T10.5 — Build this class's vtable descriptor layout, cache it on
+        // T10.5 вЂ” Build this class's vtable descriptor layout, cache it on
         // `self.vtable_descriptors`, and fire the install hook so the VM
         // side can populate its `VtableManager`.
         //
@@ -1783,7 +1802,7 @@ impl ClassManager {
             self.build_vtable_descriptors_with_overrides(id, superclass_id);
         self.vtable_descriptors.insert(id, entries.clone());
         fire_vtable_install_hook(class_id_for_hook, entries);
-        // T10.9.A — fire CHA override signals for each super-class slot
+        // T10.9.A вЂ” fire CHA override signals for each super-class slot
         // that this class replaced. The VM-side listener calls
         // `VtableManager::invalidate_for_override` so stale cached
         // dispatch entries (thread-local invoke_cache or promoted
@@ -1792,12 +1811,12 @@ impl ClassManager {
             fire_vtable_override_hook(super_id, slot);
         }
 
-        // T6.3.1 — Fire the JVMTI ClassLoad hook. The VM's JvmtiEventManager
+        // T6.3.1 вЂ” Fire the JVMTI ClassLoad hook. The VM's JvmtiEventManager
         // snapshots the attached-env list under its own lock; it never
         // re-enters the class manager, so it is safe to call from inside
         // `&mut self`. We still release the caller's class-manager write
         // lock at the outer callsite before agent callbacks run for any
-        // slower path that needs it — here, the define_class path only
+        // slower path that needs it вЂ” here, the define_class path only
         // mutates `self`, so dropping is not needed.
         //
         // ClassPrepare is fired after linking/verification completes. For
@@ -1812,7 +1831,7 @@ impl ClassManager {
         Ok(id)
     }
 
-    /// T10.5 — build the vtable descriptor vec for `class_id`.
+    /// T10.5 вЂ” build the vtable descriptor vec for `class_id`.
     ///
     /// Standard single-inheritance walk:
     /// - seed with a clone of the superclass's descriptor vec (empty for
@@ -1828,7 +1847,7 @@ impl ClassManager {
     ///
     /// Returns an owned vec; caller is responsible for storing/forwarding.
     ///
-    /// T10.9.A — also returns the list of `(super_class_id, slot)` pairs that
+    /// T10.9.A вЂ” also returns the list of `(super_class_id, slot)` pairs that
     /// were overridden by this class. The VM-side CHA listener uses this to
     /// invalidate super's cached dispatch entries.
     fn build_vtable_descriptors(
@@ -1839,7 +1858,7 @@ impl ClassManager {
         self.build_vtable_descriptors_with_overrides(class_id, superclass_id).0
     }
 
-    /// T10.9.A — same as `build_vtable_descriptors` but also returns the
+    /// T10.9.A вЂ” same as `build_vtable_descriptors` but also returns the
     /// list of super-class slots this class overrode. Each pair is
     /// `(super_class_id_u32, slot_index)`. Used by the class-link path
     /// to fire CHA-invalidation signals on the super's cached vtable
@@ -1881,7 +1900,7 @@ impl ClassManager {
         let class_id_u32 = class_id.as_u32();
         let super_u32 = superclass_id.map(|s| s.as_u32());
 
-        // T10.9.A — record each super-class slot index that this class
+        // T10.9.A вЂ” record each super-class slot index that this class
         // overrides so the VM-side hook can fire the CHA invalidation.
         let mut overrides: Vec<(u32, usize)> = Vec::new();
 
@@ -1902,7 +1921,7 @@ impl ClassManager {
 
             let key = (method.name.to_string(), method.descriptor.to_string());
 
-            // T10.9.A — snapshot the method's Code attribute + flags at
+            // T10.9.A вЂ” snapshot the method's Code attribute + flags at
             // link time. `None` when the method has no Code (abstract)
             // or when it's native (no bytecode). Native methods still
             // populate the slot so name-based lookup succeeds; the
@@ -1945,7 +1964,7 @@ impl ClassManager {
                 })
             } else {
                 // Non-abstract, non-native method without a Code
-                // attribute — this is a spec violation but we stay
+                // attribute вЂ” this is a spec violation but we stay
                 // defensive and leave `dispatch = None` so the slow
                 // path kicks in.
                 None
@@ -1960,7 +1979,7 @@ impl ClassManager {
             };
 
             if let Some(&slot) = name_to_slot.get(&key) {
-                // Override inherited slot in place — same slot index so
+                // Override inherited slot in place вЂ” same slot index so
                 // that subclass dispatch remains index-stable across
                 // further inheritance. Record the super's slot for CHA
                 // invalidation.
@@ -1979,7 +1998,7 @@ impl ClassManager {
         (entries, overrides)
     }
 
-    /// T10.5 — read-only view of a class's vtable descriptor layout.
+    /// T10.5 вЂ” read-only view of a class's vtable descriptor layout.
     ///
     /// Used by tests and by any caller that needs to inspect the
     /// descriptor vec without going through the VM's installed hook.
@@ -2004,7 +2023,7 @@ impl ClassManager {
 
     /// Find a raw classpath resource by name.
     ///
-    /// Searches all classpaths in order (bootstrap → extension → application).
+    /// Searches all classpaths in order (bootstrap в†’ extension в†’ application).
     /// Returns the raw bytes of the first match, or `None` if not found.
     pub fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
         self.bootstrap.class_path().find_resource(name)
@@ -2015,7 +2034,7 @@ impl ClassManager {
     /// Return a URL string for every classpath entry that contains a resource
     /// with the given name. Searches bootstrap, extension, and application
     /// classpaths in order and concatenates the results. Analog of
-    /// `ClassLoader.getResources` — enumerates every match rather than
+    /// `ClassLoader.getResources` вЂ” enumerates every match rather than
     /// stopping at the first.
     pub fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
         let mut out = self.bootstrap.class_path().find_all_resource_urls(name);
@@ -2026,7 +2045,7 @@ impl ClassManager {
 
     /// Find the filesystem path of the classpath entry that holds a given
     /// class.  Used by `Class.getProtectionDomain()` to build a CodeSource
-    /// with a real location URL.  Searches application → extension → bootstrap.
+    /// with a real location URL.  Searches application в†’ extension в†’ bootstrap.
     pub fn find_class_source_path(&self, class_name: &str) -> Option<String> {
         self.application.class_path().find_class_source_path(class_name)
             .or_else(|| self.extension.class_path().find_class_source_path(class_name))
@@ -2035,8 +2054,8 @@ impl ClassManager {
 
     /// Build a real `CodeSource` for a given class by locating its origin
     /// classpath entry and, if that entry is a signed JAR, extracting the
-    /// signer certificate blocks from `META-INF`.  Searches application →
-    /// extension → bootstrap; returns `None` if the class is a synthetic
+    /// signer certificate blocks from `META-INF`.  Searches application в†’
+    /// extension в†’ bootstrap; returns `None` if the class is a synthetic
     /// stub or lives in a JMOD/jimage module.
     pub fn find_class_code_source(&self, class_name: &str) -> Option<CodeSource> {
         let (url, certs) = self
@@ -2048,27 +2067,27 @@ impl ClassManager {
         Some(CodeSource::new(Some(url), certs))
     }
 
-    /// WP2.3 — query whether a class was registered with
+    /// WP2.3 вЂ” query whether a class was registered with
     /// `DefineClassOptions::skip_verification = true`.
     ///
     /// Used by the VM's link-time verifier to bypass Pass-3 bytecode
     /// type-checking for trusted hidden / runtime-generated classes
     /// (JDK Proxy, ByteBuddy, CGLIB) that pass JVMS structural rules
     /// but emit synthesised stack frames that our verifier does not
-    /// model.  Default `false` — every other class is verified.
+    /// model.  Default `false` вЂ” every other class is verified.
     pub fn class_skip_bytecode_verification(&self, class_id: ClassId) -> bool {
         self.skip_bytecode_verification.contains(&class_id)
     }
 
     // -------------------------------------------------------------------
-    // WP2.4-B — JEP 109 / JVMTI RedefineClasses
+    // WP2.4-B вЂ” JEP 109 / JVMTI RedefineClasses
     // -------------------------------------------------------------------
 
-    /// WP2.4-B — current redefinition generation for a class. Starts
+    /// WP2.4-B вЂ” current redefinition generation for a class. Starts
     /// at 0 for every freshly-defined class and increments by 1 on
     /// each successful [`Self::redefine_class`]. Caches that key
     /// entries by [`ClassId`] should snapshot this value at insert
-    /// time and invalidate the entry on mismatch — that's cheaper than
+    /// time and invalidate the entry on mismatch вЂ” that's cheaper than
     /// walking every cache at redefine time.
     pub fn class_redefine_generation(&self, class_id: ClassId) -> u32 {
         self.redefine_generations
@@ -2079,7 +2098,7 @@ impl ClassManager {
             .unwrap_or(0)
     }
 
-    /// WP2.4-B — return a shared [`Arc<AtomicU32>`] handle to the
+    /// WP2.4-B вЂ” return a shared [`Arc<AtomicU32>`] handle to the
     /// generation counter for `class_id`. Callers (JIT cache, invoke
     /// cache) hold the handle and re-check on each cache hit; the
     /// counter outlives the [`ClassManager`] borrow because it's
@@ -2090,7 +2109,7 @@ impl ClassManager {
     /// handle whose value is 0; the next `redefine_class` will bump
     /// it without re-allocating.
     ///
-    /// WP2.4-F1 — takes `&self` (was `&mut self`) so the per-thread
+    /// WP2.4-F1 вЂ” takes `&self` (was `&mut self`) so the per-thread
     /// invoke-cache populate path can acquire a handle while only
     /// holding `class_manager.read()`.  The internal lock guards lazy
     /// insertion; the returned `Arc` outlives the lock guard.
@@ -2120,7 +2139,7 @@ impl ClassManager {
         )
     }
 
-    /// WP2.4-B — JEP 109 + JVMTI `RedefineClasses` semantics. Replace
+    /// WP2.4-B вЂ” JEP 109 + JVMTI `RedefineClasses` semantics. Replace
     /// the bytecode of `class_id` with `new_bytes`, leaving the class
     /// identity, vtable layout, field set, and existing instances
     /// untouched.
@@ -2147,7 +2166,7 @@ impl ClassManager {
     /// * Each method's `Code` and `RuntimeVisibleAnnotations` (etc.)
     ///   attributes are replaced with the new ones. Non-`Code`
     ///   non-annotation attributes (e.g. `Exceptions`,
-    ///   `MethodParameters`) are also replaced — they're metadata
+    ///   `MethodParameters`) are also replaced вЂ” they're metadata
     ///   that has no observable runtime effect on existing
     ///   in-flight frames.
     /// * The class's constant pool, bootstrap_methods, and
@@ -2225,7 +2244,7 @@ impl ClassManager {
                     .unwrap_or_default(),
                 None => String::new(),
             };
-            // Direct interfaces — internal names in declaration order.
+            // Direct interfaces вЂ” internal names in declaration order.
             let iface_names: Vec<String> = cls
                 .interfaces
                 .iter()
@@ -2258,7 +2277,7 @@ impl ClassManager {
         // return its own transformed buffer. We grab the old bytes
         // from `class_bytes_cache`; if not present (synthetic stub or
         // old code path that never recorded them) we pass an empty
-        // slice — JVMTI agents tolerate that.
+        // slice вЂ” JVMTI agents tolerate that.
         let old_bytes_opt = self.class_bytes_cache.get(&existing_name).cloned();
         let old_bytes_slice: &[u8] = old_bytes_opt.as_deref().unwrap_or(&[]);
         let class_id_u32 = class_id.as_u32();
@@ -2293,7 +2312,7 @@ impl ClassManager {
 
         // ---- Step 4: structural-equivalence checks (skippable) ----
         if !options.skip_structural_check {
-            // 4a — superclass name match.
+            // 4a вЂ” superclass name match.
             let new_super_name = new_class_file
                 .super_class
                 .clone()
@@ -2316,7 +2335,7 @@ impl ClassManager {
                     ),
                 });
             }
-            // 4b — interface list (counts, order, names).
+            // 4b вЂ” interface list (counts, order, names).
             if new_class_file.interfaces.len() != existing_iface_names.len() {
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
@@ -2341,7 +2360,7 @@ impl ClassManager {
                     });
                 }
             }
-            // 4c — field set (counts, order, name+desc+modifiers).
+            // 4c вЂ” field set (counts, order, name+desc+modifiers).
             if new_class_file.fields.len() != existing_field_sigs.len() {
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
@@ -2373,7 +2392,7 @@ impl ClassManager {
                     });
                 }
             }
-            // 4d — method declarations (counts, order, name+desc+modifiers).
+            // 4d вЂ” method declarations (counts, order, name+desc+modifiers).
             if new_class_file.methods.len() != existing_method_sigs.len() {
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
@@ -2414,7 +2433,7 @@ impl ClassManager {
         // then drop it before firing hooks (which can re-enter the
         // loader).
         if options.log_diff {
-            // Best-effort diagnostic — list any methods whose code
+            // Best-effort diagnostic вЂ” list any methods whose code
             // attribute bytes differ. Cheap because we already have
             // both the old and the new method vecs in scope.
             // (Using only the existing/new method indices; the new
@@ -2478,7 +2497,7 @@ impl ClassManager {
         // is_synthetic_stub, has_finalizer, code_source, nest_host,
         // nest_members, record_components, permitted_subclasses,
         // inner_classes, enclosing_method, version, state, and
-        // initializing_thread are all PRESERVED — JEP 109 forbids
+        // initializing_thread are all PRESERVED вЂ” JEP 109 forbids
         // changing any of them.
         {
             let cls = self.class_store.get_mut(class_id).ok_or_else(|| {
@@ -2495,7 +2514,7 @@ impl ClassManager {
                 cls.source_file = new_source_file;
             }
         }
-        // Forget the borrow — the rest of this function is hooks +
+        // Forget the borrow вЂ” the rest of this function is hooks +
         // bookkeeping that may re-enter the manager.
         let _ = existing_loader; // silence unused warning if no read below
 
@@ -2568,7 +2587,7 @@ impl ClassManager {
     }
 
     /// Find a class by name. Searches all loaders in priority order
-    /// (bootstrap → extension → application).
+    /// (bootstrap в†’ extension в†’ application).
     ///
     /// Returns `None` if the class hasn't been loaded by any loader.
     pub fn find_class_by_name(&self, name: &str) -> Option<ClassId> {
@@ -2591,7 +2610,7 @@ impl ClassManager {
     }
 
     /// Find a class by name within a specific loader's namespace, with delegation
-    /// fallback to the standard loader chain (Bootstrap → Extension → Application).
+    /// fallback to the standard loader chain (Bootstrap в†’ Extension в†’ Application).
     pub fn find_class_by_name_in_loader(&self, name: &str, loader_id: ClassLoaderId) -> Option<ClassId> {
         // Check the specific loader first
         if let Some(&id) = self.loaded_classes.get(&(loader_id, name.to_string())) {
@@ -2623,7 +2642,7 @@ impl ClassManager {
         self.class_store.len()
     }
 
-    /// Register a class name → id mapping for a given loader.
+    /// Register a class name в†’ id mapping for a given loader.
     ///
     /// This is primarily used by test code that manually inserts classes
     /// into the `ClassStore` and needs `find_class_by_name` to work.
@@ -2631,6 +2650,267 @@ impl ClassManager {
         self.loaded_classes
             .insert((loader_id, name.to_string()), id);
         self.name_to_id.insert(class_name_hash(name), id);
+    }
+
+    // -----------------------------------------------------------------
+    // RKC16N.3 — Reference-array class synthesis (no classpath I/O).
+    //
+    // Per JVMS §5.3.3 the bootstrap class loader synthesises array
+    // classes from their resolved component class — never from a
+    // `.class` file. Per JLS §10.7 every array class:
+    //   * has `java.lang.Object` as its (direct) superclass,
+    //   * implements `java.lang.Cloneable` and `java.io.Serializable`,
+    //   * has a public, final, abstract access flag set.
+    //
+    // We mark the class `is_synthetic_stub = true` so existing logic
+    // that special-cases stubs (no real bytecode methods, no field
+    // layout, no `<clinit>`, etc.) continues to work; the additional
+    // `array_info` field carries the component-type linkage that the
+    // generic JDK stub fallback was discarding.
+    //
+    // Cache key: the array's full binary name. `load_class("[Lx;")` is
+    // idempotent — two calls return the same `ClassId`.
+    // -----------------------------------------------------------------
+
+    /// RKC16N.3 — Resolve an array class by name. Synthesised on demand
+    /// from the resolved component class with no classpath I/O.
+    fn resolve_or_synthesise_array_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+        debug_assert!(name.starts_with('['), "array fast path called with non-array name");
+
+        // Cache hit for an array class already shaped with array_info —
+        // return it as-is.
+        if let Some(id) = self.get_loaded_class_id(name) {
+            let already_array = self
+                .class_store
+                .get(id)
+                .map(|c| c.array_info.is_some())
+                .unwrap_or(false);
+            if already_array {
+                return Ok(id);
+            }
+            // A previous load went through the JMOD-scan + generic
+            // synthetic-stub fallback. We fall through to (re)build the
+            // array shape and patch the existing `Class` in place so
+            // every prior reference to `id` keeps pointing at a valid
+            // entry — no orphaned `ClassId`s.
+        }
+
+        // Recursion / re-entry guard. Without this two threads (or one
+        // re-entrant load) racing on the same array name could double-
+        // synthesise.
+        if self.loading_guard.contains(name) {
+            return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: name.to_string(),
+                message: format!(
+                    "circular array-class hierarchy detected: {} is already being loaded",
+                    name
+                ),
+            }));
+        }
+        self.loading_guard.insert(name.to_string());
+
+        let result = self.synthesise_array_class_inner(name);
+        self.loading_guard.remove(name);
+        result
+    }
+
+    fn synthesise_array_class_inner(&mut self, name: &str) -> Result<ClassId, VmError> {
+        // Step 1: Resolve the IMMEDIATE component type.
+        // For `[X` (where X starts with `[` or `L` or is a primitive
+        // letter) this is the descriptor minus the leading `[`.
+        let component_descriptor = &name[1..];
+
+        let (component_class_id, component_dim) = if component_descriptor.starts_with('[') {
+            // Recurse: nested array such as `[[I`. Resolves the inner
+            // `[I` first, which in turn resolves the primitive `int`.
+            let inner_id = self.load_class(component_descriptor)?;
+            let inner_dim = self
+                .class_store
+                .get(inner_id)
+                .and_then(|c| c.array_info.as_ref().map(|ai| ai.array_dimension))
+                .unwrap_or(0);
+            (inner_id, inner_dim)
+        } else if component_descriptor.starts_with('L') && component_descriptor.ends_with(';') {
+            // Reference component, e.g. `Ljava/util/HashMap;` — strip
+            // the `L` prefix and the trailing `;` and recursively
+            // resolve.  This is the path that previously triggered the
+            // JMOD-scan fallback for inner classes.
+            let inner_name = &component_descriptor[1..component_descriptor.len() - 1];
+            let inner_id = self.load_class(inner_name)?;
+            (inner_id, 0)
+        } else if component_descriptor.len() == 1 {
+            // Primitive component (B,C,D,F,I,J,S,Z) or 'V' (illegal,
+            // rejected below).
+            let prim_name = primitive_name_for_descriptor(component_descriptor)
+                .ok_or_else(|| VmError::ClassFile(ClassFileError::ClassNotFound {
+                    class_name: name.to_string(),
+                }))?;
+            (self.intern_primitive_class(prim_name)?, 0)
+        } else {
+            return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                class_name: name.to_string(),
+            }));
+        };
+
+        let array_dimension = component_dim.saturating_add(1);
+        let leaf_component_name: Arc<str> = self
+            .class_store
+            .get(component_class_id)
+            .and_then(|c| {
+                c.array_info
+                    .as_ref()
+                    .map(|ai| ai.leaf_component_name.clone())
+                    .or_else(|| Some(c.name.clone()))
+            })
+            .unwrap_or_else(|| rustjvm_types::intern_arc("java/lang/Object"));
+
+        // Resolve Object / Cloneable / Serializable. They may not be
+        // loaded yet during early bootstrap; load_class is idempotent
+        // and recursion-safe for those names because they don't start
+        // with '['.
+        let object_id = self.load_class("java/lang/Object")?;
+        let cloneable_id = self.load_class("java/lang/Cloneable").ok();
+        let serializable_id = self.load_class("java/io/Serializable").ok();
+        let mut interfaces = Vec::with_capacity(2);
+        if let Some(id) = cloneable_id {
+            interfaces.push(id);
+        }
+        if let Some(id) = serializable_id {
+            interfaces.push(id);
+        }
+
+        let array_info = ArrayInfo {
+            component_class_id,
+            array_dimension,
+            leaf_component_name,
+        };
+
+        // If a generic synthetic stub was registered for this name on a
+        // prior load, patch it in place rather than allocating a new
+        // ClassId — preserves any references downstream code may have
+        // already taken.
+        if let Some(existing_id) = self.get_loaded_class_id(name) {
+            if let Some(existing) = self.class_store.get_mut(existing_id) {
+                existing.superclass = Some(object_id);
+                existing.interfaces = interfaces;
+                existing.array_info = Some(array_info);
+                existing.access_flags = ClassAccessFlags::PUBLIC
+                    | ClassAccessFlags::FINAL
+                    | ClassAccessFlags::ABSTRACT;
+                debug!(
+                    class = %existing.name,
+                    id = %existing_id,
+                    array_dimension,
+                    component = %component_class_id,
+                    "RKC16N.3: upgraded generic stub to array class"
+                );
+            }
+            return Ok(existing_id);
+        }
+
+        let id = self.class_store.next_id();
+        let class = Class {
+            id,
+            loader_id: ClassLoaderId::Bootstrap,
+            name: rustjvm_types::intern_arc(name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Initialized, // arrays need no <clinit>
+            initializing_thread: None,
+            constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
+            access_flags: ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::FINAL
+                | ClassAccessFlags::ABSTRACT,
+            superclass: Some(object_id),
+            interfaces,
+            fields: vec![],
+            methods: vec![],
+            first_field_index: 0,
+            num_total_fields: 0,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: true,
+            has_finalizer: false,
+            signature: None,
+            code_source: None,
+            array_info: Some(array_info),
+        };
+
+        let name_hash = class_name_hash(name);
+        self.loaded_classes
+            .insert((ClassLoaderId::Bootstrap, name.to_string()), id);
+        self.name_to_id.insert(name_hash, id);
+        self.class_store.add(class);
+
+        debug!(
+            class = name,
+            id = %id,
+            array_dimension,
+            component = %component_class_id,
+            "RKC16N.3: synthesised array class"
+        );
+
+        Ok(id)
+    }
+
+    /// RKC16N.3 — Lazily register a primitive pseudo-class
+    /// (`int`, `long`, …) so an array's `component_class_id` can refer
+    /// to it. Idempotent. The pseudo-class is a synthetic stub with no
+    /// fields, no methods, and no superclass — it exists solely as a
+    /// `ClassId` anchor for `[I`, `[J`, etc.
+    fn intern_primitive_class(&mut self, prim_name: &str) -> Result<ClassId, VmError> {
+        if let Some(id) = self.get_loaded_class_id(prim_name) {
+            return Ok(id);
+        }
+        let id = self.class_store.next_id();
+        let class = Class {
+            id,
+            loader_id: ClassLoaderId::Bootstrap,
+            name: rustjvm_types::intern_arc(prim_name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Initialized,
+            initializing_thread: None,
+            constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
+            access_flags: ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::FINAL
+                | ClassAccessFlags::ABSTRACT,
+            superclass: None,
+            interfaces: vec![],
+            fields: vec![],
+            methods: vec![],
+            first_field_index: 0,
+            num_total_fields: 0,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: true,
+            has_finalizer: false,
+            signature: None,
+            code_source: None,
+            array_info: None,
+        };
+        let name_hash = class_name_hash(prim_name);
+        self.loaded_classes
+            .insert((ClassLoaderId::Bootstrap, prim_name.to_string()), id);
+        self.name_to_id.insert(name_hash, id);
+        self.class_store.add(class);
+        Ok(id)
     }
 
     /// Create a synthetic stub class for a JDK class that has no .class file.
@@ -2713,6 +2993,7 @@ impl ClassManager {
             has_finalizer: false, // synthetic stubs don't override finalize()
             signature: None,
             code_source: None,
+            array_info: None,
         };
 
         debug!(
@@ -2875,7 +3156,7 @@ impl ClassManager {
 /// This is critical for exception handling: without the correct hierarchy,
 /// `catch (RuntimeException e)` won't match `ArithmeticException` because
 /// `is_subclass_of` checks require a correct parent chain.
-/// Public lookup for verifier fallback — walks JDK superclass hierarchy
+/// Public lookup for verifier fallback вЂ” walks JDK superclass hierarchy
 /// when classes aren't loaded yet.
 pub fn jdk_superclass_lookup(name: &str) -> &'static str {
     jdk_superclass(name)
@@ -2994,7 +3275,7 @@ fn jdk_superclass(name: &str) -> &'static str {
         // ---- T19.H5: AtomicReferenceFieldUpdater / AtomicIntegerFieldUpdater
         // / AtomicLongFieldUpdater synthetic impl subclasses. Real Java
         // bytecode that calls `newUpdater(...)` then implicitly casts the
-        // result to the abstract base — the cast only succeeds if the
+        // result to the abstract base вЂ” the cast only succeeds if the
         // returned object's class chain reaches the abstract base. So we
         // declare each `$RustJvmImpl` as a direct subclass of the
         // corresponding factory.
@@ -3085,6 +3366,24 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// RKC16N.3 — Map a one-letter primitive descriptor to its canonical
+/// pseudo-class name. Returns `None` for any descriptor that is not a
+/// JVMS §4.3.2 primitive base type. `void` ('V') is excluded — there
+/// is no `void[]` in the JVM.
+fn primitive_name_for_descriptor(d: &str) -> Option<&'static str> {
+    match d {
+        "B" => Some("byte"),
+        "C" => Some("char"),
+        "D" => Some("double"),
+        "F" => Some("float"),
+        "I" => Some("int"),
+        "J" => Some("long"),
+        "S" => Some("short"),
+        "Z" => Some("boolean"),
+        _ => None,
+    }
+}
+
 /// Check if a class name belongs to the JDK (should get a synthetic stub
 /// when its .class file is not found).
 fn is_jdk_class(name: &str) -> bool {
@@ -3117,7 +3416,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
     }
 
     match name {
-        // String: 2 instance fields (value char[], hash int) — enough for
+        // String: 2 instance fields (value char[], hash int) вЂ” enough for
         // synthetic mode.  When the real JDK String class is loaded from a
         // .class file, its actual field count (e.g. 4 in JDK 25) is used
         // instead; see `create_java_string` in vm_object.rs.
@@ -3216,7 +3515,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "java/util/OptionalInt"
         | "java/util/OptionalLong"
         | "java/util/OptionalDouble" => instance_fields(1),
-        // T2.3.8 — Spliterator and its primitive specializations:
+        // T2.3.8 вЂ” Spliterator and its primitive specializations:
         //   field 0 = backing array (Object[], int[], long[], double[])
         //   field 1 = cursor Int (next element to emit)
         "java/util/Spliterator"
@@ -3234,7 +3533,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "java/io/FileReader" | "java/io/FileWriter" => instance_fields(1),
         // PrintStream/PrintWriter = 1 field (fd)
         "java/io/PrintStream" | "java/io/PrintWriter" => instance_fields(1),
-        // T1.10 — corrected StringReader/StringWriter shapes to match
+        // T1.10 вЂ” corrected StringReader/StringWriter shapes to match
         // the real native init code in `native-io/src/lib.rs`:
         //   StringReader = 3 fields (content, pos, length) per
         //   `SR_FIELD_CONTENT/POS/LENGTH` constants.
@@ -3245,7 +3544,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // `native_sw_init` / `native_sr_init`.
         "java/io/StringReader" => instance_fields(3),
         "java/io/StringWriter" => instance_fields(2),
-        // ByteArrayInputStream = 4 (buf, pos, mark, count) — real-JDK layout (Session 83).
+        // ByteArrayInputStream = 4 (buf, pos, mark, count) вЂ” real-JDK layout (Session 83).
         "java/io/ByteArrayInputStream" => instance_fields(4),
         // ByteArrayOutputStream = 2 (data, count)
         "java/io/ByteArrayOutputStream" => instance_fields(2),
@@ -3264,7 +3563,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "java/nio/DoubleBuffer" => instance_fields(5),
         // Charset = 2 fields (name, aliases)
         "java/nio/charset/Charset" => instance_fields(2),
-        // StandardCharsets — 6 public static final Charset fields
+        // StandardCharsets вЂ” 6 public static final Charset fields
         "java/nio/charset/StandardCharsets" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
@@ -3504,7 +3803,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // ---- T19.5: sun.nio.ch.Net TCP cluster ----
         // Layouts shared with `native-io::net::register_sun_nio_ch_net`.
         // These classes don't have Java-side instance fields of interest to
-        // our natives — the `fd` integer that identifies a socket is carried
+        // our natives вЂ” the `fd` integer that identifies a socket is carried
         // on the FileDescriptor handed in as an arg. We still register them
         // so `ensure_class_initialized` succeeds when a user class does
         // e.g. `ServerSocketChannel.open()` (which calls
@@ -3513,13 +3812,13 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // sun/nio/ch/Net                     = 0 (static utility class; no instance state)
         // sun/nio/ch/ServerSocketChannelImpl = 4 (fd, localAddress, state, blocking)
         // sun/nio/ch/SocketChannelImpl       = 5 (fd, localAddress, remoteAddress, state, blocking)
-        // sun/nio/ch/SelectorImpl            = 5 — T19.7.a layout:
+        // sun/nio/ch/SelectorImpl            = 5 вЂ” T19.7.a layout:
         //   field 0: id (Int, lookup key into nio_selector::selectors())
         //   field 1: registered_map (Object, Java-side Set<SelectionKey>)
         //   field 2: selected_set   (Object, Java-side Set<SelectionKey>)
         //   field 3: keys_set       (Object, Java-side Set<SelectionKey>)
         //   field 4: open_flag      (Int, 1 = open, 0 = closed)
-        // sun/nio/ch/SelectionKeyImpl        = 5 — T19.7.a layout:
+        // sun/nio/ch/SelectionKeyImpl        = 5 вЂ” T19.7.a layout:
         //   field 0: selector      (Object, parent Selector)
         //   field 1: channel       (Object, the SelectableChannel)
         //   field 2: interestOps   (Int)
@@ -3592,7 +3891,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // post-clinit fixup in `vm/src/vm/vm_util.rs` populates
         // `DefaultBootModuleLoaderHolder.INSTANCE` with a synthetic
         // `LocalModuleLoader`; the natives below model the minimal Java
-        // surface that `Main.main` → `loadModule(...)` → `Module.loadClass`
+        // surface that `Main.main` в†’ `loadModule(...)` в†’ `Module.loadClass`
         // touches.  Field counts are kept in sync with the
         // `LOADER_FIELD_COUNT` / `MOD_FIELD_COUNT` / `MCL_FIELD_COUNT`
         // constants in `jboss_module_loader.rs`.
@@ -3601,13 +3900,13 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "org/jboss/modules/LocalModuleLoader" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("root"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
-        // `ModuleLoader` — the abstract base.  Some bytecode holds a
+        // `ModuleLoader` вЂ” the abstract base.  Some bytecode holds a
         // `ModuleLoader` reference; give it the same 1-slot root layout so
         // field resolution doesn't OOB.
         "org/jboss/modules/ModuleLoader" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("root"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
-        // `DefaultBootModuleLoaderHolder` — single static field INSTANCE
+        // `DefaultBootModuleLoaderHolder` вЂ” single static field INSTANCE
         // that post_clinit_fixup writes with a LocalModuleLoader ref.
         // T19_H4_ANCHOR_DEFAULT_BOOT_HOLDER
         "org/jboss/modules/DefaultBootModuleLoaderHolder" => vec![
@@ -3618,7 +3917,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // `Module` — 4 instance slots (name, loader, classLoader, resourceRoots).
+        // `Module` вЂ” 4 instance slots (name, loader, classLoader, resourceRoots).
         // T19_H4_ANCHOR_MODULE
         "org/jboss/modules/Module" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
@@ -3626,12 +3925,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("classLoader"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/modules/ModuleClassLoader;"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("resourceRoots"), descriptor: rustjvm_types::intern_arc("[Ljava/lang/String;"), attributes: vec![] },
         ],
-        // `ModuleClassLoader` — 1 back-reference field to its owning Module.
+        // `ModuleClassLoader` вЂ” 1 back-reference field to its owning Module.
         // T19_H4_ANCHOR_MODULE_CLASSLOADER
         "org/jboss/modules/ModuleClassLoader" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("module"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/modules/Module;"), attributes: vec![] },
         ],
-        // `ModuleNotFoundException` — Throwable 2-slot shape (message, cause).
+        // `ModuleNotFoundException` вЂ” Throwable 2-slot shape (message, cause).
         // T19_H4_ANCHOR_MODULE_NOT_FOUND
         "org/jboss/modules/ModuleNotFoundException" => instance_fields(2),
 
@@ -3648,7 +3947,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         ],
         // Services is a pure-static utility class (Services.deploymentUnitName, etc.).
         "org/jboss/as/server/deployment/Services" => vec![],
-        // EnhancedQueueExecutor: 4 fields — name (String), core_size (Int),
+        // EnhancedQueueExecutor: 4 fields вЂ” name (String), core_size (Int),
         // max_size (Int), tasks_queue (Object).  The real queue lives in
         // the Rust `EnhancedQueueExecutor` registry keyed by `name`.
         "org/jboss/threads/EnhancedQueueExecutor" => vec![
@@ -3658,7 +3957,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("tasksQueue"), descriptor: rustjvm_types::intern_arc("Ljava/util/Queue;"), attributes: vec![] },
         ],
         // Logger mirror: name (String), parent_handle (Object).  The
-        // real log machinery is the `tracing` subscriber — this just
+        // real log machinery is the `tracing` subscriber вЂ” this just
         // bridges the JDK calls through.
         "org/jboss/logmanager/Logger" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
@@ -3692,7 +3991,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("environment"), descriptor: rustjvm_types::intern_arc("Ljava/util/Hashtable;"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("defaultInitCtx"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
         ],
-        // Binding: 3 fields (name, className, object) — wraps a single JNDI
+        // Binding: 3 fields (name, className, object) вЂ” wraps a single JNDI
         // entry for enumeration-style APIs (listBindings / list).
         "javax/naming/Binding" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
@@ -3713,7 +4012,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("bindingName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
         // NameNotFoundException / NamingException / InvalidNameException inherit
-        // Throwable — reuse the 2-slot (message, cause) shape.
+        // Throwable вЂ” reuse the 2-slot (message, cause) shape.
         "javax/naming/NameNotFoundException"
         | "javax/naming/NamingException"
         | "javax/naming/InvalidNameException" => instance_fields(2),
@@ -3741,7 +4040,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             },
         ],
         // StartupContext = 2 fields (shutdown_tasks List, values Map).
-        // Both fields are left null by the <init> native — the Rust-side
+        // Both fields are left null by the <init> native вЂ” the Rust-side
         // HashMap + Vec owned by `startup_context_values` /
         // `startup_context_shutdown_tasks` hold the real state. Reserving
         // the slots keeps bytecode `getfield shutdownTasks` from OOB-ing.
@@ -3856,7 +4155,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         ],
         // RunnerClassLoader = 1-slot placeholder (parent ClassLoader).  Real
         // class extends URLClassLoader and holds many more slots; the
-        // synthetic layout is a minimum — bytecode that touches
+        // synthetic layout is a minimum вЂ” bytecode that touches
         // `parent.*` walks to java/lang/ClassLoader which is real.
         "io/quarkus/bootstrap/runner/RunnerClassLoader" => vec![
             ClassFileField {
@@ -3902,7 +4201,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // LogManager singleton — 4 slots matching
+        // LogManager singleton вЂ” 4 slots matching
         // `native-builtins::logmanager::LM_NUM_FIELDS` (properties,
         // loggerRegistry, rootLogger, ready). Reserving them in the
         // synthetic layout means alloc_object has room when the real
@@ -3949,7 +4248,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // java.util.logging.Logger (synthetic) — 3 slots (name, level, parent).
+        // java.util.logging.Logger (synthetic) вЂ” 3 slots (name, level, parent).
         "java/util/logging/Logger" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
@@ -4021,7 +4320,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // their declared shape unchanged (`alloc_concurrent_synthetic`
         // picks the max of synthetic-count vs real-count).
         //
-        // Subject = 3 (principals, publicCreds, privateCreds) — each
+        // Subject = 3 (principals, publicCreds, privateCreds) вЂ” each
         // field is the object reference the native side uses as a key
         // into its Rust-side `SubjectHandle` map; Java bytecode that
         // reads these fields sees a non-null handle it can pass to
@@ -4070,7 +4369,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // `javax.transaction.xa.Xid.getFormatId / getGlobalTransactionId /
         // getBranchQualifier`.
         //
-        // `javax.sql.DataSource` is a pure interface — no instance fields.
+        // `javax.sql.DataSource` is a pure interface вЂ” no instance fields.
         "org/jboss/as/connector/subsystems/datasources/DataSourceService" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("jndiName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("poolHandle"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
@@ -4091,13 +4390,13 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // ---- T19.2.d: WildFly Undertow (HTTP subsystem) field layouts ----
         //
         // Companion to `native-builtins/src/wildfly_undertow.rs`. The
-        // Undertow builder → server lifecycle pins listener config on
+        // Undertow builder в†’ server lifecycle pins listener config on
         // Undertow itself, the per-request HttpServerExchange threads
         // through the handler chain, and HeaderMap / HttpString provide
         // the CRLF-safe header surface.
         //
         // Undertow = 5 (listeners, handler, worker_threads, io_threads,
-        //               bound_fds — a long id into the native
+        //               bound_fds вЂ” a long id into the native
         //               `undertow_instances` registry).
         "io/undertow/Undertow" | "io/undertow/Undertow$Builder" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("listeners"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
@@ -4156,7 +4455,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("optionsHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
         ],
-        // Xnio = 2 (name, providerHandle).  Singleton provider — the handle
+        // Xnio = 2 (name, providerHandle).  Singleton provider вЂ” the handle
         // always round-trips to the same global Arc.
         "org/xnio/Xnio" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
@@ -4266,7 +4565,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // IoFuture = 3 (status int snapshot, result_slot handle, notifier_list
         // mirror handle).  Real state (AtomicU8, Mutex<FutureState>, Condvar)
         // lives in the process-wide `futures` registry.  Transitions are
-        // monotonic: WAITING → {DONE, CANCELLED, FAILED}.
+        // monotonic: WAITING в†’ {DONE, CANCELLED, FAILED}.
         "org/xnio/IoFuture" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("status"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("resultSlot"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
@@ -4276,13 +4575,13 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // `setResult/setException/setCancelled` to the same IoFutureInner
         // that `getIoFuture()` returns.  Drop-triggered abandonment
         // (never called any of the three setters) is logged via
-        // `tracing::warn!` but not auto-FAILED — the tracked handle
+        // `tracing::warn!` but not auto-FAILED вЂ” the tracked handle
         // stays in the registry so subsequent rebind does not NPE.
         "org/xnio/FutureResult" => vec![
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("futureHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
         ],
-        // Options is a pure-static class — no instance fields.  The
-        // well-known option constants (WORKER_IO_THREADS, BACKLOG, …)
+        // Options is a pure-static class вЂ” no instance fields.  The
+        // well-known option constants (WORKER_IO_THREADS, BACKLOG, вЂ¦)
         // are populated on first access via `ensure_options_initialized`
         // and stashed in a Rust-side map keyed by field name.
         "org/xnio/Options" => vec![],
@@ -4302,7 +4601,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("configName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("started"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
         ],
-        // EmbeddedCacheManager (interface) — no instance fields; method
+        // EmbeddedCacheManager (interface) вЂ” no instance fields; method
         // dispatch goes through the native registry directly.
         "org/infinispan/manager/EmbeddedCacheManager" => vec![],
         // CacheImpl = 3 (handle J, name String, manager DefaultCacheManager).
@@ -4311,7 +4610,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("manager"), descriptor: rustjvm_types::intern_arc("Lorg/infinispan/manager/DefaultCacheManager;"), attributes: vec![] },
         ],
-        // Cache (interface) and AdvancedCache (interface) — no instance fields;
+        // Cache (interface) and AdvancedCache (interface) вЂ” no instance fields;
         // method dispatch goes through the native registry directly.
         "org/infinispan/Cache" | "org/infinispan/AdvancedCache" => vec![],
         // Configuration = 3 (name String, sizeLimit I, ttlMs J).
@@ -4338,7 +4637,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("jmxEnabled"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
             ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("reserved"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
         ],
-        // CacheNotifier — interface; no instance fields.
+        // CacheNotifier вЂ” interface; no instance fields.
         "org/infinispan/notifications/cachelistener/CacheNotifier" => vec![],
 
         // ---- T19.4: Quarkus ArC CDI container field layouts ----
@@ -4347,10 +4646,10 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // layouts let `alloc_object` reserve the correct number of slots
         // before the ArC natives write into them.
         //
-        // Arc (static-only class) — no instance fields; all methods are
+        // Arc (static-only class) вЂ” no instance fields; all methods are
         // static and dispatch through the process-wide OnceLock singleton.
         "io/quarkus/arc/Arc" => vec![],
-        // ArcContainer (interface) + ArcContainerImpl (backing impl) — the
+        // ArcContainer (interface) + ArcContainerImpl (backing impl) вЂ” the
         // impl carries a Long container-id in slot 0 so native calls can
         // recover the Rust-side ArcContainerInner without trusting ObjectRef
         // pointer identity (which collides in parallel unit-test contexts).
@@ -4363,7 +4662,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // InstanceHandle / InstanceHandleImpl — slot 0 is the Long
+        // InstanceHandle / InstanceHandleImpl вЂ” slot 0 is the Long
         // container-id; slot 1 is the bean Object stored by the resolution
         // path so that `InstanceHandle.get()` can unwrap it without a
         // second map lookup.
@@ -4382,7 +4681,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // InjectableBean — same two-slot shape as InstanceHandle so that
+        // InjectableBean вЂ” same two-slot shape as InstanceHandle so that
         // `InjectableBean.get()` (backed by native_instance_handle_get)
         // can read slot 1 without an extra dispatch step.
         "io/quarkus/arc/InjectableBean" => vec![
@@ -4399,7 +4698,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // javax/jakarta CDI Instance — same two-slot shape; ArC returns
+        // javax/jakarta CDI Instance вЂ” same two-slot shape; ArC returns
         // an InstanceHandle as an Instance<T> for the `select()` path.
         "javax/enterprise/inject/Instance"
         | "jakarta/enterprise/inject/Instance" => vec![
@@ -4416,7 +4715,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // BeanManager (both javax and jakarta) — holds the container-id
+        // BeanManager (both javax and jakarta) вЂ” holds the container-id
         // in slot 0 so that `getBeans` / `getReference` can route to the
         // right ArcContainerInner.
         "javax/enterprise/inject/spi/BeanManager"
@@ -4428,7 +4727,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 attributes: vec![],
             },
         ],
-        // ManagedContext (requestContext() return type) — single slot
+        // ManagedContext (requestContext() return type) вЂ” single slot
         // reserved for future state; the current boot path never reads it.
         "io/quarkus/arc/ManagedContext" => vec![
             ClassFileField {
@@ -4454,20 +4753,20 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/lang/ModuleLayer" => instance_fields(2),
 
         // T19.H2: synthetic `Module` fallback. Slots: name/layer/packages/
-        // descriptor/loader — see `jboss_jdkspecific.rs` for the layout.
+        // descriptor/loader вЂ” see `jboss_jdkspecific.rs` for the layout.
         "java/lang/Module" => instance_fields(5),
 
-        // T19.H2: StackWalker synthetic fallback — options, estimateDepth,
+        // T19.H2: StackWalker synthetic fallback вЂ” options, estimateDepth,
         // extendedOption, retainClassRef, contScope, continuation.
         // `phases_late::p59_sw_walk` already allocates 0-field stubs for
         // walker objects; the 6-field layout here upgrades that path.
         "java/lang/StackWalker" => instance_fields(6),
 
-        // T19.H2: ClassFileDumper synthetic fallback — key, dumpDir,
+        // T19.H2: ClassFileDumper synthetic fallback вЂ” key, dumpDir,
         // enabled, counter slots used by `register_t19_h2_lookup_clinit_deps`.
         "jdk/internal/util/ClassFileDumper" => instance_fields(4),
 
-        // T19_M1_PLATFORM_MXBEANS — synthetic stubs for JDK 25 JMX
+        // T19_M1_PLATFORM_MXBEANS вЂ” synthetic stubs for JDK 25 JMX
         // OpenType machinery used by `jmx_openmbean::alloc_*`.
         // CompositeType: typeName, description, className, isArray,
         // itemNames, nameToDescription, nameToType, nameToIndex.
@@ -4578,7 +4877,7 @@ mod tests {
     fn compute_field_layout_excludes_static() {
         let fields = vec![
             make_field("x", false),
-            make_field("COUNT", true), // static — not counted
+            make_field("COUNT", true), // static вЂ” not counted
             make_field("y", false),
         ];
         let store = ClassStore::new();
@@ -4622,6 +4921,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
 
         let child_fields = vec![make_field("a", false), make_field("b", false)];
@@ -4651,8 +4951,8 @@ mod tests {
         assert!(debug.contains("loaded_count"));
     }
 
-    /// T10.3 — Verify the FxHashMap swap on `name_to_id` preserves the
-    /// name-hash → ClassId lookup for 100 distinct class names. Uses
+    /// T10.3 вЂ” Verify the FxHashMap swap on `name_to_id` preserves the
+    /// name-hash в†’ ClassId lookup for 100 distinct class names. Uses
     /// `register_class_name` (the only public writer) and `get_loaded_class_id`
     /// (the only public reader that hits `name_to_id` directly).
     #[test]
@@ -4675,7 +4975,7 @@ mod tests {
         assert!(mgr.get_loaded_class_id("pkg/Unseen").is_none());
     }
 
-    /// T10.9.B — smoke test: verify the FxHashMap swap on
+    /// T10.9.B вЂ” smoke test: verify the FxHashMap swap on
     /// `loaded_classes`, `class_bytes_cache`, `cds_class_cache`, and the
     /// `loading_guard` FxHashSet preserves insert/lookup semantics.
     #[test]
@@ -4752,6 +5052,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_record());
@@ -4797,6 +5098,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_sealed());
@@ -4840,6 +5142,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.is_record());
@@ -4884,10 +5187,11 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         assert!(store.get(parent_id).unwrap().is_sealed());
 
-        // "test/NotAllowed" is NOT in the permitted list → verification should reject it
+        // "test/NotAllowed" is NOT in the permitted list в†’ verification should reject it
         let not_allowed = "test/NotAllowed";
         let parent = store.get(parent_id).unwrap();
         let is_permitted = parent.permitted_subclasses.iter().any(|p| p == not_allowed);
@@ -4944,6 +5248,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         // java/lang/Object itself should NOT be considered as "declares_finalize"
@@ -4992,6 +5297,7 @@ mod tests {
             has_finalizer: true,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(cls.declares_finalize());
@@ -5031,13 +5337,14 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.declares_finalize());
         assert!(!cls.has_finalizer);
     }
 
-    // ── Boot classpath module discovery integration tests ─────────────
+    // в”Ђв”Ђ Boot classpath module discovery integration tests в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     // Run with: cargo test -p rustjvm-classloading -- --ignored
 
     /// Helper: find the jmods directory on this machine.
@@ -5149,7 +5456,7 @@ mod tests {
         );
         assert!(
             modules.len() >= 10,
-            "Should have ≥10 modules, got {}",
+            "Should have в‰Ґ10 modules, got {}",
             modules.len()
         );
 
@@ -5180,7 +5487,7 @@ mod tests {
         let boot_cp = vec![base.to_string_lossy().into_owned()];
         let mut cm = ClassManager::new(&boot_cp, &[], &[]);
 
-        // Load java.lang.Object — this is the deliverable for Session 6
+        // Load java.lang.Object вЂ” this is the deliverable for Session 6
         let result = cm.load_class("java/lang/Object");
         assert!(
             result.is_ok(),
@@ -5198,7 +5505,7 @@ mod tests {
         );
         assert!(
             !cls.is_synthetic_stub,
-            "Object should NOT be a synthetic stub — it came from real bytecode"
+            "Object should NOT be a synthetic stub вЂ” it came from real bytecode"
         );
 
         eprintln!(
@@ -5211,12 +5518,12 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // T6.3.1 — JVMTI class-hook registration / fire-path tests.
+    // T6.3.1 вЂ” JVMTI class-hook registration / fire-path tests.
     // ----------------------------------------------------------------
 
     #[test]
     fn jvmti_hooks_off_by_default() {
-        // No hooks installed yet → `CLASS_HOOKS_ACTIVE` may be either true
+        // No hooks installed yet в†’ `CLASS_HOOKS_ACTIVE` may be either true
         // (if another test installed one earlier) or false, but the fire_*
         // helpers must never panic regardless.
         fire_class_load_hook(1, "a/b/C", 0);
@@ -5227,7 +5534,7 @@ mod tests {
     fn jvmti_fire_hooks_dispatch_when_installed() {
         // The OnceLock-based registry is process-wide, so this test acts as
         // both the installer and the observer. Subsequent tests in the same
-        // process rely on the installed hook remaining in place — callback
+        // process rely on the installed hook remaining in place вЂ” callback
         // bodies therefore must tolerate being re-invoked.
         use std::sync::atomic::{AtomicU32, Ordering as O};
         static LOAD_CALLS: AtomicU32 = AtomicU32::new(0);
@@ -5252,7 +5559,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // T10.5 — vtable build in class_manager
+    // T10.5 вЂ” vtable build in class_manager
     //
     // These tests drive `build_vtable_descriptors` by hand-rolling a
     // minimal `Class` with just enough method metadata to populate the
@@ -5276,7 +5583,7 @@ mod tests {
     /// Create and register a stub `Class` carrying the given method list.
     ///
     /// Returns the newly allocated `ClassId`. The class has no fields, no
-    /// interfaces, and no constant pool entries — it's just a vehicle for
+    /// interfaces, and no constant pool entries вЂ” it's just a vehicle for
     /// the method list.
     fn add_stub_class(
         mgr: &mut ClassManager,
@@ -5315,13 +5622,14 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let entries = mgr.build_vtable_descriptors(id, superclass);
         mgr.vtable_descriptors.insert(id, entries);
         id
     }
 
-    /// T10.5 — build_vtable_descriptors populates virtual slots for a
+    /// T10.5 вЂ” build_vtable_descriptors populates virtual slots for a
     /// root class with no superclass.
     #[test]
     fn t10_class_manager_vtable_populated_at_link_time() {
@@ -5349,7 +5657,7 @@ mod tests {
         assert_eq!(e1.method_name, "bar");
     }
 
-    /// T10.5 — static / private / `<init>` / `<clinit>` methods must be
+    /// T10.5 вЂ” static / private / `<init>` / `<clinit>` methods must be
     /// excluded from the vtable.
     #[test]
     fn t10_class_manager_vtable_excludes_non_virtual() {
@@ -5386,7 +5694,7 @@ mod tests {
         assert_eq!(entries[1].as_ref().unwrap().method_name, "virtualTwo");
     }
 
-    /// T10.5 — a subclass that doesn't override sees the super's slot
+    /// T10.5 вЂ” a subclass that doesn't override sees the super's slot
     /// verbatim (same declaring_class_id, same method_index).
     #[test]
     fn t10_class_manager_vtable_inherits_from_super() {
@@ -5424,7 +5732,7 @@ mod tests {
         assert_eq!(own.method_name, "extra");
     }
 
-    /// T10.5 — override replaces the super's entry in place at the same
+    /// T10.5 вЂ” override replaces the super's entry in place at the same
     /// slot index.
     #[test]
     fn t10_class_manager_vtable_override_replaces_super() {
@@ -5444,7 +5752,7 @@ mod tests {
             "pkg/SubOv",
             Some(super_id),
             vec![
-                // Same signature as super's "toString" — must override
+                // Same signature as super's "toString" вЂ” must override
                 // slot 1 in place.
                 stub_method(
                     "toString",
@@ -5476,7 +5784,7 @@ mod tests {
         assert_eq!(ts.method_index, 0, "subclass's own method_index");
     }
 
-    /// T10.5 — install hook receives the freshly-built descriptor vec.
+    /// T10.5 вЂ” install hook receives the freshly-built descriptor vec.
     #[test]
     fn t10_class_manager_vtable_install_hook_fires() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -5492,7 +5800,7 @@ mod tests {
         }
         install_vtable_install_hook(my_hook);
 
-        // Fire the hook directly — same code path that
+        // Fire the hook directly вЂ” same code path that
         // `define_class_with_options` uses.
         let before = HOOK_CALLS.load(Ordering::SeqCst);
         fire_vtable_install_hook(
@@ -5512,10 +5820,10 @@ mod tests {
     }
 
     // --------------------------------------------------------------
-    // T10.9.A tests — dispatch snapshot + override-hook
+    // T10.9.A tests вЂ” dispatch snapshot + override-hook
     // --------------------------------------------------------------
 
-    /// T10.9.A.2 — `build_vtable_descriptors` populates the
+    /// T10.9.A.2 вЂ” `build_vtable_descriptors` populates the
     /// `dispatch` field for each concrete bytecode method.
     #[test]
     fn t10_9_a_build_vtable_populates_dispatch_for_concrete_methods() {
@@ -5569,6 +5877,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
 
         let (entries, overrides) = mgr.build_vtable_descriptors_with_overrides(id, None);
@@ -5587,7 +5896,7 @@ mod tests {
         assert_eq!(&dispatch.class_name, "pkg/Dispatch");
     }
 
-    /// T10.9.A.4 — override detection: when a subclass method matches
+    /// T10.9.A.4 вЂ” override detection: when a subclass method matches
     /// an inherited slot's (name, descriptor), the returned
     /// `overrides` vec contains `(super_class_id, slot)`.
     #[test]
@@ -5635,6 +5944,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let (_entries, overrides) =
             mgr.build_vtable_descriptors_with_overrides(sub_id, Some(super_id));
@@ -5643,7 +5953,7 @@ mod tests {
         assert_eq!(overrides[0].1, 1, "overrode slot 1 (b)");
     }
 
-    /// T10.9.A — the override hook fires once per overridden slot when
+    /// T10.9.A вЂ” the override hook fires once per overridden slot when
     /// `fire_vtable_override_hook` is driven by the build output.
     #[test]
     fn t10_9_a_override_hook_fires_per_slot() {
@@ -5667,8 +5977,8 @@ mod tests {
         assert_eq!(LAST_SLOT.load(O2::SeqCst), 7);
     }
 
-    /// T10.9.A.6 — abstract methods (no Code attribute) produce a
-    /// `dispatch: None` entry — the interpreter's fast path falls
+    /// T10.9.A.6 вЂ” abstract methods (no Code attribute) produce a
+    /// `dispatch: None` entry вЂ” the interpreter's fast path falls
     /// through to the slow path which raises `AbstractMethodError`.
     #[test]
     fn t10_9_a_abstract_method_dispatch_is_none() {
@@ -5710,6 +6020,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let entries = mgr.build_vtable_descriptors(id, None);
         assert_eq!(entries.len(), 1);
@@ -5718,7 +6029,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // WP2.4-B — redefine_class lib-level smoke tests
+    // WP2.4-B вЂ” redefine_class lib-level smoke tests
     //
     // These cover the bookkeeping logic that doesn't need a real class
     // file fixture: generation counter allocation, default options,
@@ -5826,7 +6137,7 @@ mod tests {
 
     #[test]
     fn jit_invalidate_hook_inactive_returns_quietly() {
-        // No hook installed — must be a no-op.
+        // No hook installed вЂ” must be a no-op.
         fire_jit_invalidate_hook(0);
         // No assertion beyond "doesn't panic".
     }
