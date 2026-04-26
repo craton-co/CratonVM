@@ -2882,6 +2882,129 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("isSynthetic", "()Z", 0x01),
             ("toGenericString", "()Ljava/lang/String;", 0x401),
         ],
+        // WP2.1-narrow — JDBC SPI interface methods. The native registry
+        // already pins the canonical natives (see WP7.2 anchor tests
+        // `each_jdbc_core_type_has_registered_natives` /
+        // `each_jdbc_core_type_has_multiple_anchor_natives` in
+        // `vm/tests/wp7_2_jdbc_core_types_reachable.rs`), but the synthetic
+        // stub for these interfaces ships with `methods: vec![]`, so
+        // `Class.getDeclaredMethods()` returned an empty array even though
+        // the dispatch path itself worked. This synthetic-method table is
+        // the documented hook (see [`synthetic_jdk_method_decls`] header)
+        // for surfacing those declarations to the reflection layer when
+        // real JDK bytecode is unavailable. All flags are
+        // ACC_PUBLIC|ACC_ABSTRACT (0x401) — these are interface methods.
+        //
+        // The lists below are subsets of the JDBC SPI surface, chosen to
+        // mirror the WP7.2 width-of-surface anchors so frameworks holding
+        // real JDBC bytecode (HikariCP wrapping, ByteBuddy stubbing,
+        // Spring/Hibernate proxies) see a non-empty reflective surface.
+        "java/sql/Connection" => &[
+            ("createStatement", "()Ljava/sql/Statement;", 0x401),
+            (
+                "prepareStatement",
+                "(Ljava/lang/String;)Ljava/sql/PreparedStatement;",
+                0x401,
+            ),
+            (
+                "prepareCall",
+                "(Ljava/lang/String;)Ljava/sql/CallableStatement;",
+                0x401,
+            ),
+            ("getMetaData", "()Ljava/sql/DatabaseMetaData;", 0x401),
+            ("close", "()V", 0x401),
+            ("isClosed", "()Z", 0x401),
+            ("setAutoCommit", "(Z)V", 0x401),
+            ("getAutoCommit", "()Z", 0x401),
+            ("commit", "()V", 0x401),
+            ("rollback", "()V", 0x401),
+            ("setReadOnly", "(Z)V", 0x401),
+            ("isReadOnly", "()Z", 0x401),
+            ("setCatalog", "(Ljava/lang/String;)V", 0x401),
+            ("getCatalog", "()Ljava/lang/String;", 0x401),
+            ("setSchema", "(Ljava/lang/String;)V", 0x401),
+            ("getSchema", "()Ljava/lang/String;", 0x401),
+            ("isValid", "(I)Z", 0x401),
+        ],
+        "java/sql/Statement" => &[
+            ("execute", "(Ljava/lang/String;)Z", 0x401),
+            (
+                "executeQuery",
+                "(Ljava/lang/String;)Ljava/sql/ResultSet;",
+                0x401,
+            ),
+            ("executeUpdate", "(Ljava/lang/String;)I", 0x401),
+            ("close", "()V", 0x401),
+            ("isClosed", "()Z", 0x401),
+            ("getConnection", "()Ljava/sql/Connection;", 0x401),
+            ("getResultSet", "()Ljava/sql/ResultSet;", 0x401),
+            ("getUpdateCount", "()I", 0x401),
+            ("setQueryTimeout", "(I)V", 0x401),
+            ("getQueryTimeout", "()I", 0x401),
+            ("cancel", "()V", 0x401),
+        ],
+        "java/sql/PreparedStatement" => &[
+            ("execute", "()Z", 0x401),
+            ("executeQuery", "()Ljava/sql/ResultSet;", 0x401),
+            ("executeUpdate", "()I", 0x401),
+            ("setInt", "(II)V", 0x401),
+            ("setLong", "(IJ)V", 0x401),
+            ("setString", "(ILjava/lang/String;)V", 0x401),
+            ("setBoolean", "(IZ)V", 0x401),
+            ("setNull", "(II)V", 0x401),
+            ("setObject", "(ILjava/lang/Object;)V", 0x401),
+            ("clearParameters", "()V", 0x401),
+            ("close", "()V", 0x401),
+        ],
+        "java/sql/ResultSet" => &[
+            ("next", "()Z", 0x401),
+            ("close", "()V", 0x401),
+            ("wasNull", "()Z", 0x401),
+            ("getString", "(I)Ljava/lang/String;", 0x401),
+            ("getString", "(Ljava/lang/String;)Ljava/lang/String;", 0x401),
+            ("getInt", "(I)I", 0x401),
+            ("getInt", "(Ljava/lang/String;)I", 0x401),
+            ("getLong", "(I)J", 0x401),
+            ("getLong", "(Ljava/lang/String;)J", 0x401),
+            ("getBoolean", "(I)Z", 0x401),
+            ("getBoolean", "(Ljava/lang/String;)Z", 0x401),
+            ("getObject", "(I)Ljava/lang/Object;", 0x401),
+            ("getObject", "(Ljava/lang/String;)Ljava/lang/Object;", 0x401),
+            ("getMetaData", "()Ljava/sql/ResultSetMetaData;", 0x401),
+            ("isClosed", "()Z", 0x401),
+        ],
+        "java/sql/Driver" => &[
+            (
+                "connect",
+                "(Ljava/lang/String;Ljava/util/Properties;)Ljava/sql/Connection;",
+                0x401,
+            ),
+            ("acceptsURL", "(Ljava/lang/String;)Z", 0x401),
+            ("getMajorVersion", "()I", 0x401),
+            ("getMinorVersion", "()I", 0x401),
+            ("jdbcCompliant", "()Z", 0x401),
+        ],
+        "java/sql/DatabaseMetaData" => &[
+            (
+                "getDatabaseProductName",
+                "()Ljava/lang/String;",
+                0x401,
+            ),
+            (
+                "getDatabaseProductVersion",
+                "()Ljava/lang/String;",
+                0x401,
+            ),
+            ("getDriverName", "()Ljava/lang/String;", 0x401),
+            ("getDriverVersion", "()Ljava/lang/String;", 0x401),
+            ("getURL", "()Ljava/lang/String;", 0x401),
+            ("getUserName", "()Ljava/lang/String;", 0x401),
+            ("getDatabaseMajorVersion", "()I", 0x401),
+            ("getDatabaseMinorVersion", "()I", 0x401),
+            ("getJDBCMajorVersion", "()I", 0x401),
+            ("getJDBCMinorVersion", "()I", 0x401),
+            ("getConnection", "()Ljava/sql/Connection;", 0x401),
+        ],
         _ => &[],
     }
 }

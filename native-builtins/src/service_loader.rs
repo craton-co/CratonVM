@@ -91,8 +91,28 @@ fn build_service_loader(
 }
 
 /// Read provider FQNs for `sl.service` from every
-/// `META-INF/services/<fqcn>` resource visible to `sl.loader`.
+/// `META-INF/services/<fqcn>` resource visible on the classpath.
 /// Each line in each resource file contributes one provider name.
+///
+/// WP1.8-narrow (session 94): the original implementation drove the
+/// JDK chain `ClassLoader.getResources(String) -> Enumeration<URL> ->
+/// URL.openStream() -> InputStreamReader.<init> -> BufferedReader.
+/// <init>(Reader) -> readLine()`. That chain depends on synthetic-stub
+/// surface (`URL.openStream`, `BufferedReader` constructor + readLine)
+/// that is incomplete in the open-sourced revision and surfaces as
+/// `NoSuchMethodError` at bytecode resolution before the proper natives
+/// are reached. The WP7.1 commit (`245e996`) confirms this and works
+/// around the gap in `jdbc.rs::collect_driver_providers` by walking the
+/// classpath directly via `NativeContext::find_all_resource_urls` /
+/// `find_resource` — the same primitives the VM's classloader uses to
+/// answer `Class.getResource` natively. WP1.8-narrow ports that
+/// approach back into the proper iterator so
+/// `ServiceLoader.load(Class).iterator()` works end-to-end without
+/// re-entering the broken JDK Reader chain.
+///
+/// Functionally identical to the prior implementation when the JDK
+/// chain works (lex-sorted, dedup'd FQNs from every classpath match);
+/// strictly more robust when it doesn't.
 fn discover_providers(
     ctx: &mut dyn NativeContext,
     sl: rustjvm_types::ObjectRef,
@@ -123,143 +143,82 @@ fn discover_providers(
             message: "ServiceLoader: service.getName() returned null".to_string(),
         }));
     }
-    let resource_name = format!("META-INF/services/{}", service_name);
-    let res_str = ctx.create_string(&resource_name);
+    let resource = format!("META-INF/services/{}", service_name);
 
-    // Pick a loader: prefer the stashed `loader`, fall back to the
-    // system loader.
-    let loader = match ctx.get_field_by_name(sl, "loader") {
-        Value::Object(Some(l)) => Value::Object(Some(l)),
-        _ => match ctx.get_field(sl, 1) {
-            Value::Object(Some(l)) => Value::Object(Some(l)),
-            _ => {
-                let sys = ctx
-                    .invoke(
-                        "java/lang/ClassLoader",
-                        "getSystemClassLoader",
-                        "()Ljava/lang/ClassLoader;",
-                        &[],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                sys
-            }
-        },
-    };
-
-    let loader_obj = match loader {
-        Value::Object(Some(l)) => l,
-        _ => {
-            // No loader at all — return empty provider list.
-            return Ok(Vec::new());
-        }
-    };
-
-    let urls_val = ctx.invoke(
-        "java/lang/ClassLoader",
-        "getResources",
-        "(Ljava/lang/String;)Ljava/util/Enumeration;",
-        &[
-            Value::Object(Some(loader_obj)),
-            Value::Object(Some(res_str)),
-        ],
-    )?;
-    let urls = match urls_val {
-        Some(Value::Object(Some(e))) => e,
-        _ => return Ok(Vec::new()),
-    };
-
+    // Walk the classpath directly. `find_all_resource_urls` returns a
+    // URL string per match: `file:/<dir>/<entry>` for plain dirs,
+    // `jar:file:/<jar>!/META-INF/services/<spi>` for JAR entries, and
+    // (rarely) `classpath:<entry>` for VM-synthetic resources. Each
+    // scheme is decoded back to bytes inline below.
+    let urls = ctx.find_all_resource_urls(&resource);
     let mut providers: Vec<String> = Vec::new();
-    loop {
-        let has_more = ctx.invoke_virtual(
-            urls,
-            "hasMoreElements",
-            "()Z",
-            &[],
-        )?;
-        let stop = match has_more {
-            Some(Value::Int(0)) => true,
-            Some(Value::Int(_)) => false,
-            _ => true,
-        };
-        if stop {
-            break;
-        }
-        let url = ctx.invoke_virtual(
-            urls,
-            "nextElement",
-            "()Ljava/lang/Object;",
-            &[],
-        )?;
-        let url_obj = match url {
-            Some(Value::Object(Some(u))) => u,
-            _ => continue,
-        };
-        let stream = ctx.invoke(
-            "java/net/URL",
-            "openStream",
-            "()Ljava/io/InputStream;",
-            &[Value::Object(Some(url_obj))],
-        )?;
-        let stream_obj = match stream {
-            Some(Value::Object(Some(s))) => s,
-            _ => continue,
-        };
-        let isr_cls = "java/io/InputStreamReader";
-        let isr_cid = ctx.ensure_class_initialized(isr_cls).map_err(|_| {
-            MethodCallFailed::InternalError(VmError::Internal {
-                message: "InputStreamReader: not loaded".to_string(),
-            })
-        })?;
-        let isr = ctx.alloc_object(isr_cid, ctx.class_num_total_fields(isr_cid).max(2));
-        let charset_name = ctx.create_string("UTF-8");
-        ctx.invoke(
-            isr_cls,
-            "<init>",
-            "(Ljava/io/InputStream;Ljava/lang/String;)V",
-            &[
-                Value::Object(Some(isr)),
-                Value::Object(Some(stream_obj)),
-                Value::Object(Some(charset_name)),
-            ],
-        )?;
-        let br_cls = "java/io/BufferedReader";
-        let br_cid = ctx.ensure_class_initialized(br_cls).map_err(|_| {
-            MethodCallFailed::InternalError(VmError::Internal {
-                message: "BufferedReader: not loaded".to_string(),
-            })
-        })?;
-        let br = ctx.alloc_object(br_cid, ctx.class_num_total_fields(br_cid).max(2));
-        ctx.invoke(
-            br_cls,
-            "<init>",
-            "(Ljava/io/Reader;)V",
-            &[Value::Object(Some(br)), Value::Object(Some(isr))],
-        )?;
-        loop {
-            let line_val = ctx.invoke(
-                br_cls,
-                "readLine",
-                "()Ljava/lang/String;",
-                &[Value::Object(Some(br))],
-            )?;
-            let line_obj = match line_val {
-                Some(Value::Object(Some(s))) => s,
-                _ => break,
-            };
-            let raw = ctx.read_string(line_obj).unwrap_or_default();
-            if let Some(token) = raw.split('#').next() {
-                let trimmed = token.trim();
-                if !trimmed.is_empty() && is_valid_provider_name(trimmed) {
-                    providers.push(trimmed.to_string());
-                }
+    if !urls.is_empty() {
+        for url in urls {
+            if let Some(bytes) = read_resource_bytes(ctx, &url, &resource) {
+                parse_provider_lines(&bytes, &mut providers);
             }
         }
-        let _ = ctx.invoke(br_cls, "close", "()V", &[Value::Object(Some(br))]);
+    } else if let Some(bytes) = ctx.find_resource(&resource) {
+        // Test mocks may stub `find_resource` without populating the
+        // URL list; honour the single-resource fallback so a fixture
+        // pointing at one descriptor still walks.
+        parse_provider_lines(&bytes, &mut providers);
     }
 
     providers.sort();
     providers.dedup();
     Ok(providers)
+}
+
+/// Read raw bytes for a classpath URL. Mirrors the helper in
+/// `jdbc.rs::read_url_bytes` (kept duplicated here to keep
+/// `service_loader.rs` self-contained — both files are owned by Wave 1
+/// / Wave 7 and the helper is small).
+fn read_resource_bytes(
+    ctx: &mut dyn NativeContext,
+    url: &str,
+    resource: &str,
+) -> Option<Vec<u8>> {
+    if let Some(rest) = url.strip_prefix("jar:file:") {
+        let rest = rest.trim_start_matches('/');
+        let (jar_path, entry) = match rest.find("!/") {
+            Some(i) => (&rest[..i], &rest[i + 2..]),
+            None => return None,
+        };
+        let jar_bytes = std::fs::read(jar_path).ok()?;
+        let cursor = std::io::Cursor::new(jar_bytes);
+        let mut zip = zip::ZipArchive::new(cursor).ok()?;
+        let mut f = zip.by_name(entry).ok()?;
+        use std::io::Read;
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    } else if let Some(rest) = url.strip_prefix("file:") {
+        let path = rest.trim_start_matches('/');
+        std::fs::read(path).or_else(|_| std::fs::read(rest)).ok()
+    } else if let Some(name) = url.strip_prefix("classpath:") {
+        ctx.find_resource(name.trim_start_matches('/'))
+    } else {
+        // Unknown scheme — last-resort resource lookup.
+        ctx.find_resource(resource)
+    }
+}
+
+/// Tokenize a `META-INF/services/<spi>` descriptor. Each non-comment,
+/// non-blank line is a provider FQN; everything after `#` on a line is
+/// a comment. Mirrors `is_valid_provider_name`'s validation so callers
+/// that reuse the parsed list don't need to re-filter.
+fn parse_provider_lines(bytes: &[u8], out: &mut Vec<String>) {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for raw in text.lines() {
+        let token = raw.split('#').next().unwrap_or("").trim();
+        if !token.is_empty() && is_valid_provider_name(token) {
+            out.push(token.to_string());
+        }
+    }
 }
 
 fn is_valid_provider_name(s: &str) -> bool {
@@ -499,5 +458,30 @@ mod tests {
         let raw = "com.acme.Foo  # comment";
         let token = raw.split('#').next().unwrap().trim();
         assert_eq!(token, "com.acme.Foo");
+    }
+
+    /// WP1.8-narrow: the descriptor parser strips comments and blanks,
+    /// rejects malformed lines, and returns valid FQNs unchanged. This
+    /// is the load-bearing parser the iterator now uses (replacing the
+    /// JDK BufferedReader chain that the open-sourced revision can't
+    /// drive end-to-end).
+    #[test]
+    fn parse_provider_lines_handles_comments_blanks_and_junk() {
+        let body = b"# header comment\n  com.acme.A  \n\ncom.acme.B # trailing\nfoo bar\n!bad\nGood$Inner\n";
+        let mut out = Vec::new();
+        parse_provider_lines(body, &mut out);
+        assert_eq!(out, vec!["com.acme.A", "com.acme.B", "Good$Inner"]);
+    }
+
+    /// WP1.8-narrow: invalid UTF-8 bytes do not panic the parser; they
+    /// are silently dropped. ServiceLoader descriptors are spec'd as
+    /// UTF-8 but a malformed JAR shouldn't kill discovery for the rest
+    /// of the classpath.
+    #[test]
+    fn parse_provider_lines_silently_drops_non_utf8() {
+        let body: &[u8] = &[0xff, 0xfe, b'\n'];
+        let mut out = Vec::new();
+        parse_provider_lines(body, &mut out);
+        assert!(out.is_empty());
     }
 }
