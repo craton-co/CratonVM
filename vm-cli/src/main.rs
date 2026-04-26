@@ -678,6 +678,14 @@ fn run() -> Result<()> {
     };
     if let Some(secs) = effective_watchdog {
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
+        // RKC16N.5 — capture the audit-dump paths into the watchdog
+        // thread so a hung run still produces a missing-natives
+        // census. Without this, the only flush path is the
+        // clean-shutdown branch at the end of `main()`, and every
+        // watchdog-killed run loses the JSON we use for KC16/KC26
+        // boot debugging.
+        let watchdog_dump_path = args.dump_missing_natives.clone();
+        let watchdog_dump_grouped_path = args.dump_missing_natives_grouped.clone();
         std::thread::Builder::new()
             .name("rustjvm-stack-watchdog".into())
             .spawn(move || {
@@ -714,6 +722,36 @@ fn run() -> Result<()> {
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
                 );
+
+                // RKC16N.5 — flush the missing-natives audit BEFORE
+                // `process::abort()` so a hung or watchdog-killed run
+                // still produces the diagnostic JSON. Errors are
+                // logged but never unwrap; abort still happens.
+                shared_for_watchdog.dump_missing_natives();
+                if let Some(path) = watchdog_dump_path.as_deref() {
+                    match shared_for_watchdog.dump_missing_natives_json(path) {
+                        Ok(()) => eprintln!(
+                            "=== T19.H1 watchdog: missing-natives audit \
+                             flushed (json={path}) ==="
+                        ),
+                        Err(e) => eprintln!(
+                            "=== T19.H1 watchdog: failed to flush \
+                             missing-natives JSON to {path}: {e} ==="
+                        ),
+                    }
+                }
+                if let Some(path) = watchdog_dump_grouped_path.as_deref() {
+                    match shared_for_watchdog.dump_missing_natives_grouped_json(path) {
+                        Ok(()) => eprintln!(
+                            "=== T19.H1 watchdog: missing-natives audit \
+                             flushed (grouped json={path}) ==="
+                        ),
+                        Err(e) => eprintln!(
+                            "=== T19.H1 watchdog: failed to flush \
+                             grouped missing-natives JSON to {path}: {e} ==="
+                        ),
+                    }
+                }
 
                 // Flush the stderr handle so our banners land before
                 // the abort kills the process.
