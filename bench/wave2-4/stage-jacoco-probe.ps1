@@ -79,8 +79,35 @@ foreach ($cand in $candidates) {
 }
 
 if (-not $JarPath) {
+    # Maven Central fallback — download jacocoagent runtime into staged-jacoco\cache\.
+    $CacheDir = Join-Path $StagedDir 'cache'
+    $JacocoVer = if ($env:JACOCO_VERSION) { $env:JACOCO_VERSION } else { '0.8.12' }
+    $CachedJar = Join-Path $CacheDir ("org.jacoco.agent-{0}-runtime.jar" -f $JacocoVer)
+    if (Test-Path $CachedJar) {
+        Add-Content -Path $CompileLog -Value "stage-jacoco-probe: using cached jacoco at $CachedJar" -Encoding utf8
+        $JarPath = $CachedJar
+    } elseif ($env:NO_NET -eq '1') {
+        Add-Content -Path $CompileLog -Value "stage-jacoco-probe: NO_NET=1; skipping Maven Central fallback" -Encoding utf8
+    } else {
+        New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+        $McBase = if ($env:MAVEN_CENTRAL_BASE) { $env:MAVEN_CENTRAL_BASE } else { 'https://repo1.maven.org/maven2' }
+        $Url = "$McBase/org/jacoco/org.jacoco.agent/$JacocoVer/org.jacoco.agent-$JacocoVer-runtime.jar"
+        Add-Content -Path $CompileLog -Value "stage-jacoco-probe: fetching $Url" -Encoding utf8
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $CachedJar -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            $JarPath = $CachedJar
+            Add-Content -Path $CompileLog -Value "stage-jacoco-probe: downloaded jacoco to $CachedJar" -Encoding utf8
+        } catch {
+            Add-Content -Path $CompileLog -Value "stage-jacoco-probe: Maven Central download failed: $($_.Exception.Message)" -Encoding utf8
+            if (Test-Path $CachedJar) { Remove-Item $CachedJar -Force }
+        }
+    }
+}
+
+if (-not $JarPath) {
     Add-Content -Path $CompileLog -Value "stage-jacoco-probe: SKIP jacocoagent.jar not found" -Encoding utf8
     Add-Content -Path $CompileLog -Value "  searched: \$env:JACOCO_AGENT_JAR, C:\craton\ejbca-ce\lib\coverage, ~/.m2/repository/org/jacoco" -Encoding utf8
+    Add-Content -Path $CompileLog -Value "  attempted: Maven Central (set NO_NET=1 to skip; \$env:MAVEN_CENTRAL_BASE to override mirror)" -Encoding utf8
     Set-Content -Path $SkipFlag -Value 'no-jacoco-agent' -Encoding utf8
     Write-Output "stage-jacoco-probe: SKIP jacoco agent jar not found"
 }

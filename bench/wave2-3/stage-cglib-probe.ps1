@@ -106,8 +106,35 @@ foreach ($cand in $candidates) {
 }
 
 if (-not $JarPath) {
+    # Maven Central fallback — download cglib-nodep into staged-cglib\cache\.
+    $CacheDir = Join-Path $StagedDir 'cache'
+    $CglibVer = if ($env:CGLIB_VERSION) { $env:CGLIB_VERSION } else { '3.3.0' }
+    $CachedJar = Join-Path $CacheDir ("cglib-nodep-{0}.jar" -f $CglibVer)
+    if (Test-Path $CachedJar) {
+        Add-Content -Path $CompileLog -Value "stage-cglib-probe: using cached cglib at $CachedJar" -Encoding utf8
+        $JarPath = $CachedJar
+    } elseif ($env:NO_NET -eq '1') {
+        Add-Content -Path $CompileLog -Value "stage-cglib-probe: NO_NET=1; skipping Maven Central fallback" -Encoding utf8
+    } else {
+        New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+        $McBase = if ($env:MAVEN_CENTRAL_BASE) { $env:MAVEN_CENTRAL_BASE } else { 'https://repo1.maven.org/maven2' }
+        $Url = "$McBase/cglib/cglib-nodep/$CglibVer/cglib-nodep-$CglibVer.jar"
+        Add-Content -Path $CompileLog -Value "stage-cglib-probe: fetching $Url" -Encoding utf8
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $CachedJar -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            $JarPath = $CachedJar
+            Add-Content -Path $CompileLog -Value "stage-cglib-probe: downloaded cglib to $CachedJar" -Encoding utf8
+        } catch {
+            Add-Content -Path $CompileLog -Value "stage-cglib-probe: Maven Central download failed: $($_.Exception.Message)" -Encoding utf8
+            if (Test-Path $CachedJar) { Remove-Item $CachedJar -Force }
+        }
+    }
+}
+
+if (-not $JarPath) {
     Add-Content -Path $CompileLog -Value "stage-cglib-probe: SKIP cglib jar not found" -Encoding utf8
     Add-Content -Path $CompileLog -Value "  searched: \$env:CGLIB_JAR, $env:USERPROFILE\.m2, C:\Users\Victor\.m2, C:\craton\ejbca-ce\lib, C:\craton\keycloak-*" -Encoding utf8
+    Add-Content -Path $CompileLog -Value "  attempted: Maven Central (set NO_NET=1 to skip; \$env:MAVEN_CENTRAL_BASE to override mirror)" -Encoding utf8
     Set-Content -Path $SkipFlag -Value 'no-cglib-jar' -Encoding utf8
     Write-Output "stage-cglib-probe: SKIP cglib jar not found (set CGLIB_JAR to enable real-DSL probe)"
 }

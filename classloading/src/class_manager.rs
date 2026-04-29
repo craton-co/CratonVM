@@ -2036,11 +2036,12 @@ impl ClassManager {
         out
     }
 
-    /// Return the raw bytes of every classpath entry that contains a resource
-    /// with the given name. Parallel to [`find_all_resource_urls`] but
-    /// returns content instead of URLs — used by Rust-native resource
-    /// enumeration (e.g. `ServiceLoader` provider discovery) that wants to
-    /// avoid the JDK's `URL.openStream` / `BufferedReader` chain.
+    /// with the given name. Parallel to [`find_all_resource_urls`] but returns
+    /// content rather than URLs — used by Rust-native resource enumeration
+    /// paths (e.g. `ServiceLoader` provider discovery in
+    /// `native-builtins/src/service_loader.rs`) that bypass the JDK's
+    /// `URL.openStream` / `BufferedReader` chain. Searches bootstrap →
+    /// extension → application and concatenates the results.
     pub fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
         let mut out = self.bootstrap.class_path().find_all_resource_bytes(name);
         out.extend(self.extension.class_path().find_all_resource_bytes(name));
@@ -2931,6 +2932,12 @@ impl ClassManager {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            // RKC16N.3: array-class metadata not yet populated by this
+            // synthesis path — the field is currently write-only across
+            // the codebase, so leaving it `None` here matches every
+            // other call site (see access_control, verifier, vm.rs,
+            // benches, tests). Wire up real `ArrayInfo` once a consumer
+            // (e.g. `Class.getComponentType` fast-path) actually reads it.
             array_info: None,
         };
 
