@@ -2777,6 +2777,54 @@ impl Vm {
             .read()
             .is_subclass_of(child_id, parent_id)
     }
+
+    // ----- Throwable stack-trace accessor (CLI unhandled-exception renderer) ----
+    //
+    // `Throwable.fillInStackTrace` in this VM stashes captured frames in the
+    // per-thread `JvmThread::throwable_stacks` map keyed by identity hash of
+    // the throwable — it does NOT populate the heap-side `stackTrace` /
+    // `backtrace` field. The Java-side field is only populated lazily when
+    // `Throwable.getStackTrace()` runs, which has typically not happened for
+    // an exception that escapes `main()`. The CLI renderer falls back to
+    // this accessor so unhandled exceptions still get a `\tat ...` listing.
+    //
+    // Returns frames from the main thread's `throwable_stacks` only; other
+    // threads' `throwable_stacks` are not aggregated here, but unhandled
+    // escapes from `main()` always landed on the main thread by definition.
+
+    /// Display-friendly snapshot of one frame in a captured Throwable trace.
+    pub fn throwable_stack_for(&self, throwable: ObjectRef) -> Option<Vec<StackTraceFrame>> {
+        let h = self.shared.heap.identity_hash_code(throwable);
+        let frames = self.main_thread.throwable_stacks.get(&h)?;
+        Some(
+            frames
+                .iter()
+                .map(|e| StackTraceFrame {
+                    class: e.class_name.to_string(),
+                    method: e.method_name.to_string(),
+                    file: e.source_file.as_deref().map(|s| s.to_string()),
+                    line: e.line_number,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Display-friendly snapshot of one captured-stack-trace frame, suitable for
+/// the CLI's unhandled-exception renderer. Detached from the on-heap
+/// `StackTraceElement` layout so callers do not need to walk fields.
+#[derive(Debug, Clone)]
+pub struct StackTraceFrame {
+    /// Fully-qualified class name, e.g. `java/lang/Class`.
+    pub class: String,
+    /// Method name (no descriptor).
+    pub method: String,
+    /// Source file (e.g. `Class.java`), `None` when the class has no
+    /// `SourceFile` attribute. CLI prints "Unknown Source" in that case.
+    pub file: Option<String>,
+    /// Line number, `-1` for unknown / `-2` for native. CLI omits
+    /// `:<line>` when negative.
+    pub line: i32,
 }
 
 impl std::fmt::Debug for Vm {

@@ -1135,11 +1135,13 @@ fn run() -> Result<()> {
                 // (String), fileName (String, nullable), lineNumber (int).
                 // We resolve those four field indices the same way as the
                 // Throwable fields above so we work regardless of layout.
+                let mut emitted_frames = false;
                 if let Some(si) = stack_idx {
                     let stack_val = vm.shared.heap.get_field(cur, si);
                     if let Value::Object(Some(arr)) = stack_val {
                         let len = vm.shared.heap.array_length(arr);
                         if len > 0 {
+                            emitted_frames = true;
                             // Resolve StackTraceElement field indices once
                             // from the first non-null element's class.
                             let mut ste_idx: Option<(usize, usize, usize, usize)> = None;
@@ -1206,6 +1208,30 @@ fn run() -> Result<()> {
                                 };
                                 lines.push(format!("\tat {class_name}.{method_name}({location})"));
                             }
+                        }
+                    }
+                }
+
+                // Fallback: when `Throwable.stackTrace[]` was never populated
+                // (the array is null or empty — the typical case for an
+                // exception that escapes `main()` without anyone calling
+                // `getStackTrace()`), pull frames from the per-thread
+                // `JvmThread::throwable_stacks` map keyed by identity hash
+                // — that's where `Throwable.fillInStackTrace` actually
+                // stashes the captured frames in this VM. See
+                // `vm/src/vm/vm_init.rs::Vm::throwable_stack_for`.
+                if !emitted_frames {
+                    if let Some(frames) = vm.throwable_stack_for(cur) {
+                        for frame in frames {
+                            let location = match (frame.file.as_deref(), frame.line) {
+                                (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                (Some(f), _) if !f.is_empty() => f.to_string(),
+                                _ => "Unknown Source".to_string(),
+                            };
+                            lines.push(format!(
+                                "\tat {}.{}({})",
+                                frame.class, frame.method, location
+                            ));
                         }
                     }
                 }
