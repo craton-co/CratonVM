@@ -1,5 +1,149 @@
 # KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
+## Live status (Session 95, 2026-04-29 — main() reaches exit 0; RKC16N.9–.13 landed)
+
+After commits `8aad4c8` (RKC16N.9 + RKC16N.10), `01f091e` + `9971e41`
+(CLI Java stack-trace renderer + per-thread `throwable_stacks` fallback),
+`3fffef3` + `643e155` (sun.management.* batch + synthetic `VM$BufferPool`),
+`17d85c9` (RKC16N.12), and `ba97403` (RKC16N.13), KC16 main() now **exits
+0** for the first time in the project. Reproducer is unchanged. Output:
+
+```
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+WARNING: Failed to load the specified log manager class org.jboss.logmanager.LogManager
+WARN B6: silent-swallow ... class=java/lang/management/ManagementFactory exc=java/lang/UnsatisfiedLinkError
+WARN B6: silent-swallow ... class=java/math/BigDecimal exc=java/lang/NullPointerException: Cannot read field 'signum' because the object is null
+WARN NoSuchMethodError method="java/lang/Object.get(Ljava/lang/Object;)Ljava/lang/Object;"
+WARN: main() completed with 2 swallowed VM error(s) ...
+```
+
+`main()` returns cleanly with exit 0. **The WildFly server itself does
+not yet actually start** — the swallowed errors and the unloaded JBoss
+LogManager (system property `java.util.logging.manager=org.jboss.logmanager.LogManager`
+fails to resolve) prevent the ServiceContainer from spinning up and
+silently drop any startup-banner logs.
+
+**RKC16N.12** (commit `17d85c9`) — two fixes that together advanced
+boot from `ClassNotFoundException` escaping uncaught at `Module.run`
+PC 40 to a clean `main()` return:
+
+- `native-builtins/src/lang_class.rs::native_class_for_name` was
+  ignoring its `args[2]` (`ClassLoader`) parameter, going straight to
+  `ctx.ensure_class_initialized` against bootstrap classpath. JBoss's
+  `Module.run` calls `Class.forName(mainClassName, false,
+  this.moduleClassLoader)` — without honoring the loader arg,
+  `org.jboss.as.server.Main` was looked up in bootstrap (no module
+  JARs there) and CNFE escaped uncaught. Patched to dispatch via
+  `ctx.invoke_virtual(loader, "loadClass", ...)` when the loader arg
+  is non-null. Routes through `ModuleClassLoader.loadClass` (already
+  in `jboss_module_loader.rs`) which walks the visibility closure,
+  registers all 70 resource roots reachable from
+  `org.jboss.as.standalone`, and resolves through the system loader.
+- `native-builtins/src/jboss_module_loader.rs::build_module_object`
+  never populated `mainClassName` on the synthetic
+  `org.jboss.modules.Module` instance. The real `Module` class
+  (loaded from jboss-modules.jar) has many more fields than our
+  4-slot synthetic; `Module.run(String[])` reads `getfield
+  mainClassName` at PC 1, which on our synthetic returned the
+  default-zero/null at the un-set slot, so we were calling
+  `Class.forName("", false, mcl)`. Confirmed via a temporary
+  `RUSTJVM_DBG_MCL=1` trace (now permanent, gated). Patched to
+  `ctx.set_field_by_name(module, "mainClassName", main_str)` so the
+  real layout is honored regardless of slot offset.
+
+**RKC16N.13** (commit `ba97403`) — `java/lang/StackStreamFactory.checkStackWalkModes()Z`
+was registered only on the inner `$AbstractStackWalker`. JDK 25 exposes
+the same helper as a static native on the outer class too, called from
+`StackStreamFactory.<clinit>`. Adding the outer registration drops the
+swallowed-error count from 4 to 2 (the dropped pair was the failing
+clinit + the downstream `$StackFrameTraverser.<clinit>` NPE).
+
+**Frontier as of end of Session 95**: server bytecode runs but the
+ServiceContainer doesn't actually spin up. Three concrete next blockers:
+
+1. **`BigDecimal.<clinit>` NPE** ("Cannot read field 'signum' because the
+   object is null"). Likely `BigInteger.ZERO`/`ONE`/`TEN` statics not
+   populated in time, then `BigDecimal.<clinit>` constructs
+   `new BigDecimal(BigInteger.ZERO, ...)` and the constructor reads
+   `.signum` on null. Cascade from `BigInteger.<clinit>`.
+2. **`java/lang/Object.get(Object)Object` `NoSuchMethodError`**. Looks
+   like a `Map.get(key)` invokevirtual that resolved against the static
+   type `Object` instead of the receiver's concrete `Map` class — likely
+   an interpreter / vtable dispatch bug.
+3. **JBoss LogManager wiring**. `java.util.logging.LogManager` rejects
+   the system property `java.util.logging.manager=org.jboss.logmanager.LogManager`
+   because the class isn't on the system classpath at LogManager
+   bootstrap time (LogManager runs very early, before module-loader
+   resource roots are visible to the system loader). Without this
+   wiring all WildFly startup logs are silently dropped — even if the
+   ServiceContainer starts, the user sees no banner.
+
+Each is its own RKC16N.* item. (1) and (2) look like single-fix
+investigations (1-3 iterations apiece); (3) is a substantial wiring
+exercise. None block the next iteration of (1)/(2).
+
+## Live status (Session 95, 2026-04-29 — RKC16N.9 + RKC16N.10 landed)
+
+After commit `8aad4c8` ("RKC16N.9 + RKC16N.10") landed both fixes, KC16
+boot now reaches a new opaque blocker: an empty-message NPE that escapes
+from `main()` downstream of `ManagementFactory.<clinit>`. This is
+**RKC16N.11**.
+
+Reproducer (unchanged from Session 94):
+```
+target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+Observed (post-`8aad4c8`):
+```
+Exception in thread "main" java/lang/NullPointerException
+```
+
+No message, no cause, no Java stack trace. Note that **`ManagementFactory.<clinit>`
+still records a silent-swallow `UnsatisfiedLinkError`** from one of its
+internal `Class.forName` try/catch blocks (likely tolerated by design —
+HotSpot's reference impl catches and swallows missing-impl probes during
+that clinit). The fatal NPE that escapes to the CLI is **unrelated** to
+that swallow and originates somewhere downstream — diagnostic gap is the
+absence of a Java stack at the CLI exception print path (parallel agent
+working on that).
+
+**What was needed to get here** (capsule of the two fixes that landed in
+`8aad4c8`):
+
+- **RKC16N.9** — `org.jboss.modules.Module.<clinit>` NPE. The original
+  Session 94 recon notes pointed at JBoss-Modules-specific helpers
+  (`PathFilters.acceptAll()`, `DefaultBootModuleLoaderHolder` mirror)
+  and that turned out to be **wrong**. Actual root cause was a chain
+  of three independent gaps that combined to leave `Void.TYPE` null,
+  which in turn surfaced as a `Module.<clinit>` NPE:
+  - jimage header version-decoding bug in `reader/src/jimage.rs` —
+    the version field was read as two `u16`s instead of a single `u32`
+    split into HIGH=major / LOW=minor (inverted on little-endian disk).
+  - missing `lib/modules` jimage fallback in
+    `vm/src/config.rs::discover_boot_classpath` — only checked `rt.jar`
+    and `jmods/`, missed JRE-style and jlink-trimmed runtimes including
+    the Adoptium "JDK 25" header dist used in this reproducer.
+  - new `obj_arg` backtrace diagnostic in `native-builtins/src/lib.rs`,
+    gated on `RUSTJVM_DBG_NULL_NATIVE`, for future "which native got
+    null" investigations.
+- **RKC16N.10** — `ManagementFactory.<clinit>` UnsatisfiedLinkError
+  cluster (5 + 4 missing JMX natives + a null bridge return). Added
+  `sun/management/VMManagementImpl` (5 specific natives + 16 boolean
+  `is*Supported`/`is*Enabled` returning `false` + 17 long counters
+  returning `0`), `sun/management/MemoryImpl` (4 natives), wired into
+  both real-JDK registration paths in `vm/src/vm/vm_init.rs`, and the
+  legacy `Buffer$1.getDirectBufferPool()Ljdk/internal/misc/VM$BufferPool;`
+  returning null in `native-builtins/src/shared_secrets_bridge.rs`.
+
+Frontier as of 2026-04-29: **RKC16N.11** — diagnose the opaque
+main()-thread NPE downstream of `ManagementFactory.<clinit>`. Serialised
+after the parallel CLI-stack-trace work lands (otherwise pure recon is
+blind).
+
 ## Live status (2026-04-26, Session 94 — fourth iteration; RVERIF.2 landed)
 
 After RVERIF.2 (verifier subtype widening fix via JDK interface name table):

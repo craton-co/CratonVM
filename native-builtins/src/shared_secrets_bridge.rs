@@ -45,6 +45,8 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::{ArrayElementType, ObjectRef, Value};
 
+use crate::alloc_concurrent_synthetic;
+
 /// WP1.4 — Re-export of the canonical concrete-class mapping.
 /// Mirrors `vm/src/runtime/shared_secrets.rs::SharedSecretsInterface`
 /// (we can't `use` it here because native-builtins does not depend
@@ -949,6 +951,59 @@ fn jnio_acquire_session(
     Ok(Some(Value::Object(None)))
 }
 
+/// RKC16N.11 — return a synthetic `jdk.internal.misc.VM$BufferPool`
+/// instance (rather than the previous null) so that the caller — typically
+/// `ManagementFactoryHelper.getBufferPoolMXBeans` and friends, which
+/// immediately invoke `getName()` / `getCount()` / `getMemoryUsed()` /
+/// `getTotalCapacity()` on the returned reference — does not NPE.
+///
+/// The natives bound to `jdk/internal/misc/VM$BufferPool` (registered
+/// alongside this in `register_java_nio_access`) provide safe defaults:
+/// `"direct"` for the name, zero counters for the rest. That's
+/// spec-compatible: the legacy interface only documents the value
+/// shape, not strict per-call accuracy of the counters.
+fn jnio_get_direct_buffer_pool(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let pool = alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4);
+    Ok(Some(Value::Object(Some(pool))))
+}
+
+fn vm_buffer_pool_get_name(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Legacy `jdk.internal.misc.VM$BufferPool.getName()` — the only
+    // direct-buffer pool surface this object covers, so always
+    // "direct".  Real JDK uses the same constant.
+    let s = ctx.create_string("direct");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn vm_buffer_pool_get_count(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // No live direct-buffer accounting — return zero so callers that
+    // chart counts see "no pool activity" rather than NPEing.
+    Ok(Some(Value::Long(0)))
+}
+
+fn vm_buffer_pool_get_total_capacity(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Long(0)))
+}
+
+fn vm_buffer_pool_get_memory_used(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Long(0)))
+}
+
 fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/nio/Buffer$1";
     registry.register(
@@ -968,6 +1023,44 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "acquireSession",
         "(Ljava/nio/Buffer;)Ljava/lang/foreign/MemorySegment$Scope;",
         jnio_acquire_session,
+    );
+    // RKC16N.10 follow-on / RKC16N.11: legacy JDK 8/9 SharedSecrets
+    // accessor still referenced by ManagementFactory.<clinit> in some
+    // JDK 25 builds. Originally returned null, which downstream NPE'd
+    // when the caller dereferenced the result. Now returns a synthetic
+    // `jdk.internal.misc.VM$BufferPool` whose four natives — registered
+    // just below — yield safe defaults.
+    registry.register(
+        owner,
+        "getDirectBufferPool",
+        "()Ljdk/internal/misc/VM$BufferPool;",
+        jnio_get_direct_buffer_pool,
+    );
+
+    // RKC16N.11: the four `VM$BufferPool` interface methods. The
+    // returned synthetic from `jnio_get_direct_buffer_pool` carries
+    // no instance state, so all four bindings are stateless lambdas
+    // returning safe defaults. Registered on the synthetic class
+    // name (matches the shape used elsewhere in the bridge).
+    let pool_owner = "jdk/internal/misc/VM$BufferPool";
+    registry.register(
+        pool_owner,
+        "getName",
+        "()Ljava/lang/String;",
+        vm_buffer_pool_get_name,
+    );
+    registry.register(pool_owner, "getCount", "()J", vm_buffer_pool_get_count);
+    registry.register(
+        pool_owner,
+        "getTotalCapacity",
+        "()J",
+        vm_buffer_pool_get_total_capacity,
+    );
+    registry.register(
+        pool_owner,
+        "getMemoryUsed",
+        "()J",
+        vm_buffer_pool_get_memory_used,
     );
 }
 

@@ -40,7 +40,7 @@ pub use classloading::{Class, ClassId, ClassLoaderId, ClassPath, ClassState, Cla
 pub use config::VmConfig;
 pub use error::{MethodCallFailed, MethodCallResult, VmError};
 pub use threading::{JvmThread, ThreadId};
-pub use vm::{SharedVm, Vm};
+pub use vm::{SharedVm, StackTraceFrame, Vm};
 
 // ---------------------------------------------------------------------------
 // T17.E.2 — Windows test-harness teardown shim

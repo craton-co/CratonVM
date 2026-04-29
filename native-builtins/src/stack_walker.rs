@@ -241,6 +241,19 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_check_stack_walk_modes,
     );
+    // RKC16N.13 — In JDK 25 the helper is exposed as a *static* native on
+    // the outer `StackStreamFactory` class as well (called from
+    // `StackStreamFactory.<clinit>` to feature-test the walker pipeline).
+    // Without it, JBoss-Modules / WildFly boot logs an UnsatisfiedLinkError
+    // swallowed at `<clinit>` and a downstream NPE on
+    // `StackFrameTraverser.<clinit>` because the verbatim `mode` static
+    // never gets initialised. Same semantics — return true.
+    registry.register(
+        "java/lang/StackStreamFactory",
+        "checkStackWalkModes",
+        "()Z",
+        native_check_stack_walk_modes,
+    );
 }
 
 /// `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` —

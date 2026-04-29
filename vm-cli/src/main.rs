@@ -1062,6 +1062,21 @@ fn run() -> Result<()> {
             // Try to read exception class name and message, plus the cause chain
             // so users can see the underlying reason for wrapper exceptions like
             // ExceptionInInitializerError or InvocationTargetException.
+            //
+            // Also render the captured Java-side stack trace from the
+            // `stackTrace` field on each Throwable when present. NOTE: in the
+            // current rustjvm, `Throwable.fillInStackTrace` (see
+            // `native-builtins/src/lang_misc.rs`) only stashes frames into the
+            // per-thread `JvmThread::throwable_stacks` map keyed by identity
+            // hash — it does NOT populate the heap-side `stackTrace` /
+            // `backtrace` field. The Java code only writes that field lazily
+            // when something calls `Throwable.getStackTrace()`. For unhandled
+            // exceptions that escape `main()`, that has typically never
+            // happened, so the renderer below will usually find a null array
+            // and emit no `\tat ...` lines. Promoting the synthetic capture
+            // to populate the heap field (or wiring this CLI to read from
+            // `throwable_stacks` directly) is roadmap item T2.2.18 — see
+            // `docs/roadmap-100.md` line 471.
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
             let mut prefix = "Exception in thread \"main\"";
@@ -1071,10 +1086,11 @@ fn run() -> Result<()> {
                     .get_class(cid).map(|c| c.name.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 // Find fields by name so we work regardless of layout.
-                let (msg_idx, cause_idx) = {
+                let (msg_idx, cause_idx, stack_idx) = {
                     let cm = vm.shared.class_manager.read();
                     let mut msg_i: Option<usize> = None;
                     let mut cause_i: Option<usize> = None;
+                    let mut stack_i: Option<usize> = None;
                     // Walk from Throwable down
                     let mut walk = Some(cid);
                     while let Some(k) = walk {
@@ -1089,13 +1105,16 @@ fn run() -> Result<()> {
                                     if &*f.name == "cause" && cause_i.is_none() {
                                         cause_i = Some(abs);
                                     }
+                                    if &*f.name == "stackTrace" && stack_i.is_none() {
+                                        stack_i = Some(abs);
+                                    }
                                     inst += 1;
                                 }
                             }
                             walk = cls.superclass;
                         } else { break; }
                     }
-                    (msg_i, cause_i)
+                    (msg_i, cause_i, stack_i)
                 };
                 let message = if let Some(i) = msg_idx {
                     let v = vm.shared.heap.get_field(cur, i);
@@ -1109,6 +1128,114 @@ fn run() -> Result<()> {
                     format!("{prefix} {cname}: {message}")
                 };
                 lines.push(line);
+
+                // Render `\tat ...` frames from `stackTrace[]` if populated.
+                // Each element is a `StackTraceElement` with fields, in
+                // declaration order: declaringClass (String), methodName
+                // (String), fileName (String, nullable), lineNumber (int).
+                // We resolve those four field indices the same way as the
+                // Throwable fields above so we work regardless of layout.
+                let mut emitted_frames = false;
+                if let Some(si) = stack_idx {
+                    let stack_val = vm.shared.heap.get_field(cur, si);
+                    if let Value::Object(Some(arr)) = stack_val {
+                        let len = vm.shared.heap.array_length(arr);
+                        if len > 0 {
+                            emitted_frames = true;
+                            // Resolve StackTraceElement field indices once
+                            // from the first non-null element's class.
+                            let mut ste_idx: Option<(usize, usize, usize, usize)> = None;
+                            for i in 0..len {
+                                let elem = vm.shared.heap.get_array_element(arr, i)
+                                    .ok()
+                                    .and_then(|v| if let Value::Object(Some(o)) = v { Some(o) } else { None });
+                                let Some(elem_ref) = elem else { continue };
+                                if ste_idx.is_none() {
+                                    let ecid = vm.shared.heap.class_id_of(elem_ref);
+                                    let cm = vm.shared.class_manager.read();
+                                    let mut dc: Option<usize> = None;
+                                    let mut mn: Option<usize> = None;
+                                    let mut fn_: Option<usize> = None;
+                                    let mut ln: Option<usize> = None;
+                                    let mut walk = Some(ecid);
+                                    while let Some(k) = walk {
+                                        if let Some(cls) = cm.get_class(k) {
+                                            let mut inst = 0usize;
+                                            for f in &cls.fields {
+                                                if !f.is_static() {
+                                                    let abs = cls.first_field_index + inst;
+                                                    match &*f.name {
+                                                        "declaringClass" if dc.is_none() => dc = Some(abs),
+                                                        "methodName" if mn.is_none() => mn = Some(abs),
+                                                        "fileName" if fn_.is_none() => fn_ = Some(abs),
+                                                        "lineNumber" if ln.is_none() => ln = Some(abs),
+                                                        _ => {}
+                                                    }
+                                                    inst += 1;
+                                                }
+                                            }
+                                            walk = cls.superclass;
+                                        } else { break; }
+                                    }
+                                    if let (Some(a), Some(b), Some(c), Some(d)) = (dc, mn, fn_, ln) {
+                                        ste_idx = Some((a, b, c, d));
+                                    }
+                                }
+                                let Some((dc, mn, fn_, ln)) = ste_idx else { continue };
+                                let read_str = |idx: usize| -> Option<String> {
+                                    match vm.shared.heap.get_field(elem_ref, idx) {
+                                        Value::Object(Some(s)) => {
+                                            rustjvm_vm::vm::read_java_string(&vm.shared.heap, s)
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                let class_name = read_str(dc).unwrap_or_else(|| "<unknown>".to_string());
+                                let method_name = read_str(mn).unwrap_or_else(|| "<unknown>".to_string());
+                                let file_name = read_str(fn_);
+                                let line_no = match vm.shared.heap.get_field(elem_ref, ln) {
+                                    Value::Int(i) => i,
+                                    _ => -1,
+                                };
+                                // HotSpot format:
+                                //   \tat <class>.<method>(<file>:<line>)
+                                // If fileName is null/empty, use "Unknown Source".
+                                // If lineNumber < 0, omit ":<line>".
+                                let location = match (file_name.as_deref(), line_no) {
+                                    (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                    (Some(f), _) if !f.is_empty() => f.to_string(),
+                                    _ => "Unknown Source".to_string(),
+                                };
+                                lines.push(format!("\tat {class_name}.{method_name}({location})"));
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: when `Throwable.stackTrace[]` was never populated
+                // (the array is null or empty — the typical case for an
+                // exception that escapes `main()` without anyone calling
+                // `getStackTrace()`), pull frames from the per-thread
+                // `JvmThread::throwable_stacks` map keyed by identity hash
+                // — that's where `Throwable.fillInStackTrace` actually
+                // stashes the captured frames in this VM. See
+                // `vm/src/vm/vm_init.rs::Vm::throwable_stack_for`.
+                if !emitted_frames {
+                    if let Some(frames) = vm.throwable_stack_for(cur) {
+                        for frame in frames {
+                            let location = match (frame.file.as_deref(), frame.line) {
+                                (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                (Some(f), _) if !f.is_empty() => f.to_string(),
+                                _ => "Unknown Source".to_string(),
+                            };
+                            lines.push(format!(
+                                "\tat {}.{}({})",
+                                frame.class, frame.method, location
+                            ));
+                        }
+                    }
+                }
+
                 // Follow cause
                 if let Some(i) = cause_idx {
                     let v = vm.shared.heap.get_field(cur, i);

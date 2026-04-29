@@ -561,6 +561,20 @@ fn build_module_object(
     ctx.set_field(module, MOD_SLOT_RESOURCE_ROOTS, Value::Object(Some(arr)));
     // Class loader is populated lazily on first `getClassLoader()` call.
     ctx.set_field(module, MOD_SLOT_CLASSLOADER, Value::Object(None));
+
+    // RKC16N.12 — populate `mainClassName` on the real `org.jboss.modules.Module`
+    // class layout. The synthetic above only writes our 4 slots, but the real
+    // bytecode (loaded from jboss-modules.jar) reads `getfield mainClassName`
+    // at PC 1 of `Module.run(String[])` which then drives PC 40 of
+    // `Module.run(String,String[])` — `Class.forName(mainClassName, false, mcl)`.
+    // Without this, the field reads back its default zero/null and KC16 boot
+    // calls `Class.forName("", ...)` which fails as ClassNotFoundException
+    // with no detail (the empty class-name path through MCL.loadClass).
+    // Setting by NAME (not slot index) handles the real class's field layout.
+    if let Some(main_class) = resolved.mx.main_class.as_deref() {
+        let main_str = ctx.create_string(main_class);
+        ctx.set_field_by_name(module, "mainClassName", Value::Object(Some(main_str)));
+    }
     module
 }
 
@@ -1183,14 +1197,20 @@ pub(crate) fn native_module_classloader_load_class(
     };
     let class_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
+    let dbg = std::env::var_os("RUSTJVM_DBG_MCL").is_some();
+    if dbg {
+        eprintln!("[mcl.loadClass] entry name={class_name:?}");
+    }
 
     // Step 1 — parent-first for JDK internals so they always come from the
     // bootstrap loader (not the module's resource roots, even if a module
     // tries to ship a duplicate `java.*` class).
     if is_jdk_internal_class(&class_name) {
+        if dbg { eprintln!("[mcl.loadClass] jdk-internal path"); }
         return match ctx.load_class(&internal) {
             Ok(Some(mirror)) => Ok(Some(mirror)),
             _ => {
+                if dbg { eprintln!("[mcl.loadClass] jdk-internal: load_class miss"); }
                 let exc =
                     alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
                 let msg = ctx.create_string(&class_name);
@@ -1207,15 +1227,22 @@ pub(crate) fn native_module_classloader_load_class(
     let entry_path = format!("{}.class", internal);
     let mut visible = false;
     if let Some(name) = module_name.as_deref() {
-        let (_modules, roots) = module_visibility_closure(name);
+        let (modules, roots) = module_visibility_closure(name);
+        if dbg {
+            eprintln!("[mcl.loadClass] module={name:?} closure={modules:?} root_count={}", roots.len());
+        }
         // Register every visible root on the shared dynamic classpath so
         // the system class loader can resolve once visibility passes.
         // (`register_resource_roots` is idempotent.)
         register_resource_roots(ctx, &roots);
         if find_entry_in_roots(&roots, &entry_path).is_some() {
             visible = true;
+            if dbg { eprintln!("[mcl.loadClass] entry visible in closure"); }
+        } else if dbg {
+            eprintln!("[mcl.loadClass] entry NOT in closure for {entry_path:?}");
         }
     } else {
+        if dbg { eprintln!("[mcl.loadClass] no module backref (defensive: visible=true)"); }
         // Defensive: if we don't have a module backref (synthetic or test
         // fixture), behave like a plain delegating loader so apps that
         // don't depend on isolation still work.
@@ -1231,7 +1258,8 @@ pub(crate) fn native_module_classloader_load_class(
 
     match ctx.load_class(&internal) {
         Ok(Some(mirror)) => Ok(Some(mirror)),
-        _ => {
+        other => {
+            if dbg { eprintln!("[mcl.loadClass] load_class miss after visible: {other:?}"); }
             let exc =
                 alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
             let msg = ctx.create_string(&class_name);

@@ -500,6 +500,23 @@ pub fn discover_boot_classpath(java_home: Option<&str>) -> Vec<String> {
         }
     }
 
+    // JRE-style and jlink-trimmed runtime distributions: no `jmods/` directory,
+    // but `$JAVA_HOME/lib/modules` is the jimage blob containing every module
+    // class. This includes Adoptium/Temurin "JRE" archives, custom jlink
+    // images, and any JDK where `jmods/` was deleted to save space. Our reader
+    // has jimage support (see classloading/src/class_path.rs::JImageFile);
+    // ClassPath::is_likely_jimage detects the file and routes to JImageReader.
+    //
+    // RKC16N.9: missing this fallback was the root cause of `Void.TYPE` (and
+    // every other wrapper TYPE field) being null at boot — pre_init_wrapper
+    // skipped them because bootstrap_core_classes saw an empty boot
+    // classpath, so wrapper classes never loaded eagerly and Module.<clinit>
+    // hit a null at `getstatic Void.TYPE`.
+    let lib_modules = java_home.join("lib").join("modules");
+    if lib_modules.is_file() {
+        return vec![lib_modules.to_string_lossy().into_owned()];
+    }
+
     Vec::new()
 }
 

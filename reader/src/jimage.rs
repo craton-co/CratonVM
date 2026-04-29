@@ -15,8 +15,8 @@
 //! +---------------------------+
 //! | Header (28 bytes)         |
 //! |   u4 magic = 0xCAFEDADA   |
-//! |   u2 major_version = 1    |
-//! |   u2 minor_version = 0    |
+//! |   u4 version              | // (major << 16) | minor — i.e. version 1.0
+//! |                           | // is `0x0001_0000` (HIGH=major, LOW=minor).
 //! |   u4 flags                |
 //! |   u4 resource_count       |
 //! |   u4 table_length         |
@@ -301,8 +301,19 @@ impl Header {
             }
         };
 
-        let major_version = read_u16(4);
-        let minor_version = read_u16(6);
+        // RKC16N.9: the jimage header stores `version` as a single u4 with
+        // `major` in the HIGH 16 bits and `minor` in the LOW 16 bits — i.e.
+        // version 1.0 is encoded as `(1 << 16) | 0 = 0x0001_0000`. On a
+        // little-endian disk that becomes the byte sequence `00 00 01 00`
+        // at offsets 4..7 — reading two consecutive u16's would swap major
+        // and minor. (See OpenJDK
+        // src/java.base/share/native/libjimage/imageFile.hpp `image_version`.)
+        // We were misreading every JDK 9+ runtime image as version "0.1"
+        // and bouncing it as unsupported, leaving the boot classpath empty
+        // and `Void.TYPE` (and every wrapper TYPE field) null.
+        let version = read_u32(4);
+        let major_version = (version >> 16) as u16;
+        let minor_version = (version & 0xFFFF) as u16;
         let flags = read_u32(8);
         let resource_count = read_u32(12);
         let table_length = read_u32(16);
@@ -937,8 +948,8 @@ pub mod test_builder {
         );
         // Header (little-endian).
         out.extend_from_slice(&JIMAGE_MAGIC.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes()); // major
-        out.extend_from_slice(&0u16.to_le_bytes()); // minor
+        // u4 version = (major << 16) | minor — version 1.0 = 0x0001_0000.
+        out.extend_from_slice(&((1u32 << 16) | 0).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // flags
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         out.extend_from_slice(&(table_len as u32).to_le_bytes());
@@ -1073,8 +1084,8 @@ mod tests {
     fn header_parse_little_endian_magic() {
         let mut bytes = vec![0u8; HEADER_SIZE];
         bytes[0..4].copy_from_slice(&JIMAGE_MAGIC.to_le_bytes());
-        bytes[4..6].copy_from_slice(&1u16.to_le_bytes()); // major
-        bytes[6..8].copy_from_slice(&0u16.to_le_bytes()); // minor
+        // u4 version = (major << 16) | minor — version 1.0 = 0x0001_0000.
+        bytes[4..8].copy_from_slice(&((1u32 << 16) | 0).to_le_bytes());
         let h = Header::parse(&bytes).unwrap();
         assert!(h.little_endian);
         assert_eq!(h.major_version, 1);
@@ -1085,8 +1096,7 @@ mod tests {
     fn header_parse_big_endian_magic() {
         let mut bytes = vec![0u8; HEADER_SIZE];
         bytes[0..4].copy_from_slice(&JIMAGE_MAGIC.to_be_bytes());
-        bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
-        bytes[6..8].copy_from_slice(&0u16.to_be_bytes());
+        bytes[4..8].copy_from_slice(&((1u32 << 16) | 0).to_be_bytes());
         let h = Header::parse(&bytes).unwrap();
         assert!(!h.little_endian);
         assert_eq!(h.major_version, 1);
@@ -1102,7 +1112,8 @@ mod tests {
     fn header_parse_unsupported_version() {
         let mut bytes = vec![0u8; HEADER_SIZE];
         bytes[0..4].copy_from_slice(&JIMAGE_MAGIC.to_le_bytes());
-        bytes[4..6].copy_from_slice(&99u16.to_le_bytes()); // major
+        // u4 version = (major << 16) | minor — encode major=99, minor=0.
+        bytes[4..8].copy_from_slice(&(99u32 << 16).to_le_bytes());
         assert!(matches!(
             Header::parse(&bytes),
             Err(JImageError::UnsupportedVersion { major: 99, .. })
