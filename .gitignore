@@ -14,6 +14,14 @@ apps/
 # JAR files (benchmark dependencies — download separately)
 bench/*.jar
 
+# Bench fixture caches (Maven Central downloads, EJBCA dist zip, WildFly tgz, etc.)
+bench/**/cache/
+bench/**/staged/
+bench/**/staged-*/
+bench/wildfly-boot/wildfly-*.tar.gz
+bench/wildfly-boot/wildfly-*.zip
+bench/ejbca-deploy/ejbca_ce_*.zip
+
 # Temp files
 *.tmp
 

@@ -98,6 +98,51 @@ if (-not $ObjJar -or -not (Test-Path $ObjJar)) {
     $ObjJar = Find-FirstJar -Roots $roots -ArtifactName 'objenesis'
 }
 
+# Maven Central fallback — download any missing jar into staged-mockito\cache\.
+$CacheDir = Join-Path $StagedDir 'cache'
+$McBase   = if ($env:MAVEN_CENTRAL_BASE) { $env:MAVEN_CENTRAL_BASE } else { 'https://repo1.maven.org/maven2' }
+function Fetch-Mc {
+    param([string]$Label, [string]$GroupPath, [string]$Artifact, [string]$Version, [string]$BaseName, [string]$LogPath, [string]$CacheDir, [string]$McBase)
+    $cached = Join-Path $CacheDir ("{0}.jar" -f $BaseName)
+    if (Test-Path $cached) {
+        Add-Content -Path $LogPath -Value "stage-mockito-probe: using cached $Label at $cached" -Encoding utf8
+        return $cached
+    }
+    if ($env:NO_NET -eq '1') { return $null }
+    New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+    $url = "$McBase/$GroupPath/$Artifact/$Version/$BaseName.jar"
+    Add-Content -Path $LogPath -Value "stage-mockito-probe: fetching $url" -Encoding utf8
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $cached -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        return $cached
+    } catch {
+        Add-Content -Path $LogPath -Value "stage-mockito-probe: download failed for $Label : $($_.Exception.Message)" -Encoding utf8
+        if (Test-Path $cached) { Remove-Item $cached -Force }
+        return $null
+    }
+}
+
+if (-not $MockitoJar) {
+    $v = if ($env:MOCKITO_VERSION) { $env:MOCKITO_VERSION } else { '5.13.0' }
+    $got = Fetch-Mc -Label 'mockito-core' -GroupPath 'org/mockito' -Artifact 'mockito-core' -Version $v -BaseName "mockito-core-$v" -LogPath $CompileLog -CacheDir $CacheDir -McBase $McBase
+    if ($got) { $MockitoJar = $got }
+}
+if (-not $BbJar) {
+    $v = if ($env:BYTEBUDDY_VERSION) { $env:BYTEBUDDY_VERSION } else { '1.14.19' }
+    $got = Fetch-Mc -Label 'byte-buddy' -GroupPath 'net/bytebuddy' -Artifact 'byte-buddy' -Version $v -BaseName "byte-buddy-$v" -LogPath $CompileLog -CacheDir $CacheDir -McBase $McBase
+    if ($got) { $BbJar = $got }
+}
+if (-not $BbAgJar) {
+    $v = if ($env:BYTEBUDDY_VERSION) { $env:BYTEBUDDY_VERSION } else { '1.14.19' }
+    $got = Fetch-Mc -Label 'byte-buddy-agent' -GroupPath 'net/bytebuddy' -Artifact 'byte-buddy-agent' -Version $v -BaseName "byte-buddy-agent-$v" -LogPath $CompileLog -CacheDir $CacheDir -McBase $McBase
+    if ($got) { $BbAgJar = $got }
+}
+if (-not $ObjJar) {
+    $v = if ($env:OBJENESIS_VERSION) { $env:OBJENESIS_VERSION } else { '3.4' }
+    $got = Fetch-Mc -Label 'objenesis' -GroupPath 'org/objenesis' -Artifact 'objenesis' -Version $v -BaseName "objenesis-$v" -LogPath $CompileLog -CacheDir $CacheDir -McBase $McBase
+    if ($got) { $ObjJar = $got }
+}
+
 $missing = @()
 if (-not $MockitoJar) { $missing += 'mockito-core' }
 if (-not $BbJar)      { $missing += 'byte-buddy' }
@@ -107,6 +152,7 @@ if (-not $ObjJar)     { $missing += 'objenesis' }
 if ($missing.Count -gt 0) {
     Add-Content -Path $CompileLog -Value ("stage-mockito-probe: SKIP missing jars: " + ($missing -join ', ')) -Encoding utf8
     Add-Content -Path $CompileLog -Value "  searched: ~/.m2/repository, C:\Users\Victor\.m2\repository" -Encoding utf8
+    Add-Content -Path $CompileLog -Value "  attempted: Maven Central (set NO_NET=1 to skip; \$env:MAVEN_CENTRAL_BASE to override mirror)" -Encoding utf8
     Set-Content -Path $SkipFlag -Value ('missing: ' + ($missing -join ',')) -Encoding utf8
     # Compile the interface even when skipping so re-runs of the run script
     # don't hit a missing main-class.

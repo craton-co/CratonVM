@@ -74,7 +74,33 @@ for cand in "${candidates[@]}"; do
 done
 
 if [[ -z "$BB_JAR_PATH" ]]; then
+    # Maven Central fallback — download byte-buddy core into staged-bytebuddy/cache/.
+    CACHE_DIR="$STAGED_DIR/cache"
+    BB_VER="${BYTEBUDDY_VERSION:-1.14.19}"
+    BB_CACHED="$CACHE_DIR/byte-buddy-${BB_VER}.jar"
+    if [[ -f "$BB_CACHED" ]]; then
+        echo "stage-bytebuddy-probe: using cached byte-buddy at $BB_CACHED" | tee -a "$COMPILE_LOG"
+        BB_JAR_PATH="$BB_CACHED"
+    elif [[ "${NO_NET:-0}" == "1" ]]; then
+        echo "stage-bytebuddy-probe: NO_NET=1; skipping Maven Central fallback" | tee -a "$COMPILE_LOG"
+    elif command -v curl >/dev/null 2>&1; then
+        mkdir -p "$CACHE_DIR"
+        MC_BASE="${MAVEN_CENTRAL_BASE:-https://repo1.maven.org/maven2}"
+        URL="$MC_BASE/net/bytebuddy/byte-buddy/${BB_VER}/byte-buddy-${BB_VER}.jar"
+        echo "stage-bytebuddy-probe: fetching $URL" | tee -a "$COMPILE_LOG"
+        if curl -fsSL --retry 2 --connect-timeout 30 -o "$BB_CACHED" "$URL" >> "$COMPILE_LOG" 2>&1; then
+            BB_JAR_PATH="$BB_CACHED"
+            echo "stage-bytebuddy-probe: downloaded byte-buddy to $BB_CACHED" | tee -a "$COMPILE_LOG"
+        else
+            echo "stage-bytebuddy-probe: Maven Central download failed (continuing to skip)" | tee -a "$COMPILE_LOG"
+            rm -f "$BB_CACHED"
+        fi
+    fi
+fi
+
+if [[ -z "$BB_JAR_PATH" ]]; then
     echo "stage-bytebuddy-probe: SKIP byte-buddy jar not found" | tee -a "$COMPILE_LOG"
+    echo "  attempted: Maven Central (set NO_NET=1 to skip; \$MAVEN_CENTRAL_BASE to override mirror)" | tee -a "$COMPILE_LOG"
     echo "  set BYTEBUDDY_JAR=/path/to/byte-buddy-X.Y.Z.jar to enable real-DSL probe" | tee -a "$COMPILE_LOG"
     touch "$SKIP_FLAG"
 fi

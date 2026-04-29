@@ -94,8 +94,35 @@ for cand in "${candidates[@]}"; do
 done
 
 if [[ -z "$CGLIB_JAR_PATH" ]]; then
+    # Maven Central fallback — download cglib-nodep into staged-cglib/cache/.
+    # Honours $MAVEN_CENTRAL_BASE override; respects $NO_NET=1 to skip.
+    CACHE_DIR="$STAGED_DIR/cache"
+    CGLIB_VER="${CGLIB_VERSION:-3.3.0}"
+    CGLIB_CACHED="$CACHE_DIR/cglib-nodep-${CGLIB_VER}.jar"
+    if [[ -f "$CGLIB_CACHED" ]]; then
+        echo "stage-cglib-probe: using cached cglib at $CGLIB_CACHED" | tee -a "$COMPILE_LOG"
+        CGLIB_JAR_PATH="$CGLIB_CACHED"
+    elif [[ "${NO_NET:-0}" == "1" ]]; then
+        echo "stage-cglib-probe: NO_NET=1; skipping Maven Central fallback" | tee -a "$COMPILE_LOG"
+    elif command -v curl >/dev/null 2>&1; then
+        mkdir -p "$CACHE_DIR"
+        MC_BASE="${MAVEN_CENTRAL_BASE:-https://repo1.maven.org/maven2}"
+        URL="$MC_BASE/cglib/cglib-nodep/${CGLIB_VER}/cglib-nodep-${CGLIB_VER}.jar"
+        echo "stage-cglib-probe: fetching $URL" | tee -a "$COMPILE_LOG"
+        if curl -fsSL --retry 2 --connect-timeout 30 -o "$CGLIB_CACHED" "$URL" >> "$COMPILE_LOG" 2>&1; then
+            CGLIB_JAR_PATH="$CGLIB_CACHED"
+            echo "stage-cglib-probe: downloaded cglib to $CGLIB_CACHED" | tee -a "$COMPILE_LOG"
+        else
+            echo "stage-cglib-probe: Maven Central download failed (continuing to skip)" | tee -a "$COMPILE_LOG"
+            rm -f "$CGLIB_CACHED"
+        fi
+    fi
+fi
+
+if [[ -z "$CGLIB_JAR_PATH" ]]; then
     echo "stage-cglib-probe: SKIP cglib-nodep jar not found" | tee -a "$COMPILE_LOG"
     echo "  searched: \$CGLIB_JAR, ~/.m2/repository/cglib/, C:/Users/Victor/.m2, C:/craton/ejbca-ce/lib, C:/craton/keycloak-*" | tee -a "$COMPILE_LOG"
+    echo "  attempted: Maven Central (set NO_NET=1 to skip; \$MAVEN_CENTRAL_BASE to override mirror)" | tee -a "$COMPILE_LOG"
     echo "  set CGLIB_JAR=/path/to/cglib-nodep-X.Y.jar to enable the real-DSL probe" | tee -a "$COMPILE_LOG"
     touch "$SKIP_FLAG"
 fi

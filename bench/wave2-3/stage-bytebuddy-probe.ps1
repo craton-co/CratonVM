@@ -109,7 +109,34 @@ foreach ($cand in $candidates) {
 }
 
 if (-not $JarPath) {
+    # Maven Central fallback — download byte-buddy core into staged-bytebuddy\cache\.
+    $CacheDir = Join-Path $StagedDir 'cache'
+    $BbVer = if ($env:BYTEBUDDY_VERSION) { $env:BYTEBUDDY_VERSION } else { '1.14.19' }
+    $CachedJar = Join-Path $CacheDir ("byte-buddy-{0}.jar" -f $BbVer)
+    if (Test-Path $CachedJar) {
+        Add-Content -Path $CompileLog -Value "stage-bytebuddy-probe: using cached byte-buddy at $CachedJar" -Encoding utf8
+        $JarPath = $CachedJar
+    } elseif ($env:NO_NET -eq '1') {
+        Add-Content -Path $CompileLog -Value "stage-bytebuddy-probe: NO_NET=1; skipping Maven Central fallback" -Encoding utf8
+    } else {
+        New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+        $McBase = if ($env:MAVEN_CENTRAL_BASE) { $env:MAVEN_CENTRAL_BASE } else { 'https://repo1.maven.org/maven2' }
+        $Url = "$McBase/net/bytebuddy/byte-buddy/$BbVer/byte-buddy-$BbVer.jar"
+        Add-Content -Path $CompileLog -Value "stage-bytebuddy-probe: fetching $Url" -Encoding utf8
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $CachedJar -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            $JarPath = $CachedJar
+            Add-Content -Path $CompileLog -Value "stage-bytebuddy-probe: downloaded byte-buddy to $CachedJar" -Encoding utf8
+        } catch {
+            Add-Content -Path $CompileLog -Value "stage-bytebuddy-probe: Maven Central download failed: $($_.Exception.Message)" -Encoding utf8
+            if (Test-Path $CachedJar) { Remove-Item $CachedJar -Force }
+        }
+    }
+}
+
+if (-not $JarPath) {
     Add-Content -Path $CompileLog -Value "stage-bytebuddy-probe: SKIP byte-buddy jar not found" -Encoding utf8
+    Add-Content -Path $CompileLog -Value "  attempted: Maven Central (set NO_NET=1 to skip; \$env:MAVEN_CENTRAL_BASE to override mirror)" -Encoding utf8
     Add-Content -Path $CompileLog -Value "  set BYTEBUDDY_JAR=/path/to/byte-buddy-X.Y.Z.jar to enable real-DSL probe" -Encoding utf8
     Set-Content -Path $SkipFlag -Value 'no-bytebuddy-jar' -Encoding utf8
     Write-Output "stage-bytebuddy-probe: SKIP byte-buddy jar not found (set BYTEBUDDY_JAR to enable real-DSL probe)"

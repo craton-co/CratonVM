@@ -1,0 +1,67 @@
+{
+  "$schema_version": 1,
+  "generated_at": "2026-04-29T00:00:00Z",
+  "rustjvm_version": "unknown",
+  "wp": "WP8.10",
+  "fixture": {
+    "mode": "real-distribution",
+    "wildfly_version": "32.0.1.Final",
+    "wildfly_url": "https://github.com/wildfly/wildfly/releases/download/32.0.1.Final/wildfly-32.0.1.Final.tar.gz",
+    "wildfly_sha256": "REPLACE_WITH_REAL_SHA256_ON_FIRST_RUN",
+    "notes": "Boots a real WildFly 32 distribution under rust-jvm via jboss-modules.jar (NOT JPMS). The first-failure baseline below is a best-guess from JBoss Modules architecture and the known rust-jvm gaps in waves 1-7 — to be replaced with the actual stderr signature once the parent runs the harness once."
+  },
+  "steps": [
+    {
+      "name": "stage",
+      "rc": 0,
+      "notes": "stage.sh / stage.ps1 download wildfly-32.0.1.Final.tar.gz to .cache/, validate sha256, extract under staged/wildfly/. Idempotent."
+    },
+    {
+      "name": "run",
+      "rc": 1,
+      "notes": "run-under-rustjvm.{sh,ps1} invokes rustjvm --jar staged/wildfly/jboss-modules.jar -mp staged/wildfly/modules org.jboss.as.standalone --server-config=standalone.xml. Boot is killed by TIMEOUT_SEC (default 60) — most-likely outcome is a JBoss Modules clinit / SPI failure long before 'WFLYSRV0025: WildFly Full ... started in Nms' is emitted."
+    }
+  ],
+  "expected_final_rc": 1,
+  "expected_stdout_contains": [],
+  "expected_stderr_contains": [
+    "JBoss Modules"
+  ],
+  "expected_stderr_forbidden": [
+    "panicked at",
+    "RUST_BACKTRACE",
+    "STATUS_ACCESS_VIOLATION"
+  ],
+  "first_failure_hypothesis": {
+    "most_likely": "java.lang.NoSuchMethodError or NPE inside org.jboss.modules.Main.<clinit> or org.jboss.modules.ModuleLoader, while parsing the first module.xml under staged/wildfly/modules/system/layers/base/. Most plausible exact site: ServiceLoader-driven discovery of org.jboss.modules.ModuleLoader providers, or a java.util.logging.LogManager initialization race when Djava.util.logging.manager=org.jboss.logmanager.LogManager forces JBoss LogManager to be installed before java.base finishes bootstrap.",
+    "alternates": [
+      "URLClassPath/URLClassLoader path while resolving file: URLs to module .jars — known WP1.8 / Wave 7 surface area.",
+      "java.nio.channels.FileChannel.map for memory-mapped reads (h2 / log files) — WP3.3 partial.",
+      "Thread.getContextClassLoader being null inside a clinit before jboss-modules has finished installing its bootstrap loader.",
+      "Module.getResources('META-INF/services/...') returning empty because the rust-jvm classpath only contains jboss-modules.jar and not the system modules — by design, JBoss Modules walks modules/ at runtime, so this should be OK after WP1.8."
+    ]
+  },
+  "known_blockers": [
+    {
+      "id": "WP8.10.3",
+      "summary": "Pin the actual first-failure stderr signature here once run-under-rustjvm.sh has been executed once on a real machine. Replace `expected_stderr_contains` with the precise NoSuchMethodError class+method or the exception qualified name. Bump `generated_at`."
+    },
+    {
+      "id": "WP1.8",
+      "summary": "ServiceLoader.discover_providers must scan via ctx.find_all_resource_urls — confirmed landed (see roadmap §16). Re-verify under WildFly's ModuleLoader SPI which uses ServiceLoader.load(ModuleFinder.class)."
+    },
+    {
+      "id": "WP3.3",
+      "summary": "FileChannel.map partial — WildFly's H2 datasource and jboss-logmanager file appender both touch FileChannel APIs. Watch for UnsupportedOperationException on map/transferTo/lock."
+    }
+  ],
+  "history": [
+    {
+      "session": 99,
+      "rc": 1,
+      "blocker": "WP8.10 first-failure hypothesis only — no real boot run yet. expected_stderr_contains pinned to the conservative 'JBoss Modules' substring (banner) so diff-baseline passes only if rust-jvm gets at least far enough to emit the JBoss Modules header line."
+    }
+  ],
+  "definition_of_pass": "Long-term: rc=0 + 'WFLYSRV0025' in stdout + a reachable :9990 admin console. Short-term: rc matches expected_final_rc and stderr contains the pinned first-failure marker (no regression past it).",
+  "update_policy": "Update this file as soon as the first real run produces a concrete first-failure. Each new failure surfaced + fixed should bump generated_at, move the previous failure into history[], and pin the next-most-distant failure as the new expected_stderr_contains target. Total expected updates: 5-30 across the WP8.10 lifecycle (each round is a 1-3 hr fix in some Wave 1-7 WP)."
+}
