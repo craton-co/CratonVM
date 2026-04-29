@@ -223,6 +223,233 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-registered sun.management.* native surface (post-RKC16N.10)
+//
+// After commit 8aad4c8 (RKC16N.10) the boot advances past
+// `ManagementFactory.<clinit>` and `Module.<clinit>`. The previous iteration
+// loop spent five build cycles each adding 1-2 missing natives in this same
+// family. Rather than continue iterating, the helpers below register the
+// whole rest of the `sun.management.*` surface up-front: ThreadImpl,
+// ClassLoadingImpl, GarbageCollectorImpl, OperatingSystemImpl,
+// HotSpotDiagnostic, FlagImpl. JBoss/Keycloak only iterates these MXBeans
+// for diagnostic display, not control flow — empty arrays / zeros / -1 are
+// safe defaults consistent with OpenJDK's "metric unavailable" semantics.
+//
+// All six helpers are `pub` and called from BOTH real-JDK paths in
+// `vm/src/vm/vm_init.rs`, alongside `register_vm_management_impl`. They live
+// outside `register_jmx_natives` (which is feature-gated synthetic-only).
+// ---------------------------------------------------------------------------
+
+/// `sun.management.ThreadImpl` — JMM thread inspection natives.
+///
+/// Empty arrays / no-ops match OpenJDK's behaviour when the relevant
+/// optional thread-CPU/contention-monitoring features are disabled (which
+/// they are here — `VMManagementImpl.isThreadCpuTimeSupported` etc. all
+/// return `false`).
+pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/ThreadImpl";
+
+    // No-op population helpers ([JI..., [J[J...) — all leave their output
+    // arrays untouched. Java callers iterate the result and find the
+    // pre-zeroed slots, which matches "feature unsupported".
+    let void_noop: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(None);
+    for (name, desc) in [
+        (
+            "getThreadInfo1",
+            "([JI[Ljava/lang/management/ThreadInfo;)V",
+        ),
+        ("getThreadTotalCpuTime0", "([J[J)V"),
+        ("getThreadUserCpuTime0", "([J[J)V"),
+        ("getThreadAllocatedMemory1", "([J[J)V"),
+        ("setThreadCpuTimeEnabled0", "(Z)V"),
+        ("setThreadContentionMonitoringEnabled0", "(Z)V"),
+        ("resetContentionTimes0", "(J)V"),
+        ("resetPeakThreadCount0", "()V"),
+    ] {
+        r.register(cls, name, desc, void_noop);
+    }
+
+    // getThreads()[Ljava/lang/Thread; — empty Thread[] is safe; consumers
+    // just iterate.
+    r.register(
+        cls,
+        "getThreads",
+        "()[Ljava/lang/Thread;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
+    // findMonitorDeadlockedThreads0 / findDeadlockedThreads0 return null
+    // when no deadlocks (per JMM spec) — match that.
+    r.register(
+        cls,
+        "findMonitorDeadlockedThreads0",
+        "()[J",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        cls,
+        "findDeadlockedThreads0",
+        "()[J",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+}
+
+/// `sun.management.ClassLoadingImpl` — most info comes via
+/// `ManagementFactoryHelper`, so this is intentionally minimal.
+pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/ClassLoadingImpl";
+
+    // setVerboseClass(Z)V — accept and ignore (synthetic verbose flag is
+    // already false in VMManagementImpl).
+    r.register(cls, "setVerboseClass", "(Z)V", |_ctx, _args| Ok(None));
+
+    // <init>(Lsun/management/VMManagement;)V — no-op constructor; the
+    // VMManagement reference is stored by Java bytecode in a field that
+    // we don't read.
+    r.register(
+        cls,
+        "<init>",
+        "(Lsun/management/VMManagement;)V",
+        native_noop_with_this,
+    );
+}
+
+/// `sun.management.GarbageCollectorImpl` — per-collector counters.
+///
+/// Returning 0 is consistent with "no GC events recorded yet" and matches
+/// what OpenJDK reports when GC notification is disabled (and our
+/// `VMManagementImpl.isGcNotificationSupported` returns `false`).
+pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/GarbageCollectorImpl";
+
+    let zero_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Long(0)));
+    for name in ["getCollectionCount", "getCollectionTime"] {
+        r.register(cls, name, "()J", zero_long);
+    }
+
+    // <init>(Ljava/lang/String;Lsun/management/VMManagement;)V — no-op;
+    // the name + VMManagement refs are stored by Java bytecode in fields
+    // we don't introspect.
+    r.register(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;Lsun/management/VMManagement;)V",
+        native_noop_with_this,
+    );
+
+    // gc()V — GarbageCollectorImpl exposes a manual-trigger entry point
+    // mirroring MemoryMXBean.gc(). No-op is fine; we don't proxy through
+    // to the real GC here (MemoryMXBean.gc() does that elsewhere).
+    r.register(cls, "gc", "()V", |_ctx, _args| Ok(None));
+}
+
+/// `sun.management.OperatingSystemImpl` — process / OS metrics.
+///
+/// All byte-quantity longs return -1 (matches OpenJDK behaviour when the
+/// underlying metric is unavailable). All doubles return -1.0 per the
+/// `OperatingSystemMXBean` spec for "load not available".
+pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/OperatingSystemImpl";
+
+    let neg_one_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Long(-1)));
+    for name in [
+        "getCommittedVirtualMemorySize0",
+        "getTotalSwapSpaceSize0",
+        "getFreeSwapSpaceSize0",
+        "getProcessCpuTime0",
+        "getFreePhysicalMemorySize0",
+        "getTotalPhysicalMemorySize0",
+        "getOpenFileDescriptorCount0",
+        "getMaxFileDescriptorCount0",
+    ] {
+        r.register(cls, name, "()J", neg_one_long);
+    }
+
+    let neg_one_double: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Double(-1.0)));
+    for name in ["getSystemCpuLoad0", "getProcessCpuLoad0"] {
+        r.register(cls, name, "()D", neg_one_double);
+    }
+
+    // initialize0()V — sets up native counters; nothing to do here.
+    r.register(cls, "initialize0", "()V", |_ctx, _args| Ok(None));
+}
+
+/// `com.sun.management.HotSpotDiagnostic` (internally
+/// `sun.management.HotSpotDiagnostic`) — heap dumping + flag listing.
+pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
+    // OpenJDK's HotSpotDiagnostic class is in `sun.management` (the public
+    // facade lives in `com.sun.management.HotSpotDiagnosticMXBean`).
+    let cls = "sun/management/HotSpotDiagnostic";
+
+    // dumpHeap0(String, Z)V — heap dumping is a major separate effort;
+    // accept arguments and no-op.
+    r.register(
+        cls,
+        "dumpHeap0",
+        "(Ljava/lang/String;Z)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // getDiagnosticOptions()Ljava/util/List; — empty ArrayList matches
+    // "no manageable VM options exposed". JBoss only iterates this for
+    // diagnostic display.
+    r.register(
+        cls,
+        "getDiagnosticOptions",
+        "()Ljava/util/List;",
+        |ctx, _args| {
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let backing = ctx.new_ref_array(ClassId::new(0), 0);
+            ctx.set_field(list, 0, Value::Object(Some(backing))); // elementData
+            ctx.set_field(list, 1, Value::Int(0));                // size
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+}
+
+/// `sun.management.Flag` — VM flag enumeration.
+///
+/// We don't expose any VM-level manageable flags through JMM, so all
+/// queries return zero / empty.
+pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/Flag";
+
+    r.register(cls, "getInternalFlagCount", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(
+        cls,
+        "getAllFlagNames",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
+    // Empty Flag[] — same reference-array pattern as getAllFlagNames; the
+    // element type is `Lsun/management/Flag;` but our synthetic ref-array
+    // doesn't carry the element class beyond ClassId::new(0).
+    r.register(
+        cls,
+        "getAllFlags",
+        "()[Lsun/management/Flag;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 1. ManagementFactory
 // ---------------------------------------------------------------------------
 

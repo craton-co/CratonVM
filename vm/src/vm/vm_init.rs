@@ -840,6 +840,18 @@ impl SharedVm {
                 // UnsatisfiedLinkError. Lives outside register_jmx_natives
                 // (which is synthetic-only) so the real-JDK path picks it up.
                 rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+                // RKC16N.11: pre-register the rest of the sun.management.*
+                // native surface so future Keycloak-boot iterations don't
+                // trip on missing-native errors as JMM init walks deeper.
+                // All return reasonable defaults (zeros / empty arrays /
+                // -1 for "metric unavailable"); JBoss only iterates these
+                // MXBeans for diagnostic display, not control flow.
+                rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
         }
@@ -885,6 +897,15 @@ impl SharedVm {
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+            // RKC16N.11: rest of the sun.management.* native surface.
+            // See companion calls in the `feature = "synthetic-jdk"`
+            // branch above for the full rationale.
+            rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support
