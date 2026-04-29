@@ -527,6 +527,45 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     };
     let dotted_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal_name = dotted_name.replace('.', "/");
+
+    // RKC16N.12 — when `Class.forName` is invoked with an explicit non-null
+    // classloader, route through `loader.loadClass(name)` so module-scoped
+    // loaders (notably `org.jboss.modules.ModuleClassLoader`) get their
+    // visibility-closure search. Without this, JBoss Modules' boot path
+    // (`Module.run` → `Class.forName(mainClass, false, mcl)` at PC 40 of
+    // `Module.run(String,String[])`) bypasses the module's resource-roots
+    // and the bootstrap classpath has no entry for module-private classes
+    // like `org.jboss.as.server.Main` — so KC16 boot dies with CNFE before
+    // reaching `Main.main`.
+    //
+    // Argument layout per JDK 25 `Class.forName0(String,boolean,ClassLoader,Class)`:
+    //   args[0] = name (String, already read above)
+    //   args[1] = initialize (boolean)
+    //   args[2] = loader (ClassLoader, may be null = bootstrap)
+    //   args[3] = caller (Class, ignored by us)
+    if let Some(Value::Object(Some(loader))) = args.get(2) {
+        let invoke_args = [Value::Object(Some(*loader)), Value::Object(Some(name_obj))];
+        match ctx.invoke_virtual(
+            *loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &invoke_args[1..],
+        ) {
+            Ok(Some(mirror)) => return Ok(Some(mirror)),
+            // ClassLoader.loadClass returning null is technically illegal
+            // (per spec it must throw CNFE) but defensively translate it.
+            Ok(None) => {
+                return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                    class_name: dotted_name,
+                }
+                .into())
+            }
+            // Propagate exceptions thrown by the classloader (CNFE,
+            // LinkageError, etc.) without re-wrapping.
+            Err(e) => return Err(e),
+        }
+    }
+
     match ctx.ensure_class_initialized(&internal_name) {
         Ok(class_id) => {
             // WP2.10 — JDK 25 spec: hidden classes (created via
