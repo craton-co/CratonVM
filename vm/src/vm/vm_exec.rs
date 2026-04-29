@@ -1931,11 +1931,39 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class
             .methods
             .iter()
-            .map(|m| MethodMetadata {
-                name: m.name.to_string(),
-                descriptor: m.descriptor.to_string(),
-                access_flags: m.access_flags.bits(),
-                declaring_class_id: class_id,
+            .map(|m| {
+                // WP2.5 v3 — populate `exceptions` from the JVMS §4.7.5
+                // `Exceptions` attribute when present. Used by the proxy
+                // generator to thread the declared throws set into
+                // `<clinit>` so the dispatch helper's UTE wrap can match
+                // thrown exceptions against the method's declared set.
+                let exceptions: Vec<String> = m
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        rustjvm_reader::attribute::Attribute::Exceptions {
+                            exception_indices,
+                        } => Some(
+                            exception_indices
+                                .iter()
+                                .filter_map(|idx| {
+                                    class
+                                        .constant_pool
+                                        .get_class_name(*idx)
+                                        .map(str::to_string)
+                                })
+                                .collect::<Vec<String>>(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                MethodMetadata {
+                    name: m.name.to_string(),
+                    descriptor: m.descriptor.to_string(),
+                    access_flags: m.access_flags.bits(),
+                    declaring_class_id: class_id,
+                    exceptions,
+                }
             })
             .collect()
     }

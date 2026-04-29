@@ -23390,20 +23390,18 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Class;",
         native_proxy_get_interfaces,
     );
-    // WP2.5 v2: helper that the bytecode emitted by
-    // `classloading::proxy_gen::emit_proxy_classfile` INVOKESTATICs from
-    // each generated method body. In the common case the interpreter's
-    // dispatch hook (interpreter.rs:7041, generalized via
-    // `class_chain_reaches_proxy_instance`) intercepts BEFORE the body
-    // executes, so this native is dead code on the hot path. It is
-    // registered defensively so any code path that bypasses the hook
-    // (JIT-compiled call sites, future regressions, etc.) still
-    // routes through `InvocationHandler.invoke` instead of returning
-    // unsatisfied-link.
+    // WP2.5 v3 — INVOKESTATIC target embedded in every generated `$ProxyN`
+    // method body. Signature changed from the v2 3-string-arg shape to
+    // `(Object, Method, Object[]) Object`: the Method object is now built
+    // once per proxied method by the generated class's `<clinit>` via
+    // `Class.getMethod`, then loaded onto the stack before the
+    // INVOKESTATIC. The native handler propagates that Method straight
+    // into `InvocationHandler.invoke` and applies UndeclaredThrowable-
+    // Exception wrapping on return (item 6).
     registry.register(
         "java/lang/reflect/Proxy$Dispatch",
         "invokeProxy",
-        "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         native_proxy_dispatch_invoke,
     );
 }
@@ -23534,22 +23532,29 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(proxy))))
 }
 
-/// WP2.5 v2 — INVOKESTATIC target embedded in every generated `$ProxyN`
+/// WP2.5 v3 — INVOKESTATIC target embedded in every generated `$ProxyN`
 /// method body. Dead code on the hot path (the interpreter's dispatch
 /// hook intercepts before this runs); registered defensively so any
 /// path that bypasses the hook (JIT-compiled call sites, future
-/// regressions) still routes through `InvocationHandler.invoke`
-/// instead of returning `UnsatisfiedLinkError`.
+/// regressions) still routes through `InvocationHandler.invoke`.
 ///
 /// Signature (as registered in `register_reflect_proxy_natives`):
-///   `(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)
+///   `(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)
 ///    Ljava/lang/Object;`
 ///
 /// Args:
 ///   `[0]` proxy receiver (the generated method body's `this`)
-///   `[1]` method name (Java String)
-///   `[2]` method descriptor (Java String)
-///   `[3]` boxed argument array (`Object[]`, or null if no args)
+///   `[1]` `java.lang.reflect.Method` mirror (built once per method by
+///         the generated class's `<clinit>` via `Class.getMethod` —
+///         already populated with `name`, `parameterTypes`,
+///         `exceptionTypes`, etc.)
+///   `[2]` boxed argument array (`Object[]`, may be `null` for no-arg
+///         methods).
+///
+/// On `MethodCallFailed::ExceptionThrown(t)` the helper consults
+/// `Method.exceptionTypes` and applies JLS-spec UndeclaredThrowable-
+/// Exception wrapping for non-`RuntimeException` / non-`Error`
+/// mismatches (item 6).
 fn native_proxy_dispatch_invoke(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -23563,15 +23568,16 @@ fn native_proxy_dispatch_invoke(
             .into());
         }
     };
-    let name = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
+    let method_obj = match args.get(1) {
+        Some(Value::Object(Some(m))) => *m,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Proxy$Dispatch.invokeProxy: null Method arg".to_string()),
+            }
+            .into());
+        }
     };
-    let desc = match args.get(2) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let args_arr = match args.get(3) {
+    let args_arr = match args.get(2) {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
@@ -23589,35 +23595,6 @@ fn native_proxy_dispatch_invoke(
         }
     };
 
-    // Synthesize a minimal `java.lang.reflect.Method` object — same
-    // pattern used by `vm::vm_exec::proxy_invoke_handler_shared` so
-    // userland InvocationHandlers see a consistent Method shape across
-    // both code paths. The synthesized object has the load-bearing
-    // fields populated (name, descriptor) plus their slot-indexed
-    // duplicates so synthetic-mode callers reading by-slot also work.
-    let method_cid = ctx
-        .ensure_class_initialized("java/lang/reflect/Method")
-        .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
-    let total_fields = ctx.class_num_total_fields(method_cid).max(8);
-    let method_obj = ctx.alloc_object(method_cid, total_fields);
-    let name_str = ctx.create_string(&name);
-    let desc_str = ctx.create_string(&desc);
-    ctx.set_field_by_name(method_obj, "name", Value::Object(Some(name_str)));
-    ctx.set_field_by_name(method_obj, "signature", Value::Object(Some(desc_str)));
-    ctx.set_field_by_name(method_obj, "modifiers", Value::Int(1)); // ACC_PUBLIC
-    // Synthetic-mode fixed slot fallback (matches the layout in
-    // `vm::vm_exec::proxy_invoke_handler_shared`).
-    if total_fields >= 6 {
-        ctx.set_field(method_obj, 1, Value::Object(Some(name_str)));
-        ctx.set_field(method_obj, 4, Value::Int(1));
-        ctx.set_field(method_obj, 5, Value::Object(Some(desc_str)));
-    }
-
-    // Dispatch through the handler's actual class. For most callers
-    // this is the user's `InvocationHandler` impl class; for lambda-
-    // backed handlers it's the lambda's synthetic class. The standard
-    // `NativeContext::invoke` lookup chain walks the handler's class
-    // hierarchy to find `invoke` and dispatches.
     let handler_cid = ctx.class_id_of_object(handler);
     let handler_class = ctx
         .class_name_of_id(handler_cid)
@@ -23629,12 +23606,89 @@ fn native_proxy_dispatch_invoke(
         Value::Object(Some(method_obj)),
         Value::Object(args_arr),
     ];
-    ctx.invoke(
+    let result = ctx.invoke(
         &handler_class,
         "invoke",
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
-    )
+    );
+
+    // Item 6 — UndeclaredThrowableException wrapping. On a thrown Java
+    // exception, classify against `Method.exceptionTypes` and wrap if
+    // the throw is not declared (and is not a RuntimeException / Error
+    // subclass). VM-internal failures propagate verbatim.
+    match result {
+        Ok(v) => Ok(v),
+        Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) => {
+            let final_obj = wrap_undeclared_throwable(ctx, method_obj, thrown);
+            Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(
+                final_obj,
+            ))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// WP2.5 v3 item 6 — classify a thrown exception from
+/// `InvocationHandler.invoke` against the proxied method's declared
+/// throws set; wrap in `java.lang.reflect.UndeclaredThrowableException`
+/// if not a `RuntimeException` / `Error` and not declared.
+///
+/// On any failure to allocate or invoke the wrapper ctor, the original
+/// exception is returned verbatim — losing the wrap is preferable to
+/// losing the exception entirely.
+fn wrap_undeclared_throwable(
+    ctx: &mut dyn NativeContext,
+    method_obj: rustjvm_types::ObjectRef,
+    thrown: rustjvm_types::ObjectRef,
+) -> rustjvm_types::ObjectRef {
+    // 1) RuntimeException / Error — always propagate.
+    let thrown_cid = ctx.class_id_of_object(thrown);
+    if let Ok(rcid) = ctx.ensure_class_initialized("java/lang/RuntimeException") {
+        if thrown_cid == rcid || ctx.is_subclass(thrown_cid, rcid) {
+            return thrown;
+        }
+    }
+    if let Ok(ecid) = ctx.ensure_class_initialized("java/lang/Error") {
+        if thrown_cid == ecid || ctx.is_subclass(thrown_cid, ecid) {
+            return thrown;
+        }
+    }
+
+    // 2) Inspect Method.exceptionTypes (Class[]). Generated `<clinit>`
+    // populates this via `Class.getExceptionTypes()`; if for any reason
+    // the field is missing or null, fall through to the wrap path —
+    // matching JDK behaviour for methods with no declared throws.
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(method_obj, "exceptionTypes") {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(decl_mirror)) = ctx.get_array_element(arr, i) {
+                if let Some(decl_cid) = ctx.class_id_from_mirror(decl_mirror) {
+                    if thrown_cid == decl_cid || ctx.is_subclass(thrown_cid, decl_cid) {
+                        return thrown;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) Wrap. Allocate UndeclaredThrowableException and invoke its
+    // (Throwable) constructor.
+    let ute_cid = match ctx.ensure_class_initialized("java/lang/reflect/UndeclaredThrowableException")
+    {
+        Ok(c) => c,
+        Err(_) => return thrown,
+    };
+    let n_fields = ctx.class_num_total_fields(ute_cid).max(4);
+    let ute = ctx.alloc_object(ute_cid, n_fields);
+    let ctor_args = [Value::Object(Some(ute)), Value::Object(Some(thrown))];
+    let _ = ctx.invoke(
+        "java/lang/reflect/UndeclaredThrowableException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+        &ctor_args,
+    );
+    ute
 }
 
 /// WP2.5-B — define (or fetch from cache) a `$ProxyN` class for the
@@ -23669,10 +23723,16 @@ fn define_or_get_proxy_class(
     let (gen_name, spec) = build_proxy_spec_for(ctx, &sorted)?;
     let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec);
     let opts = rustjvm_native_api::DefineClassFull {
-        // The emitter intentionally omits `StackMapTable` (see the
-        // `proxy_gen` module doc); skip Pass 3 verification so the
-        // class loads.
-        skip_verification: true,
+        // WP2.5-v3 item 4 — every method body emitted by `proxy_gen`
+        // (constructor super-delegate, per-method dispatch shim, and
+        // the v3 `<clinit>` initialiser) is straight-line: no IF*,
+        // GOTO, JSR, ATHROW, switch, or exception_table entries. JVMS
+        // §4.10.1 only requires `StackMapTable` when a method has at
+        // least one branch target or exception handler reachable from
+        // entry, so full Pass 3 type-checking accepts these classes
+        // as-is. Verified by the `emitted_class_is_straight_line_no_handlers`
+        // regression test in `classloading::proxy_gen`.
+        skip_verification: false,
         ..Default::default()
     };
     match ctx.define_class_full(&gen_name, &bytes, loader_id, opts) {
@@ -23725,6 +23785,9 @@ fn build_proxy_spec_for(
         if !visited.insert(cid) {
             continue;
         }
+        // WP2.5 v3 — capture the iface_owner internal name for the
+        // generated `<clinit>`'s `Class.forName(iface).getMethod` lookup.
+        let owner = ctx.class_name_of_id(cid).unwrap_or_default();
         for m in ctx.declared_methods(cid) {
             if m.access_flags & ACC_STATIC != 0 {
                 continue;
@@ -23737,10 +23800,15 @@ fn build_proxy_spec_for(
             }
             let key = (m.name.to_string(), m.descriptor.to_string());
             let is_default = m.access_flags & ACC_ABSTRACT == 0;
+            let param_class_names = parse_param_class_names(&m.descriptor);
+            let exception_types = m.exceptions.clone();
             let entry = by_key.entry(key).or_insert(ProxyMethod {
                 name: m.name.to_string(),
                 descriptor: m.descriptor.to_string(),
                 is_default,
+                iface_owner: owner.clone(),
+                param_class_names,
+                exception_types,
             });
             if !is_default {
                 entry.is_default = false;
@@ -23764,10 +23832,14 @@ fn build_proxy_spec_for(
     // class because `Proxy$Instance` is itself synthetic and the
     // bootstrap-loaded `Object` Method entries may not be reachable
     // through its vtable in synthetic-jdk mode.
-    for (name, descriptor) in [
-        ("equals", "(Ljava/lang/Object;)Z"),
-        ("hashCode", "()I"),
-        ("toString", "()Ljava/lang/String;"),
+    for (name, descriptor, params) in [
+        (
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            vec!["java/lang/Object".to_string()],
+        ),
+        ("hashCode", "()I", Vec::<String>::new()),
+        ("toString", "()Ljava/lang/String;", Vec::<String>::new()),
     ] {
         by_key
             .entry((name.to_string(), descriptor.to_string()))
@@ -23775,6 +23847,9 @@ fn build_proxy_spec_for(
                 name: name.to_string(),
                 descriptor: descriptor.to_string(),
                 is_default: false,
+                iface_owner: "java/lang/Object".to_string(),
+                param_class_names: params,
+                exception_types: Vec::new(),
             });
     }
 
@@ -23807,6 +23882,77 @@ fn native_proxy_get_interfaces(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => Value::Object(None),
     };
     Ok(Some(arr))
+}
+
+/// WP2.5 v3 — parse a JVMS method descriptor's parameter list into
+/// internal class names. Primitives map to their wrapper internal
+/// names (the emitter then rewrites those to `<Wrapper>.TYPE` GETSTATIC
+/// so `Class.getMethod` matches the primitive `Class<?>`).
+///
+///   `I` → `java/lang/Integer`         `J` → `java/lang/Long`
+///   `Z` → `java/lang/Boolean`         `F` → `java/lang/Float`
+///   `B` → `java/lang/Byte`            `D` → `java/lang/Double`
+///   `C` → `java/lang/Character`
+///   `S` → `java/lang/Short`
+///   `Lfoo/Bar;`     → `foo/Bar`       (plain reference)
+///   `[I`            → `[I`            (array — kept as descriptor)
+///   `[[Lfoo/Bar;`   → `[[Lfoo/Bar;`
+fn parse_param_class_names(descriptor: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = descriptor.as_bytes();
+    let mut i = match bytes.first() {
+        Some(b'(') => 1,
+        _ => return out,
+    };
+    while i < bytes.len() && bytes[i] != b')' {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] {
+            b'L' => {
+                let name_start = i + 1;
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+                if start == name_start - 1 {
+                    out.push(descriptor[name_start..i].to_string());
+                } else {
+                    out.push(descriptor[start..=i].to_string());
+                }
+                i += 1;
+            }
+            b'I' | b'Z' | b'B' | b'C' | b'S' | b'J' | b'F' | b'D' => {
+                if start == i {
+                    let wrapper = match bytes[i] {
+                        b'I' => "java/lang/Integer",
+                        b'Z' => "java/lang/Boolean",
+                        b'B' => "java/lang/Byte",
+                        b'C' => "java/lang/Character",
+                        b'S' => "java/lang/Short",
+                        b'J' => "java/lang/Long",
+                        b'F' => "java/lang/Float",
+                        b'D' => "java/lang/Double",
+                        _ => unreachable!(),
+                    };
+                    out.push(wrapper.to_string());
+                } else {
+                    out.push(descriptor[start..=i].to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 // ===========================================================================

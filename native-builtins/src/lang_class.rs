@@ -3019,6 +3019,7 @@ fn synthetic_method_meta(
         descriptor: decl.1.to_string(),
         access_flags: decl.2,
         declaring_class_id,
+        exceptions: Vec::new(),
     }
 }
 
@@ -7487,6 +7488,7 @@ mod tests {
             descriptor: "()I".to_string(),
             access_flags: 0x1,
             declaring_class_id: declaring_cid,
+            exceptions: Vec::new(),
         };
 
         let method_obj = create_method_object(&mut ctx, &meta);
@@ -8210,6 +8212,7 @@ mod tests {
                     .to_string(),
             access_flags: 0x1, // ACC_PUBLIC, distinct from synthetic 0x14
             declaring_class_id: cl_cid,
+            exceptions: Vec::new(),
         };
         ctx.set_declared_methods(cl_cid, vec![real_meta]);
 
@@ -8432,6 +8435,7 @@ mod tests {
             descriptor: "()Ljava/lang/String;".to_string(),
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
+            exceptions: Vec::new(),
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -8464,6 +8468,7 @@ mod tests {
             descriptor: "()I".to_string(),
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
+            exceptions: Vec::new(),
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -8497,6 +8502,7 @@ mod tests {
             descriptor: "()Ljava/lang/String;".to_string(),
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
+            exceptions: Vec::new(),
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -8665,12 +8671,14 @@ mod tests {
                 descriptor: "()Ljava/lang/String;".to_string(),
                 access_flags: 0x01,
                 declaring_class_id: object_cid,
+                exceptions: Vec::new(),
             },
             MethodMetadata {
                 name: "hashCode".to_string(),
                 descriptor: "()I".to_string(),
                 access_flags: 0x01,
                 declaring_class_id: object_cid,
+                exceptions: Vec::new(),
             },
         ];
         ctx.set_declared_methods(object_cid, object_methods);
@@ -8684,6 +8692,7 @@ mod tests {
             descriptor: "(I)I".to_string(),
             access_flags: 0x401, // ACC_PUBLIC|ACC_ABSTRACT
             declaring_class_id: iface_cid,
+            exceptions: Vec::new(),
         }];
         ctx.set_declared_methods(iface_cid, iface_methods);
         ctx.set_superclass(iface_cid, object_cid);
@@ -8715,6 +8724,7 @@ mod tests {
                 .to_string(),
             access_flags: 0x09, // ACC_PUBLIC|ACC_STATIC, distinct from synthetic 0x81
             declaring_class_id: m_cid,
+            exceptions: Vec::new(),
         };
         ctx.set_declared_methods(m_cid, vec![real_meta]);
 
