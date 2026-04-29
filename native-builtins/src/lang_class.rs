@@ -19,7 +19,86 @@ use crate::alloc_concurrent_synthetic;
 use rustjvm_types::access_flags::{
     ACC_PUBLIC_I32 as ACC_PUBLIC,
     ACC_STATIC_I32 as ACC_STATIC,
+    ACC_FINAL_I32 as ACC_FINAL,
+    ACC_VOLATILE_I32 as ACC_VOLATILE,
 };
+
+/// WP2.1-field — final-field write check for `Field.set*`.
+///
+/// Per `java.lang.reflect.Field.set` Javadoc and JLS §15.26.1:
+///   * Writing a non-static `final` field via reflection requires
+///     `setAccessible(true)`. Without it, throws IllegalAccessException.
+///   * Writing a `static final` field is **always** disallowed via the
+///     plain `Field.set*` path — even with `setAccessible(true)`. (The
+///     escape hatch is `Unsafe.staticFieldBase`/`putReference` or
+///     `MethodHandles.Lookup.findStaticVarHandle`, neither of which
+///     route through `Field.set`.)
+///   * Records, hidden classes, and `enum` constants are likewise pinned
+///     via final fields; we treat them under the same rule. The
+///     fine-grained record/hidden-class differentiation belongs in a
+///     follow-up — for now we conservatively reject the write.
+fn check_final_for_set(
+    modifiers: i32,
+    accessible: bool,
+    member_desc: &str,
+) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+    if (modifiers & ACC_FINAL) == 0 {
+        return Ok(());
+    }
+    let is_static = (modifiers & ACC_STATIC) != 0;
+    // Static-final: hard-disallowed regardless of `setAccessible`.
+    if is_static {
+        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "Can not set static final field via Field.set: {}",
+                member_desc,
+            ),
+        }
+        .into());
+    }
+    // Instance-final: requires `setAccessible(true)`.
+    if !accessible {
+        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "Can not set final field without setAccessible(true): {}",
+                member_desc,
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// WP2.1-field — volatile-aware load barrier.
+///
+/// `Field.get` / `Field.getInt` / `Field.getLong` etc. observe the
+/// volatile read semantics of the field, which on the JDK delegate
+/// internally to `Unsafe.getReferenceVolatile` / `getIntVolatile` /
+/// `getLongVolatile`. We mirror that by issuing an `Acquire` fence
+/// before the load when the field is `ACC_VOLATILE`. Non-volatile
+/// fields skip the fence to avoid the perf hit on plain reads.
+fn volatile_load_fence(modifiers: i32) {
+    if (modifiers & ACC_VOLATILE) != 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    }
+}
+
+/// WP2.1-field — volatile-aware store barrier.
+///
+/// Mirrors `Unsafe.putReferenceVolatile` / `putIntVolatile` etc.:
+/// emit a `Release` fence before the store and a `SeqCst` full fence
+/// after. Non-volatile fields skip both to keep plain writes cheap.
+fn volatile_store_fence_pre(modifiers: i32) {
+    if (modifiers & ACC_VOLATILE) != 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn volatile_store_fence_post(modifiers: i32) {
+    if (modifiers & ACC_VOLATILE) != 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Check if a reflective member access is allowed.
 /// `accessible` is true when `setAccessible(true)` has been called on the
@@ -1791,6 +1870,11 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.get")?;
 
+    // WP2.1-field — volatile-aware read fence: matches what the JDK does
+    // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
+    // for non-volatile fields so the plain-read path stays cheap.
+    volatile_load_fence(modifiers);
+
     let raw_value = if is_static {
         ctx.get_static_field(class_id, slot)
     } else {
@@ -1828,6 +1912,9 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
+    // WP2.1-field — final-field write check (must run AFTER access check
+    // so the more specific error message wins on a public-final field).
+    check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.set")?;
 
@@ -1836,6 +1923,8 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // cannot be narrowed/widened to the target primitive per JLS §5.1.2.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set")?;
 
+    // WP2.1-field — volatile-aware write fences (no-op for non-volatile).
+    volatile_store_fence_pre(modifiers);
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
@@ -1844,6 +1933,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         })?;
         ctx.set_field(recv, slot, coerced);
     }
+    volatile_store_fence_post(modifiers);
     Ok(None)
 }
 
@@ -1877,6 +1967,9 @@ fn field_get_raw(
     // declaring-class mirror on the Field object; still 0 historically,
     // but the real JDK layout puts `clazz` elsewhere. Wrap with a helper.
     enforce_module_check_on_field(ctx, this, accessible, "Field typed getter")?;
+
+    // WP2.1-field — volatile-aware read fence (no-op for non-volatile).
+    volatile_load_fence(modifiers);
 
     if is_static {
         Ok(ctx.get_static_field(class_id, slot))
@@ -1994,6 +2087,9 @@ fn field_set_raw(
     let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, "Field typed setter")?;
+    // WP2.1-field — final-field write check (matches Field.set on the
+    // generic `set(Object,Object)` path).
+    check_final_for_set(modifiers, accessible, "Field typed setter")?;
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field typed setter")?;
 
@@ -2002,6 +2098,8 @@ fn field_set_raw(
     // and the like, producing IllegalArgumentException as per javadoc.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter")?;
 
+    // WP2.1-field — volatile-aware write fences (no-op for non-volatile).
+    volatile_store_fence_pre(modifiers);
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
@@ -2010,6 +2108,7 @@ fn field_set_raw(
         })?;
         ctx.set_field(recv, slot, coerced);
     }
+    volatile_store_fence_post(modifiers);
     Ok(())
 }
 
@@ -9188,6 +9287,96 @@ mod tests {
             Value::Object(Some(_)) => {}
             other => panic!("expected Class mirror for java.lang.Object, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WP2.1-field — final-write check + volatile-aware fence helpers.
+    // -----------------------------------------------------------------------
+    //
+    // These are pure-Rust helpers, so the tests are tiny but they pin the
+    // semantics that `Field.set*` enforces:
+    //   * non-static final without setAccessible → IllegalAccessException
+    //   * static final ALWAYS → IllegalAccessException (even with
+    //     setAccessible — the escape hatch is Unsafe / VarHandle)
+    //   * non-final fields → no error, regardless of accessible
+    //   * volatile fences are emitted only when ACC_VOLATILE is set on
+    //     the field's modifiers (avoiding the perf hit on plain reads).
+
+    #[test]
+    fn wp21_field_check_final_non_final_passes() {
+        // Plain int field, public, no final bit set — should pass.
+        let modifiers = ACC_PUBLIC; // 0x0001
+        assert!(check_final_for_set(modifiers, false, "x").is_ok());
+        assert!(check_final_for_set(modifiers, true, "x").is_ok());
+    }
+
+    #[test]
+    fn wp21_field_check_final_instance_final_no_access_throws() {
+        let modifiers = ACC_PUBLIC | ACC_FINAL; // 0x0011
+        let r = check_final_for_set(modifiers, false, "Y");
+        assert!(
+            r.is_err(),
+            "instance final without setAccessible MUST throw IllegalAccessException"
+        );
+        let err = r.unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("IllegalAccessException"),
+            "expected IllegalAccessException, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn wp21_field_check_final_instance_final_with_access_passes() {
+        // Mirrors `ff.setAccessible(true); ff.setInt(o, 11);` — must succeed.
+        let modifiers = ACC_PUBLIC | ACC_FINAL;
+        assert!(check_final_for_set(modifiers, true, "Y").is_ok());
+    }
+
+    #[test]
+    fn wp21_field_check_final_static_final_always_throws() {
+        let modifiers = ACC_PUBLIC | ACC_STATIC | ACC_FINAL; // 0x0019
+        // Without setAccessible.
+        assert!(
+            check_final_for_set(modifiers, false, "K").is_err(),
+            "static final without setAccessible MUST throw"
+        );
+        // WITH setAccessible — must still throw.
+        let r = check_final_for_set(modifiers, true, "K");
+        assert!(
+            r.is_err(),
+            "static final WITH setAccessible MUST also throw — only Unsafe / VarHandle bypasses",
+        );
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(
+            msg.contains("static final"),
+            "static-final error should call out 'static final' specifically, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn wp21_field_volatile_fence_no_op_on_plain_field() {
+        // Pure runtime smoke: should not panic. The fence is unobservable
+        // by definition; we just exercise the branch that decides whether
+        // to issue one.
+        let plain = ACC_PUBLIC; // no ACC_VOLATILE
+        volatile_load_fence(plain);
+        volatile_store_fence_pre(plain);
+        volatile_store_fence_post(plain);
+    }
+
+    #[test]
+    fn wp21_field_volatile_fence_emitted_on_volatile_field() {
+        // Same shape — exercises the path that issues the fence. We can't
+        // observe the memory ordering directly from a single thread, but
+        // we can pin that the call doesn't panic and the bit-test is
+        // exercised end-to-end. The integration test in
+        // `vm/tests/wp2_1_field_surface.rs::volatile_long_round_trips`
+        // pins the end-to-end round-trip via Field.getLong/setLong.
+        let volatile_field = ACC_PUBLIC | ACC_VOLATILE; // 0x0041
+        volatile_load_fence(volatile_field);
+        volatile_store_fence_pre(volatile_field);
+        volatile_store_fence_post(volatile_field);
     }
 }
 
