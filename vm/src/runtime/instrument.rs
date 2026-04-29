@@ -1135,6 +1135,63 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_is_prefix_supported0,
     );
+
+    // WP2.4 v3 follow-up — public-name aliases. The bench/wave2-4 agent
+    // calls `isRetransformClassesSupported()` (no `0` suffix); in stock
+    // OpenJDK this is a Java method on `InstrumentationImpl` that
+    // forwards to the `0`-suffixed native. In synthetic-jdk mode our
+    // class layout doesn't carry that Java method body, so the bytecode
+    // resolution fails with `NoSuchMethodError`. Registering the
+    // public-name native aliases routes the call to the same handler
+    // and unblocks the agent's premain.
+    r.register(
+        impl_class,
+        "isRetransformClassesSupported",
+        "()Z",
+        native_is_retransform_supported0,
+    );
+    r.register(
+        impl_class,
+        "isRedefineClassesSupported",
+        "()Z",
+        native_is_redefine_supported0,
+    );
+    r.register(
+        impl_class,
+        "isNativeMethodPrefixSupported",
+        "()Z",
+        native_is_prefix_supported0,
+    );
+    r.register(
+        impl_class,
+        "isModifiableClass",
+        "(Ljava/lang/Class;)Z",
+        native_is_modifiable_class0,
+    );
+    r.register(
+        impl_class,
+        "getObjectSize",
+        "(Ljava/lang/Object;)J",
+        native_get_object_size0,
+    );
+    r.register(
+        impl_class,
+        "getAllLoadedClasses",
+        "()[Ljava/lang/Class;",
+        native_get_all_loaded_classes0,
+    );
+    r.register(
+        impl_class,
+        "retransformClasses",
+        "([Ljava/lang/Class;)V",
+        native_retransform_classes0,
+    );
+    r.register(
+        impl_class,
+        "redefineClasses",
+        "([Ljava/lang/instrument/ClassDefinition;)V",
+        native_redefine_classes0,
+    );
     // Constructor `<init>(JLjava/lang/String;ZZ)V` — JDK's
     // `sun.instrument.InstrumentationImpl(jvmtienv, agentArgs, isRedefine,
     // isRetransform)`. Since our `agent_loader::build_instrumentation_mirror`

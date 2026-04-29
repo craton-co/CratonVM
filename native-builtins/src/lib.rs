@@ -1419,6 +1419,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     registry.register("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;", native_class_for_name);
+    // Public-name `Class.forName` overloads. In stock OpenJDK these are
+    // Java methods that forward to `forName0`; in synthetic-jdk mode the
+    // bridge in `register_synthetic_overrides` registers the same set.
+    // Promote them to essential so default-built rust-jvm (no
+    // `synthetic-jdk` feature) still resolves them — needed by
+    // `bench/wave2-4` instrument probe's `RetransformAgent.premain` and
+    // generally by any agent / DI framework that calls `Class.forName(...)`.
+    registry.register("java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", native_class_for_name);
+    registry.register("java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", lang_class::native_class_for_name_3);
+    registry.register("java/lang/Class", "forName", "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;", lang_class::native_class_for_name_module);
     // isInterface/isPrimitive/isArray are bytecode in JDK 25 but registered
     // here for compatibility with older JDKs and as native fallbacks.
     registry.register("java/lang/Class", "isInterface", "()Z", native_class_is_interface);

@@ -1,49 +1,50 @@
 {
   "$schema_version": 1,
-  "generated_at": "2026-04-24T00:00:00Z",
+  "generated_at": "2026-04-29T00:00:00Z",
   "rustjvm_version": "unknown",
   "fixture": {
-    "mode": "placeholder",
+    "mode": "real",
     "placeholder_source": "apps/ejbca_min_fixture/src/Main.java",
     "real_source_expected_at": "C:/craton/ejbca-test-run/src",
-    "notes": "Placeholder is used until the full cesecore AccessMatchType + DirectRunner subset is staged. stage-ejbca-min.sh auto-selects real over placeholder when C:/craton/ejbca-test-run/src/org/cesecore/authorization/user/AccessMatchType.java is present."
+    "notes": "Real-mode: pre-staged cesecore-common AccessMatchType + DirectRunner + BcMin + BcProbe + MultiEnumProbe under bench/wildfly/staged/classes/ from a prior workstation build. stage-ejbca-min.sh auto-selects real over placeholder when C:/craton/ejbca-test-run/src/.../AccessMatchType.java is present."
   },
   "steps": [
     {
       "name": "stage",
       "rc": 0,
-      "notes": "javac --release 21 of Main.java (placeholder) or AccessMatchType.java + DirectRunner.java (real). Depends only on a JDK 21+ javac on PATH or JAVA_HOME."
+      "notes": "javac --release 21 of AccessMatchType.java + DirectRunner.java (real) with junit + hamcrest jars on cp. Pre-staged on the dev workstation; classes/ checked in."
     },
     {
       "name": "run",
-      "rc": 1,
-      "notes": "rust-jvm currently throws NullPointerException on the 2nd System.out.println (WP0.1 blocker, session 93). Placeholder Main.java triggers this intentionally. Once WP0.1 lands this rc flips to 0 and the expected_stderr_contains list shrinks; expected_stdout_contains gains 'ejbca_min_fixture: ok'."
+      "rc": 0,
+      "notes": "rust-jvm runs the cesecore-common DirectRunner subset to completion (12/12 enum tests pass). Validates real-EJBCA-code execution under the JVM: enum constants, multi-enum dispatch, BC bouncy-castle integration probe."
     }
   ],
-  "expected_stderr_contains": [
-    "NullPointerException",
-    "Cannot invoke write on null"
-  ],
+  "expected_stderr_contains": [],
   "expected_stderr_forbidden": [
     "panicked at",
     "RUST_BACKTRACE",
     "abort",
-    "STATUS_ACCESS_VIOLATION"
+    "STATUS_ACCESS_VIOLATION",
+    "NoSuchMethodError",
+    "Cannot invoke write on null"
   ],
   "expected_stdout_contains": [
-    "ejbca_min_fixture: starting baseline smoke"
+    "OK   0 = TYPE_UNUSED",
+    "passed=12 failed=0"
   ],
-  "expected_final_rc": 1,
-  "known_blockers": [
+  "expected_final_rc": 0,
+  "known_blockers": [],
+  "history": [
     {
-      "id": "WP0.1",
-      "summary": "Two consecutive System.out.println NPE on 2nd write ('Cannot invoke write on null')",
-      "see": "memory/finding_println_regression.md; docs/wildfly-ejbca-roadmap.md WP0.1"
+      "session": 93,
+      "rc": 1,
+      "blocker": "WP0.1 — Two consecutive System.out.println NPE on 2nd write"
     },
     {
-      "id": "WP0.2",
-      "summary": "ObjectStreamClass.serializableConstructor null — blocks JUnit4 harness",
-      "see": "docs/wildfly-ejbca-roadmap.md WP0.2"
+      "session": 99,
+      "rc": 0,
+      "notes": "All Wave 1+2 closure work cumulatively delivered: WP0.1 fix + WP1.1-1.5/1.7-1.12 + WP1.6 lang.invoke + WP2.1-2.10 (incl. WP2.5 v3 real Proxy bytecode generation). 12/12 cesecore enum tests pass under default-built rust-jvm."
     }
   ],
   "update_policy": "Update this file any time a WP lands that changes expected_final_rc or the expected_stderr_* sets. diff-baseline.sh compares a fresh run against these fields. A 'baseline match' result is mandatory for CI green; a mismatch either indicates a regression (bad) or an unshipped fix (update this file in the same PR)."

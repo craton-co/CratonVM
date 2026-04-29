@@ -457,6 +457,33 @@ Prereq: Waves 1-7 baseline. Dispatch: **5 agents**.
 - **Outcome**: `docs/INSTALL.md`, `docs/CONFIG.md`, per-app runbooks. Keep this roadmap honest as work lands.
 - **Status (session 94)**: `INSTALL.md` binary-name bug fixed (the executable is `target/release/rustjvm`, not `rustjvm-cli`; package is `rustjvm-cli` but `[[bin]] name = "rustjvm"`). `CONFIG.md` expanded from 12 documented flags to the full ~30-flag surface (heap/GC/verification/observability/CDS/AOT/JPMS/agents/container/diagnostics) with cross-refs into `vm-cli/src/main.rs` and `vm/src/config.rs`. Roadmap status markers refreshed (this commit). Remaining: per-app runbooks under `docs/runbooks/` (keycloak, wildfly-ejbca, tomcat); the only app with a complete fixture today is wildfly via `bench/wildfly/`.
 
+### WP8.9 — Stage real cglib/bytebuddy/mockito/jacoco JARs  [M, 1-2d]  ⚠️ open
+- **Outcome**: `bench/wave2-3/staged-{cglib,bytebuddy}/` and `bench/wave2-4/staged-{jacoco,mockito}/` carry the actual third-party JARs (committed under LFS or fetched on-demand by `stage-*.sh` from Maven Central / GitHub releases) so all four probes run end-to-end on a clean dev machine.
+- **Status (session 99)**: WP2.3 + WP2.4 + WP2.5 v3 machinery is all green (proven by `bench/wave2-4/staged-instrument` rc=0 — full agent-retransform pipeline). The remaining four probes (CGLIB enhancer, ByteBuddy `subclass(...).make()`, Mockito MockMaker, JaCoCo coverage agent) all depend on real JARs that today resolve only on the user's `~/.m2/repository/...` path. CI cannot run them.
+- **Subtasks (actionable)**:
+  - **WP8.9.1** Update `stage-cglib-probe.{sh,ps1}` to fetch `cglib-nodep-3.3.0.jar` from Maven Central if absent (`https://repo1.maven.org/maven2/cglib/cglib-nodep/3.3.0/cglib-nodep-3.3.0.jar`).
+  - **WP8.9.2** Same for ByteBuddy: `byte-buddy-1.14.19.jar` + `byte-buddy-agent-1.14.19.jar`.
+  - **WP8.9.3** Same for Mockito stack: `mockito-core-5.13.0.jar` + `byte-buddy*.jar` + `objenesis-3.3.jar`.
+  - **WP8.9.4** Same for JaCoCo: `org.jacoco.agent-0.8.12-runtime.jar` from JaCoCo's GitHub release.
+  - **WP8.9.5** Each `stage-*.sh` writes a `staged/jar-path.txt` pointing at the resolved jar so the runner picks it up unchanged.
+
+### WP8.10 — Real WildFly boot under rust-jvm  [XL, 5-7d]  ⚠️ open
+- **Outcome**: download WildFly 32.x distribution, run `standalone.sh` (or its Windows equivalent) under rust-jvm, log the first crash. Iterate fixing native/JDK gaps until WildFly reaches "Started in N ms" log line.
+- **Status (session 99)**: today's `bench/wildfly/` exercises the cesecore-common DirectRunner — 12/12 enum tests pass. The gap from "12 enum tests pass" to "WildFly admin console responds at :9990" is multiple wave-level efforts: full `ServiceLoader`-based JBoss Modules layout, MSC service container, Logmanager, Undertow, Elytron security, JTS transactions, etc. Each will surface JVM-level gaps that fold back into Waves 1-7.
+- **Subtasks (actionable)**:
+  - **WP8.10.1** Add `bench/wildfly-boot/stage.sh` that downloads `https://github.com/wildfly/wildfly/releases/download/32.0.1.Final/wildfly-32.0.1.Final.tar.gz` (~150 MB) and unpacks to `bench/wildfly-boot/staged/`.
+  - **WP8.10.2** Add `bench/wildfly-boot/run-under-rustjvm.sh` that mirrors `standalone.sh`'s `java` invocation but substitutes `target/release/rustjvm`. Capture first 200 lines of stderr.
+  - **WP8.10.3** Pin the first-failure baseline (whatever it is today — likely a `JBoss Modules` boot issue around `module.xml` parsing, or `LogManager` discovery via SPI, or `URL.openConnection` for jboss-logmanager.jar resolution). Document the failure in `bench/wildfly-boot/bench-baseline.json` schema-v1.
+  - **WP8.10.4** Triage each failure into a Wave 1-7 WP. Repeat until WildFly emits "Started" log line.
+
+### WP8.11 — Real EJBCA WAR/EAR deploy on WildFly  [XL, 7-10d]  ⚠️ open (depends on WP8.10)
+- **Outcome**: deploy EJBCA CE 8.x EAR onto a running rust-jvm WildFly, observe the install wizard at `https://localhost:8443/ejbca/`, complete the first-CA-init flow.
+- **Status (session 99)**: depends on WP8.10. EJBCA CE adds Hibernate/JPA, Liquibase migrations against PostgreSQL or H2, RESTEasy/JAX-RS endpoints, BouncyCastle deep usage (every Wave 6 crypto WP must work), JKS/PKCS12 keystores (WP5.2 — done), client-cert mTLS (WP5.1 — partial).
+- **Subtasks (actionable)**:
+  - **WP8.11.1** Bench fixture stages EJBCA CE 8.3.2 EAR + a pre-configured `standalone-ejbca.xml` + an embedded H2 datasource so we don't need PostgreSQL.
+  - **WP8.11.2** First-failure baseline + triage loop, same as WP8.10.4.
+  - **WP8.11.3** Acceptance: `curl -k https://localhost:8443/ejbca/` returns the install wizard HTML.
+
 ---
 
 ## 12. Dispatch strategy
