@@ -23390,6 +23390,22 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Class;",
         native_proxy_get_interfaces,
     );
+    // WP2.5 v2: helper that the bytecode emitted by
+    // `classloading::proxy_gen::emit_proxy_classfile` INVOKESTATICs from
+    // each generated method body. In the common case the interpreter's
+    // dispatch hook (interpreter.rs:7041, generalized via
+    // `class_chain_reaches_proxy_instance`) intercepts BEFORE the body
+    // executes, so this native is dead code on the hot path. It is
+    // registered defensively so any code path that bypasses the hook
+    // (JIT-compiled call sites, future regressions, etc.) still
+    // routes through `InvocationHandler.invoke` instead of returning
+    // unsatisfied-link.
+    registry.register(
+        "java/lang/reflect/Proxy$Dispatch",
+        "invokeProxy",
+        "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",
+        native_proxy_dispatch_invoke,
+    );
 }
 
 fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23479,12 +23495,16 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // dispatch hook handles both shapes uniformly so callers see
     // unchanged behaviour even when generation is skipped.
     //
-    // Loader id 0 = application loader. Per-loader namespacing for
-    // user-defined ClassLoaders is a follow-up; the JDK uses the loader
-    // arg's identity, but for the bootstrap/app/ext space (which is
-    // where every JDBC / annotation / Mockito proxy sits today) loader
-    // id 0 is sufficient.
-    let proxy_cid = define_or_get_proxy_class(ctx, 0, &iface_cids);
+    // WP2.5 v2 — per-loader namespacing. Use the ClassLoader instance's
+    // identity hash as the cache namespace. Different ClassLoader
+    // instances (e.g. two URLClassLoaders pointing at different jars)
+    // get different proxy class spaces, matching JDK semantics. A null
+    // ClassLoader arg = bootstrap loader = namespace 0.
+    let loader_namespace: u32 = match args.first() {
+        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        _ => 0,
+    };
+    let proxy_cid = define_or_get_proxy_class(ctx, loader_namespace, &iface_cids);
     let proxy = match proxy_cid {
         Some(cid) => {
             // The generated class extends `Proxy$Instance` (3 slots:
@@ -23512,6 +23532,109 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     PROXY_INSTANCES_CREATED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
     Ok(Some(Value::Object(Some(proxy))))
+}
+
+/// WP2.5 v2 — INVOKESTATIC target embedded in every generated `$ProxyN`
+/// method body. Dead code on the hot path (the interpreter's dispatch
+/// hook intercepts before this runs); registered defensively so any
+/// path that bypasses the hook (JIT-compiled call sites, future
+/// regressions) still routes through `InvocationHandler.invoke`
+/// instead of returning `UnsatisfiedLinkError`.
+///
+/// Signature (as registered in `register_reflect_proxy_natives`):
+///   `(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)
+///    Ljava/lang/Object;`
+///
+/// Args:
+///   `[0]` proxy receiver (the generated method body's `this`)
+///   `[1]` method name (Java String)
+///   `[2]` method descriptor (Java String)
+///   `[3]` boxed argument array (`Object[]`, or null if no args)
+fn native_proxy_dispatch_invoke(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let proxy = match args.first() {
+        Some(Value::Object(Some(p))) => *p,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Proxy$Dispatch.invokeProxy: null proxy receiver".to_string()),
+            }
+            .into());
+        }
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let desc = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let args_arr = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+
+    // Read InvocationHandler from proxy slot 0.
+    let handler = match ctx.get_field(proxy, 0) {
+        Value::Object(Some(h)) => h,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Proxy$Dispatch.invokeProxy: proxy InvocationHandler is null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+
+    // Synthesize a minimal `java.lang.reflect.Method` object — same
+    // pattern used by `vm::vm_exec::proxy_invoke_handler_shared` so
+    // userland InvocationHandlers see a consistent Method shape across
+    // both code paths. The synthesized object has the load-bearing
+    // fields populated (name, descriptor) plus their slot-indexed
+    // duplicates so synthetic-mode callers reading by-slot also work.
+    let method_cid = ctx
+        .ensure_class_initialized("java/lang/reflect/Method")
+        .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+    let total_fields = ctx.class_num_total_fields(method_cid).max(8);
+    let method_obj = ctx.alloc_object(method_cid, total_fields);
+    let name_str = ctx.create_string(&name);
+    let desc_str = ctx.create_string(&desc);
+    ctx.set_field_by_name(method_obj, "name", Value::Object(Some(name_str)));
+    ctx.set_field_by_name(method_obj, "signature", Value::Object(Some(desc_str)));
+    ctx.set_field_by_name(method_obj, "modifiers", Value::Int(1)); // ACC_PUBLIC
+    // Synthetic-mode fixed slot fallback (matches the layout in
+    // `vm::vm_exec::proxy_invoke_handler_shared`).
+    if total_fields >= 6 {
+        ctx.set_field(method_obj, 1, Value::Object(Some(name_str)));
+        ctx.set_field(method_obj, 4, Value::Int(1));
+        ctx.set_field(method_obj, 5, Value::Object(Some(desc_str)));
+    }
+
+    // Dispatch through the handler's actual class. For most callers
+    // this is the user's `InvocationHandler` impl class; for lambda-
+    // backed handlers it's the lambda's synthetic class. The standard
+    // `NativeContext::invoke` lookup chain walks the handler's class
+    // hierarchy to find `invoke` and dispatches.
+    let handler_cid = ctx.class_id_of_object(handler);
+    let handler_class = ctx
+        .class_name_of_id(handler_cid)
+        .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
+
+    let invoke_args = [
+        Value::Object(Some(handler)),
+        Value::Object(Some(proxy)),
+        Value::Object(Some(method_obj)),
+        Value::Object(args_arr),
+    ];
+    ctx.invoke(
+        &handler_class,
+        "invoke",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+        &invoke_args,
+    )
 }
 
 /// WP2.5-B — define (or fetch from cache) a `$ProxyN` class for the
@@ -23628,6 +23751,31 @@ fn build_proxy_spec_for(
                 work.push(super_iface);
             }
         }
+    }
+
+    // WP2.5 v2 — always emit equals/hashCode/toString. JDK proxy
+    // semantics route these through the InvocationHandler too (so
+    // userland can override `Object.equals` reference-equality in a
+    // proxied iface). Ifaces that explicitly redeclare any of these
+    // already have an entry in `by_key` from the BFS above; the
+    // `or_insert` only adds the canonical descriptor when missing,
+    // which is the common case (most ifaces don't redeclare Object
+    // methods). Without these the verifier rejects the generated
+    // class because `Proxy$Instance` is itself synthetic and the
+    // bootstrap-loaded `Object` Method entries may not be reachable
+    // through its vtable in synthetic-jdk mode.
+    for (name, descriptor) in [
+        ("equals", "(Ljava/lang/Object;)Z"),
+        ("hashCode", "()I"),
+        ("toString", "()Ljava/lang/String;"),
+    ] {
+        by_key
+            .entry((name.to_string(), descriptor.to_string()))
+            .or_insert(ProxyMethod {
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                is_default: false,
+            });
     }
 
     // Stable iteration order so the generated bytecode is reproducible
