@@ -3005,6 +3005,202 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("getJDBCMinorVersion", "()I", 0x401),
             ("getConnection", "()Ljava/sql/Connection;", 0x401),
         ],
+        // WP2.1-class-modern — surface the modern `java.lang.Class` API
+        // methods (Java 11–25 sealed-class / record-class / nest-mate
+        // accessors plus the canonical reflection-info methods) so
+        // ByteBuddy's `TypeDescription.forLoadedType(Class.class)` and
+        // Hibernate's record/sealed scanners see a non-empty
+        // declared-method list when the synthetic-JDK `Class` stub is in
+        // use. The natives backing each entry are already registered in
+        // `lib.rs` / `phases_early.rs` / `lang_reflect.rs` — this table
+        // surfaces them to the reflection layer.
+        //
+        // Flags: 0x01 ACC_PUBLIC, 0x11 ACC_PUBLIC|ACC_FINAL,
+        //        0x101 ACC_PUBLIC|ACC_NATIVE.
+        // `Class` itself is final, so all instance methods are effectively
+        // final — but the JDK source marks only a few that way; we follow
+        // the OpenJDK 25 declarations to stay byte-compatible.
+        "java/lang/Class" => &[
+            // Identity / naming
+            ("getName", "()Ljava/lang/String;", 0x01),
+            ("getSimpleName", "()Ljava/lang/String;", 0x01),
+            ("getCanonicalName", "()Ljava/lang/String;", 0x01),
+            ("getTypeName", "()Ljava/lang/String;", 0x01),
+            ("toString", "()Ljava/lang/String;", 0x01),
+            ("toGenericString", "()Ljava/lang/String;", 0x01),
+            ("descriptorString", "()Ljava/lang/String;", 0x01),
+            // Modifiers / shape predicates
+            ("getModifiers", "()I", 0x01),
+            ("isInterface", "()Z", 0x101),
+            ("isArray", "()Z", 0x101),
+            ("isPrimitive", "()Z", 0x101),
+            ("isAnnotation", "()Z", 0x101),
+            ("isSynthetic", "()Z", 0x01),
+            ("isEnum", "()Z", 0x01),
+            ("isRecord", "()Z", 0x01),
+            ("isSealed", "()Z", 0x01),
+            ("isHidden", "()Z", 0x101),
+            ("isAnonymousClass", "()Z", 0x01),
+            ("isLocalClass", "()Z", 0x01),
+            ("isMemberClass", "()Z", 0x01),
+            ("isInstance", "(Ljava/lang/Object;)Z", 0x101),
+            ("isAssignableFrom", "(Ljava/lang/Class;)Z", 0x101),
+            // Hierarchy
+            ("getSuperclass", "()Ljava/lang/Class;", 0x101),
+            ("getInterfaces", "()[Ljava/lang/Class;", 0x01),
+            ("getGenericSuperclass", "()Ljava/lang/reflect/Type;", 0x01),
+            ("getGenericInterfaces", "()[Ljava/lang/reflect/Type;", 0x01),
+            ("getComponentType", "()Ljava/lang/Class;", 0x01),
+            ("getEnclosingClass", "()Ljava/lang/Class;", 0x01),
+            ("getEnclosingMethod", "()Ljava/lang/reflect/Method;", 0x01),
+            ("getEnclosingConstructor", "()Ljava/lang/reflect/Constructor;", 0x01),
+            ("getDeclaringClass", "()Ljava/lang/Class;", 0x01),
+            ("getNestHost", "()Ljava/lang/Class;", 0x01),
+            ("getNestMembers", "()[Ljava/lang/Class;", 0x01),
+            ("isNestmateOf", "(Ljava/lang/Class;)Z", 0x01),
+            // Sealed-class API (Java 17+)
+            ("getPermittedSubclasses", "()[Ljava/lang/Class;", 0x01),
+            // Record API (Java 16+)
+            ("getRecordComponents", "()[Ljava/lang/reflect/RecordComponent;", 0x01),
+            // Reflection — declared / inherited members
+            ("getDeclaredFields", "()[Ljava/lang/reflect/Field;", 0x01),
+            ("getDeclaredMethods", "()[Ljava/lang/reflect/Method;", 0x01),
+            ("getDeclaredConstructors", "()[Ljava/lang/reflect/Constructor;", 0x01),
+            ("getDeclaredClasses", "()[Ljava/lang/Class;", 0x01),
+            (
+                "getDeclaredField",
+                "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+                0x01,
+            ),
+            (
+                "getDeclaredMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+                0x81,
+            ),
+            (
+                "getDeclaredConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+                0x81,
+            ),
+            ("getFields", "()[Ljava/lang/reflect/Field;", 0x01),
+            ("getMethods", "()[Ljava/lang/reflect/Method;", 0x01),
+            ("getConstructors", "()[Ljava/lang/reflect/Constructor;", 0x01),
+            ("getClasses", "()[Ljava/lang/Class;", 0x01),
+            (
+                "getField",
+                "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+                0x01,
+            ),
+            (
+                "getMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+                0x81,
+            ),
+            (
+                "getConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+                0x81,
+            ),
+            // Annotations (AnnotatedElement surface + the annotated-type API)
+            (
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            ("getAnnotations", "()[Ljava/lang/annotation/Annotation;", 0x01),
+            (
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "getAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "getDeclaredAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "isAnnotationPresent",
+                "(Ljava/lang/Class;)Z",
+                0x01,
+            ),
+            (
+                "getAnnotatedSuperclass",
+                "()Ljava/lang/reflect/AnnotatedType;",
+                0x01,
+            ),
+            (
+                "getAnnotatedInterfaces",
+                "()[Ljava/lang/reflect/AnnotatedType;",
+                0x01,
+            ),
+            // Class loader / module / signers / protection domain
+            ("getClassLoader", "()Ljava/lang/ClassLoader;", 0x01),
+            ("getModule", "()Ljava/lang/Module;", 0x01),
+            ("getPackage", "()Ljava/lang/Package;", 0x01),
+            ("getPackageName", "()Ljava/lang/String;", 0x01),
+            (
+                "getProtectionDomain",
+                "()Ljava/security/ProtectionDomain;",
+                0x01,
+            ),
+            ("getSigners", "()[Ljava/lang/Object;", 0x01),
+            ("getEnumConstants", "()[Ljava/lang/Object;", 0x01),
+            (
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+                0x01,
+            ),
+            (
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+                0x01,
+            ),
+            // Generics
+            ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;", 0x01),
+            // Casts / forName
+            (
+                "cast",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                0x01,
+            ),
+            (
+                "asSubclass",
+                "(Ljava/lang/Class;)Ljava/lang/Class;",
+                0x01,
+            ),
+            (
+                "forName",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                0x09,
+            ),
+            (
+                "forName",
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+                0x09,
+            ),
+            (
+                "newInstance",
+                "()Ljava/lang/Object;",
+                0x01,
+            ),
+            (
+                "desiredAssertionStatus",
+                "()Z",
+                0x01,
+            ),
+            ("arrayType", "()Ljava/lang/Class;", 0x01),
+            ("componentType", "()Ljava/lang/Class;", 0x01),
+        ],
         _ => &[],
     }
 }
@@ -6300,6 +6496,122 @@ pub(crate) fn native_class_get_permitted_subclasses(
         }
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `java/lang/Class.getAnnotatedSuperclass()Ljava/lang/reflect/AnnotatedType;`
+///
+/// WP2.1-class-modern: returns an `AnnotatedType` for the direct superclass
+/// of this Class. Synthetic best-effort impl: builds a minimal
+/// `AnnotatedType` whose backing `Type` is the superclass `Class` mirror,
+/// with no type-annotations attached. Returns null for `Object`, primitive
+/// types, void, array types, and interfaces — matching the JDK contract.
+///
+/// The returned object is a synthetic 2-field stand-in:
+///   * slot 0: backing `Type` (the superclass `Class` mirror)
+///   * slot 1: empty `Annotation[]` (placeholder for future RUNTIME
+///     type-annotation wiring)
+///
+/// Frameworks that probe `Class.getAnnotatedSuperclass()` usually only
+/// need it to be non-null + not throw (Hibernate's
+/// `ReflectionUtil.scanForAnnotatedTypes`); the synthetic backing is
+/// sufficient to keep their `<clinit>` chain alive.
+pub(crate) fn native_class_get_annotated_superclass(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    // Match JDK contract: null for Object, primitives, void, array, interfaces.
+    let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    if name == "java/lang/Object" || name.starts_with('[') || name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Resolve the direct superclass via `NativeContext::superclass_of`.
+    let super_mirror = match ctx.superclass_of(class_id) {
+        Some(sid) => ctx.get_class_mirror(sid),
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    Ok(Some(Value::Object(Some(make_annotated_type(ctx, super_mirror)))))
+}
+
+/// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
+///
+/// WP2.1-class-modern: returns an `AnnotatedType[]` mirroring the
+/// `getInterfaces()` array. Each element is a synthetic `AnnotatedType`
+/// wrapping the corresponding interface `Class` mirror — see
+/// [`make_annotated_type`] for the layout.
+///
+/// Always returns a non-null (possibly zero-length) array — matching the
+/// JDK contract. Frameworks (ByteBuddy, JMX OpenMBean introspector) rely
+/// on the non-null guarantee; throwing or returning null here breaks
+/// `MBeanIntrospector.getMethods` recursion.
+pub(crate) fn native_class_get_annotated_interfaces(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => {
+            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+
+    let iface_ids = ctx.class_interfaces(class_id);
+    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), iface_ids.len());
+    for (i, iface_id) in iface_ids.iter().enumerate() {
+        let iface_mirror = ctx.get_class_mirror(*iface_id);
+        let at = make_annotated_type(ctx, iface_mirror);
+        ctx.set_array_element(arr, i, Value::Object(Some(at)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// Build a minimal synthetic `AnnotatedType` object wrapping a `Type`
+/// (typically a `Class` mirror).
+///
+/// Layout (2 fields, by-name + slot-fallback):
+///   * `type` — the wrapped `Type` (slot 0)
+///   * `annotations` — empty `Annotation[]` (slot 1)
+///
+/// `AnnotatedType` is an interface in the JDK; its concrete impl class is
+/// `sun.reflect.annotation.AnnotatedTypeFactory$AnnotatedTypeBaseImpl` /
+/// `AnnotatedTypeImpl`. We allocate against `java/lang/reflect/AnnotatedType`
+/// — the dispatch path treats this as a synthetic-stub instance.
+/// `getType()` reads slot 0 ; downstream frameworks only need that
+/// accessor + non-null-ness.
+fn make_annotated_type(
+    ctx: &mut dyn NativeContext,
+    backing_type: rustjvm_types::ObjectRef,
+) -> rustjvm_types::ObjectRef {
+    // Try the impl class first (real-JDK layout); fall back to the
+    // interface name (synthetic-mode placeholder).
+    let cid = ctx
+        .ensure_class_initialized("sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl")
+        .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+
+    let layout_fields = ctx.class_num_total_fields(cid);
+    let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
+    let obj = ctx.alloc_object(cid, num_fields);
+
+    // empty Annotation[] for `annotations`
+    let empty_anns = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+
+    ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
+    ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_anns)));
+    if layout_fields == 0 {
+        ctx.set_field(obj, 0, Value::Object(Some(backing_type)));
+        ctx.set_field(obj, 1, Value::Object(Some(empty_anns)));
+    }
+    obj
 }
 
 /// `java/lang/Class.getClassFileVersion0()I`
