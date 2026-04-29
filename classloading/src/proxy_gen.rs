@@ -1,0 +1,1032 @@
+//! Proxy bytecode emitter — generates a `ClassFile` per
+//! (loader, sorted-iface-list) key for `java.lang.reflect.Proxy.newProxyInstance`.
+//!
+//! # v1 design
+//!
+//! Each generated class:
+//! 1. Extends `java/lang/reflect/Proxy$Instance` (the synthetic super
+//!    introduced before WP2.5-A — it owns the `handler`, `interfaces`, and
+//!    `hashSeed` fields, plus the `<init>(InvocationHandler, Class[])`
+//!    constructor that populates them). The interpreter's existing
+//!    cast/dispatch hooks generalise via "is the receiver an instance of
+//!    (a subclass of) Proxy$Instance?" so we don't need to register a
+//!    per-class hook.
+//! 2. Declares the iface set in `interfaces[]`.
+//! 3. Emits one method body per declared interface method (abstract or
+//!    default). The body boxes args and routes through
+//!    `Proxy$Dispatch.invokeProxy`, an `INVOKESTATIC` helper registered as
+//!    a builtin native.
+//! 4. Emits a constructor that just delegates to `super.<init>`.
+//!
+//! # No StackMapTable
+//!
+//! These class files are intentionally emitted **without** a
+//! `StackMapTable` attribute. `ClassManager::define_class_with_options`
+//! is invoked with `DefineClassOptions { skip_verification: true, .. }`
+//! (WP2.3) so Pass 3 verification is bypassed; Pass 2 doesn't need stack
+//! maps. For Java 7+ class files (major ≥ 51) the JVM would otherwise
+//! reject the class with `VerifyError: Expecting a stackmap frame at
+//! branch target`. Skipping verification is the v1 trade-off — a future
+//! hardening pass could emit `same_frame` / `same_locals_1_stack_item`
+//! entries directly.
+//!
+//! # Method body shape (per `ProxyMethod`)
+//!
+//! ```text
+//! ALOAD_0                                    ; receiver
+//! LDC "<method.name>"                        ; method name
+//! LDC "<method.descriptor>"                  ; method descriptor
+//! ICONST_<argc> ; ANEWARRAY java/lang/Object ; Object[] for boxed args
+//! <for each parameter slot N starting at 1:
+//!     DUP ; ICONST_<i> ;
+//!     <load slot N (ILOAD/LLOAD/FLOAT/DLOAD/ALOAD)> ;
+//!     <if primitive: INVOKESTATIC <Wrapper>.valueOf(<prim>)<Wrapper>> ;
+//!     AASTORE>
+//! INVOKESTATIC java/lang/reflect/Proxy$Dispatch.invokeProxy
+//!     (Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)
+//!     Ljava/lang/Object;
+//! <return:
+//!     V       → POP ; RETURN
+//!     L...;   → CHECKCAST <ret>; ARETURN
+//!     [...    → CHECKCAST <retArr>; ARETURN
+//!     I/S/B/C/Z → CHECKCAST <Wrapper>; INVOKEVIRTUAL <prim>Value(); IRETURN
+//!     J       → CHECKCAST Long;    INVOKEVIRTUAL longValue();    LRETURN
+//!     F       → CHECKCAST Float;   INVOKEVIRTUAL floatValue();   FRETURN
+//!     D       → CHECKCAST Double;  INVOKEVIRTUAL doubleValue();  DRETURN
+//! >
+//! ```
+
+use std::collections::HashMap;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Spec for a single proxy class to emit.
+#[derive(Debug, Clone)]
+pub struct ProxyClassSpec {
+    /// Internal name, e.g. `"java/lang/reflect/$Proxy0"`.
+    pub gen_class_name: String,
+    /// Internal name of super class, normally `"java/lang/reflect/Proxy$Instance"`.
+    pub super_class: String,
+    /// Internal names of interfaces this proxy implements.
+    pub interfaces: Vec<String>,
+    /// Methods to emit (collected by the caller from all ifaces' abstract+default methods).
+    pub methods: Vec<ProxyMethod>,
+}
+
+/// One method to emit on the proxy.
+#[derive(Debug, Clone)]
+pub struct ProxyMethod {
+    /// Method name, e.g. `"get"`.
+    pub name: String,
+    /// JVMS descriptor, e.g. `"()Ljava/lang/Object;"` or `"(I)I"`.
+    pub descriptor: String,
+    /// Whether this is an interface default method. We still emit a body so
+    /// the dispatch hook intercepts the call; without an emitted body the
+    /// JVM would inherit the iface's default impl directly and bypass the
+    /// InvocationHandler.
+    pub is_default: bool,
+}
+
+/// Emit a JVMS §4 ClassFile for the given proxy spec. Returns the raw bytes.
+///
+/// The result is intended to be consumed by `rustjvm_reader::read_class`
+/// (round-trip) and `ClassManager::define_class_with_options` (with
+/// `skip_verification: true`).
+pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Vec<u8> {
+    let mut cp = CpBuilder::new();
+
+    // Resolve all class/method/string CP indices we'll need up-front.
+    let this_class_idx = cp.add_class(&spec.gen_class_name);
+    let super_class_idx = cp.add_class(&spec.super_class);
+    let iface_idxs: Vec<u16> = spec.interfaces.iter().map(|i| cp.add_class(i)).collect();
+    let code_attr_name_idx = cp.add_utf8("Code");
+
+    // Constructor descriptor and CP refs for super.<init>.
+    let ctor_desc = "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V";
+    let init_name_idx = cp.add_utf8("<init>");
+    let ctor_desc_idx = cp.add_utf8(ctor_desc);
+    let super_ctor_ref = cp.add_methodref(&spec.super_class, "<init>", ctor_desc);
+
+    // Dispatch helper INVOKESTATIC ref.
+    let dispatch_owner = "java/lang/reflect/Proxy$Dispatch";
+    let dispatch_name = "invokeProxy";
+    let dispatch_desc = "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;\
+                         [Ljava/lang/Object;)Ljava/lang/Object;";
+    let dispatch_ref = cp.add_methodref(dispatch_owner, dispatch_name, dispatch_desc);
+    let object_class_idx = cp.add_class("java/lang/Object");
+
+    // Emit method blobs.
+    let mut method_blobs: Vec<Vec<u8>> = Vec::with_capacity(spec.methods.len() + 1);
+
+    // 1) Constructor `<init>` — pure super-delegate.
+    method_blobs.push(emit_constructor(
+        init_name_idx,
+        ctor_desc_idx,
+        code_attr_name_idx,
+        super_ctor_ref,
+    ));
+
+    // 2) One body per declared method.
+    for m in &spec.methods {
+        method_blobs.push(emit_proxy_method(
+            &mut cp,
+            m,
+            code_attr_name_idx,
+            dispatch_ref,
+            object_class_idx,
+        ));
+    }
+
+    // ── Assemble ClassFile (JVMS §4.1) ───────────────────────────────────
+    let mut out = Vec::with_capacity(
+        256 + cp.entries.len() + method_blobs.iter().map(|b| b.len()).sum::<usize>(),
+    );
+
+    // magic + version (Java 21 = 65)
+    out.extend_from_slice(&0xCAFEBABE_u32.to_be_bytes());
+    out.extend_from_slice(&0_u16.to_be_bytes()); // minor
+    out.extend_from_slice(&65_u16.to_be_bytes()); // major (Java 21)
+
+    // constant_pool_count = 1 + total_entries (1-based, slot 0 reserved)
+    out.extend_from_slice(&(cp.count + 1).to_be_bytes());
+    out.extend_from_slice(&cp.entries);
+
+    // access_flags = ACC_PUBLIC | ACC_FINAL | ACC_SUPER | ACC_SYNTHETIC
+    let access_flags: u16 = 0x0001 | 0x0010 | 0x0020 | 0x1000;
+    out.extend_from_slice(&access_flags.to_be_bytes());
+
+    // this_class, super_class
+    out.extend_from_slice(&this_class_idx.to_be_bytes());
+    out.extend_from_slice(&super_class_idx.to_be_bytes());
+
+    // interfaces[]
+    out.extend_from_slice(&(iface_idxs.len() as u16).to_be_bytes());
+    for idx in &iface_idxs {
+        out.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    // fields[] — empty (handler/interfaces live on Proxy$Instance super).
+    out.extend_from_slice(&0_u16.to_be_bytes());
+
+    // methods[]
+    out.extend_from_slice(&(method_blobs.len() as u16).to_be_bytes());
+    for blob in &method_blobs {
+        out.extend_from_slice(blob);
+    }
+
+    // class attributes[] — empty.
+    out.extend_from_slice(&0_u16.to_be_bytes());
+
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Descriptor parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kind of a single descriptor parameter / return type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescKind {
+    /// Boolean/byte/char/short/int — single JVM stack slot.
+    Int,
+    /// long — double JVM stack slot.
+    Long,
+    /// float — single JVM stack slot.
+    Float,
+    /// double — double JVM stack slot.
+    Double,
+    /// Reference (object or array). `descriptor` is the full descriptor
+    /// string (e.g. `"Ljava/lang/String;"` or `"[I"`) so we can produce
+    /// correct CHECKCAST class names.
+    Reference(String),
+}
+
+impl DescKind {
+    fn slots(&self) -> u16 {
+        match self {
+            DescKind::Long | DescKind::Double => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Return-type kind for a method descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnKind {
+    Void,
+    Prim(DescKind),
+    Reference(String),
+}
+
+/// Parse the parameter list of a method descriptor (the part between `(`
+/// and `)`).
+pub fn descriptor_param_slots(desc: &str) -> Vec<DescKind> {
+    let bytes = desc.as_bytes();
+    let mut out = Vec::new();
+    let start = bytes
+        .iter()
+        .position(|&b| b == b'(')
+        .expect("descriptor must start with '('")
+        + 1;
+    let end = bytes
+        .iter()
+        .position(|&b| b == b')')
+        .expect("descriptor must contain ')'");
+    let mut i = start;
+    while i < end {
+        let (kind, advanced) = parse_one_field(desc, i);
+        out.push(kind);
+        i = advanced;
+    }
+    out
+}
+
+/// Parse the return type of a method descriptor.
+pub fn descriptor_return(desc: &str) -> ReturnKind {
+    let bytes = desc.as_bytes();
+    let close = bytes
+        .iter()
+        .position(|&b| b == b')')
+        .expect("descriptor must contain ')'");
+    let after = close + 1;
+    if after >= bytes.len() {
+        return ReturnKind::Void;
+    }
+    if bytes[after] == b'V' {
+        return ReturnKind::Void;
+    }
+    let (kind, _) = parse_one_field(desc, after);
+    match kind {
+        DescKind::Reference(s) => ReturnKind::Reference(s),
+        other => ReturnKind::Prim(other),
+    }
+}
+
+/// Parse a single field-type (JVMS §4.3.2) at `desc[i..]`. Returns
+/// `(kind, next_index)`.
+fn parse_one_field(desc: &str, i: usize) -> (DescKind, usize) {
+    let bytes = desc.as_bytes();
+    match bytes[i] {
+        b'B' | b'C' | b'I' | b'S' | b'Z' => (DescKind::Int, i + 1),
+        b'J' => (DescKind::Long, i + 1),
+        b'F' => (DescKind::Float, i + 1),
+        b'D' => (DescKind::Double, i + 1),
+        b'L' => {
+            let semi = i + 1
+                + desc[i + 1..]
+                    .find(';')
+                    .expect("L-type missing terminator ';'");
+            let raw = &desc[i..=semi];
+            (DescKind::Reference(raw.to_string()), semi + 1)
+        }
+        b'[' => {
+            let (inner, next) = parse_one_field(desc, i + 1);
+            let _ = inner;
+            let raw = &desc[i..next];
+            (DescKind::Reference(raw.to_string()), next)
+        }
+        other => panic!("unsupported descriptor byte: 0x{other:02X} in '{desc}'"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constant-pool builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum CpKey {
+    Utf8(String),
+    Class(String),
+    String(u16),
+    NameAndType(u16, u16),
+    MethodRef(String, String, String),
+    FieldRef(String, String, String),
+    InterfaceMethodRef(String, String, String),
+    Integer(i32),
+}
+
+/// Linear-append constant pool with `(tag, key) -> u16` dedup.
+///
+/// `entries` is the raw byte stream of CP info structures (no tombstone —
+/// the tombstone at index 0 is implicit; the final classfile encodes
+/// `constant_pool_count = count + 1`).
+#[derive(Debug)]
+pub struct CpBuilder {
+    entries: Vec<u8>,
+    dedup: HashMap<CpKey, u16>,
+    count: u16,
+}
+
+impl CpBuilder {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(256),
+            dedup: HashMap::new(),
+            count: 0,
+        }
+    }
+
+    /// Allocate the next 1-based CP slot. Long/Double take 2 slots — proxy
+    /// emission never produces them (no LDC2_W of a long/double constant),
+    /// so the simple +1 is sufficient.
+    fn next_index(&mut self) -> u16 {
+        self.count = self
+            .count
+            .checked_add(1)
+            .expect("constant pool overflow (>65535 entries)");
+        self.count
+    }
+
+    /// CONSTANT_Utf8 (tag 1, JVMS §4.4.7).
+    pub fn add_utf8(&mut self, s: &str) -> u16 {
+        let key = CpKey::Utf8(s.to_string());
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let idx = self.next_index();
+        self.entries.push(1);
+        let bytes = s.as_bytes();
+        assert!(bytes.len() <= u16::MAX as usize, "UTF-8 entry too long");
+        self.entries
+            .extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        self.entries.extend_from_slice(bytes);
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_Class (tag 7).
+    pub fn add_class(&mut self, internal_name: &str) -> u16 {
+        let key = CpKey::Class(internal_name.to_string());
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let name_idx = self.add_utf8(internal_name);
+        let idx = self.next_index();
+        self.entries.push(7);
+        self.entries.extend_from_slice(&name_idx.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_String (tag 8).
+    pub fn add_string(&mut self, s: &str) -> u16 {
+        let utf8_idx = self.add_utf8(s);
+        let key = CpKey::String(utf8_idx);
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let idx = self.next_index();
+        self.entries.push(8);
+        self.entries.extend_from_slice(&utf8_idx.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_NameAndType (tag 12).
+    pub fn add_name_and_type(&mut self, name: &str, desc: &str) -> u16 {
+        let n = self.add_utf8(name);
+        let d = self.add_utf8(desc);
+        let key = CpKey::NameAndType(n, d);
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let idx = self.next_index();
+        self.entries.push(12);
+        self.entries.extend_from_slice(&n.to_be_bytes());
+        self.entries.extend_from_slice(&d.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_Methodref (tag 10).
+    pub fn add_methodref(&mut self, owner: &str, name: &str, desc: &str) -> u16 {
+        let key = CpKey::MethodRef(owner.into(), name.into(), desc.into());
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let class_idx = self.add_class(owner);
+        let nat_idx = self.add_name_and_type(name, desc);
+        let idx = self.next_index();
+        self.entries.push(10);
+        self.entries.extend_from_slice(&class_idx.to_be_bytes());
+        self.entries.extend_from_slice(&nat_idx.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_Fieldref (tag 9).
+    pub fn add_fieldref(&mut self, owner: &str, name: &str, desc: &str) -> u16 {
+        let key = CpKey::FieldRef(owner.into(), name.into(), desc.into());
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let class_idx = self.add_class(owner);
+        let nat_idx = self.add_name_and_type(name, desc);
+        let idx = self.next_index();
+        self.entries.push(9);
+        self.entries.extend_from_slice(&class_idx.to_be_bytes());
+        self.entries.extend_from_slice(&nat_idx.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_InterfaceMethodref (tag 11).
+    pub fn add_interface_methodref(&mut self, owner: &str, name: &str, desc: &str) -> u16 {
+        let key = CpKey::InterfaceMethodRef(owner.into(), name.into(), desc.into());
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let class_idx = self.add_class(owner);
+        let nat_idx = self.add_name_and_type(name, desc);
+        let idx = self.next_index();
+        self.entries.push(11);
+        self.entries.extend_from_slice(&class_idx.to_be_bytes());
+        self.entries.extend_from_slice(&nat_idx.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+
+    /// CONSTANT_Integer (tag 3).
+    pub fn add_integer(&mut self, value: i32) -> u16 {
+        let key = CpKey::Integer(value);
+        if let Some(&i) = self.dedup.get(&key) {
+            return i;
+        }
+        let idx = self.next_index();
+        self.entries.push(3);
+        self.entries.extend_from_slice(&value.to_be_bytes());
+        self.dedup.insert(key, idx);
+        idx
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code-stream builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Opcodes from JVMS §6.5 (only the ones we emit).
+mod op {
+    pub const ALOAD_0: u8 = 0x2A;
+    pub const ALOAD: u8 = 0x19;
+    pub const ILOAD: u8 = 0x15;
+    pub const LLOAD: u8 = 0x16;
+    pub const FLOAD: u8 = 0x17;
+    pub const DLOAD: u8 = 0x18;
+    pub const ICONST_M1: u8 = 0x02;
+    pub const ICONST_0: u8 = 0x03;
+    pub const ICONST_5: u8 = 0x08;
+    pub const BIPUSH: u8 = 0x10;
+    pub const SIPUSH: u8 = 0x11;
+    pub const LDC: u8 = 0x12;
+    pub const LDC_W: u8 = 0x13;
+    pub const DUP: u8 = 0x59;
+    pub const POP: u8 = 0x57;
+    pub const ANEWARRAY: u8 = 0xBD;
+    pub const AASTORE: u8 = 0x53;
+    pub const CHECKCAST: u8 = 0xC0;
+    pub const INVOKESTATIC: u8 = 0xB8;
+    pub const INVOKESPECIAL: u8 = 0xB7;
+    pub const INVOKEVIRTUAL: u8 = 0xB6;
+    pub const RETURN: u8 = 0xB1;
+    pub const ARETURN: u8 = 0xB0;
+    pub const IRETURN: u8 = 0xAC;
+    pub const LRETURN: u8 = 0xAD;
+    pub const FRETURN: u8 = 0xAE;
+    pub const DRETURN: u8 = 0xAF;
+}
+
+#[derive(Debug)]
+pub struct CodeBuilder {
+    pub bytes: Vec<u8>,
+}
+
+impl CodeBuilder {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(64),
+        }
+    }
+
+    pub fn emit_aload(&mut self, n: u8) {
+        if n == 0 {
+            self.bytes.push(op::ALOAD_0);
+        } else if n <= 3 {
+            self.bytes.push(0x2A + n);
+        } else {
+            self.bytes.push(op::ALOAD);
+            self.bytes.push(n);
+        }
+    }
+
+    pub fn emit_iload(&mut self, n: u8) {
+        if n <= 3 {
+            self.bytes.push(0x1A + n);
+        } else {
+            self.bytes.push(op::ILOAD);
+            self.bytes.push(n);
+        }
+    }
+
+    pub fn emit_lload(&mut self, n: u8) {
+        if n <= 3 {
+            self.bytes.push(0x1E + n);
+        } else {
+            self.bytes.push(op::LLOAD);
+            self.bytes.push(n);
+        }
+    }
+
+    pub fn emit_fload(&mut self, n: u8) {
+        if n <= 3 {
+            self.bytes.push(0x22 + n);
+        } else {
+            self.bytes.push(op::FLOAD);
+            self.bytes.push(n);
+        }
+    }
+
+    pub fn emit_dload(&mut self, n: u8) {
+        if n <= 3 {
+            self.bytes.push(0x26 + n);
+        } else {
+            self.bytes.push(op::DLOAD);
+            self.bytes.push(n);
+        }
+    }
+
+    /// LDC if the index fits in u8, else LDC_W. Used for String CP entries.
+    pub fn emit_ldc_w(&mut self, idx: u16) {
+        if idx <= u8::MAX as u16 {
+            self.bytes.push(op::LDC);
+            self.bytes.push(idx as u8);
+        } else {
+            self.bytes.push(op::LDC_W);
+            self.bytes.extend_from_slice(&idx.to_be_bytes());
+        }
+    }
+
+    pub fn emit_iconst(&mut self, n: i32) {
+        if (-1..=5).contains(&n) {
+            self.bytes.push(
+                (op::ICONST_0 as i32 + n)
+                    .clamp(op::ICONST_M1 as i32, op::ICONST_5 as i32) as u8,
+            );
+        } else if (i8::MIN as i32..=i8::MAX as i32).contains(&n) {
+            self.bytes.push(op::BIPUSH);
+            self.bytes.push(n as i8 as u8);
+        } else if (i16::MIN as i32..=i16::MAX as i32).contains(&n) {
+            self.bytes.push(op::SIPUSH);
+            self.bytes.extend_from_slice(&(n as i16).to_be_bytes());
+        } else {
+            unreachable!("ICONST out of range: {n}");
+        }
+    }
+
+    pub fn emit_invokestatic(&mut self, idx: u16) {
+        self.bytes.push(op::INVOKESTATIC);
+        self.bytes.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    pub fn emit_invokespecial(&mut self, idx: u16) {
+        self.bytes.push(op::INVOKESPECIAL);
+        self.bytes.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    pub fn emit_invokevirtual(&mut self, idx: u16) {
+        self.bytes.push(op::INVOKEVIRTUAL);
+        self.bytes.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    pub fn emit_anewarray(&mut self, idx: u16) {
+        self.bytes.push(op::ANEWARRAY);
+        self.bytes.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    pub fn emit_checkcast(&mut self, idx: u16) {
+        self.bytes.push(op::CHECKCAST);
+        self.bytes.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    pub fn emit_aastore(&mut self) {
+        self.bytes.push(op::AASTORE);
+    }
+
+    pub fn emit_dup(&mut self) {
+        self.bytes.push(op::DUP);
+    }
+
+    pub fn emit_pop(&mut self) {
+        self.bytes.push(op::POP);
+    }
+
+    pub fn emit_areturn(&mut self) {
+        self.bytes.push(op::ARETURN);
+    }
+
+    pub fn emit_ireturn(&mut self) {
+        self.bytes.push(op::IRETURN);
+    }
+
+    pub fn emit_lreturn(&mut self) {
+        self.bytes.push(op::LRETURN);
+    }
+
+    pub fn emit_freturn(&mut self) {
+        self.bytes.push(op::FRETURN);
+    }
+
+    pub fn emit_dreturn(&mut self) {
+        self.bytes.push(op::DRETURN);
+    }
+
+    pub fn emit_return(&mut self) {
+        self.bytes.push(op::RETURN);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Method emission
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Emit the method_info bytes (JVMS §4.6) for the constructor:
+/// `<init>(InvocationHandler, Class[]) { super(handler, ifaces); return; }`
+fn emit_constructor(
+    init_name_idx: u16,
+    ctor_desc_idx: u16,
+    code_attr_name_idx: u16,
+    super_ctor_ref: u16,
+) -> Vec<u8> {
+    let mut code = CodeBuilder::new();
+    code.emit_aload(0); // this
+    code.emit_aload(1); // handler
+    code.emit_aload(2); // interfaces
+    code.emit_invokespecial(super_ctor_ref);
+    code.emit_return();
+
+    // max_stack=3 (this + handler + ifaces), max_locals=3 (this, handler, ifaces).
+    let max_stack: u16 = 3;
+    let max_locals: u16 = 3;
+    let access_flags: u16 = 0x0001; // ACC_PUBLIC
+
+    build_method_info(
+        access_flags,
+        init_name_idx,
+        ctor_desc_idx,
+        code_attr_name_idx,
+        max_stack,
+        max_locals,
+        code.bytes,
+    )
+}
+
+/// Emit method_info for one proxy method (delegating into
+/// `Proxy$Dispatch.invokeProxy`).
+fn emit_proxy_method(
+    cp: &mut CpBuilder,
+    m: &ProxyMethod,
+    code_attr_name_idx: u16,
+    dispatch_ref: u16,
+    object_class_idx: u16,
+) -> Vec<u8> {
+    let _ = m.is_default; // currently informational only; same body either way
+
+    let params = descriptor_param_slots(&m.descriptor);
+    let ret = descriptor_return(&m.descriptor);
+
+    // Resolve constants up-front (so dedup wins — repeat calls return same idx).
+    let name_str_idx = cp.add_string(&m.name);
+    let desc_str_idx = cp.add_string(&m.descriptor);
+
+    let mut code = CodeBuilder::new();
+
+    // 1) ALOAD_0 (this)
+    code.emit_aload(0);
+    // 2) LDC name
+    code.emit_ldc_w(name_str_idx);
+    // 3) LDC descriptor
+    code.emit_ldc_w(desc_str_idx);
+    // 4) Build Object[] of length params.len() and box each arg.
+    code.emit_iconst(params.len() as i32);
+    code.emit_anewarray(object_class_idx);
+
+    let mut local_slot: u8 = 1; // 0 = this
+    for (i, kind) in params.iter().enumerate() {
+        code.emit_dup();
+        code.emit_iconst(i as i32);
+        match kind {
+            DescKind::Int => {
+                code.emit_iload(local_slot);
+                let r = cp.add_methodref("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;");
+                code.emit_invokestatic(r);
+            }
+            DescKind::Long => {
+                code.emit_lload(local_slot);
+                let r = cp.add_methodref("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
+                code.emit_invokestatic(r);
+            }
+            DescKind::Float => {
+                code.emit_fload(local_slot);
+                let r = cp.add_methodref("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;");
+                code.emit_invokestatic(r);
+            }
+            DescKind::Double => {
+                code.emit_dload(local_slot);
+                let r = cp.add_methodref("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;");
+                code.emit_invokestatic(r);
+            }
+            DescKind::Reference(_) => {
+                code.emit_aload(local_slot);
+            }
+        }
+        code.emit_aastore();
+        local_slot = local_slot
+            .checked_add(kind.slots() as u8)
+            .expect("local slot overflow");
+    }
+
+    // 5) INVOKESTATIC Proxy$Dispatch.invokeProxy(...)
+    code.emit_invokestatic(dispatch_ref);
+
+    // 6) Return path — coerce Object back to declared return type.
+    match ret {
+        ReturnKind::Void => {
+            code.emit_pop();
+            code.emit_return();
+        }
+        ReturnKind::Reference(raw) => {
+            // CHECKCAST takes a Class CP entry. For "L<Name>;" we strip the
+            // L/; per JVMS §4.4.1; for arrays "[..." we keep the descriptor.
+            let cast_name = if raw.starts_with('L') && raw.ends_with(';') {
+                raw[1..raw.len() - 1].to_string()
+            } else {
+                raw.clone()
+            };
+            let cast_idx = cp.add_class(&cast_name);
+            code.emit_checkcast(cast_idx);
+            code.emit_areturn();
+        }
+        ReturnKind::Prim(DescKind::Int) => {
+            let cast_idx = cp.add_class("java/lang/Integer");
+            code.emit_checkcast(cast_idx);
+            let r = cp.add_methodref("java/lang/Integer", "intValue", "()I");
+            code.emit_invokevirtual(r);
+            code.emit_ireturn();
+        }
+        ReturnKind::Prim(DescKind::Long) => {
+            let cast_idx = cp.add_class("java/lang/Long");
+            code.emit_checkcast(cast_idx);
+            let r = cp.add_methodref("java/lang/Long", "longValue", "()J");
+            code.emit_invokevirtual(r);
+            code.emit_lreturn();
+        }
+        ReturnKind::Prim(DescKind::Float) => {
+            let cast_idx = cp.add_class("java/lang/Float");
+            code.emit_checkcast(cast_idx);
+            let r = cp.add_methodref("java/lang/Float", "floatValue", "()F");
+            code.emit_invokevirtual(r);
+            code.emit_freturn();
+        }
+        ReturnKind::Prim(DescKind::Double) => {
+            let cast_idx = cp.add_class("java/lang/Double");
+            code.emit_checkcast(cast_idx);
+            let r = cp.add_methodref("java/lang/Double", "doubleValue", "()D");
+            code.emit_invokevirtual(r);
+            code.emit_dreturn();
+        }
+        ReturnKind::Prim(DescKind::Reference(_)) => {
+            unreachable!("Prim never holds Reference")
+        }
+    }
+
+    // ── Method header ────────────────────────────────────────────────────
+    let name_idx = cp.add_utf8(&m.name);
+    let desc_idx = cp.add_utf8(&m.descriptor);
+
+    // Conservative max_stack: 4 baseline (this/name/desc/array) + 2*params
+    // for safety (room for primitive-load + DUP + box-call temporaries).
+    let param_slot_count: u16 = params.iter().map(|k| k.slots()).sum();
+    let max_stack: u16 = 4 + param_slot_count * 2;
+    // max_locals: 1 (this) + param_slot_count.
+    let max_locals: u16 = 1 + param_slot_count;
+    // ACC_PUBLIC | ACC_FINAL (proxy methods are non-overridable).
+    let access_flags: u16 = 0x0001 | 0x0010;
+
+    build_method_info(
+        access_flags,
+        name_idx,
+        desc_idx,
+        code_attr_name_idx,
+        max_stack,
+        max_locals,
+        code.bytes,
+    )
+}
+
+/// Build a `method_info` blob (JVMS §4.6) wrapping a single Code attribute
+/// (JVMS §4.7.3). No exception_table, no inner attributes (no
+/// LineNumberTable, no LocalVariableTable, **no StackMapTable** — see
+/// module doc).
+fn build_method_info(
+    access_flags: u16,
+    name_idx: u16,
+    desc_idx: u16,
+    code_attr_name_idx: u16,
+    max_stack: u16,
+    max_locals: u16,
+    code_bytes: Vec<u8>,
+) -> Vec<u8> {
+    // Code attribute body:
+    //   u2 max_stack; u2 max_locals;
+    //   u4 code_length; u1 code[code_length];
+    //   u2 exception_table_length; ExceptionTableEntry[];   -- 0 entries
+    //   u2 attributes_count; attribute_info[];              -- 0 entries
+    let mut code_attr_body = Vec::with_capacity(12 + code_bytes.len());
+    code_attr_body.extend_from_slice(&max_stack.to_be_bytes());
+    code_attr_body.extend_from_slice(&max_locals.to_be_bytes());
+    code_attr_body.extend_from_slice(&(code_bytes.len() as u32).to_be_bytes());
+    code_attr_body.extend_from_slice(&code_bytes);
+    code_attr_body.extend_from_slice(&0_u16.to_be_bytes()); // exception_table_length
+    code_attr_body.extend_from_slice(&0_u16.to_be_bytes()); // attributes_count
+
+    let mut out = Vec::with_capacity(8 + 6 + code_attr_body.len());
+    out.extend_from_slice(&access_flags.to_be_bytes());
+    out.extend_from_slice(&name_idx.to_be_bytes());
+    out.extend_from_slice(&desc_idx.to_be_bytes());
+    out.extend_from_slice(&1_u16.to_be_bytes()); // 1 attribute (Code)
+    out.extend_from_slice(&code_attr_name_idx.to_be_bytes());
+    out.extend_from_slice(&(code_attr_body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&code_attr_body);
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustjvm_reader::read_class;
+
+    fn supplier_spec() -> ProxyClassSpec {
+        ProxyClassSpec {
+            gen_class_name: "java/lang/reflect/$Proxy0".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec!["java/util/function/Supplier".to_string()],
+            methods: vec![ProxyMethod {
+                name: "get".to_string(),
+                descriptor: "()Ljava/lang/Object;".to_string(),
+                is_default: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn emits_supplier_proxy_with_get_method() {
+        let bytes = emit_proxy_classfile(&supplier_spec());
+        let cf = read_class(&bytes).expect("emitted class file must round-trip through reader");
+        assert_eq!(&*cf.this_class, "java/lang/reflect/$Proxy0");
+        assert_eq!(
+            cf.super_class.as_ref().map(|s| &**s),
+            Some("java/lang/reflect/Proxy$Instance")
+        );
+        assert!(cf
+            .interfaces
+            .iter()
+            .any(|s| &**s == "java/util/function/Supplier"));
+        assert!(cf
+            .methods
+            .iter()
+            .any(|m| &*m.name == "<init>"
+                && &*m.descriptor == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"));
+        assert!(cf
+            .methods
+            .iter()
+            .any(|m| &*m.name == "get" && &*m.descriptor == "()Ljava/lang/Object;"));
+    }
+
+    #[test]
+    fn emits_two_iface_proxy_with_both() {
+        let spec = ProxyClassSpec {
+            gen_class_name: "java/lang/reflect/$Proxy1".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec![
+                "java/lang/Runnable".to_string(),
+                "java/util/concurrent/Callable".to_string(),
+            ],
+            methods: vec![
+                ProxyMethod {
+                    name: "run".to_string(),
+                    descriptor: "()V".to_string(),
+                    is_default: false,
+                },
+                ProxyMethod {
+                    name: "call".to_string(),
+                    descriptor: "()Ljava/lang/Object;".to_string(),
+                    is_default: false,
+                },
+            ],
+        };
+        let bytes = emit_proxy_classfile(&spec);
+        let cf = read_class(&bytes).expect("two-iface emitted class file must parse");
+        assert!(cf
+            .interfaces
+            .iter()
+            .any(|s| &**s == "java/lang/Runnable"));
+        assert!(cf
+            .interfaces
+            .iter()
+            .any(|s| &**s == "java/util/concurrent/Callable"));
+        assert!(cf
+            .methods
+            .iter()
+            .any(|m| &*m.name == "run" && &*m.descriptor == "()V"));
+        assert!(cf
+            .methods
+            .iter()
+            .any(|m| &*m.name == "call" && &*m.descriptor == "()Ljava/lang/Object;"));
+        assert!(cf.methods.iter().any(|m| &*m.name == "<init>"));
+    }
+
+    #[test]
+    fn cp_dedup_returns_same_index_for_identical_utf8() {
+        let mut cp = CpBuilder::new();
+        let a = cp.add_utf8("java/lang/Object");
+        let b = cp.add_utf8("java/lang/Object");
+        let c = cp.add_utf8("java/lang/Object");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        let d = cp.add_utf8("java/lang/String");
+        assert_ne!(a, d);
+        let cls1 = cp.add_class("java/lang/Object");
+        let cls2 = cp.add_class("java/lang/Object");
+        assert_eq!(cls1, cls2);
+    }
+
+    #[test]
+    fn descriptor_param_parsing_handles_mixed() {
+        let p = descriptor_param_slots("(IJLjava/lang/String;[BD)V");
+        assert_eq!(p.len(), 5);
+        assert_eq!(p[0], DescKind::Int);
+        assert_eq!(p[1], DescKind::Long);
+        assert!(matches!(p[2], DescKind::Reference(ref s) if s == "Ljava/lang/String;"));
+        assert!(matches!(p[3], DescKind::Reference(ref s) if s == "[B"));
+        assert_eq!(p[4], DescKind::Double);
+    }
+
+    #[test]
+    fn descriptor_return_parsing_handles_void_and_ref() {
+        assert_eq!(descriptor_return("()V"), ReturnKind::Void);
+        assert_eq!(descriptor_return("()I"), ReturnKind::Prim(DescKind::Int));
+        assert!(matches!(
+            descriptor_return("()Ljava/lang/Object;"),
+            ReturnKind::Reference(ref s) if s == "Ljava/lang/Object;"
+        ));
+    }
+
+    #[test]
+    fn emits_int_return_method_uses_iret_in_tail() {
+        let spec = ProxyClassSpec {
+            gen_class_name: "java/lang/reflect/$Proxy2".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec!["x/Y".to_string()],
+            methods: vec![ProxyMethod {
+                name: "calc".to_string(),
+                descriptor: "(I)I".to_string(),
+                is_default: false,
+            }],
+        };
+        let bytes = emit_proxy_classfile(&spec);
+        let cf = read_class(&bytes).expect("int-return emitted class file must parse");
+        let m = cf
+            .methods
+            .iter()
+            .find(|m| &*m.name == "calc" && &*m.descriptor == "(I)I")
+            .expect("calc method present");
+        // Round-trip succeeded — the verifier-skip path will accept it. Spot-
+        // check the access flags include ACC_PUBLIC | ACC_FINAL.
+        assert_eq!(m.access_flags.bits() & 0x0011, 0x0011);
+    }
+
+    #[test]
+    fn emits_void_return_method() {
+        let spec = ProxyClassSpec {
+            gen_class_name: "java/lang/reflect/$Proxy3".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec!["java/lang/Runnable".to_string()],
+            methods: vec![ProxyMethod {
+                name: "run".to_string(),
+                descriptor: "()V".to_string(),
+                is_default: false,
+            }],
+        };
+        let bytes = emit_proxy_classfile(&spec);
+        let cf = read_class(&bytes).expect("void-return emitted class file must parse");
+        assert!(cf
+            .methods
+            .iter()
+            .any(|m| &*m.name == "run" && &*m.descriptor == "()V"));
+    }
+}

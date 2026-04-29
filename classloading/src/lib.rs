@@ -23,6 +23,7 @@ mod class_path;
 pub(crate) mod fx_hash;
 pub mod loaders;
 pub mod module;
+pub mod proxy_gen;
 pub mod resolution;
 pub mod verifier;
 pub mod verify_frame;
