@@ -874,7 +874,22 @@ parallel, then D+E+F, then G+H, then I as continuous validation.
 | Constraints | Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
 | Notes | Likely a category-class bug: `String.length()`, `String.substring(II)`, `String.indexOf(I)` may all be in the same boat. Agent should grep `register_synthetic_overrides` for `"java/lang/String"` registrations and audit which are also reachable in real-JDK mode. |
 
-### RKC16N.9 — Investigate `org.jboss.modules.Module.<clinit>` NPE after RVERIF.2 lands
+### RKC16N.9 — Investigate `org.jboss.modules.Module.<clinit>` NPE after RVERIF.2 lands — **RESOLVED in `8aad4c8`**
+
+**Status (2026-04-29):** RESOLVED in commit `8aad4c8`. Actual root cause
+was **not** a JBoss-Modules-specific helper as the original recon
+guessed — it was a three-gap chain that left `java.lang.Void.TYPE` null
+during JDK core bootstrap, which surfaced downstream as a
+`Module.<clinit>` NPE. The fix landed three independent changes:
+(a) jimage header version-decoding bug in `reader/src/jimage.rs` (read
+as two `u16`s instead of one `u32` split into HIGH=major / LOW=minor —
+inverted on little-endian disk); (b) missing `lib/modules` jimage
+fallback in `vm/src/config.rs::discover_boot_classpath` (only checked
+`rt.jar` and `jmods/`, missed JRE-style and jlink-trimmed runtimes
+including the Adoptium "JDK 25" header dist used in the reproducer);
+(c) `obj_arg` backtrace diagnostic added in `native-builtins/src/lib.rs`
+gated on `RUSTJVM_DBG_NULL_NATIVE` for future "which native got null"
+investigations. The follow-up KC16 boot blocker is now **RKC16N.11**.
 
 | Field | Value |
 |---|---|
@@ -887,6 +902,20 @@ parallel, then D+E+F, then G+H, then I as continuous validation.
 | Success | KC16 standalone progresses past `Module.<clinit>` and enters `org.jboss.modules.Main.run` proper. Next failure (if any) is downstream — module.xml parsing or class-resolution against deployed modules. |
 | Parallel-safe with | Phase A–I items, RVERIF.2 (depends), RKC16N.1/3/5/8 (depend). |
 | Constraints | No emojis. Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
+
+### RKC16N.11 — Diagnose opaque main()-thread NPE downstream of `ManagementFactory.<clinit>`
+
+| Field | Value |
+|---|---|
+| ID | RKC16N.11 |
+| Title | Diagnose opaque main()-thread NPE downstream of `ManagementFactory.<clinit>` |
+| Files | TBD — depends on which Java frame the NPE escapes from. Recon-only iteration first; expected suspects (once the failing frame is identified) include `vm/src/vm/vm_init.rs` (further missing-native registrations), `native-builtins/src/jmx.rs` (RKC16N.10 added natives — one of them may be returning a value of the wrong type), `native-builtins/src/shared_secrets_bridge.rs` (legacy `BufferPool` bridge from RKC16N.10 — null is the right answer per spec, but a downstream caller may be deref'ing it without a null check), and any class whose `<clinit>` sits between `ManagementFactory` and `main()` in JBoss-Modules' boot chain. |
+| Reproducer | `target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"` → `Exception in thread "main" java/lang/NullPointerException` (no message, no cause, no Java stack trace). Note: `ManagementFactory.<clinit>` records a silent-swallow `UnsatisfiedLinkError` immediately before this — that swallow is **unrelated** to the fatal NPE (it comes from one of `ManagementFactory`'s `Class.forName` try/catch probes, tolerated by design). |
+| Recon | The immediate diagnostic gap is **no Java stack trace** in the CLI exception path. A parallel agent is working on adding stack-trace formatting at the top-level CLI exception print site (`vm-cli/src/main.rs`); this task is **gated on that work** and is pure recon for the first iteration. Once a Java stack trace is available: (1) capture stderr to `/tmp/kc16_post_rkc16n10.txt`; (2) read the throwing frame and the immediately-enclosing frames; (3) `javap -c -p` on the failing class (extract from JDK `lib/modules` if it's a JDK class, or from `jboss-modules.jar` if JBoss); (4) walk the bytecode at the failing PC to identify which value is null and trace it back to the producer (static field, constructor, factory method, or native return). Useful env knobs already in place: `RUSTJVM_STRICT_SWALLOWS=1` (escalates first swallow to panic), `RUSTJVM_DBG_NULL_NATIVE=1` (RKC16N.9's new `obj_arg` backtrace — emits a Rust backtrace when a native receives `Value::Object(None)`). |
+| Fix direction | Once the failing frame is identified, the fix follows the historical RKC16N.9 pattern (which turned out to be a JDK-side gap, not a JBoss-side gap — keep an open mind about which side the missing piece is on). Two likely shapes: (a) add the missing native or static-init helper that produced the null — register in the appropriate real-JDK / synthetic registration path; or (b) walk back to the silent-swallow that left a static field null — either the `ManagementFactory` swallow noted above (if it turns out to be load-bearing despite looking by-design) or a different upstream swallow surfaced via `RUSTJVM_STRICT_SWALLOWS=1`. Path (a) is the structurally-correct fix; (b) may need a post-clinit fixup mirror similar to `DefaultBootModuleLoaderHolder` if the real native isn't yet implementable. |
+| Success | KC16 standalone progresses past the empty-message NPE; either `org.jboss.modules.Main.run` enters its main loop and starts opening `module.xml`, or the next failure is a different, named exception with a real stack trace (capture verbatim and file as RKC16N.12). |
+| Parallel-safe with | Existing RKC16N.* items, but **serialised after the CLI stack-trace work lands** (parallel agent on `vm-cli/src/main.rs`). Also serialised after the parallel work on `native-builtins/src/jmx.rs` and `native-builtins/src/shared_secrets_bridge.rs` if those land first — they touch the most likely suspect surface. |
+| Constraints | **Pure recon for the first iteration — no code changes until the failing frame is identified.** No emojis. Don't touch `value_stack.rs` / Getfield-Putfield in `interpreter.rs` / `phases_late.rs::register_phase71_natives`. |
 
 ### RKC16N.4 — Capture next KC16 blocker after RKC16N.1 lands
 

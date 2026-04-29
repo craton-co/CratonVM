@@ -1,5 +1,67 @@
 # KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
+## Live status (Session 95, 2026-04-29 — RKC16N.9 + RKC16N.10 landed)
+
+After commit `8aad4c8` ("RKC16N.9 + RKC16N.10") landed both fixes, KC16
+boot now reaches a new opaque blocker: an empty-message NPE that escapes
+from `main()` downstream of `ManagementFactory.<clinit>`. This is
+**RKC16N.11**.
+
+Reproducer (unchanged from Session 94):
+```
+target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+Observed (post-`8aad4c8`):
+```
+Exception in thread "main" java/lang/NullPointerException
+```
+
+No message, no cause, no Java stack trace. Note that **`ManagementFactory.<clinit>`
+still records a silent-swallow `UnsatisfiedLinkError`** from one of its
+internal `Class.forName` try/catch blocks (likely tolerated by design —
+HotSpot's reference impl catches and swallows missing-impl probes during
+that clinit). The fatal NPE that escapes to the CLI is **unrelated** to
+that swallow and originates somewhere downstream — diagnostic gap is the
+absence of a Java stack at the CLI exception print path (parallel agent
+working on that).
+
+**What was needed to get here** (capsule of the two fixes that landed in
+`8aad4c8`):
+
+- **RKC16N.9** — `org.jboss.modules.Module.<clinit>` NPE. The original
+  Session 94 recon notes pointed at JBoss-Modules-specific helpers
+  (`PathFilters.acceptAll()`, `DefaultBootModuleLoaderHolder` mirror)
+  and that turned out to be **wrong**. Actual root cause was a chain
+  of three independent gaps that combined to leave `Void.TYPE` null,
+  which in turn surfaced as a `Module.<clinit>` NPE:
+  - jimage header version-decoding bug in `reader/src/jimage.rs` —
+    the version field was read as two `u16`s instead of a single `u32`
+    split into HIGH=major / LOW=minor (inverted on little-endian disk).
+  - missing `lib/modules` jimage fallback in
+    `vm/src/config.rs::discover_boot_classpath` — only checked `rt.jar`
+    and `jmods/`, missed JRE-style and jlink-trimmed runtimes including
+    the Adoptium "JDK 25" header dist used in this reproducer.
+  - new `obj_arg` backtrace diagnostic in `native-builtins/src/lib.rs`,
+    gated on `RUSTJVM_DBG_NULL_NATIVE`, for future "which native got
+    null" investigations.
+- **RKC16N.10** — `ManagementFactory.<clinit>` UnsatisfiedLinkError
+  cluster (5 + 4 missing JMX natives + a null bridge return). Added
+  `sun/management/VMManagementImpl` (5 specific natives + 16 boolean
+  `is*Supported`/`is*Enabled` returning `false` + 17 long counters
+  returning `0`), `sun/management/MemoryImpl` (4 natives), wired into
+  both real-JDK registration paths in `vm/src/vm/vm_init.rs`, and the
+  legacy `Buffer$1.getDirectBufferPool()Ljdk/internal/misc/VM$BufferPool;`
+  returning null in `native-builtins/src/shared_secrets_bridge.rs`.
+
+Frontier as of 2026-04-29: **RKC16N.11** — diagnose the opaque
+main()-thread NPE downstream of `ManagementFactory.<clinit>`. Serialised
+after the parallel CLI-stack-trace work lands (otherwise pure recon is
+blind).
+
 ## Live status (2026-04-26, Session 94 — fourth iteration; RVERIF.2 landed)
 
 After RVERIF.2 (verifier subtype widening fix via JDK interface name table):
