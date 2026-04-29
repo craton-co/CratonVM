@@ -685,6 +685,26 @@ pub trait NativeContext {
         method_desc: &str,
     ) -> Option<AnnotationElementValue>;
 
+    /// WP2.1 — Get the list of checked-exception class internal names from
+    /// a method's `Exceptions` attribute (JVMS 4.7.5).
+    ///
+    /// Returns an empty `Vec` if the method has no `Exceptions` attribute
+    /// (no `throws` clause), or if the class / method cannot be located.
+    /// Each entry is a binary internal class name like
+    /// `"java/io/IOException"`.
+    ///
+    /// Default implementation returns an empty `Vec` so that mock
+    /// `NativeContext` implementations don't need to plumb through the
+    /// class-file attribute store.
+    fn method_exceptions(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Invoke a virtual method on a receiver, with lambda-proxy awareness.
     ///
     /// If the receiver's ClassId is registered as a lambda proxy, this performs

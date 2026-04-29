@@ -2296,7 +2296,29 @@ pub(crate) fn create_method_object(
     // `JavaDispatcher.<clinit>` which does `arraylength` on a `Method`-
     // returned array. The real JDK guarantees these fields are non-null
     // (initialised by the `Method` constructor); we mirror that.
-    let empty_class_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+    //
+    // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
+    // attribute when present, so `Method.getExceptionTypes()` (which the
+    // JDK Java code implements by `return exceptionTypes.clone();`)
+    // returns the actual throws-clause types instead of always-empty.
+    let exception_names = ctx.method_exceptions(
+        meta.declaring_class_id,
+        &meta.name,
+        &meta.descriptor,
+    );
+    let exception_arr = ctx.new_ref_array(
+        rustjvm_types::ClassId::new(0),
+        exception_names.len(),
+    );
+    for (i, name) in exception_names.iter().enumerate() {
+        // Build a Class<T> mirror for each thrown checked exception.
+        // We use `descriptor_to_class_mirror` with an L-form so that
+        // the same code path that turns `Ljava/io/IOException;` into a
+        // mirror handles class loading + caching consistently.
+        let desc = format!("L{name};");
+        let mirror = descriptor_to_class_mirror(ctx, &desc);
+        ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
+    }
     let empty_byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
 
     let desc_str = ctx.create_string(&meta.descriptor);
@@ -2306,11 +2328,11 @@ pub(crate) fn create_method_object(
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(obj, "returnType", Value::Object(Some(ret_mirror)));
     ctx.set_field_by_name(obj, "parameterTypes", Value::Object(Some(param_arr)));
-    // G2: exceptionTypes must be a non-null empty Class[] (not null).
-    // `Method.getExceptionTypes()` does `exceptionTypes.clone()` which
-    // would NPE on null; ByteBuddy's clinit iterates exception types of
-    // declared methods.
-    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(empty_class_arr)));
+    // G2 + WP2.1: exceptionTypes is a non-null Class[] populated from the
+    // `Exceptions` class-file attribute (or empty if no throws clause).
+    // `Method.getExceptionTypes()` does `exceptionTypes.clone()` — if this
+    // were null, ByteBuddy / Mockito / Spring AOP clinit paths would NPE.
+    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(exception_arr)));
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     // JDK's `slot` is an opaque vmindex we don't populate; default 0.
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
