@@ -823,6 +823,7 @@ impl NativeContext for MockNativeContext {
                         descriptor: m.descriptor.clone(),
                         access_flags: m.access_flags,
                         declaring_class_id: m.declaring_class_id,
+                        exceptions: m.exceptions.clone(),
                     })
                     .collect()
             })

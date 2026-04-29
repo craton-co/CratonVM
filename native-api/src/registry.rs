@@ -34,6 +34,16 @@ pub struct MethodMetadata {
     pub descriptor: String,
     pub access_flags: u16,
     pub declaring_class_id: ClassId,
+    /// Internal names of exception classes the method declares to
+    /// throw (JVMS §4.7.5 `Exceptions` attribute). Empty for methods
+    /// without a `throws` clause. Populated by the VM's
+    /// `declared_methods` impl from `Attribute::Exceptions`.
+    ///
+    /// Used by `native_builtins::build_proxy_spec_for` (WP2.5 v3 item 3)
+    /// to thread the declared exception set through to the generated
+    /// proxy class's `<clinit>` so that `wrap_undeclared_throwable`
+    /// (WP2.5 v3 item 6) can match thrown exceptions against it.
+    pub exceptions: Vec<String>,
 }
 
 /// WP2.3 — defineClass options carried through `NativeContext::define_class_full`.

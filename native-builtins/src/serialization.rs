@@ -3190,6 +3190,7 @@ mod wp02_tests {
             descriptor: desc.to_string(),
             access_flags: flags,
             declaring_class_id: declaring,
+            exceptions: Vec::new(),
         }
     }
 
