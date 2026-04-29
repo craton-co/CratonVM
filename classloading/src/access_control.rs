@@ -38,10 +38,10 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
 /// Check whether `accessor` can access a field in `declaring` class with given flags.
 ///
 /// Per JVM spec 5.4.4:
-/// - `PUBLIC` → accessible from anywhere
-/// - `PRIVATE` → accessible only from declaring class
-/// - `PROTECTED` → accessible from same package OR subclasses
-/// - Package-private (no access modifier) → accessible from same package only
+/// - `PUBLIC` в†’ accessible from anywhere
+/// - `PRIVATE` в†’ accessible only from declaring class
+/// - `PROTECTED` в†’ accessible from same package OR subclasses
+/// - Package-private (no access modifier) в†’ accessible from same package only
 #[inline]
 pub fn check_field_access(
     accessor: &Class,
@@ -172,10 +172,10 @@ pub fn are_nestmates(a: &Class, b: &Class) -> bool {
 ///
 /// The runtime package is determined by the package prefix of the fully-qualified
 /// internal name. For example:
-/// - `"java/lang/Object"` → package `"java/lang"`
-/// - `"java/lang/String"` → package `"java/lang"` (same)
-/// - `"java/util/List"` → package `"java/util"` (different)
-/// - `"Foo"` → default package `""` (no `/`)
+/// - `"java/lang/Object"` в†’ package `"java/lang"`
+/// - `"java/lang/String"` в†’ package `"java/lang"` (same)
+/// - `"java/util/List"` в†’ package `"java/util"` (different)
+/// - `"Foo"` в†’ default package `""` (no `/`)
 #[inline]
 pub fn same_runtime_package(name_a: &str, name_b: &str) -> bool {
     package_of(name_a) == package_of(name_b)
@@ -199,9 +199,9 @@ fn package_of(class_name: &str) -> &str {
 /// This is called **in addition** to the standard JVM 5.4.4 checks above.
 /// It only fires when both classes belong to distinct *named* modules.
 ///
-/// Rules (simplified from JVMS §5.4.4 with JPMS overlay):
-/// 1. Same module → allowed.
-/// 2. Either module is the unnamed module → allowed (classpath compat).
+/// Rules (simplified from JVMS В§5.4.4 with JPMS overlay):
+/// 1. Same module в†’ allowed.
+/// 2. Either module is the unnamed module в†’ allowed (classpath compat).
 /// 3. `accessor_module` must *read* `target_module`.
 /// 4. `target_module` must *export* the target package to `accessor_module`.
 ///
@@ -212,7 +212,7 @@ pub fn check_module_access(
     target: &Class,
     registry: &ModuleRegistry,
 ) -> Result<(), LinkageError> {
-    // No modules registered → classpath-only mode, skip enforcement.
+    // No modules registered в†’ classpath-only mode, skip enforcement.
     if registry.is_empty() {
         return Ok(());
     }
@@ -220,7 +220,7 @@ pub fn check_module_access(
     let accessor_mod = accessor.module_name.as_deref().unwrap_or(UNNAMED_MODULE);
     let target_mod = target.module_name.as_deref().unwrap_or(UNNAMED_MODULE);
 
-    // Same module or unnamed module involved → always allowed.
+    // Same module or unnamed module involved в†’ always allowed.
     if accessor_mod == target_mod || accessor_mod == UNNAMED_MODULE || target_mod == UNNAMED_MODULE {
         return Ok(());
     }
@@ -272,7 +272,7 @@ pub fn check_method_access_with_modules(
 /// ClassId, using a ClassManager reference (which holds both the class store
 /// and the module registry).
 ///
-/// Returns Ok(()) silently if either class is not found (defensive — the
+/// Returns Ok(()) silently if either class is not found (defensive вЂ” the
 /// missing class will be caught later by a more specific error path).
 pub fn check_module_access_by_id(
     accessor_id: super::class::ClassId,
@@ -341,6 +341,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         id
     }
@@ -708,6 +709,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         id
     }

@@ -30,8 +30,8 @@ pub mod verify_insn;
 pub mod vtype;
 
 pub use class::{
-    find_field_recursive, find_method_recursive, Class, ClassId, ClassLoaderId, ClassState,
-    ClassStore, CodeSource, RecordComponentInfo,
+    find_field_recursive, find_method_recursive, ArrayInfo, Class, ClassId, ClassLoaderId,
+    ClassState, ClassStore, CodeSource, RecordComponentInfo,
 };
 pub use class_manager::{
     install_class_file_load_hook, install_class_load_hook, install_class_prepare_hook,

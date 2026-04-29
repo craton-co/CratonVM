@@ -1,6 +1,174 @@
-# KC16 Boot-Blocker Map (Session 93 / WP0.3, 2026-04-24)
+# KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
-Keycloak 16.1.1 (WildFly / JBoss-Modules) under Session 92/93 `rustjvm.exe`.
+## Live status (2026-04-26, Session 94 — fourth iteration; RVERIF.2 landed)
+
+After RVERIF.2 (verifier subtype widening fix via JDK interface name table):
+
+```
+target/release/rustjvm.exe --java-home "C:/.../jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+→ verifier passes. Single failure (no NoSuchMethodError, no other warnings):
+```
+B6: silent-swallow class=org/jboss/modules/Module
+   exc=java/lang/NullPointerException: null object argument
+Exception in thread "main" java/lang/NullPointerException
+```
+
+**RKC16N.9** — `org.jboss.modules.Module.<clinit>` NPE. The class init
+is silently swallowed (B6 path), leaving `Module` in a partially-
+initialised state, then `main()` references something that NPEs.
+
+**Recon completed (2026-04-26 PM, Session 94 fifth iteration):**
+- `RUSTJVM_STRICT_SWALLOWS=1` panics inside `common_superclass` →
+  `ensure_class_initialized_shared`, confirming the NPE is during a
+  cascading class-init triggered by `Module.<clinit>`.
+- `Module.<clinit>` clinit chain (via `RUST_LOG=...vm_util=debug`):
+  `Main` → `StartTimeHolder` → `StandardCharsets` →
+  `DefaultBootModuleLoaderHolder` → `ModuleLoader` →
+  `LocalModuleLoader` → `Module` (the NPE class).
+- The NPE message "null object argument" comes from the generic
+  `obj_arg` helper at `native-builtins/src/lib.rs:6036`, which means
+  some native method is being called with a `Value::Object(None)`
+  argument. Without a Java stack at the call site we can't tell which
+  native — adding a per-native eprintln in `obj_arg` or recording the
+  failing method name in `record_swallow` would expose this in <1
+  iteration.
+- `Module.<clinit>` bytecode (via `javap -c -p` on jboss-modules.jar):
+  PC 0..125 sets up `MAIN_METHOD_TYPE` + `log` + `BOOT_MODULE_LOADER`
+  + 6 RuntimePermission statics + 2 FastCopyHashSets. PC 128..156
+  reads `jboss.modules.system.pkgs` via PropertyReadAction +
+  AccessController.doPrivileged, allocates `ArrayList`, then calls
+  `JDKSpecific.addInternalPackages(list)` (PC 154). Stubbed as no-op
+  in Session 94 commit `<TBD>` — did not change the NPE, so the
+  triggering native is elsewhere.
+- Plausible remaining culprits: `MethodType.methodType(Class, Class)`
+  (PC 6) returning null then later invocation NPEs; `AccessController.doPrivileged`
+  arity mismatch; `FastCopyHashSet.<init>(I)V` taking null where it
+  expects `this`. Add a Java-stack log in `obj_arg` to find out.
+
+
+
+Keycloak 16.1.1 (WildFly / JBoss-Modules) under current `target/release/rustjvm.exe`
+on Windows 11, JDK 25.0.2 (Adoptium) for boot classpath, default flags.
+
+## Live status (2026-04-26, Session 94 — third iteration; RKC16N.1/3/5/8 + recon hacks landed)
+
+After RKC16N.8 landed (`Class.desiredAssertionStatus()Z` + `System.initPhase1()V` stubs):
+
+```
+target/release/rustjvm.exe --java-home "C:/.../jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+→ no NoSuchMethodError warnings. Single failure:
+```
+linkage error: verification error in org/jboss/modules/Module.getResources:
+ at bytecode offset 294: expected ObjectRef("java/util/Collection") on stack,
+ found ObjectRef("java/util/List")
+```
+
+That is **RVERIF.2** (subtype widening). Agent dispatched. With `--noverify`,
+KC16 progresses to `org.jboss.modules.Module.<clinit>` NPE (RKC16N.9, follow-up).
+
+`-version` (full clean run, no diagnostic warnings):
+```
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+JBoss Modules version 2.0.0.Final
+```
+
+## Live status (2026-04-26, Session 94 — second iteration with recon hacks landed)
+
+After Session 94 first-iteration work (Properties.load(Reader) stub +
+String layout-neutral natives + override-allowlist + throwable ctor
+stubs):
+
+```
+target/release/rustjvm.exe --java-home "C:/.../jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+→ aborts at the bytecode verifier:
+```
+linkage error: verification error in org/jboss/modules/Module.getResources:
+ at bytecode offset 294: expected ObjectRef("java/util/Collection") on stack,
+ found ObjectRef("java/util/List")
+```
+
+This is the **RVERIF.1**-class bug (subtype widening): `List` extends
+`Collection`, so the verifier should accept it.
+
+With `--noverify`, KC16 progresses further to:
+```
+B6: silent-swallow — class=org/jboss/modules/Module exc=java/lang/NullPointerException
+Exception in thread "main" java/lang/NullPointerException
+```
+
+`-version` (with the recon hacks) reaches the actual `main()` body and
+prints `JBoss Modules version (unknown)` — the entirety of `Main.<clinit>`
+runs cleanly.
+
+**Frontier as of 2026-04-26 18:05 UTC**: WildFly module-loader inside
+`org.jboss.modules.Module.<clinit>`. This is several phases past where
+the previous KC16 baseline was stuck.
+
+## Live status (2026-04-26)
+
+Reproducer (worked from worktree root):
+```
+target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+Observed (~30 ms wall-clock to abort):
+```
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+WARN  NoSuchMethodError method="java/lang/System.initPhase1()V"
+WARN  NoSuchMethodError method="java/util/Properties.load(Ljava/io/Reader;)V"
+Error in thread "main" linkage error: no such method:
+   java/util/Properties.load(Ljava/io/Reader;)V
+```
+
+This is **earlier** than every blocker the previous (Session 93) revision of
+this doc describes — the CHM `initTable` livelock at P0 module-loader
+bootstrap is now unreachable because `org.jboss.modules.Main.<clinit>` aborts
+during its `version.properties` load.
+
+## Resolved since Session 93
+
+| # | Status | Evidence |
+|---|--------|----------|
+| #3 KC16 `initPhase1` synthetic-stream fallback | RESOLVED | `WARN NoSuchMethodError java/lang/System.initPhase1()V` is now a non-fatal warning; main thread proceeds (it only re-fails downstream on Properties.load(Reader)). |
+| #4 9 static MISSING natives | RESOLVED (WP0.3) | Coverage 191/191. |
+| #5 Silent livelock / no watchdog | RESOLVED | First line of every run is `stack-dump watchdog armed: will dump + abort after 45s`. SIGTERM dump still TBD. |
+
+## Open blockers (refreshed)
+
+| # | Phase | Symptom | Root cause | Fix scope | Cmplx |
+|---|-------|---------|------------|-----------|-------|
+| 1 | Mod-loader pre-P0 | **`Properties.load(Ljava/io/Reader;)V` NoSuchMethodError** in `Main.<clinit>` reading `version.properties`. | `properties_sidetable.rs::register_properties_sidetable` registers `load(InputStream)` but not `load(Reader)`. | New native that drains the Reader via `invoke_virtual(read([CII)I)` and reuses `parse_properties`. See **RKC16N.1** in `roadmap-any-java-app.md`. | Easy |
+| 2 | Mod-loader P0 (gated on #1) | CHM `initTable()` CAS livelock on `sizeCtl` (PC 0..41 spin ~5,740 /s). Identical bytecode to KC26 #1. | `Unsafe.compareAndSetInt` reads zero-alloc primitive slot as `Value::Object(None)` not `Int(0)`; CAS equality never holds. | Typed default at `gc::heap::alloc_object`, or typed `read_slot`. See **RKC16N.2**. | Hard |
+| 3 | Mod-loader P0 (gated on #2) | Never opens any `module.xml`. | Downstream of #2. | — | — |
+| 4 | Boot diff | Synthesize `[L…;` array classes on demand instead of JMOD scan. | KC26 Blocker #3 (still open across both KC16 and KC26). | `classloading/src/class_manager.rs`. See **RKC16N.3**. | Easy |
+| 5 | Observability | SIGTERM/abort path still loses missing-natives audit dump. | Audit flush only on clean exit. | Flush on watchdog/SIGTERM. | Medium |
+
+Workload (legacy reference): `jboss-modules.jar -jaxpmodule
+javax.xml.jaxp-provider org.jboss.as.standalone -b 0.0.0.0`. JDK 21.0.6.
+Reference: HotSpot `standalone\log\server.log` hit `WFLYSRV0025` in ~47 s.
+
+---
+
+## Historical notes (Session 93 / WP0.3, 2026-04-24)
+
 **WP0.3 now closed** (N1..N4 + WP0.3 verification):
   * All 9 known MISSING natives registered. `s10_native_coverage_100_percent`
     runs: `Total ACC_NATIVE=191, Covered=191, Missing=0, Coverage=100.0%`.
@@ -8,10 +176,6 @@ Keycloak 16.1.1 (WildFly / JBoss-Modules) under Session 92/93 `rustjvm.exe`.
     returns 0 — the real emitter at `vm/src/vm/vm_object.rs:719` emits
     `MISSING: <class>.<method><desc>` and the inventory scan returns empty.
   * Blocker #4 below is therefore RESOLVED.
-
-Workload: `jboss-modules.jar -jaxpmodule
-javax.xml.jaxp-provider org.jboss.as.standalone -b 0.0.0.0`. JDK 21.0.6.
-Reference: HotSpot `standalone\log\server.log` hit `WFLYSRV0025` in ~47 s.
 
 ## 1. WildFly phase timeline
 

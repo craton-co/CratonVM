@@ -345,6 +345,40 @@ pub struct Class {
     /// URL becomes the code base and the SHA-256 of each signer cert
     /// becomes the signedBy match key.
     pub code_source: Option<CodeSource>,
+
+    /// RKC16N.3 — Array-class metadata.
+    ///
+    /// `Some(_)` if and only if this class represents a Java array type
+    /// (binary name starts with `[`). The bootstrap class loader
+    /// **synthesises** these classes from the resolved component class —
+    /// JVMS §5.3.3 forbids any classpath I/O for reference-array types.
+    /// `None` for ordinary classes and interfaces.
+    pub array_info: Option<ArrayInfo>,
+}
+
+/// RKC16N.3 — Metadata for a synthesised array class.
+///
+/// Per JVMS §5.3.3 reference-array classes are synthesised by the bootstrap
+/// loader from the resolved component class with no classpath I/O. Per
+/// JLS §10.7 every array class has `java.lang.Object` as its superclass and
+/// implements `java.lang.Cloneable` and `java.io.Serializable`.
+#[derive(Debug, Clone)]
+pub struct ArrayInfo {
+    /// `ClassId` of the **immediate** component type. For `[Ljava/util/HashMap;`
+    /// this is the id of `java/util/HashMap`. For `[[I` this is the id of
+    /// the inner array class `[I`. For primitive arrays such as `[I` this
+    /// is the id of the primitive pseudo-class (`int`, `long`, …).
+    pub component_class_id: ClassId,
+
+    /// Total number of `[` prefixes in the array's binary name. For `[I`
+    /// this is `1`; for `[[I` and `[[Ljava/util/HashMap;` this is `2`; etc.
+    pub array_dimension: u8,
+
+    /// Internal name of the **leaf** component (the inner-most non-array
+    /// type). For `[Ljava/util/HashMap;` this is `java/util/HashMap`; for
+    /// `[[I` this is `int`. Cached so callers do not have to re-walk the
+    /// `[` chain.
+    pub leaf_component_name: Arc<str>,
 }
 
 /// A resolved record component (from the Record attribute, Java 16+).
@@ -843,6 +877,7 @@ mod tests {
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         }
     }
 

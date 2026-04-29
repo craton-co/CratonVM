@@ -91,26 +91,32 @@ fn build_service_loader(
 }
 
 /// Read provider FQNs for `sl.service` from every
-/// `META-INF/services/<fqcn>` resource on the classpath.
+/// `META-INF/services/<fqcn>` resource visible on the classpath.
+/// Each line in each resource file contributes one provider name.
 ///
-/// **Pre-WP1.8 behaviour** (kept here for context): this routine fetched
-/// the thread context class loader, called `ClassLoader.getResources` to
-/// get a `Enumeration<URL>`, and then walked each `URL.openStream` ->
-/// `InputStreamReader` -> `BufferedReader.readLine` chain. In real-JDK
-/// mode that chain hit `NoSuchMethodError`s on `Thread.getContextClassLoader`
-/// and `ArrayList.iterator` because several of the JDK class
-/// `<clinit>`s on the path (`URLClassPath`, the loader chain) NPE before
-/// completing — leaving `getResources` to silently return empty and
-/// downstream methods unresolvable.
+/// WP1.8-narrow (session 94): the original implementation drove the
+/// JDK chain `ClassLoader.getResources(String) -> Enumeration<URL> ->
+/// URL.openStream() -> InputStreamReader.<init> -> BufferedReader.
+/// <init>(Reader) -> readLine()`. That chain depends on synthetic-stub
+/// surface (`URL.openStream`, `BufferedReader` constructor + readLine)
+/// that is incomplete in the open-sourced revision and surfaces as
+/// `NoSuchMethodError` at bytecode resolution before the proper natives
+/// are reached. The WP7.1 commit (`245e996`) confirms this and works
+/// around the gap in `jdbc.rs::collect_driver_providers` by walking the
+/// classpath directly.
 ///
-/// **WP1.8 fix** — bypass the JDK entirely. We resolve the service's
-/// binary name through the VM's class registry (`class_id_from_mirror`
-/// + `class_name_of_id`, with a synthetic-mode fallback to
-/// `Class.getName()`) and then enumerate descriptor bytes via
-/// [`NativeContext::find_all_resource_bytes`], which already walks every
-/// classpath flavour (directory / JAR / nested JAR / JMOD / jimage) on
-/// the Rust side. Each descriptor is parsed line-by-line directly from
-/// its bytes, so no JDK I/O classes are touched.
+/// **Hybrid resolution (session 94 merge):** the WP1.8-narrow approach
+/// (parsing `find_all_resource_urls` URL strings inline) and the
+/// Wave 8 closure approach (a layered `find_all_resource_bytes` helper
+/// across `ClassPath` / `ClassManager` / `NativeContext` / `Vm`) target
+/// the same goal. The hybrid keeps WP1.8-narrow's structure and tests
+/// but routes byte fetching through the layered helper — the URL-string
+/// detour and the inline `read_resource_bytes` jar-cracker disappear,
+/// leaving classpath-flavour handling owned by `class_path.rs` where
+/// every classpath consumer (jdbc, here, anywhere else later) sees a
+/// uniform implementation. Functionally identical to the prior
+/// implementation when the JDK chain works (lex-sorted, dedup'd FQNs
+/// from every classpath match); strictly more robust when it doesn't.
 fn discover_providers(
     ctx: &mut dyn NativeContext,
     sl: rustjvm_types::ObjectRef,
@@ -126,33 +132,41 @@ fn discover_providers(
             }
         },
     };
-
-    // Resolve the service's binary name without round-tripping through
-    // `Class.getName()`. Real-JDK mode breaks that path during early
-    // bootstrap (URLClassPath clinit NPE leaves
-    // `Thread.getContextClassLoader` resolving to NoSuchMethodError).
-    let service_name = service_class_name(ctx, service_class).unwrap_or_default();
+    let service_name_val = ctx.invoke(
+        "java/lang/Class",
+        "getName",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(service_class))],
+    )?;
+    let service_name = match service_name_val {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
     if service_name.is_empty() {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
-            message: "ServiceLoader: cannot resolve service class name".to_string(),
+            message: "ServiceLoader: service.getName() returned null".to_string(),
         }));
     }
-    let resource_name = format!("META-INF/services/{}", service_name);
+    let resource = format!("META-INF/services/{}", service_name);
 
-    // Rust-side classpath scan — see the function-level doc above.
+    // Fetch every classpath match's bytes in one call. The layered
+    // `find_all_resource_bytes` helper walks Directory / JarFile /
+    // NestedJar / JmodFile / JImageFile entries; classpath-flavour
+    // handling lives in `class_path.rs` so we do not need a local
+    // jar-cracker here.
     let mut providers: Vec<String> = Vec::new();
-    let descriptors = ctx.find_all_resource_bytes(&resource_name);
+    let descriptors = ctx.find_all_resource_bytes(&resource);
     for bytes in &descriptors {
-        parse_provider_descriptor(bytes, &mut providers);
+        parse_provider_lines(bytes, &mut providers);
     }
 
-    // Fall back to the single-resource lookup if `find_all_resource_bytes`
-    // returned nothing. This covers test mocks (which inherit the empty
-    // default impl) and `ctx.find_resource(name)` paths that succeed when
-    // the classpath enumeration would otherwise miss the entry.
+    // Test mocks may stub `find_resource` without populating the
+    // bytes list (the trait's default `find_all_resource_bytes` impl
+    // returns empty); honour the single-resource fallback so a
+    // fixture pointing at one descriptor still walks.
     if descriptors.is_empty() {
-        if let Some(bytes) = ctx.find_resource(&resource_name) {
-            parse_provider_descriptor(&bytes, &mut providers);
+        if let Some(bytes) = ctx.find_resource(&resource) {
+            parse_provider_lines(&bytes, &mut providers);
         }
     }
 
@@ -161,50 +175,19 @@ fn discover_providers(
     Ok(providers)
 }
 
-/// Resolve the binary name (`com.acme.Foo` form) of a `java.lang.Class`
-/// mirror without invoking `Class.getName()`. Returns `None` if neither
-/// the mirror lookup nor the fallback `Class.getName()` invocation
-/// succeeds.
-fn service_class_name(
-    ctx: &mut dyn NativeContext,
-    service_class: rustjvm_types::ObjectRef,
-) -> Option<String> {
-    if let Some(cid) = ctx.class_id_from_mirror(service_class) {
-        if let Some(internal) = ctx.class_name_of_id(cid) {
-            return Some(internal.replace('/', "."));
-        }
-    }
-    // Synthetic-mode fallback — `Class.getName()` works there even though
-    // it breaks in real-JDK mode pre-WP1.5 fixes.
-    let name_val = ctx
-        .invoke(
-            "java/lang/Class",
-            "getName",
-            "()Ljava/lang/String;",
-            &[Value::Object(Some(service_class))],
-        )
-        .ok()
-        .flatten();
-    if let Some(Value::Object(Some(s))) = name_val {
-        return ctx.read_string(s);
-    }
-    None
-}
-
-/// Parse a `META-INF/services/<svc>` descriptor's raw bytes and append
-/// every legal provider FQN to `out`. Comments (`#`-prefix) and blank
-/// lines are ignored. Invalid characters cause the line to be dropped
-/// (matching the JDK's tolerant parser — bad lines become a load-time
-/// `ServiceConfigurationError` only when the iterator hits them, but our
-/// strategy is to skip them at scan time).
-fn parse_provider_descriptor(bytes: &[u8], out: &mut Vec<String>) {
-    let text = String::from_utf8_lossy(bytes);
-    for line in text.lines() {
-        if let Some(token) = line.split('#').next() {
-            let trimmed = token.trim();
-            if !trimmed.is_empty() && is_valid_provider_name(trimmed) {
-                out.push(trimmed.to_string());
-            }
+/// Tokenize a `META-INF/services/<spi>` descriptor. Each non-comment,
+/// non-blank line is a provider FQN; everything after `#` on a line is
+/// a comment. Mirrors `is_valid_provider_name`'s validation so callers
+/// that reuse the parsed list don't need to re-filter.
+fn parse_provider_lines(bytes: &[u8], out: &mut Vec<String>) {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for raw in text.lines() {
+        let token = raw.split('#').next().unwrap_or("").trim();
+        if !token.is_empty() && is_valid_provider_name(token) {
+            out.push(token.to_string());
         }
     }
 }
@@ -446,5 +429,30 @@ mod tests {
         let raw = "com.acme.Foo  # comment";
         let token = raw.split('#').next().unwrap().trim();
         assert_eq!(token, "com.acme.Foo");
+    }
+
+    /// WP1.8-narrow: the descriptor parser strips comments and blanks,
+    /// rejects malformed lines, and returns valid FQNs unchanged. This
+    /// is the load-bearing parser the iterator now uses (replacing the
+    /// JDK BufferedReader chain that the open-sourced revision can't
+    /// drive end-to-end).
+    #[test]
+    fn parse_provider_lines_handles_comments_blanks_and_junk() {
+        let body = b"# header comment\n  com.acme.A  \n\ncom.acme.B # trailing\nfoo bar\n!bad\nGood$Inner\n";
+        let mut out = Vec::new();
+        parse_provider_lines(body, &mut out);
+        assert_eq!(out, vec!["com.acme.A", "com.acme.B", "Good$Inner"]);
+    }
+
+    /// WP1.8-narrow: invalid UTF-8 bytes do not panic the parser; they
+    /// are silently dropped. ServiceLoader descriptors are spec'd as
+    /// UTF-8 but a malformed JAR shouldn't kill discovery for the rest
+    /// of the classpath.
+    #[test]
+    fn parse_provider_lines_silently_drops_non_utf8() {
+        let body: &[u8] = &[0xff, 0xfe, b'\n'];
+        let mut out = Vec::new();
+        parse_provider_lines(body, &mut out);
+        assert!(out.is_empty());
     }
 }

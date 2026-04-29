@@ -1,4 +1,4 @@
-//! WP2.10 — Class.getNestHost / Class.getNestMembers / Class.isHidden
+//! WP2.10 вЂ” Class.getNestHost / Class.getNestMembers / Class.isHidden
 //! conformance tests for `java.lang.Class` nest-mate accounting.
 //!
 //! Verifies the classloading-side data plumbing:
@@ -35,7 +35,7 @@ fn workspace_root() -> PathBuf {
 
 #[test]
 fn class_default_nest_host_is_none() {
-    // A freshly-constructed Class struct has no NestHost attribute → nest_host
+    // A freshly-constructed Class struct has no NestHost attribute в†’ nest_host
     // should be None, indicating "this class is its own nest host".
     let c = make_minimal_class("foo/Bar", ClassId::new(1));
     assert!(
@@ -72,7 +72,7 @@ fn class_manager_load_populates_nest_host_when_present() {
         .join("nesthost_probe")
         .join("classes");
     if !probe_dir.exists() {
-        eprintln!("nesthost_probe/classes not staged — skipping");
+        eprintln!("nesthost_probe/classes not staged вЂ” skipping");
         return;
     }
 
@@ -114,7 +114,7 @@ fn class_manager_outer_class_lists_nest_members() {
         .join("nesthost_probe")
         .join("classes");
     if !probe_dir.exists() {
-        eprintln!("nesthost_probe/classes not staged — skipping");
+        eprintln!("nesthost_probe/classes not staged вЂ” skipping");
         return;
     }
 
@@ -138,7 +138,7 @@ fn class_manager_outer_class_lists_nest_members() {
     // exists.
     if cls.nest_members.is_empty() {
         eprintln!(
-            "NestHostProbe has no NestMembers — javac may have suppressed it; \
+            "NestHostProbe has no NestMembers вЂ” javac may have suppressed it; \
              skipping member-content assertion"
         );
         return;
@@ -166,7 +166,7 @@ fn anonymous_class_nest_host_resolves_to_enclosing() {
         .join("classes");
     let anon = probe_dir.join("NestHostProbe$1.class");
     if !anon.exists() {
-        eprintln!("nesthost_probe/NestHostProbe$1.class not staged — skipping");
+        eprintln!("nesthost_probe/NestHostProbe$1.class not staged вЂ” skipping");
         return;
     }
 
@@ -247,5 +247,6 @@ fn make_minimal_class(name: &str, id: ClassId) -> Class {
         is_synthetic_stub: false,
         has_finalizer: false,
         code_source: None,
+        array_info: None,
     }
 }

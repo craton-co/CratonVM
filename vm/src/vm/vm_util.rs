@@ -12,15 +12,15 @@ use super::SharedVm;
 // Free functions: class initialization
 // ---------------------------------------------------------------------------
 
-/// Ensure a class is fully initialized (JVM spec §5.5).
+/// Ensure a class is fully initialized (JVM spec В§5.5).
 ///
 /// Handles three cases:
-/// 1. Already `Initialized` → return immediately.
-/// 2. `Initializing` by the **same** thread → return immediately (re-entrancy).
-/// 3. `Initializing` by a **different** thread → block until it finishes,
+/// 1. Already `Initialized` в†’ return immediately.
+/// 2. `Initializing` by the **same** thread в†’ return immediately (re-entrancy).
+/// 3. `Initializing` by a **different** thread в†’ block until it finishes,
 ///    then check the final state.
-/// 4. `InitializationError` → return `NoClassDefFoundError`.
-/// 5. Any other state → run the full initialization sequence.
+/// 4. `InitializationError` в†’ return `NoClassDefFoundError`.
+/// 5. Any other state в†’ run the full initialization sequence.
 pub fn ensure_class_initialized_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -56,13 +56,13 @@ pub fn ensure_class_initialized_shared(
             ClassState::Initializing => {
                 if init_thread == Some(current_thread_id) {
                     // Re-entrant: this thread is already initializing this class.
-                    // JVM spec §5.5 step 2: "If C is being initialized by the
+                    // JVM spec В§5.5 step 2: "If C is being initialized by the
                     // current thread, then this must be a recursive request for
                     // initialization. Release LC and complete normally."
                     return Ok(());
                 }
-                // Another thread is initializing this class — wait for it.
-                // JVM spec §5.5 step 2: "If C is being initialized by some
+                // Another thread is initializing this class вЂ” wait for it.
+                // JVM spec В§5.5 step 2: "If C is being initialized by some
                 // other thread, then release LC and block the current thread
                 // until informed that the in-progress initialization has
                 // completed."
@@ -81,7 +81,7 @@ pub fn ensure_class_initialized_shared(
                     // Loop back to re-check state (might be Initialized or Error)
                     continue;
                 }
-                // No waiter entry — init may have completed between our checks
+                // No waiter entry вЂ” init may have completed between our checks
                 continue;
             }
 
@@ -140,7 +140,7 @@ pub fn ensure_class_initialized_shared(
                 if claimed {
                     return initialize_class_shared(shared, thread, class_id);
                 }
-                // Another thread claimed it — loop back to wait
+                // Another thread claimed it вЂ” loop back to wait
                 continue;
             }
         }
@@ -174,8 +174,8 @@ fn initialize_class_shared(
     }
     // Run verification with read lock (unless -noverify).
     //
-    // JVMS §5.4.1 requires verification before linking. We always run Pass 2
-    // (structural verification — access flag conflicts, final-class/method
+    // JVMS В§5.4.1 requires verification before linking. We always run Pass 2
+    // (structural verification вЂ” access flag conflicts, final-class/method
     // constraints, abstract-method implementation, Code attribute presence),
     // which is cheap and well-tested on both synthetic and real .class files.
     //
@@ -199,18 +199,18 @@ fn initialize_class_shared(
                     || class.name.starts_with("com/sun/");
                 if !is_jdk_class {
                     let hierarchy = ClassStoreHierarchy { store };
-                    // Pass 2 — structural verification.
+                    // Pass 2 вЂ” structural verification.
                     let structural =
                         crate::classloading::verifier::verify_class_structure(class, store);
-                    // Pass 3 — bytecode type-checking, lenient mode.
+                    // Pass 3 вЂ” bytecode type-checking, lenient mode.
                     // F3: route through `verify_class_bytecode` (JSR-aware)
                     // instead of `bytecode_verifier::verify_bytecode` so
                     // pre-Java-7 classes with `jsr`/`ret` subroutines
                     // (e.g. ByteBuddy 1.12 targeting Java 5) are not
                     // rejected by the worklist's two-`ReturnAddress`
-                    // merge → Top false positive. See
+                    // merge в†’ Top false positive. See
                     // `classloading/src/verifier.rs` module docs for
-                    // the JVMS §4.10.2.5 background.
+                    // the JVMS В§4.10.2.5 background.
                     let bytecode = structural.and_then(|()| {
                         crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
                     });
@@ -254,7 +254,7 @@ fn initialize_class_shared(
     }
 
     // Step 3.5: Initialize directly-implemented interfaces that declare
-    // non-constant static fields (JVM spec §5.5 step 7).
+    // non-constant static fields (JVM spec В§5.5 step 7).
     {
         let iface_ids: Vec<ClassId> = shared
             .class_manager
@@ -339,7 +339,7 @@ fn initialize_class_shared(
         }
     }
 
-    // Check if <clinit> exists (read lock only) — also check native registry
+    // Check if <clinit> exists (read lock only) вЂ” also check native registry
     // because synthetic stubs have no bytecode methods but may have native <clinit>.
     let has_clinit = {
         let in_class = shared
@@ -368,7 +368,7 @@ fn initialize_class_shared(
         crate::native::builtins::aot::aot_record_class_loaded(&class_name_for_jfr);
     }
 
-    // Helper: finalize initialization — set final state, clear tracking,
+    // Helper: finalize initialization вЂ” set final state, clear tracking,
     // remove waiter entry, and notify all waiting threads.
     let finalize_init = |shared: &SharedVm, class_id: ClassId, new_state: ClassState| {
         {
@@ -545,7 +545,7 @@ fn initialize_class_shared(
                     return Ok(());
                 }
                 finalize_init(shared, class_id, ClassState::InitializationError);
-                // JVM spec §5.5: If the exception is an Error (or subclass),
+                // JVM spec В§5.5: If the exception is an Error (or subclass),
                 // propagate as-is. Otherwise, wrap in ExceptionInInitializerError.
                 match &e {
                     MethodCallFailed::ExceptionThrown(exc_ref) => {
@@ -565,7 +565,7 @@ fn initialize_class_shared(
                             // Log the root cause for diagnostics. Read the
                             // detailMessage field (slot 0 on Throwable) so the
                             // operator can see WHICH field/argument was null
-                            // — required to triage real-app `<clinit>` NPEs
+                            // вЂ” required to triage real-app `<clinit>` NPEs
                             // (e.g. KC26 `org/keycloak/common/Version`) where
                             // the bare class+cause pair gives no actionable
                             // signal. Read failure (e.g. stale ref or layout
@@ -584,7 +584,7 @@ fn initialize_class_shared(
                                     class = %class_name_for_jfr,
                                     cause = %cause_class,
                                     message = %cause_msg,
-                                    "<clinit> failed — wrapping in ExceptionInInitializerError"
+                                    "<clinit> failed вЂ” wrapping in ExceptionInInitializerError"
                                 );
                             }
                             match crate::runtime::exceptions::create_exception_object(
@@ -640,7 +640,7 @@ fn initialize_class_shared(
             }
         }
     } else {
-        // No <clinit> — class is fully initialized
+        // No <clinit> вЂ” class is fully initialized
         finalize_init(shared, class_id, ClassState::Initialized);
         // Record JFR class load event
         let now_ns = std::time::SystemTime::now()
@@ -657,15 +657,15 @@ fn initialize_class_shared(
 }
 
 /// Prepare a class: allocate static fields with default values, then apply
-/// `ConstantValue` attributes (JVMS §5.5 step 9 — must run before `<clinit>`
+/// `ConstantValue` attributes (JVMS В§5.5 step 9 вЂ” must run before `<clinit>`
 /// so compile-time constants are visible to the static initializer).
 ///
-/// Supported constant pool entry types per JVMS §4.7.2:
-/// - `Integer` → byte/char/short/int/boolean primitive slot
-/// - `Float`   → float slot
-/// - `Long`    → long slot
-/// - `Double`  → double slot
-/// - `String`  → resolves the Utf8, allocates a Java String via the VM's
+/// Supported constant pool entry types per JVMS В§4.7.2:
+/// - `Integer` в†’ byte/char/short/int/boolean primitive slot
+/// - `Float`   в†’ float slot
+/// - `Long`    в†’ long slot
+/// - `Double`  в†’ double slot
+/// - `String`  в†’ resolves the Utf8, allocates a Java String via the VM's
 ///   string pool, and stores the reference in the slot.
 fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmError> {
     use rustjvm_reader::constant_pool::ConstantPoolEntry;
@@ -764,7 +764,7 @@ pub fn resolve_constant_value(
 }
 
 // ---------------------------------------------------------------------------
-// ClassStoreHierarchy — adapter for the bytecode verifier
+// ClassStoreHierarchy вЂ” adapter for the bytecode verifier
 // ---------------------------------------------------------------------------
 
 /// Adapter that implements [`ClassHierarchy`] using the VM's [`ClassStore`].
@@ -805,7 +805,7 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
             current = sup;
         }
 
-        // If either class is not loaded, be optimistic — the compiler guarantees
+        // If either class is not loaded, be optimistic вЂ” the compiler guarantees
         // type safety, and the verifier can't prove otherwise without full class loading.
         // This handles: exception handler types, JAR classes not yet loaded, etc.
         if child_class.is_none() || parent_class.is_none() {
@@ -904,7 +904,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // holds a static INSTANCE:ModeImpl whose `normalizer2` field is
             // read by NormalizerBase$<Form>Mode.getNormalizer2().  If INSTANCE
             // is null, downstream getfield throws NPE.  Populate it with a
-            // ModeImpl wrapping Norm2AllModes$NoopNormalizer2 — a concrete
+            // ModeImpl wrapping Norm2AllModes$NoopNormalizer2 вЂ” a concrete
             // Normalizer2 subclass present in the JDK that passes strings
             // through unchanged.  KC16 bootstrap never actually normalizes
             // real Unicode, so the pass-through behavior is sufficient.
@@ -937,7 +937,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             } else {
                 tracing::warn!(
                     class = %class_name,
-                    "Post-clinit fixup: cannot populate INSTANCE — ModeImpl or NoopNormalizer2 not loaded"
+                    "Post-clinit fixup: cannot populate INSTANCE вЂ” ModeImpl or NoopNormalizer2 not loaded"
                 );
             }
         }
@@ -961,7 +961,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             //
             // Populate FORM with a minimally-initialized VarForm stub.  The
             // VarForm instance fields (implClass, methodType_table,
-            // memberName_table, methodType_V_table) are left as defaults —
+            // memberName_table, methodType_V_table) are left as defaults вЂ”
             // they are consulted only by full VarHandle invocation, which
             // we intercept natively in lang_invoke.rs anyway.  Downstream
             // code only needs FORM to be non-null so that ordinary
@@ -985,12 +985,12 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             } else {
                 tracing::warn!(
                     class = %class_name,
-                    "Post-clinit fixup: cannot populate FORM — VarForm class not loaded"
+                    "Post-clinit fixup: cannot populate FORM вЂ” VarForm class not loaded"
                 );
             }
         }
         "io/quarkus/bootstrap/logging/InitialConfigurator" => {
-            // DELAYED_HANDLER must be non-null — QuarkusEntryPoint.main() reads it.
+            // DELAYED_HANDLER must be non-null вЂ” QuarkusEntryPoint.main() reads it.
             // Allocate a synthetic QuarkusDelayedHandler.
             let handler_class_name = "io/quarkus/bootstrap/logging/QuarkusDelayedHandler";
             let handler_id = {
@@ -1004,7 +1004,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     }
                 }
             } else {
-                // Class not yet loaded — allocate a generic Handler stub
+                // Class not yet loaded вЂ” allocate a generic Handler stub
                 if let Some(handler) = shared.heap.try_alloc_object(class_id, 4) {
                     if set_static_by_name("DELAYED_HANDLER", Value::Object(Some(handler))) {
                         tracing::warn!("Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated (generic)");
@@ -1274,7 +1274,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // prepare_class_shared — ConstantValue initialization (JVMS §5.5 step 9)
+    // prepare_class_shared вЂ” ConstantValue initialization (JVMS В§5.5 step 9)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1324,7 +1324,7 @@ mod tests {
             make_static_field("L_CONST", "J", 3),
             make_static_field("D_CONST", "D", 5),
             make_static_field("S_CONST", "Ljava/lang/String;", 8),
-            // Plain static field (no ConstantValue) — must keep its
+            // Plain static field (no ConstantValue) вЂ” must keep its
             // descriptor-derived default after prepare runs.
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC,
@@ -1368,6 +1368,7 @@ mod tests {
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
+                array_info: None,
             });
             id
         };
@@ -1399,7 +1400,7 @@ mod tests {
         }
 
         // PLAIN_LONG: no ConstantValue attribute, must remain Long(0) (zero
-        // default for a J descriptor) — not Object(None) and not Int(0).
+        // default for a J descriptor) вЂ” not Object(None) and not Int(0).
         assert_eq!(slots[5], Value::Long(0), "PLAIN_LONG default");
     }
 }
