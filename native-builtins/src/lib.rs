@@ -1470,6 +1470,27 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "getNestHost0", "()Ljava/lang/Class;", lang_class::native_class_get_nest_host);
     registry.register("java/lang/Class", "getNestMembers0", "()[Ljava/lang/Class;", lang_class::native_class_get_nest_members);
     registry.register("java/lang/Class", "getPermittedSubclasses0", "()[Ljava/lang/Class;", lang_class::native_class_get_permitted_subclasses);
+    // WP2.1-class-modern — `Class.getAnnotatedSuperclass()` /
+    // `getAnnotatedInterfaces()`. Real-JDK impl is pure Java but reads
+    // `getRawTypeAnnotations()` (a native we already provide) and parses
+    // it into `AnnotatedType` instances; in synthetic-JDK mode the Java
+    // pipeline isn't available, so we surface a minimal-but-non-null
+    // synthetic `AnnotatedType` (see `make_annotated_type`). Registered
+    // unconditionally so frameworks that probe the methods (ByteBuddy,
+    // Hibernate ORM record/sealed scanners) get a non-throwing surface
+    // in either mode.
+    registry.register(
+        "java/lang/Class",
+        "getAnnotatedSuperclass",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_class_get_annotated_superclass,
+    );
+    registry.register(
+        "java/lang/Class",
+        "getAnnotatedInterfaces",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_class_get_annotated_interfaces,
+    );
     registry.register("java/lang/Class", "getClassFileVersion0", "()I", lang_class::native_class_get_class_file_version);
     registry.register("java/lang/Class", "getClassAccessFlagsRaw0", "()I", lang_class::native_class_get_modifiers);
     // T19.N1: Class security natives — expose the CodeSource installed at
@@ -23572,29 +23593,42 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_class_get_type_name,
     );
+    // WP2.1-class-modern: route the public `getEnclosing*` accessors to
+    // their real impls in `lang_reflect`. Previously these were
+    // `native_return_null` — fine for "doesn't crash" but breaks
+    // ByteBuddy / Hibernate scanners that rely on
+    // `Inner.class.getEnclosingClass() == Outer.class`.
+    // The proper natives consult the InnerClasses / EnclosingMethod
+    // attributes via `NativeContext::inner_classes` / `enclosing_method`
+    // (see `native_class_get_enclosing_class` in lang_reflect.rs:205).
+    //
+    // `register_wp2_1_natives` (called inside `register_essential_natives`)
+    // installs these earlier; the assignments here would clobber them
+    // back to null-stubs because `register_synthetic_overrides` runs
+    // *after* essential. Keep both consistent.
     registry.register(
         c,
         "getEnclosingClass",
         "()Ljava/lang/Class;",
-        native_return_null,
+        lang_reflect::native_class_get_enclosing_class,
     );
     registry.register(
         c,
         "getEnclosingMethod",
         "()Ljava/lang/reflect/Method;",
-        native_return_null,
+        lang_reflect::native_class_get_enclosing_method_public,
     );
     registry.register(
         c,
         "getEnclosingConstructor",
         "()Ljava/lang/reflect/Constructor;",
-        native_return_null,
+        lang_reflect::native_class_get_enclosing_constructor_public,
     );
     registry.register(
         c,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
-        native_return_null,
+        lang_class::native_class_get_declaring_class,
     );
     registry.register(
         c,
