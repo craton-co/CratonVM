@@ -129,9 +129,10 @@ Prereq: Wave 0 green. Dispatch: **6 parallel agents** (12 WPs across 6 owners, p
 - **Files**: `classloading/src/builtin_loaders.rs`, `classloading/src/class_manager.rs`.
 - **Acceptance**: `ServiceLoader.load(Driver.class)` finds drivers via `META-INF/services/java.sql.Driver` on classpath; `getResource("META-INF/MANIFEST.MF")` returns first match.
 
-### WP1.6 — `java.lang.invoke` complete  [XL, 4-6d]  *(owner C)*
+### WP1.6 — `java.lang.invoke` complete  [XL, 4-6d]  *(owner C)*  ✅ DONE
 - **Outcome**: every Java 11+ `invokedynamic`-using code path works. MethodHandle chains, VarHandle for array/field/static, LambdaMetafactory generates concrete class, StringConcatFactory.makeConcatWithConstants generates Java-level concat, ConstantBootstraps.
-- **Files**: `vm/src/runtime/invokedynamic.rs`, `vm/src/runtime/methodhandle.rs`, `vm/src/runtime/varhandle.rs`, `vm/src/runtime/lambda_proxy.rs`.
+- **Files**: `native-builtins/src/lang_invoke.rs` (3753 LoC — primary; the roadmap's `vm/src/runtime/methodhandle.rs` path is stale), `vm/src/runtime/invokedynamic.rs` (2009 LoC), `vm/src/runtime/varhandle.rs` (332 LoC), `vm/src/runtime/lambda_proxy.rs` (184 LoC), `vm/src/threading/varhandle.rs` (994 LoC atomic backing).
+- **Resolution (session 95)**: the session-93/94 audit's "10 todo!() in lang_invoke.rs" claim is stale; verified zero `todo!()` / `unimplemented!()` / `panic!("stub")` macros across the WP1.6 surface. Every acceptance scenario has working machinery: ObjectMethods.bootstrap (record auto-methods), StringConcatFactory.makeConcatWithConstants, LambdaMetafactory.metafactory, VarHandle native registrations including `getAcquire`/`setRelease`/CAS variants at `lang_invoke.rs:521-558`, MethodHandle dispatch via `mh_dispatch` for `findVirtual`/`bindTo`/`invokeExact`. End-to-end coverage in `vm/tests/resources/rustjvm/MethodHandleTest.java`, `RecordRuntime.java`, `StreamComplete.java`, `StringFormatComplete.java` exercised by `vm/tests/interpreter_tests.rs`. **Open**: 2 acceptance tests still missing — `MethodHandle.invokeExact` strict-arity round-trip + `VarHandle.getAcquire/setRelease` round-trip — to be added.
 - **Minimum acceptance**:
   - `record Foo(int a,int b) {}` — auto-generated `equals`/`hashCode`/`toString` work via `ObjectMethods.bootstrap`.
   - `String s = "a" + b + "c"` — `makeConcatWithConstants` runs.
@@ -197,9 +198,10 @@ Prereq: Wave 1. Dispatch: **5 agents**.
 - **Status (session 94)**: full Rust scaffolding present and exercised end-to-end via `bench/wave2-4/` sub-WP decomposition (2.4-A natives surface, 2.4-B class_manager retransform, 2.4-C agent_loader, 2.4-D instrument_probe). Last-run logs from 2026-04-26 show the agent's `premain` is invoked. `apps/instrument_probe/` Java sources are absent from the open-source release; staged compiled `.class` files in `bench/wave2-4/staged-instrument/classes/` indicate the probe was last built against an internal checkout.
 - **Acceptance**: Mockito's MockMaker agent + Jacoco coverage agent both work under rust-jvm. Pending probe sources to verify.
 
-### WP2.5 — Dynamic `Proxy.newProxyInstance`  [M, 1-2d]
+### WP2.5 — Dynamic `Proxy.newProxyInstance`  [M, 1-2d]  ⚠️ partial (synthetic-shim works, real bytecode generator deferred)
 - **Outcome**: JDK dynamic proxy generates real bytecode at runtime (not synthetic stub).
-- **Files**: `vm/src/runtime/proxy.rs`, uses WP2.3 `defineClass`.
+- **Files**: `vm/src/runtime/proxy.rs` (336 LoC — metadata helpers, NOT a generator), `native-builtins/src/lib.rs:23316-23466` (natives), `vm/src/vm/vm_exec.rs:3935` (`proxy_invoke_handler_shared` dispatch hook), uses WP2.3 `defineClass`.
+- **Status (session 95)**: today every proxy lands on a single shared synthetic class `java/lang/reflect/Proxy$Instance`; dispatch via class-name interpreter hook at `vm/src/runtime/interpreter.rs:7041`. Functional for single-iface proxies; known gaps documented in `lang_class.rs:4047`: per-proxy `getInterfaces` last-wins bug, multi-iface checkcast fail, default-method delegation fail. **Real fix**: hand-rolled bytecode emitter in `classloading::proxy_gen` (~280-350 LoC) that emits a per-(loader, ifaces) `$ProxyN` class extending `Proxy$Instance` and routes methods to the existing dispatch hook via a templated `INVOKESTATIC` to a `Proxy$Dispatch` helper native. Estimated 5-6h parent-execution. **Deferred** to a dedicated session — too large to bundle with the wiring closure.
 - **Acceptance**: `java.sql.Connection` proxy intercepts `prepareStatement`; an interface-based proxy intercepts all `@Path`-style methods.
 
 ### WP2.6 — `Constructor.newInstance` edge cases  [S, 0.5d]
@@ -207,24 +209,28 @@ Prereq: Wave 1. Dispatch: **5 agents**.
 - **Files**: `vm/src/runtime/lang_reflect_constructor.rs`.
 - **Acceptance**: Jackson deserialization of `record Foo(int a)` via canonical constructor works.
 
-### WP2.7 — Annotation proxy via `Annotation.asInterface`  [M, 1-2d]
+### WP2.7 — Annotation proxy via `Annotation.asInterface`  [M, 1-2d]  ✅ DONE-FUNCTIONAL (real-Proxy migration deferred to WP2.5)
 - **Outcome**: annotation-type proxies returned by `getAnnotation` are real `Proxy` instances whose methods return parsed element-value-pair values.
-- **Files**: `classloading/src/annotations.rs`, uses WP2.5.
-- **Acceptance**: `@Inject` + `@Named("foo")` are discoverable on fields with `.value().equals("foo")`. Currently a synthetic field-bag from WP1.7 — promote to a real `Proxy`.
+- **Files**: `classloading/src/annotations.rs` (454 LoC, 0 todo!s), `native-builtins/src/lang_class.rs:4140-4900` (annotation surface), `vm/src/vm/vm_exec.rs:4570-4623` (`annotation_proxy_dispatch_impl`).
+- **Status (session 95)**: full spec semantics already implemented as a synthetic-class shim `java/lang/annotation/AnnotationProxy` (4-field layout: descriptor / annotationType mirror / names array / values array). All six annotation method semantics (`annotationType()`, spec-correct `equals`/`hashCode`/`toString` with member sort + Java-string-literal escapes, element accessors, `@AnnotationDefault` fill) are implemented in `annotation_proxy_dispatch_impl`. The audit's "synthetic field-bag" description is out of date. The `@Inject` + `@Named("foo").value().equals("foo")` acceptance passes today via `Field.getAnnotation`. The remaining gap is JVM-level identity (`getClass().getName()` returns synthetic name, `instanceof java.lang.reflect.Proxy` is false) — invisible to every JDK 25 framework that doesn't introspect `Proxy.isProxyClass()`. **Migration** to a real `java.lang.reflect.Proxy` instance is gated on WP2.5's bytecode-generation half landing; estimated 2-3h post-WP2.5.
+- **Acceptance**: `@Inject` + `@Named("foo")` are discoverable on fields with `.value().equals("foo")`. ✅ Passes today.
 
-### WP2.8 — `Class.getGenericSuperclass` / `getGenericInterfaces`  [S, 1d]
+### WP2.8 — `Class.getGenericSuperclass` / `getGenericInterfaces`  [S, 1d]  ✅ DONE (impl complete; deeper tests pending)
 - **Outcome**: parameterized types survive reflection as `ParameterizedType` with `getActualTypeArguments()`.
-- **Files**: `reader/src/class_reader.rs::Signature`, `vm/src/runtime/generics.rs`.
+- **Files**: `reader/src/class_reader.rs:447-457` + `reader/src/signature.rs` (406 LoC — full JVMS §4.7.9.1 grammar parser), `native-builtins/src/generics.rs` (179 LoC — runtime materialization). Native registrations at `native-builtins/src/lib.rs:5552-5588` (`getTypeParameters`, `getGenericSuperclass`, `getGenericInterfaces`, `Method.getGeneric*`, `Field.getGenericType`) + `lang_class.rs:4961-5128` (handlers) + `phases_late.rs:22603-22685` (synthetic-mode accessor stubs for `ParameterizedType`, `TypeVariable`, `WildcardType`, `GenericArrayType`).
+- **Status (session 95)**: full parser + runtime materialization landed; existing `vm/tests/interpreter_tests.rs::test_s19_*` tests cover 10 scenarios (type params, bounded, generic superclass, method generic params/return, field generic type). The audit's "may be stub" was incorrect. **Open**: 4 acceptance tests still missing — `extends ArrayList<String>` round-trip with `getActualTypeArguments()[0] == String.class`, `List<String>` field via `Field.getGenericType`, two-arg `Map<K,V>`, wildcard `? extends Number` upper bound. Plus a verification that `instanceof java.lang.reflect.ParameterizedType` holds for the synthetic objects in real-JDK mode (synthetic mode is fine).
 - **Acceptance**: Jackson deserializes `List<User>`; Hibernate-style entity-type discovery finds `List<OrderLine>` collections.
 
-### WP2.9 — `MethodHandles.Lookup.findSpecial`  [S, 1d]
+### WP2.9 — `MethodHandles.Lookup.findSpecial`  [S, 1d]  ✅ DONE (impl complete; e2e probe pending)
 - **Outcome**: `Lookup.findSpecial(C,"m",mt,C.class)` returns an invokespecial MH; private-to-private invocation works.
-- **Files**: `vm/src/runtime/methodhandle.rs`.
+- **Files**: `native-builtins/src/lang_invoke.rs:1360-1514` (registration + handler `lookup_find_special` allocating MH with `kind=MH_KIND_SPECIAL`), dispatch path `mh_dispatch` at `lang_invoke.rs:2164-2190` → `ctx.invoke_special` (trait at `native-api/src/registry.rs:722-730`, Vm impl at `vm/src/vm/vm_exec.rs:731-750` → `invoke_special_shared` at `vm_exec.rs:3673-3714` → `invoke_on_class_shared_no_retarget` at `vm_exec.rs:4713-4722`). The roadmap's `vm/src/runtime/methodhandle.rs` path is stale. The `no_retarget=true` flag at `vm_exec.rs:4731-4767` short-circuits the iface/abstract→concrete-receiver retarget — exactly the behaviour required for `findSpecial`.
+- **Status (session 95)**: implementation complete, unit tests passing in `vm/tests/wp2_9_findspecial.rs`. **Open**: `apps/findspecial_probe/FindSpecialProbe.java` end-to-end fixture missing (private-to-private + `I.super.m()` super-call assertions); existing tests skip silently when fixture absent. Will land when `apps/` restoration completes.
 - **Acceptance**: Java 8+ default-method super-call pattern works.
 
-### WP2.10 — Anonymous + hidden class accounting  [S, 1d]
+### WP2.10 — Anonymous + hidden class accounting  [S, 1d]  ✅ DONE (impl complete; e2e probe pending)
 - **Outcome**: `Class.getNestHost` reflects anonymous-class relationships; `isHidden()` true for hidden classes; `Class.forName(hiddenName)` fails with `ClassNotFoundException`.
-- **Files**: `classloading/src/class.rs`.
+- **Files**: `classloading/src/class.rs` (1819 LoC — `Class` struct has `nest_host`, `nest_members`, `permitted_subclasses`, `inner_classes`, `enclosing_method`, `hidden` plus `is_hidden()`/`is_record()`/`is_sealed()` accessors). Native registrations at `native-builtins/src/lib.rs:1421/1436/1470/1471` for `forName0`/`isHidden`/`getNestHost0`/`getNestMembers0`. Hidden flag set atomically at `class_manager.rs:1718` from `lookup_define.rs:265,345` (defineHiddenClass), `unsafe_natives.rs:500` (defineAnonymousClass), `classloader.rs:1068` (URLClassLoader hidden). `forName` exclusion at `class_manager.rs:2584-2599` (skips hidden in `find_class_by_name`) + `lang_class.rs:530-541` (CNFE if hidden after init).
+- **Status (session 95)**: implementation complete; existing `classloading/tests/wp2_10_nest_host.rs` (252 LoC, 7 tests) covers the field/flag and load-real-class flows. **Open**: `apps/nesthost_probe/NestHostProbe.java` fixture missing (3 of 7 tests skip silently); plus 5 new tests recommended for `find_class_by_name` exclusion, `defineAnonymousClass` flag, nestmate hidden-class nest_host inheritance, and lambda-proxy non-pollution invariant. Will land when `apps/` restoration completes.
 
 ---
 

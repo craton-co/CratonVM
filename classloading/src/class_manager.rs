@@ -731,6 +731,7 @@ impl ClassManager {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         };
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
@@ -1720,6 +1721,7 @@ impl ClassManager {
             is_synthetic_stub: false,
             has_finalizer: false, // computed below
             code_source,
+            array_info: None,
         };
 
         // Compute has_finalizer: true if this class or any ancestor
@@ -2031,6 +2033,18 @@ impl ClassManager {
         let mut out = self.bootstrap.class_path().find_all_resource_urls(name);
         out.extend(self.extension.class_path().find_all_resource_urls(name));
         out.extend(self.application.class_path().find_all_resource_urls(name));
+        out
+    }
+
+    /// Return the raw bytes of every classpath entry that contains a resource
+    /// with the given name. Parallel to [`find_all_resource_urls`] but
+    /// returns content instead of URLs — used by Rust-native resource
+    /// enumeration (e.g. `ServiceLoader` provider discovery) that wants to
+    /// avoid the JDK's `URL.openStream` / `BufferedReader` chain.
+    pub fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
+        let mut out = self.bootstrap.class_path().find_all_resource_bytes(name);
+        out.extend(self.extension.class_path().find_all_resource_bytes(name));
+        out.extend(self.application.class_path().find_all_resource_bytes(name));
         out
     }
 
@@ -2723,6 +2737,7 @@ impl ClassManager {
             has_finalizer: false, // synthetic stubs don't override finalize()
             signature: None,
             code_source: None,
+            array_info: None,
         };
 
         debug!(
@@ -2916,6 +2931,7 @@ impl ClassManager {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         };
 
         debug!(

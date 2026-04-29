@@ -1040,6 +1040,48 @@ fn test_method_handle_type() {
     }
 }
 
+// WP1.6 acceptance: MethodHandle.invokeExact strict-arity round-trip.
+// `findVirtual` + `bindTo` + `invokeExact` is the literal acceptance text
+// in `docs/wildfly-ejbca-roadmap.md` Wave 1 §WP1.6. The pre-existing
+// `test_method_handle_bind_to` exercises the loose `invoke` path; this
+// closes the gap by driving the signature-polymorphic strict-arity path.
+#[test]
+fn test_method_handle_invoke_exact_round_trip() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/MethodHandleTest",
+        "testInvokeExactRoundTrip",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// WP1.6 acceptance: VarHandle.getAcquire / setRelease round-trip on a
+// regular int field. Roadmap §WP1.6 calls out
+// "VarHandle.acquire/release on volatile int field of a regular class"
+// — this drives the access mode through the VarHandle native dispatch
+// in `native-builtins/src/lang_invoke.rs::lang_invoke.rs:521-558`.
+#[test]
+fn test_var_handle_acquire_release() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/MethodHandleTest",
+        "testVarHandleAcquireRelease",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 97: OpenJDK TCK Preparation
 // ---------------------------------------------------------------------------
@@ -1870,6 +1912,81 @@ fn test_s19_no_type_params() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("rustjvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// WP2.8 acceptance: getGenericSuperclass on a class extending
+// ArrayList<String> returns a real ParameterizedType whose raw type is
+// ArrayList and getActualTypeArguments()[0] is String.class. This is the
+// load-bearing roadmap acceptance criterion (Jackson List<User> /
+// Hibernate List<OrderLine> patterns).
+#[test]
+fn test_s19_parameterized_superclass() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/GenericReflectionTest",
+        "testParameterizedSuperclass",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// WP2.8 acceptance: Field.getGenericType for a List<String> field
+// materializes a ParameterizedType with the right raw + args.
+#[test]
+fn test_s19_parameterized_field() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/GenericReflectionTest",
+        "testParameterizedField",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// WP2.8 acceptance: two-argument ParameterizedType (Map<String, Integer>)
+// — both type arguments must round-trip in declaration order.
+#[test]
+fn test_s19_two_arg_parameterized_field() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/GenericReflectionTest",
+        "testTwoArgParameterizedField",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// WP2.8 acceptance: wildcard with upper bound (`? extends Number`)
+// materializes as a WildcardType whose getUpperBounds()[0] is Number.class.
+#[test]
+fn test_s19_wildcard_extends_number() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "rustjvm/GenericReflectionTest",
+        "testWildcardExtendsNumber",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
