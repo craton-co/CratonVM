@@ -19,7 +19,86 @@ use crate::alloc_concurrent_synthetic;
 use rustjvm_types::access_flags::{
     ACC_PUBLIC_I32 as ACC_PUBLIC,
     ACC_STATIC_I32 as ACC_STATIC,
+    ACC_FINAL_I32 as ACC_FINAL,
+    ACC_VOLATILE_I32 as ACC_VOLATILE,
 };
+
+/// WP2.1-field — final-field write check for `Field.set*`.
+///
+/// Per `java.lang.reflect.Field.set` Javadoc and JLS §15.26.1:
+///   * Writing a non-static `final` field via reflection requires
+///     `setAccessible(true)`. Without it, throws IllegalAccessException.
+///   * Writing a `static final` field is **always** disallowed via the
+///     plain `Field.set*` path — even with `setAccessible(true)`. (The
+///     escape hatch is `Unsafe.staticFieldBase`/`putReference` or
+///     `MethodHandles.Lookup.findStaticVarHandle`, neither of which
+///     route through `Field.set`.)
+///   * Records, hidden classes, and `enum` constants are likewise pinned
+///     via final fields; we treat them under the same rule. The
+///     fine-grained record/hidden-class differentiation belongs in a
+///     follow-up — for now we conservatively reject the write.
+fn check_final_for_set(
+    modifiers: i32,
+    accessible: bool,
+    member_desc: &str,
+) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+    if (modifiers & ACC_FINAL) == 0 {
+        return Ok(());
+    }
+    let is_static = (modifiers & ACC_STATIC) != 0;
+    // Static-final: hard-disallowed regardless of `setAccessible`.
+    if is_static {
+        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "Can not set static final field via Field.set: {}",
+                member_desc,
+            ),
+        }
+        .into());
+    }
+    // Instance-final: requires `setAccessible(true)`.
+    if !accessible {
+        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "Can not set final field without setAccessible(true): {}",
+                member_desc,
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// WP2.1-field — volatile-aware load barrier.
+///
+/// `Field.get` / `Field.getInt` / `Field.getLong` etc. observe the
+/// volatile read semantics of the field, which on the JDK delegate
+/// internally to `Unsafe.getReferenceVolatile` / `getIntVolatile` /
+/// `getLongVolatile`. We mirror that by issuing an `Acquire` fence
+/// before the load when the field is `ACC_VOLATILE`. Non-volatile
+/// fields skip the fence to avoid the perf hit on plain reads.
+fn volatile_load_fence(modifiers: i32) {
+    if (modifiers & ACC_VOLATILE) != 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    }
+}
+
+/// WP2.1-field — volatile-aware store barrier.
+///
+/// Mirrors `Unsafe.putReferenceVolatile` / `putIntVolatile` etc.:
+/// emit a `Release` fence before the store and a `SeqCst` full fence
+/// after. Non-volatile fields skip both to keep plain writes cheap.
+fn volatile_store_fence_pre(modifiers: i32) {
+    if (modifiers & ACC_VOLATILE) != 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn volatile_store_fence_post(modifiers: i32) {
+    if (modifiers & ACC_VOLATILE) != 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Check if a reflective member access is allowed.
 /// `accessible` is true when `setAccessible(true)` has been called on the
@@ -1791,6 +1870,11 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.get")?;
 
+    // WP2.1-field — volatile-aware read fence: matches what the JDK does
+    // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
+    // for non-volatile fields so the plain-read path stays cheap.
+    volatile_load_fence(modifiers);
+
     let raw_value = if is_static {
         ctx.get_static_field(class_id, slot)
     } else {
@@ -1828,6 +1912,9 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
+    // WP2.1-field — final-field write check (must run AFTER access check
+    // so the more specific error message wins on a public-final field).
+    check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.set")?;
 
@@ -1836,6 +1923,8 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // cannot be narrowed/widened to the target primitive per JLS §5.1.2.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set")?;
 
+    // WP2.1-field — volatile-aware write fences (no-op for non-volatile).
+    volatile_store_fence_pre(modifiers);
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
@@ -1844,6 +1933,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         })?;
         ctx.set_field(recv, slot, coerced);
     }
+    volatile_store_fence_post(modifiers);
     Ok(None)
 }
 
@@ -1877,6 +1967,9 @@ fn field_get_raw(
     // declaring-class mirror on the Field object; still 0 historically,
     // but the real JDK layout puts `clazz` elsewhere. Wrap with a helper.
     enforce_module_check_on_field(ctx, this, accessible, "Field typed getter")?;
+
+    // WP2.1-field — volatile-aware read fence (no-op for non-volatile).
+    volatile_load_fence(modifiers);
 
     if is_static {
         Ok(ctx.get_static_field(class_id, slot))
@@ -1994,6 +2087,9 @@ fn field_set_raw(
     let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, "Field typed setter")?;
+    // WP2.1-field — final-field write check (matches Field.set on the
+    // generic `set(Object,Object)` path).
+    check_final_for_set(modifiers, accessible, "Field typed setter")?;
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field typed setter")?;
 
@@ -2002,6 +2098,8 @@ fn field_set_raw(
     // and the like, producing IllegalArgumentException as per javadoc.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter")?;
 
+    // WP2.1-field — volatile-aware write fences (no-op for non-volatile).
+    volatile_store_fence_pre(modifiers);
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
@@ -2010,6 +2108,7 @@ fn field_set_raw(
         })?;
         ctx.set_field(recv, slot, coerced);
     }
+    volatile_store_fence_post(modifiers);
     Ok(())
 }
 
@@ -2296,7 +2395,29 @@ pub(crate) fn create_method_object(
     // `JavaDispatcher.<clinit>` which does `arraylength` on a `Method`-
     // returned array. The real JDK guarantees these fields are non-null
     // (initialised by the `Method` constructor); we mirror that.
-    let empty_class_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+    //
+    // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
+    // attribute when present, so `Method.getExceptionTypes()` (which the
+    // JDK Java code implements by `return exceptionTypes.clone();`)
+    // returns the actual throws-clause types instead of always-empty.
+    let exception_names = ctx.method_exceptions(
+        meta.declaring_class_id,
+        &meta.name,
+        &meta.descriptor,
+    );
+    let exception_arr = ctx.new_ref_array(
+        rustjvm_types::ClassId::new(0),
+        exception_names.len(),
+    );
+    for (i, name) in exception_names.iter().enumerate() {
+        // Build a Class<T> mirror for each thrown checked exception.
+        // We use `descriptor_to_class_mirror` with an L-form so that
+        // the same code path that turns `Ljava/io/IOException;` into a
+        // mirror handles class loading + caching consistently.
+        let desc = format!("L{name};");
+        let mirror = descriptor_to_class_mirror(ctx, &desc);
+        ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
+    }
     let empty_byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
 
     let desc_str = ctx.create_string(&meta.descriptor);
@@ -2306,11 +2427,11 @@ pub(crate) fn create_method_object(
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(obj, "returnType", Value::Object(Some(ret_mirror)));
     ctx.set_field_by_name(obj, "parameterTypes", Value::Object(Some(param_arr)));
-    // G2: exceptionTypes must be a non-null empty Class[] (not null).
-    // `Method.getExceptionTypes()` does `exceptionTypes.clone()` which
-    // would NPE on null; ByteBuddy's clinit iterates exception types of
-    // declared methods.
-    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(empty_class_arr)));
+    // G2 + WP2.1: exceptionTypes is a non-null Class[] populated from the
+    // `Exceptions` class-file attribute (or empty if no throws clause).
+    // `Method.getExceptionTypes()` does `exceptionTypes.clone()` — if this
+    // were null, ByteBuddy / Mockito / Spring AOP clinit paths would NPE.
+    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(exception_arr)));
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     // JDK's `slot` is an opaque vmindex we don't populate; default 0.
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
@@ -3004,6 +3125,202 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("getJDBCMajorVersion", "()I", 0x401),
             ("getJDBCMinorVersion", "()I", 0x401),
             ("getConnection", "()Ljava/sql/Connection;", 0x401),
+        ],
+        // WP2.1-class-modern — surface the modern `java.lang.Class` API
+        // methods (Java 11–25 sealed-class / record-class / nest-mate
+        // accessors plus the canonical reflection-info methods) so
+        // ByteBuddy's `TypeDescription.forLoadedType(Class.class)` and
+        // Hibernate's record/sealed scanners see a non-empty
+        // declared-method list when the synthetic-JDK `Class` stub is in
+        // use. The natives backing each entry are already registered in
+        // `lib.rs` / `phases_early.rs` / `lang_reflect.rs` — this table
+        // surfaces them to the reflection layer.
+        //
+        // Flags: 0x01 ACC_PUBLIC, 0x11 ACC_PUBLIC|ACC_FINAL,
+        //        0x101 ACC_PUBLIC|ACC_NATIVE.
+        // `Class` itself is final, so all instance methods are effectively
+        // final — but the JDK source marks only a few that way; we follow
+        // the OpenJDK 25 declarations to stay byte-compatible.
+        "java/lang/Class" => &[
+            // Identity / naming
+            ("getName", "()Ljava/lang/String;", 0x01),
+            ("getSimpleName", "()Ljava/lang/String;", 0x01),
+            ("getCanonicalName", "()Ljava/lang/String;", 0x01),
+            ("getTypeName", "()Ljava/lang/String;", 0x01),
+            ("toString", "()Ljava/lang/String;", 0x01),
+            ("toGenericString", "()Ljava/lang/String;", 0x01),
+            ("descriptorString", "()Ljava/lang/String;", 0x01),
+            // Modifiers / shape predicates
+            ("getModifiers", "()I", 0x01),
+            ("isInterface", "()Z", 0x101),
+            ("isArray", "()Z", 0x101),
+            ("isPrimitive", "()Z", 0x101),
+            ("isAnnotation", "()Z", 0x101),
+            ("isSynthetic", "()Z", 0x01),
+            ("isEnum", "()Z", 0x01),
+            ("isRecord", "()Z", 0x01),
+            ("isSealed", "()Z", 0x01),
+            ("isHidden", "()Z", 0x101),
+            ("isAnonymousClass", "()Z", 0x01),
+            ("isLocalClass", "()Z", 0x01),
+            ("isMemberClass", "()Z", 0x01),
+            ("isInstance", "(Ljava/lang/Object;)Z", 0x101),
+            ("isAssignableFrom", "(Ljava/lang/Class;)Z", 0x101),
+            // Hierarchy
+            ("getSuperclass", "()Ljava/lang/Class;", 0x101),
+            ("getInterfaces", "()[Ljava/lang/Class;", 0x01),
+            ("getGenericSuperclass", "()Ljava/lang/reflect/Type;", 0x01),
+            ("getGenericInterfaces", "()[Ljava/lang/reflect/Type;", 0x01),
+            ("getComponentType", "()Ljava/lang/Class;", 0x01),
+            ("getEnclosingClass", "()Ljava/lang/Class;", 0x01),
+            ("getEnclosingMethod", "()Ljava/lang/reflect/Method;", 0x01),
+            ("getEnclosingConstructor", "()Ljava/lang/reflect/Constructor;", 0x01),
+            ("getDeclaringClass", "()Ljava/lang/Class;", 0x01),
+            ("getNestHost", "()Ljava/lang/Class;", 0x01),
+            ("getNestMembers", "()[Ljava/lang/Class;", 0x01),
+            ("isNestmateOf", "(Ljava/lang/Class;)Z", 0x01),
+            // Sealed-class API (Java 17+)
+            ("getPermittedSubclasses", "()[Ljava/lang/Class;", 0x01),
+            // Record API (Java 16+)
+            ("getRecordComponents", "()[Ljava/lang/reflect/RecordComponent;", 0x01),
+            // Reflection — declared / inherited members
+            ("getDeclaredFields", "()[Ljava/lang/reflect/Field;", 0x01),
+            ("getDeclaredMethods", "()[Ljava/lang/reflect/Method;", 0x01),
+            ("getDeclaredConstructors", "()[Ljava/lang/reflect/Constructor;", 0x01),
+            ("getDeclaredClasses", "()[Ljava/lang/Class;", 0x01),
+            (
+                "getDeclaredField",
+                "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+                0x01,
+            ),
+            (
+                "getDeclaredMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+                0x81,
+            ),
+            (
+                "getDeclaredConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+                0x81,
+            ),
+            ("getFields", "()[Ljava/lang/reflect/Field;", 0x01),
+            ("getMethods", "()[Ljava/lang/reflect/Method;", 0x01),
+            ("getConstructors", "()[Ljava/lang/reflect/Constructor;", 0x01),
+            ("getClasses", "()[Ljava/lang/Class;", 0x01),
+            (
+                "getField",
+                "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+                0x01,
+            ),
+            (
+                "getMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+                0x81,
+            ),
+            (
+                "getConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+                0x81,
+            ),
+            // Annotations (AnnotatedElement surface + the annotated-type API)
+            (
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            ("getAnnotations", "()[Ljava/lang/annotation/Annotation;", 0x01),
+            (
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "getAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "getDeclaredAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+                0x01,
+            ),
+            (
+                "isAnnotationPresent",
+                "(Ljava/lang/Class;)Z",
+                0x01,
+            ),
+            (
+                "getAnnotatedSuperclass",
+                "()Ljava/lang/reflect/AnnotatedType;",
+                0x01,
+            ),
+            (
+                "getAnnotatedInterfaces",
+                "()[Ljava/lang/reflect/AnnotatedType;",
+                0x01,
+            ),
+            // Class loader / module / signers / protection domain
+            ("getClassLoader", "()Ljava/lang/ClassLoader;", 0x01),
+            ("getModule", "()Ljava/lang/Module;", 0x01),
+            ("getPackage", "()Ljava/lang/Package;", 0x01),
+            ("getPackageName", "()Ljava/lang/String;", 0x01),
+            (
+                "getProtectionDomain",
+                "()Ljava/security/ProtectionDomain;",
+                0x01,
+            ),
+            ("getSigners", "()[Ljava/lang/Object;", 0x01),
+            ("getEnumConstants", "()[Ljava/lang/Object;", 0x01),
+            (
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+                0x01,
+            ),
+            (
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+                0x01,
+            ),
+            // Generics
+            ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;", 0x01),
+            // Casts / forName
+            (
+                "cast",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                0x01,
+            ),
+            (
+                "asSubclass",
+                "(Ljava/lang/Class;)Ljava/lang/Class;",
+                0x01,
+            ),
+            (
+                "forName",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                0x09,
+            ),
+            (
+                "forName",
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+                0x09,
+            ),
+            (
+                "newInstance",
+                "()Ljava/lang/Object;",
+                0x01,
+            ),
+            (
+                "desiredAssertionStatus",
+                "()Z",
+                0x01,
+            ),
+            ("arrayType", "()Ljava/lang/Class;", 0x01),
+            ("componentType", "()Ljava/lang/Class;", 0x01),
         ],
         _ => &[],
     }
@@ -6302,6 +6619,122 @@ pub(crate) fn native_class_get_permitted_subclasses(
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// `java/lang/Class.getAnnotatedSuperclass()Ljava/lang/reflect/AnnotatedType;`
+///
+/// WP2.1-class-modern: returns an `AnnotatedType` for the direct superclass
+/// of this Class. Synthetic best-effort impl: builds a minimal
+/// `AnnotatedType` whose backing `Type` is the superclass `Class` mirror,
+/// with no type-annotations attached. Returns null for `Object`, primitive
+/// types, void, array types, and interfaces — matching the JDK contract.
+///
+/// The returned object is a synthetic 2-field stand-in:
+///   * slot 0: backing `Type` (the superclass `Class` mirror)
+///   * slot 1: empty `Annotation[]` (placeholder for future RUNTIME
+///     type-annotation wiring)
+///
+/// Frameworks that probe `Class.getAnnotatedSuperclass()` usually only
+/// need it to be non-null + not throw (Hibernate's
+/// `ReflectionUtil.scanForAnnotatedTypes`); the synthetic backing is
+/// sufficient to keep their `<clinit>` chain alive.
+pub(crate) fn native_class_get_annotated_superclass(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    // Match JDK contract: null for Object, primitives, void, array, interfaces.
+    let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    if name == "java/lang/Object" || name.starts_with('[') || name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Resolve the direct superclass via `NativeContext::superclass_of`.
+    let super_mirror = match ctx.superclass_of(class_id) {
+        Some(sid) => ctx.get_class_mirror(sid),
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    Ok(Some(Value::Object(Some(make_annotated_type(ctx, super_mirror)))))
+}
+
+/// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
+///
+/// WP2.1-class-modern: returns an `AnnotatedType[]` mirroring the
+/// `getInterfaces()` array. Each element is a synthetic `AnnotatedType`
+/// wrapping the corresponding interface `Class` mirror — see
+/// [`make_annotated_type`] for the layout.
+///
+/// Always returns a non-null (possibly zero-length) array — matching the
+/// JDK contract. Frameworks (ByteBuddy, JMX OpenMBean introspector) rely
+/// on the non-null guarantee; throwing or returning null here breaks
+/// `MBeanIntrospector.getMethods` recursion.
+pub(crate) fn native_class_get_annotated_interfaces(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => {
+            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+
+    let iface_ids = ctx.class_interfaces(class_id);
+    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), iface_ids.len());
+    for (i, iface_id) in iface_ids.iter().enumerate() {
+        let iface_mirror = ctx.get_class_mirror(*iface_id);
+        let at = make_annotated_type(ctx, iface_mirror);
+        ctx.set_array_element(arr, i, Value::Object(Some(at)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// Build a minimal synthetic `AnnotatedType` object wrapping a `Type`
+/// (typically a `Class` mirror).
+///
+/// Layout (2 fields, by-name + slot-fallback):
+///   * `type` — the wrapped `Type` (slot 0)
+///   * `annotations` — empty `Annotation[]` (slot 1)
+///
+/// `AnnotatedType` is an interface in the JDK; its concrete impl class is
+/// `sun.reflect.annotation.AnnotatedTypeFactory$AnnotatedTypeBaseImpl` /
+/// `AnnotatedTypeImpl`. We allocate against `java/lang/reflect/AnnotatedType`
+/// — the dispatch path treats this as a synthetic-stub instance.
+/// `getType()` reads slot 0 ; downstream frameworks only need that
+/// accessor + non-null-ness.
+fn make_annotated_type(
+    ctx: &mut dyn NativeContext,
+    backing_type: rustjvm_types::ObjectRef,
+) -> rustjvm_types::ObjectRef {
+    // Try the impl class first (real-JDK layout); fall back to the
+    // interface name (synthetic-mode placeholder).
+    let cid = ctx
+        .ensure_class_initialized("sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl")
+        .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+
+    let layout_fields = ctx.class_num_total_fields(cid);
+    let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
+    let obj = ctx.alloc_object(cid, num_fields);
+
+    // empty Annotation[] for `annotations`
+    let empty_anns = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+
+    ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
+    ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_anns)));
+    if layout_fields == 0 {
+        ctx.set_field(obj, 0, Value::Object(Some(backing_type)));
+        ctx.set_field(obj, 1, Value::Object(Some(empty_anns)));
+    }
+    obj
+}
+
 /// `java/lang/Class.getClassFileVersion0()I`
 ///
 /// Returns the class file version number. The JDK encodes this as
@@ -8876,6 +9309,96 @@ mod tests {
             Value::Object(Some(_)) => {}
             other => panic!("expected Class mirror for java.lang.Object, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WP2.1-field — final-write check + volatile-aware fence helpers.
+    // -----------------------------------------------------------------------
+    //
+    // These are pure-Rust helpers, so the tests are tiny but they pin the
+    // semantics that `Field.set*` enforces:
+    //   * non-static final without setAccessible → IllegalAccessException
+    //   * static final ALWAYS → IllegalAccessException (even with
+    //     setAccessible — the escape hatch is Unsafe / VarHandle)
+    //   * non-final fields → no error, regardless of accessible
+    //   * volatile fences are emitted only when ACC_VOLATILE is set on
+    //     the field's modifiers (avoiding the perf hit on plain reads).
+
+    #[test]
+    fn wp21_field_check_final_non_final_passes() {
+        // Plain int field, public, no final bit set — should pass.
+        let modifiers = ACC_PUBLIC; // 0x0001
+        assert!(check_final_for_set(modifiers, false, "x").is_ok());
+        assert!(check_final_for_set(modifiers, true, "x").is_ok());
+    }
+
+    #[test]
+    fn wp21_field_check_final_instance_final_no_access_throws() {
+        let modifiers = ACC_PUBLIC | ACC_FINAL; // 0x0011
+        let r = check_final_for_set(modifiers, false, "Y");
+        assert!(
+            r.is_err(),
+            "instance final without setAccessible MUST throw IllegalAccessException"
+        );
+        let err = r.unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("IllegalAccessException"),
+            "expected IllegalAccessException, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn wp21_field_check_final_instance_final_with_access_passes() {
+        // Mirrors `ff.setAccessible(true); ff.setInt(o, 11);` — must succeed.
+        let modifiers = ACC_PUBLIC | ACC_FINAL;
+        assert!(check_final_for_set(modifiers, true, "Y").is_ok());
+    }
+
+    #[test]
+    fn wp21_field_check_final_static_final_always_throws() {
+        let modifiers = ACC_PUBLIC | ACC_STATIC | ACC_FINAL; // 0x0019
+        // Without setAccessible.
+        assert!(
+            check_final_for_set(modifiers, false, "K").is_err(),
+            "static final without setAccessible MUST throw"
+        );
+        // WITH setAccessible — must still throw.
+        let r = check_final_for_set(modifiers, true, "K");
+        assert!(
+            r.is_err(),
+            "static final WITH setAccessible MUST also throw — only Unsafe / VarHandle bypasses",
+        );
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(
+            msg.contains("static final"),
+            "static-final error should call out 'static final' specifically, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn wp21_field_volatile_fence_no_op_on_plain_field() {
+        // Pure runtime smoke: should not panic. The fence is unobservable
+        // by definition; we just exercise the branch that decides whether
+        // to issue one.
+        let plain = ACC_PUBLIC; // no ACC_VOLATILE
+        volatile_load_fence(plain);
+        volatile_store_fence_pre(plain);
+        volatile_store_fence_post(plain);
+    }
+
+    #[test]
+    fn wp21_field_volatile_fence_emitted_on_volatile_field() {
+        // Same shape — exercises the path that issues the fence. We can't
+        // observe the memory ordering directly from a single thread, but
+        // we can pin that the call doesn't panic and the bit-test is
+        // exercised end-to-end. The integration test in
+        // `vm/tests/wp2_1_field_surface.rs::volatile_long_round_trips`
+        // pins the end-to-end round-trip via Field.getLong/setLong.
+        let volatile_field = ACC_PUBLIC | ACC_VOLATILE; // 0x0041
+        volatile_load_fence(volatile_field);
+        volatile_store_fence_pre(volatile_field);
+        volatile_store_fence_post(volatile_field);
     }
 }
 

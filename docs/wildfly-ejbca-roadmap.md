@@ -60,7 +60,7 @@ Rough budget: ~71 WPs × 0.5-4 dev-days avg ≈ 100-200 focused dev-days. With 4
 | `java.security.Policy` real parser | Apps with `-Djava.security.manager` | ✅ session 86 |
 | Runtime proxy generation (`java.lang.reflect.Proxy`) | JAX-RS client, JDK service factories | ⚠️ partial |
 | Annotation retention RUNTIME parsing | DI containers, JPA discovery | ⚠️ partial (WP1.7 landed) |
-| `java.util.ServiceLoader` | JDBC drivers, JAX-RS providers | ⚠️ classpath scan needs WP1.8 fix |
+| `java.util.ServiceLoader` | JDBC drivers, JAX-RS providers | ✅ session 95 (WP1.8 closed: directory + JAR classpath) |
 | `java.lang.StackWalker` | Logging frameworks, exception filtering | ⚠️ partial (WP1.9 stub-residual) |
 | `java.lang.ref.Cleaner` / `PhantomReference` | DirectByteBuffer cleanup | ⚠️ phantom OK; cleaner partial |
 | `java.lang.System.getenv` / `getProperties` | Every app's config | ⚠️ partial |
@@ -145,10 +145,10 @@ Prereq: Wave 0 green. Dispatch: **6 parallel agents** (12 WPs across 6 owners, p
 - **Outcome**: `@Retention(RUNTIME)` annotations on classes/methods/fields/parameters/type-uses parse from the .class file and populate real proxy objects reachable via `getAnnotation(Class)`.
 - **Resolution (session 93)**: `apps/annotation_probe` round-trips string/int/class/enum/nested/array/method-anno/field-anno values. Files: `reader/src/class_reader.rs`, `classloading/src/annotations.rs`.
 
-### WP1.8 — `java.util.ServiceLoader` per-module  [M, 1-2d]  *(owner D)*  ⚠️ partial
+### WP1.8 — `java.util.ServiceLoader` per-module  [M, 1-2d]  *(owner D)*  ✅ DONE
 - **Outcome**: `ServiceLoader.load(Class)` scans `META-INF/services/<fqcn>` on classpath.
-- **Status (session 93)**: `native-builtins/src/service_loader.rs` exists; `apps/serviceloader_probe` returns count=0 — classpath scan not wired to JDK iterator.
-- **Acceptance**: `ServiceLoader.load(java.sql.Driver.class)` finds H2 (or any driver JAR) via `META-INF/services` on classpath.
+- **Resolution (session 95)**: closure landed across three sessions. (1) `native-builtins/src/service_loader.rs::discover_providers` was rewritten in session 94 to bypass the JDK `URL.openStream → BufferedReader.readLine` chain and walk the classpath directly via the layered `find_all_resource_bytes` helper (Directory / JarFile / NestedJar / JmodFile / JImageFile flavours owned by `classloading/src/class_path.rs`). (2) WP1.8-narrow added the synthetic-stub method-table declarations for `Class.forName(String)` and `BufferedReader.<init>(Reader)` plus 5 directory-classpath e2e tests in `vm/tests/wp1_8_serviceloader_e2e.rs`. (3) WP1.8-finish (session 95) closed the acceptance bar verbatim: a new `vm/tests/wp1_8_real_jar_serviceloader.rs` synthesises a real `.jar` (via the `zip` crate so no `jar` binary required) containing both `META-INF/services/java.sql.Driver` and the `FakeDriver` class, boots the VM with **only that JAR** on the classpath, and asserts `ServiceLoader.load(java.sql.Driver.class).iterator().hasNext() == true` — proving the JarFile-flavour path of `find_all_resource_bytes` reaches the iterator end-to-end.
+- **Acceptance**: `ServiceLoader.load(java.sql.Driver.class)` finds H2 (or any driver JAR) via `META-INF/services` on classpath. ✅ proven by `wp1_8_real_jar_serviceloader::driver_discovered_from_jar_on_classpath`.
 
 ### WP1.9 — `java.lang.StackWalker` complete  [M, 1d]  *(owner E)*  ✅ DONE
 - **Outcome**: `StackWalker.getInstance().walk(s -> ...)` returns real `StackFrame` objects with class, method, BCI, line.

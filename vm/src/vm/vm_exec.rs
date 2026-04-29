@@ -2604,6 +2604,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         None
     }
 
+    fn method_exceptions(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<String> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                for attr in &m.attributes {
+                    if let rustjvm_reader::attribute::Attribute::Exceptions {
+                        exception_indices,
+                    } = attr
+                    {
+                        return exception_indices
+                            .iter()
+                            .filter_map(|idx| {
+                                class.constant_pool.get_class_name(*idx).map(|s| s.to_string())
+                            })
+                            .collect();
+                    }
+                }
+                return Vec::new();
+            }
+        }
+        Vec::new()
+    }
+
     // -- Scoped Values (JEP 446, Java 25) --
 
     fn get_scoped_value(&self, key_id: u64) -> Option<Value> {

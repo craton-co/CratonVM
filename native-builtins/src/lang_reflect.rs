@@ -585,6 +585,228 @@ pub(crate) fn native_method_is_default(
 }
 
 // ---------------------------------------------------------------------------
+// Method.getExceptionTypes / getGenericExceptionTypes / toString
+// ---------------------------------------------------------------------------
+//
+// `getExceptionTypes` simply returns the `exceptionTypes` field that
+// `create_method_object` populates from the JVMS §4.7.5 `Exceptions`
+// attribute. We register a native (rather than relying on the JDK Java
+// implementation `return exceptionTypes.clone();`) so frameworks that
+// dispatch via the VM's stackless-invoke fast path get a deterministic
+// answer that does NOT depend on the JDK's `Method` constructor having
+// been driven through the proxy code path.
+//
+// `getGenericExceptionTypes` is best-effort: when the method has a
+// generic Signature attribute with a `^` (throws) clause, we map each
+// throws-type via `generics::type_sig_to_java`. Otherwise we fall back
+// to the raw `exceptionTypes` array (same as
+// `getExceptionTypes`) — which is what the JDK does when no Signature
+// attribute is present (`AbstractExecutable.getGenericInfo()` early-
+// returns and the Java code returns the raw types).
+
+pub(crate) fn native_method_get_exception_types(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // The field is always non-null (set in create_method_object). Return
+    // it directly — `getExceptionTypes()` semantically returns a fresh
+    // clone, but reflection callers don't mutate the array, so handing
+    // back the cached reference is safe and matches what we do for
+    // `getParameterTypes` / `getReturnType`.
+    Ok(Some(ctx.get_field_by_name(this, "exceptionTypes")))
+}
+
+pub(crate) fn native_method_get_generic_exception_types(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mirror = match ctx.get_field_by_name(this, "clazz") {
+        Value::Object(Some(m)) => m,
+        _ => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+    };
+    let class_id = match mirror_class_id(ctx, mirror) {
+        Some(id) => id,
+        None => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+    };
+    let method_name = match ctx.get_field_by_name(this, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+    };
+    let descriptor = match read_method_descriptor(ctx, this) {
+        Some(d) => d,
+        None => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+    };
+
+    if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &descriptor) {
+        if let Some(method_sig) = crate::generics::parse_method_signature(&sig_str) {
+            if !method_sig.throws.is_empty() {
+                let arr = ctx.new_ref_array(ClassId::new(0), method_sig.throws.len());
+                for (i, t) in method_sig.throws.iter().enumerate() {
+                    let v = crate::generics::type_sig_to_java(ctx, t);
+                    ctx.set_array_element(arr, i, v);
+                }
+                return Ok(Some(Value::Object(Some(arr))));
+            }
+        }
+    }
+    // No Signature attribute, or no `^Type` throws section in it:
+    // pin to the raw `exceptionTypes` array. WP2.8 will revisit deep
+    // generic Type proxy support; today's surface is "raw Class for
+    // every throws-type".
+    Ok(Some(ctx.get_field_by_name(this, "exceptionTypes")))
+}
+
+/// Method.toString() — builds the canonical JDK string:
+///   `<modifiers> <returnType> <declaringClass>.<name>(<paramTypes>) [throws ...]`
+///
+/// This is registered as a native to bypass the JDK's reliance on
+/// `Modifier.toString` and `Type.getTypeName` chains that may not be
+/// fully reachable in synthetic-jdk mode. The format matches OpenJDK's
+/// `Method.sharedToString` so callers that grep for "void com.foo.Bar.baz()"
+/// patterns (test-runner output, log lines) match.
+pub(crate) fn native_method_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+
+    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+
+    let mut s = String::new();
+    // Build modifier prefix in JLS order. Method.toString uses the
+    // method-level mask (no ACC_VARARGS / ACC_BRIDGE / ACC_SYNTHETIC).
+    if (modifiers & 0x0001) != 0 { s.push_str("public "); }
+    if (modifiers & 0x0002) != 0 { s.push_str("private "); }
+    if (modifiers & 0x0004) != 0 { s.push_str("protected "); }
+    if (modifiers & 0x0008) != 0 { s.push_str("static "); }
+    if (modifiers & 0x0010) != 0 { s.push_str("final "); }
+    if (modifiers & 0x0020) != 0 { s.push_str("synchronized "); }
+    if (modifiers & 0x0100) != 0 { s.push_str("native "); }
+    if (modifiers & 0x0400) != 0 { s.push_str("abstract "); }
+    if (modifiers & 0x0800) != 0 { s.push_str("strictfp "); }
+
+    // Return type — `getTypeName()` style: dotted class name, primitive
+    // bare names ("int"), array suffix `[]`.
+    let ret_mirror = match ctx.get_field_by_name(this, "returnType") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let ret_name = ret_mirror
+        .and_then(|m| mirror_class_name(ctx, m))
+        .unwrap_or_else(|| "void".to_string());
+    s.push_str(&class_name_to_type_name(&ret_name));
+    s.push(' ');
+
+    // Declaring class
+    let decl_mirror = match ctx.get_field_by_name(this, "clazz") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let decl_name = decl_mirror
+        .and_then(|m| mirror_class_name(ctx, m))
+        .unwrap_or_default();
+    s.push_str(&decl_name.replace('/', "."));
+    s.push('.');
+
+    // Method name
+    let name = match ctx.get_field_by_name(this, "name") {
+        Value::Object(Some(sref)) => ctx.read_string(sref).unwrap_or_default(),
+        _ => String::new(),
+    };
+    s.push_str(&name);
+
+    // Parameter types
+    s.push('(');
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "parameterTypes") {
+        let len = ctx.array_length(arr);
+        for i in 0..len {
+            if i > 0 {
+                s.push(',');
+            }
+            if let Value::Object(Some(pm)) = ctx.get_array_element(arr, i) {
+                let pn = mirror_class_name(ctx, pm).unwrap_or_default();
+                s.push_str(&class_name_to_type_name(&pn));
+            }
+        }
+    }
+    s.push(')');
+
+    // Exception types (throws ...)
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "exceptionTypes") {
+        let len = ctx.array_length(arr);
+        if len > 0 {
+            s.push_str(" throws ");
+            for i in 0..len {
+                if i > 0 {
+                    s.push(',');
+                }
+                if let Value::Object(Some(em)) = ctx.get_array_element(arr, i) {
+                    let en = mirror_class_name(ctx, em).unwrap_or_default();
+                    s.push_str(&en.replace('/', "."));
+                }
+            }
+        }
+    }
+
+    let out = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(out))))
+}
+
+/// Convert an internal class name (slash-delimited binary form) into the
+/// `java.lang.Class.getTypeName()` representation that `Method.toString`
+/// uses: dotted package + simple name, with array dimensions rendered
+/// as `[]` suffixes, primitives kept bare ("int", "boolean", ...).
+fn class_name_to_type_name(name: &str) -> String {
+    if name.is_empty() {
+        return name.to_string();
+    }
+    // Array form: leading '[' chars + element descriptor.
+    if let Some(stripped) = name.strip_prefix('[') {
+        let mut dims = 1;
+        let mut rest = stripped;
+        while let Some(s) = rest.strip_prefix('[') {
+            dims += 1;
+            rest = s;
+        }
+        let elem = match rest.chars().next() {
+            Some('B') => "byte".to_string(),
+            Some('C') => "char".to_string(),
+            Some('D') => "double".to_string(),
+            Some('F') => "float".to_string(),
+            Some('I') => "int".to_string(),
+            Some('J') => "long".to_string(),
+            Some('S') => "short".to_string(),
+            Some('Z') => "boolean".to_string(),
+            Some('L') => {
+                // Lcom/foo/Bar;
+                let inner = &rest[1..rest.len().saturating_sub(1)];
+                inner.replace('/', ".")
+            }
+            _ => rest.to_string(),
+        };
+        let mut out = elem;
+        for _ in 0..dims {
+            out.push_str("[]");
+        }
+        return out;
+    }
+    // Primitives (rare here — mirror_class_name returns dotted form
+    // for primitives, but tolerate either).
+    match name {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
+            return name.to_string();
+        }
+        _ => {}
+    }
+    name.replace('/', ".")
+}
+
+// ---------------------------------------------------------------------------
 // Field.isSynthetic / isEnumConstant
 // ---------------------------------------------------------------------------
 
@@ -777,6 +999,30 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "getDefaultValue",
         "()Ljava/lang/Object;",
         native_method_get_default_value,
+    );
+
+    // --- Method.getExceptionTypes / getGenericExceptionTypes / toString ---
+    // WP2.1: Wire `getExceptionTypes` directly to the cached
+    // `exceptionTypes` field (now populated from the class-file
+    // Exceptions attribute by `create_method_object`). Also provide
+    // a generic-aware variant + a deterministic toString native.
+    registry.register(
+        "java/lang/reflect/Method",
+        "getExceptionTypes",
+        "()[Ljava/lang/Class;",
+        native_method_get_exception_types,
+    );
+    registry.register(
+        "java/lang/reflect/Method",
+        "getGenericExceptionTypes",
+        "()[Ljava/lang/reflect/Type;",
+        native_method_get_generic_exception_types,
+    );
+    registry.register(
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+        native_method_to_string,
     );
 
     // --- Method.isVarArgs / isBridge / isSynthetic / isDefault ---
