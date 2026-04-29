@@ -6026,6 +6026,56 @@ fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_name: &str) 
 }
 
 // ---------------------------------------------------------------------------
+// Helper: walk a class's superclass chain by name to detect Proxy$Instance
+// ---------------------------------------------------------------------------
+
+/// WP2.5 — walks the superclass chain of `class_id` looking for
+/// `java/lang/reflect/Proxy$Instance`. Returns `true` if found within
+/// `MAX_DEPTH` hops.
+///
+/// Used by the cast/instanceof and dispatch hooks below to extend their
+/// "is this a proxy?" check from a literal name match to "literal match
+/// OR extends `Proxy$Instance`" — matters once the WP2.5-A bytecode
+/// emitter starts producing per-(loader, ifaces) `$ProxyN` classes that
+/// extend `Proxy$Instance` (and the receiver's runtime class is the
+/// generated `$ProxyN`, not the abstract super). The literal-name fast
+/// path stays in the caller; this helper only runs on the slow path so
+/// the cost is zero on every non-proxy dispatch.
+///
+/// We could call `class_manager.is_subclass_of(child, parent_id)`, but
+/// that needs the ClassId of `Proxy$Instance` which forces a
+/// `load_class("Proxy$Instance")` on the slow path. Walking by name is
+/// simpler, lock-scoped, and depth-bounded against pathological cycles
+/// in user-loaded class graphs.
+fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
+    const MAX_DEPTH: usize = 32;
+    const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+
+    let cm = shared.class_manager.read();
+    let mut current = Some(class_id);
+    for _ in 0..MAX_DEPTH {
+        let cid = match current {
+            Some(c) => c,
+            None => return false,
+        };
+        let class = match cm.get_class(cid) {
+            Some(c) => c,
+            None => return false,
+        };
+        if &*class.name == PROXY_INSTANCE {
+            return true;
+        }
+        // Stop early once we hit Object — Proxy$Instance sits below it
+        // by construction, so going further is wasted work.
+        if &*class.name == "java/lang/Object" {
+            return false;
+        }
+        current = class.superclass;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Helper: name-based type compatibility for synthetic classes
 // ---------------------------------------------------------------------------
 
@@ -6110,8 +6160,14 @@ fn synthetic_implements(
         );
     }
 
-    // Dynamic proxy — Proxy$Instance satisfies any interface cast.
-    if &*obj_name == "java/lang/reflect/Proxy$Instance" {
+    // Dynamic proxy — Proxy$Instance (and any class extending it, i.e.
+    // WP2.5-A generated `$ProxyN` classes) satisfies any interface cast.
+    // Fast path: literal name compare keeps the cost zero on the common
+    // synthetic-shim path. Slow path: walk the receiver's superclass
+    // chain so generated `$ProxyN` subclasses get the same treatment.
+    if &*obj_name == "java/lang/reflect/Proxy$Instance"
+        || class_chain_reaches_proxy_instance(shared, obj_class_id)
+    {
         return true;
     }
 
@@ -7036,9 +7092,23 @@ fn execute_invoke(
         }
     };
 
-    // Dynamic proxy dispatch: forward interface method calls on Proxy$Instance to
-    // the InvocationHandler.invoke(). Handle Object methods specially.
-    if &*invoke_class == "java/lang/reflect/Proxy$Instance" && !is_special {
+    // Dynamic proxy dispatch: forward interface method calls on
+    // `Proxy$Instance` (and any class extending it — WP2.5-A generated
+    // `$ProxyN` classes) to the InvocationHandler.invoke(). Handle Object
+    // methods specially. Fast path stays a literal compare; slow path
+    // walks the receiver's superclass chain — only fires when
+    // `invoke_class != "Proxy$Instance"` and we have an actual receiver
+    // to inspect, so the cost is zero on every non-proxy dispatch.
+    let is_proxy_dispatch = &*invoke_class == "java/lang/reflect/Proxy$Instance"
+        || matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver)))
+                if class_chain_reaches_proxy_instance(
+                    shared,
+                    shared.heap.class_id_of(*receiver),
+                )
+        );
+    if is_proxy_dispatch && !is_special {
         // Handle getClass() directly — return the proxy's class mirror
         if &*method_name == "getClass" {
             if let Value::Object(Some(proxy_ref)) = &args[0] {

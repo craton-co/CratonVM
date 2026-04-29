@@ -4825,6 +4825,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
 
         let child_fields = vec![make_field("a", false), make_field("b", false)];
@@ -5049,6 +5050,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_record());
@@ -5094,6 +5096,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_sealed());
@@ -5137,6 +5140,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.is_record());
@@ -5181,6 +5185,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         assert!(store.get(parent_id).unwrap().is_sealed());
 
@@ -5241,6 +5246,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         // java/lang/Object itself should NOT be considered as "declares_finalize"
@@ -5289,6 +5295,7 @@ mod tests {
             has_finalizer: true,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(cls.declares_finalize());
@@ -5328,6 +5335,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
+            array_info: None,
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.declares_finalize());
@@ -5612,6 +5620,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let entries = mgr.build_vtable_descriptors(id, superclass);
         mgr.vtable_descriptors.insert(id, entries);
@@ -5866,6 +5875,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
 
         let (entries, overrides) = mgr.build_vtable_descriptors_with_overrides(id, None);
@@ -5932,6 +5942,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let (_entries, overrides) =
             mgr.build_vtable_descriptors_with_overrides(sub_id, Some(super_id));
@@ -6007,6 +6018,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            array_info: None,
         });
         let entries = mgr.build_vtable_descriptors(id, None);
         assert_eq!(entries.len(), 1);

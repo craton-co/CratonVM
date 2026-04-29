@@ -23334,6 +23334,20 @@ static PROXY_LAST_INTERFACES_BITS: std::sync::atomic::AtomicU64 = std::sync::ato
 /// Total proxies created in this process. Diagnostic only.
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// WP2.5-B — generated-proxy-class cache, keyed on
+/// `(loader_id, sorted_iface_class_ids)`. One generated `$ProxyN` class
+/// per (loader, interface-set) — the JDK `ProxyGenerator` does the same.
+static PROXY_CLASS_CACHE: parking_lot::RwLock<
+    Option<rustc_hash::FxHashMap<(u32, Vec<rustjvm_types::ClassId>), rustjvm_types::ClassId>>,
+> = parking_lot::RwLock::new(None);
+
+/// WP2.5-B — global counter for the `$ProxyN` suffix. JDK uses
+/// per-loader counters; a global counter is sufficient here since the
+/// generated names are internal and never observed by user code other
+/// than via `Class.getName()`.
+static PROXY_CLASS_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// Public accessor for `lang_class::native_class_get_interfaces` to
 /// pick up the interfaces array of the most recently created proxy.
 /// Also public so WP2.5 tests can sanity-check the symbol exists.
@@ -23426,33 +23440,215 @@ fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // WP2.5 — track the interfaces array on the proxy so that
-    // `proxy.getClass().getInterfaces()` round-trips and so that the
-    // dispatch path can see exactly what interfaces the user requested.
+    // WP2.5-B — strategy A path: emit a real `$ProxyN` class that
+    // extends `java/lang/reflect/Proxy$Instance` and implements the
+    // requested interfaces, then allocate an instance of THAT class.
+    // The interpreter's existing dispatch hook (interpreter.rs around
+    // line 7041, generalized in WP2.5-C via
+    // `class_chain_reaches_proxy_instance`) intercepts method calls
+    // before they reach the generated method bodies, so dispatch routes
+    // through `InvocationHandler.invoke` exactly as before — the
+    // generated bodies are dead code that exists only to satisfy the
+    // verifier's "every declared interface method must have a
+    // concrete impl" rule.
     //
     // Args: [classloader, Class[] interfaces, InvocationHandler handler]
     //
-    // Field layout (see vm::runtime::proxy):
+    // Field layout (inherited from Proxy$Instance):
     //   0 -> InvocationHandler
     //   1 -> Class[] interfaces
     //   2 -> identity-hashcode override (reserved, default 0)
     let interfaces = args.get(1).cloned().unwrap_or(Value::Object(None));
     let handler = args.get(2).cloned().unwrap_or(Value::Object(None));
-    let proxy = alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3);
+
+    // Walk the Class[] arg into a list of iface ClassIds for cache keying.
+    let mut iface_cids: Vec<rustjvm_types::ClassId> = Vec::new();
+    if let Value::Object(Some(arr)) = interfaces {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    iface_cids.push(cid);
+                }
+            }
+        }
+    }
+
+    // Try to generate a `$ProxyN` class. On any failure, fall back to
+    // the legacy synthetic `Proxy$Instance` allocation — the existing
+    // dispatch hook handles both shapes uniformly so callers see
+    // unchanged behaviour even when generation is skipped.
+    //
+    // Loader id 0 = application loader. Per-loader namespacing for
+    // user-defined ClassLoaders is a follow-up; the JDK uses the loader
+    // arg's identity, but for the bootstrap/app/ext space (which is
+    // where every JDBC / annotation / Mockito proxy sits today) loader
+    // id 0 is sufficient.
+    let proxy_cid = define_or_get_proxy_class(ctx, 0, &iface_cids);
+    let proxy = match proxy_cid {
+        Some(cid) => {
+            // The generated class extends `Proxy$Instance` (3 slots:
+            // handler / interfaces / identity-hash). Use whichever is
+            // larger of the declared field count or 3 — `class_num_total_fields`
+            // returns 0 if the class is loaded as a synthetic stub
+            // without bytecode parsing.
+            let n = ctx.class_num_total_fields(cid).max(3);
+            ctx.alloc_object(cid, n)
+        }
+        None => alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
+    };
     ctx.set_field(proxy, 0, handler);
     ctx.set_field(proxy, 1, interfaces);
     ctx.set_field(proxy, 2, Value::Int(0));
 
-    // WP2.5: register the most recently created proxy's interfaces
-    // array so `Class.getInterfaces()` on the shared Proxy$Instance
-    // class mirror can reflect them. See module-level comment for the
-    // last-wins limitation.
+    // Backward-compat: keep the global "last-proxy interfaces" cache
+    // populated so legacy readers (lang_class::native_class_get_interfaces
+    // synthetic-mode fallback) still work even when the per-class
+    // interfaces array is also reachable via the generated class's
+    // `interfaces[]` table.
     if let Value::Object(Some(arr)) = interfaces {
         PROXY_LAST_INTERFACES_BITS.store(arr.as_ptr() as u64, std::sync::atomic::Ordering::Release);
     }
     PROXY_INSTANCES_CREATED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
     Ok(Some(Value::Object(Some(proxy))))
+}
+
+/// WP2.5-B — define (or fetch from cache) a `$ProxyN` class for the
+/// given iface ClassId set under `loader_id`. Returns `None` on any
+/// failure so the caller can fall back to the legacy synthetic shim
+/// without raising an exception.
+fn define_or_get_proxy_class(
+    ctx: &mut dyn NativeContext,
+    loader_id: u32,
+    iface_class_ids: &[rustjvm_types::ClassId],
+) -> Option<rustjvm_types::ClassId> {
+    // Sort + dedup ClassIds for deterministic cache keying.
+    let mut sorted: Vec<rustjvm_types::ClassId> = iface_class_ids.to_vec();
+    sorted.sort_by_key(|c| c.as_u32());
+    sorted.dedup();
+    let cache_key = (loader_id, sorted.clone());
+
+    {
+        let guard = PROXY_CLASS_CACHE.read();
+        if let Some(map) = guard.as_ref() {
+            if let Some(&cid) = map.get(&cache_key) {
+                return Some(cid);
+            }
+        }
+    }
+
+    // Ensure the synthetic super class exists so `define_class_full`
+    // can resolve it. `ensure_class_initialized` is idempotent — fast
+    // on the second+ call.
+    let _ = ctx.ensure_class_initialized("java/lang/reflect/Proxy$Instance");
+
+    let (gen_name, spec) = build_proxy_spec_for(ctx, &sorted)?;
+    let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec);
+    let opts = rustjvm_native_api::DefineClassFull {
+        // The emitter intentionally omits `StackMapTable` (see the
+        // `proxy_gen` module doc); skip Pass 3 verification so the
+        // class loads.
+        skip_verification: true,
+        ..Default::default()
+    };
+    match ctx.define_class_full(&gen_name, &bytes, loader_id, opts) {
+        Ok(cid) => {
+            let mut guard = PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert(cache_key, cid);
+            Some(cid)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Build a [`rustjvm_classloading::proxy_gen::ProxyClassSpec`] for the
+/// given sorted interface ClassId set. Walks each interface (and its
+/// super-interfaces transitively) collecting public abstract + default
+/// instance methods, deduplicated by `(name, descriptor)`. Returns
+/// `None` if any ClassId fails to resolve to a name.
+fn build_proxy_spec_for(
+    ctx: &mut dyn NativeContext,
+    sorted_ifaces: &[rustjvm_types::ClassId],
+) -> Option<(String, rustjvm_classloading::proxy_gen::ProxyClassSpec)> {
+    use rustjvm_classloading::proxy_gen::{ProxyClassSpec, ProxyMethod};
+
+    const ACC_STATIC: u16 = 0x0008;
+    const ACC_PUBLIC: u16 = 0x0001;
+    const ACC_ABSTRACT: u16 = 0x0400;
+
+    let n = PROXY_CLASS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let gen_class_name = format!("java/lang/reflect/$Proxy{n}");
+
+    // Resolve iface internal names.
+    let mut iface_names: Vec<String> = Vec::with_capacity(sorted_ifaces.len());
+    for cid in sorted_ifaces {
+        match ctx.class_name_of_id(*cid) {
+            Some(name) => iface_names.push(name),
+            None => return None,
+        }
+    }
+
+    // BFS over interface inheritance. Collect public, non-static,
+    // non-`<init>`/`<clinit>` methods. Abstract beats default if the
+    // same `(name, descriptor)` key appears with both flavours.
+    let mut visited: std::collections::HashSet<rustjvm_types::ClassId> =
+        std::collections::HashSet::new();
+    let mut work: Vec<rustjvm_types::ClassId> = sorted_ifaces.to_vec();
+    let mut by_key: std::collections::HashMap<(String, String), ProxyMethod> =
+        std::collections::HashMap::new();
+    while let Some(cid) = work.pop() {
+        if !visited.insert(cid) {
+            continue;
+        }
+        for m in ctx.declared_methods(cid) {
+            if m.access_flags & ACC_STATIC != 0 {
+                continue;
+            }
+            if m.name == "<init>" || m.name == "<clinit>" {
+                continue;
+            }
+            if m.access_flags & ACC_PUBLIC == 0 {
+                continue;
+            }
+            let key = (m.name.to_string(), m.descriptor.to_string());
+            let is_default = m.access_flags & ACC_ABSTRACT == 0;
+            let entry = by_key.entry(key).or_insert(ProxyMethod {
+                name: m.name.to_string(),
+                descriptor: m.descriptor.to_string(),
+                is_default,
+            });
+            if !is_default {
+                entry.is_default = false;
+            }
+        }
+        for super_iface in ctx.class_interfaces(cid) {
+            if !visited.contains(&super_iface) {
+                work.push(super_iface);
+            }
+        }
+    }
+
+    // Stable iteration order so the generated bytecode is reproducible
+    // (the cache key already enforces that the iface set matches; this
+    // pins the method-table layout too).
+    let mut methods: Vec<ProxyMethod> = by_key.into_values().collect();
+    methods.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.descriptor.cmp(&b.descriptor))
+    });
+
+    Some((
+        gen_class_name.clone(),
+        ProxyClassSpec {
+            gen_class_name,
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: iface_names,
+            methods,
+        },
+    ))
 }
 
 /// Helper for the `proxy.getClass().getInterfaces()` round-trip:
