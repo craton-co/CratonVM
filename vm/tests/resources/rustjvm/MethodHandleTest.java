@@ -200,4 +200,55 @@ public class MethodHandleTest {
             return 0;
         }
     }
+
+    // --- WP1.6 acceptance: MethodHandle.invokeExact strict-arity round-trip ---
+    //
+    // `invokeExact` is signature-polymorphic — javac emits an `invokevirtual`
+    // call site whose descriptor matches the bound handle's `MethodType`
+    // exactly (here `(I)I`). This is distinct from `invoke` which boxes/
+    // unboxes on demand. The acceptance criterion in roadmap §4 WP1.6
+    // includes "MethodHandles.Lookup.findVirtual + .bindTo + .invokeExact
+    // round-trips" — the existing testBindTo only exercises the loose
+    // `invoke` path, so this method closes the gap.
+    public static int testInvokeExactRoundTrip() {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            MethodHandle mh = lookup.findVirtual(
+                MethodHandleTest.class,
+                "instanceMultiply",
+                MethodType.methodType(int.class, int.class)
+            );
+            MethodHandleTest obj = new MethodHandleTest(6);
+            MethodHandle bound = mh.bindTo(obj);
+            // Strict-arity: bound expects (int)int after binding receiver.
+            // 6 * 7 = 42.
+            int result = (int) bound.invokeExact(7);
+            return result == 42 ? 1 : 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    // --- WP1.6 acceptance: VarHandle.getAcquire / setRelease round-trip ---
+    //
+    // The acceptance criterion in roadmap §4 WP1.6 includes "VarHandle.
+    // acquire/release on volatile int field of a regular class". Our
+    // existing testInstanceVarHandle only exercises plain get/set; this
+    // method drives the acquire/release access mode on the same field.
+    // The access mode is selected by VarHandle method name, not by a
+    // field flag — both modes should round-trip the same value.
+    public static int testVarHandleAcquireRelease() {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            VarHandle vh = lookup.findVarHandle(
+                MethodHandleTest.class, "instanceField", int.class);
+            MethodHandleTest obj = new MethodHandleTest(7);
+            vh.setRelease(obj, 11);
+            Object got = vh.getAcquire(obj);
+            return (got instanceof Integer
+                    && ((Integer) got).intValue() == 11) ? 1 : 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
 }
