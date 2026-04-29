@@ -75,7 +75,12 @@ fn run_probe(method: &str) -> Result<i32, String> {
 #[test]
 fn field_get_set_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    // Field natives ship via `register_synthetic_overrides`, mirroring the
+    // pattern WP7.2 established (`each_jdbc_core_type_has_registered_natives`).
+    // The VM's vm_init.rs uses `register_builtins` (essential + synthetic
+    // overrides) under `use_synthetic_jdk = true` (the default), so this
+    // matches the production registry shape.
+    rustjvm_native_builtins::register_builtins(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Field",
@@ -101,7 +106,12 @@ fn field_get_set_natives_registered() {
 #[test]
 fn field_typed_accessors_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    // Field natives ship via `register_synthetic_overrides`, mirroring the
+    // pattern WP7.2 established (`each_jdbc_core_type_has_registered_natives`).
+    // The VM's vm_init.rs uses `register_builtins` (essential + synthetic
+    // overrides) under `use_synthetic_jdk = true` (the default), so this
+    // matches the production registry shape.
+    rustjvm_native_builtins::register_builtins(&mut r);
     for (name, sig) in &[
         ("getInt", "(Ljava/lang/Object;)I"),
         ("setInt", "(Ljava/lang/Object;I)V"),
@@ -132,7 +142,12 @@ fn field_typed_accessors_registered() {
 #[test]
 fn field_metadata_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    // Field natives ship via `register_synthetic_overrides`, mirroring the
+    // pattern WP7.2 established (`each_jdbc_core_type_has_registered_natives`).
+    // The VM's vm_init.rs uses `register_builtins` (essential + synthetic
+    // overrides) under `use_synthetic_jdk = true` (the default), so this
+    // matches the production registry shape.
+    rustjvm_native_builtins::register_builtins(&mut r);
     for (name, sig) in &[
         ("getName", "()Ljava/lang/String;"),
         ("getType", "()Ljava/lang/Class;"),
@@ -166,6 +181,14 @@ fn int_getter_setter_round_trips() {
         r, 1,
         "WP2.1-field: Field.getInt/setInt must round-trip on primitive int"
     );
+}
+
+#[test]
+fn plain_long_round_trips_diag() {
+    if !fixture_compiled() { return; }
+    let r = run_probe("plainLongGetterSetterRoundTripsDiag")
+        .expect("WP2.1-field: plain long diag must invoke");
+    assert_eq!(r, 1, "plain long setLong: returned {r}");
 }
 
 #[test]
