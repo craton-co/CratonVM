@@ -6051,10 +6051,31 @@ pub(crate) fn platform_lib_name(name: &str) -> String {
 pub(crate) fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, rustjvm_types::error::MethodCallFailed> {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => Ok(*o),
-        _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
-            message: Some("null object argument".to_string()),
+        _ => {
+            // RKC16N.9 diagnostic. The "null object argument" NPE is
+            // generic across ~3900 obj_arg call sites; without a Java
+            // frame at this point we cannot tell *which* native helper
+            // is being invoked with a null.
+            //
+            // When `RUSTJVM_DBG_NULL_NATIVE` is set, dump a Rust
+            // backtrace + the offending arg index/length to stderr.
+            // The topmost non-`obj_arg` frame names the native helper.
+            // Gated so production NPEs stay quiet — Java code legally
+            // throws NPE in many places (`HashMap.get(null)` etc.) and
+            // we don't want to drown those in backtraces.
+            if std::env::var_os("RUSTJVM_DBG_NULL_NATIVE").is_some() {
+                eprintln!(
+                    "[obj_arg] null at idx={} args.len={}\n{}",
+                    idx,
+                    args.len(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("null object argument".to_string()),
+            }
+            .into())
         }
-        .into()),
     }
 }
 

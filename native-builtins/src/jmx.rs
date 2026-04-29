@@ -2,6 +2,7 @@
 //! Provides MBeanServer and platform MXBeans for runtime monitoring.
 
 use rustjvm_types::ClassId;
+use rustjvm_types::error::MethodCallResult;
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectRef, Value};
 use std::time::Instant;
@@ -49,6 +50,176 @@ pub(crate) fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_compilation_mxbean(r);
     register_gc_mxbean(r);
     register_mbean_server(r);
+    register_vm_management_impl(r);
+}
+
+// ---------------------------------------------------------------------------
+// sun.management.VMManagementImpl
+//
+// RKC16N.10: `java.lang.management.ManagementFactory.<clinit>` instantiates
+// `sun.management.VMManagementImpl`, whose `<clinit>` calls a set of native
+// helpers that talk to the JMM interface. Without these, JBoss Modules'
+// `Module.<clinit>` chain (which Keycloak boots through) silent-swallows an
+// `UnsatisfiedLinkError` for `getVersion0` and then a hard one for
+// `getStartupTime`. Providing reasonable defaults lets the boot advance.
+// ---------------------------------------------------------------------------
+
+/// RKC16N.10: register the `sun.management.VMManagementImpl` natives so
+/// `java.lang.management.ManagementFactory.<clinit>` doesn't throw
+/// `UnsatisfiedLinkError` and JBoss Modules' `Module.<clinit>` chain
+/// (Keycloak boot) can advance past it.
+///
+/// **Call from both real-JDK and synthetic-JDK registration paths.** This
+/// function lives outside `register_jmx_natives` because that helper is only
+/// reachable from `register_synthetic_overrides`, which is skipped in
+/// real-JDK mode (synthetic-mode-only field layouts).
+pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
+    // (probe eprintln removed — registration confirmed working)
+    let cls = "sun/management/VMManagementImpl";
+
+    // Management interface version. OpenJDK reports "10.0" for JDK 8+.
+    // Format: "<major>.<minor>" — JBoss / Hotspot consumers parse only major.
+    r.register(cls, "getVersion0", "()Ljava/lang/String;", |ctx, _args| {
+        let s = ctx.create_string("10.0");
+        Ok(Some(Value::Object(Some(s))))
+    });
+
+    // JVM init-done time, epoch millis. Mirrors RuntimeMXBean.getStartTime.
+    r.register(cls, "getStartupTime", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(vm_start_epoch_ms() as i64)))
+    });
+
+    // Process id. Same plumbing as RuntimeMXBean.getName which embeds PID.
+    r.register(cls, "getProcessId", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(std::process::id() as i32)))
+    });
+
+    // initOptionalSupportFields populates a bag of "isXxxSupported" booleans
+    // on the receiver. OpenJDK writes them via Unsafe + JNI; we no-op so the
+    // synthetic instance stays at its default (all `false`) — accurate, since
+    // we don't claim any optional JMM features.
+    r.register(cls, "initOptionalSupportFields", "()V", |_ctx, _args| {
+        Ok(None)
+    });
+
+    // No JVM args plumbed through to JMM yet — return an empty String[].
+    r.register(
+        cls,
+        "getVmArguments0",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
+    // -- VMManagementImpl `is*Supported` / `is*Enabled` queries --
+    //
+    // ManagementFactory.<clinit> iterates the entire feature-flag surface
+    // to populate static booleans. We don't support any of these optional
+    // JMM features yet (thread CPU time, allocated-memory tracking, object
+    // monitor usage, synchronizer usage, etc.), so every flag is `false`.
+    // Done as a batch to avoid the iterate-and-add-one-at-a-time treadmill;
+    // the consumer is iterating a static const list at clinit time.
+    let false_zero: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Int(0))); // false / 0
+    for name in [
+        "isThreadAllocatedMemorySupported",
+        "isThreadAllocatedMemoryEnabled",
+        "isThreadContentionMonitoringSupported",
+        "isThreadContentionMonitoringEnabled",
+        "isThreadCpuTimeSupported",
+        "isThreadCpuTimeEnabled",
+        "isCurrentThreadCpuTimeSupported",
+        "isOtherThreadCpuTimeSupported",
+        "isObjectMonitorUsageSupported",
+        "isSynchronizerUsageSupported",
+        "isBootClassPathSupported",
+        "isCompilationTimeMonitoringSupported",
+        "isRemoteDiagnosticCommandsSupported",
+        "isGcNotificationSupported",
+        "getVerboseClass",
+        "getVerboseGC",
+    ] {
+        r.register(cls, name, "()Z", false_zero);
+    }
+
+    // -- VMManagementImpl long-typed counters / timers --
+    //
+    // Returning 0 is consistent with "unsupported / not measured": JBoss
+    // uses these for diagnostic output, not for control flow.
+    let zero_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Long(0)));
+    for name in [
+        "getTotalCompileTime",
+        "getTotalClassCount",
+        "getUnloadedClassCount",
+        "getLoadedClassSize",
+        "getUnloadedClassSize",
+        "getClassLoadingTime",
+        "getMethodDataSize",
+        "getInitializedClassCount",
+        "getClassInitializationTime",
+        "getClassVerificationTime",
+        "getSafepointSyncTime",
+        "getTotalSafepointTime",
+        "getSafepointCount",
+        "getTotalApplicationNonStoppedTime",
+        "getTotalThreadCount",
+        "getLiveThreadCount",
+        "getPeakThreadCount",
+        "getDaemonThreadCount",
+    ] {
+        r.register(cls, name, "()J", zero_long);
+    }
+    // Reset peak counter — accept and ignore.
+    r.register(cls, "resetPeakThreadCount", "()V", |_ctx, _args| Ok(None));
+
+    // -- sun.management.MemoryImpl --
+    // RKC16N.10 follow-on: ManagementFactory.<clinit> instantiates
+    // sun.management.MemoryImpl alongside VMManagementImpl. Without these
+    // natives the boot trips on UnsatisfiedLinkError after VMManagementImpl
+    // succeeds. We return empty arrays — accurate, since rustjvm doesn't
+    // expose JMM memory pools / managers yet (JFR / GC introspection isn't
+    // wired through JMM). JBoss only checks length / iterates, so empty is
+    // safe; consumers asking for actual usage data get UNDEFINED_USAGE
+    // (-1, -1, -1, -1) from `getMemoryUsage0`.
+    let memory_impl = "sun/management/MemoryImpl";
+    r.register(
+        memory_impl,
+        "getMemoryPools0",
+        "()[Ljava/lang/management/MemoryPoolMXBean;",
+        |ctx, _args| {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        memory_impl,
+        "getMemoryManagers0",
+        "()[Ljava/lang/management/MemoryManagerMXBean;",
+        |ctx, _args| {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    // setVerboseGC(boolean) — accept and ignore.
+    r.register(memory_impl, "setVerboseGC", "(Z)V", |_ctx, _args| Ok(None));
+    // getMemoryUsage0(boolean heap) returns a MemoryUsage with -1 fields,
+    // matching MemoryUsage.UNDEFINED_USAGE per the JMM spec.
+    r.register(
+        memory_impl,
+        "getMemoryUsage0",
+        "(Z)Ljava/lang/management/MemoryUsage;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+            ctx.set_field(obj, 0, Value::Long(-1)); // init
+            ctx.set_field(obj, 1, Value::Long(-1)); // used
+            ctx.set_field(obj, 2, Value::Long(-1)); // committed
+            ctx.set_field(obj, 3, Value::Long(-1)); // max
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

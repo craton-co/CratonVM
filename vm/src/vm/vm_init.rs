@@ -833,6 +833,13 @@ impl SharedVm {
                 // rustjvm.Instrument bridge used by the
                 // apps/instrument_probe smoke fixture.
                 crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
+                // RKC16N.10: sun.management.VMManagementImpl natives —
+                // ManagementFactory.<clinit> instantiates VMManagementImpl
+                // whose <clinit> calls native helpers; without these the
+                // JBoss Modules boot path (Keycloak) trips on an
+                // UnsatisfiedLinkError. Lives outside register_jmx_natives
+                // (which is synthetic-only) so the real-JDK path picks it up.
+                rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
         }
@@ -875,6 +882,9 @@ impl SharedVm {
             // companion call in the `feature = "synthetic-jdk"` branch
             // above.
             crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
+            // RKC16N.10: VMManagementImpl natives. See companion call
+            // in the `feature = "synthetic-jdk"` branch above.
+            rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support

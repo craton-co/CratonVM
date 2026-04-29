@@ -969,6 +969,18 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/Buffer;)Ljava/lang/foreign/MemorySegment$Scope;",
         jnio_acquire_session,
     );
+    // RKC16N.10 follow-on: legacy JDK 8/9 SharedSecrets accessor still
+    // referenced by ManagementFactory.<clinit> in some JDK 25 builds.
+    // Returns the older `jdk.internal.misc.VM$BufferPool` shape — that
+    // class doesn't exist in JDK 25 so we return null. The caller path
+    // (`ManagementFactoryHelper.getBufferPoolMXBeans` -> direct/mapped
+    // pool registration) treats null as "no such pool" and proceeds.
+    registry.register(
+        owner,
+        "getDirectBufferPool",
+        "()Ljdk/internal/misc/VM$BufferPool;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 }
 
 // JavaSecurityAccess ----------------------------------------------------------
