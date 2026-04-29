@@ -17,20 +17,27 @@
       "real_jar_search": [],
       "main_class": "Main",
       "javaagent_arg": "-javaagent:bench/wave2-4/staged-instrument/agent.jar",
-      "expected_final_rc": 1,
-      "expected_stderr_contains": [
-        "InstrumentationImpl.isRetransformClassesSupported0",
-        "javaagent premain aborted VM"
-      ],
+      "expected_final_rc": 0,
+      "expected_stderr_contains": [],
       "expected_stdout_contains": [
-        "agent: premain entered"
+        "agent: premain entered",
+        "agent: isRetransformClassesSupported=true",
+        "agent: addTransformer done",
+        "agent: retransforming Target",
+        "agent: transform className=Target",
+        "agent: retransformClasses done",
+        "before=99",
+        "after=99",
+        "OK"
       ],
       "expected_stderr_forbidden": [
         "panicked at",
         "RUST_BACKTRACE",
-        "STATUS_ACCESS_VIOLATION"
+        "STATUS_ACCESS_VIOLATION",
+        "NoSuchMethodError",
+        "javaagent premain aborted VM"
       ],
-      "notes": "Today's reality (2026-04-25): rust-jvm's `agent_loader` (sibling 2.4-C) successfully parses `-javaagent:agent.jar`, locates the manifest, finds RetransformAgent, and invokes its premain. The premain enters and prints `agent: premain entered` to stdout. It then queries `inst.isRetransformClassesSupported()` which dispatches to a missing native `sun/instrument/InstrumentationImpl.isRetransformClassesSupported0(J)Z`. UnsatisfiedLinkError aborts the agent's premain. After 2.4-A wires the InstrumentationImpl native surface (isRetransformClassesSupported0, retransformClasses0, redefineClasses0, getAllLoadedClasses0, isModifiableClass0), the transformer registration + retransform path should fire; expected_final_rc flips to 0 and stdout gains `before=99 / after=99 / OK`."
+      "notes": "Today's reality (2026-04-29 session 99): rc=0 — the full agent retransform pipeline works. Premain runs, isRetransformClassesSupported returns true, addTransformer succeeds, retransformClasses fires the transformer which patches `bipush 42` → `bipush 99` in Target.class, and the retransformed Target.compute() returns 99. Required fixes that landed this session: (a) public-name aliases on InstrumentationImpl for isRetransform/isRedefine/isNativeMethodPrefixSupported, isModifiableClass, getObjectSize, getAllLoadedClasses, retransformClasses, redefineClasses; (b) promoted Class.forName(String) / forName(String,Z,ClassLoader) / forName(Module,String) overloads from `register_synthetic_overrides` (synthetic-jdk-only) into `register_essential_natives` (always registered). Combined with the WP2.4 v1+v2 work + WP2.5 v1+v2+v3 (real bytecode generator + UTE wrapping + static Method[] slots), this is end-to-end JVMTI-style javaagent retransform working under rust-jvm."
     },
     "jacoco": {
       "real_jar_search": [
