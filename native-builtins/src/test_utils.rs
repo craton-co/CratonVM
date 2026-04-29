@@ -179,6 +179,19 @@ pub(crate) struct MockNativeContext {
     /// transitive dependency closure on the shared classpath when a
     /// module is loaded.  Insertion order is preserved.
     pub(crate) registered_classpath: UnsafeCell<Vec<String>>,
+    /// WP8.11.5: per-class `nest_host` override, returned by the
+    /// `nest_host_name` trait method. Empty by default (every class is
+    /// its own nest host); tests populate this via
+    /// `set_nest_host_override(child_id, "OuterClass")` to simulate a
+    /// lookup class that is itself a nestmate of an outer.
+    pub(crate) nest_host_override: UnsafeCell<HashMap<u32, String>>,
+    /// WP8.11.5: snapshot of the most recent `define_class_full` call's
+    /// `DefineClassFull` options. Set by the override below;
+    /// `last_define_full_opts()` reads it. Used by NESTMATE-propagation
+    /// tests to assert exactly which `nest_host_class_name` reached the
+    /// backend.
+    pub(crate) last_define_full_opts:
+        UnsafeCell<Option<rustjvm_native_api::DefineClassFull>>,
 }
 
 impl MockNativeContext {
@@ -214,7 +227,30 @@ impl MockNativeContext {
             next_native_tid: UnsafeCell::new(1),
             native_thread_java_objs: UnsafeCell::new(HashMap::new()),
             registered_classpath: UnsafeCell::new(Vec::new()),
+            nest_host_override: UnsafeCell::new(HashMap::new()),
+            last_define_full_opts: UnsafeCell::new(None),
         }
+    }
+
+    /// WP8.11.5: declare that `child_id` has a nest host named `host`.
+    /// Subsequent calls to `nest_host_name(child_id)` return `Some(host)`.
+    #[allow(dead_code)]
+    pub(crate) fn set_nest_host_override(&self, child_id: ClassId, host: &str) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_host_override.get())
+                .insert(child_id.as_u32(), host.to_string());
+        }
+    }
+
+    /// WP8.11.5: read the most recent `DefineClassFull` options passed
+    /// through `define_class_full`. `None` if no call has been made yet.
+    #[allow(dead_code)]
+    pub(crate) fn last_define_full_opts(
+        &self,
+    ) -> Option<rustjvm_native_api::DefineClassFull> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.last_define_full_opts.get()).clone() }
     }
 
     /// T19_H15 — read a snapshot of the dynamic classpath entries that
@@ -1096,6 +1132,47 @@ impl NativeContext for MockNativeContext {
 
     fn is_class_hidden(&self, class_id: ClassId) -> bool {
         unsafe { (*self.hidden_classes.get()).contains(&class_id.as_u32()) }
+    }
+
+    /// WP8.11.5: override the default `define_class_full` so the mock
+    /// captures the full `DefineClassFull` options (notably
+    /// `nest_host_class_name`). The default impl in the trait would
+    /// collapse the call to `define_class_from_bytes` and lose the
+    /// option, defeating NESTMATE-propagation tests.
+    fn define_class_full(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        _loader_id: u32,
+        opts: rustjvm_native_api::DefineClassFull,
+    ) -> Result<ClassId, String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.last_define_full_opts.get() = Some(opts.clone());
+        }
+        // Use override_name if present (hidden-class mangled name path).
+        let stored_name = opts.override_name.as_deref().unwrap_or(name);
+        match self.define_class_from_bytes(stored_name, bytes) {
+            Some(cid) => {
+                if opts.hidden {
+                    self.set_class_hidden(cid);
+                }
+                Ok(cid)
+            }
+            None => Err(format!("define_class_full failed for {stored_name}")),
+        }
+    }
+
+    /// WP8.11.5: read the per-class nest-host override populated by
+    /// `set_nest_host_override`. `None` => the class is its own nest
+    /// host (default).
+    fn nest_host_name(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_host_override.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
     }
 
     fn discover_reference(

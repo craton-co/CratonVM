@@ -3304,6 +3304,21 @@ fn is_jdk_class(name: &str) -> bool {
         || name.starts_with("jdk/")
         || name.starts_with("com/sun/")
         || name.starts_with("[") // array type descriptors like [I, [Ljava/lang/String;
+        // WP8.10.5 — non-JDK prefixes whose classes have rich synthetic-stub
+        // layouts declared below in `synthetic_stub_fields` (org/jboss/*,
+        // org/wildfly/*, etc.). Without these, references to
+        // org.jboss.modules.Module raise NoClassDefFoundError before the
+        // synthetic-stub fallback in `load_class` can fire. The fallback
+        // only triggers when classpath lookup has already failed, so a real
+        // jboss-modules.jar on the classpath still loads normally.
+        || name.starts_with("org/jboss/")
+        || name.starts_with("org/wildfly/")
+        || name.starts_with("org/xnio/")
+        || name.starts_with("org/infinispan/")
+        || name.starts_with("io/quarkus/")
+        || name.starts_with("io/agroal/")
+        || name.starts_with("io/undertow/")
+        || name.starts_with("io/smallrye/")
 }
 
 /// Create the field declarations for well-known JDK stub classes.

@@ -19,6 +19,37 @@
 //!
 //! Hard size limits: 1 MiB total input, 64 levels of nesting (matches the
 //! `security_manager::x509` parser already shipped in session 90).
+//!
+//! ## WP8.11.6 — PKCS#10 / X.509 v3 helpers
+//!
+//! BC's `JcaPKCS10CertificationRequestBuilder.build(signer)` (used by
+//! EJBCA's first cert-issue call) materialises three new SEQUENCE shapes
+//! we did not previously encode:
+//!
+//! ```text
+//! AlgorithmIdentifier ::= SEQUENCE {
+//!     algorithm   OBJECT IDENTIFIER,
+//!     parameters  ANY DEFINED BY algorithm OPTIONAL
+//! }
+//!
+//! SubjectPublicKeyInfo ::= SEQUENCE {
+//!     algorithm        AlgorithmIdentifier,
+//!     subjectPublicKey BIT STRING
+//! }
+//!
+//! Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension
+//! Extension   ::= SEQUENCE {
+//!     extnID    OBJECT IDENTIFIER,
+//!     critical  BOOLEAN DEFAULT FALSE,
+//!     extnValue OCTET STRING
+//! }
+//! ```
+//!
+//! And the wrapping `CertificationRequestInfo` (RFC 2986 §4.1) and a
+//! lightweight `TBSCertificate` skeleton (RFC 5280 §4.1).  The encoders
+//! below are deliberately byte-faithful: BC's `DERSequence.encode` emits
+//! tag, length, then content with no extra padding, the same shape we
+//! already produce — the test fixtures cross-check that property.
 
 #![allow(dead_code)]
 
@@ -261,6 +292,433 @@ pub fn read_directory_string(tag: u8, content: &[u8]) -> Option<String> {
         _ => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Generic encoders (INTEGER, BIT STRING, OCTET STRING, BOOLEAN, NULL, [n])
+// ---------------------------------------------------------------------------
+
+/// Encode an unsigned big-integer as a DER `INTEGER`.
+///
+/// DER requires the encoding to be the shortest two's-complement form, so
+/// when the high bit of the first byte is set we prepend a `0x00` to keep
+/// the value non-negative.  Empty inputs encode as `INTEGER 0`.
+pub fn encode_integer_unsigned(bytes: &[u8]) -> Vec<u8> {
+    // Trim leading zero bytes (X.690 §8.3.2 minimal encoding).
+    let mut start = 0;
+    while start + 1 < bytes.len() && bytes[start] == 0 {
+        start += 1;
+    }
+    let trimmed = &bytes[start..];
+    if trimmed.is_empty() {
+        return encode_tlv(TAG_INTEGER, &[0]);
+    }
+    if trimmed[0] & 0x80 != 0 {
+        // Avoid two's-complement sign flip.
+        let mut content = Vec::with_capacity(trimmed.len() + 1);
+        content.push(0x00);
+        content.extend_from_slice(trimmed);
+        encode_tlv(TAG_INTEGER, &content)
+    } else {
+        encode_tlv(TAG_INTEGER, trimmed)
+    }
+}
+
+/// Encode a small non-negative `INTEGER` in canonical DER.  The most-
+/// common use is the `version` field of `CertificationRequestInfo` /
+/// `TBSCertificate`.
+pub fn encode_integer_u64(value: u64) -> Vec<u8> {
+    if value == 0 {
+        return encode_tlv(TAG_INTEGER, &[0]);
+    }
+    let mut bytes = Vec::with_capacity(8);
+    let mut v = value;
+    while v > 0 {
+        bytes.push((v & 0xFF) as u8);
+        v >>= 8;
+    }
+    bytes.reverse();
+    if bytes[0] & 0x80 != 0 {
+        let mut content = Vec::with_capacity(bytes.len() + 1);
+        content.push(0x00);
+        content.extend_from_slice(&bytes);
+        encode_tlv(TAG_INTEGER, &content)
+    } else {
+        encode_tlv(TAG_INTEGER, &bytes)
+    }
+}
+
+/// Encode a primitive `OCTET STRING`.
+pub fn encode_octet_string(content: &[u8]) -> Vec<u8> {
+    encode_tlv(TAG_OCTET_STRING, content)
+}
+
+/// Encode a primitive `BIT STRING` carrying *whole* octets (no unused
+/// bits).  This is the shape `SubjectPublicKeyInfo.subjectPublicKey`
+/// uses — the unused-bits count is always 0 because the wrapped DER blob
+/// is byte-aligned.
+pub fn encode_bit_string_aligned(payload: &[u8]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(payload.len() + 1);
+    content.push(0x00); // unused bits
+    content.extend_from_slice(payload);
+    encode_tlv(TAG_BIT_STRING, &content)
+}
+
+/// Encode a `BOOLEAN`.  DER §11.1 — TRUE *must* be encoded as `0xFF`.
+pub fn encode_boolean(value: bool) -> Vec<u8> {
+    encode_tlv(TAG_BOOLEAN, &[if value { 0xFF } else { 0x00 }])
+}
+
+/// Encode an explicit context-specific tag `[n]` wrapping `inner`.  This
+/// is what `CertificationRequestInfo.attributes [0]` and TBSCertificate's
+/// `[3] EXPLICIT extensions` need.  The constructed bit (0x20) is set so
+/// the resulting tag is `0xA0 | n`.
+pub fn encode_explicit_context(tag_number: u8, inner: &[u8]) -> Vec<u8> {
+    debug_assert!(tag_number < 0x1F, "high-tag-number form not supported");
+    let tag = 0xA0 | (tag_number & 0x1F);
+    encode_tlv(tag, inner)
+}
+
+/// Encode a `NULL` primitive — `05 00`.  Used as the `parameters` of
+/// `AlgorithmIdentifier` for algorithms like `sha256WithRSAEncryption`
+/// where RFC 4055 §2.1 says parameters MUST be present and NULL.
+pub fn encode_null() -> Vec<u8> {
+    vec![TAG_NULL, 0x00]
+}
+
+// ---------------------------------------------------------------------------
+// AlgorithmIdentifier (RFC 5280 §4.1.1.2)
+// ---------------------------------------------------------------------------
+
+/// `AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }`.
+///
+/// `params_der` is treated as opaque pre-encoded DER.  Pass `None` to
+/// omit parameters entirely (used by EC algorithms where parameters are
+/// either absent or carry a named-curve OID), `Some(&encode_null())` for
+/// the RSA-style `NULL` parameters, or `Some(&pre_encoded_oid)` for EC
+/// named-curve identifiers.
+pub fn encode_algorithm_identifier(oid_dotted: &str, params_der: Option<&[u8]>) -> Vec<u8> {
+    let oid_der = encode_oid(oid_dotted)
+        .unwrap_or_else(|_| encode_tlv(TAG_OID, oid_dotted.as_bytes()));
+    let mut inner = Vec::with_capacity(oid_der.len() + params_der.map_or(0, |p| p.len()));
+    inner.extend_from_slice(&oid_der);
+    if let Some(p) = params_der {
+        inner.extend_from_slice(p);
+    }
+    encode_sequence(&inner)
+}
+
+/// Decode an `AlgorithmIdentifier` into `(oid_dotted, params_der_opt)`.
+///
+/// `params_der_opt` is the raw TLV bytes of the optional parameters
+/// element (NULL, OID, or any other ANY-DEFINED-BY value), preserved for
+/// re-encoding.  `None` means parameters were absent.
+pub fn decode_algorithm_identifier(der: &[u8]) -> Result<(String, Option<Vec<u8>>), DerError> {
+    let (tag, hdr, content_len, _total) = read_header(der)?;
+    if tag != TAG_SEQUENCE {
+        return Err(DerError::BadTag);
+    }
+    let content = &der[hdr..hdr + content_len];
+    // OID
+    let (otag, ohdr, oclen, ototal) = read_header(content)?;
+    if otag != TAG_OID {
+        return Err(DerError::BadTag);
+    }
+    let oid = read_oid(&content[ohdr..ohdr + oclen])?;
+    // Optional parameters (whatever's left).
+    let params = if ototal < content.len() {
+        // Validate the trailing element is well-formed before keeping it.
+        let (_, _, _, ptotal) = read_header(&content[ototal..])?;
+        if ototal + ptotal != content.len() {
+            return Err(DerError::Trailing);
+        }
+        Some(content[ototal..ototal + ptotal].to_vec())
+    } else {
+        None
+    };
+    Ok((oid, params))
+}
+
+// ---------------------------------------------------------------------------
+// SubjectPublicKeyInfo (RFC 5280 §4.1.2.7)
+// ---------------------------------------------------------------------------
+
+/// `SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier,
+///  subjectPublicKey BIT STRING }`.
+///
+/// `algorithm_oid` + `algorithm_params` flow through to
+/// `encode_algorithm_identifier`.  `key_bits` is the raw public-key
+/// bytes (e.g. RSA's PKCS#1 `RSAPublicKey` SEQUENCE, or EC's uncompressed
+/// point).  We always emit unused-bits = 0 because every public-key
+/// encoding we care about is byte-aligned.
+pub fn encode_subject_public_key_info(
+    algorithm_oid: &str,
+    algorithm_params: Option<&[u8]>,
+    key_bits: &[u8],
+) -> Vec<u8> {
+    let alg_id = encode_algorithm_identifier(algorithm_oid, algorithm_params);
+    let bit_str = encode_bit_string_aligned(key_bits);
+    let mut inner = Vec::with_capacity(alg_id.len() + bit_str.len());
+    inner.extend_from_slice(&alg_id);
+    inner.extend_from_slice(&bit_str);
+    encode_sequence(&inner)
+}
+
+/// Decoded view of a SubjectPublicKeyInfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectPublicKeyInfo {
+    pub algorithm_oid: String,
+    pub algorithm_params: Option<Vec<u8>>,
+    /// Raw public-key bytes (the BIT STRING content with the unused-bits
+    /// prefix stripped).
+    pub subject_public_key: Vec<u8>,
+}
+
+/// Decode a SubjectPublicKeyInfo SEQUENCE.
+pub fn decode_subject_public_key_info(der: &[u8]) -> Result<SubjectPublicKeyInfo, DerError> {
+    let (tag, hdr, content_len, _) = read_header(der)?;
+    if tag != TAG_SEQUENCE {
+        return Err(DerError::BadTag);
+    }
+    let content = &der[hdr..hdr + content_len];
+    // AlgorithmIdentifier
+    let (atag, _ahdr, _aclen, atot) = read_header(content)?;
+    if atag != TAG_SEQUENCE {
+        return Err(DerError::BadTag);
+    }
+    let alg_der = &content[..atot];
+    let (algorithm_oid, algorithm_params) = decode_algorithm_identifier(alg_der)?;
+    // BIT STRING
+    let (btag, bhdr, bclen, _) = read_header(&content[atot..])?;
+    if btag != TAG_BIT_STRING {
+        return Err(DerError::BadTag);
+    }
+    let bit_content = &content[atot + bhdr..atot + bhdr + bclen];
+    if bit_content.is_empty() {
+        return Err(DerError::BadLength);
+    }
+    let unused = bit_content[0];
+    if unused != 0 {
+        // We only encode aligned BIT STRINGs; non-zero unused-bits is a
+        // signal that this SPKI was produced by some other tool.  Keep
+        // the bytes anyway — callers can interpret them.
+    }
+    Ok(SubjectPublicKeyInfo {
+        algorithm_oid,
+        algorithm_params,
+        subject_public_key: bit_content[1..].to_vec(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Extensions (RFC 5280 §4.1.2.9 / §4.2)
+// ---------------------------------------------------------------------------
+
+/// One Extension before encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extension {
+    pub oid: String,
+    pub critical: bool,
+    /// Pre-encoded DER for the extension's payload.  RFC 5280 wraps it
+    /// in an OCTET STRING; the encoder handles that.
+    pub value: Vec<u8>,
+}
+
+/// Encode a single `Extension` SEQUENCE.
+///
+/// The `critical` BOOLEAN is omitted when false (DER §11.5 — DEFAULT
+/// values must be absent).  This matches BC's
+/// `org.bouncycastle.asn1.x509.Extension.toASN1Primitive` exactly — the
+/// EJBCA → BC interop check drives this rule.
+pub fn encode_extension(ext: &Extension) -> Vec<u8> {
+    let oid_der = encode_oid(&ext.oid)
+        .unwrap_or_else(|_| encode_tlv(TAG_OID, ext.oid.as_bytes()));
+    let crit_der = if ext.critical {
+        Some(encode_boolean(true))
+    } else {
+        None
+    };
+    let value_der = encode_octet_string(&ext.value);
+    let mut inner = Vec::with_capacity(
+        oid_der.len() + crit_der.as_ref().map_or(0, |c| c.len()) + value_der.len(),
+    );
+    inner.extend_from_slice(&oid_der);
+    if let Some(c) = &crit_der {
+        inner.extend_from_slice(c);
+    }
+    inner.extend_from_slice(&value_der);
+    encode_sequence(&inner)
+}
+
+/// Encode a top-level `Extensions ::= SEQUENCE OF Extension`.
+pub fn encode_extensions(exts: &[Extension]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    for e in exts {
+        inner.extend_from_slice(&encode_extension(e));
+    }
+    encode_sequence(&inner)
+}
+
+/// Decode a single Extension SEQUENCE into the typed struct.
+pub fn decode_extension(der: &[u8]) -> Result<Extension, DerError> {
+    let (tag, hdr, content_len, _) = read_header(der)?;
+    if tag != TAG_SEQUENCE {
+        return Err(DerError::BadTag);
+    }
+    let content = &der[hdr..hdr + content_len];
+    // OID
+    let (otag, ohdr, oclen, ototal) = read_header(content)?;
+    if otag != TAG_OID {
+        return Err(DerError::BadTag);
+    }
+    let oid = read_oid(&content[ohdr..ohdr + oclen])?;
+    let mut pos = ototal;
+    // Optional BOOLEAN
+    let mut critical = false;
+    let (next_tag, next_hdr, next_clen, next_total) = read_header(&content[pos..])?;
+    if next_tag == TAG_BOOLEAN {
+        if next_clen != 1 {
+            return Err(DerError::BadLength);
+        }
+        critical = content[pos + next_hdr] != 0x00;
+        pos += next_total;
+    }
+    // OCTET STRING
+    let (vtag, vhdr, vclen, _) = read_header(&content[pos..])?;
+    if vtag != TAG_OCTET_STRING {
+        return Err(DerError::BadTag);
+    }
+    let value = content[pos + vhdr..pos + vhdr + vclen].to_vec();
+    Ok(Extension { oid, critical, value })
+}
+
+/// Decode a top-level `Extensions` SEQUENCE.
+pub fn decode_extensions(der: &[u8]) -> Result<Vec<Extension>, DerError> {
+    let (tag, hdr, content_len, _) = read_header(der)?;
+    if tag != TAG_SEQUENCE {
+        return Err(DerError::BadTag);
+    }
+    let content = &der[hdr..hdr + content_len];
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < content.len() {
+        let (_, _, _, total) = read_header(&content[pos..])?;
+        out.push(decode_extension(&content[pos..pos + total])?);
+        pos += total;
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// CertificationRequestInfo (RFC 2986 §4.1)
+// ---------------------------------------------------------------------------
+
+/// CertificationRequestInfo ::= SEQUENCE {
+///     version       INTEGER { v1(0) },
+///     subject       Name,
+///     subjectPKInfo SubjectPublicKeyInfo,
+///     attributes    \[0\] Attributes
+/// }
+///
+/// `subject_name_der` is the *complete* DER blob produced by
+/// `x500::encode_rdns_to_der` (i.e. an X.500 `Name` SEQUENCE).
+/// `subject_pki_der` is the SPKI SEQUENCE.  `attributes_der` is the
+/// inner SEQUENCE OF Attribute *content*; we wrap it in `[0]` here.
+/// Pass an empty slice to emit `[0] {}` (BC does this for plain CSRs
+/// with no extension request).
+pub fn encode_certification_request_info(
+    version: u64,
+    subject_name_der: &[u8],
+    subject_pki_der: &[u8],
+    attributes_inner: &[u8],
+) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(
+        16 + subject_name_der.len() + subject_pki_der.len() + attributes_inner.len(),
+    );
+    inner.extend_from_slice(&encode_integer_u64(version));
+    inner.extend_from_slice(subject_name_der);
+    inner.extend_from_slice(subject_pki_der);
+    inner.extend_from_slice(&encode_explicit_context(0, attributes_inner));
+    encode_sequence(&inner)
+}
+
+// ---------------------------------------------------------------------------
+// TBSCertificate skeleton (RFC 5280 §4.1)
+// ---------------------------------------------------------------------------
+
+/// Minimal TBSCertificate encoder for X.509 v3.
+///
+/// `TBSCertificate ::= SEQUENCE {
+///     version         \[0\] EXPLICIT INTEGER DEFAULT v1,
+///     serialNumber    INTEGER,
+///     signature       AlgorithmIdentifier,
+///     issuer          Name,
+///     validity        SEQUENCE { notBefore Time, notAfter Time },
+///     subject         Name,
+///     subjectPublicKeyInfo SubjectPublicKeyInfo,
+///     ...
+///     extensions      \[3\] EXPLICIT Extensions OPTIONAL
+/// }`
+///
+/// All inputs except `serial` and `extensions` are pre-encoded DER
+/// blobs.  `version_v3` controls whether to emit the explicit `[0] 2`
+/// version tag.  `validity_der` is the pre-built validity SEQUENCE
+/// (callers compose this from two `UTCTime` / `GeneralizedTime` TLVs —
+/// out of scope for this helper).  `extensions_der` is the wrapped
+/// Extensions SEQUENCE; the helper adds the `[3] EXPLICIT` wrapper.
+///
+/// This is a *skeleton* — Wave-6 + WP8.11.6 only need it to round-trip
+/// the BC test fixtures; full v3 cert issuance is deferred to whatever
+/// future WP wires up `X509CertificateGenerator`.
+pub fn encode_tbs_certificate(
+    version_v3: bool,
+    serial: &[u8],
+    signature_alg_der: &[u8],
+    issuer_name_der: &[u8],
+    validity_der: &[u8],
+    subject_name_der: &[u8],
+    subject_pki_der: &[u8],
+    extensions_der: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut inner = Vec::new();
+    if version_v3 {
+        // [0] EXPLICIT INTEGER 2.
+        let v = encode_integer_u64(2);
+        inner.extend_from_slice(&encode_explicit_context(0, &v));
+    }
+    inner.extend_from_slice(&encode_integer_unsigned(serial));
+    inner.extend_from_slice(signature_alg_der);
+    inner.extend_from_slice(issuer_name_der);
+    inner.extend_from_slice(validity_der);
+    inner.extend_from_slice(subject_name_der);
+    inner.extend_from_slice(subject_pki_der);
+    if let Some(ext) = extensions_der {
+        inner.extend_from_slice(&encode_explicit_context(3, ext));
+    }
+    encode_sequence(&inner)
+}
+
+// ---------------------------------------------------------------------------
+// Common signature/key OIDs (RFC 5280 §A.2 + RFC 8017 §A.2)
+// ---------------------------------------------------------------------------
+
+/// `rsaEncryption` — the algorithm OID for RSA SubjectPublicKeyInfo.
+pub const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+/// `sha256WithRSAEncryption`.
+pub const OID_SHA256_WITH_RSA: &str = "1.2.840.113549.1.1.11";
+/// `sha384WithRSAEncryption`.
+pub const OID_SHA384_WITH_RSA: &str = "1.2.840.113549.1.1.12";
+/// `sha512WithRSAEncryption`.
+pub const OID_SHA512_WITH_RSA: &str = "1.2.840.113549.1.1.13";
+/// `id-ecPublicKey`.
+pub const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+/// `ecdsa-with-SHA256`.
+pub const OID_ECDSA_WITH_SHA256: &str = "1.2.840.10045.4.3.2";
+/// `secp256r1` / P-256 named curve.
+pub const OID_SECP256R1: &str = "1.2.840.10045.3.1.7";
+/// `id-ce-extKeyUsage`.
+pub const OID_EXT_KEY_USAGE: &str = "2.5.29.37";
+/// `id-ce-basicConstraints`.
+pub const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
 
 #[cfg(test)]
 mod tests {

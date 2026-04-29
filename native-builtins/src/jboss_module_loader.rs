@@ -176,8 +176,21 @@ static MP_ROOT_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// (the rustjvm CLI captures positional args via `trailing_var_arg`,
 /// so they remain in the process argv).
 ///
-/// Returns `None` if `-mp` is not present (or has no following arg).
+/// Resolution order (first match wins):
+///   1. `RUSTJVM_JBOSS_MP_ROOT` environment variable — used by external
+///      integration tests (`vm/tests/wp8_10_jboss_modules_smoke.rs`)
+///      that need to inject a `-mp` value without touching the process
+///      argv (which is owned by the test harness, not our test).
+///   2. `-mp <path>`, `-modulepath <path>`, or `--module-path <path>`
+///      in the process argv.
+///
+/// Returns `None` if neither source is present.
 fn find_mp_argument() -> Option<String> {
+    if let Ok(root) = std::env::var("RUSTJVM_JBOSS_MP_ROOT") {
+        if !root.is_empty() {
+            return Some(root);
+        }
+    }
     let args: Vec<String> = std::env::args().collect();
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -1826,6 +1839,54 @@ mod tests {
         assert!(validate_module_name("foo\nbar").is_err());
         assert!(validate_module_name("foo\tbar").is_err());
         assert!(validate_module_name("foo\x7fbar").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // find_mp_argument — env-var fallback
+    // -----------------------------------------------------------------
+
+    /// WP8.10.5 — `RUSTJVM_JBOSS_MP_ROOT` environment variable provides a
+    /// `-mp` value when the process argv is owned by the test harness
+    /// (and therefore can't carry `-mp <path>`).  External integration
+    /// tests like `vm/tests/wp8_10_jboss_modules_smoke.rs` need this path
+    /// to point `LocalModuleLoader` at a fixture-built modules tree
+    /// without going through the rustjvm CLI.
+    ///
+    /// Acceptance: setting the env var causes `find_mp_argument()` to
+    /// return its value verbatim, taking precedence over any argv `-mp`
+    /// (the env-var setter has authority).  Empty or unset env var
+    /// causes us to fall back to argv.
+    #[test]
+    fn wp8_10_find_mp_argument_honours_env_var() {
+        let _g = TEST_LOCK.lock();
+        // Start from a clean slate.
+        let prev = std::env::var("RUSTJVM_JBOSS_MP_ROOT").ok();
+        std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", "/tmp/wp8_10_fixture_mp");
+        let v = find_mp_argument();
+        assert_eq!(v.as_deref(), Some("/tmp/wp8_10_fixture_mp"));
+        // Restore prior state.
+        match prev {
+            Some(p) => std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", p),
+            None => std::env::remove_var("RUSTJVM_JBOSS_MP_ROOT"),
+        }
+    }
+
+    /// Empty `RUSTJVM_JBOSS_MP_ROOT` must be ignored — we should fall
+    /// through to argv resolution rather than treating "" as a valid
+    /// (and dangerous) module-path root.
+    #[test]
+    fn wp8_10_find_mp_argument_ignores_empty_env_var() {
+        let _g = TEST_LOCK.lock();
+        let prev = std::env::var("RUSTJVM_JBOSS_MP_ROOT").ok();
+        std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", "");
+        let v = find_mp_argument();
+        // With an empty env var and the cargo test harness's argv (which
+        // never carries `-mp`), find_mp_argument() must return None.
+        assert!(v.is_none(), "empty env var must be treated as unset; got {:?}", v);
+        match prev {
+            Some(p) => std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", p),
+            None => std::env::remove_var("RUSTJVM_JBOSS_MP_ROOT"),
+        }
     }
 
     // -----------------------------------------------------------------

@@ -34,10 +34,13 @@
     "ClassNotFoundException",
     "NoClassDefFoundError",
     "NoSuchMethodError",
-    "java.lang.invoke.LambdaConversionException",
-    "java.lang.UnsupportedOperationException",
-    "Could not initialize class org.bouncycastle"
+    "java.lang.UnsupportedOperationException"
   ],
+  "removed_session_101": {
+    "Provider$Service": "WP6.5 Provider$Service.<init> NPE chain closed — see native-builtins/src/jca/provider_chain.rs (provider_service_init shim) + tests in vm/tests/wp6_5_provider_service_init.rs (4/4) and the new pins in jca::provider_chain::tests (5/5). The BC GOST3411$Mappings InternalError no longer fires from this NPE; if BC still fails to register fully, the next failure surface is downstream of the Service constructor (Provider.parseLegacyPut / Provider.put serviceMap population).",
+    "GOST3411$Mappings": "Was the symptom, not the cause — same closure as above.",
+    "cannot create instance of org.bouncycastle": "Was the wrapping InternalError text from the NPE; closure above removes the trigger."
+  },
   "expected_stderr_forbidden": [
     "panicked at",
     "RUST_BACKTRACE",
@@ -61,14 +64,23 @@
   },
   "known_blockers": [
     {"id": "WP8.10", "summary": "WildFly itself does not boot under rust-jvm yet."},
+    {"id": "WP6.5",  "summary": "BouncyCastle compatibility — Provider$Service.<init> NPE chain CLOSED in session 101 (native-builtins/src/jca/provider_chain.rs adds a 6-arg constructor shim + Provider$ServiceKey/EngineDescription <clinit> no-ops; tests in vm/tests/wp6_5_provider_service_init.rs 4/4 + jca::provider_chain::tests 5/5). PARTIAL: BC's downstream Cipher.getInstance(..., \"BC\")/Signature.getInstance(..., \"BC\") provider-chain lookups still need Provider.parseLegacyPut / Provider.serviceMap population to materialize and resolve cleanly — that is the next failure surface once the EAR boot reaches it."},
     {"id": "WP1.6",  "summary": "java.lang.invoke complete — Hibernate proxies + Weld CDI exercise corners not yet probed."},
-    {"id": "WP2.5",  "summary": "Dynamic Proxy.newProxyInstance — partial today; Hibernate/RESTEasy proxies will exercise this."},
-    {"id": "WP6.3",  "summary": "Cipher full algo set (AES-GCM, ChaCha20-Poly1305) — TLS + token encryption."},
-    {"id": "WP6.4",  "summary": "Signature/KeyFactory/KeyGenerator (ECDSA, Ed25519, RSA-PSS) — every issued cert."},
-    {"id": "WP6.5",  "summary": "BouncyCastle compatibility — partial. EJBCA's deepest crypto consumer."},
-    {"id": "WP6.6",  "summary": "ASN.1 DER for X.509 / PKCS#10 / PKCS#12."},
-    {"id": "WP5.1",  "summary": "SSLEngine TLS 1.3 — partial; client-cert renegotiation for admin mTLS still gaps."},
-    {"id": "WP3.5",  "summary": "FileChannel.map STUB → H2 MV-store cannot open. Likely first-failure once WP8.10 unblocks."}
+    {"id": "WP2.5",  "summary": "Dynamic Proxy.newProxyInstance — v3 bytecode emitter just landed (b289a94, classloading/src/proxy_gen.rs); Hibernate/RESTEasy proxies will exercise this end-to-end."},
+    {"id": "WP6.3",  "summary": "Cipher full algo set (AES-GCM works; ChaCha20-Poly1305 + RSA-PSS missing)."},
+    {"id": "WP6.4",  "summary": "Signature/KeyFactory/KeyGenerator (SHA{256,384}withECDSA + Ed25519 work; SHA512withECDSA + RSASSA-PSS + Ed448 missing)."},
+    {"id": "WP6.6",  "summary": "ASN.1 DER for X.500 names done; SubjectPublicKeyInfo / AlgorithmIdentifier / Extensions sequences for PKCS#10 / X.509 v3 missing — see WP8.11.6."},
+    {"id": "WP5.1",  "summary": "SSLEngine TLS 1.3 — partial; client-cert renegotiation for admin mTLS still gaps. Affects WP8.11.3 acceptance only."},
+    {"id": "WP8.11.5", "summary": "Lookup.defineHiddenClass NESTMATE flag propagation (Weld CDI Bean<?> proxies). Proposed in diagnostic.md, ~1-2d effort."},
+    {"id": "WP8.11.6", "summary": "BC PKCS#10 / X.509 v3 ASN.1 helpers. Proposed in diagnostic.md, ~1-2d effort."}
+  ],
+  "stale_pins_flipped_session_100": [
+    {"was": "WP3.5 FileChannel.map STUB", "now": "WP3.3 FileChannel.map DONE — memmap2-backed at native-io/src/file_channel.rs:171-247"},
+    {"was": "WP6.1 provider chain partial", "now": "WP6.1 provider chain seed DONE — 13 JDK 25 defaults at native-builtins/src/jca/provider_chain.rs:50-74"},
+    {"was": "WP6.6 ASN.1 stub", "now": "WP6.6 X.500-class DER DONE; PKCS#10/X.509 v3 helpers tracked under WP8.11.6"}
+  ],
+  "stale_pins_flipped_session_101": [
+    {"was": "WP6.5 BouncyCastle Provider$Service.<init> NPE first-failure", "now": "WP6.5 PARTIAL — Service.<init> NPE chain closed via native-builtins/src/jca/provider_chain.rs (provider_service_init shim + Provider$ServiceKey/EngineDescription <clinit> no-ops). Downstream Cipher/Signature provider-chain resolution is the next surface."}
   ],
   "history": [],
   "update_policy": "Update this file any time a triaged WP lands that changes expected_final_rc, the expected_stderr_contains alternatives list, or the known_blockers array. When the EAR finally deploys, swap the top-level expected_* with the acceptance_when_passing block and move the old block into history[]."

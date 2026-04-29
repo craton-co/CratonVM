@@ -642,6 +642,27 @@ fn initialize_class_shared(
     } else {
         // No <clinit> вЂ” class is fully initialized
         finalize_init(shared, class_id, ClassState::Initialized);
+
+        // WP8.10.5 — synthetic-stub classes never run a <clinit> (they
+        // have no bytecode), so the post-clinit fixup that populates
+        // load-bearing static fields like
+        // `DefaultBootModuleLoaderHolder.INSTANCE` was previously
+        // unreachable for the synthetic-stub-only path.  Fire it here
+        // for synthetic stubs only — real classes either run a clinit
+        // (and reach the swallow-path fixup site at line ~543) or
+        // populate their own statics.  Idempotent re-firing is fine
+        // because every fixup arm only writes a fresh value when the
+        // existing value is null/uninitialized.
+        let is_synthetic_stub = shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.is_synthetic_stub)
+            .unwrap_or(false);
+        if is_synthetic_stub {
+            post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+        }
+
         // Record JFR class load event
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

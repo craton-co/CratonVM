@@ -439,6 +439,118 @@ fn security_set_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 }
 
 // ---------------------------------------------------------------------------
+// WP6.5 — `java.security.Provider$Service.<init>` native shim.
+//
+// ## Problem
+//
+// `bench/wildfly/bcprobe.stderr.log` shows BouncyCastleProvider's setup
+// chain NPEing inside `Provider$Service.<init>` at pc=29:
+//
+//     class=java/security/Provider$Service method=<init> pc=29
+//     NullPointerException("Cannot invoke get on null")
+//
+// pc=29 maps to `this.engineDescription = knownEngines.get(type);` in
+// the OpenJDK 21+ bytecode for the constructor.  `knownEngines` is a
+// static `Map<String,EngineDescription>` populated by `Provider.<clinit>`
+// — but the populating sequence depends on the inner classes
+// `Provider$ServiceKey` and `EngineDescription` resolving cleanly under
+// real-JDK loading, which the rust-jvm class manager doesn't fully wire
+// today.  Result: `knownEngines` stays null, every BC `addAlgorithm`
+// call constructs a `Provider$Service` and the constructor NPEs on the
+// `.get(...)` call before BC finishes registering its ~500 algorithm
+// mappings.
+//
+// ## Fix
+//
+// Replace the constructor with a native that copies the six argument
+// references straight into the receiver's instance fields.  Bypassing
+// the bytecode means `knownEngines` is never read; the resulting
+// `Service` instance has `engineDescription == null` (the field is
+// final but the JVM allocates it as null and never writes via
+// PUTFIELD), which is fine for downstream code as long as nobody does
+// `service.engineDescription.foo()` (verified by audit — the
+// `engineDescription` field is consumed only inside `newInstance` /
+// `supportsParameter` paths that we either intercept upstream
+// (`Cipher.getInstance` / `Signature.getInstance`) or that fail
+// gracefully when the description is null).
+//
+// ## Field layout strategy
+//
+// The OpenJDK 21+ source declaration order for `Provider$Service` is:
+//   final Provider provider;        // declared first
+//   final String   type;            // engine type
+//   final String   algorithm;
+//   final String   className;
+//   final List<String>          aliases;
+//   final Map<String,String>    attributes;
+//   final EngineDescription     engineDescription;  // we LEAVE NULL
+//
+// Two write paths cover both modes:
+//   1. `set_field_by_name` — resolves the slot from the class hierarchy
+//      so real-JDK Provider$Service writes go to the right offsets.
+//   2. Slot fallback — `phases_early::register_phase53_security`
+//      registers synthetic getters reading `(type=0, algorithm=1,
+//      provider=2)`.  We mirror writes to those slots so synthetic-mode
+//      callers keep working.
+//
+// Constructor signature (instance method, args[0]=this):
+//   `(Provider, String type, String algorithm, String className,
+//     List<String> aliases, Map<String,String> attributes)V`
+//
+// args[0]=this  args[1]=provider  args[2]=type      args[3]=algorithm
+// args[4]=className args[5]=aliases  args[6]=attributes
+// ---------------------------------------------------------------------------
+
+fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+
+    let provider = args.get(1).copied().unwrap_or(Value::Object(None));
+    let svc_type = args.get(2).copied().unwrap_or(Value::Object(None));
+    let algorithm = args.get(3).copied().unwrap_or(Value::Object(None));
+    let class_name = args.get(4).copied().unwrap_or(Value::Object(None));
+    let aliases = args.get(5).copied().unwrap_or(Value::Object(None));
+    let attributes = args.get(6).copied().unwrap_or(Value::Object(None));
+
+    // Real-JDK path: write by field name so the actual class layout is
+    // honoured.  Each call is a no-op when the receiver has no field with
+    // that name (synthetic mode).
+    ctx.set_field_by_name(this, "provider", provider);
+    ctx.set_field_by_name(this, "type", svc_type);
+    ctx.set_field_by_name(this, "algorithm", algorithm);
+    ctx.set_field_by_name(this, "className", class_name);
+    ctx.set_field_by_name(this, "aliases", aliases);
+    ctx.set_field_by_name(this, "attributes", attributes);
+    // `engineDescription` left null — see module doc; this is the whole
+    // point of the shim.
+
+    // Synthetic-mode mirror: `phases_early::register_phase53_security`
+    // exposes `getType` / `getAlgorithm` / `getProvider` as slot-index
+    // reads at 0/1/2.  Mirror those writes so synthetic Provider$Service
+    // allocations (i.e. when the real-JDK class isn't loaded) keep
+    // returning the right values.
+    let nfields = ctx.object_num_fields(this);
+    if nfields > 0 {
+        ctx.set_field(this, 0, svc_type);
+    }
+    if nfields > 1 {
+        ctx.set_field(this, 1, algorithm);
+    }
+    if nfields > 2 {
+        ctx.set_field(this, 2, provider);
+    }
+
+    Ok(None)
+}
+
+/// `<clinit>` no-op — used to mark a class as initialized without
+/// running its bytecode.  Identical body to `cipher::clinit_noop`,
+/// restated here so this module is self-contained.
+#[inline]
+fn clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -449,6 +561,25 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     r.register(prov, "getVersionStr", "()Ljava/lang/String;", provider_get_version_str);
     r.register(prov, "toString", "()Ljava/lang/String;", provider_to_string);
     r.register(prov, "getInfo", "()Ljava/lang/String;", provider_get_info);
+
+    // WP6.5: short-circuit `Provider$Service.<init>` so BouncyCastle's
+    // setup() loop doesn't NPE on `knownEngines.get(type)` at pc=29.
+    // See module-level docs above this function for rationale.
+    let svc = "java/security/Provider$Service";
+    r.register(
+        svc,
+        "<init>",
+        "(Ljava/security/Provider;Ljava/lang/String;Ljava/lang/String;\
+         Ljava/lang/String;Ljava/util/List;Ljava/util/Map;)V",
+        provider_service_init,
+    );
+    // Inner-class `<clinit>` shims — `Provider$ServiceKey` and
+    // `EngineDescription` real-JDK clinits would otherwise drag the
+    // `knownEngines` static-init chain in.  The constructor shim above
+    // makes those chains unnecessary, so no-op them to skip the
+    // class-load-time work entirely.
+    r.register("java/security/Provider$ServiceKey", "<clinit>", "()V", clinit_noop);
+    r.register("java/security/Provider$EngineDescription", "<clinit>", "()V", clinit_noop);
 
     let sec = "java/security/Security";
     r.register(sec, "getProviders", "()[Ljava/security/Provider;", security_get_providers);
@@ -513,5 +644,186 @@ mod tests {
         assert!(find(&unique_name).is_some());
         remove(&unique_name);
         assert!(find(&unique_name).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // WP6.5: Provider$Service.<init> shim — verify the constructor
+    // populates all six instance fields without invoking real bytecode
+    // (no `knownEngines.get` lookup, no NPE).
+    // -----------------------------------------------------------------
+
+    use crate::test_utils::MockNativeContext;
+
+    /// Helper: allocate a synthetic Provider$Service heap entry sized
+    /// large enough for the slot fallback (synthetic getters at 0/1/2)
+    /// plus three more slots so `set_field_by_name` calls the production
+    /// code makes don't get rejected by `mock_jdk_field_slot` for unknown
+    /// field names (the mock silently ignores unknown names).
+    fn alloc_service(ctx: &mut MockNativeContext) -> ObjectRef {
+        // Synthetic mode: alloc 7 slots (0..6) so writes via set_field
+        // never overflow.
+        ctx.alloc_object(rustjvm_types::ClassId::new(0), 7)
+    }
+
+    #[test]
+    fn wp6_5_provider_service_init_registered_with_jdk21_descriptor() {
+        // Acceptance pin #1: the `<init>` shim must be registered on the
+        // exact 6-arg descriptor that BouncyCastle's `addAlgorithm` call
+        // chain reaches via `parseLegacyPut`. A descriptor mismatch would
+        // silently fall through to the real-JDK bytecode and re-trigger
+        // the `knownEngines.get(type)` NPE at pc=29.
+        let mut r = NativeMethodRegistry::new();
+        register(&mut r);
+        let cb = r.find(
+            "java/security/Provider$Service",
+            "<init>",
+            "(Ljava/security/Provider;Ljava/lang/String;Ljava/lang/String;\
+             Ljava/lang/String;Ljava/util/List;Ljava/util/Map;)V",
+        );
+        assert!(
+            cb.is_some(),
+            "Provider$Service.<init> with the JDK 21+ 6-arg descriptor must be registered"
+        );
+
+        // Defence: register() must be idempotent — re-registering the
+        // same triple from a sibling call site would otherwise panic on
+        // a hash collision check.
+        register(&mut r);
+        assert!(
+            r.find(
+                "java/security/Provider$Service",
+                "<init>",
+                "(Ljava/security/Provider;Ljava/lang/String;Ljava/lang/String;\
+                 Ljava/lang/String;Ljava/util/List;Ljava/util/Map;)V",
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn wp6_5_provider_service_init_populates_synthetic_slots() {
+        // The synthetic-mode `Provider$Service` getters declared in
+        // `phases_early::register_phase53_security` read from slots
+        // 0/1/2 → (type, algorithm, provider). Verify the shim writes
+        // those slots so subsequent `getType()` / `getAlgorithm()` /
+        // `getProvider()` calls return the right references.
+        let mut ctx = MockNativeContext::new();
+        let this = alloc_service(&mut ctx);
+        let provider = ctx.create_string("BC");
+        let svc_type = ctx.create_string("MessageDigest");
+        let algorithm = ctx.create_string("SHA-256");
+        let class_name = ctx.create_string("org.bouncycastle.jcajce.provider.digest.SHA256$Digest");
+        let aliases = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let attributes = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+
+        let args = [
+            Value::Object(Some(this)),
+            Value::Object(Some(provider)),
+            Value::Object(Some(svc_type)),
+            Value::Object(Some(algorithm)),
+            Value::Object(Some(class_name)),
+            Value::Object(Some(aliases)),
+            Value::Object(Some(attributes)),
+        ];
+        let res = provider_service_init(&mut ctx, &args);
+        assert!(res.is_ok(), "shim must not error");
+        assert!(matches!(res.unwrap(), None), "constructor returns void");
+
+        // Synthetic-mode slot mirror: type=0, algorithm=1, provider=2.
+        assert!(
+            matches!(ctx.get_field(this, 0), Value::Object(Some(o)) if o == svc_type),
+            "slot 0 must hold the `type` argument (synthetic getType())"
+        );
+        assert!(
+            matches!(ctx.get_field(this, 1), Value::Object(Some(o)) if o == algorithm),
+            "slot 1 must hold the `algorithm` argument (synthetic getAlgorithm())"
+        );
+        assert!(
+            matches!(ctx.get_field(this, 2), Value::Object(Some(o)) if o == provider),
+            "slot 2 must hold the `provider` argument (synthetic getProvider())"
+        );
+    }
+
+    #[test]
+    fn wp6_5_provider_service_init_does_not_npe_on_null_engines() {
+        // The whole point of the shim: the constructor must NOT consult
+        // `knownEngines` (which would NPE because the `Provider.<clinit>`
+        // chain doesn't fully populate it under real-JDK class loading
+        // here). Calling the shim with all-null aux arguments — the
+        // pathological case BouncyCastle's `parseLegacyPut` produces
+        // when an attribute map is empty — must return Ok(None) without
+        // touching any static state.
+        let mut ctx = MockNativeContext::new();
+        let this = alloc_service(&mut ctx);
+        let svc_type = ctx.create_string("Cipher");
+        let algorithm = ctx.create_string("AES/GCM/NoPadding");
+
+        let args = [
+            Value::Object(Some(this)),
+            Value::Object(None),               // null provider
+            Value::Object(Some(svc_type)),
+            Value::Object(Some(algorithm)),
+            Value::Object(None),               // null className
+            Value::Object(None),               // null aliases
+            Value::Object(None),               // null attributes
+        ];
+        let res = provider_service_init(&mut ctx, &args);
+        assert!(
+            res.is_ok(),
+            "shim must accept null aux args (parseLegacyPut produces these)"
+        );
+
+        // type and algorithm must still land in the synthetic slots.
+        assert!(
+            matches!(ctx.get_field(this, 0), Value::Object(Some(o)) if o == svc_type)
+        );
+        assert!(
+            matches!(ctx.get_field(this, 1), Value::Object(Some(o)) if o == algorithm)
+        );
+        // Provider slot is null — that's OK, the BC chain only consults
+        // `getType` / `getAlgorithm` for the cache key.
+        assert!(matches!(ctx.get_field(this, 2), Value::Object(None)));
+    }
+
+    #[test]
+    fn wp6_5_provider_service_init_throws_on_null_this() {
+        // Defensive: a null receiver must surface a NullPointerException
+        // (via `obj_arg`'s contract), not panic or silently succeed.
+        // BouncyCastle never produces this case but a regression in
+        // bytecode dispatch could hand us a null `this`.
+        let mut ctx = MockNativeContext::new();
+        let args = [
+            Value::Object(None),        // null this
+            Value::Object(None),
+            Value::Object(None),
+            Value::Object(None),
+            Value::Object(None),
+            Value::Object(None),
+            Value::Object(None),
+        ];
+        let res = provider_service_init(&mut ctx, &args);
+        assert!(
+            res.is_err(),
+            "null `this` must produce a NullPointerException, not silently succeed"
+        );
+    }
+
+    #[test]
+    fn wp6_5_inner_class_clinits_registered() {
+        // The inner-class clinit no-ops are part of the same fix:
+        // without them, the JVM walks `Provider$ServiceKey.<clinit>` and
+        // `Provider$EngineDescription.<clinit>` whose real bytecode
+        // touches the same `knownEngines` map indirectly. No-opping
+        // them keeps the fix self-consistent.
+        let mut r = NativeMethodRegistry::new();
+        register(&mut r);
+        assert!(
+            r.find("java/security/Provider$ServiceKey", "<clinit>", "()V").is_some(),
+            "Provider$ServiceKey.<clinit> must be no-op'd alongside the Service ctor shim"
+        );
+        assert!(
+            r.find("java/security/Provider$EngineDescription", "<clinit>", "()V").is_some(),
+            "Provider$EngineDescription.<clinit> must be no-op'd alongside the Service ctor shim"
+        );
     }
 }

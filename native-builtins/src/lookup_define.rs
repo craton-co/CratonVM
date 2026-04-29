@@ -225,11 +225,14 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // 2. Lookup.defineHiddenClass([B, boolean, ClassOption...) → Lookup
 // ---------------------------------------------------------------------------
 //
-// JEP 371: the new class is HIDDEN, has the lookup class as its NEST
-// HOST (always — even without the NESTMATE option, the spec says hidden
-// classes are nestmates of the defining lookup class), and is named
-// "<original>/0x<id>" so multiple defines from the same template get
-// distinct synthetic names.
+// JEP 371 / JLS §12.7: the new class is HIDDEN. When the caller passes
+// the `NESTMATE` ClassOption, the hidden class becomes a member of the
+// lookup class's NEST — i.e. its nest host equals the lookup class's
+// nest host, NOT the lookup class itself when the lookup class is a
+// nested class. Without NESTMATE, the hidden class is in its own nest.
+//
+// The hidden class is named "<original>/0x<id>" so multiple defines
+// from the same template get distinct synthetic names.
 
 fn lk_define_hidden_class_full(
     ctx: &mut dyn NativeContext,
@@ -239,22 +242,34 @@ fn lk_define_hidden_class_full(
     let class_bytes = decode_byte_array(ctx, args.get(1), "defineHiddenClass")?;
     let initialize = matches!(args.get(2), Some(Value::Int(n)) if *n != 0);
 
-    // Walk the ClassOption[] for STRONG (we don't act on it) / NESTMATE
-    // (no-op since hidden classes are always nestmates of the lookup
-    // class — kept here for forward-compat with future option flags).
-    if let Some(Value::Object(Some(options_arr))) = args.get(3) {
-        let _opt_count = ctx.array_length(*options_arr);
-        // No option currently changes the WP2.3-B behaviour. Loop reserved
-        // for future options (e.g. STRONG to keep the class loader pinned).
-    }
+    // WP8.11.5: Walk the ClassOption[] varargs and detect NESTMATE
+    // (ordinal 0) / STRONG (ordinal 1, advisory only). Each element is
+    // a synthetic ClassOption enum object whose field 0 holds its
+    // ordinal — same convention as `classloader.rs::lk_define_hidden_class`.
+    let nestmate = parse_nestmate_option(ctx, args.get(3));
 
-    let nest_host_class_name = lookup_class_name(ctx, this_lookup);
+    // WP8.11.5: When NESTMATE is set, the hidden class joins the lookup
+    // class's NEST (JEP 371). The correct nest-host name is the lookup
+    // class's *own* nest-host attribute when the lookup is itself a
+    // nested class, OR the lookup class's name when the lookup IS its
+    // own nest host. Without NESTMATE, leave `nest_host_class_name`
+    // unset so the class file's NestHost attribute (if any) — or
+    // self-nest — applies via the resolution chain in
+    // `class_manager.rs:1675-1678`.
+    let lookup_name = lookup_class_name(ctx, this_lookup);
+    let nest_host_class_name = if nestmate {
+        resolve_lookup_nest_host(ctx, this_lookup, lookup_name.clone())
+    } else {
+        None
+    };
     let code_source_url = lookup_class_code_source(ctx, this_lookup);
+    // Keep the original name for the mangled hidden-class label.
+    let nest_host_class_name_for_label = lookup_name;
 
     // Mint a unique mangled name. The class file's own `this_class` may
     // hold a placeholder; we pass `override_name` so the backend stamps
     // the new name into the class metadata.
-    let original = nest_host_class_name
+    let original = nest_host_class_name_for_label
         .clone()
         .unwrap_or_else(|| "HiddenClass".to_string());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -296,6 +311,73 @@ fn lk_define_hidden_class_full(
 }
 
 // ---------------------------------------------------------------------------
+// WP8.11.5 helpers — ClassOption[] parsing and nest-host resolution.
+// ---------------------------------------------------------------------------
+
+/// Walk a `MethodHandles$Lookup$ClassOption[]` array and return `true`
+/// if any element is the `NESTMATE` constant (ordinal 0). Field 0 of
+/// each synthetic ClassOption mirror holds its ordinal — same encoding
+/// used by `classloader.rs::lk_define_hidden_class`.
+///
+/// Returns `false` when the argument is null, missing, or not an array,
+/// matching the JDK's behaviour for an empty `ClassOption...` varargs.
+fn parse_nestmate_option(ctx: &mut dyn NativeContext, opts_arg: Option<&Value>) -> bool {
+    let options_arr = match opts_arg {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => return false,
+    };
+    let opt_count = ctx.array_length(options_arr);
+    for i in 0..opt_count {
+        if let Value::Object(Some(opt)) = ctx.get_array_element(options_arr, i) {
+            if let Value::Int(ord) = ctx.get_field(opt, 0) {
+                if ord == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolve the nest host that a NESTMATE hidden class should join.
+///
+/// Per JEP 371 / JLS §12.7, the new class is added to the *nest of the
+/// lookup class*. When the lookup class is itself a nested class
+/// (i.e. has a `NestHost` attribute pointing at an outer class), the
+/// hidden class's nest host must be that outer class — otherwise
+/// `Class.getNestHost()` of the hidden class would diverge from
+/// `Class.getNestHost()` of the lookup class, breaking
+/// `MethodHandles.privateLookupIn` and every `@Inject` injection point
+/// in Weld CDI's `Bean<?>` proxies.
+///
+/// Resolution order:
+///   1. `lookup_class.nest_host` (its own NestHost attribute) when set;
+///   2. otherwise, the lookup class's own name (it IS its own nest host).
+///
+/// Returns `None` only when the lookup class can't be identified
+/// (anonymous / public Lookup), in which case the backend falls back
+/// to the class file's NestHost attribute or self-nest.
+fn resolve_lookup_nest_host(
+    ctx: &mut dyn NativeContext,
+    this_lookup: ObjectRef,
+    lookup_class_name_cached: Option<String>,
+) -> Option<String> {
+    let mirror = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let cid = crate::lang_class::mirror_class_id(ctx, mirror)?;
+    // Prefer the lookup class's own NestHost attribute — this is the
+    // "lookup class is itself a nestmate" case (e.g. inner-class
+    // lookup minted via `MethodHandles.privateLookupIn(Outer$Inner.class, ...)`).
+    if let Some(host) = ctx.nest_host_name(cid) {
+        return Some(host);
+    }
+    // Lookup class is its own nest host.
+    lookup_class_name_cached.or_else(|| ctx.class_name_of_id(cid))
+}
+
+// ---------------------------------------------------------------------------
 // 3. Lookup.defineHiddenClassWithClassData(
 //        byte[] bytes,
 //        Object classData,
@@ -325,16 +407,20 @@ fn lk_define_hidden_class_with_class_data(
     };
     let initialize = matches!(args.get(3), Some(Value::Int(n)) if *n != 0);
 
-    // Walk ClassOption[]; same forward-compat-only loop as the plain
-    // `defineHiddenClass` case above.
-    if let Some(Value::Object(Some(_options_arr))) = args.get(4) {
-        // No option currently changes WP2.3-B behaviour.
-    }
-
-    let nest_host_class_name = lookup_class_name(ctx, this_lookup);
+    // WP8.11.5: NESTMATE option propagation, mirror of
+    // `lk_define_hidden_class_full`. ClassOption[] is arg 4 here
+    // (after [B, Object, Z); arg 3 in the plain variant).
+    let nestmate = parse_nestmate_option(ctx, args.get(4));
+    let lookup_name = lookup_class_name(ctx, this_lookup);
+    let nest_host_class_name = if nestmate {
+        resolve_lookup_nest_host(ctx, this_lookup, lookup_name.clone())
+    } else {
+        None
+    };
     let code_source_url = lookup_class_code_source(ctx, this_lookup);
+    let nest_host_class_name_for_label = lookup_name;
 
-    let original = nest_host_class_name
+    let original = nest_host_class_name_for_label
         .clone()
         .unwrap_or_else(|| "HiddenClass".to_string());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -626,5 +712,235 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // WP8.11.5 — NESTMATE flag propagation tests
+    // -----------------------------------------------------------------
+    //
+    // These tests pin the JEP 371 / JLS §12.7 contract for hidden-class
+    // nest-host inheritance. The WP8.11 diagnostic agent flagged that
+    // EJBCA's Weld CDI `Bean<?>` proxy generation was failing every
+    // `@Inject` injection point with `IllegalAccessError` because the
+    // NESTMATE option from `defineHiddenClass(bytes, true, NESTMATE,
+    // STRONG)` was being collapsed to a no-op rather than propagated to
+    // `define_class_full`'s `nest_host_class_name` field.
+    //
+    // The fix in this file walks the ClassOption[] varargs and only
+    // sets `nest_host_class_name` when NESTMATE is requested; the
+    // resolved name is the *lookup class's nest host* (not the lookup
+    // class itself) so a hidden class defined from inside an
+    // `Outer$Inner` lookup correctly joins `Outer`'s nest.
+
+    /// Build the smallest valid `MethodHandles$Lookup$ClassOption` enum
+    /// mirror with the requested ordinal at field 0 (NESTMATE = 0,
+    /// STRONG = 1). Mirrors the convention used by
+    /// `classloader.rs::lk_define_hidden_class`.
+    fn make_class_option(ctx: &mut MockNativeContext, ordinal: i32) -> ObjectRef {
+        let opt_cid = ctx.ensure_class_initialized(
+            "java/lang/invoke/MethodHandles$Lookup$ClassOption",
+        )
+        .expect("alloc class option cid");
+        let opt = ctx.alloc_object(opt_cid, 4);
+        ctx.set_field(opt, 0, Value::Int(ordinal));
+        opt
+    }
+
+    /// Build a `ClassOption[]` array containing the given ordinals.
+    fn make_options_array(ctx: &mut MockNativeContext, ordinals: &[i32]) -> ObjectRef {
+        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, ordinals.len());
+        for (i, ord) in ordinals.iter().enumerate() {
+            let opt = make_class_option(ctx, *ord);
+            ctx.set_array_element(arr, i, Value::Object(Some(opt)));
+        }
+        arr
+    }
+
+    /// Allocate a Lookup whose lookup-class field points at a mirror of
+    /// `class_name`, registering the name under a fresh ClassId.
+    /// Returns `(lookup_object, lookup_class_id)`.
+    fn make_lookup_for(ctx: &mut MockNativeContext, class_name: &str) -> (ObjectRef, ClassId) {
+        let cid = ctx.ensure_class_initialized(class_name).expect("alloc cid");
+        let mirror = ctx.get_class_mirror(cid);
+        let lookup = ctx.alloc_object(ClassId::new(1), 4);
+        ctx.set_field(lookup, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
+        (lookup, cid)
+    }
+
+    /// Drive `defineHiddenClass([B, true, options...)` with the given
+    /// lookup and ClassOption ordinals, returning the captured
+    /// `DefineClassFull.nest_host_class_name` actually passed to the
+    /// backend. Asserts the call itself succeeded.
+    fn drive_hidden_define(
+        lookup_class_name: &str,
+        lookup_nest_host: Option<&str>,
+        option_ordinals: &[i32],
+    ) -> Option<String> {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, lookup_cid) = make_lookup_for(&mut ctx, lookup_class_name);
+        if let Some(host) = lookup_nest_host {
+            ctx.set_nest_host_override(lookup_cid, host);
+        }
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(
+            rustjvm_types::ArrayElementType::Byte,
+            class_bytes.len(),
+        );
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+
+        let opts_arr = make_options_array(&mut ctx, option_ordinals);
+
+        let r = lk_define_hidden_class_full(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+                Value::Int(0), // initialize = false
+                Value::Object(Some(opts_arr)),
+            ],
+        );
+        assert!(r.is_ok(), "defineHiddenClass must succeed: {:?}", r.err());
+
+        ctx.last_define_full_opts()
+            .expect("define_class_full was not invoked")
+            .nest_host_class_name
+    }
+
+    /// Acceptance #1: when the lookup class IS its own nest host
+    /// (no `NestHost` attribute) and NESTMATE is requested, the hidden
+    /// class's nest host is the lookup class itself.
+    #[test]
+    fn nestmate_propagates_when_lookup_is_own_nest_host() {
+        let nh = drive_hidden_define(
+            "weld/cdi/BeanFactory",
+            None, // lookup IS its own nest host
+            &[0], // NESTMATE
+        );
+        assert_eq!(
+            nh.as_deref(),
+            Some("weld/cdi/BeanFactory"),
+            "NESTMATE-only hidden class must inherit the lookup class as nest host"
+        );
+    }
+
+    /// Acceptance #2: when the lookup class is itself a nestmate of an
+    /// outer class (i.e. its own `NestHost` attribute names the outer),
+    /// the hidden class's nest host is the OUTER class — not the
+    /// (already-nested) lookup class. This is the JEP 371 / JLS §12.7
+    /// transitive case that broke EJBCA's `Bean<?>` proxies: Weld's
+    /// `BeanFactory` is a static inner of `BeanManagerImpl`, so the
+    /// proxy must end up in `BeanManagerImpl`'s nest, not in
+    /// `BeanFactory`'s (which would not even be a valid nest).
+    #[test]
+    fn nestmate_inherits_outer_when_lookup_is_a_nestmate() {
+        let nh = drive_hidden_define(
+            "weld/cdi/BeanManagerImpl$BeanFactory",
+            Some("weld/cdi/BeanManagerImpl"), // lookup is itself a nestmate
+            &[0],                             // NESTMATE
+        );
+        assert_eq!(
+            nh.as_deref(),
+            Some("weld/cdi/BeanManagerImpl"),
+            "NESTMATE on a nestmate-lookup must resolve to the OUTER nest host \
+             (JEP 371: hidden class joins lookup class's nest, not the lookup itself)"
+        );
+    }
+
+    /// Acceptance #3: when NESTMATE is absent from the ClassOption[]
+    /// array (e.g. only STRONG passed, or empty options), the backend
+    /// receives `nest_host_class_name = None` so the class file's own
+    /// `NestHost` attribute (or self-nest) determines the nest host.
+    /// This guarantees we don't regress the default case where a
+    /// hidden class should remain in its own nest.
+    #[test]
+    fn no_nestmate_means_no_nest_host_inheritance() {
+        // Empty options.
+        let nh_empty = drive_hidden_define("some/Caller", None, &[]);
+        assert_eq!(
+            nh_empty, None,
+            "empty ClassOption[] must NOT inherit nest host"
+        );
+
+        // STRONG-only (ordinal 1) — also must not trigger inheritance.
+        let nh_strong = drive_hidden_define("some/Caller", None, &[1]);
+        assert_eq!(
+            nh_strong, None,
+            "STRONG-only ClassOption[] must NOT inherit nest host"
+        );
+    }
+
+    /// Defence-in-depth: NESTMATE + STRONG together (the exact pattern
+    /// emitted by Weld CDI's proxy generator) propagates correctly.
+    /// This pins the original Weld bytecode pattern from the WP8.11
+    /// diagnostic.
+    #[test]
+    fn nestmate_plus_strong_still_propagates() {
+        let nh = drive_hidden_define(
+            "weld/cdi/BeanManagerImpl$BeanFactory",
+            Some("weld/cdi/BeanManagerImpl"),
+            &[0, 1], // NESTMATE, STRONG — exact Weld pattern
+        );
+        assert_eq!(
+            nh.as_deref(),
+            Some("weld/cdi/BeanManagerImpl"),
+            "NESTMATE + STRONG (Weld's exact ClassOption[] pattern) must \
+             propagate the outer nest host"
+        );
+    }
+
+    /// Defence-in-depth: the WithClassData variant (used by
+    /// LambdaMetafactory and Weld's classData-bound proxies) also walks
+    /// the ClassOption[] correctly. We only need a single happy-path
+    /// assertion since the helper functions are shared with the plain
+    /// variant.
+    #[test]
+    fn with_class_data_also_propagates_nestmate() {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, lookup_cid) =
+            make_lookup_for(&mut ctx, "weld/cdi/BeanManagerImpl$BeanFactory");
+        ctx.set_nest_host_override(lookup_cid, "weld/cdi/BeanManagerImpl");
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(
+            rustjvm_types::ArrayElementType::Byte,
+            class_bytes.len(),
+        );
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+        let payload = ctx.alloc_object(ClassId::new(1), 1);
+        let opts_arr = make_options_array(&mut ctx, &[0, 1]);
+
+        let r = lk_define_hidden_class_with_class_data(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+                Value::Object(Some(payload)),
+                Value::Int(0),
+                Value::Object(Some(opts_arr)),
+            ],
+        );
+        assert!(r.is_ok(), "defineHiddenClassWithClassData must succeed");
+
+        let captured = ctx
+            .last_define_full_opts()
+            .expect("define_class_full not invoked")
+            .nest_host_class_name;
+        assert_eq!(
+            captured.as_deref(),
+            Some("weld/cdi/BeanManagerImpl"),
+            "WithClassData variant must also resolve to the outer nest host"
+        );
+    }
+
+    /// Smoke: keep the unused `dummy_this` helper alive so editors don't
+    /// flag it; future negative tests may want a null-this lookup.
+    #[test]
+    fn dummy_this_is_null_object() {
+        assert!(matches!(dummy_this(), Value::Object(None)));
     }
 }
