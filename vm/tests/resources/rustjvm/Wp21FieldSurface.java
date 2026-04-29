@@ -45,6 +45,9 @@ public class Wp21FieldSurface {
     /** Volatile long — exercises Unsafe.getLong/putLongVolatile path. */
     public volatile long v;
 
+    /** Plain (non-volatile) long — diagnostic differentiator for setLong. */
+    public long plainLong;
+
     /** Volatile reference — exercises Unsafe.getReferenceVolatile. */
     public volatile Object refV;
 
@@ -92,23 +95,77 @@ public class Wp21FieldSurface {
      * round-trips identically — and the Rust integration test asserts
      * the unsafe getLongVolatile native dispatched through.
      */
-    public static int volatileLongGetterSetterRoundTrips() {
+    /**
+     * Diagnostic: same shape as volatileLongGetterSetterRoundTrips
+     * but on a plain long — pinpoints whether the bug is in setLong
+     * (will fail) or in the volatile-aware path (will pass).
+     */
+    public static int plainLongGetterSetterRoundTripsDiag() {
+        Wp21FieldSurface o = new Wp21FieldSurface();
+        o.plainLong = 100L;
+        Field fp;
         try {
-            Wp21FieldSurface o = new Wp21FieldSurface();
-            o.v = 100L;
-            Field fv = Wp21FieldSurface.class.getDeclaredField("v");
-            // Preflight: modifier carries ACC_VOLATILE so the native
-            // takes the volatile-aware path.
-            if ((fv.getModifiers() & Modifier.VOLATILE) == 0) return -2;
-            long got = fv.getLong(o);
-            if (got != 100L) return 0;
-            fv.setLong(o, 200L);
-            if (fv.getLong(o) != 200L) return 0;
-            if (o.v != 200L) return 0;
-            return 1;
+            fp = Wp21FieldSurface.class.getDeclaredField("plainLong");
+        } catch (Throwable t) { return -10; }
+        long got;
+        try {
+            got = fp.getLong(o);
+        } catch (Throwable t) { return -12; }
+        if (got != 100L) return -20;
+        try {
+            fp.setLong(o, 200L);
+        } catch (Throwable t) { return -13; }
+        if (o.plainLong != 200L) return -22;
+        return 1;
+    }
+
+    public static int volatileLongGetterSetterRoundTrips() {
+        // Step-by-step sentinels so a failing run pinpoints the broken native:
+        //  -10  : Wp21FieldSurface.class.getDeclaredField("v") threw
+        //  -11  : Field.getModifiers() threw
+        //  -2   : ACC_VOLATILE bit missing on getModifiers
+        //  -12  : Field.getLong(o) initial read threw
+        //  0a   : initial getLong returned wrong value (-20 sentinel)
+        //  -13  : Field.setLong(o, 200) threw
+        //  -14  : second Field.getLong(o) threw
+        //  0b   : second getLong returned wrong value (-21 sentinel)
+        //  0c   : underlying field o.v didn't update (-22 sentinel)
+        Wp21FieldSurface o = new Wp21FieldSurface();
+        o.v = 100L;
+        Field fv;
+        try {
+            fv = Wp21FieldSurface.class.getDeclaredField("v");
         } catch (Throwable t) {
-            return -1;
+            return -10;
         }
+        int mods;
+        try {
+            mods = fv.getModifiers();
+        } catch (Throwable t) {
+            return -11;
+        }
+        if ((mods & Modifier.VOLATILE) == 0) return -2;
+        long got;
+        try {
+            got = fv.getLong(o);
+        } catch (Throwable t) {
+            return -12;
+        }
+        if (got != 100L) return -20;
+        try {
+            fv.setLong(o, 200L);
+        } catch (Throwable t) {
+            return -13;
+        }
+        long got2;
+        try {
+            got2 = fv.getLong(o);
+        } catch (Throwable t) {
+            return -14;
+        }
+        if (got2 != 200L) return -21;
+        if (o.v != 200L) return -22;
+        return 1;
     }
 
     /**

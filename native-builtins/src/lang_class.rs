@@ -1230,6 +1230,26 @@ pub(crate) fn coerce_arg_strict(
     expected_desc: &str,
     context: &str,
 ) -> Result<Value, MethodCallFailed> {
+    // WP2.1-field — operand-stack tag-erasure recovery for J/D.
+    //
+    // `CompactValue::to_value()` on an untagged 64-bit slot cannot tell
+    // a small-magnitude long from a denormal double — both round-trip
+    // identical bits.  When the operand stack pops a J-typed slot whose
+    // bit pattern doesn't match a NaN-tagged subform, the resulting
+    // `Value` is tagged `Double` even though the slot holds a long
+    // (and vice-versa for a D slot whose bits collide with a tagged
+    // subform).  See `types/src/compact_value.rs::to_value` and the
+    // descriptor-aware sibling `decode_by_descriptor`.
+    //
+    // For typed setters, the method descriptor tells us the declared
+    // type — reinterpret the bits accordingly so widening checks below
+    // see the right tag.  This sits at the native edge so the
+    // VM-internal call-frame plumbing stays untouched.
+    let value = match (expected_desc, value) {
+        ("J", Value::Double(d)) => Value::Long(d.to_bits() as i64),
+        ("D", Value::Long(n)) => Value::Double(f64::from_bits(n as u64)),
+        (_, v) => v,
+    };
     match expected_desc {
         // Primitive expected
         "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C" => {
