@@ -38,6 +38,8 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::{ObjectRef, Value};
 
+use rustc_hash::FxHashMap;
+
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
@@ -551,6 +553,397 @@ fn clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
 }
 
 // ---------------------------------------------------------------------------
+// WP6.5 finish — `Provider.put` / `parseLegacyPut` / `getService`.
+//
+// ## What this section adds
+//
+// A process-wide service registry keyed on `(provider_name, type,
+// algorithm_normalized)` plus an alias map keyed on
+// `(provider_name, type, alias_normalized) → canonical algorithm`.
+// The registry is populated by `Provider.put(Object, Object)` —
+// BouncyCastleProvider's `addAlgorithm(...)` chain reaches it via
+// the JDK's `parseLegacyPut(String, String)` helper which cracks
+// "Cipher.AES/GCM/NoPadding" into `(type="Cipher", algo="AES/GCM/NoPadding")`.
+//
+// ## What it solves
+//
+// Without a per-provider service map, `Cipher.getInstance(algo, "BC")`
+// has no way to confirm BC actually registered the algorithm — every
+// such call would either fall through to permissive synthetic dispatch
+// (which silently misroutes BC-only algos to the SUN-style backend) or
+// throw NoSuchAlgorithmException because real-JDK Provider.getService
+// queries `services` which our shim leaves null.
+//
+// ## Service entry shape
+//
+// `ServiceEntry` mirrors the six fields a JDK `Provider.Service`
+// constructor takes — `provider`, `type`, `algorithm`, `className`,
+// `aliases`, `attributes` — but stores only what the consumer side
+// (`Cipher.getInstance(algo, providerName)`, `Provider.getService(...)`)
+// reads back.  We don't materialise `EngineDescription` (the
+// `<init>` shim leaves it null on purpose, see module-level docs).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+struct ServiceEntry {
+    /// Engine type, e.g. "Cipher", "MessageDigest", "Signature".
+    /// Stored exactly as the put() call passed it (case preserved
+    /// for diagnostics, but lookups go through `normalize_engine`).
+    type_str: String,
+    /// Canonical algorithm name, e.g. "AES/GCM/NoPadding".  Lookups
+    /// route through `normalize_algo`.
+    algorithm: String,
+    /// Implementation class name, e.g.
+    /// "org.bouncycastle.jcajce.provider.symmetric.AES$GCM".
+    /// May be empty if the put() call only registered an alias.
+    class_name: String,
+    /// Original lookup key used during `put` (e.g. the literal
+    /// "Cipher.AES/GCM/NoPadding"), retained so `getService` /
+    /// debugging can render it verbatim.
+    key: String,
+}
+
+/// Process-wide service map, keyed `(provider_name → (type, algo) → entry)`.
+/// Provider-name match is case-sensitive (matches JDK semantics — names
+/// are stable identifiers).  Type+algo lookups normalise to ASCII upper-
+/// case so `cipher.getInstance("aes/gcm/nopadding", "BC")` resolves the
+/// same entry as `getInstance("AES/GCM/NoPadding", "BC")`.
+type ServiceMap = FxHashMap<(String, String), ServiceEntry>;
+
+fn services() -> &'static parking_lot::Mutex<FxHashMap<String, ServiceMap>> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<parking_lot::Mutex<FxHashMap<String, ServiceMap>>> = OnceLock::new();
+    MAP.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
+}
+
+/// Process-wide alias map, keyed `(provider_name, type, alias_norm)
+/// → canonical_algo_norm`.  BouncyCastle's legacy `addAlgorithm` flow
+/// produces both kinds of put-keys; we resolve aliases on the way in,
+/// not on the way out, so `getService` is a single hash lookup.
+fn aliases() -> &'static parking_lot::Mutex<FxHashMap<(String, String, String), String>> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<parking_lot::Mutex<FxHashMap<(String, String, String), String>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
+}
+
+/// Engine type normalisation: ASCII uppercase, no leading/trailing dots.
+/// JDK's `Provider$ServiceKey` uses case-insensitive comparison for both
+/// type and algorithm.
+fn normalize_engine(s: &str) -> String {
+    s.trim().to_ascii_uppercase()
+}
+
+/// Algorithm-name normalisation: ASCII uppercase.  The JDK trims spaces
+/// inside transformation strings on lookup but BC stores them with no
+/// internal whitespace, so simple uppercase suffices.
+fn normalize_algo(s: &str) -> String {
+    s.trim().to_ascii_uppercase()
+}
+
+/// Provider-side getter: fetch `(class_name, algorithm)` for an
+/// `(provider, type, algo-or-alias)` triple.  Caller-side aliases are
+/// resolved here before the service lookup runs, so e.g.
+/// `getService("Cipher", "AES")` will resolve to the entry whose
+/// canonical algo is "AES" even if BC registered an alias chain.
+fn get_service_entry(provider: &str, type_str: &str, algo: &str) -> Option<ServiceEntry> {
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algo);
+    // Resolve alias first.
+    let canonical = aliases()
+        .lock()
+        .get(&(provider.to_string(), type_n.clone(), algo_n.clone()))
+        .cloned()
+        .unwrap_or(algo_n);
+    services()
+        .lock()
+        .get(provider)
+        .and_then(|m| m.get(&(type_n, canonical)).cloned())
+}
+
+/// Crack a legacy-style put key (e.g. `"Cipher.AES/GCM/NoPadding"`,
+/// `"Alg.Alias.Cipher.AES"`, `"Cipher AES/GCM/NoPadding SupportedModes"`)
+/// into `(kind, type, algorithm, attribute_or_alias_target)`.
+///
+/// Returns `None` for keys that aren't service-shaped (e.g. arbitrary
+/// `Properties` reads BC stashes inside its provider — those are
+/// stored in the property bag but ignored by service resolution).
+///
+/// `kind` is one of:
+///   - `"primary"` — `"Type.Algorithm"` registers a Service entry.
+///   - `"alias"`   — `"Alg.Alias.Type.Alias"` maps Alias → value.
+///   - `"attr"`    — `"Type.Algorithm AttrName"` sets an attribute
+///                   on an existing Service.  We currently store these
+///                   in the entry's class_name slot only when they are
+///                   the recognized `ImplementedIn` style; the attribute
+///                   path is mostly cosmetic for resolution.
+///
+/// Mirrors OpenJDK's `Provider.parseLegacyPut(String, String)` —
+/// see https://github.com/openjdk/jdk/blob/jdk-25%2B/src/java.base/share/classes/java/security/Provider.java.
+fn parse_legacy_key(key: &str) -> Option<(String, String, String, Option<String>)> {
+    // Attribute form: "Type.Algorithm AttrName" — split on first space.
+    let (head, attr) = match key.find(' ') {
+        Some(idx) => (&key[..idx], Some(key[idx + 1..].trim().to_string())),
+        None => (key, None),
+    };
+    let head = head.trim();
+    if head.is_empty() {
+        return None;
+    }
+
+    // Alias form: "Alg.Alias.<Type>.<Alias>" — three dots minimum.
+    if let Some(rest) = head.strip_prefix("Alg.Alias.") {
+        let dot = rest.find('.')?;
+        let type_str = &rest[..dot];
+        let alias = &rest[dot + 1..];
+        if type_str.is_empty() || alias.is_empty() {
+            return None;
+        }
+        return Some((
+            "alias".to_string(),
+            type_str.to_string(),
+            alias.to_string(),
+            None,
+        ));
+    }
+
+    // Primary / attr form: "Type.Algorithm[ AttrName]" — split on FIRST dot.
+    let dot = head.find('.')?;
+    let type_str = &head[..dot];
+    let algorithm = &head[dot + 1..];
+    if type_str.is_empty() || algorithm.is_empty() {
+        return None;
+    }
+    let kind = if attr.is_some() { "attr" } else { "primary" };
+    Some((
+        kind.to_string(),
+        type_str.to_string(),
+        algorithm.to_string(),
+        attr,
+    ))
+}
+
+/// Internal API: register a single service entry.  Test helper plus
+/// the mechanism `provider_put_native` and `provider_parse_legacy_put_native`
+/// both funnel through.
+fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
+    let entry = ServiceEntry {
+        type_str: type_str.to_string(),
+        algorithm: algorithm.to_string(),
+        class_name: value.to_string(),
+        key: format!("{type_str}.{algorithm}"),
+    };
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algorithm);
+    let mut s = services().lock();
+    s.entry(provider.to_string())
+        .or_default()
+        .insert((type_n, algo_n), entry);
+}
+
+/// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
+fn put_alias(provider: &str, type_str: &str, alias: &str, canonical: &str) {
+    let type_n = normalize_engine(type_str);
+    let alias_n = normalize_algo(alias);
+    let canon_n = normalize_algo(canonical);
+    aliases()
+        .lock()
+        .insert((provider.to_string(), type_n, alias_n), canon_n);
+}
+
+/// Apply a single `put(key, value)` operation against the provider's
+/// service map.  Keys that don't parse as `Type.Algorithm` /
+/// `Alg.Alias.Type.Alias` / `Type.Algorithm Attr` are silently ignored
+/// — they'd land in the inherited `Hashtable` slot in the real JDK and
+/// never participate in service resolution.
+///
+/// Returns `true` when the put resulted in a service-map mutation,
+/// `false` when the key was non-service-shaped.
+fn apply_legacy_put(provider: &str, key: &str, value: &str) -> bool {
+    let parsed = match parse_legacy_key(key) {
+        Some(p) => p,
+        None => return false,
+    };
+    match parsed.0.as_str() {
+        "primary" => {
+            put_service(provider, &parsed.1, &parsed.2, value);
+            true
+        }
+        "alias" => {
+            // Alias maps: parsed.2 is the alias name, value is canonical algo.
+            put_alias(provider, &parsed.1, &parsed.2, value);
+            true
+        }
+        "attr" => {
+            // Attribute on an existing service.  Ignore here — attribute
+            // semantics (`SupportedModes`, `SupportedKeyClasses`, …) are
+            // queried by `Service.supportsParameter` which we don't
+            // intercept.  Returning true so callers can distinguish
+            // "ignored shape" (false) from "recognized but no-op" (true).
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Discover the provider name attached to a `Provider` receiver.  Used
+/// by `Provider.put` / `parseLegacyPut` to key the global service map.
+/// Falls back to `"<unknown>"` if the receiver has no name (which would
+/// only happen for synthetic test fixtures).
+fn provider_name_of(ctx: &dyn NativeContext, prov: ObjectRef) -> String {
+    if let Some((name, _)) = read_provider_name_version(ctx, prov) {
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    "<unknown>".to_string()
+}
+
+/// `Provider.put(Object key, Object value)` native — accepts any
+/// `(Object, Object)` pair, but only `(String, String)` participates
+/// in service-map population.  Other shapes (Object value used as
+/// attribute holder) silently no-op on the service side; the value is
+/// preserved on the inherited Hashtable in the real-JDK class so the
+/// JVM doesn't lose state.
+///
+/// Returns the previous value the same way `Hashtable.put` does — we
+/// return null because there is no per-key prior-value tracking on our
+/// shim, which matches the behaviour any caller sees on a fresh
+/// Provider's first put.
+fn provider_put_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let value = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        // Non-string value (rare — BC sometimes puts an attribute Map).
+        // Stringify as empty so `apply_legacy_put` still parses the key
+        // shape and stores an entry with an empty class_name.
+        _ => String::new(),
+    };
+    let provider_name = provider_name_of(ctx, this);
+    apply_legacy_put(&provider_name, &key, &value);
+    // Hashtable.put contract: return previous value (null on first put).
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Provider.parseLegacyPut(String name, String value)` native — the
+/// JDK's package-private helper that BouncyCastle's `addAlgorithm`
+/// chain calls into.  Identical population semantics to `put` modulo
+/// the return type (void).
+///
+/// The descriptor used here matches the OpenJDK 21+ source — a 2-arg
+/// instance method.  If a future JDK version moves this to a
+/// `Properties#put` override, the put native above already handles
+/// that path.
+fn provider_parse_legacy_put_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    let value = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let provider_name = provider_name_of(ctx, this);
+    apply_legacy_put(&provider_name, &name, &value);
+    Ok(None)
+}
+
+/// Allocate a `Provider$Service` synthetic populated from a stored
+/// `ServiceEntry`.  Used by `provider_get_service_native` and the
+/// `Cipher.getInstance(algo, providerName)` resolution path.
+fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectRef) -> ObjectRef {
+    let svc = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7);
+    let type_s = ctx.create_string(&entry.type_str);
+    let algo_s = ctx.create_string(&entry.algorithm);
+    let class_s = ctx.create_string(&entry.class_name);
+
+    // Real-JDK path — write by field name.
+    ctx.set_field_by_name(svc, "provider", Value::Object(Some(prov)));
+    ctx.set_field_by_name(svc, "type", Value::Object(Some(type_s)));
+    ctx.set_field_by_name(svc, "algorithm", Value::Object(Some(algo_s)));
+    ctx.set_field_by_name(svc, "className", Value::Object(Some(class_s)));
+
+    // Synthetic-mode mirror — getType=0, getAlgorithm=1, getProvider=2
+    // (matches the layout in `phases_early::register_phase53_security`).
+    ctx.set_field(svc, 0, Value::Object(Some(type_s)));
+    ctx.set_field(svc, 1, Value::Object(Some(algo_s)));
+    ctx.set_field(svc, 2, Value::Object(Some(prov)));
+    // Slot 3 reserved for className so the new `Service.getClassName`
+    // accessor (registered below) returns the right string.
+    ctx.set_field(svc, 3, Value::Object(Some(class_s)));
+    svc
+}
+
+/// `Provider.getService(String type, String algorithm)` native —
+/// resolves a service entry from the per-provider map populated via
+/// `put` / `parseLegacyPut`.  Returns null if the provider has no
+/// entry for that `(type, algorithm)` pair (matches the JDK contract;
+/// `Cipher.getInstance` then throws `NoSuchAlgorithmException`).
+fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let type_str = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let algo = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let prov_name = provider_name_of(ctx, this);
+    match get_service_entry(&prov_name, &type_str, &algo) {
+        Some(entry) => {
+            let svc = make_service(ctx, &entry, this);
+            Ok(Some(Value::Object(Some(svc))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Provider$Service.getClassName()` native — returns the entry's
+/// implementation class name.  Required by the BC fallback path and by
+/// `Cipher.getInstance(algo, providerName)` to render diagnostics when
+/// resolution fails.  Reads slot 3 (populated in `make_service`).
+fn provider_service_get_class_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Real-JDK path first.
+    let by_name = ctx.get_field_by_name(this, "className");
+    if matches!(&by_name, Value::Object(Some(_))) {
+        return Ok(Some(by_name));
+    }
+    Ok(Some(ctx.get_field(this, 3)))
+}
+
+#[cfg(test)]
+static TEST_SERVICE_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test helper: clear the global service / alias maps and return a guard
+/// that serialises tests touching global service state.  Cargo runs tests
+/// in parallel by default, and the WP6.5-finish service map is process-wide;
+/// without this guard, two tests can race such that test A's
+/// `reset_service_state_for_tests` clears test B's entries mid-flight,
+/// producing intermittent `unwrap on None` failures.  The returned guard
+/// is held until the end of the calling test (bind to `_lock` — DROPPING
+/// it early defeats the serialisation).
+#[cfg(test)]
+#[must_use = "drop the guard at the end of the test, not before; assign to `_lock`"]
+fn reset_service_state_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    let guard = TEST_SERVICE_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    services().lock().clear();
+    aliases().lock().clear();
+    guard
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -580,6 +973,51 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // class-load-time work entirely.
     r.register("java/security/Provider$ServiceKey", "<clinit>", "()V", clinit_noop);
     r.register("java/security/Provider$EngineDescription", "<clinit>", "()V", clinit_noop);
+
+    // WP6.5 finish: service-map population + lookup.
+    //
+    // `Provider.put(Object,Object)` is the public surface BouncyCastle's
+    // `addAlgorithm` reaches via the inherited `Hashtable` API.
+    // `parseLegacyPut(String,String)` is the package-private helper that
+    // older BC versions call directly; we shim both so the population
+    // path is covered regardless of which one the caller uses.
+    //
+    // `getService(String,String)` is the consumer side — every
+    // `Cipher.getInstance(algo, providerName)` /
+    // `Signature.getInstance(algo, providerName)` resolution funnels
+    // through it.
+    r.register(
+        prov,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        provider_put_native,
+    );
+    r.register(
+        prov,
+        "parseLegacyPut",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        provider_parse_legacy_put_native,
+    );
+    r.register(
+        prov,
+        "getService",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;",
+        provider_get_service_native,
+    );
+
+    // Provider$Service accessors — `getClassName()` is consumed by both
+    // `Cipher.getInstance` (to instantiate the SPI) and by callers
+    // building diagnostic strings.  `getType` / `getAlgorithm` /
+    // `getProvider` are already registered in
+    // `phases_early::register_phase53_security`; re-registering here
+    // would be a no-op (idempotent) but the explicit `getClassName`
+    // entry is new for WP6.5 finish.
+    r.register(
+        svc,
+        "getClassName",
+        "()Ljava/lang/String;",
+        provider_service_get_class_name,
+    );
 
     let sec = "java/security/Security";
     r.register(sec, "getProviders", "()[Ljava/security/Provider;", security_get_providers);
@@ -824,6 +1262,282 @@ mod tests {
         assert!(
             r.find("java/security/Provider$EngineDescription", "<clinit>", "()V").is_some(),
             "Provider$EngineDescription.<clinit> must be no-op'd alongside the Service ctor shim"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // WP6.5 finish — service map population + lookup.
+    //
+    // These tests pin the unit-level behaviour of the parseLegacyPut
+    // and getService chain: that "Cipher.AES/GCM/NoPadding"-style keys
+    // crack into (Cipher, AES/GCM/NoPadding), that the entry lands in
+    // the per-provider service map, and that getService returns it
+    // case-insensitively.  Higher-level integration is in
+    // `vm/tests/wp6_5_finish_provider_chain_resolution.rs`.
+    //
+    // Each test calls `reset_service_state_for_tests()` first so global
+    // state from sibling tests doesn't bleed in.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_legacy_key_primary_form() {
+        let parsed = parse_legacy_key("Cipher.AES/GCM/NoPadding").unwrap();
+        assert_eq!(parsed.0, "primary");
+        assert_eq!(parsed.1, "Cipher");
+        assert_eq!(parsed.2, "AES/GCM/NoPadding");
+        assert!(parsed.3.is_none());
+    }
+
+    #[test]
+    fn parse_legacy_key_alias_form() {
+        let parsed = parse_legacy_key("Alg.Alias.Cipher.AES").unwrap();
+        assert_eq!(parsed.0, "alias");
+        assert_eq!(parsed.1, "Cipher");
+        assert_eq!(parsed.2, "AES");
+        assert!(parsed.3.is_none());
+    }
+
+    #[test]
+    fn parse_legacy_key_attribute_form() {
+        // "Type.Algorithm AttrName" — attr lands in the optional 4th tuple slot.
+        let parsed = parse_legacy_key("Cipher.AES SupportedModes").unwrap();
+        assert_eq!(parsed.0, "attr");
+        assert_eq!(parsed.1, "Cipher");
+        assert_eq!(parsed.2, "AES");
+        assert_eq!(parsed.3.as_deref(), Some("SupportedModes"));
+    }
+
+    #[test]
+    fn parse_legacy_key_rejects_non_service_keys() {
+        // Empty + dot-only strings must not parse — they'd otherwise
+        // pollute the service map with bogus entries.
+        assert!(parse_legacy_key("").is_none());
+        assert!(parse_legacy_key(".").is_none());
+        // A no-dot key (no Type.Algorithm separator) must reject.
+        assert!(parse_legacy_key("UnstructuredKey").is_none());
+        // An incomplete alias ("Alg.Alias.Cipher" with no third segment)
+        // must reject — the OpenJDK helper requires both type and alias.
+        assert!(parse_legacy_key("Alg.Alias.Cipher").is_none());
+    }
+
+    #[test]
+    fn put_service_round_trip_via_apply_legacy_put() {
+        let _lock = reset_service_state_for_tests();
+        let ok = apply_legacy_put(
+            "TestProvider",
+            "Cipher.AES/GCM/NoPadding",
+            "com.example.TestAesGcm",
+        );
+        assert!(ok, "primary key must populate the service map");
+        let entry = get_service_entry("TestProvider", "Cipher", "AES/GCM/NoPadding").unwrap();
+        assert_eq!(entry.type_str, "Cipher");
+        assert_eq!(entry.algorithm, "AES/GCM/NoPadding");
+        assert_eq!(entry.class_name, "com.example.TestAesGcm");
+    }
+
+    #[test]
+    fn get_service_entry_is_case_insensitive() {
+        let _lock = reset_service_state_for_tests();
+        apply_legacy_put("BC", "Cipher.AES/GCM/NoPadding", "org.bc.AESGCM");
+        // Lower-case lookup must hit.
+        assert!(get_service_entry("BC", "cipher", "aes/gcm/nopadding").is_some());
+        // Mixed case must hit.
+        assert!(get_service_entry("BC", "CIPHER", "AES/GCM/nopadding").is_some());
+        // Wrong provider name does NOT hit (provider names are stable).
+        assert!(get_service_entry("SUN", "Cipher", "AES/GCM/NoPadding").is_none());
+    }
+
+    #[test]
+    fn alias_resolves_to_canonical_service() {
+        let _lock = reset_service_state_for_tests();
+        // Register the canonical service plus an alias pointing to it.
+        apply_legacy_put("BC", "MessageDigest.SHA-256", "org.bc.SHA256");
+        apply_legacy_put("BC", "Alg.Alias.MessageDigest.SHA256", "SHA-256");
+        // Lookup by alias (no dash) must resolve to the canonical entry.
+        let via_alias = get_service_entry("BC", "MessageDigest", "SHA256").unwrap();
+        assert_eq!(via_alias.algorithm, "SHA-256");
+        assert_eq!(via_alias.class_name, "org.bc.SHA256");
+        // Direct canonical lookup still works.
+        let direct = get_service_entry("BC", "MessageDigest", "SHA-256").unwrap();
+        assert_eq!(direct.class_name, "org.bc.SHA256");
+    }
+
+    #[test]
+    fn put_native_populates_service_via_string_keys() {
+        let _lock = reset_service_state_for_tests();
+        let mut ctx = MockNativeContext::new();
+        // Build a Provider receiver with `name="BC"` populated.
+        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let name = ctx.create_string("BC");
+        ctx.set_field(prov, 0, Value::Object(Some(name)));
+        ctx.set_field(prov, 1, Value::Double(1.80));
+
+        let key = ctx.create_string("Cipher.AES/GCM/NoPadding");
+        let value = ctx.create_string("org.bouncycastle.jcajce.provider.symmetric.AES$GCM");
+        let args = [
+            Value::Object(Some(prov)),
+            Value::Object(Some(key)),
+            Value::Object(Some(value)),
+        ];
+        let res = provider_put_native(&mut ctx, &args);
+        assert!(res.is_ok());
+        // Hashtable.put returns previous value — null for first put.
+        assert!(matches!(res.unwrap(), Some(Value::Object(None))));
+
+        // The service map must now have the entry under "BC".
+        let entry = get_service_entry("BC", "Cipher", "AES/GCM/NoPadding").unwrap();
+        assert_eq!(
+            entry.class_name,
+            "org.bouncycastle.jcajce.provider.symmetric.AES$GCM"
+        );
+    }
+
+    #[test]
+    fn parse_legacy_put_native_alias_round_trip() {
+        let _lock = reset_service_state_for_tests();
+        let mut ctx = MockNativeContext::new();
+        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let name = ctx.create_string("BC");
+        ctx.set_field(prov, 0, Value::Object(Some(name)));
+        ctx.set_field(prov, 1, Value::Double(1.80));
+
+        // First, the canonical service.
+        let key1 = ctx.create_string("MessageDigest.SHA-256");
+        let val1 = ctx.create_string("org.bc.SHA256");
+        let _ = provider_parse_legacy_put_native(
+            &mut ctx,
+            &[
+                Value::Object(Some(prov)),
+                Value::Object(Some(key1)),
+                Value::Object(Some(val1)),
+            ],
+        );
+        // Then, an alias.
+        let key2 = ctx.create_string("Alg.Alias.MessageDigest.SHA256");
+        let val2 = ctx.create_string("SHA-256");
+        let _ = provider_parse_legacy_put_native(
+            &mut ctx,
+            &[
+                Value::Object(Some(prov)),
+                Value::Object(Some(key2)),
+                Value::Object(Some(val2)),
+            ],
+        );
+
+        // Resolve via alias.
+        let resolved = get_service_entry("BC", "MessageDigest", "SHA256").unwrap();
+        assert_eq!(resolved.algorithm, "SHA-256");
+    }
+
+    #[test]
+    fn get_service_native_returns_null_for_unknown_algo() {
+        let _lock = reset_service_state_for_tests();
+        let mut ctx = MockNativeContext::new();
+        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let name = ctx.create_string("BC");
+        ctx.set_field(prov, 0, Value::Object(Some(name)));
+        ctx.set_field(prov, 1, Value::Double(1.80));
+
+        let type_s = ctx.create_string("Cipher");
+        let algo_s = ctx.create_string("MissingAlgo");
+        let res = provider_get_service_native(
+            &mut ctx,
+            &[
+                Value::Object(Some(prov)),
+                Value::Object(Some(type_s)),
+                Value::Object(Some(algo_s)),
+            ],
+        );
+        assert!(res.is_ok());
+        // Null = NoSuchAlgorithmException at the JDK call site.
+        assert!(matches!(res.unwrap(), Some(Value::Object(None))));
+    }
+
+    #[test]
+    fn get_service_native_returns_populated_service_for_registered_algo() {
+        let _lock = reset_service_state_for_tests();
+        // Pre-populate the service map for "BC".
+        apply_legacy_put(
+            "BC",
+            "Cipher.AES/GCM/NoPadding",
+            "org.bouncycastle.jcajce.provider.symmetric.AES$GCM",
+        );
+        let mut ctx = MockNativeContext::new();
+        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let name = ctx.create_string("BC");
+        ctx.set_field(prov, 0, Value::Object(Some(name)));
+        ctx.set_field(prov, 1, Value::Double(1.80));
+
+        let type_s = ctx.create_string("Cipher");
+        let algo_s = ctx.create_string("AES/GCM/NoPadding");
+        let res = provider_get_service_native(
+            &mut ctx,
+            &[
+                Value::Object(Some(prov)),
+                Value::Object(Some(type_s)),
+                Value::Object(Some(algo_s)),
+            ],
+        );
+        let svc = match res.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected non-null Service object, got {other:?}"),
+        };
+        // Synthetic slot 0 = type, slot 1 = algorithm, slot 3 = className.
+        let svc_type = match ctx.get_field(svc, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let svc_algo = match ctx.get_field(svc, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let svc_class = match ctx.get_field(svc, 3) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        assert_eq!(svc_type, "Cipher");
+        assert_eq!(svc_algo, "AES/GCM/NoPadding");
+        assert_eq!(svc_class, "org.bouncycastle.jcajce.provider.symmetric.AES$GCM");
+    }
+
+    #[test]
+    fn put_get_service_natives_registered_via_register_fn() {
+        // The natives must be exposed via `register()` so the WP6.5
+        // wiring in `jca::register_jca_natives` picks them up.
+        let mut r = NativeMethodRegistry::new();
+        register(&mut r);
+
+        assert!(
+            r.find(
+                "java/security/Provider",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+            .is_some(),
+            "Provider.put must be registered for BouncyCastle's addAlgorithm chain"
+        );
+        assert!(
+            r.find(
+                "java/security/Provider",
+                "parseLegacyPut",
+                "(Ljava/lang/String;Ljava/lang/String;)V"
+            )
+            .is_some(),
+            "Provider.parseLegacyPut must be registered for BC's older-API path"
+        );
+        assert!(
+            r.find(
+                "java/security/Provider",
+                "getService",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;"
+            )
+            .is_some(),
+            "Provider.getService must be registered for Cipher.getInstance lookups"
+        );
+        assert!(
+            r.find("java/security/Provider$Service", "getClassName", "()Ljava/lang/String;")
+                .is_some(),
+            "Provider$Service.getClassName must be registered for SPI instantiation"
         );
     }
 }

@@ -752,3 +752,143 @@ pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
     );
 }
 
+// =============================================================================
+// WP8.10.7 — Throwable.getMessage / printStackTrace on synthetic-stub
+// Throwable subclasses
+// =============================================================================
+//
+// Background: `getMessage()`, `getLocalizedMessage()` and `printStackTrace()`
+// (both no-arg and `(PrintStream)V`) are declared on `java/lang/Throwable`,
+// but the registry dispatch is keyed by class name — so a `catch (Throwable t) {
+// t.getMessage(); }` whose `t` is a `NoClassDefFoundError` synthetic-stub will
+// surface a secondary `NoSuchMethodError` because no native is registered under
+// `java/lang/NoClassDefFoundError.getMessage`.
+//
+// Field layout (verified against
+// `classloading/src/class_manager.rs::synthetic_stub_fields` arm at line 3373+):
+//   slot 0 = detailMessage (String)
+//   slot 1 = cause (Throwable)
+// Each subclass is allocated with `instance_fields(2)` so the slot indexing
+// is robust as long as that arm is not re-ordered.
+//
+// We intentionally re-register `java/lang/Throwable` itself too so the
+// behavior is uniform across the family — `register` is last-write-wins
+// and the new closure is a strict superset of the existing native (it
+// reads slot 0, validates it's a string, and falls back to null).
+pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
+    // Subset that surfaces in jboss-modules / WildFly catch-blocks (per
+    // bench/wildfly-boot/diagnostic.md §WP8.10.7) plus the broader
+    // Error/Exception families that any defensive catch will see.
+    let throwable_classes = [
+        "java/lang/Throwable",
+        "java/lang/Exception",
+        "java/lang/RuntimeException",
+        "java/lang/Error",
+        "java/lang/LinkageError",
+        "java/lang/NoClassDefFoundError",
+        "java/lang/ClassNotFoundException",
+        "java/lang/NoSuchMethodError",
+        "java/lang/NoSuchFieldError",
+        "java/lang/NoSuchMethodException",
+        "java/lang/NoSuchFieldException",
+        "java/lang/NullPointerException",
+        "java/lang/ArithmeticException",
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "java/lang/IndexOutOfBoundsException",
+        "java/lang/ClassCastException",
+        "java/lang/IllegalArgumentException",
+        "java/lang/IllegalStateException",
+        "java/lang/UnsupportedOperationException",
+        "java/lang/StackOverflowError",
+        "java/lang/OutOfMemoryError",
+        "java/util/NoSuchElementException",
+        "java/util/InputMismatchException",
+        "java/io/IOException",
+        "java/io/FileNotFoundException",
+        "java/lang/NumberFormatException",
+        "java/util/ConcurrentModificationException",
+        "java/lang/NegativeArraySizeException",
+        "java/lang/AssertionError",
+        "java/lang/MatchException",
+        "java/lang/IncompatibleClassChangeError",
+        "java/lang/ExceptionInInitializerError",
+        "java/lang/VerifyError",
+        "java/lang/AbstractMethodError",
+        "java/lang/InternalError",
+        "java/lang/UnsatisfiedLinkError",
+    ];
+
+    for cls in throwable_classes.iter() {
+        // getMessage()Ljava/lang/String; — read slot 0 (detailMessage).
+        r.register(
+            cls,
+            "getMessage",
+            "()Ljava/lang/String;",
+            native_throwable_get_message,
+        );
+        // getLocalizedMessage()Ljava/lang/String; — JDK delegates to
+        // getMessage by default.
+        r.register(
+            cls,
+            "getLocalizedMessage",
+            "()Ljava/lang/String;",
+            native_throwable_get_message,
+        );
+        // printStackTrace()V — no-arg overload, prints to System.err equivalent.
+        r.register(
+            cls,
+            "printStackTrace",
+            "()V",
+            native_throwable_print_stack_trace,
+        );
+        // printStackTrace(Ljava/io/PrintStream;)V — JDK 25 overload.
+        r.register(
+            cls,
+            "printStackTrace",
+            "(Ljava/io/PrintStream;)V",
+            native_throwable_print_stack_trace_to_stream,
+        );
+        // printStackTrace(Ljava/io/PrintWriter;)V — same shape, same sink.
+        r.register(
+            cls,
+            "printStackTrace",
+            "(Ljava/io/PrintWriter;)V",
+            native_throwable_print_stack_trace_to_stream,
+        );
+        // toString()Ljava/lang/String; — "ClassName: message".
+        r.register(
+            cls,
+            "toString",
+            "()Ljava/lang/String;",
+            native_throwable_to_string,
+        );
+        // getCause()Ljava/lang/Throwable; — read slot 1.
+        r.register(
+            cls,
+            "getCause",
+            "()Ljava/lang/Throwable;",
+            native_throwable_get_cause,
+        );
+    }
+}
+
+/// printStackTrace(Ljava/io/PrintStream;)V (and PrintWriter overload).
+///
+/// Args layout: [this, stream]. We reuse the no-arg printStackTrace
+/// implementation which writes to the recorded-line sink; the
+/// PrintStream/PrintWriter argument is intentionally ignored because
+/// the recorded-line sink is already wired through to System.err in
+/// the lib.rs PrintStream natives.
+///
+/// Null-safe: if `this` is null we no-op; if `stream` is null we still
+/// print, because catch-block code paths frequently call
+/// `t.printStackTrace(System.err)` and the synthetic-stub System.err
+/// static may itself be null on early boot — we don't want to throw a
+/// secondary NPE inside a catch handler.
+pub(crate) fn native_throwable_print_stack_trace_to_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_throwable_print_stack_trace(ctx, args)
+}
+

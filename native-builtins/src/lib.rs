@@ -615,6 +615,59 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(if s.ends_with(&p) { 1 } else { 0 })))
         },
     );
+    // WP8.10.9: register String.contains(CharSequence) so synthetic-jdk
+    // mode no longer NSME's when WildFly/JBoss code does
+    // `name.contains("Module")`. The descriptor in OpenJDK 25 is
+    // `(Ljava/lang/CharSequence;)Z` — in practice every observed callsite
+    // passes a String literal, so we route through `read_string` (which
+    // returns `Some` for any string-shaped object). For non-String
+    // CharSequence subtypes (StringBuilder, CharBuffer) `read_string`
+    // also works because both expose char[] at slot 0 in synthetic-jdk
+    // mode. Empty-needle is an explicit `true` per the JDK spec.
+    registry.register(
+        "java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let needle = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let n = ctx.read_string(needle).unwrap_or_default();
+            if n.is_empty() { return Ok(Some(Value::Int(1))); }
+            Ok(Some(Value::Int(if s.contains(&n) { 1 } else { 0 })))
+        },
+    );
+    // WP8.10.9: also register the offset variant of startsWith — the
+    // single-arg `startsWith(String)` is already registered above, but
+    // bytecode that does `name.startsWith("Module", 4)` would still NSME
+    // without this entry.
+    registry.register(
+        "java/lang/String", "startsWith", "(Ljava/lang/String;I)Z",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let prefix = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
+            let off = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let p = ctx.read_string(prefix).unwrap_or_default();
+            if off < 0 { return Ok(Some(Value::Int(0))); }
+            let off = off as usize;
+            let chars: Vec<char> = s.chars().collect();
+            if off > chars.len() { return Ok(Some(Value::Int(0))); }
+            let tail: String = chars[off..].iter().collect();
+            Ok(Some(Value::Int(if tail.starts_with(&p) { 1 } else { 0 })))
+        },
+    );
+
+    // WP8.10.7 — Throwable.getMessage / printStackTrace / getLocalizedMessage /
+    // toString / getCause registered on synthetic-stub Throwable subclasses
+    // (NoClassDefFoundError, ClassNotFoundException, NoSuchMethodError, …).
+    // Without this, jboss-modules / WildFly catch-block code paths trip a
+    // secondary NoSuchMethodError when calling `t.getMessage()` on a caught
+    // synthetic-stub Throwable subclass — see bench/wildfly-boot/diagnostic.md
+    // §WP8.10.7. Field layout verified against the `instance_fields(2)` arm
+    // in classloading/src/class_manager.rs::synthetic_stub_fields:3373+.
+    // Wired here in `register_essential_natives` (universal) so the natives
+    // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
+    crate::lang_misc::register_throwable_subclass_natives(registry);
+
     registry.register(
         "java/lang/String", "trim", "()Ljava/lang/String;",
         |ctx, args| {
@@ -4183,6 +4236,10 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/StackTraceElement;",
         native_throwable_get_stack_trace_array,
     );
+
+    // (WP8.10.7 wiring moved to register_essential_natives so the Throwable
+    // subclass natives are registered in BOTH synthetic-jdk and real-JDK
+    // modes — see bench/wildfly-boot/diagnostic.md §WP8.10.7.)
 
     // --- Exception constructors ---
     // Throwable/Exception/RuntimeException/<init>()V — no-op (fields default to null)
