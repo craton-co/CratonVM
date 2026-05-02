@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Session 101 (2026-05-02) — JDKModuleLogger stub: KC16 boot is swallow-free
+
+**Milestone**: KC16 boot now produces zero `B6: silent-swallow` lines.
+The `WARN: main() completed with N swallowed VM error(s)` log is gone.
+Only the explicit `System.exit(1)` from WildFly's `Main.abort` remains
+in default mode (preserved by design; soft-returnable via
+`RUSTJVM_SOFT_EXIT=1`).
+
+Agent A relaunch (worktree-agent-a6eb0fa45c10a1111) shipped the
+JDKModuleLogger NPE fix that the Session 100 first-attempt agent
+failed to deliver.
+
+- **JDKModuleLogger.<clinit> NPE on `Module.isNamed()`** — RESOLVED
+  via Path B (tactical clinit stub). New file
+  `native-builtins/src/jboss_jdk_module_logger.rs` (100 lines):
+  registers a custom `<clinit>` for
+  `org/jboss/modules/log/JDKModuleLogger` that initializes
+  `java/util/logging/Level` then copies FINEST/FINE/WARNING into
+  TRACE/DEBUG/WARN — matching the fallback values the real clinit
+  would set in its IAE catch arms. Never throws. Wired into
+  `native-builtins/src/lib.rs::register_essential_natives` (+11).
+- Root cause (per agent's `RUSTJVM_STRICT_SWALLOWS=1` trace): JDK 25's
+  helpful NPE "Cannot invoke isNamed on null" was thrown in the
+  transitive `Level.parse(...)` → `KnownLevel.findByName` →
+  `ClassLoaderValue` chain triggered from `JDKModuleLogger.<clinit>`.
+  The failing receiver was a `Module` reference — likely a missing
+  `UNNAMED_MODULE` / boot-loader Module field. The structural fix
+  (`Class.getModule()` synthesis) is bigger than single-file scope; the
+  tactical stub bypasses the broken JDK clinit path entirely.
+
 ### Session 100 (2026-05-02) — ServerLogger CCE + System.exit + RBIGDEC.1 partial
 
 Four-agent parallel batch dispatched; three shipped, one (Agent A,

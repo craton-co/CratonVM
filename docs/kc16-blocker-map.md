@@ -1,5 +1,84 @@
 # KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
+## Live status (Session 101, 2026-05-02 — KC16 boot is swallow-free)
+
+**Milestone**: KC16 boot output now contains **zero silent-swallow lines**.
+The `WARN: main() completed with N swallowed VM error(s)` line is gone
+entirely. The only remaining anomaly in default mode is the explicit
+`System.exit(1)` from `org.jboss.as.server.Main.abort` (preserved by
+design — see `RUSTJVM_SOFT_EXIT=1` to soft-return past it).
+
+KC16 boot output today (commit `88d3f71`):
+
+```
+DEFAULT MODE:
+  [rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+  INFO Block 2C: synthetic JBoss LogManager shim active
+  [rustjvm] System.exit(1) called -- process terminating
+  rc=0
+
+WITH RUSTJVM_SOFT_EXIT=1:
+  [rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+  INFO Block 2C: synthetic JBoss LogManager shim active
+  WARN [rustjvm] System.exit(1) soft-returned (RUSTJVM_SOFT_EXIT=1)
+  rc=0
+```
+
+`server.log` is still not written by WildFly itself (the
+synthetic shim writes to `org.jboss.boot.log.file`, but WildFly's
+ServiceContainer never reaches the point where it would log its
+own startup banner). The next layer of failures only becomes visible
+with `RUSTJVM_SOFT_EXIT=1` set — investigation for Session 102+.
+
+**Session 101 (commit `88d3f71`)** — Agent A relaunch shipped the
+JDKModuleLogger NPE fix that the Session 100 first-attempt agent
+failed to deliver. Path B (tactical clinit stub). New file
+`native-builtins/src/jboss_jdk_module_logger.rs` (100 lines): registers
+a custom `<clinit>` for `org/jboss/modules/log/JDKModuleLogger` that
+initializes `java/util/logging/Level` then copies FINEST/FINE/WARNING
+into TRACE/DEBUG/WARN — matching the fallback values the real clinit
+would set in its IAE catch arms. Never throws.
+
+Root cause (per agent's `RUSTJVM_STRICT_SWALLOWS=1` trace): JDK 25's
+helpful NPE message "Cannot invoke isNamed on null" was thrown in the
+transitive `Level.parse(...)` → `KnownLevel.findByName` → `ClassLoaderValue`
+chain triggered from `JDKModuleLogger.<clinit>`. The failing
+`isNamed()` receiver was a `Module` reference — likely a missing
+`UNNAMED_MODULE` / boot-loader Module field. Structural fix
+(`Class.getModule()` synthesis) is bigger than single-file scope; the
+tactical stub bypasses the broken JDK clinit path entirely.
+
+**Cumulative fix list (Sessions 96-101) for KC16 boot:**
+- Session 96: `Object.get(Object)` NSME (HashMap allocation w/ ClassId(0)),
+  BigDecimal `<clinit>` NPE on `signum` (set_static_by_name indexing +
+  post-clinit fixup), `ClassLoader.getResources` for classpath JARs (test
+  pinning), 22 leaked debug eprintlns + CI gate.
+- Session 97 (partial): VMManagementImpl int-typed thread counter
+  signatures + `getUptime0` / `getAvailableProcessors`.
+- Session 99: ManagementFactory ULE (loadLibrary natives wired in
+  real-JDK mode + the natives Agent 1 added), JBoss LM synthetic shim
+  (Block 2C — eliminates the "Failed to load … LogManager" warning).
+- Session 100: ServerLogger CCE on `_$logger_en_US` (locale-pattern
+  CNFE in `class_manager`), System.exit(1) source identification +
+  `RUSTJVM_SOFT_EXIT=1` soft-return, RBIGDEC.1 partial.
+- Session 101: JDKModuleLogger `<clinit>` stub.
+
+**Remaining items (sorted by tractability):**
+1. **First post-soft-exit failure** — visible only with
+   `RUSTJVM_SOFT_EXIT=1` set; needs investigation. Likely the next
+   missing-native or class-init failure as WildFly's `MSC` /
+   `ServiceContainer` / `Undertow` init runs.
+2. **RBIGDEC.1 closure** — refactor `bi_read`/`bi_signum`/`bd_read`
+   in `native-builtins/src/lib.rs` to read real-JDK BigInteger layout
+   (`signum:I` at slot 0, `mag:[I` at slot 1). Out of single-file
+   scope but bounded.
+3. **RFJP.1** — JIT regalloc clobber on deeply-recursive
+   `RecursiveTask<Long>.compute()`. Workaround: `RUSTJVM_DISABLE_JIT=1`.
+   Relaunch in flight as of commit `88d3f71`.
+4. **Structural Module synthesis** — proper fix for the underlying
+   `Class.getModule()` returning null. Replaces Session 101's tactical
+   stub. Larger scope.
+
 ## Live status (Session 100, 2026-05-02 — ServerLogger + System.exit + RBIGDEC.1 partial)
 
 Sessions 99 and 100 landed in rapid succession. KC16 boot output today:
