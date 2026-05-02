@@ -259,6 +259,76 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+
+    // -- ManagementFactory.loadNativeLib + loadLibrary chain --
+    //
+    // Session 98 root-cause for `B6: silent-swallow class=ManagementFactory
+    // exc=UnsatisfiedLinkError` on KC16 boot:
+    //
+    // `java.lang.management.ManagementFactory.<clinit>` calls
+    // `loadNativeLib()V` (a private static helper) whose body is just
+    // `System.loadLibrary("management")`. The real-JDK bytecode for
+    // `System.loadLibrary` walks `Reflection.getCallerClass` ->
+    // `Runtime.getRuntime().loadLibrary0` -> `ClassLoader.loadLibrary`,
+    // which throws `UnsatisfiedLinkError` (with a NULL detail message)
+    // because libmanagement.dll genuinely is not on java.library.path —
+    // we ship the JMM natives in-process via NativeMethodRegistry.
+    //
+    // RKC16N.12 (Session 97) attempted a fix in vm_exec.rs by adding a
+    // "force-native-override" entry for `System.loadLibrary` /
+    // `Runtime.loadLibrary*`, but in real-JDK mode the *underlying*
+    // overrides for those methods (registered in `lang_system::
+    // register_runtime_natives`) are never wired in: the real-JDK
+    // bootstrap in `vm/src/vm/vm_init.rs` calls `register_essential_natives`
+    // (which omits Runtime + System.loadLibrary) but NOT
+    // `register_runtime_natives` or `register_synthetic_overrides`. So the
+    // override-allowlist in vm_exec finds no native to substitute in and
+    // falls through to the throwing bytecode.
+    //
+    // Cheapest scoped fix: register no-op natives for the three methods in
+    // the loadLibrary chain right here, since `register_vm_management_impl`
+    // IS called from real-JDK init (vm_init.rs line 842). Once any of these
+    // wins the dispatch (try_stackless_invoke checks the native registry
+    // before running bytecode — see vm/src/runtime/interpreter.rs line
+    // 8039), the chain short-circuits and ManagementFactory.<clinit>
+    // completes cleanly.
+    //
+    // Registering at all three levels (loadNativeLib, System.loadLibrary,
+    // Runtime.loadLibrary0) is belt-and-suspenders — any single match
+    // suffices. We start the chain at `loadNativeLib` because it is the
+    // narrowest scope (private static helper used only by ManagementFactory)
+    // and least likely to mask real bugs in unrelated app code that calls
+    // `System.loadLibrary` for its own purposes.
+    r.register(
+        "java/lang/management/ManagementFactory",
+        "loadNativeLib",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "java/lang/System",
+        "loadLibrary",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "java/lang/System",
+        "load",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "java/lang/Runtime",
+        "loadLibrary0",
+        "(Ljava/lang/Class;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "java/lang/Runtime",
+        "load0",
+        "(Ljava/lang/Class;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,6 +1665,64 @@ mod jmx_tests {
         assert!(
             r.find(cls, "getAvailableProcessors", "()I").is_some(),
             "VMManagementImpl.getAvailableProcessors missing"
+        );
+    }
+
+    #[test]
+    fn test_management_factory_load_native_lib_chain() {
+        // Session 98: ManagementFactory.<clinit> -> loadNativeLib() ->
+        // System.loadLibrary("management") -> Runtime.loadLibrary0(...) ->
+        // ClassLoader.loadLibrary throws UnsatisfiedLinkError because
+        // libmanagement.dll is genuinely absent (we ship JMM natives
+        // in-process via NativeMethodRegistry). RKC16N.12's vm_exec.rs
+        // override-allowlist failed because the *target* natives for
+        // System.loadLibrary / Runtime.loadLibrary0 are registered only
+        // in `register_runtime_natives` (synthetic-mode-only), not in
+        // `register_essential_natives` (real-JDK-mode). Pin the no-op
+        // entries here so the chain short-circuits at the narrowest
+        // possible point (loadNativeLib) plus belt-and-suspenders fallbacks
+        // at System / Runtime levels.
+        let mut r = NativeMethodRegistry::new();
+        register_vm_management_impl(&mut r);
+        assert!(
+            r.find(
+                "java/lang/management/ManagementFactory",
+                "loadNativeLib",
+                "()V"
+            )
+            .is_some(),
+            "ManagementFactory.loadNativeLib must be a no-op native; \
+             without it, ManagementFactory.<clinit> calls into the \
+             real-JDK loadLibrary chain which throws UnsatisfiedLinkError."
+        );
+        assert!(
+            r.find("java/lang/System", "loadLibrary", "(Ljava/lang/String;)V").is_some(),
+            "System.loadLibrary must be registered in real-JDK mode (via \
+             register_vm_management_impl) — register_runtime_natives is \
+             synthetic-mode-only."
+        );
+        assert!(
+            r.find("java/lang/System", "load", "(Ljava/lang/String;)V").is_some(),
+            "System.load must be registered as the no-op companion of loadLibrary."
+        );
+        assert!(
+            r.find(
+                "java/lang/Runtime",
+                "loadLibrary0",
+                "(Ljava/lang/Class;Ljava/lang/String;)V"
+            )
+            .is_some(),
+            "Runtime.loadLibrary0 must be registered as a backstop in case \
+             ManagementFactory.loadNativeLib doesn't intercept first."
+        );
+        assert!(
+            r.find(
+                "java/lang/Runtime",
+                "load0",
+                "(Ljava/lang/Class;Ljava/lang/String;)V"
+            )
+            .is_some(),
+            "Runtime.load0 must be registered alongside loadLibrary0."
         );
     }
 

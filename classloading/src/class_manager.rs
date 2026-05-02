@@ -3215,6 +3215,15 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl" =>
             "java/util/concurrent/atomic/AtomicLongFieldUpdater",
 
+        // Block 2C / Path A: synthetic JBoss LogManager extends the JDK
+        // LogManager. Without this mapping, the synthetic stub's superclass
+        // defaults to java/lang/Object — and the JDK initLogManager bytecode
+        // does `checkcast java/util/logging/LogManager` on the result of
+        // `Class.newInstance()`. With the wrong parent, the checkcast fails
+        // and the WARNING about `Failed to load the specified log manager`
+        // (or in JDK 25 `Could not load Logmanager "..."`) prints.
+        "org/jboss/logmanager/LogManager" => "java/util/logging/LogManager",
+
         // Default: everything else extends Object
         _ => "java/lang/Object",
     }

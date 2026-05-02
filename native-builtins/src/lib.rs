@@ -181,6 +181,14 @@ pub mod jboss_jdkspecific;
 // singleton + Logger registry (fixes KC26 ClassCastException where
 // LogManager.getLogManager() was returning a Class mirror).
 pub mod logmanager;
+// Block 2C / Path A: synthetic JBoss LogManager shim — re-registers
+// `Class.newInstance` in real-JDK mode so the `getConstructor0`-based
+// reflection bytecode in `java.util.logging.LogManager.initLogManager`
+// stops raising InstantiationException on our zero-method synthetic
+// stub. Also exposes `emit_boot_log` for routing bootstrap log lines
+// to `org.jboss.boot.log.file` (or stderr fallback). See module doc
+// for the full causal chain.
+pub mod jboss_logmanager;
 // T19.H5: AtomicReferenceFieldUpdater / AtomicIntegerFieldUpdater /
 // AtomicLongFieldUpdater `newUpdater` factories — unblock
 // `org.jboss.logmanager.ExtHandler.<clinit>` ClassCastException on
@@ -3904,6 +3912,29 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // java/util/logging/LogManager` by ensuring the native always
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
+
+    // Block 2C / Path A: synthetic JBoss LogManager shim.
+    //
+    // KC16 boot prints `WARNING: Failed to load the specified log
+    // manager class org.jboss.logmanager.LogManager` (or in JDK 25
+    // `Could not load Logmanager "..."`) because
+    // `java.util.logging.LogManager.initLogManager` calls
+    // `Class.newInstance()` on the synthetic-stub LogManager class —
+    // and JDK bytecode for `Class.newInstance` walks
+    // `getReflectionFactory().getConstructor0(...)`, which fails when
+    // the synthetic stub has no `<init>` Method object on it (the
+    // `<init>()V` callback is in the native registry but not in the
+    // class's method list).
+    //
+    // `lang_class::native_class_new_instance` already bypasses the
+    // reflection path by directly calling `ctx.invoke(name, "<init>",
+    // "()V", &[obj])`. That callback is registered for synthetic-jdk
+    // mode in `register_synthetic_overrides` but NOT here in real-JDK
+    // mode — which is exactly what KC16 boot uses. Wiring the same
+    // callback in `register_essential_natives` via this module fixes
+    // the warning AND makes `getLogManager()` return our singleton
+    // `org.jboss.logmanager.LogManager` instance.
+    jboss_logmanager::register_jboss_logmanager_natives(registry);
 
     // WP2.1: java.lang.reflect full coverage — net-new natives
     // (trySetAccessible, canAccess, getEnclosingClass, Parameter

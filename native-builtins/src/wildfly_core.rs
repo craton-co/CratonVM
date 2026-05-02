@@ -612,14 +612,31 @@ impl LoggerMirror {
     /// subscriber regardless of what formatter is installed.
     pub fn log(&self, level: JulLevel, message: &str) {
         let redacted = redact_credentials(message);
+        // Block 2C / Path A: also route every Logger.log call through
+        // `jboss_logmanager::emit_boot_log_no_ctx` for INFO / WARN /
+        // SEVERE levels so the bootstrap log file (`org.jboss.boot.log.file`)
+        // captures whatever WildFly emits before its own handler chain
+        // is online. The path is primed on first `getLogManager()` /
+        // `getLogger()` call (see `prime_boot_log_path` wiring in
+        // `register_logmanager_natives`); if priming hasn't happened
+        // yet, the call falls through to stderr — which matches the
+        // brief's specified stderr fallback when the property is unset.
+        // Skip Fine / Finer / Finest / All / Config — those are debug
+        // levels that would flood the boot log with noise.
         match level {
             JulLevel::Severe => {
                 tracing::error!(target: "wildfly_core::logger", logger = %self.name, "{}", redacted);
+                crate::jboss_logmanager::emit_boot_log_no_ctx("SEVERE", &self.name, &redacted);
             }
             JulLevel::Warning => {
                 tracing::warn!(target: "wildfly_core::logger", logger = %self.name, "{}", redacted);
+                crate::jboss_logmanager::emit_boot_log_no_ctx("WARNING", &self.name, &redacted);
             }
-            JulLevel::Info | JulLevel::Config => {
+            JulLevel::Info => {
+                tracing::info!(target: "wildfly_core::logger", logger = %self.name, "{}", redacted);
+                crate::jboss_logmanager::emit_boot_log_no_ctx("INFO", &self.name, &redacted);
+            }
+            JulLevel::Config => {
                 tracing::info!(target: "wildfly_core::logger", logger = %self.name, "{}", redacted);
             }
             JulLevel::Fine => {

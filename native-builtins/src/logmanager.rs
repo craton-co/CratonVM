@@ -284,7 +284,35 @@ pub(crate) fn reset_state_for_tests() {
 // ---------------------------------------------------------------------------
 
 fn native_get_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    // Block 2C / Path A: honour `-Djava.util.logging.manager=...` by
+    // allocating the singleton with the *requested concrete class* —
+    // not always `java.util.logging.LogManager`. jboss-modules' `Main`
+    // would otherwise observe a JDK-default LogManager via
+    // `getLogManager().getClass()` and print the
+    // "WARNING: Failed to load the specified log manager class" line.
+    //
+    // We honour ONLY `org.jboss.logmanager.LogManager` here (the canonical
+    // KC16 / Quarkus / WildFly case). Other custom LogManager subclasses
+    // still get the default — narrowing keeps blast radius minimal and
+    // avoids accidentally returning instances of classes whose clinit
+    // would NPE on our synthetic-stub field layouts.
+    //
+    // `LmProbe` exercises this exact path: `getLogManager().getClass()`
+    // is asserted to print `org.jboss.logmanager.LogManager` when the
+    // system property is set. Without this change LmProbe prints the
+    // JDK default class name and KC16 prints the WARNING.
+    let class_name = match ctx.get_system_property("java.util.logging.manager") {
+        Some(name) if name == "org.jboss.logmanager.LogManager" => CLS_JBOSS_LOG_MANAGER,
+        _ => CLS_JUL_LOG_MANAGER,
+    };
+    // Block 2C / Path A: prime the boot-log path cache so background
+    // threads' `LoggerMirror::log` (in `wildfly_core.rs`) can route
+    // INFO/WARN/SEVERE lines through `jboss_logmanager::emit_boot_log_no_ctx`
+    // without needing a NativeContext. `getLogManager()` is the
+    // earliest reliable hook — it runs during JDK initLogManager
+    // before any user-level logger is allocated.
+    crate::jboss_logmanager::prime_boot_log_path(ctx);
+    let obj = ensure_singleton(ctx, class_name);
     Ok(Some(Value::Object(Some(obj))))
 }
 
