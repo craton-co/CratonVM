@@ -463,11 +463,47 @@ pub(crate) fn native_system_nano_time(_ctx: &mut dyn NativeContext, _args: &[Val
     Ok(Some(Value::Long(nanos)))
 }
 
-pub(crate) fn native_system_exit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let code = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+
+    // RUSTJVM_DBG_EXIT=1 — capture and log the Java caller chain BEFORE we
+    // either soft-return or terminate. Helps identify which class/method in
+    // the upstream code invoked System.exit. Env-gated so default output is
+    // unchanged.
+    if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
+        let trace = ctx.capture_stack_trace(0);
+        let mut rendered = String::new();
+        for (i, entry) in trace.iter().take(20).enumerate() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                rendered,
+                "\n  #{i} {cls}.{m} (bci={bci})",
+                cls = entry.class_name,
+                m = entry.method_name,
+                bci = entry.byte_code_index,
+            );
+        }
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[RUSTJVM_DBG_EXIT] System.exit({code}) caller chain:{rendered}"
+        );
+    }
+
+    // RUSTJVM_SOFT_EXIT=1 — opt-in. Convert ANY System.exit(I)V into a soft
+    // return so the calling Java frame keeps executing (and `main` can reach
+    // further). Used to expose downstream failures hidden behind an explicit
+    // upstream exit. Default behaviour (env unset) is unchanged: terminate.
+    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[rustjvm] System.exit({code}) soft-returned (RUSTJVM_SOFT_EXIT=1)"
+        );
+        return Ok(None);
+    }
+
     // B6: Surface System.exit calls — Kotlin/Scala programs often reach exit
     // via an uncaught-exception handler after some earlier failure that would
     // otherwise be invisible. Log to stderr directly since tracing may not be
@@ -613,7 +649,7 @@ pub(crate) fn native_runtime_free_memory(_ctx: &mut dyn NativeContext, _args: &[
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
-pub(crate) fn native_runtime_exit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let code = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => match args.first() {
@@ -621,6 +657,35 @@ pub(crate) fn native_runtime_exit(_ctx: &mut dyn NativeContext, args: &[Value]) 
             _ => 0,
         },
     };
+
+    // Mirror native_system_exit: env-gated caller-chain dump and soft-return.
+    if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
+        let trace = ctx.capture_stack_trace(0);
+        let mut rendered = String::new();
+        for (i, entry) in trace.iter().take(20).enumerate() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                rendered,
+                "\n  #{i} {cls}.{m} (bci={bci})",
+                cls = entry.class_name,
+                m = entry.method_name,
+                bci = entry.byte_code_index,
+            );
+        }
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[RUSTJVM_DBG_EXIT] Runtime.exit({code}) caller chain:{rendered}"
+        );
+    }
+
+    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[rustjvm] Runtime.exit({code}) soft-returned (RUSTJVM_SOFT_EXIT=1)"
+        );
+        return Ok(None);
+    }
+
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[rustjvm] Runtime.exit({code}) called — process terminating");
     std::process::exit(code);

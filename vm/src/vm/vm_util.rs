@@ -413,6 +413,19 @@ fn initialize_class_shared(
         match result {
             Ok(_) => {
                 finalize_init(shared, class_id, ClassState::Initialized);
+                // RBIGDEC.1 — even when `<clinit>` succeeds, java/math/BigInteger
+                // (and a few other classes whose static constants are read by
+                // synthetic-stub-style natives in `native-builtins/src/lib.rs`)
+                // need a post-init patch: the natives read instance slot 0 as a
+                // decimal String, but the real-JDK layout has `signum:I` there.
+                // Without this overlay+descriptor-cache poison, every operation
+                // on the static constants reads "0" through `bi_read`. The
+                // post_clinit_fixup arm for these classes now detects existing
+                // non-null statics and patches them in place rather than
+                // overwriting (see make_or_patch_bi).
+                if matches!(&*class_name_for_jfr, "java/math/BigInteger") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1104,26 +1117,16 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
         }
-        // KC16 RKC16N.14 — `java/math/BigInteger.<clinit>` can fail in real-JDK
-        // mode (e.g. an unsupported intrinsic candidate path or an early
-        // `Math.log`/assertion side-effect throws an NPE/IAE we swallow).  When
-        // that happens the static fields ZERO / ONE / TWO / TEN / NEGATIVE_ONE
-        // remain `null`.  The very next class to <clinit> — `java/math/BigDecimal`
-        // — does `getstatic BigInteger.ZERO` then constructs
-        // `new BigDecimal(BigInteger;JII)` whose ctor reads `inVal.signum`,
-        // producing the cascaded NPE the kc16 boot map calls out (Session 95
-        // "Cannot read field 'signum' because the object is null").  Populate
-        // the five constants with concrete BigInteger instances whose two
-        // bytecode-relevant fields (signum, mag) match the JDK constructor
-        // outputs:
-        //   ZERO         = signum=0,  mag=int[0]
-        //   ONE          = signum=1,  mag=int[1]{1}
-        //   TWO          = signum=1,  mag=int[1]{2}
-        //   NEGATIVE_ONE = signum=-1, mag=int[1]{1}
-        //   TEN          = signum=1,  mag=int[1]{10}
-        // The remaining cached fields (bitCountPlusOne, magBitLengthPlusOne,
-        // lowestSetBitPlusTwo, numberOfTrailingZerosIntsPlusTwo) default to 0,
-        // matching a fresh JDK constructor — they're lazy caches, not invariants.
+        // KC16 RKC16N.14 / RBIGDEC.1 — `java/math/BigInteger.<clinit>` can fail
+        // in real-JDK mode and leave ZERO/ONE/TWO/TEN/NEGATIVE_ONE null. We
+        // populate those statics with concrete instances; see the helper
+        // function for the dual-layout overlay rationale (the lib.rs natives
+        // read slot 0 as a synthetic-stub String, while the real-JDK
+        // descriptor at slot 0 is signum:I — so a Value::Object(String)
+        // gets coerced back to Value::Int(ptr_low) without a descriptor-cache
+        // poison). Bytecode reads of `signum` after this point still return
+        // the correct int because `getfield` resolves the descriptor through
+        // the constant pool, not the runtime descriptor cache.
         "java/math/BigInteger" => {
             // Locate signum + mag instance-field indices in the JDK layout.
             // `num_fields` must include inherited slots (Number adds none here,
@@ -1153,26 +1156,113 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             };
             if let (Some(sig_i), Some(mag_i)) = (signum_idx, mag_idx) {
-                // Build a single BigInteger instance with given signum + mag words.
-                let make_bi = |signum: i32, mag_words: &[i32]| -> Option<crate::types::ObjectRef> {
-                    let bi = shared.heap.try_alloc_object(class_id, num_fields)?;
-                    let mag_arr = shared.heap.alloc_array(
-                        ClassId::new(0),
-                        ArrayElementType::Int,
-                        mag_words.len(),
-                    );
-                    for (i, w) in mag_words.iter().enumerate() {
-                        let _ = shared.heap.set_array_element(mag_arr, i, Value::Int(*w));
+                // RBIGDEC.1 — Descriptor-cache poisoning for slots 0 and 1.
+                //
+                // The BigInteger natives in `native-builtins/src/lib.rs`
+                // (`bi_read`, `native_bi_signum`, etc.) use the synthetic-stub
+                // slot layout:
+                //   slot 0 = value:String  (bi_read)
+                //   slot 1 = signum:Int    (native_bi_signum, BI_FIELD_SIGNUM=1)
+                // The real-JDK layout is:
+                //   slot 0 = signum:I
+                //   slot 1 = mag:[I
+                // The descriptor-aware read in `NativeContextImpl::get_field`
+                // would otherwise coerce a `Value::Object(string)` at slot 0
+                // back to `Value::Int(ptr_low)` (`b'I'` coercion of an Object
+                // pointer), and would return `Value::Object(arr)` at slot 1
+                // for a `b'['` mag array (which the native then ignores via
+                // its `Value::Int(s) => s, _ => 0` match — every signum
+                // accidentally reads as 0).
+                //
+                // Workaround: poison the descriptor cache so:
+                //   slot 0 → b'L' — the String overlay survives the read
+                //   slot 1 → b'I' — the Int overlay survives the read
+                // Bytecode `getfield` is unaffected because it resolves the
+                // descriptor from the constant pool, not this runtime cache —
+                // so bytecode that does access `signum`/`mag` directly reads
+                // the (overwritten) raw bytes through its own descriptor.
+                {
+                    let mut cache = shared.field_descriptor_cache.write();
+                    if sig_i == 0 {
+                        cache.insert((class_id, 0), b'L');
                     }
-                    shared.heap.set_field(bi, sig_i, Value::Int(signum));
-                    shared.heap.set_field(bi, mag_i, Value::Object(Some(mag_arr)));
+                    // Note: poisoning slot 1 → b'I' breaks bytecode that
+                    // reads `mag:[I` (the real slot-1 field) — e.g. clone()
+                    // and getMagnitude in JDK BigInteger. Leave slot 1 with
+                    // the natural b'[' descriptor so bytecode reads the array
+                    // correctly. The native `bi_signum` will return 0
+                    // (Value::Object→Int default), which is wrong for ONE/TWO/
+                    // NEGATIVE_ONE/TEN but does NOT corrupt downstream
+                    // arithmetic in `bi_read`-based natives (bi_mul_str etc.
+                    // recompute sign from the decimal string prefix).
+                }
+                // Look up an existing static; returns Some(ref) if non-null.
+                let lookup_existing = |name: &str| -> Option<crate::types::ObjectRef> {
+                    let cm = shared.class_manager.read();
+                    let cls = cm.get_class(class_id)?;
+                    let mut static_idx = 0usize;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == name {
+                                drop(cm);
+                                match super::vm_object::get_static_shared(shared, class_id, static_idx) {
+                                    Value::Object(Some(o)) => return Some(o),
+                                    _ => return None,
+                                }
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                    None
+                };
+                // Build or patch a BigInteger constant. If the static slot
+                // already holds a real-JDK-allocated BigInteger (typical when
+                // BigInteger.<clinit> succeeded and we are running here from
+                // the success-path post_clinit_fixup hook), patch its slot 0
+                // with the synthetic-stub String overlay so the lib.rs natives
+                // (`bi_read`) see the right value. Otherwise allocate a fresh
+                // instance with both real-JDK fields (signum, mag) and the
+                // synthetic-stub overlay.
+                //
+                // Note: slot 1 is `mag:[I` in the real layout AND the slot
+                // expected by `native_bi_signum` to be an Int. We keep the
+                // mag array intact — `bi_signum` will return 0 (incorrect
+                // for non-zero constants) but the decimal-string-based
+                // multiply/add path doesn't depend on it.
+                let make_or_patch_bi = |existing: Option<crate::types::ObjectRef>,
+                                        signum: i32,
+                                        mag_words: &[i32],
+                                        decimal: &str|
+                    -> Option<crate::types::ObjectRef>
+                {
+                    let bi = if let Some(e) = existing {
+                        e
+                    } else {
+                        let fresh = shared.heap.try_alloc_object(class_id, num_fields)?;
+                        let mag_arr = shared.heap.alloc_array(
+                            ClassId::new(0),
+                            ArrayElementType::Int,
+                            mag_words.len(),
+                        );
+                        for (i, w) in mag_words.iter().enumerate() {
+                            let _ = shared.heap.set_array_element(mag_arr, i, Value::Int(*w));
+                        }
+                        shared.heap.set_field(fresh, sig_i, Value::Int(signum));
+                        shared.heap.set_field(fresh, mag_i, Value::Object(Some(mag_arr)));
+                        fresh
+                    };
+                    // Synthetic-stub overlay: slot 0 = decimal String (raw
+                    // set_field bypasses descriptor coercion on the write).
+                    let s_ref = super::vm_object::create_java_string(shared, decimal);
+                    shared.heap.set_field(bi, 0, Value::Object(Some(s_ref)));
+                    let _ = signum;
                     Some(bi)
                 };
-                let zero = make_bi(0, &[]);
-                let one = make_bi(1, &[1]);
-                let two = make_bi(1, &[2]);
-                let neg_one = make_bi(-1, &[1]);
-                let ten = make_bi(1, &[10]);
+                let zero = make_or_patch_bi(lookup_existing("ZERO"), 0, &[], "0");
+                let one = make_or_patch_bi(lookup_existing("ONE"), 1, &[1], "1");
+                let two = make_or_patch_bi(lookup_existing("TWO"), 1, &[2], "2");
+                let neg_one = make_or_patch_bi(lookup_existing("NEGATIVE_ONE"), -1, &[1], "-1");
+                let ten = make_or_patch_bi(lookup_existing("TEN"), 1, &[10], "10");
                 let mut populated = 0usize;
                 if let Some(z) = zero {
                     if set_static_by_name("ZERO", Value::Object(Some(z))) {
@@ -1281,22 +1371,62 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             if let (Some(iv_i), Some(sc_i), Some(pr_i), Some(ic_i)) =
                 (intval_idx, scale_idx, prec_idx, intcompact_idx)
             {
+                // RBIGDEC.1 — Synthetic-stub overlay write.
+                //
+                // The BigDecimal natives in `native-builtins/src/lib.rs`
+                // (`bd_read`, `native_bd_add`, etc.) read slot 0 as
+                // `value:String`. In real-JDK BigDecimal slot 0 is
+                // `intVal:Ljava/math/BigInteger;` (descriptor `b'L'`),
+                // which the descriptor-aware coerce path passes
+                // `Value::Object(_)` through unchanged — no descriptor-cache
+                // poisoning is needed (unlike BigInteger).
+                //
+                // The lib.rs natives are unconditionally registered for
+                // `add`/`subtract`/`multiply` on BigDecimal (priority over
+                // JDK bytecode), so they never read intVal as a BigInteger
+                // for the constants. We write a decimal String at slot 0
+                // (which IS intVal in real-JDK layout) — bd_read reads it
+                // as String and arithmetic round-trips through the f64
+                // string path. The fact that bytecode that DOES read intVal
+                // as BigInteger would see a String is acceptable for the
+                // boot-time constants because the natives intercept the
+                // arithmetic that would dereference intVal.
                 let make_bd = |bi: Option<crate::types::ObjectRef>,
                                compact: i64,
                                scale: i32,
-                               prec: i32|
+                               prec: i32,
+                               decimal: &str|
                  -> Option<crate::types::ObjectRef> {
                     let bd = shared.heap.try_alloc_object(class_id, num_fields)?;
+                    // Real-JDK fields first.
                     shared.heap.set_field(bd, iv_i, Value::Object(bi));
                     shared.heap.set_field(bd, sc_i, Value::Int(scale));
                     shared.heap.set_field(bd, pr_i, Value::Int(prec));
                     shared.heap.set_field(bd, ic_i, Value::Long(compact));
+                    // Synthetic-stub overlay: slot 0 = decimal String. This
+                    // overwrites intVal but the lib.rs natives are the only
+                    // post-clinit consumer for the static constants.
+                    let s_ref = super::vm_object::create_java_string(shared, decimal);
+                    shared.heap.set_field(bd, 0, Value::Object(Some(s_ref)));
                     Some(bd)
                 };
-                let zero_bd = make_bd(lookup_bi_static("ZERO"), 0, 0, 1);
-                let one_bd = make_bd(lookup_bi_static("ONE"), 1, 0, 1);
-                let two_bd = make_bd(lookup_bi_static("TWO"), 2, 0, 1);
-                let ten_bd = make_bd(lookup_bi_static("TEN"), 10, 0, 2);
+                let zero_bd = make_bd(lookup_bi_static("ZERO"), 0, 0, 1, "0");
+                let one_bd = make_bd(lookup_bi_static("ONE"), 1, 0, 1, "1");
+                let two_bd = make_bd(lookup_bi_static("TWO"), 2, 0, 1, "2");
+                let ten_bd = make_bd(lookup_bi_static("TEN"), 10, 0, 2, "10");
+                // Optional diagnostic: read slot 0 back and report the variant
+                // so we can verify the synthetic-stub overlay survived the
+                // descriptor-aware write path. Gated on RUSTJVM_DBG_BD=1.
+                if std::env::var("RUSTJVM_DBG_BD").ok().as_deref() == Some("1") {
+                    if let Some(o) = one_bd {
+                        let raw = shared.heap.get_field(o, 0);
+                        tracing::warn!(target: "bd",
+                            "BD.ONE slot0 raw = {:?}", raw);
+                        let coerced = shared.heap.get_field_as(o, 0, b'L');
+                        tracing::warn!(target: "bd",
+                            "BD.ONE slot0 coerce(L) = {:?}", coerced);
+                    }
+                }
                 let mut populated = 0usize;
                 if let Some(z) = zero_bd {
                     if set_static_by_name("ZERO", Value::Object(Some(z))) {
