@@ -1,5 +1,115 @@
 # KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
+## Live status (Session 100, 2026-05-02 — ServerLogger + System.exit + RBIGDEC.1 partial)
+
+Sessions 99 and 100 landed in rapid succession. KC16 boot output today:
+
+```
+DEFAULT MODE (no env):
+  [rustjvm] stack-dump watchdog armed
+  INFO Block 2C: synthetic JBoss LogManager shim active
+  WARN B6: silent-swallow class=org/jboss/modules/log/JDKModuleLogger NPE: isNamed on null
+  [rustjvm] System.exit(1) called -- process terminating
+  rc=0
+
+WITH RUSTJVM_SOFT_EXIT=1 (Agent C path):
+  [rustjvm] stack-dump watchdog armed
+  INFO Block 2C: synthetic JBoss LogManager shim active
+  WARN B6: silent-swallow class=org/jboss/modules/log/JDKModuleLogger NPE: isNamed on null
+  WARN [rustjvm] System.exit(1) soft-returned (RUSTJVM_SOFT_EXIT=1)
+  WARN: main() completed with 1 swallowed VM error(s)
+  rc=0
+```
+
+Down from Session 99's 2 swallows + hard exit. ServerLogger CCE
+eliminated. With `RUSTJVM_SOFT_EXIT=1`, main reaches normal completion
+past `org.jboss.as.server.Main.abort` for the first time — visibility
+into the next WildFly init layer is now possible.
+
+**Session 99 (commit `b9f421d`)** — landed in user merge from
+worktrees `agent-a964ef2a6f54772cf` (Agent 1) and
+`agent-a7487eef04ebd9101` (Agent 4):
+- ManagementFactory `<clinit>` UnsatisfiedLinkError — RESOLVED. Root
+  cause: vm_exec.rs override-allowlist for `System.loadLibrary` /
+  `Runtime.loadLibrary*` was a dead-code path (target natives weren't
+  registered in real-JDK mode). Fix: register them as no-ops in
+  `register_vm_management_impl` plus `ManagementFactory.loadNativeLib()V`.
+  Also added int-typed thread counters (`getLiveThreadCount`/Peak/Daemon
+  were `()J` but JDK 25 declares `()I`) and `getUptime0` /
+  `getAvailableProcessors`. Files: `native-builtins/src/jmx.rs` (+128).
+- JBoss LogManager Block 2C synthetic shim (RESOLVED — eliminates the
+  `WARNING: Failed to load the specified log manager class` line).
+  New file `native-builtins/src/jboss_logmanager.rs` (394 lines)
+  provides synthetic `org/jboss/logmanager/LogManager` extending
+  `java/util/logging/LogManager`. `addLogger` / `getLogger` / `log`
+  delegation routes WildFly-issued logger calls to stderr or
+  `org.jboss.boot.log.file`. Wired into `lib.rs::register_essential_natives`.
+
+**Session 100 (commit `022c043`)** — landed from worktrees
+`agent-ad8c5ffa59334bad9` (Agent B), `agent-a0cb6df17357dc943`
+(Agent C), and `agent-ac965f255a169de91` (Agent D):
+- ServerLogger `_$logger_en_US` ClassCastException — RESOLVED.
+  Non-obvious root cause: WildFly's `_$logger_en_US.class` is
+  **intentionally absent** from the JAR; JBoss-Logging probes
+  locale-specific names wrapped in `catch (ClassNotFoundException)` and
+  falls back to the locale-less `_$logger`. Our class loader synthesized
+  an interface stub for the missing name (because it contains `$`); JDK
+  bytecode then ran `Class.asSubclass(Logger.class)` which threw
+  `ClassCastException(this.toString())`, and `Class.toString()` on an
+  interface yields literally
+  `"interface org.jboss.as.server.logging.ServerLogger_$logger_en_US"`.
+  The CCE escaped JBoss-Logging's CNFE catch.
+  Fix: `classloading/src/class_manager.rs:1172-1190` (new match arm in
+  `load_class`) + `:3325-3344` (helper `is_jboss_logging_locale_lookup`)
+  — return `ClassNotFound` for `_$logger_<locale>` / `_$bundle_<locale>`
+  patterns instead of synthesizing a stub.
+- System.exit(1) source identified + soft-return env shipped. Caller
+  chain: `Main.main → Module.run → Main.abort → SystemExiter.logAndExit
+  → DefaultExiter.exit → System.exit(1)`. Exit is downstream of the
+  catastrophic-init path triggered by the previous swallows. Added
+  `RUSTJVM_DBG_EXIT=1` (caller-chain dump) and `RUSTJVM_SOFT_EXIT=1`
+  (env-gated soft-return; default behavior unchanged).
+  File: `native-builtins/src/lang_system.rs`.
+- RBIGDEC.1 — PARTIAL. Real root cause identified (deeper than Session
+  98's intCompact theory): `bi_read`/`bi_signum`/`bd_read` natives in
+  `native-builtins/src/lib.rs` use synthetic-stub slot indices but
+  real-JDK BigInteger layout differs at slot 1. Slot-0 fixable via
+  descriptor-cache poison + String overlay; slot-1 NOT fixable the
+  same way (other bytecode legitimately reads `mag` as `[I`). Out of
+  single-file scope to refactor `lib.rs` natives.
+  Files: `vm/src/vm/vm_util.rs` (+172/-42, more thorough fixup) +
+  `vm/tests/rbigdec1_arithmetic.rs` (new, 197 lines, with
+  `bdprobe_runs_to_ok_without_npe` passing and `#[ignore]`d
+  `bdprobe_arithmetic_roundtrip` pinning the target).
+  BdProbe progression: `0\n0\nOK` → `0\nObject@1ea\nOK` (BigInteger
+  result improves to a real object; `toString()` falls back to
+  `Object.toString()`). Target `11\n20\nOK` requires `lib.rs` refactor.
+
+**Sessions 99-100 agents that did NOT deliver:**
+- Agent A (JDKModuleLogger NPE) — empty worktree, agent concluded "all
+  properly implemented" without running the strict-swallow repro.
+  Lesson: future prompts must require `RUSTJVM_STRICT_SWALLOWS=1`
+  output verbatim in the report and at least one `cargo build` + repro
+  cycle. Filed for relaunch.
+- RFJP.1 first attempt (Session 96 Agent 4) — diagnosed JIT regalloc
+  clobber but couldn't ship fix. Workaround `RUSTJVM_DISABLE_JIT=1`
+  confirmed. Session 99 relaunch in flight as of commit `022c043`.
+
+**Remaining KC16 boot blockers (sorted by tractability):**
+1. **JDKModuleLogger.<clinit> NPE** — `Class.getModule()` returns null
+   on the real-JDK class JBoss-Modules' logger probes. Fix in
+   `native-builtins/src/lang_class.rs::native_class_get_module`
+   (synthesize a non-null Module with `isNamed()=true`). Or stub the
+   `JDKModuleLogger.<clinit>` directly. Single-file fix.
+2. **First post-soft-exit failure** — visible only with
+   `RUSTJVM_SOFT_EXIT=1` set; needs investigation, then a fix per the
+   pattern of Sessions 96-100. Likely the next missing-native or
+   class-init swallow further into WildFly's `MSC` or `Undertow` init.
+3. **RBIGDEC.1 closure** — refactor `bi_read`/`bi_signum`/`bd_read` in
+   `native-builtins/src/lib.rs` to read real-JDK layout (`signum:I` at
+   slot 0, `mag:[I` at slot 1). Out of single-file scope but bounded.
+4. **RFJP.1** — JIT regalloc bug (workaround available via env).
+
 ## Live status (Session 97, 2026-05-02 — partial: VMManagementImpl int-typed signatures)
 
 A 6-agent batch was dispatched to close the remaining boot blockers

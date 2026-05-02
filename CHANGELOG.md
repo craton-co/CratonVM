@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Session 100 (2026-05-02) — ServerLogger CCE + System.exit + RBIGDEC.1 partial
+
+Four-agent parallel batch dispatched; three shipped, one (Agent A,
+JDKModuleLogger NPE) returned no work product.
+
+- **Session 99 baseline (commit `b9f421d`)** — ManagementFactory
+  UnsatisfiedLinkError + JBoss LM synthetic shim landed via 2-agent
+  merge (Agent 1 + Agent 4 from a prior batch).
+  - ManagementFactory `<clinit>` ULE — RESOLVED. The vm_exec.rs
+    override-allowlist for `System.loadLibrary` / `Runtime.loadLibrary*`
+    was a dead-code path (target natives weren't registered in real-JDK
+    mode). Fix: register them as no-ops in `register_vm_management_impl`
+    plus `ManagementFactory.loadNativeLib()V`. Files:
+    `native-builtins/src/jmx.rs` (+128).
+  - JBoss LogManager synthetic shim (Block 2C). New file
+    `native-builtins/src/jboss_logmanager.rs` (394 lines) provides
+    synthetic `org/jboss/logmanager/LogManager`. Eliminates the
+    `WARNING: Failed to load the specified log manager class` line
+    and routes WildFly logger calls to stderr or
+    `org.jboss.boot.log.file`.
+- **Session 100 (commit `022c043`)**:
+  - **ServerLogger `_$logger_en_US` ClassCastException** — RESOLVED.
+    Non-obvious root cause: WildFly's `_$logger_en_US.class` is
+    intentionally absent; JBoss-Logging probes locale-specific names
+    wrapped in `catch (CNFE)` and falls back to the locale-less
+    `_$logger`. Our class loader synthesized an interface stub for the
+    missing name (because it contains `$`); JDK bytecode then ran
+    `Class.asSubclass(Logger.class)` which threw CCE. Fix:
+    `classloading/src/class_manager.rs:1172-1190` (new match arm) +
+    `:3325-3344` (helper `is_jboss_logging_locale_lookup`) — return
+    `ClassNotFound` for `_$logger_<locale>` / `_$bundle_<locale>`
+    patterns instead of synthesizing a stub.
+  - **System.exit(1) source identified + soft-return env shipped.**
+    Caller chain: `Main.main → Module.run → org/jboss/as/server/Main.abort
+    → SystemExiter.logAndExit → DefaultExiter.exit → System.exit(1)`.
+    Added `RUSTJVM_DBG_EXIT=1` (caller-chain dump) and
+    `RUSTJVM_SOFT_EXIT=1` (env-gated soft-return; default behavior
+    unchanged). With soft-exit set, KC16 main reaches normal completion
+    past `Main.abort` for the first time.
+    File: `native-builtins/src/lang_system.rs`.
+  - **RBIGDEC.1 — partial.** Real root cause identified (deeper than
+    Session 98's intCompact theory): `bi_read` / `bi_signum` / `bd_read`
+    natives in `native-builtins/src/lib.rs` use synthetic-stub slot
+    indices but real-JDK BigInteger layout differs at slot 1. Slot-0
+    fixable via descriptor-cache poison + String overlay; slot-1 NOT
+    fixable the same way (other bytecode reads `mag` as `[I`). Out of
+    single-file scope to refactor `lib.rs` natives.
+    Files: `vm/src/vm/vm_util.rs` (+172/-42, more thorough fixup +
+    descriptor-cache poison + dual-layout overlay) +
+    `vm/tests/rbigdec1_arithmetic.rs` (new, 197 lines).
+    BdProbe progression: `0\n0\nOK` → `0\nObject@1ea\nOK`. Target
+    `11\n20\nOK` requires `lib.rs` refactor.
+
+KC16 boot post-Session-100:
+- DEFAULT mode: 1 swallow remains (JDKModuleLogger NPE — Agent A's
+  failed territory) + System.exit(1) terminates. rc=0.
+- WITH `RUSTJVM_SOFT_EXIT=1`: main() reaches normal completion past
+  the bootstrap fatal-error path. WildFly init proceeds further than
+  ever observed. rc=0.
+
+Apps: HelloWorld / AnnoTest / FjpSum / CipherProbe / DigestProbe
+unchanged. BdProbe better.
+
 ### Session 97 (2026-05-02) — partial: VMManagementImpl signature fixes
 
 Six-agent batch dispatched to close the remaining KC16 boot blockers
