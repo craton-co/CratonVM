@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Session 97 (2026-05-02) — partial: VMManagementImpl signature fixes
+
+Six-agent batch dispatched to close the remaining KC16 boot blockers
+(`ManagementFactory.<clinit>` UnsatisfiedLinkError, BigDecimal arithmetic
+returning 0 on post-clinit-populated statics, JIT regalloc clobber on
+deep recursion, three blocks of JBoss LogManager wiring). All six agents
+hit token limits before iterating on their first attempts. Only one
+agent shipped a net-positive partial:
+
+- **RKC16N.12 (partial)** — VMManagementImpl int-typed thread counters +
+  uptime / processor natives. `getLiveThreadCount` / `getPeakThreadCount` /
+  `getDaemonThreadCount` were registered with descriptor `()J` (long), but
+  JDK 25 declares them as `()I` (int) — the dispatcher matches on full
+  descriptor so the registrations were silently ignored, surfacing as ULE
+  during `ManagementFactory.<clinit>`. Re-registered with `()I` and added
+  the missing `getUptime0()J` + `getAvailableProcessors()I` natives. Added
+  `System.loadLibrary` / `Runtime.loadLibrary0` override-allowlist entry
+  so the loadLibrary("management") path doesn't throw. Files:
+  `native-builtins/src/jmx.rs` (+93), `vm/src/vm/vm_exec.rs` (+28).
+  Tests: `vm/tests/management_factory_clinit.rs`,
+  `jmx_tests::test_vm_management_impl_int_typed_thread_counters`,
+  `jmx_tests::test_vm_management_impl_uptime_and_processors`.
+- **`ManagementFactory.<clinit>` swallow still fires** post-fix — at least
+  one more missing native deeper in the JMM init chain (likely in
+  `sun/management/MemoryPoolImpl`, `MemoryManagerImpl`,
+  `GarbageCollectorImpl`, or `HotSpotDiagnostic`). Diagnose via
+  `RUSTJVM_STRICT_SWALLOWS=1`.
+
+Not delivered (deferred to a future batch with smaller scopes):
+
+- RBIGDEC.1 (BigDecimal arithmetic on populated statics)
+- RFJP.1 (JIT regalloc clobber on deeply-recursive `RecursiveTask<Long>`)
+- Block 2A (JBoss LM JAR auto-discovery — agent's wiring exists but
+  doesn't make the class reachable to `Class.forName` from inside the
+  JDK's `java.util.logging.LogManager.<clinit>`; not merged)
+- Block 2B (`LogManager.getLogManager()` factory for arbitrary subclasses)
+- Block 2C (synthetic `org.jboss.logmanager.LogManager` shim fallback)
+
+### Session 96 (2026-05-02) — KC16 boot-blocker batch
+
+- **`Object.get(Object)Object` `NoSuchMethodError` on KC16 boot — RESOLVED.**
+  `native-builtins/src/lang_system.rs::native_system_getenv_all` was allocating
+  the returned HashMap with `ClassId::new(0)`; the dispatcher's stale-pointer
+  detector misrouted the resulting `Map.get(key)` invokeinterface to
+  `java/lang/Object`. Fix: route allocation through
+  `ctx.ensure_class_initialized("java/util/HashMap")`. Pinned by
+  `vm/tests/wp8_10_10_system_getenv_map_class.rs`.
+- **`BigDecimal.<clinit>` NPE cascade on KC16 boot — RESOLVED on the boot
+  path** (arithmetic still red — see RBIGDEC.1 follow-up). Two fixes in
+  `vm/src/vm/vm_util.rs`: (a) `set_static_by_name` was using enumerate-indexing
+  where it should have been using static-only indexing — JDK classes with
+  interleaved static/instance fields (BigDecimal has `JLA`/`INFLATED` between
+  instance fields) silently wrote statics into instance slots; (b) added
+  post-clinit fixup arms for `BigInteger` and `BigDecimal` populating
+  `ZERO`/`ONE`/`TWO`/`NEGATIVE_ONE`/`TEN` when the swallow path triggers.
+- **`ClassLoader.getResources` for classpath JARs — pinned by regression test.**
+  Override-allowlist in `vm/src/vm/vm_exec.rs` + JAR walker in
+  `native-builtins/src/classloader.rs::cl_get_resources` had landed silently
+  in a prior commit; `vm/tests/rslf4j1_get_resources.rs` now locks it in.
+  Verified end-to-end on Windows.
+- **22 leaked diagnostic eprintlns removed** from `native-builtins/src/`
+  (`[WP4.2 essential]`, `[FJPTRACE]`, etc.). 14 deleted, 8 converted to
+  `tracing::debug!`. CI gate: `scripts/check-no-diag-prints.sh` (called from
+  `.github/workflows/ci.yml`) enforces 0 hits across the workspace. Closes
+  RJ.1.
+
+#### Known limitations after Session 96
+- `RBIGDEC.1`: BigDecimal/BigInteger arithmetic on the post-clinit-populated
+  statics returns 0 (`BigDecimal.ONE.add(BigDecimal.TEN)` → `0`). KC16 boot
+  doesn't compute with these values, so it's unblocked, but anything that
+  does (JDBC numeric, Jackson numeric) remains broken. Reproducer:
+  `apps/bigdecimal_probe/BdProbe.java`.
+- `RFJP.1`: `pool.invoke(RecursiveTask)` for divide-and-conquer at depth ≥10
+  returns 0. JIT correctness bug in deeply-recursive boxed-Long arithmetic
+  (likely register clobber across `jit_invoke_dispatch`). Workaround:
+  `RUSTJVM_DISABLE_JIT=1`. Pinned (failing) by
+  `vm/tests/fjp_recursive.rs::fjp_probe_recursive_returns_correct_sum`
+  (`#[ignore]`-gated).
+- KC16 main() exits 0 but the WildFly ServiceContainer never starts:
+  `ManagementFactory.<clinit>` swallow remains, JBoss LogManager wiring not
+  yet done. See `docs/kc16-blocker-map.md`.
+
 ### Added
 - **JIT XMM register allocation for float/double locals** — graph-coloring allocator now runs a separate XMM pass assigning float/double locals to XMM8-XMM15 (callee-saved on Windows x64). Previously all FP locals spilled to frame memory. Prologue saves/restores callee-saved XMMs via R11 (not RAX, which holds the return value). Zero-init loop skips XMM registers already loaded from params.
 - **JIT Math.sqrt intrinsic** — `invokestatic java/lang/Math.sqrt:(D)D` is now inlined as `SQRTSD XMM0, XMM0` via a sentinel `JitDirectCall` (entry = `MATH_SQRT_INTRINSIC`). Eliminates interpreter dispatch overhead for sqrt in FP-heavy methods.

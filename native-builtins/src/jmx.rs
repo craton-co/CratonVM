@@ -150,6 +150,10 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // uses these for diagnostic output, not for control flow.
     let zero_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Long(0)));
+    // Long-typed natives — `()J`. Only `getTotalThreadCount` is `long` on
+    // the thread side; live/peak/daemon are `int` (see int-typed batch
+    // below). Mismatching the descriptor causes the dispatcher to miss
+    // the registration and the JVM to raise UnsatisfiedLinkError.
     for name in [
         "getTotalCompileTime",
         "getTotalClassCount",
@@ -166,14 +170,49 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "getSafepointCount",
         "getTotalApplicationNonStoppedTime",
         "getTotalThreadCount",
+    ] {
+        r.register(cls, name, "()J", zero_long);
+    }
+
+    // -- VMManagementImpl int-typed counters --
+    //
+    // RKC16N.12: live/peak/daemon thread counts are declared `int`, not
+    // `long`, in JDK 25's VMManagementImpl. Registering them with `()J`
+    // (as the previous batch did) caused the dispatcher to never match
+    // the call site, surfacing as `UnsatisfiedLinkError` during
+    // `ManagementFactoryHelper.<clinit>` -> `new VMManagementImpl()`
+    // chain on Keycloak boot.
+    let zero_int: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Int(0)));
+    for name in [
         "getLiveThreadCount",
         "getPeakThreadCount",
         "getDaemonThreadCount",
     ] {
-        r.register(cls, name, "()J", zero_long);
+        r.register(cls, name, "()I", zero_int);
     }
     // Reset peak counter — accept and ignore.
     r.register(cls, "resetPeakThreadCount", "()V", |_ctx, _args| Ok(None));
+
+    // -- VMManagementImpl uptime + processor count --
+    //
+    // RKC16N.12: `getUptime()` calls `getUptime0()J` and
+    // `RuntimeImpl.getAvailableProcessors()` delegates to
+    // `VMManagementImpl.getAvailableProcessors()I`. Both are declared
+    // native; without registrations the JMM init chain trips on ULE.
+    // `getUptime0` returns real elapsed millis since VM start (we already
+    // track this for `getStartupTime`); `getAvailableProcessors` reports
+    // Rust's view of the host's parallelism, matching what
+    // `Runtime.availableProcessors()` would report.
+    r.register(cls, "getUptime0", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(uptime_ms() as i64)))
+    });
+    r.register(cls, "getAvailableProcessors", "()I", |_ctx, _args| {
+        let n = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        Ok(Some(Value::Int(n as i32)))
+    });
 
     // -- sun.management.MemoryImpl --
     // RKC16N.10 follow-on: ManagementFactory.<clinit> instantiates
@@ -1505,6 +1544,58 @@ mod jmx_tests {
                 cls
             );
         }
+    }
+
+    #[test]
+    fn test_vm_management_impl_int_typed_thread_counters() {
+        // RKC16N.12 regression: live/peak/daemon thread counts are `int`
+        // in JDK 25's VMManagementImpl, not `long`. The earlier batch
+        // registered them as `()J`, which caused the dispatcher to never
+        // match the call site and the JVM to raise UnsatisfiedLinkError
+        // during ManagementFactoryHelper.<clinit> -> new VMManagementImpl()
+        // on Keycloak boot. Pin the correct descriptors here so the
+        // mismatch can't silently regress.
+        let mut r = NativeMethodRegistry::new();
+        register_vm_management_impl(&mut r);
+        let cls = "sun/management/VMManagementImpl";
+        for name in [
+            "getLiveThreadCount",
+            "getPeakThreadCount",
+            "getDaemonThreadCount",
+        ] {
+            assert!(
+                r.find(cls, name, "()I").is_some(),
+                "VMManagementImpl.{} should be registered with `()I` (int), \
+                 not `()J` (long) — see JDK 25 sun/management/VMManagementImpl.java",
+                name
+            );
+            assert!(
+                r.find(cls, name, "()J").is_none(),
+                "VMManagementImpl.{} must NOT be registered with `()J`; \
+                 the JDK declares it `int` and the dispatcher matches by \
+                 full descriptor.",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_vm_management_impl_uptime_and_processors() {
+        // RKC16N.12: VMManagementImpl declares native getUptime0()J and
+        // getAvailableProcessors()I. Both are reachable from
+        // RuntimeImpl during JMM bootstrap; missing either surfaces as
+        // an UnsatisfiedLinkError during ManagementFactory class init.
+        let mut r = NativeMethodRegistry::new();
+        register_vm_management_impl(&mut r);
+        let cls = "sun/management/VMManagementImpl";
+        assert!(
+            r.find(cls, "getUptime0", "()J").is_some(),
+            "VMManagementImpl.getUptime0 missing"
+        );
+        assert!(
+            r.find(cls, "getAvailableProcessors", "()I").is_some(),
+            "VMManagementImpl.getAvailableProcessors missing"
+        );
     }
 
     #[test]

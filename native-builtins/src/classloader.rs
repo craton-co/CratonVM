@@ -318,7 +318,6 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    eprintln!("[WP2.3 debug] cl_init_parent fired");
     let this = obj_arg(args, 0)?;
     let parent = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));

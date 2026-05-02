@@ -5187,9 +5187,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             };
             let (done, cached) = fjp_state_get(task);
             if done {
-                if std::env::var("FJPTRACE").is_ok() {
-                    eprintln!("[FJPTRACE] pool.invoke task=0x{:x} done=true cached={:?}", fjp_key(task), cached);
-                }
+                tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), cached = ?cached, "pool.invoke done");
                 return Ok(Some(cached));
             }
             let result = match ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]) {
@@ -5199,9 +5197,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                     Value::Object(None)
                 }
             };
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] pool.invoke task=0x{:x} result={:?}", fjp_key(task), result);
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), result = ?result, "pool.invoke result");
             fjp_state_set_done(task, result);
             Ok(Some(result))
         },
@@ -5219,9 +5215,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] fjt.fork (lazy) task=0x{:x}", fjp_key(this));
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), "fjt.fork (lazy)");
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -5229,16 +5223,12 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, cached) = fjp_state_get(this);
         if done {
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] fjt.join task=0x{:x} cached={:?}", fjp_key(this), cached);
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "fjt.join cached");
             return Ok(Some(cached));
         }
         let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
             .ok().flatten().unwrap_or(Value::Object(None));
-        if std::env::var("FJPTRACE").is_ok() {
-            eprintln!("[FJPTRACE] fjt.join (recompute) task=0x{:x} result={:?}", fjp_key(this), result);
-        }
+        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "fjt.join recompute");
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -5305,9 +5295,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] rt.fork (lazy) task=0x{:x}", fjp_key(this));
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), "rt.fork (lazy)");
             // Lazy: do not eagerly compute. The next `join()` / `get()` /
             // `invoke()` on this task will run `compute()` if not done.
             Ok(Some(Value::Object(Some(this))))
@@ -5317,16 +5305,12 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, cached) = fjp_state_get(this);
         if done {
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] rt.join task=0x{:x} cached={:?}", fjp_key(this), cached);
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "rt.join cached");
             return Ok(Some(cached));
         }
         let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
             .ok().flatten().unwrap_or(Value::Object(None));
-        if std::env::var("FJPTRACE").is_ok() {
-            eprintln!("[FJPTRACE] rt.join (compute) task=0x{:x} result={:?}", fjp_key(this), result);
-        }
+        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "rt.join compute");
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });

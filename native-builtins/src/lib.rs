@@ -776,7 +776,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // native to win over the real JDK bytecode for both
     // `(Ljava/lang/Runnable;)V` and `(Ljava/util/concurrent/ForkJoinTask;)V`.
 
-    // WP4.2 DEBUG: trace completeValue
+    // WP4.2: CompletableFuture.completeValue — manual CAS on the result slot.
     registry.register(
         "java/util/concurrent/CompletableFuture",
         "completeValue",
@@ -784,15 +784,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = match args.first().copied() {
                 Some(Value::Object(Some(r))) => r,
-                _ => { eprintln!("[WP4.2 cv] no this"); return Ok(Some(Value::Int(0))); }
+                _ => return Ok(Some(Value::Int(0))),
             };
             let val = args.get(1).copied().unwrap_or(Value::Object(None));
             let before = ctx.get_field(this, 0);
-            eprintln!("[WP4.2 cv] this.result BEFORE = {:?}, val = {:?}", before, val);
             // Manually do the CAS
             if matches!(before, Value::Object(None)) {
                 ctx.set_field(this, 0, val);
-                eprintln!("[WP4.2 cv] this.result AFTER set = {:?}", ctx.get_field(this, 0));
                 Ok(Some(Value::Int(1)))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -809,26 +807,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            // Trace which class the runnable is
-            let cid = ctx.class_id_of_object(runnable);
-            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
-            eprintln!("[WP4.2 essential] FJP.execute(Runnable) firing (runnable_class={cname})");
-            // Capture dep BEFORE run (since AsyncSupply.run clears it)
-            let dep_before = if cname.contains("AsyncSupply") || cname.contains("AsyncRun") {
-                let d = ctx.get_field(runnable, 2);
-                eprintln!("[WP4.2 essential] AsyncSupply.dep BEFORE run = {:?}", d);
-                if let Value::Object(Some(dep)) = d {
-                    eprintln!("[WP4.2 essential] dep.result(slot0) BEFORE = {:?}", ctx.get_field(dep, 0));
-                    eprintln!("[WP4.2 essential] dep.stack(slot1) BEFORE = {:?}", ctx.get_field(dep, 1));
-                }
-                d
-            } else { Value::Object(None) };
             ctx.invoke_virtual(runnable, "run", "()V", &[])?;
-            if let Value::Object(Some(dep)) = dep_before {
-                eprintln!("[WP4.2 essential] dep.result(slot0) AFTER = {:?}", ctx.get_field(dep, 0));
-                eprintln!("[WP4.2 essential] dep.stack(slot1) AFTER = {:?}", ctx.get_field(dep, 1));
-            }
-            eprintln!("[WP4.2 essential] FJP.execute(Runnable) done");
             Ok(None)
         },
     );

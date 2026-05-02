@@ -805,8 +805,27 @@ pub(crate) fn native_system_getenv(ctx: &mut dyn NativeContext, args: &[Value]) 
 pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     use rustjvm_types::ClassId;
 
-    // Build a HashMap with all environment variables
-    let map = ctx.alloc_object(ClassId::new(0), 3); // MAP_NUM_FIELDS = 3
+    // Build a HashMap with all environment variables.
+    //
+    // RKC16N.14: allocate the backing object with the real `java/util/HashMap`
+    // class_id (when available) so that interpreter virtual dispatch on the
+    // returned reference resolves through HashMap's registered native methods
+    // (e.g. `get(Object)Object`).
+    //
+    // Pre-fix the object was allocated with `ClassId::new(0)`; the dispatcher's
+    // stale-pointer detector then sees a non-zero header (identity hash etc.)
+    // and falls through to "Genuinely java.lang.Object", routing
+    // `Map.get(key)` invokeinterface dispatch to `java/lang/Object`. Since
+    // `Object` declares no `get(Object)Object` method, the slow path emitted
+    // `WARN NoSuchMethodError method="java/lang/Object.get(Object)Object"`
+    // and `Main.determineEnvironment` propagated null upward —
+    // surfaced during KC16 boot inside
+    // `ServerEnvironment.configureQualifiedHostName` against the
+    // `WildFlySecurityManager.getSystemEnvironmentPrivileged()` Map.
+    let hashmap_class_id = ctx
+        .ensure_class_initialized("java/util/HashMap")
+        .unwrap_or(ClassId::new(0));
+    let map = ctx.alloc_object(hashmap_class_id, 3); // MAP_NUM_FIELDS = 3
     let cap = 16usize;
     let buckets = ctx.new_ref_array(ClassId::new(0), cap);
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS

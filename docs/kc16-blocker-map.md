@@ -1,5 +1,155 @@
 # KC16 Boot-Blocker Map (Session 94, 2026-04-26)
 
+## Live status (Session 97, 2026-05-02 — partial: VMManagementImpl int-typed signatures)
+
+A 6-agent batch was dispatched to close the remaining boot blockers
+(ManagementFactory ULE, BigDecimal arithmetic, JIT regalloc-on-recursion,
+JBoss LogManager classpath visibility / `getLogManager` factory / synthetic
+shim). All 6 agents hit token limits before delivering working fixes; **only
+1 of 6 (Item 1, ManagementFactory natives) shipped a net-positive partial**.
+
+**RKC16N.12 partial — VMManagementImpl int-typed thread counters & uptime/
+processors (LANDED Session 97).** `getLiveThreadCount`/`getPeakThreadCount`/
+`getDaemonThreadCount` were registered with `()J` but JDK 25 declares them
+as `()I`; the dispatcher missed all three. Re-registered with `()I`. Also
+added `getUptime0()J` (returns real elapsed-millis) and
+`getAvailableProcessors()I` (routes to Rust's
+`std::thread::available_parallelism`). Added a
+`System.loadLibrary` / `Runtime.loadLibrary*` override-allowlist entry in
+`vm/src/vm/vm_exec.rs:4852-4882` so the JDK's `Class.forName` path through
+`ManagementFactory.<clinit>`'s loadLibrary("management") call doesn't throw.
+Files: `native-builtins/src/jmx.rs` (+93), `vm/src/vm/vm_exec.rs` (+28).
+New tests: `vm/tests/management_factory_clinit.rs`,
+`jmx_tests::test_vm_management_impl_int_typed_thread_counters`,
+`jmx_tests::test_vm_management_impl_uptime_and_processors`.
+
+**`ManagementFactory.<clinit>` UnsatisfiedLinkError still fires** post-fix
+— at least one further missing native is reachable from the JMM init chain
+(probably in `sun/management/MemoryPoolImpl`, `MemoryManagerImpl`,
+`GarbageCollectorImpl`, or `HotSpotDiagnostic`). Diagnose via
+`RUSTJVM_STRICT_SWALLOWS=1` to capture the failing native by name; the
+existing `register_vm_management_impl` is the right home.
+
+**Items NOT delivered by the Session 97 batch (need rework):**
+
+- **RBIGDEC.1** — BigDecimal/BigInteger arithmetic on post-clinit-populated
+  statics returns 0. Agent investigated `vm/src/vm/vm_util.rs::post_clinit_fixup`
+  but didn't compile (`alloc_array_checked` doesn't exist; trivially
+  fixable but the resulting binary still printed `0\n0\nOK` on
+  `apps/bigdecimal_probe/BdProbe`). Worktree exists at
+  `agent-a5574fe75239a0e58` for inspection; not merged.
+- **RFJP.1** — `pool.invoke(RecursiveTask)` divide-and-conquer at depth ≥10
+  returns 0. Worktree discarded by harness; nothing to inspect. Workaround
+  `RUSTJVM_DISABLE_JIT=1` confirmed working in Session 96.
+- **Block 2A** — JBoss LM JAR auto-discovery + classpath extension when
+  `java.util.logging.manager=org.jboss.logmanager.LogManager` is set.
+  Agent landed `discover_jboss_logmanager_jar()` in `vm/src/config.rs` and
+  classpath-extension wiring in `vm/src/vm/vm_init.rs`, but with the system
+  property set the KC16 boot warning still fires — the wiring activates but
+  the JAR isn't reaching `Class.forName` from inside the JDK's
+  `java.util.logging.LogManager.<clinit>`. Worktree at
+  `agent-a72e1604a23f27bfc`; not merged.
+- **Block 2B** (`getLogManager()` honors the property for arbitrary classes)
+  — worktree discarded by harness.
+- **Block 2C** (synthetic `org.jboss.logmanager.LogManager` shim fallback)
+  — worktree discarded by harness.
+
+**Operational lesson**: 6 simultaneous opus agents on multi-file
+investigation tasks exhausted account capacity faster than agents could
+iterate on first-attempt failures. Future batches should be ≤4 opus
+agents on tightly-scoped fixes (each with a known repro and a clear
+single-file root cause), or use sonnet for the easier items. Pure
+add-only / cleanup tasks (like Session 96's RJ.1) ship reliably; deep
+multi-system investigations (regalloc, classloader-ordering, native-init
+chains) need either more budget per agent or up-front scoping into
+smaller blocks.
+
+## Live status (Session 96, 2026-05-02 — Object.get + BigDecimal cascade closed)
+
+After a 5-agent parallel batch this session, two of the three remaining KC16
+boot blockers from Session 95 are closed:
+
+- **`Object.get(Object)Object` `NoSuchMethodError`** — RESOLVED. Root cause was
+  `native-builtins/src/lang_system.rs::native_system_getenv_all` allocating
+  the returned HashMap with `ClassId::new(0)` instead of routing through
+  `ctx.ensure_class_initialized("java/util/HashMap")`. The dispatcher's
+  stale-pointer detector then routed `Map.get(key)` invokeinterface (called
+  from `WildFlySecurityManager.getSystemEnvironmentPrivileged()` →
+  `org/jboss/as/server/ServerEnvironment.configureQualifiedHostName`) to
+  `java/lang/Object`, which has no `get`. Pinned by
+  `vm/tests/wp8_10_10_system_getenv_map_class.rs`.
+- **`BigDecimal.<clinit>` NPE on `signum`** — RESOLVED (boot path; arithmetic
+  still red — see RBIGDEC.1 below). Root causes were two: (a) a
+  `set_static_by_name` indexing bug in `vm/src/vm/vm_util.rs` that used
+  enumerate-indexing instead of static-only indexing, so JDK classes with
+  interleaved static/instance fields (BigDecimal has `JLA`/`INFLATED`/
+  `INFLATED_BIGINT` between instance fields) silently wrote statics into
+  instance slots; (b) a missing post-clinit fixup arm for BigInteger and
+  BigDecimal — when their `<clinit>` swallows, ZERO/ONE/TWO/NEGATIVE_ONE/TEN
+  are populated with hand-built instances. The display WARN for the known-
+  recoverable BigDecimal cascade is suppressed (counter still increments;
+  `RUSTJVM_STRICT_SWALLOWS=1` still escalates).
+
+Reproducer (unchanged):
+```
+target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot" \
+   --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- \
+   -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone \
+   "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1"
+```
+
+Output (post-merge, end of Session 96):
+```
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+WARNING: Failed to load the specified log manager class org.jboss.logmanager.LogManager
+WARN B6: silent-swallow ... class=java/lang/management/ManagementFactory exc=java/lang/UnsatisfiedLinkError
+WARN Post-clinit fixup: BigDecimal ZERO/ONE/TWO/TEN populated (4/4)
+WARN: main() completed with 2 swallowed VM error(s)
+```
+
+`main()` returns rc=0. **The WildFly server itself still does not start** —
+`server.log` is not written, no port is bound. Two concrete next blockers,
+each its own RKC16N.* item:
+
+1. **`ManagementFactory.<clinit>` `UnsatisfiedLinkError`** — see Session 95
+   live-status above. Likely needs another batch of `sun/management/*` natives
+   (RKC16N.10 batch was incomplete). Probable source of the `java.lang.invoke`
+   bootstrap-cycle wording in JEP 358 NPE messages downstream.
+2. **JBoss LogManager wiring** — `java.util.logging.manager=org.jboss.logmanager.LogManager`
+   is rejected at LogManager bootstrap because the class isn't on the system
+   classpath that early. Substantial wiring exercise — see Session 95.
+
+`RBIGDEC.1` (new follow-up): the post-clinit fixup populates the static
+fields, but `BigDecimal.ONE.add(BigDecimal.TEN)` returns `0` instead of `11`,
+and `BigInteger.TWO.multiply(BigInteger.TEN)` returns `0` instead of `20`.
+Reproducer: `apps/bigdecimal_probe/BdProbe.java` (rc=0 today, prints `0\n0\nOK`
+instead of `11\n20\nOK`). The `mag`/`signum`/`intCompact`/`intVal` fields
+are populated with the right *values* but the JDK arithmetic methods still
+read them as zeroes — likely either the field offsets in the fixup don't
+match the JDK 25 layout or the in-place arithmetic fast-path bypasses the
+fields the fixup writes.
+
+`RFJP.1` (new): `apps/fjp_probe/FjpProbe.java` (`pool.invoke(RecursiveTask)` of
+divide-and-conquer Long sum) returns `0` instead of `499999500000`.
+Diagnosed in this session as a JIT correctness bug in deeply-recursive
+`compute()` Long-arithmetic at depth ≥10. Workaround: `RUSTJVM_DISABLE_JIT=1`.
+Pinned (failing) by `vm/tests/fjp_recursive.rs::fjp_probe_recursive_returns_correct_sum`
+(`#[ignore]`-gated). Files investigated but not landed:
+`vm/src/jit/x64.rs::flush_scratch_registers`, `vm/src/jit/helpers.rs::jit_invoke_dispatch`.
+
+`RJ.1` (debug-print cleanup) — RESOLVED in this session. 22 leaked
+`eprintln!("[WP*]" / "[FJPTRACE]" / etc.)` removed across native-builtins;
+CI gate at `scripts/check-no-diag-prints.sh` enforces 0 hits.
+
+`RSLF4J.1` (ClassLoader.getResources for classpath JARs) — RESOLVED. The fix
+(override-allowlist in `vm/src/vm/vm_exec.rs`, JAR walker in
+`native-builtins/src/classloader.rs::cl_get_resources`) had landed silently
+in a prior commit; this session pinned it with a regression test
+(`vm/tests/rslf4j1_get_resources.rs`) so it can't silently regress.
+Verified end-to-end on Windows: `getResources("META-INF/services/foo.svc")`
+returns 1 entry from a classpath JAR, with URL
+`jar:file:/.../svctest.jar!/META-INF/services/foo.svc`.
+
 ## Live status (Session 95, 2026-04-29 — main() reaches exit 0; RKC16N.9–.13 landed)
 
 After commits `8aad4c8` (RKC16N.9 + RKC16N.10), `01f091e` + `9971e41`

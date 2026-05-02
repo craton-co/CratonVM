@@ -4852,6 +4852,34 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // RKC16N.12: System.loadLibrary / Runtime.loadLibrary0
+                        // — the real JDK bytecode walks down through
+                        // ClassLoader.loadLibrary which throws
+                        // UnsatisfiedLinkError("no <name> in java.library.path: ...")
+                        // when the library can't be found on disk (we ship
+                        // the JMM natives in-process via NativeMethodRegistry,
+                        // so libmanagement.dll is genuinely absent). The ULE
+                        // surfaces during ManagementFactory.<clinit> (which
+                        // calls System.loadLibrary("management")) as a B6
+                        // silent-swallow on Keycloak boot. Force the
+                        // no-op native override registered in
+                        // `lang_system::register_lang_system_natives` so the
+                        // bytecode never runs the throwing path.
+                        || ({
+                            let m = (class_name == "java/lang/System"
+                                && matches!(method_name, "loadLibrary" | "load"))
+                                || (class_name == "java/lang/Runtime"
+                                    && matches!(method_name, "loadLibrary0" | "load0"
+                                        | "loadLibrary" | "load"));
+                            if m {
+                                tracing::debug!(
+                                    target: "rkc16n12",
+                                    class=%class_name, method=%method_name, desc=%descriptor,
+                                    "RKC16N.12: forcing native override for loadLibrary path"
+                                );
+                            }
+                            m
+                        })
                         // C23: AtomicReferenceArray / AtomicIntegerArray /
                         // AtomicLongArray use VarHandle.compareAndSet on their
                         // inner array, which routes through VarHandles$Array$*
@@ -5141,6 +5169,39 @@ fn invoke_on_class_shared_inner(
                     }
                 }
 
+                if std::env::var_os("RUSTJVM_DBG_NSME").is_some() {
+                    // Diagnostic: when an NSME is about to be raised, capture
+                    // the receiver's actual concrete class and the caller's
+                    // method name so a wrong-dispatch (receiver vs. cp class
+                    // mismatch) shows up in logs without rebuilding.
+                    let recv_dbg = match args.first() {
+                        Some(Value::Object(Some(o))) => {
+                            let cid = shared.heap.class_id_of(*o);
+                            let cm3 = shared.class_manager.read();
+                            cm3.get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| format!("<cid {cid}>"))
+                        }
+                        Some(Value::Object(None)) => "<null>".to_string(),
+                        Some(v) => format!("<non-obj {v:?}>"),
+                        None => "<no-args>".to_string(),
+                    };
+                    let caller_dbg = thread
+                        .frames
+                        .last()
+                        .map(|f| {
+                            format!(
+                                "{}.{}{}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor()
+                            )
+                        })
+                        .unwrap_or_else(|| "<no-frame>".to_string());
+                    eprintln!(
+                        "[NSME_DBG] dispatch_class={class_name} method={method_name}{descriptor} receiver={recv_dbg} caller={caller_dbg}"
+                    );
+                }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),
                     "NoSuchMethodError"
