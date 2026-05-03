@@ -115,18 +115,87 @@ fn read_inet_socket_address(
     ctx: &dyn NativeContext,
     sa: ObjectRef,
 ) -> Result<(String, i32), rustjvm_types::error::MethodCallFailed> {
-    let host_val = ctx.get_field(sa, ISA_HOST);
-    let host = match host_val {
-        Value::Object(Some(s)) => match ctx.read_string(s) {
-            Some(t) => t,
-            None => read_field_string_or(ctx, s, IA_ADDR, "0.0.0.0"),
-        },
+    // Wave 3-B² (RE.4): the real JDK `InetSocketAddress` stores all of its
+    // logical state in a private inner `InetSocketAddressHolder` reachable
+    // through slot 0 (`holder`). The holder layout is:
+    //   slot 0 -> hostname : String
+    //   slot 1 -> addr     : InetAddress
+    //   slot 2 -> port     : int
+    // Bytecode `getPort()` is a final method that reads `this.holder.port`
+    // via two `getfield`s, so the synthetic "host at slot 0 / port at slot 1"
+    // layout we used in `alloc_inet_socket_address` would route the
+    // sub-`invokevirtual` for `Holder.getPort()` to the wrong receiver
+    // (a `String` masquerading as the holder). We mirror the real layout
+    // here so reads off a synthetic OR a real-JDK-`<init>`-allocated
+    // `InetSocketAddress` both yield the host+port pair.
+    let holder_val = ctx.get_field(sa, ISA_HOST);
+    let host = match holder_val {
+        Value::Object(Some(holder)) => {
+            // Holder may be (a) a `String` (legacy synthetic layout —
+            // pre-W3-B² helpers), or (b) an `InetSocketAddressHolder` whose
+            // slot 0 is `hostname:String`, slot 1 is `addr:InetAddress`,
+            // slot 2 is `port:int` (real-JDK layout). When hostname is null
+            // (real-JDK ctor that resolved successfully via getByName), we
+            // dig into the InetAddress at slot 1, which itself can be (a)
+            // a synthetic InetAddress with slot 0=hostName, slot 1=ip, or
+            // (b) a real-JDK InetAddress whose slot 0 holder carries
+            // hostName + a 4/16-byte address. Probe in that order; only
+            // fall back to "0.0.0.0" if every slot fails to yield a string.
+            if let Some(s) = ctx.read_string(holder) {
+                s
+            } else {
+                let mut resolved = None;
+                if let Value::Object(Some(name_obj)) = ctx.get_field(holder, 0) {
+                    if let Some(t) = ctx.read_string(name_obj) {
+                        resolved = Some(t);
+                    }
+                }
+                if resolved.is_none() {
+                    if let Value::Object(Some(addr_obj)) = ctx.get_field(holder, 1) {
+                        // synthetic InetAddress: slot 0 = hostName String, slot 1 = ip String
+                        for slot in [IA_HOST, IA_ADDR] {
+                            if let Value::Object(Some(s)) = ctx.get_field(addr_obj, slot) {
+                                if let Some(t) = ctx.read_string(s) {
+                                    if !t.is_empty() {
+                                        resolved = Some(t);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // real-JDK InetAddress: slot 0 = InetAddressHolder; the
+                        // holder's slot 0 is hostName, slot 1 packs address bytes.
+                        if resolved.is_none() {
+                            if let Value::Object(Some(inner_holder)) = ctx.get_field(addr_obj, 0) {
+                                if let Value::Object(Some(name_obj)) = ctx.get_field(inner_holder, 0) {
+                                    if let Some(t) = ctx.read_string(name_obj) {
+                                        if !t.is_empty() {
+                                            resolved = Some(t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                resolved.unwrap_or_else(|| "0.0.0.0".to_string())
+            }
+        }
         _ => "0.0.0.0".to_string(),
     };
-    let port = ctx
-        .get_field(sa, ISA_PORT)
-        .as_int()
-        .ok_or_else(|| ioex("InetSocketAddress port is not an int"))?;
+    // Port: synthetic legacy lives at slot 1; real-JDK lives at holder.slot 2.
+    let port = match ctx.get_field(sa, ISA_PORT) {
+        Value::Int(n) => n,
+        Value::Long(n) => n as i32,
+        _ => match holder_val {
+            Value::Object(Some(holder)) => match ctx.get_field(holder, 2) {
+                Value::Int(n) => n,
+                Value::Long(n) => n as i32,
+                _ => 0,
+            },
+            _ => 0,
+        },
+    };
     Ok((host, port))
 }
 
@@ -202,9 +271,28 @@ fn alloc_inet_socket_address(
     host: &str,
     port: i32,
 ) -> ObjectRef {
+    // Wave 3-B² (RE.4): the real JDK `InetSocketAddress.getPort()` is
+    //     getfield  holder
+    //     invokevirtual InetSocketAddressHolder.getPort()
+    // so the outer object's slot 0 MUST hold an
+    // `InetSocketAddress$InetSocketAddressHolder` — putting a `String`
+    // there causes the inner `invokevirtual` to retarget onto
+    // `java/lang/String.getPort()` and trip a NoSuchMethodError. We
+    // allocate the holder synthetically (its three fields hostname,
+    // addr, port match the real layout exactly) and link it so both
+    // the synthetic `read_inet_socket_address` reader AND real-JDK
+    // bytecode see consistent state.
     let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let holder = alloc_concurrent_synthetic(
+        ctx,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
     let h = ctx.create_string(host);
-    ctx.set_field(isa, ISA_HOST, Value::Object(Some(h)));
+    ctx.set_field(holder, 0, Value::Object(Some(h)));
+    ctx.set_field(holder, 1, Value::Object(None));
+    ctx.set_field(holder, 2, Value::Int(port));
+    ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
     ctx.set_field(isa, ISA_PORT, Value::Int(port));
     isa
 }

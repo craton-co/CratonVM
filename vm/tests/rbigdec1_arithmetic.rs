@@ -166,12 +166,12 @@ fn bdprobe_runs_to_ok_without_npe() {
     );
 }
 
-/// Stretch test (gated on the natives layout fix completing): once the
-/// `bi_read`/`bd_read` natives are taught the real-JDK slot layout, this
-/// test will pass. Until then it documents the target output and stays
-/// `#[ignore]`d so CI doesn't gate on the partial fix.
+/// Full arithmetic round-trip — used to be `#[ignore]`d while the natives
+/// in `native-builtins/src/lib.rs` (`bi_read`/`bd_read`) read the
+/// synthetic-stub slot layout instead of the real-JDK one.  The Session
+/// closing RBIGDEC.1 refactored those natives via
+/// `NativeContext::resolve_field_index`, so the gate is now live in CI.
 #[test]
-#[ignore = "RBIGDEC.1 partial: requires native-builtins layout-aware fix"]
 fn bdprobe_arithmetic_roundtrip() {
     let (stdout, stderr, rc) = match run_bdprobe(Duration::from_secs(60)) {
         Some(o) => o,

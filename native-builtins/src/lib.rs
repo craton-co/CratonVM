@@ -321,6 +321,27 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
 
+    // RBIGDEC.1 — BigInteger / BigDecimal arithmetic + toString overrides.
+    //
+    // BigInteger.<clinit> can fail in real-JDK mode (intrinsic fallback,
+    // SunJCE side-effects, etc.), causing the BigDecimal cascade NPE on
+    // `Cannot read field 'signum' because the object is null`.  The
+    // post-clinit fixup in `vm/src/vm/vm_util.rs` populates the static
+    // constants but cannot patch the rest of BigInteger/BigDecimal's
+    // partially-initialized internal tables (POW10, BIG_TEN_POWERS, etc.)
+    // which the JDK's `add` / `multiply` bytecode dereferences.
+    //
+    // We register Rust-side arithmetic + `toString` overrides that read the
+    // operand decimal value via `bi_read` / `bd_read` (which now understand
+    // the real-JDK `signum`+`mag` and `intCompact`+`scale` layouts via
+    // `NativeContext::resolve_field_index`) and produce a fresh result that
+    // round-trips through `bi_alloc` / `bd_alloc`.  These overrides run
+    // BEFORE the JDK bytecode (native dispatch takes priority — see
+    // `try_stackless_invoke`), so the partially-init'd JDK internals are
+    // never touched at runtime.
+    register_biginteger_arithmetic_overrides(registry);
+    register_bigdecimal_arithmetic_overrides(registry);
+
     // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
     // surface for real-JDK mode. Real-JDK mode bytecode resolution is
     // failing for these basic String methods during JDK class clinits on
@@ -14944,20 +14965,118 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
 // 2-field synthetic (field 0 = String decimal representation, field 1 = Int signum)
 // ===========================================================================
 
-pub(crate) const BI_FIELD_VALUE: usize = 0; // String decimal representation
-pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Int: -1, 0, or 1
+pub(crate) const BI_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
+pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Synthetic-mode: Int signum (-1, 0, or 1)
 
+/// RBIGDEC.1 — Resolve the real-JDK BigInteger field layout if available.
+///
+/// Returns `Some((signum_idx, mag_idx))` when the JDK class is loaded with the
+/// real fields `signum:I` and `mag:[I`.  Returns `None` in synthetic-jdk mode
+/// or before the class has been loaded — callers fall back to the legacy
+/// 2-field synthetic layout (`BI_FIELD_VALUE` / `BI_FIELD_SIGNUM`).
+pub(crate) fn bi_layout(ctx: &dyn NativeContext) -> Option<(usize, usize)> {
+    let s = ctx.resolve_field_index("java/math/BigInteger", "signum")?;
+    let m = ctx.resolve_field_index("java/math/BigInteger", "mag")?;
+    Some((s, m))
+}
+
+/// Read a `BigInteger` instance and return its decimal string representation.
+///
+/// Two layouts are supported:
+///   * Real-JDK layout (slot 0 = `signum:I`, slot 1 = `mag:[I`): we convert
+///     the magnitude array (big-endian, base 2^32) to a decimal string and
+///     prepend `-` if `signum < 0`.
+///   * Synthetic-stub layout (slot 0 = `value:String`): we read the string
+///     directly.
 pub(crate) fn bi_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, BI_FIELD_VALUE) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
-        _ => "0".to_string(),
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let signum = match ctx.get_field(this, sig_i) {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        if signum == 0 {
+            return "0".to_string();
+        }
+        let mag = match ctx.get_field(this, mag_i) {
+            Value::Object(Some(o)) => o,
+            _ => return "0".to_string(),
+        };
+        let len = ctx.array_length(mag);
+        if len == 0 {
+            return "0".to_string();
+        }
+        let mut words: Vec<u32> = Vec::with_capacity(len);
+        for i in 0..len {
+            let w = match ctx.get_array_element(mag, i) {
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+            words.push(w);
+        }
+        let abs = mag_words_to_decimal(&words);
+        if signum < 0 { format!("-{}", abs) } else { abs }
+    } else {
+        match ctx.get_field(this, BI_FIELD_VALUE) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
+            _ => "0".to_string(),
+        }
     }
+}
+
+/// Convert a big-endian base-2^32 magnitude array to a decimal string.
+/// Returns `"0"` for an empty array.  Used by `bi_read` (real-JDK layout).
+fn mag_words_to_decimal(mag: &[u32]) -> String {
+    if mag.is_empty() {
+        return "0".to_string();
+    }
+    let mut words: Vec<u32> = mag.to_vec();
+    let mut digits: Vec<u8> = Vec::new();
+    while !words.iter().all(|&w| w == 0) {
+        let mut rem: u64 = 0;
+        for w in words.iter_mut() {
+            let cur = (rem << 32) | (*w as u64);
+            *w = (cur / 10) as u32;
+            rem = cur % 10;
+        }
+        digits.push(rem as u8);
+    }
+    if digits.is_empty() {
+        return "0".to_string();
+    }
+    digits.iter().rev().map(|&d| (d + b'0') as char).collect()
+}
+
+/// Convert an unsigned decimal string to a big-endian base-2^32 magnitude
+/// vector.  Empty result for `"0"`.  Used by `bi_alloc` (real-JDK layout).
+fn decimal_to_mag_words(decimal: &str) -> Vec<u32> {
+    let s = decimal.trim_start_matches('-');
+    if s == "0" || s.is_empty() {
+        return Vec::new();
+    }
+    // Repeated multiply-and-add over the decimal digits.
+    let mut words: Vec<u32> = Vec::new();
+    for ch in s.chars() {
+        let d = match ch.to_digit(10) {
+            Some(v) => v as u64,
+            None => continue,
+        };
+        // multiply existing magnitude by 10
+        let mut carry: u64 = d;
+        for w in words.iter_mut().rev() {
+            let prod = (*w as u64) * 10 + carry;
+            *w = prod as u32;
+            carry = prod >> 32;
+        }
+        while carry != 0 {
+            words.insert(0, carry as u32);
+            carry >>= 32;
+        }
+    }
+    words
 }
 
 pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
-    let s = ctx.create_string(value);
-    ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
     let signum = if value.starts_with('-') {
         -1
     } else if value == "0" {
@@ -14965,7 +15084,22 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     } else {
         1
     };
-    ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        // Real-JDK layout: write signum + mag[].  This is the canonical
+        // representation that bytecode reads via `getfield`.
+        let mag_words = decimal_to_mag_words(value);
+        let mag_arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, mag_words.len());
+        for (i, w) in mag_words.iter().enumerate() {
+            ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+        }
+        ctx.set_field(obj, sig_i, Value::Int(signum));
+        ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+    } else {
+        // Synthetic-stub fallback.
+        let s = ctx.create_string(value);
+        ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
+        ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+    }
     obj
 }
 
@@ -15247,6 +15381,65 @@ fn bi_bitwise_xor(a: &str, b: &str) -> String {
         .collect();
     let trimmed = result.trim_start_matches('0');
     if trimmed.is_empty() { "0".to_string() } else { bi_from_binary(trimmed) }
+}
+
+/// RBIGDEC.1 — register BigInteger arithmetic + toString overrides for
+/// real-JDK mode. The synthetic-jdk-only `register_biginteger_natives`
+/// registers the full surface; this lean variant covers the methods the
+/// `BdProbe` tests + KC16 boot path actually call, so we don't perturb
+/// real-JDK behaviour for the broader class.
+fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry) {
+    let bi = "java/math/BigInteger";
+    registry.register(
+        bi, "add",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        native_bi_add,
+    );
+    registry.register(
+        bi, "subtract",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        native_bi_subtract,
+    );
+    registry.register(
+        bi, "multiply",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        native_bi_multiply,
+    );
+    registry.register(bi, "negate", "()Ljava/math/BigInteger;", native_bi_negate);
+    registry.register(bi, "signum", "()I", native_bi_signum);
+    registry.register(bi, "toString", "()Ljava/lang/String;", native_bi_to_string);
+    registry.register(bi, "intValue", "()I", native_bi_int_value);
+    registry.register(bi, "longValue", "()J", native_bi_long_value);
+}
+
+/// RBIGDEC.1 — register BigDecimal arithmetic + toString overrides for
+/// real-JDK mode.  Same rationale as `register_biginteger_arithmetic_overrides`.
+fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMethodRegistry) {
+    let bd = "java/math/BigDecimal";
+    registry.register(
+        bd, "add",
+        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+        native_bd_add,
+    );
+    registry.register(
+        bd, "subtract",
+        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+        native_bd_subtract,
+    );
+    registry.register(
+        bd, "multiply",
+        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+        native_bd_multiply,
+    );
+    registry.register(bd, "negate", "()Ljava/math/BigDecimal;", native_bd_negate);
+    registry.register(bd, "signum", "()I", native_bd_signum);
+    registry.register(bd, "scale", "()I", native_bd_scale);
+    registry.register(bd, "precision", "()I", native_bd_precision);
+    registry.register(bd, "toString", "()Ljava/lang/String;", native_bd_to_string);
+    registry.register(bd, "toPlainString", "()Ljava/lang/String;", native_bd_to_string);
+    registry.register(bd, "intValue", "()I", native_bd_int_value);
+    registry.register(bd, "longValue", "()J", native_bd_long_value);
+    registry.register(bd, "doubleValue", "()D", native_bd_double_value);
 }
 
 fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
@@ -15612,17 +15805,35 @@ fn native_bi_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => "0".to_string(),
     };
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(val_str)));
-    let signum = if s.starts_with('-') {
+    bi_write_into(ctx, this, &s);
+    Ok(None)
+}
+
+/// Populate an existing `BigInteger` instance with the value parsed from a
+/// decimal string.  Picks the slot layout (real-JDK signum/mag vs. legacy
+/// synthetic value/signum) automatically.  Used by the `<init>` natives so
+/// `new BigInteger("17")` lands in the right slots regardless of JDK mode.
+fn bi_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str) {
+    let signum = if value.starts_with('-') {
         -1
-    } else if s == "0" {
+    } else if value == "0" {
         0
     } else {
         1
     };
-    ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
-    Ok(None)
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let mag_words = decimal_to_mag_words(value);
+        let mag_arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, mag_words.len());
+        for (i, w) in mag_words.iter().enumerate() {
+            ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+        }
+        ctx.set_field(this, sig_i, Value::Int(signum));
+        ctx.set_field(this, mag_i, Value::Object(Some(mag_arr)));
+    } else {
+        let val_str = ctx.create_string(value);
+        ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(val_str)));
+        ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
+    }
 }
 
 fn native_bi_init_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15650,16 +15861,7 @@ fn native_bi_init_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             val.to_string()
         }
     };
-    let val_str = ctx.create_string(&decimal);
-    ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(val_str)));
-    let signum = if decimal.starts_with('-') {
-        -1
-    } else if decimal == "0" {
-        0
-    } else {
-        1
-    };
-    ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
+    bi_write_into(ctx, this, &decimal);
     Ok(None)
 }
 
@@ -15818,8 +16020,11 @@ fn native_bi_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let v = ctx.get_field(this, BI_FIELD_VALUE);
-    Ok(Some(v))
+    // RBIGDEC.1 — `bi_read` already handles both the real-JDK and synthetic
+    // layouts; allocate a fresh Java string from the decimal representation.
+    let s = bi_read(ctx, this);
+    let java_str = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(java_str))))
 }
 
 fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15833,7 +16038,11 @@ fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let a = bi_read(ctx, this);
     if radix == 10 {
-        return Ok(Some(ctx.get_field(this, BI_FIELD_VALUE)));
+        // RBIGDEC.1 — bi_read returns the decimal already; allocate a fresh
+        // Java string instead of returning the raw slot 0 (which in real-JDK
+        // mode is signum:I, not the value string).
+        let result = ctx.create_string(&a);
+        return Ok(Some(Value::Object(Some(result))));
     }
     let val: i128 = a.parse().unwrap_or(0);
     let s = match radix {
@@ -15891,7 +16100,12 @@ fn native_bi_signum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let signum = match ctx.get_field(this, BI_FIELD_SIGNUM) {
+    // RBIGDEC.1 — read from the real-JDK `signum:I` slot when available.
+    // Falls back to the synthetic-stub slot 1.  We deliberately do not use
+    // `bi_read` + sign-of-string here because that path requires reading
+    // `mag[]` and is overkill for a single-int read.
+    let sig_idx = bi_layout(ctx).map(|(s, _)| s).unwrap_or(BI_FIELD_SIGNUM);
+    let signum = match ctx.get_field(this, sig_idx) {
         Value::Int(s) => s,
         _ => 0,
     };
@@ -15969,20 +16183,67 @@ fn native_bi_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // BigDecimal — 3-field synthetic (value String, scale Int, precision Int)
 // ===========================================================================
 
-const BD_FIELD_VALUE: usize = 0;
-const BD_FIELD_SCALE: usize = 1;
-const BD_FIELD_PRECISION: usize = 2;
+const BD_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
+const BD_FIELD_SCALE: usize = 1; // Synthetic-mode: Int scale
+const BD_FIELD_PRECISION: usize = 2; // Synthetic-mode: Int precision
+
+/// `INFLATED` sentinel from real-JDK `BigDecimal`: when `intCompact` equals
+/// `Long.MIN_VALUE`, the value lives in `intVal` (a `BigInteger`).  Otherwise
+/// the compact long is the unscaled value and `intVal` may be null.
+const BD_INFLATED: i64 = i64::MIN;
+
+/// RBIGDEC.1 — Resolve the real-JDK BigDecimal field layout if available.
+///
+/// Returns the slot indices for `(intVal, scale, precision, intCompact)`
+/// when the JDK class is loaded.  None ⇒ synthetic-stub fallback.
+fn bd_layout(ctx: &dyn NativeContext) -> Option<(usize, usize, usize, usize)> {
+    let iv = ctx.resolve_field_index("java/math/BigDecimal", "intVal")?;
+    let sc = ctx.resolve_field_index("java/math/BigDecimal", "scale")?;
+    let pr = ctx.resolve_field_index("java/math/BigDecimal", "precision")?;
+    let ic = ctx.resolve_field_index("java/math/BigDecimal", "intCompact")?;
+    Some((iv, sc, pr, ic))
+}
 
 fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
-    let s = ctx.create_string(value);
-    ctx.set_field(obj, BD_FIELD_VALUE, Value::Object(Some(s)));
-    ctx.set_field(obj, BD_FIELD_SCALE, Value::Int(scale));
-    ctx.set_field(
-        obj,
-        BD_FIELD_PRECISION,
-        Value::Int(value.replace(['-', '.'], "").len() as i32),
-    );
+    let precision = value.replace(['-', '.'], "").len() as i32;
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        // Real-JDK layout: build the value as the scaled unscaled-integer
+        // representation.  `value` may include a decimal point (e.g.
+        // "1.5", scale=1 → unscaled=15).  Strip the dot and parse.
+        let unscaled_str = value.replace('.', "");
+        // Try a fast i64 path; fall back to inflated BigInteger.
+        let bi_class_id = ctx.class_id_by_name("java/math/BigInteger");
+        let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
+        if int_compact == BD_INFLATED {
+            // Value out of i64 range (or literal `Long.MIN_VALUE`, which we
+            // treat as inflated to keep the sentinel pure).  Allocate an
+            // intVal BigInteger.
+            let bi = bi_alloc(ctx, &unscaled_str);
+            ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
+        } else {
+            // Compact path: leave `intVal` null (or, when non-null, the JDK
+            // expects it to mirror `intCompact`).  Allocate a backing
+            // BigInteger so reflective reads of `intVal` still see a real
+            // object — matches HotSpot's behaviour for `BigDecimal.ONE`
+            // where `intVal != null` even though `intCompact == 1`.
+            if bi_class_id.is_some() {
+                let bi = bi_alloc(ctx, &unscaled_str);
+                ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            } else {
+                ctx.set_field(obj, iv_i, Value::Object(None));
+            }
+            ctx.set_field(obj, ic_i, Value::Long(int_compact));
+        }
+        ctx.set_field(obj, sc_i, Value::Int(scale));
+        ctx.set_field(obj, pr_i, Value::Int(precision));
+    } else {
+        let s = ctx.create_string(value);
+        ctx.set_field(obj, BD_FIELD_VALUE, Value::Object(Some(s)));
+        ctx.set_field(obj, BD_FIELD_SCALE, Value::Int(scale));
+        ctx.set_field(obj, BD_FIELD_PRECISION, Value::Int(precision));
+    }
     obj
 }
 
@@ -16088,9 +16349,77 @@ fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
 }
 
 fn bd_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
+    if let Some((iv_i, sc_i, _pr_i, ic_i)) = bd_layout(ctx) {
+        // Real-JDK layout — prefer the compact long unless inflated.
+        let scale = match ctx.get_field(this, sc_i) {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        let int_compact = match ctx.get_field(this, ic_i) {
+            Value::Long(l) => l,
+            _ => BD_INFLATED,
+        };
+        let unscaled = if int_compact != BD_INFLATED {
+            int_compact.to_string()
+        } else {
+            match ctx.get_field(this, iv_i) {
+                Value::Object(Some(bi)) => bi_read(ctx, bi),
+                _ => "0".to_string(),
+            }
+        };
+        return apply_scale(&unscaled, scale);
+    }
+    // Synthetic-stub fallback — the value is already a decimal string.
     match ctx.get_field(this, BD_FIELD_VALUE) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
         _ => "0".to_string(),
+    }
+}
+
+/// Read the `scale` int from a `BigDecimal`, picking the layout-correct slot.
+fn bd_scale_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let idx = bd_layout(ctx).map(|(_, sc, _, _)| sc).unwrap_or(BD_FIELD_SCALE);
+    match ctx.get_field(this, idx) {
+        Value::Int(s) => s,
+        _ => 0,
+    }
+}
+
+/// Read the `precision` int from a `BigDecimal`, picking the layout slot.
+fn bd_precision_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let idx = bd_layout(ctx).map(|(_, _, pr, _)| pr).unwrap_or(BD_FIELD_PRECISION);
+    match ctx.get_field(this, idx) {
+        Value::Int(p) => p,
+        _ => 0,
+    }
+}
+
+/// Format an unscaled integer string + a scale into the canonical
+/// `BigDecimal.toString` decimal representation (no exponent — used for
+/// arithmetic, not pretty-printing, so we keep it simple and round-trip-able
+/// through `f64::parse`).
+fn apply_scale(unscaled: &str, scale: i32) -> String {
+    if scale == 0 || unscaled == "0" {
+        return unscaled.to_string();
+    }
+    let (neg, abs) = if let Some(stripped) = unscaled.strip_prefix('-') {
+        (true, stripped.to_string())
+    } else {
+        (false, unscaled.to_string())
+    };
+    let sign = if neg { "-" } else { "" };
+    if scale > 0 {
+        let s = scale as usize;
+        if abs.len() > s {
+            let split = abs.len() - s;
+            format!("{}{}.{}", sign, &abs[..split], &abs[split..])
+        } else {
+            let pad = s - abs.len();
+            format!("{}0.{}{}", sign, "0".repeat(pad), abs)
+        }
+    } else {
+        // Negative scale = trailing zeros.
+        format!("{}{}{}", sign, abs, "0".repeat((-scale) as usize))
     }
 }
 
@@ -16104,15 +16433,35 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => "0".to_string(),
     };
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace(['-', '.'], "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, scale);
     Ok(None)
+}
+
+/// Populate an existing `BigDecimal` instance from a decimal string + scale.
+/// Picks the layout (real-JDK intVal/scale/precision/intCompact vs. legacy
+/// synthetic value/scale/precision) automatically.
+fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) {
+    let precision = value.replace(['-', '.'], "").len() as i32;
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        let unscaled_str = value.replace('.', "");
+        let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
+        if int_compact == BD_INFLATED {
+            let bi = bi_alloc(ctx, &unscaled_str);
+            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
+        } else {
+            let bi = bi_alloc(ctx, &unscaled_str);
+            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(this, ic_i, Value::Long(int_compact));
+        }
+        ctx.set_field(this, sc_i, Value::Int(scale));
+        ctx.set_field(this, pr_i, Value::Int(precision));
+    } else {
+        let val_str = ctx.create_string(value);
+        ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
+        ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
+        ctx.set_field(this, BD_FIELD_PRECISION, Value::Int(precision));
+    }
 }
 
 fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16126,14 +16475,7 @@ fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let s = format!("{}", d);
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace(['-', '.'], "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, scale);
     Ok(None)
 }
 
@@ -16147,14 +16489,7 @@ fn native_bd_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => 0,
     };
     let s = v.to_string();
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(0));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace('-', "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, 0);
     Ok(None)
 }
 
@@ -16168,14 +16503,7 @@ fn native_bd_init_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => 0,
     };
     let s = v.to_string();
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(0));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace('-', "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, 0);
     Ok(None)
 }
 
@@ -16326,14 +16654,8 @@ fn native_bd_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let a = bd_read(ctx, this);
     let b = bd_read(ctx, other);
-    let a_scale = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
-    let b_scale = match ctx.get_field(other, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
+    let a_scale = bd_scale_of(ctx, this);
+    let b_scale = bd_scale_of(ctx, other);
     Ok(Some(Value::Int(if a == b && a_scale == b_scale {
         1
     } else {
@@ -16346,24 +16668,20 @@ fn native_bd_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, BD_FIELD_VALUE)))
+    // RBIGDEC.1 — `bd_read` reconstructs the decimal from intCompact + scale
+    // in real-JDK mode, so synthesise a fresh Java string.
+    let s = bd_read(ctx, this);
+    let java_str = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(java_str))))
 }
 
 fn native_bd_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() {
-                eprintln!("[bd_int_value] no receiver, args={:?}", args);
-            }
-            return Ok(Some(Value::Int(0)));
-        }
+        _ => return Ok(Some(Value::Int(0))),
     };
     let s = bd_read(ctx, this);
     let v: f64 = s.parse().unwrap_or(0.0);
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() {
-        eprintln!("[bd_int_value] this={:p} field0={:?} parsed={}", this.as_ptr(), ctx.get_field(this, BD_FIELD_VALUE), v);
-    }
     Ok(Some(Value::Int(v as i32)))
 }
 
@@ -16399,11 +16717,7 @@ fn native_bd_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let s = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(s)))
+    Ok(Some(Value::Int(bd_scale_of(ctx, this))))
 }
 
 fn native_bd_precision(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16411,11 +16725,7 @@ fn native_bd_precision(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let p = match ctx.get_field(this, BD_FIELD_PRECISION) {
-        Value::Int(p) => p,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(p)))
+    Ok(Some(Value::Int(bd_precision_of(ctx, this))))
 }
 
 fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16424,10 +16734,7 @@ fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
     let a = bd_read(ctx, this);
-    let scale = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
+    let scale = bd_scale_of(ctx, this);
     let neg = if let Some(stripped) = a.strip_prefix('-') {
         stripped.to_string()
     } else if a == "0" {
@@ -16445,10 +16752,7 @@ fn native_bd_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Object(None))),
     };
     let a = bd_read(ctx, this);
-    let scale = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
+    let scale = bd_scale_of(ctx, this);
     let abs = if let Some(rest) = a.strip_prefix('-') {
         rest.to_string()
     } else {

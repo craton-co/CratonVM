@@ -1377,6 +1377,29 @@ impl ClassManager {
         let (first_field_index, num_total_fields) =
             compute_field_layout(&class_file.fields, superclass_id, &self.class_store);
 
+        // Wave 3-B (RE.4): some real-JDK classes (e.g. java.net.InetSocketAddress
+        // = 1 instance field `holder`) have a much smaller declared field count
+        // than the synthetic-mode field layout used by `native-builtins`. Native
+        // `<init>` methods write to the synthetic indices; without padding the
+        // object would lack slots for those writes (panic on set_field) or the
+        // slots would never be allocated (so reads see uninitialised slots and
+        // misreport as e.g. `port is not an int`). Pad with the larger of the
+        // declared count and the synthetic stub layout.
+        let stub_fields = synthetic_stub_fields(name);
+        let stub_instance_count = stub_fields
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        let stub_parent_fields = match superclass_id {
+            Some(super_id) => self
+                .class_store
+                .get(super_id)
+                .map_or(0, |c| c.num_total_fields),
+            None => 0,
+        };
+        let stub_total = stub_parent_fields + stub_instance_count;
+        let num_total_fields = num_total_fields.max(stub_total);
+
         // Build the runtime Class
         let id = self.class_store.next_id();
         let source_file = class_file.source_file().map(|s| s.to_string());
@@ -3001,6 +3024,25 @@ impl ClassManager {
         let (first_field_index, num_total_fields) =
             compute_field_layout(&class_file.fields, superclass_id, &self.class_store);
 
+        // Wave 3-B (RE.4): pad to the synthetic stub field count when defined
+        // (mirrors `define_class_with_options`). Required for classes that are
+        // upgraded from a synthetic stub but whose real bytecode field count
+        // is smaller than the synthetic-mode layout used by native helpers.
+        let stub_fields_for_pad = synthetic_stub_fields(name);
+        let stub_instance_count_for_pad = stub_fields_for_pad
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        let stub_parent_fields_for_pad = match superclass_id {
+            Some(super_id) => self
+                .class_store
+                .get(super_id)
+                .map_or(0, |c| c.num_total_fields),
+            None => 0,
+        };
+        let stub_total_for_pad = stub_parent_fields_for_pad + stub_instance_count_for_pad;
+        let num_total_fields = num_total_fields.max(stub_total_for_pad);
+
         // Extract source file
         let source_file = class_file.source_file().map(|s| s.to_string());
 
@@ -3725,6 +3767,42 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/nio/channels/DatagramChannel" => instance_fields(5),
         // MulticastSocket = 5 (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
         "java/net/MulticastSocket" => instance_fields(5),
+        // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
+        // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
+        // allocates enough slots for the synthetic-mode field layout used by
+        // `native-builtins::net_phase_e`. The real-JDK classes have a much
+        // smaller `num_total_fields` (e.g. InetSocketAddress has 1: holder),
+        // and `upgrade_synthetic_class` preserves max(synthetic, real) so we
+        // get the wider layout once the real bytecode loads.
+        //
+        // InetSocketAddress = 3 (holder=0 InetSocketAddressHolder, port=1 Int, addr=2 InetAddress).
+        // Slot 0 mirrors the real-JDK layout (`private final InetSocketAddressHolder holder`)
+        // so bytecode `getfield holder` sees the holder our synthetic helpers populate.
+        "java/net/InetSocketAddress" => instance_fields(3),
+        // InetSocketAddressHolder = 3 (hostname=0 String, addr=1 InetAddress, port=2 Int).
+        // Wave 3-B² fix for the deeper dispatch bug: `InetSocketAddress.getPort()`
+        // bytecode reads `this.holder` and invokevirtuals `Holder.getPort()` on it,
+        // so the holder's class id MUST be honored — putting a String at slot 0 of
+        // the InetSocketAddress would route the sub-invokevirtual to
+        // `java/lang/String.getPort()` (NoSuchMethodError).
+        "java/net/InetSocketAddress$InetSocketAddressHolder" => instance_fields(3),
+        // InetAddress = 2 (hostName=0 String, address=1 String)
+        "java/net/InetAddress"
+        | "java/net/Inet4Address"
+        | "java/net/Inet6Address" => instance_fields(2),
+        // HttpServer (com.sun.net.httpserver) = 5 (address, started, contexts,
+        // server_id, port) per `net_phase_e::HS_*` constants.
+        "com/sun/net/httpserver/HttpServer"
+        | "com/sun/net/httpserver/HttpServerImpl" => instance_fields(5),
+        // HttpExchange = 8 (method, uri, reqHeaders, respHeaders, reqBody,
+        // statusCode, owner_socket, response_chunks)
+        "com/sun/net/httpserver/HttpExchange" => instance_fields(8),
+        // HttpExchange$ResponseBody = 2 (owner exchange, dummy)
+        "com/sun/net/httpserver/HttpExchange$ResponseBody" => instance_fields(2),
+        // HttpContext = 2 (path, handler)
+        "com/sun/net/httpserver/HttpContext" => instance_fields(2),
+        // Headers = 1 (delegate HashMap)
+        "com/sun/net/httpserver/Headers" => instance_fields(1),
 
         // ---- T19.5: sun.nio.ch.Net TCP cluster ----
         // Layouts shared with `native-io::net::register_sun_nio_ch_net`.

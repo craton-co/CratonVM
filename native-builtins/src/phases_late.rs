@@ -34652,23 +34652,39 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
-    // HttpServer = 3-field (address=0, started=1, contexts=2 ArrayList)
+    // Wave 3-B (RE.4): the real HttpServer/HttpExchange implementations live in
+    // `net_phase_e::register_re10_http_server`, which actually binds a TcpListener
+    // and dispatches HTTP/1.1 round-trips. Phase 72 used to register opaque stubs
+    // for the same `(class, method, descriptor)` keys; because Phase 72 runs AFTER
+    // Phase E, those stubs silently overrode the real impls and broke
+    // `URL.openConnection().getInputStream()` round-trips that target a loopback
+    // HttpServer. We keep ONLY the HttpServerImpl alias for `create` (Phase E
+    // registers `HttpServer` but not the impl class), the no-arg `create()`
+    // factory (Phase E only registers the 2-arg form), executor accessors,
+    // bind, removeContext, and the HttpContext / HttpHandler / Headers
+    // helpers that Phase E does not cover.
     let hs = "com/sun/net/httpserver/HttpServer";
     let hs_simple = "com/sun/net/httpserver/HttpServerImpl";
+
+    // HttpServerImpl alias — Phase E registers HttpServer; route the impl class
+    // to the same field layout so that invocations via `HttpServerImpl.create`
+    // do not fall through to a missing-native error.
+    r.register(
+        hs_simple,
+        "create",
+        "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
+        |ctx, _args| {
+            let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
+            ctx.set_field(srv, 1, Value::Int(0));
+            let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
+            ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
+            Ok(Some(Value::Object(Some(srv))))
+        },
+    );
+
+    // No-arg factory not covered by Phase E.
     for cls in [hs, hs_simple] {
-        r.register(
-            cls,
-            "create",
-            "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
-            |ctx, _args| {
-                let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
-                ctx.set_field(srv, 1, Value::Int(0));
-                let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
-                ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
-                Ok(Some(Value::Object(Some(srv))))
-            },
-        );
         r.register(
             cls,
             "create",
@@ -34682,23 +34698,6 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Object(Some(srv))))
             },
         );
-        r.register(cls, "start", "()V", |ctx, args| {
-            ctx.set_field(obj_arg(args, 0)?, 1, Value::Int(1));
-            Ok(None)
-        });
-        r.register(cls, "stop", "(I)V", |ctx, args| {
-            ctx.set_field(obj_arg(args, 0)?, 1, Value::Int(0));
-            Ok(None)
-        });
-        r.register(cls, "createContext", "(Ljava/lang/String;Lcom/sun/net/httpserver/HttpHandler;)Lcom/sun/net/httpserver/HttpContext;",
-            |ctx, args| {
-                let path = args.get(1).copied().unwrap_or(Value::Object(None));
-                let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-                let hctx = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
-                ctx.set_field(hctx, 0, path);
-                ctx.set_field(hctx, 1, handler);
-                Ok(Some(Value::Object(Some(hctx))))
-            });
         r.register(
             cls,
             "createContext",
@@ -34713,16 +34712,9 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         );
         r.register(
             cls,
-            "getAddress",
-            "()Ljava/net/InetSocketAddress;",
-            |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0))),
-        );
-        r.register(
-            cls,
             "setExecutor",
             "(Ljava/util/concurrent/Executor;)V",
             |ctx, args| {
-                // store executor if we have space, otherwise ignore
                 let this = obj_arg(args, 0)?;
                 let _ = (ctx, this);
                 Ok(None)
@@ -34744,20 +34736,12 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        r.register(cls, "removeContext", "(Ljava/lang/String;)V", |_ctx, _args| {
-            // HttpServer.removeContext: unregisters a path mapping. Our HttpServer model
-            // doesn't maintain a context map (handlers are dispatched via direct callback
-            // registration in createContext), so the removal is a logical no-op.
-            Ok(None)
-        });
+        r.register(cls, "removeContext", "(Ljava/lang/String;)V", |_ctx, _args| Ok(None));
         r.register(
             cls,
             "removeContext",
             "(Lcom/sun/net/httpserver/HttpContext;)V",
-            |_ctx, _args| {
-                // Same as above — no context map maintained.
-                Ok(None)
-            },
+            |_ctx, _args| Ok(None),
         );
     }
 
@@ -34790,56 +34774,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(m))))
     });
 
-    // HttpExchange = 6-field (method=0, uri=1, reqHeaders=2, respHeaders=3, reqBody=4, statusCode=5)
+    // HttpExchange method registrations (getRequestMethod, getRequestURI,
+    // getRequestHeaders, getResponseHeaders, getRequestBody, getResponseBody,
+    // sendResponseHeaders, close) are owned by `net_phase_e::register_re10_http_server`,
+    // which routes them through the live HTTP/1.1 dispatch loop. Phase 72 used
+    // to override those keys with naked field accessors that returned null
+    // OutputStreams and never wrote a response — that broke real-server probes.
+    // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
-    r.register(
-        hex,
-        "getRequestMethod",
-        "()Ljava/lang/String;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0))),
-    );
-    r.register(hex, "getRequestURI", "()Ljava/net/URI;", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1)))
-    });
-    r.register(
-        hex,
-        "getRequestHeaders",
-        "()Lcom/sun/net/httpserver/Headers;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2))),
-    );
-    r.register(
-        hex,
-        "getResponseHeaders",
-        "()Lcom/sun/net/httpserver/Headers;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3))),
-    );
-    r.register(
-        hex,
-        "getRequestBody",
-        "()Ljava/io/InputStream;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 4))),
-    );
-    r.register(
-        hex,
-        "getResponseBody",
-        "()Ljava/io/OutputStream;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(hex, "sendResponseHeaders", "(IJ)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let code = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 200,
-        };
-        ctx.set_field(this, 5, Value::Int(code));
-        Ok(None)
-    });
-    r.register(hex, "close", "()V", |_ctx, _args| {
-        // HttpExchange.close() is a request lifecycle hint. Our model doesn't hold
-        // OS-level connection state on the exchange object — the underlying socket
-        // is already closed by the HttpServer dispatch loop after the handler returns.
-        Ok(None)
-    });
     r.register(
         hex,
         "getLocalAddress",
@@ -34859,7 +34801,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
-    // HttpHandler interface
+    // HttpHandler interface (default no-op so abstract dispatch resolves).
     r.register(
         "com/sun/net/httpserver/HttpHandler",
         "handle",

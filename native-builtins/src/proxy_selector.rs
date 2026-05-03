@@ -390,9 +390,24 @@ fn default_port_for(scheme: &str) -> u16 {
 // ---------------------------------------------------------------------------
 
 fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16) -> ObjectRef {
+    // Wave 3-B² (RE.4): mirror real-JDK layout — slot 0 of the
+    // InetSocketAddress holds an `InetSocketAddressHolder`, and the holder
+    // stores hostname/addr/port at slots 0/1/2. Without the inner holder,
+    // bytecode `InetSocketAddress.getPort()` (which reads `this.holder` then
+    // invokevirtuals `Holder.getPort()`) would dispatch onto the host String
+    // and trip `java/lang/String.getPort()` NoSuchMethodError. See the
+    // matching helper in `net_phase_e.rs`.
     let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let holder = alloc_concurrent_synthetic(
+        ctx,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
     let h = ctx.create_string(host);
-    ctx.set_field(isa, ISA_HOST, Value::Object(Some(h)));
+    ctx.set_field(holder, 0, Value::Object(Some(h)));
+    ctx.set_field(holder, 1, Value::Object(None));
+    ctx.set_field(holder, 2, Value::Int(port as i32));
+    ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
     ctx.set_field(isa, ISA_PORT, Value::Int(port as i32));
     isa
 }
@@ -551,13 +566,29 @@ fn connect_failed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let (host, port) = match args.get(2) {
         Some(Value::Object(Some(sa))) => {
+            // Slot 0 may be either a `String` (legacy synthetic layout) or
+            // an `InetSocketAddressHolder` whose slot 0 is the hostname
+            // (real-JDK layout via `<init>`). Probe both so we don't NPE
+            // / mis-extract on the holder-shaped variant.
             let h = match ctx.get_field(*sa, ISA_HOST) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                Value::Object(Some(s)) => match ctx.read_string(s) {
+                    Some(t) => t,
+                    None => match ctx.get_field(s, 0) {
+                        Value::Object(Some(inner)) => ctx.read_string(inner).unwrap_or_default(),
+                        _ => String::new(),
+                    },
+                },
                 _ => String::new(),
             };
             let p = match ctx.get_field(*sa, ISA_PORT) {
                 Value::Int(p) => p as u16,
-                _ => 0,
+                _ => match ctx.get_field(*sa, ISA_HOST) {
+                    Value::Object(Some(holder)) => match ctx.get_field(holder, 2) {
+                        Value::Int(p) => p as u16,
+                        _ => 0,
+                    },
+                    _ => 0,
+                },
             };
             (h, p)
         }
