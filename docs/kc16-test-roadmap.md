@@ -1,422 +1,228 @@
-# Roadmap — Keycloak 16 starts and passes its tests
+# Roadmap — CratonVM runs any Java app (general JDK API gap closure)
 
-**Anchor (Session 101, commit `88d3f71`):** KC16 main() runs to a clean
-`System.exit(1)` with zero swallowed errors. With `RUSTJVM_SOFT_EXIT=1`,
-main() reaches normal completion past `org.jboss.as.server.Main.abort`.
-WildFly's `ServiceContainer` still does not actually start: `server.log`
-is never written by WildFly itself, no port is bound, no admin console.
+**Anchor (Session 102, commit `da5d0a4`):** all JBoss/KC-specific stubs
+stripped. KC16 boot regresses to its pre-Session-99 state but the
+codebase no longer contains application-specific glue that doesn't
+generalize. Smoke matrix (9 representative apps) green.
 
-This roadmap defines the path from "main() exits cleanly" to "Keycloak
-serves OIDC tokens against a test realm". Each wave is broken into
-**atomic agent tasks** that are pairwise file-disjoint, single-file
-scope where possible, with concrete reproducers and binary success
-criteria. Each task is sized for ≤1 day for an isolated background
-agent.
+This doc replaces the prior KC16-only path. The new principle:
 
-## Format conventions
+> **No application-specific stubs.** Every fix must close a JDK API or
+> JVM-spec gap that benefits multiple unrelated apps. KC16 remains a
+> useful diagnostic but only fixes that generalize beyond it land.
 
-Each task has:
+For the canonical "runs any Java app" surface inventory, see
+[docs/roadmap-any-java-app.md](./roadmap-any-java-app.md). This doc
+defines the **wave dispatch protocol** layered on top.
 
-| Field | Meaning |
+## Forcing functions (rotate; don't fixate on one)
+
+| App | Why it forces general work |
 |---|---|
-| ID | `W<wave>-<letter>` — stable handle |
-| Title | Imperative, <60 chars |
-| Repro | Exact shell command proving "before" |
-| Success | Concrete after-state, observable in one command |
-| Files | Primary files the agent will touch |
-| Blocks | Other tasks gated on this |
-| Parallel-safe with | Pairwise compatibility |
+| Apache Maven 3.9 (`mvn --version`) | Heavy XML, classloading via `plexus-classworlds`, reflection, ServiceLoader |
+| Apache Tomcat 10 embedded | HTTP, NIO `Selector`, `ServerSocketChannel`, threading, classloading |
+| Spring Boot 3 fat-jar | Nested-JAR classloading, autowiring (reflection), embedded server |
+| Apache Cassandra (boot only) | NIO, JFR, threading, off-heap memory |
+| Apache Kafka 3 (single broker) | NIO, NIO selector, ZooKeeper-less mode |
+| The 32 apps in `apps/` | Broad spec coverage; cheap to re-run |
+| Keycloak 16 | Useful diagnostic for JBoss-Modules/CDI ecosystem; **fixes only land if generalizable** |
+
+Each wave should pick **at least 2 forcing functions** and verify the
+fix moves both forward (or one forward + one unchanged — never one
+forward + one regressed).
 
 ## Operational rules baked into every prompt
 
+(Carried forward from Sessions 96-101 lessons.)
+
 - **Mandatory `RUSTJVM_STRICT_SWALLOWS=1` trace** before any code change
-  on `<clinit>` / native-resolution failures. The trace's last 30 lines
-  must appear in the agent's report (Session 101 lesson — the
-  Session 100 first-attempt agent skipped this and produced no work).
-- **Mandatory build + repro + smoke verification** before reporting
-  success. Report must include verbatim output of each step.
+  on `<clinit>` / native-resolution failures. Last 30 lines verbatim
+  in report.
+- **Mandatory build + repro + smoke verification** before reporting.
+  Verbatim output of each step in report.
 - **Worktree baseline check** as step 0: if HEAD is not the latest
   main, merge `claude/intelligent-ishizaka-6d18f0` first.
-- **Tight timebox**: 3 build-test cycles maximum. Ship the closest
-  working state if exhausted; document the gap in the report. Do not
-  iterate into a watchdog timeout.
-- **Single-file scope** preferred. Two-file changes only when
-  registration in `lib.rs` is needed.
-- **Restricted files (do not modify)**: `vm/src/runtime/value_stack.rs`,
-  Getfield/Putfield blocks of `vm/src/runtime/interpreter.rs`,
+- **Tight timebox**: 3 build-test cycles maximum.
+- **No application-specific stubs**: any new file matching
+  `org/<vendor>/*` or `<vendor>_*.rs` must be justified with two
+  unrelated forcing functions that benefit. JDK-spec implementations
+  (`java.*`, `javax.*`, `jdk.internal.*`) are always in scope.
+- **Single-file scope** preferred; multi-file when registration in
+  `lib.rs` is needed.
+- **Restricted files**: `vm/src/runtime/value_stack.rs`, Getfield/Putfield
+  blocks of `vm/src/runtime/interpreter.rs`,
   `native-builtins/src/phases_late.rs::register_phase71_natives`.
 - **CI gate**: `scripts/check-no-diag-prints.sh` must pass.
-- **Batch size**: ≤4 opus agents in flight at once (Session 100 lesson —
-  6 simultaneous agents exhausted account capacity).
+- **Batch size**: ≤4 opus agents in flight at once.
 
 ---
 
-# WAVE 1 — Visibility past Main.abort  (3-4 agents)
+# WAVE 1 — General JDK gap closure (4 agents, 1 day)
 
-**Goal**: with `RUSTJVM_SOFT_EXIT=1` set, KC16 boot reaches at least
-one named WildFly subsystem init phase. Currently main() returns
-cleanly after the soft-exit but produces no further visible output.
+**Goal**: close 4 general JDK API gaps that show up across multiple
+forcing functions. Each task picks 2 unrelated apps to verify the fix
+generalizes.
 
-## W1-A — Post-soft-exit failure cataloger  *(investigation, no code)*
-
-| | |
-|---|---|
-| Repro | `RUSTJVM_SOFT_EXIT=1 RUST_LOG=warn target/release/rustjvm.exe --java-home <jdk25> --Xmx 2g --jar /tmp/keycloak/keycloak-16.1.1/jboss-modules.jar -- -mp /tmp/keycloak/keycloak-16.1.1/modules org.jboss.as.standalone "-Djboss.home.dir=/tmp/keycloak/keycloak-16.1.1" 2>&1 \| tee /tmp/kc16_w1a.log` |
-| Success | `/tmp/kc16_w1a.log` contains at least one line beyond `[rustjvm] System.exit(1) soft-returned`. Report categorizes each unique post-exit failure into a numbered W2-* entry filed as a follow-up section in this doc. |
-| Files | `docs/kc16-test-roadmap.md` (this file — Wave 2 section append only). |
-| Parallel-safe with | All other W1-* tasks. |
-
-## W1-B — Defensive JMX expansion: MemoryPoolImpl + MemoryManagerImpl + GarbageCollectorImpl
+## W1-A — JMX MXBean expansion: MemoryPool, MemoryManager, GarbageCollector
 
 | | |
 |---|---|
-| Repro | Pre-emptive — no current swallow attributable to this. Test fixture: a Java probe that calls `ManagementFactory.getMemoryPoolMXBeans()`, `getMemoryManagerMXBeans()`, `getGarbageCollectorMXBeans()` and prints `.size() + " " + .get(0).getName()` for each. Verify against HotSpot first. |
-| Success | Probe runs to OK against rustjvm; sizes match HotSpot. KC16 boot rc=0 unchanged. |
-| Files | `native-builtins/src/jmx.rs` (extend per RKC16N.10/.12 pattern). New test under `apps/jmx_probe/`. |
-| Parallel-safe with | All. |
+| Repro | Java probe `apps/jmx_probe/JmxProbe.java` (write it):  `ManagementFactory.getMemoryPoolMXBeans()`, `getMemoryManagerMXBeans()`, `getGarbageCollectorMXBeans()`; print `.size()` and `.get(0).getName()` for each. |
+| Cross-app verify | (1) JmxProbe — direct test. (2) Run any app with `-Dcom.sun.management.jmxremote=true` (HelloWorld is fine) and verify no new ULE swallows. |
+| Success | JmxProbe matches HotSpot output. KC16 boot's ManagementFactory ULE swallow gone (incidental — Sessions 97/99 already addressed VMManagementImpl; this is the next layer). |
+| Files | `native-builtins/src/jmx.rs` (extend `register_vm_management_impl` pattern). |
+| Generalizes to | Any app monitored by JMX (Prometheus exporters, Spring Actuator, JConsole, profilers, IDE debuggers). |
 
-## W1-C — JNDI scaffolding: `javax.naming.InitialContext.lookup` returns non-null for the canonical JBoss JNDI prefixes
-
-| | |
-|---|---|
-| Repro | Java probe: `new InitialContext().lookup("java:jboss/")`. Currently throws or returns null. WildFly heavily uses JNDI for service binding — without this, no MSC service registers. |
-| Success | The probe returns a non-null `Context` object whose `list("")` returns an empty NamingEnumeration (not null). |
-| Files | `native-builtins/src/jndi.rs` (new) + `lib.rs` registration. |
-| Parallel-safe with | W1-B, W1-D. |
-
-## W1-D — Module classloader parent-first visibility test
+## W1-B — `ClassLoader.getResources()` correctness audit
 
 | | |
 |---|---|
-| Repro | Java probe loaded via `-mp <modules> <main-class>` that calls `Thread.currentThread().getContextClassLoader().loadClass("java.lang.String")` AND `loadClass("org.jboss.as.server.ServerEnvironment")`. Both must succeed. |
-| Success | Both `loadClass` calls return non-null Class objects. JDK classes resolve via parent (boot) loader; module classes resolve via module loader. |
-| Files | `native-builtins/src/jboss_module_loader.rs` (verify + test). |
-| Parallel-safe with | All. |
+| Repro | Java probe `apps/classloader_probe/ClProbe.java`: lookup `META-INF/services/foo.svc` from a synthesized JAR + `META-INF/MANIFEST.MF` from `rt.jar`/jimage; verify both return at least one URL each. The S96 RSLF4J.1 fix landed for the first; verify the second path (boot-loader resources) too. |
+| Cross-app verify | (1) ClProbe — direct test. (2) Apache Maven `mvn --version` — currently fails because Maven uses `plexus-classworlds` which calls `getResources` heavily for plugin discovery. Spawn a tiny `apache-maven-3.9.6` install in `/tmp/maven` and try `target/release/rustjvm.exe --java-home <jdk> -c "/tmp/maven/boot/plexus-classworlds-2.8.0.jar" org.codehaus.plexus.classworlds.launcher.Launcher --version`. Confirm the failure (or success) gets visibly closer. |
+| Success | ClProbe + plexus-classworlds Launcher both find their resources. |
+| Files | `native-builtins/src/classloader.rs`, possibly `classloading/src/loaders.rs`. |
+| Generalizes to | Maven, every JDBC driver, SLF4J/Logback, Jackson modules, charset providers — every classpath-JAR ServiceLoader user. |
+
+## W1-C — `ThreadPoolExecutor` / `ExecutorService` audit
+
+| | |
+|---|---|
+| Repro | Java probe `apps/executor_probe/ExecProbe.java`: `ExecutorService es = Executors.newFixedThreadPool(4); es.submit(() -> 42).get();` returns 42. Then a 4-thread × 1000-task throughput test; assert all complete. |
+| Cross-app verify | (1) ExecProbe. (2) `apps/cf_probe/CfMin` (already passes today). (3) Spring Boot 3 minimum: `java -jar petclinic.jar` reaches "Started PetClinicApplication in N seconds" line. |
+| Success | All three pass. |
+| Files | `native-builtins/src/concurrent.rs`, `native-builtins/src/lang_thread.rs`. |
+| Generalizes to | Tomcat, Netty, Spring async, anything using `Executors`, every web server. |
+
+## W1-D — JAXP / StAX XML parsing for arbitrary files
+
+| | |
+|---|---|
+| Repro | Java probe `apps/xml_probe/XmlProbe.java`: `XMLInputFactory.newInstance().createXMLStreamReader(new FileInputStream("/tmp/test.xml"))`; advance via `next()`; assert `getLocalName()` matches expected on first START_ELEMENT. Use a test fixture XML that includes nested elements, attributes, and CDATA. |
+| Cross-app verify | (1) XmlProbe. (2) Maven again — `pom.xml` parsing is StAX-based. (3) Hibernate `hibernate.cfg.xml` parsing (small fixture). |
+| Success | XmlProbe + at least one of {Maven, Hibernate} fixture parses. |
+| Files | `native-builtins/src/xml_stax.rs` (new) + `lib.rs` registration. |
+| Generalizes to | Maven, Spring (XML config), Hibernate (`hibernate.cfg.xml`), every build tool, every EE app. |
 
 ---
 
-# WAVE 2 — MSC ServiceContainer bootstrap  (4-5 agents)
+# WAVE 2 — Reflection + ServiceLoader hardening (3 agents)
 
-**Goal**: WildFly's `ServiceContainer` reaches `start()` and registers at
-least one service. `org.jboss.msc.service.ServiceContainerImpl.<init>` runs
-without swallow.
+**Goal**: full reflective surface coverage so DI containers + annotation scanners can run.
 
-This wave's exact agent list comes from W1-A's catalog. Templates below
-cover the most likely failures based on prior WildFly experience.
+## W2-A — `Class.getDeclaredFields` / `getDeclaredMethods` / `getDeclaredConstructors` correctness
+(Per RC.1-RC.3 in roadmap-any-java-app.md.) Verify against (1) AnnoTest, (2) Spring's `ClassUtils.getDeclaredMethods`, (3) Jackson's `BeanDescription`.
 
-## W2-A — Fix topmost MSC init blocker  *(filled by W1-A)*
+## W2-B — `Method.invoke` + `Constructor.newInstance` boxing/varargs
+(Per RC.5-RC.6.) Verify against (1) AnnotationProxyProbe, (2) Spring `MethodIntrospector`.
 
-| Field | TBD by W1-A |
-
-## W2-B — `org.jboss.msc.service.ServiceName` interning
-
-| | |
-|---|---|
-| Repro | Java probe: `ServiceName.JBOSS.append("server")` returns a non-null ServiceName whose `getCanonicalName()` is `"jboss.server"`. |
-| Success | Probe passes; same hashCode for two equivalent ServiceName instances. |
-| Files | Likely `native-builtins/src/jboss_msc.rs` (new). |
-
-## W2-C — `java.util.concurrent.ThreadFactory` + `ThreadPoolExecutor` for MSC
-
-| | |
-|---|---|
-| Repro | Java probe: `Executors.newFixedThreadPool(2).submit(() -> 42).get()` returns 42. Today (per docs/jdk-regression-baseline.md) the basic case works; verify under MSC's specific ThreadFactory pattern (named threads, daemon flag, exception handler). |
-| Success | Probe passes with exact thread name `MSC service thread 1-1`. |
-| Files | `native-builtins/src/concurrent.rs` (extend). |
-
-## W2-D — XML parsing: `standalone.xml` opens via JAXP/StAX
-
-| | |
-|---|---|
-| Repro | Java probe: `XMLInputFactory.newInstance().createXMLStreamReader(new FileInputStream("/tmp/keycloak/.../standalone/configuration/standalone.xml"))` returns a reader whose `next()` advances to START_ELEMENT with localName "server". |
-| Success | Probe runs to OK, reads the first ~10 elements without exception. |
-| Files | `native-builtins/src/xml_stax.rs` (new or extend). |
-| Notes | StAX is independently useful for many WildFly subsystems. |
-
-## W2-E — `Thread.UncaughtExceptionHandler` plumbing
-
-| | |
-|---|---|
-| Repro | Java probe spawns a thread, sets an UncaughtExceptionHandler, throws inside; handler must fire. WildFly's MSC threads rely on this. |
-| Success | Handler captures the exception. |
-| Files | `native-builtins/src/lang_thread.rs`. |
+## W2-C — `MethodHandles.Lookup.findVirtual/findStatic/findSpecial`
+(Per RC.8.) Verify against (1) FindSpecialProbe, (2) lambda-heavy app like `apps/cf_probe/CfAsync`.
 
 ---
 
-# WAVE 3 — Subsystem init  (5-6 agents)
+# WAVE 3 — NIO + Networking (4 agents)
 
-**Goal**: WildFly logs `WFLYSRV0039: Creating http management service` (or
-similar — first per-subsystem log line). HTTP listener binds.
+**Goal**: HTTP servers / clients work end-to-end.
 
-## W3-A — Logging subsystem: `org.jboss.logmanager.LogManager` end-to-end
+## W3-A — `Socket.connect` + `ServerSocket.accept` real TCP
+(Per RE.1-RE.2.) Verify against (1) loopback echo test, (2) Tomcat embedded responding to `curl /`.
 
-| | |
-|---|---|
-| Repro | KC16 boot with `RUSTJVM_SOFT_EXIT=1` writes a `WFLYLOG0001` startup line to `<base>/standalone/log/server.log`. |
-| Success | `head -1 standalone/log/server.log` matches `WFLYLOG0001 .* Logging subsystem started`. |
-| Files | `native-builtins/src/jboss_logmanager.rs` (extend the Block 2C shim with file-handler + pattern formatter). |
+## W3-B — `URL.openConnection().getInputStream()` for HTTP
+(Per RE.4.) Verify against (1) loopback test, (2) `Maven plugin download` from local file:// URL.
 
-## W3-B — IO subsystem: XNIO worker pool
+## W3-C — `Selector.select` NIO
+(Per RE.9.) Verify against (1) Netty echo, (2) Tomcat NIO connector.
 
-| | |
-|---|---|
-| Repro | Java probe: `org.xnio.Xnio.getInstance().createWorker(OptionMap.EMPTY)` returns a non-null XnioWorker whose `getName()` matches `"XNIO-1"`. |
-| Success | Probe passes. |
-| Files | `native-builtins/src/xnio.rs` (new). XNIO is JBoss's NIO abstraction; ~20 classes need stubs. |
-
-## W3-C — Undertow subsystem: `HttpServer` binds port 8080
-
-| | |
-|---|---|
-| Repro | KC16 boot with `RUSTJVM_SOFT_EXIT=1`; in another shell `curl -sI http://localhost:8080/` returns ANY HTTP response (4xx/5xx is fine — just need bytes back). |
-| Success | curl exit 0 + at least one `HTTP/1.1` line in the response. |
-| Files | Likely `native-builtins/src/undertow.rs` (new) + verify our `java.net.ServerSocket` / NIO selectors work end-to-end. |
-| Blocks | All of Wave 4-6. |
-
-## W3-D — Naming subsystem (extends W1-C)
-
-| | |
-|---|---|
-| Repro | After KC16 boot, JBoss LogManager logs `WFLYNAM0001 .* Naming subsystem started`. |
-| Success | The line appears in server.log. |
-| Files | `native-builtins/src/jndi.rs`. |
-
-## W3-E — Datasources subsystem: H2 driver registers via ServiceLoader
-
-| | |
-|---|---|
-| Repro | After KC16 boot, log contains `WFLYJCA0004 .* Deploying JDBC-compliant driver class org.h2.Driver`. |
-| Success | The line appears in server.log. |
-| Files | Verify RSLF4J.1's classpath-JAR-ServiceLoader fix works for `META-INF/services/java.sql.Driver`; extend `native-builtins/src/jdbc.rs` if needed. |
-
-## W3-F — Elytron / TLS: `KeyStore.getInstance("PKCS12")` works against a fixture P12
-
-| | |
-|---|---|
-| Repro | Java probe loads `<base>/standalone/configuration/application.keystore` via `KeyStore.getInstance("PKCS12").load(fis, password)`; `aliases()` returns at least 1 alias. |
-| Success | Probe passes. |
-| Files | Verify against `docs/roadmap-any-java-app.md::RF.8`. Implement if not present. |
+## W3-D — `HttpClient.send` (JDK 11+ HttpClient)
+(Per RE.5.) Verify against (1) curl-like probe, (2) Spring `RestTemplate` minimal.
 
 ---
 
-# WAVE 4 — Keycloak deployment  (5-6 agents)
+# WAVE 4 — Concurrency primitives (3 agents)
 
-**Goal**: Keycloak's WAR deploys. Logs `WFLYUT0021 .* Registered web context: '/auth' for server 'default-server'`.
-
-## W4-A — Deployment-scanner picks up `keycloak-server.war`
-
-| | |
-|---|---|
-| Repro | After KC16 boot, log contains `WFLYDS0019 .* Deployment scanner` AND `Started deployment of "keycloak-server.war"`. |
-| Files | `native-builtins/src/wildfly_deployment.rs` (new). |
-
-## W4-B — CDI / Weld init: `BeanManager` is created
-
-| | |
-|---|---|
-| Repro | Java probe (deployable as a tiny WAR) injects `@Inject BeanManager bm` and prints `bm.getBeans(Object.class).size()`. |
-| Success | Probe prints non-zero. |
-| Files | `native-builtins/src/cdi.rs` (new). Weld is a substantial dependency; this stub may need only enough to satisfy KC's bean-discovery scan. |
-
-## W4-C — JPA / Hibernate: `EntityManagerFactory` for KC's `keycloak-default` PU
-
-| | |
-|---|---|
-| Repro | After deploy, log contains `WFLYJPA0010 .* Starting Persistence Unit Service 'keycloak-server.war#keycloak-default'`. |
-| Files | `native-builtins/src/jpa.rs` (new). |
-
-## W4-D — Resteasy / JAX-RS: REST endpoint resolution
-
-| | |
-|---|---|
-| Repro | After deploy, log contains `RESTEASY002225 .* Deploying javax.ws.rs.core.Application: org.keycloak.services.resources.KeycloakApplication`. |
-| Files | `native-builtins/src/resteasy.rs` (new). |
-
-## W4-E — Keycloak SPI registry: `Spi` services discovered
-
-| | |
-|---|---|
-| Repro | After deploy, log contains `KC-SERVICES0001 .* Loading config from standalone.xml`. |
-| Files | Verify ServiceLoader path for `META-INF/services/org.keycloak.provider.Spi`. |
-
-## W4-F — Theme + static resources: admin/keycloak themes resolve
-
-| | |
-|---|---|
-| Repro | After deploy, log contains `WFLYUT0021 .* Registered web context: '/auth/resources'`. |
-| Files | Resource-loading paths in `native-builtins/src/classloader.rs`. |
+(Per RD.1-RD.10.) Each verifies against ≥2 apps from `apps/` plus one external forcing function.
 
 ---
 
-# WAVE 5 — Live HTTP smoke  (3-4 agents)
+# WAVE 5 — Crypto (3 agents)
 
-**Goal**: Keycloak responds to HTTP requests. Each task is a binary curl check.
-
-## W5-A — Welcome page: `GET /` returns 200
-
-| | |
-|---|---|
-| Repro | KC16 booted in a background process; `curl -sI http://localhost:8080/auth/` returns `HTTP/1.1 200`. |
-| Success | curl exit 0 + status line `200`. |
-
-## W5-B — OIDC discovery endpoint
-
-| | |
-|---|---|
-| Repro | `curl -s http://localhost:8080/auth/realms/master/.well-known/openid-configuration \| jq -r .issuer` returns `http://localhost:8080/auth/realms/master`. |
-| Success | The expected issuer string. |
-
-## W5-C — Master realm exists and is reachable
-
-| | |
-|---|---|
-| Repro | `curl -s http://localhost:8080/auth/realms/master \| jq -r .realm` returns `master`. |
-| Success | Realm name in JSON. |
-
-## W5-D — Admin console returns HTML
-
-| | |
-|---|---|
-| Repro | `curl -sI http://localhost:8080/auth/admin/master/console/` returns `HTTP/1.1 200` + `Content-Type: text/html`. |
-| Success | Both headers present. |
+(Per RF.1-RF.10.) Verify against (1) DigestProbe/CipherProbe (already pass), (2) `KeyStore` load from real cacerts, (3) `HttpsURLConnection` against a public HTTPS endpoint.
 
 ---
 
-# WAVE 6 — Functional tests  (5-6 agents)
+# WAVE 6 — Real-app smoke matrix (5+ agents, ongoing)
 
-**Goal**: end-to-end Keycloak flows pass against the booted server.
+For each forcing function in the table at top: write a smoke fixture under `bench/<app>/`, get it green. Each fixture is one agent task.
 
-## W6-A — `kcadm.sh` admin login
-
-| | |
+| App | Smoke target |
 |---|---|
-| Repro | `kcadm.sh config credentials --server http://localhost:8080/auth --realm master --user admin --password admin` exits 0 and stores a token in `~/.keycloak/kcadm.config`. |
-| Success | Exit 0, config file populated. |
-
-## W6-B — Create realm via REST
-
-| | |
-|---|---|
-| Repro | `curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"realm":"test","enabled":true}' http://localhost:8080/auth/admin/realms` returns 201. Then `curl -s http://localhost:8080/auth/realms/test` returns the realm. |
-| Success | Both calls succeed. |
-
-## W6-C — Create user via REST
-
-| | |
-|---|---|
-| Repro | POST `/admin/realms/test/users` with `{"username":"alice","enabled":true,"credentials":[{"type":"password","value":"alice"}]}` returns 201. |
-| Success | Subsequent `GET /admin/realms/test/users?username=alice` returns the user. |
-
-## W6-D — OIDC password grant token flow
-
-| | |
-|---|---|
-| Repro | POST `http://localhost:8080/auth/realms/test/protocol/openid-connect/token` with `grant_type=password&username=alice&password=alice&client_id=admin-cli` returns a JSON body with non-empty `access_token`. |
-| Success | `access_token` field in response. |
-
-## W6-E — JWKS endpoint
-
-| | |
-|---|---|
-| Repro | `curl -s http://localhost:8080/auth/realms/test/protocol/openid-connect/certs \| jq -r '.keys[0].kty'` returns `RSA`. |
-| Success | The string `RSA`. |
-
-## W6-F — Single Keycloak integration test
-
-| | |
-|---|---|
-| Repro | Pick the smallest Keycloak `testsuite/integration-arquillian` test class (e.g. `org.keycloak.testsuite.admin.realm.RealmTest::getRealms`). Run it via `mvn -pl testsuite/integration-arquillian test -Dtest=RealmTest#getRealms` against the rustjvm-booted Keycloak. |
-| Success | Test passes. |
-
----
-
-# WAVE 7 — Performance + soak  (3 agents, optional)
-
-## W7-A — 24h soak with synthetic OIDC load
-
-| | |
-|---|---|
-| Repro | Run `wrk -t4 -c100 -d24h http://localhost:8080/auth/realms/test/protocol/openid-connect/token --script=token-grant.lua` for 24 hours. |
-| Success | Process alive, RSS within 2× initial, no FD leaks (`lsof` count stable), zero unhandled exceptions in server.log. |
-
-## W7-B — Token throughput vs HotSpot
-
-| | |
-|---|---|
-| Repro | `wrk -t4 -c100 -d60s` against HotSpot, then against rustjvm. |
-| Success | rustjvm geomean within 2× HotSpot tokens/sec. |
-
-## W7-C — Concurrent admin operations stress
-
-| | |
-|---|---|
-| Repro | 100 concurrent realm-create + user-create + token-grant cycles. |
-| Success | All complete; no NPE / lost updates / stuck threads. |
+| Apache Maven 3.9 | `mvn --version` exits 0 |
+| Apache Tomcat 10 embedded | `curl http://localhost:8080/` returns 200 |
+| Spring Boot 3 (Petclinic) | "Started PetClinicApplication" log line |
+| Apache Cassandra (boot only) | "Listening for thrift clients" log line |
+| Apache Kafka 3 (single broker) | "Kafka Server started" log line |
+| H2 1.4 (embedded SQL) | `CREATE TABLE … INSERT … SELECT` round-trip |
 
 ---
 
 # Wave dependencies
 
 ```
-W1 (visibility) -> W2 (MSC bootstrap) -> W3 (subsystems) -> W4 (deploy) -> W5 (HTTP) -> W6 (functional) -> W7 (perf/soak)
+W1 (general gaps) -> W2 (reflection) -> W3 (NIO/net) -> W4 (concurrency) -> W5 (crypto) -> W6 (real apps)
 ```
 
-Within a wave, tasks are pairwise file-disjoint and parallel-safe.
-The list under each wave is the dispatch slate.
+Within a wave, tasks are pairwise file-disjoint and parallel-safe. The
+list under each wave is the dispatch slate.
 
-# Estimated effort
-
-| Wave | Agents | Per-agent effort | Wave wall-time at 4 parallel |
-|---|---|---|---|
-| W1 | 4 | 0.5–1d | 1d |
-| W2 | 5 | 1–2d | 2-3d |
-| W3 | 6 | 2–4d | 1-2 weeks (XNIO, Undertow are biggest) |
-| W4 | 6 | 2–5d | 2-3 weeks (CDI, Hibernate are sprawling) |
-| W5 | 4 | 0.5–1d (mostly verification) | 1-2d |
-| W6 | 6 | 1–3d | 1-2 weeks |
-| W7 | 3 | 1d each (mostly run-and-observe) | 3d |
-
-**Realistic total**: 6-10 calendar weeks at 4-agent batches with the
-operational discipline established in Sessions 96-101 (mandatory
-strict-swallow trace, mandatory build+verify, ≤3 iteration timebox,
-single-file scope, ≤4 agents per batch).
+W6 is **continuous** — re-run after every wave to catch regressions
+and surface new gaps. Each forcing function picks up new failures as
+the underlying surface fills in.
 
 # How to dispatch a wave
 
 1. Pick the next wave whose dependencies are all green.
 2. For each task in the wave, draft a self-contained agent prompt
-   following the Session 101 template (the one in
-   [the kc16-blocker-map.md](./kc16-blocker-map.md) Session 101
-   relaunch worked cleanly):
-   - Mandatory step-numbered method
-   - Each step has a required artifact in the report
-   - 6-step report template enumerated explicitly
-   - "If your final report does not include all 6 artifacts, you have
-     not completed the task"
+   following the **Session 101 6-step template** (the proven one):
+   1. Worktree-baseline merge (step 0)
+   2. `cargo build --release -p rustjvm-cli`
+   3. Run baseline repro, capture last 10 lines verbatim
+   4. Run `RUSTJVM_STRICT_SWALLOWS=1` trace, capture panic backtrace
+   5. Implement fix; rebuild
+   6. Run post-fix repro, capture last 10 lines verbatim
+   7. Smoke regression on 2-3 apps
+   - Report format explicitly enumerated; "if your final report does
+     not include all artifacts, you have not completed the task"
 3. Dispatch ≤4 agents in parallel via the harness.
 4. Wait for completions; merge usable patches; commit one session per
-   wave with the same prose-sectioning style as Sessions 99-101.
-5. Update [docs/kc16-test-roadmap.md](./kc16-test-roadmap.md) (this
-   file) with the wave's outcome before dispatching the next wave.
+   wave with the same prose-sectioning style as Sessions 96-101.
+5. Re-run the smoke matrix from Wave 6 to confirm no regression.
+6. Update this doc with the wave's outcome before dispatching next wave.
 
-# Defensive notes for future wave authors
+# Anti-pattern checklist (ANY Yes blocks the merge)
 
-- **Worktree-isolation drift**: harness sometimes branches a worktree
-  from a stale commit. Every prompt must include the
-  `git fetch && git merge` step at the top.
-- **Watchdog timeout = 600s**: avoid commands that produce no stream
-  output for >10 min. Long `cargo build`s are the main risk; prefer
-  `cargo build --release -p rustjvm-cli` (the CLI crate alone) over a
-  workspace-wide build.
-- **Pre-existing apps/ paths**: `apps/dprop/HelloWorld` and
-  `apps/annotated/AnnoTest` are reliable smoke fixtures that ship in
-  the repo. Do not invent paths.
-- **Investigation paralysis** is the dominant failure mode. The
-  Session 100 first-attempt Agent A spent 28 minutes / 107 tool uses
-  grepping and concluded "all properly implemented" without ever
-  running the repro. The Session 101 relaunch with the strict
-  6-step protocol shipped in 19 minutes. Mandate the empirical step.
-- **Token-budget management**: 6+ simultaneous opus agents on
-  multi-file investigations will exhaust account capacity (Session 100
-  lesson — 5 of 6 stalled). Cap at 4. For trivial cleanup tasks
-  (RJ.1-style) sonnet works.
+When reviewing an agent's diff before merging:
+- [ ] Does it add a file matching `*<vendor>*.rs` for vendor in
+  `{jboss, wildfly, keycloak, undertow, weld, hibernate, resteasy,
+  springframework, tomcat, jetty, ...}`? **YES → reject.**
+- [ ] Does it stub a method that only one application calls? **YES → reject.**
+- [ ] Is the fix justified by exactly one app and not generalizable to a
+  second? **YES → reject.**
+- [ ] Does the fix paper over a JDK-spec gap (e.g. swallow the error
+  instead of fixing the producer)? **YES → reject.**
+
+JDK-spec fixes are always in scope: anything in `java.*`, `javax.*`,
+`jdk.internal.*`, `sun.*` if reachable from JDK 25 boot.
+
+# Estimated effort
+
+| Wave | Agents | Per-agent effort | Wave wall-time @ 4 parallel |
+|---|---|---|---|
+| W1 | 4 | 0.5–1d | 1d |
+| W2 | 3 | 1–2d | 2d |
+| W3 | 4 | 2–4d | 1 week |
+| W4 | 3 | 1–2d | 2-3d |
+| W5 | 3 | 1–2d | 2-3d |
+| W6 | 5+ | 2–5d | continuous |
+
+**Realistic total**: 6-8 weeks of focused work for waves 1-5 + smoke
+matrix. W6 keeps going forever (more apps = more coverage).
