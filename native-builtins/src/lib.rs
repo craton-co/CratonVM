@@ -177,11 +177,6 @@ pub mod lang_stackwalker;
 // / findModule / Module.getPackages with pre-populated JDK package set and
 // module-name input validation.
 pub mod jboss_jdkspecific;
-// KC16 boot fix: `org/jboss/modules/log/JDKModuleLogger.<clinit>` shim that
-// bypasses the upstream `Level.parse(...)` -> `Module.isNamed` NPE cascade
-// and seeds TRACE/DEBUG/WARN with the same Level fallbacks the real clinit
-// uses on `IllegalArgumentException`.
-pub mod jboss_jdk_module_logger;
 // T19.H3: java.util.logging.LogManager + org.jboss.logmanager.LogManager
 // singleton + Logger registry (fixes KC26 ClassCastException where
 // LogManager.getLogManager() was returning a Class mirror).
@@ -736,12 +731,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // T19.H2: JBoss Modules JDKSpecific — ModuleLayer.boot()/findModule +
     // Module.getName/getPackages/getLayer with pre-populated JDK packages.
     jboss_jdkspecific::register_jboss_jdkspecific(registry);
-    // KC16 boot fix: tactical `<clinit>` shim for
-    // `org/jboss/modules/log/JDKModuleLogger` that suppresses the
-    // `Cannot invoke isNamed on null` cascade (B6 swallow) by skipping
-    // the failing `Level.parse(...)` chain and copying the FINEST/FINE/
-    // WARNING fallbacks straight into TRACE/DEBUG/WARN.
-    jboss_jdk_module_logger::register_jboss_jdk_module_logger(registry);
     // T19.H4: JBoss Modules LocalModuleLoader + Module + ModuleClassLoader
     // natives. Combined with the post-clinit fixup in
     // vm/src/vm/vm_util.rs that populates
