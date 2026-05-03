@@ -849,6 +849,11 @@ impl SharedVm {
                 rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+                // Wave 1 / Task A: per-pool / per-manager MXBean natives
+                // so ManagementFactory.getXxxMXBeans() returns at least
+                // one usable bean per type (not just empty arrays).
+                rustjvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
@@ -903,6 +908,10 @@ impl SharedVm {
             rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+            // Wave 1 / Task A: per-pool / per-manager MXBean natives.
+            // See companion call in the synthetic-jdk branch above.
+            rustjvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
             rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);

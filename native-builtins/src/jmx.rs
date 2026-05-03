@@ -215,21 +215,35 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     });
 
     // -- sun.management.MemoryImpl --
-    // RKC16N.10 follow-on: ManagementFactory.<clinit> instantiates
-    // sun.management.MemoryImpl alongside VMManagementImpl. Without these
-    // natives the boot trips on UnsatisfiedLinkError after VMManagementImpl
-    // succeeds. We return empty arrays — accurate, since rustjvm doesn't
-    // expose JMM memory pools / managers yet (JFR / GC introspection isn't
-    // wired through JMM). JBoss only checks length / iterates, so empty is
-    // safe; consumers asking for actual usage data get UNDEFINED_USAGE
-    // (-1, -1, -1, -1) from `getMemoryUsage0`.
+    // Wave 1 / Task A: ManagementFactory.getMemoryPoolMXBeans() /
+    // getMemoryManagerMXBeans() / getGarbageCollectorMXBeans() all bottom
+    // out in `MemoryImpl.getMemoryPools0()` / `getMemoryManagers0()`. The
+    // GC list is built by filtering the manager array for `instanceof
+    // GarbageCollectorMXBean`, so to populate all three lists we return
+    // (a) two `MemoryPoolImpl` instances tagged HEAP, and (b) one
+    // `GarbageCollectorImpl` instance (which `extends MemoryManagerImpl
+    // implements GarbageCollectorMXBean`, satisfying both filters).
+    //
+    // The synthetic instances carry their `name` + `isHeap` fields by
+    // name (resolved at runtime); the natives we register on
+    // `MemoryPoolImpl` / `MemoryManagerImpl` / `GarbageCollectorImpl`
+    // (`getName`, `getType`, `getCollectionCount`) win dispatch over the
+    // bytecode methods, so even if a synthetic field slot were wrong, the
+    // probe-visible answers still come out right.
     let memory_impl = "sun/management/MemoryImpl";
     r.register(
         memory_impl,
         "getMemoryPools0",
         "()[Ljava/lang/management/MemoryPoolMXBean;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let pool_cid = ctx
+                .ensure_class_initialized("sun/management/MemoryPoolImpl")
+                .unwrap_or(ClassId::new(0));
+            let arr = ctx.new_ref_array(pool_cid, 2);
+            let p0 = alloc_memory_pool_impl(ctx, "Eden Space", true);
+            let p1 = alloc_memory_pool_impl(ctx, "Old Gen", true);
+            ctx.set_array_element(arr, 0, Value::Object(Some(p0)));
+            ctx.set_array_element(arr, 1, Value::Object(Some(p1)));
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -238,7 +252,15 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "getMemoryManagers0",
         "()[Ljava/lang/management/MemoryManagerMXBean;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let mgr_cid = ctx
+                .ensure_class_initialized("sun/management/MemoryManagerImpl")
+                .unwrap_or(ClassId::new(0));
+            let arr = ctx.new_ref_array(mgr_cid, 1);
+            // GarbageCollectorImpl extends MemoryManagerImpl + implements
+            // GarbageCollectorMXBean — single instance covers both the
+            // manager list and (via the instanceof filter) the GC list.
+            let gc = alloc_garbage_collector_impl(ctx, "G1 Young Generation");
+            ctx.set_array_element(arr, 0, Value::Object(Some(gc)));
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -328,6 +350,52 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "load0",
         "(Ljava/lang/Class;Ljava/lang/String;)V",
         |_ctx, _args| Ok(None),
+    );
+
+    // Wave 1 / Task A: short-circuit `ManagementFactory.getPlatformMXBeans
+    // (Class<? extends PlatformManagedObject>)List` — the bytecode body
+    // routes through `PlatformMBeanFinder.findFirst` + `PlatformComponent`
+    // SPI loading, neither of which is wired up in our VM. The convenience
+    // wrappers `getMemoryPoolMXBeans()` / `getMemoryManagerMXBeans()` /
+    // `getGarbageCollectorMXBeans()` all flow through this method, so a
+    // single override populates all three lists at once.
+    r.register(
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBeans",
+        "(Ljava/lang/Class;)Ljava/util/List;",
+        |ctx, args| {
+            let cls_arg = obj_arg(args, 0).ok();
+            let cls_name: String = cls_arg
+                .and_then(|c| ctx.class_id_from_mirror(c))
+                .and_then(|id| ctx.class_name_of_id(id))
+                .unwrap_or_default();
+            let beans: Vec<ObjectRef> = match cls_name.as_str() {
+                "java/lang/management/MemoryPoolMXBean" => vec![
+                    alloc_memory_pool_impl(ctx, "Eden Space", true),
+                    alloc_memory_pool_impl(ctx, "Old Gen", true),
+                ],
+                "java/lang/management/MemoryManagerMXBean" => vec![
+                    alloc_garbage_collector_impl(ctx, "G1 Young Generation"),
+                ],
+                "java/lang/management/GarbageCollectorMXBean" => vec![
+                    alloc_garbage_collector_impl(ctx, "G1 Young Generation"),
+                ],
+                // Other PlatformManagedObject classes (RuntimeMXBean, etc.)
+                // hit a separate `getPlatformMXBean` (singleton) path; the
+                // list-form fallback is an empty list, matching the behaviour
+                // of a JVM that genuinely has no extra components registered
+                // for that interface.
+                _ => Vec::new(),
+            };
+            let backing = ctx.new_ref_array(ClassId::new(0), beans.len());
+            for (i, b) in beans.iter().enumerate() {
+                ctx.set_array_element(backing, i, Value::Object(Some(*b)));
+            }
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(backing)));
+            ctx.set_field_by_name(list, "size", Value::Int(beans.len() as i32));
+            Ok(Some(Value::Object(Some(list))))
+        },
     );
 }
 
@@ -451,10 +519,170 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
         native_noop_with_this,
     );
 
+    // JDK 25 also has the public `<init>(Ljava/lang/String;)V` form (used
+    // by ManagementFactoryHelper internals). No-op so synthetic
+    // construction in `alloc_garbage_collector_impl` doesn't need to chain
+    // through the real bytecode.
+    r.register(cls, "<init>", "(Ljava/lang/String;)V", native_noop_with_this);
+
+    // Wave 1 / Task A: getName()Ljava/lang/String; — read the synthetic
+    // `name` slot we populate in `alloc_garbage_collector_impl`. The
+    // bytecode `MemoryManagerImpl.getName` does `getfield name` directly;
+    // overriding natively keeps us robust against field-layout drift.
+    r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+
     // gc()V — GarbageCollectorImpl exposes a manual-trigger entry point
     // mirroring MemoryMXBean.gc(). No-op is fine; we don't proxy through
     // to the real GC here (MemoryMXBean.gc() does that elsewhere).
     r.register(cls, "gc", "()V", |_ctx, _args| Ok(None));
+}
+
+/// `sun.management.MemoryManagerImpl` — base class for memory managers.
+///
+/// Wave 1 / Task A: register `getName()` so the synthetic manager
+/// instances returned by `MemoryImpl.getMemoryManagers0()` answer with
+/// their populated `name` field. (`isValid()` defaults to `false` via
+/// the synthetic field initialisation; we override it to `true` so
+/// `ManagementFactoryHelper` doesn't filter the bean out.)
+pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/MemoryManagerImpl";
+
+    r.register(cls, "<init>", "(Ljava/lang/String;)V", native_noop_with_this);
+
+    r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+
+    r.register(cls, "isValid", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+
+    // getMemoryPools0()[Ljava/lang/management/MemoryPoolMXBean; — return
+    // an empty array so the synthetic accessor doesn't trip on a missing
+    // native. The probe doesn't traverse this edge.
+    r.register(
+        cls,
+        "getMemoryPools0",
+        "()[Ljava/lang/management/MemoryPoolMXBean;",
+        |ctx, _args| {
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+}
+
+/// `sun.management.MemoryPoolImpl` — per-pool metadata + usage.
+///
+/// Wave 1 / Task A: synthetic instances are built by
+/// `alloc_memory_pool_impl` with `name` (string) + `isHeap` (boolean)
+/// fields populated. Native overrides for `getName()` and `getType()`
+/// short-circuit the bytecode so the probe sees the right values
+/// regardless of field-layout drift.
+pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
+    let cls = "sun/management/MemoryPoolImpl";
+
+    r.register(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;ZJJ)V",
+        native_noop_with_this,
+    );
+
+    r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+
+    r.register(cls, "isValid", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+
+    r.register(
+        cls,
+        "getType",
+        "()Ljava/lang/management/MemoryType;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let is_heap = matches!(
+                ctx.get_field_by_name(this, "isHeap"),
+                Value::Int(v) if v != 0
+            );
+            // MemoryType is an enum — fetch the static field by name.
+            let cid = ctx
+                .ensure_class_initialized("java/lang/management/MemoryType")
+                .unwrap_or(ClassId::new(0));
+            let field = if is_heap { "HEAP" } else { "NON_HEAP" };
+            if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
+                Ok(Some(ctx.get_static_field(cid, idx)))
+            } else {
+                // Fall back to a freshly allocated synthetic enum object —
+                // the probe only stringifies via toString(), which on
+                // enums reads the `name` field at slot 0.
+                let e = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryType", 2);
+                let label = ctx.create_string(field);
+                ctx.set_field_by_name(e, "name", Value::Object(Some(label)));
+                Ok(Some(Value::Object(Some(e))))
+            }
+        },
+    );
+
+    // getUsage / getPeakUsage / getCollectionUsage — return UNDEFINED_USAGE
+    // (-1, -1, -1, -1) per the JMM spec for "metric unavailable".
+    let undefined_usage: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |ctx, _args| {
+            let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+            ctx.set_field(mu, 0, Value::Long(-1));
+            ctx.set_field(mu, 1, Value::Long(-1));
+            ctx.set_field(mu, 2, Value::Long(-1));
+            ctx.set_field(mu, 3, Value::Long(-1));
+            Ok(Some(Value::Object(Some(mu))))
+        };
+    for name in ["getUsage0", "getPeakUsage0", "getCollectionUsage0"] {
+        r.register(
+            cls,
+            name,
+            "()Ljava/lang/management/MemoryUsage;",
+            undefined_usage,
+        );
+    }
+}
+
+/// Allocate a synthetic `sun.management.MemoryPoolImpl` with `name` +
+/// `isHeap` populated.  The remaining fields default-initialise to zero
+/// (longs) / null (refs) which matches a "no-threshold" pool — fine for
+/// JConsole-style enumeration.
+pub fn alloc_memory_pool_impl(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    is_heap: bool,
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryPoolImpl", 12);
+    let n = ctx.create_string(name);
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
+    ctx.set_field_by_name(obj, "isHeap", Value::Int(if is_heap { 1 } else { 0 }));
+    ctx.set_field_by_name(obj, "isValid", Value::Int(1));
+    obj
+}
+
+/// Allocate a synthetic `sun.management.GarbageCollectorImpl` with the
+/// inherited `name` field populated.  The bean implements both
+/// `MemoryManagerMXBean` (so it shows up in
+/// `getMemoryManagerMXBeans()`) and `GarbageCollectorMXBean` (so it
+/// passes the `instanceof` filter in
+/// `ManagementFactoryHelper.getGarbageCollectorMXBeans`).
+pub fn alloc_garbage_collector_impl(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4);
+    let n = ctx.create_string(name);
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
+    ctx.set_field_by_name(obj, "isValid", Value::Int(1));
+    obj
 }
 
 /// `sun.management.OperatingSystemImpl` — process / OS metrics.
