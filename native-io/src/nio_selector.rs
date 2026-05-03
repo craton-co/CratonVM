@@ -63,7 +63,7 @@
 use parking_lot::{Mutex, RwLock};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use rustjvm_types::{ClassId, ObjectRef, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -1353,6 +1353,27 @@ pub fn take_pending_accepted(id: i32, listener_fd: i32) -> Option<TcpStream> {
     Some(stream)
 }
 
+/// Pop the oldest accepted stream sitting in any selector's pending queue
+/// for the given listener id (search across all open selectors). Used by
+/// `ServerSocketChannel.accept()` so the user-visible accept call returns
+/// the connection that the selector loop already drained.
+pub fn take_any_pending_accepted(listener_fd: i32) -> Option<TcpStream> {
+    let regs = selectors().read();
+    for (_id, s) in regs.iter() {
+        let mut st = s.lock();
+        if let Some(pos) = st
+            .pending_accepted
+            .iter()
+            .position(|(fd, _)| *fd == listener_fd)
+        {
+            if let Some((_, stream)) = st.pending_accepted.remove(pos) {
+                return Some(stream);
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Object-field helpers
 // ---------------------------------------------------------------------------
@@ -1372,12 +1393,26 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
 }
 
 fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
-    let ch = ctx.get_field(key_obj, SK_CHANNEL);
-    let Value::Object(Some(channel)) = ch else {
+    // Prefer the side-table mapping (populated at register time).
+    let raw = sk_table()
+        .read()
+        .get(&(key_obj.as_ptr() as usize))
+        .map(|s| s.channel)?;
+    if raw == 0 {
         return None;
-    };
-    if ctx.object_num_fields(channel) == 0 {
+    }
+    let channel = unsafe { ObjectRef::from_raw(raw as *mut u8) };
+    let nf = ctx.object_num_fields(channel);
+    if nf == 0 {
         return None;
+    }
+    // WP3.4 layout: channel id lives at field 2 (F_REG_ID).
+    if nf > 2 {
+        if let Value::Int(v) = ctx.get_field(channel, 2) {
+            if v != 0 && v != -1 {
+                return Some(v);
+            }
+        }
     }
     match ctx.get_field(channel, 0) {
         Value::Int(v) if v != 0 && v != -1 => Some(v),
@@ -1386,10 +1421,14 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
 }
 
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
-    let sel = ctx.get_field(key_obj, SK_SELECTOR);
-    let Value::Object(Some(s)) = sel else {
+    let raw = sk_table()
+        .read()
+        .get(&(key_obj.as_ptr() as usize))
+        .map(|s| s.selector)?;
+    if raw == 0 {
         return None;
-    };
+    }
+    let s = unsafe { ObjectRef::from_raw(raw as *mut u8) };
     Some(selector_id_from_obj(ctx, s))
 }
 
@@ -1469,8 +1508,9 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(n)))
 }
 
-/// Mirror the native readyOps onto each registered SelectionKey object.
-fn apply_ready_ops(ctx: &mut dyn NativeContext, id: i32) {
+/// Mirror the native readyOps onto the SelectionKey side-table so user
+/// code reading `key.readyOps()` sees the post-select state.
+fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
     let snap: Vec<(usize, i32)> = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else { return };
@@ -1480,16 +1520,13 @@ fn apply_ready_ops(ctx: &mut dyn NativeContext, id: i32) {
             .map(|k| (k.key_obj, k.ready_ops))
             .collect()
     };
+    let mut table = sk_table().write();
     for (raw, ready) in snap {
         if raw == 0 {
             continue;
         }
-        // SAFETY: we stored the raw pointer at register time from a live
-        // ObjectRef on the VM's heap. The selector state is cleared on
-        // Selector.close(), at which point this slot is no longer touched.
-        let obj = unsafe { ObjectRef::from_raw(raw as *mut u8) };
-        if ctx.object_num_fields(obj) > SK_READY_OPS {
-            ctx.set_field(obj, SK_READY_OPS, Value::Int(ready));
+        if let Some(state) = table.get_mut(&raw) {
+            state.ready_ops = ready;
         }
     }
 }
@@ -1514,6 +1551,34 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // ---------------------------------------------------------------------------
 // Native method impls — SelectableChannel.register
 // ---------------------------------------------------------------------------
+
+// Side-table mapping SelectionKey object → (channel, selector, interestOps,
+// readyOps, attachment). Used because `sun/nio/ch/SelectionKeyImpl` has its
+// own JDK-managed instance layout and writing to ad-hoc slots collides.
+struct SkState {
+    channel: usize,   // raw ObjectRef ptr
+    selector: usize,
+    interest_ops: i32,
+    ready_ops: i32,
+    attachment: Option<usize>,
+    cancelled: bool,
+}
+
+fn sk_table() -> &'static parking_lot::RwLock<std::collections::HashMap<usize, SkState>> {
+    static REG: std::sync::OnceLock<parking_lot::RwLock<std::collections::HashMap<usize, SkState>>>
+        = std::sync::OnceLock::new();
+    REG.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()))
+}
+
+fn sk_state_get_field<F: FnOnce(&SkState) -> Value>(key: ObjectRef, f: F) -> Option<Value> {
+    let table = sk_table().read();
+    table.get(&(key.as_ptr() as usize)).map(f)
+}
+
+fn sk_state_with_mut<F: FnOnce(&mut SkState) -> R, R>(key: ObjectRef, f: F) -> Option<R> {
+    let mut table = sk_table().write();
+    table.get_mut(&(key.as_ptr() as usize)).map(f)
+}
 
 fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(channel))) = args.first().copied() else {
@@ -1542,13 +1607,35 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         return Err(closed_selector());
     }
 
-    let net_fd = if ctx.object_num_fields(channel) > 0 {
-        match ctx.get_field(channel, 0) {
-            Value::Int(v) => v,
-            _ => return Err(ioex("register: channel has no fd")),
-        }
+    // Channel layout (WP3.4): field 0 = open flag, field 2 = registry id
+    // into `tcp_registry()`. Older synthetic shims placed the fd at field 0 —
+    // try field 2 first and fall back so both worlds keep working.
+    let nf = ctx.object_num_fields(channel);
+    let mut net_fd = if nf > 2 {
+        ctx.get_field(channel, 2).as_int().unwrap_or(-1)
+    } else if nf > 0 {
+        ctx.get_field(channel, 0).as_int().unwrap_or(-1)
     } else {
         return Err(ioex("register: channel has no fields"));
+    };
+    if net_fd < 0 && nf > 0 {
+        // Last-resort: read field 0 (synthetic-mode fd_table id).
+        net_fd = ctx.get_field(channel, 0).as_int().unwrap_or(-1);
+    }
+
+    // If the registered channel is backed by an entry in the WP3.4
+    // tcp_registry, hand the selector a clone of the live socket so
+    // `selector_select` can actually poll readiness. The clone is
+    // independent of the JDK-visible handle (so accept()/read() still
+    // return the real connection).
+    let kind = match crate::socket_channel::tcp_clone_for_selector(net_fd) {
+        Some(crate::socket_channel::TcpHandleClone::Listener(l)) => {
+            Some(SelectableKind::Listener(l))
+        }
+        Some(crate::socket_channel::TcpHandleClone::Stream(s)) => {
+            Some(SelectableKind::Stream(s))
+        }
+        None => None,
     };
 
     let key_obj = ctx
@@ -1558,25 +1645,26 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             _ => None,
         })
         .ok_or_else(|| ioex("register: could not allocate SelectionKeyImpl"))?;
-    let n = ctx.object_num_fields(key_obj);
-    if n > SK_SELECTOR {
-        ctx.set_field(key_obj, SK_SELECTOR, Value::Object(Some(selector_obj)));
-    }
-    if n > SK_CHANNEL {
-        ctx.set_field(key_obj, SK_CHANNEL, Value::Object(Some(channel)));
-    }
-    if n > SK_INTEREST_OPS {
-        ctx.set_field(key_obj, SK_INTEREST_OPS, Value::Int(ops));
-    }
-    if n > SK_READY_OPS {
-        ctx.set_field(key_obj, SK_READY_OPS, Value::Int(0));
-    }
-    if n > SK_ATTACHMENT {
-        ctx.set_field(key_obj, SK_ATTACHMENT, attachment);
-    }
+    // Stash the key state in a side-table so our accessor natives don't
+    // have to reach into JDK-managed slots on the SelectionKeyImpl.
+    let attachment_raw = match attachment {
+        Value::Object(Some(o)) => Some(o.as_ptr() as usize),
+        _ => None,
+    };
+    sk_table().write().insert(
+        key_obj.as_ptr() as usize,
+        SkState {
+            channel: channel.as_ptr() as usize,
+            selector: selector_obj.as_ptr() as usize,
+            interest_ops: ops,
+            ready_ops: 0,
+            attachment: attachment_raw,
+            cancelled: false,
+        },
+    );
 
     let raw = key_obj.as_ptr() as usize;
-    selector_register(sel_id, net_fd, ops, raw, None)?;
+    selector_register(sel_id, net_fd, ops, raw, kind)?;
 
     Ok(Some(Value::Object(Some(key_obj))))
 }
@@ -1621,6 +1709,325 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     selector_cancel(sel_id, fd);
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Public-facing SelectionKey accessors — back the abstract methods on
+// java.nio.channels.SelectionKey + sun.nio.ch.SelectionKeyImpl by reading
+// directly out of our 5-field synthetic. The concrete is{Readable,
+// Writable, Connectable, Acceptable} stay as JDK bytecode (final methods
+// that mask readyOps() against OP_*).
+// ---------------------------------------------------------------------------
+
+fn sk_channel(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let v = sk_state_get_field(this, |s| {
+        let obj = unsafe { ObjectRef::from_raw(s.channel as *mut u8) };
+        Value::Object(Some(obj))
+    })
+    .unwrap_or(Value::Object(None));
+    Ok(Some(v))
+}
+
+fn sk_selector(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let v = sk_state_get_field(this, |s| {
+        let obj = unsafe { ObjectRef::from_raw(s.selector as *mut u8) };
+        Value::Object(Some(obj))
+    })
+    .unwrap_or(Value::Object(None));
+    Ok(Some(v))
+}
+
+fn sk_interest_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let v = sk_state_get_field(this, |s| Value::Int(s.interest_ops))
+        .unwrap_or(Value::Int(0));
+    Ok(Some(v))
+}
+
+fn sk_set_interest_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let ops = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    sk_state_with_mut(this, |s| {
+        s.interest_ops = ops;
+    });
+    // Mirror to native KeyState so the next select() picks up the change.
+    let table = sk_table().read();
+    if let Some(s) = table.get(&(this.as_ptr() as usize)) {
+        let regs = selectors().read();
+        for (sel_id, sel) in regs.iter() {
+            let mut st = sel.lock();
+            for k in st.keys.values_mut() {
+                if k.key_obj == this.as_ptr() as usize {
+                    k.interest_ops = ops;
+                    let _ = selector_set_interest(*sel_id, k.net_fd, ops);
+                    break;
+                }
+            }
+        }
+        let _ = s; // silence
+    }
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn sk_ready_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let v = sk_state_get_field(this, |s| Value::Int(s.ready_ops))
+        .unwrap_or(Value::Int(0));
+    Ok(Some(v))
+}
+
+fn sk_is_valid(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let valid = sk_state_get_field(this, |s| {
+        Value::Int(if s.cancelled { 0 } else { 1 })
+    })
+    .unwrap_or(Value::Int(0));
+    Ok(Some(valid))
+}
+
+fn sk_attach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let new_att_raw = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(o.as_ptr() as usize),
+        _ => None,
+    };
+    let prev = sk_state_with_mut(this, |s| {
+        let prev = s.attachment.take();
+        s.attachment = new_att_raw;
+        prev
+    })
+    .flatten();
+    let prev_v = match prev {
+        Some(raw) => {
+            let obj = unsafe { ObjectRef::from_raw(raw as *mut u8) };
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    };
+    Ok(Some(prev_v))
+}
+
+fn sk_attachment(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let v = sk_state_get_field(this, |s| match s.attachment {
+        Some(raw) => {
+            let obj = unsafe { ObjectRef::from_raw(raw as *mut u8) };
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    })
+    .unwrap_or(Value::Object(None));
+    Ok(Some(v))
+}
+
+fn sk_cancel_public(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    sk_state_with_mut(this, |s| {
+        s.cancelled = true;
+        s.ready_ops = 0;
+    });
+    // Walk all selectors looking for this key and mark cancelled.
+    let regs = selectors().read();
+    for (sel_id, sel) in regs.iter() {
+        let mut st = sel.lock();
+        let Some(target) = st
+            .keys
+            .iter()
+            .find(|(_, k)| k.key_obj == this.as_ptr() as usize)
+            .map(|(fd, _)| *fd)
+        else {
+            continue;
+        };
+        drop(st);
+        selector_cancel(*sel_id, target);
+        break;
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Public-facing Selector accessors that bypass the JDK bytecode (which
+// reaches into uninitialized HashMaps populated only when the JDK's own
+// SelectorImpl.<init> chain runs).
+// ---------------------------------------------------------------------------
+
+fn selector_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(obj))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let id = selector_id_from_obj(ctx, obj);
+    let raw_keys: Vec<usize> = if id == 0 {
+        Vec::new()
+    } else {
+        let regs = selectors().read();
+        match regs.get(&id) {
+            Some(s) => s
+                .lock()
+                .keys
+                .values()
+                .filter(|k| !k.cancelled && k.ready_ops != 0 && k.key_obj != 0)
+                .map(|k| k.key_obj)
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    Ok(Some(Value::Object(Some(build_set(ctx, &raw_keys)))))
+}
+
+fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(obj))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let id = selector_id_from_obj(ctx, obj);
+    let raw_keys: Vec<usize> = if id == 0 {
+        Vec::new()
+    } else {
+        let regs = selectors().read();
+        match regs.get(&id) {
+            Some(s) => s
+                .lock()
+                .keys
+                .values()
+                .filter(|k| !k.cancelled && k.key_obj != 0)
+                .map(|k| k.key_obj)
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    Ok(Some(Value::Object(Some(build_set(ctx, &raw_keys)))))
+}
+
+/// Build a HashSet populated with the given key objects. Allocates a real
+/// JDK HashSet (so its bytecode iterator/contains/remove work) and adds
+/// each key via `add(Object)`. The selector calls this on every
+/// `selectedKeys()` / `keys()` invocation; lifetimes are short so we keep
+/// it simple.
+fn build_set(ctx: &mut dyn NativeContext, raw_keys: &[usize]) -> ObjectRef {
+    // Allocate + run the no-arg constructor so the backing HashMap field
+    // (`map`) is non-null. Without <init> the JDK HashSet bytecode NPEs at
+    // `map.keySet()` during iterator()/size()/etc.
+    let set_value = ctx
+        .new_object("java/util/HashSet")
+        .ok()
+        .and_then(|v| match v {
+            Some(Value::Object(Some(o))) => Some(o),
+            _ => None,
+        });
+    let set = match set_value {
+        Some(o) => o,
+        None => match ctx.ensure_class_initialized("java/util/HashSet") {
+            Ok(cid) => ctx.alloc_object(cid, 1),
+            Err(_) => ctx.alloc_object(ClassId::new(0), 1),
+        },
+    };
+    let _ = ctx.invoke_special("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
+    for raw in raw_keys {
+        // SAFETY: stored from a live ObjectRef at SelectionKey allocation
+        // time; the heap entry is kept alive while the selector exists.
+        let key = unsafe { ObjectRef::from_raw(*raw as *mut u8) };
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(key))],
+        );
+    }
+    set
+}
+
+fn selector_select_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Selector.select() — blocking, no timeout. Cap at 30s so unit-tests
+    // never wedge if a wakeup is missed.
+    let mut new_args: Vec<Value> = Vec::with_capacity(2);
+    if let Some(this) = args.first().copied() {
+        new_args.push(this);
+    } else {
+        return Ok(Some(Value::Int(0)));
+    }
+    new_args.push(Value::Long(30_000));
+    selector_select_native(ctx, &new_args)
+}
+
+fn selector_wakeup_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    selector_wakeup_native(ctx, args)?;
+    Ok(args.first().copied())
+}
+
+fn selector_is_open_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(obj))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(if open_flag(ctx, obj) { 1 } else { 0 })))
+}
+
+/// `SelectorImpl.lockAndDoSelect(Consumer<SelectionKey> action, long timeout)`
+/// — the JDK protected method called by every public select(...) overload.
+/// It synchronizes on internal locks and walks ready key state we don't
+/// populate, so we route the timeout straight to our native select and
+/// invoke the optional consumer over freshly ready keys (Selector.select(Consumer)).
+fn selector_lock_and_do_select(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let consumer = args.get(1).copied().unwrap_or(Value::Object(None));
+    let timeout = match args.get(2) {
+        Some(Value::Long(t)) => *t,
+        Some(Value::Int(t)) => *t as i64,
+        _ => 0,
+    };
+    let n = selector_select_native(ctx, &[this, Value::Long(timeout)])?;
+    // If a Consumer<SelectionKey> was supplied, drive it across the ready keys.
+    if let Value::Object(Some(c)) = consumer {
+        if let Value::Object(Some(set)) = selector_selected_keys(ctx, &[this])?.unwrap_or(Value::Object(None)) {
+            // The synthetic HashSet's backing array is at slot 0, size at slot 1.
+            let arr = match ctx.get_field(set, 0) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(n),
+            };
+            let len = match ctx.get_field(set, 1) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            for i in 0..len {
+                if let Value::Object(Some(k)) = ctx.get_array_element(arr, i) {
+                    let _ = ctx.invoke_virtual(
+                        c,
+                        "accept",
+                        "(Ljava/lang/Object;)V",
+                        &[Value::Object(Some(k))],
+                    );
+                }
+            }
+        }
+    }
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------
@@ -1806,6 +2213,47 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     let ski = "sun/nio/ch/SelectionKeyImpl";
     r.register(ski, "interestOps0", "(I)V", key_set_interest_ops_native);
     r.register(ski, "cancel0", "()V", key_cancel_native);
+
+    // SelectionKey accessors. The real-JDK abstract methods on
+    // java.nio.channels.SelectionKey have no Code attribute, and the
+    // concrete sun.nio.ch.SelectionKeyImpl bytecode reads internal
+    // state we don't initialize via <init>. Register native overrides
+    // that read out of our 5-field SelectionKeyImpl synthetic.
+    let sk_class = "java/nio/channels/SelectionKey";
+    for c in [sk_class, ski] {
+        r.register(c, "channel", "()Ljava/nio/channels/SelectableChannel;", sk_channel);
+        r.register(c, "selector", "()Ljava/nio/channels/Selector;", sk_selector);
+        r.register(c, "interestOps", "()I", sk_interest_ops);
+        r.register(c, "interestOps", "(I)Ljava/nio/channels/SelectionKey;", sk_set_interest_ops);
+        r.register(c, "readyOps", "()I", sk_ready_ops);
+        r.register(c, "isValid", "()Z", sk_is_valid);
+        r.register(c, "attach", "(Ljava/lang/Object;)Ljava/lang/Object;", sk_attach);
+        r.register(c, "attachment", "()Ljava/lang/Object;", sk_attachment);
+        r.register(c, "cancel", "()V", sk_cancel_public);
+    }
+
+    // Selector.selectedKeys / Selector.keys — bytecode in SelectorImpl
+    // walks internal HashMaps populated by registerImpl/processFdSet,
+    // neither of which our shim wires up. Synthesize the result Set
+    // directly from our native KeyState registry.
+    let sel_iface = "java/nio/channels/Selector";
+    for c in [sel_iface, sel] {
+        r.register(c, "selectedKeys", "()Ljava/util/Set;", selector_selected_keys);
+        r.register(c, "keys", "()Ljava/util/Set;", selector_keys);
+    }
+    // Public Selector entry points — short-circuit the JDK bytecode (which
+    // marshals through SelectorImpl.lockAndDoSelect / processFdSet against
+    // internal HashMaps that we don't initialise).
+    for c in [sel_iface, sel] {
+        r.register(c, "select", "()I", selector_select_blocking);
+        r.register(c, "select", "(J)I", selector_select_native);
+        r.register(c, "selectNow", "()I", selector_select_now_native);
+        r.register(c, "wakeup", "()Ljava/nio/channels/Selector;", selector_wakeup_public);
+        r.register(c, "close", "()V", selector_close_native);
+        r.register(c, "isOpen", "()Z", selector_is_open_native);
+        // SelectorImpl.lockAndDoSelect bypass: route directly to our select.
+        r.register(c, "lockAndDoSelect", "(Ljava/util/function/Consumer;J)I", selector_lock_and_do_select);
+    }
 
     // IOUtil.fdVal — used by every SocketChannelImpl to extract the raw
     // OS fd from a FileDescriptor before passing it to native ops.

@@ -5043,7 +5043,113 @@ fn invoke_on_class_shared_inner(
                                 | "equalsIgnoreCase"
                                 | "contains"
                                 | "split"
-                            ));
+                            ))
+                        // Wave 3 Task C: NIO Selector — the real-JDK
+                        // SelectorImpl bytecode walks `keys` / `selectedKeys`
+                        // HashMaps that we don't populate (we don't run
+                        // SelectorImpl.<init>). Force our native overrides
+                        // to win for the public select / wakeup / close
+                        // entry points and for SelectorImpl's internal
+                        // `lockAndDoSelect` and accessor methods.
+                        || (matches!(
+                                class_name,
+                                "sun/nio/ch/SelectorImpl"
+                                | "sun/nio/ch/WindowsSelectorImpl"
+                                | "sun/nio/ch/EPollSelectorImpl"
+                                | "sun/nio/ch/KQueueSelectorImpl"
+                                | "java/nio/channels/Selector"
+                                | "java/nio/channels/spi/AbstractSelector"
+                            )
+                            && matches!(
+                                method_name,
+                                "select"
+                                | "selectNow"
+                                | "selectedKeys"
+                                | "keys"
+                                | "wakeup"
+                                | "close"
+                                | "isOpen"
+                                | "lockAndDoSelect"
+                            ))
+                        // Wave 3 Task C: SelectionKeyImpl.* accessors —
+                        // same reason: real-JDK bytecode reads internal
+                        // state populated by SelectorImpl.<init> chain.
+                        || (matches!(
+                                class_name,
+                                "sun/nio/ch/SelectionKeyImpl"
+                                | "java/nio/channels/SelectionKey"
+                            )
+                            && matches!(
+                                method_name,
+                                "channel"
+                                | "selector"
+                                | "interestOps"
+                                | "readyOps"
+                                | "isValid"
+                                | "cancel"
+                                | "attach"
+                                | "attachment"
+                            ))
+                        // Wave 3 Task C: ServerSocketChannel.socket() —
+                        // returns a wrapper ServerSocket whose bind /
+                        // getLocalPort delegate to the channel.
+                        || (matches!(
+                                class_name,
+                                "java/nio/channels/ServerSocketChannel"
+                                | "sun/nio/ch/ServerSocketChannelImpl"
+                            )
+                            && matches!(
+                                method_name,
+                                "socket" | "getLocalAddress"
+                            ))
+                        // Wave 3 Task C: ServerSocket adapter — when the
+                        // ServerSocket is the channel-backed wrapper its
+                        // bind / getLocalPort must reach our overrides
+                        // ahead of the real-JDK bytecode (which would
+                        // try to allocate a SocketImpl etc.).
+                        || (class_name == "java/net/ServerSocket"
+                            && matches!(
+                                method_name,
+                                "bind" | "getLocalPort" | "isBound" | "isClosed" | "getLocalSocketAddress" | "close"
+                            ))
+                        // Wave 3 Task C: SocketChannel/ServerSocketChannel
+                        // factories + connect/accept/configureBlocking — JDK
+                        // bytecode for these reaches into the SelectorProvider
+                        // chain (DefaultSelectorProvider) which we don't
+                        // wire up. Force our `WP3.4` natives to win.
+                        || (matches!(
+                                class_name,
+                                "java/nio/channels/SocketChannel"
+                                | "java/nio/channels/ServerSocketChannel"
+                                | "sun/nio/ch/SocketChannelImpl"
+                                | "sun/nio/ch/ServerSocketChannelImpl"
+                            )
+                            && matches!(
+                                method_name,
+                                "open"
+                                | "connect"
+                                | "accept"
+                                | "configureBlocking"
+                                | "isOpen"
+                                | "isBlocking"
+                                | "isConnected"
+                                | "close"
+                                | "bind"
+                                | "read"
+                                | "write"
+                                | "finishConnect"
+                                | "getRemoteAddress"
+                                | "getLocalAddress"
+                                | "socket"
+                            ))
+                        // SelectableChannel.register — JDK bytecode walks
+                        // SelectorProvider state we don't initialize.
+                        || (matches!(
+                                class_name,
+                                "java/nio/channels/SelectableChannel"
+                                | "java/nio/channels/spi/AbstractSelectableChannel"
+                            )
+                            && matches!(method_name, "register" | "configureBlocking"));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }

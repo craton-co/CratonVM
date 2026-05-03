@@ -75,9 +75,29 @@ pub struct ConnectInProgress {
     done: std::sync::atomic::AtomicBool,
 }
 
-fn tcp_registry() -> &'static RwLock<HashMap<i32, TcpHandle>> {
+pub(crate) fn tcp_registry() -> &'static RwLock<HashMap<i32, TcpHandle>> {
     static REG: OnceLock<RwLock<HashMap<i32, TcpHandle>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Try to clone a registered handle out of the tcp_registry. Returns
+/// None if the id is unknown / Closed / Connecting. Used by the selector
+/// to obtain a `SelectableKind` it can poll without taking ownership of
+/// the live JDK-visible handle.
+pub(crate) fn tcp_clone_for_selector(
+    id: i32,
+) -> Option<TcpHandleClone> {
+    let regs = tcp_registry().read();
+    match regs.get(&id) {
+        Some(TcpHandle::Listener(l)) => l.try_clone().ok().map(TcpHandleClone::Listener),
+        Some(TcpHandle::Stream(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        _ => None,
+    }
+}
+
+pub(crate) enum TcpHandleClone {
+    Listener(TcpListener),
+    Stream(TcpStream),
 }
 
 /// Per-fd non-blocking flag. The OS state on the real socket mirrors this.
@@ -213,35 +233,70 @@ fn decode_socket_address(
     ctx: &mut dyn NativeContext,
     sa: ObjectRef,
 ) -> Result<(String, u16), MethodCallFailed> {
-    // Try real-JDK's `holder.hostname` + `holder.port` first.
-    let port_named = match ctx.get_field_by_name(sa, "port") {
+    // Preferred path: use the public InetSocketAddress accessors so we
+    // observe whatever state the JDK constructor populated, regardless
+    // of internal field-layout details.
+    let port_via_method = match ctx.invoke_virtual(sa, "getPort", "()I", &[]) {
+        Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
+        _ => None,
+    };
+    let host_via_method = match ctx.invoke_virtual(sa, "getHostString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    };
+    if let Some(p) = port_via_method {
+        let h = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
+        let h = if h.is_empty() { "0.0.0.0".to_string() } else { h };
+        return Ok((h, p));
+    }
+
+    // Real-JDK java.net.InetSocketAddress holds its state inside an
+    // InetSocketAddressHolder reachable via `holder`. Try that next;
+    // fall back to flat field access for synthetic layouts.
+    let probe_obj = match ctx.get_field_by_name(sa, "holder") {
+        Value::Object(Some(h)) => h,
+        _ => sa,
+    };
+    let port_named = match ctx.get_field_by_name(probe_obj, "port") {
         Value::Int(v) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
         _ => None,
     };
-    let host_named = match ctx.get_field_by_name(sa, "hostname") {
+    let host_named = match ctx.get_field_by_name(probe_obj, "hostname") {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     };
-    let addr_named = match ctx.get_field_by_name(sa, "addr") {
-        Value::Object(Some(ia)) => match ctx.get_field_by_name(ia, "hostName") {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => match ctx.get_field_by_name(ia, "address") {
-                Value::Int(v) => Some(format!(
-                    "{}.{}.{}.{}",
-                    (v >> 24) & 0xff,
-                    (v >> 16) & 0xff,
-                    (v >> 8) & 0xff,
-                    v & 0xff
-                )),
-                _ => None,
-            },
-        },
+    // Real JDK InetAddress: holder.hostName / holder.address (int IPv4 BE).
+    // Synthetic / older shims: hostName / address directly on the InetAddress.
+    let addr_named = match ctx.get_field_by_name(probe_obj, "addr") {
+        Value::Object(Some(ia)) => {
+            let ia_probe = match ctx.get_field_by_name(ia, "holder") {
+                Value::Object(Some(h)) => h,
+                _ => ia,
+            };
+            match ctx.get_field_by_name(ia_probe, "hostName") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => match ctx.get_field_by_name(ia_probe, "address") {
+                    Value::Int(v) => Some(format!(
+                        "{}.{}.{}.{}",
+                        (v >> 24) & 0xff,
+                        (v >> 16) & 0xff,
+                        (v >> 8) & 0xff,
+                        v & 0xff
+                    )),
+                    _ => None,
+                },
+            }
+        }
         _ => None,
     };
-    if let (Some(h), Some(p)) = (host_named.as_ref().or(addr_named.as_ref()), port_named) {
-        if !h.is_empty() {
-            return Ok((h.clone(), p));
-        }
+    if let Some(p) = port_named {
+        let h = host_named
+            .as_ref()
+            .or(addr_named.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("0.0.0.0");
+        let h = if h.is_empty() { "0.0.0.0" } else { h };
+        return Ok((h.to_string(), p));
     }
 
     // Fall back to synthetic 2-field layout.
@@ -299,17 +354,9 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
     };
     let length = (limit - position).max(0);
 
-    // Direct: `address` is a non-zero long.
-    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
-        if addr != 0 {
-            return Some(BufferAccess::Direct {
-                addr: addr.wrapping_add(position as i64),
-                length,
-            });
-        }
-    }
-
-    // Heap: `hb` is the byte[].
+    // Heap: `hb` is the byte[]. Try this first; loading the `address`
+    // field on a HeapByteBuffer can transitively trigger class loads
+    // (java.lang.foreign.MemorySegment) we don't fully support.
     if let Value::Object(Some(arr)) = ctx.get_field_by_name(bb, "hb") {
         let base_off = match ctx.get_field_by_name(bb, "offset") {
             Value::Int(v) if v >= 0 => v,
@@ -320,6 +367,17 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
             offset: base_off + position,
             length,
         });
+    }
+
+    // Direct: `address` is a non-zero long. Only consult it when the
+    // heap-array fast path didn't match.
+    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
+        if addr != 0 {
+            return Some(BufferAccess::Direct {
+                addr: addr.wrapping_add(position as i64),
+                length,
+            });
+        }
     }
 
     None
@@ -426,9 +484,10 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(ch_val),
     };
     if let Some(sa) = obj_or_none(args, 0) {
-        // Best-effort connect; on failure we still return the channel
-        // and let the caller observe `isConnected() == false`.
-        let _ = sc_connect_inner(ctx, ch, sa, /* allow_block = */ true);
+        // Synchronous-connect overload of SocketChannel.open(SocketAddress)
+        // is documented to throw IOException on failure. Surface the error
+        // so callers can react instead of getting an unconnected channel.
+        sc_connect_inner(ctx, ch, sa, /* allow_block = */ true)?;
     }
     Ok(Some(Value::Object(Some(ch))))
 }
@@ -756,16 +815,15 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let id = read_reg_id(ctx, this)
         .ok_or_else(|| ioex("write: channel not connected"))?;
-
     let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
-
     let n_opt = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => try_write_nb(s, &data).map_err(|e| map_err("write", e))?,
+            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
             _ => return Err(ioex("write: channel not a stream")),
         }
     };
@@ -911,6 +969,12 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .ok_or_else(|| ioex("accept: server channel not bound"))?;
     let blocking = read_blocking_flag(ctx, this);
 
+    // Wave 3 Task C: the selector loop pre-drains pending accepts when
+    // OP_ACCEPT fires (see `kernel_select_*` in nio_selector.rs); pull
+    // from that side-channel first so we don't block on a queue that
+    // has already been emptied.
+    let preaccepted = crate::nio_selector::take_any_pending_accepted(id);
+
     // Clone listener out so the registry lock isn't held across blocking accept.
     let listener_clone = {
         let map = tcp_registry().read();
@@ -922,10 +986,17 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
     };
 
-    let accepted = match listener_clone.accept() {
-        Ok((stream, peer)) => Some((stream, peer)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock && !blocking => None,
-        Err(e) => return Err(map_err("accept", e)),
+    let accepted = if let Some(stream) = preaccepted {
+        let peer = stream.peer_addr().unwrap_or_else(|_| {
+            "0.0.0.0:0".parse().unwrap()
+        });
+        Some((stream, peer))
+    } else {
+        match listener_clone.accept() {
+            Ok((stream, peer)) => Some((stream, peer)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock && !blocking => None,
+            Err(e) => return Err(map_err("accept", e)),
+        }
     };
 
     let Some((stream, peer)) = accepted else {
@@ -1023,6 +1094,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // -- ServerSocketChannel factory + lifecycle --
     for c in [ssc, sscimpl] {
         r.register(c, "open", "()Ljava/nio/channels/ServerSocketChannel;", ssc_open);
+        r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket);
         r.register(c, "isOpen", "()Z", sc_is_open);
         r.register(c, "isBlocking", "()Z", sc_is_blocking);
         r.register(
@@ -1063,7 +1135,229 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
+        r.register(
+            c,
+            "getLocalAddress",
+            "()Ljava/net/SocketAddress;",
+            ssc_local_address,
+        );
     }
+
+    // -- ServerSocket adapter (used by ServerSocketChannel.socket()) --
+    // The wrapper returned by `ssc.socket()` has a back-ref to its parent
+    // SSC at SS_CHANNEL_REF. The bind / getLocalPort / accept / close /
+    // getInetAddress methods detect this back-ref and delegate to the
+    // owning channel; without a back-ref we fall through to defaults so
+    // that plain `new ServerSocket()` use cases (handled elsewhere) are
+    // not perturbed.
+    let server_socket = "java/net/ServerSocket";
+    r.register(
+        server_socket,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        ss_wrapper_bind,
+    );
+    r.register(
+        server_socket,
+        "bind",
+        "(Ljava/net/SocketAddress;I)V",
+        ss_wrapper_bind_backlog,
+    );
+    r.register(server_socket, "getLocalPort", "()I", ss_wrapper_local_port);
+    r.register(
+        server_socket,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        ss_wrapper_local_address,
+    );
+    r.register(server_socket, "isBound", "()Z", ss_wrapper_is_bound);
+    r.register(server_socket, "isClosed", "()Z", ss_wrapper_is_closed);
+    r.register(server_socket, "close", "()V", ss_wrapper_close);
+}
+
+// ---------------------------------------------------------------------------
+// ServerSocketChannel.socket() — wrapper ServerSocket
+// ---------------------------------------------------------------------------
+
+// The channel-backed wrapper is a plain `java/net/ServerSocket` allocated
+// with the JDK's real layout; we cannot stash a back-ref inside one of its
+// fields without colliding with JDK-private slots. Instead we keep the
+// wrapper → channel mapping in a process-wide side-table keyed by the
+// wrapper's raw ObjectRef pointer.
+const SSC_SOCKET_CACHE: usize = 5; // unused F_REMOTE slot — see note below.
+
+fn ss_back_ref_table()
+    -> &'static RwLock<HashMap<usize, usize>>
+{
+    static REG: OnceLock<RwLock<HashMap<usize, usize>>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn ss_record_back_ref(ss: ObjectRef, ssc: ObjectRef) {
+    ss_back_ref_table()
+        .write()
+        .insert(ss.as_ptr() as usize, ssc.as_ptr() as usize);
+}
+
+fn ss_back_ref(ss: ObjectRef) -> Option<ObjectRef> {
+    let raw = ss_back_ref_table()
+        .read()
+        .get(&(ss.as_ptr() as usize))
+        .copied()?;
+    // SAFETY: the SSC is kept alive by the wrapper's reference path; the
+    // mapping is removed in ssc_close.
+    Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
+}
+
+// `F_REMOTE` (slot 5) of a SSC object is unused for ServerSocketChannel
+// instances (only SocketChannel uses it). We hijack it to cache the
+// `socket()` adapter so the same instance is returned each call —
+// matching java.nio.channels.ServerSocketChannel.socket()'s contract.
+
+fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Err(ioex("socket: null channel")),
+    };
+    if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
+        if let Value::Object(Some(cached)) = ctx.get_field(this, SSC_SOCKET_CACHE) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
+    // Allocate a real-layout ServerSocket and remember the channel back-ref
+    // in a side-table; we cannot stash anything inside the wrapper itself
+    // without clashing with JDK-private fields like `bound` or `impl`.
+    let ss_value = ctx
+        .new_object("java/net/ServerSocket")
+        .ok()
+        .and_then(|v| match v {
+            Some(Value::Object(Some(o))) => Some(o),
+            _ => None,
+        })
+        .ok_or_else(|| ioex("socket: could not allocate ServerSocket"))?;
+    ss_record_back_ref(ss_value, this);
+    if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
+        ctx.set_field(this, SSC_SOCKET_CACHE, Value::Object(Some(ss_value)));
+    }
+    Ok(Some(Value::Object(Some(ss_value))))
+}
+
+fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let port = ctx.get_field(this, F_LOCAL_PORT).as_int().unwrap_or(0);
+    let id = ctx.get_field(this, F_REG_ID).as_int().unwrap_or(-1);
+    if id < 0 || port <= 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let isa = alloc_obj(ctx, "java/net/InetSocketAddress", 2);
+    let host = ctx.create_string("0.0.0.0");
+    ctx.set_field(isa, 0, Value::Object(Some(host)));
+    ctx.set_field(isa, 1, Value::Int(port));
+    Ok(Some(Value::Object(Some(isa))))
+}
+
+fn ss_wrapper_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Err(ioex("bind: null this")),
+    };
+    let Some(ssc) = ss_back_ref(this) else {
+        // Plain ServerSocket — fall through (handled elsewhere). We can't
+        // do anything for a non-channel-backed ServerSocket here.
+        return Ok(None);
+    };
+    // Delegate to ssc_bind with backlog=0 (TcpListener picks its own).
+    let sa = args.get(1).copied().unwrap_or(Value::Object(None));
+    let backlog = Value::Int(0);
+    let _ = ssc_bind(ctx, &[Value::Object(Some(ssc)), sa, backlog])?;
+    Ok(None)
+}
+
+fn ss_wrapper_bind_backlog(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Err(ioex("bind: null this")),
+    };
+    let Some(ssc) = ss_back_ref(this) else {
+        return Ok(None);
+    };
+    let sa = args.get(1).copied().unwrap_or(Value::Object(None));
+    let backlog = args.get(2).copied().unwrap_or(Value::Int(50));
+    let _ = ssc_bind(ctx, &[Value::Object(Some(ssc)), sa, backlog])?;
+    Ok(None)
+}
+
+fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    if let Some(ssc) = ss_back_ref(this) {
+        let port = ctx.get_field(ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
+        return Ok(Some(Value::Int(port)));
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let port = if let Some(ssc) = ss_back_ref(this) {
+        ctx.get_field(ssc, F_LOCAL_PORT).as_int().unwrap_or(0)
+    } else {
+        0
+    };
+    if port <= 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let isa = alloc_obj(ctx, "java/net/InetSocketAddress", 2);
+    let host = ctx.create_string("0.0.0.0");
+    ctx.set_field(isa, 0, Value::Object(Some(host)));
+    ctx.set_field(isa, 1, Value::Int(port));
+    Ok(Some(Value::Object(Some(isa))))
+}
+
+fn ss_wrapper_is_bound(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let Some(ssc) = ss_back_ref(this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let id = _ctx.get_field(ssc, F_REG_ID).as_int().unwrap_or(-1);
+    Ok(Some(Value::Int(if id >= 0 { 1 } else { 0 })))
+}
+
+fn ss_wrapper_is_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(1))),
+    };
+    if let Some(ssc) = ss_back_ref(this) {
+        let open = ctx.get_field(ssc, F_OPEN).as_int().unwrap_or(0);
+        return Ok(Some(Value::Int(if open == 0 { 1 } else { 0 })));
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    if let Some(ssc) = ss_back_ref(this) {
+        let _ = ssc_close(ctx, &[Value::Object(Some(ssc))])?;
+        ss_back_ref_table()
+            .write()
+            .remove(&(this.as_ptr() as usize));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

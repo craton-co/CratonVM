@@ -8429,13 +8429,14 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 2)))
     });
 
-    // ServerSocketChannel = 3-field synthetic (open=0, bound=1, fd_id=2)
+    // ServerSocketChannel = 4-field synthetic (open=0, bound=1, fd_id=2, cached_socket=3)
     let ssc = "java/nio/channels/ServerSocketChannel";
     r.register(ssc, "open", "()Ljava/nio/channels/ServerSocketChannel;", |ctx, _args| {
-        let ssc = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 3);
+        let ssc = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 4);
         ctx.set_field(ssc, 0, Value::Int(1));
         ctx.set_field(ssc, 1, Value::Int(0));
         ctx.set_field(ssc, 2, Value::Int(-1));
+        ctx.set_field(ssc, 3, Value::Object(None));
         Ok(Some(Value::Object(Some(ssc))))
     });
     r.register(ssc, "bind", "(Ljava/net/SocketAddress;)Ljava/nio/channels/ServerSocketChannel;", |ctx, args| {
@@ -8445,8 +8446,61 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
             ctx.set_field(this, 1, Value::Int(1));
             ctx.set_field(this, 2, Value::Int(fd as i32));
+            // If a wrapper ServerSocket has been cached, mirror the actual local port
+            // so getLocalPort/getLocalSocketAddress return the OS-chosen port.
+            if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+                if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
+                    let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                    ctx.set_field(s, 0, Value::Int(port)); // SS_PORT
+                }
+            }
         }
         Ok(Some(Value::Object(Some(this))))
+    });
+    // ServerSocketChannel.socket() — return a wrapper ServerSocket linked to this channel.
+    // Cached on first call. The wrapper's bind/getLocalPort delegate back to the channel.
+    r.register(ssc, "socket", "()Ljava/net/ServerSocket;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(cached)) = ctx.get_field(this, 3) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+        // 5-field ServerSocket: SS_PORT=0, SS_BACKLOG=1, SS_CLOSED=2, SS_LISTENER_ID=3, channel_ref=4
+        let ss = alloc_concurrent_synthetic(ctx, "java/net/ServerSocket", 5);
+        ctx.set_field(ss, 0, Value::Int(0));
+        ctx.set_field(ss, 1, Value::Int(50));
+        ctx.set_field(ss, 2, Value::Int(0));
+        ctx.set_field(ss, 3, Value::Int(-1));
+        ctx.set_field(ss, 4, Value::Object(Some(this)));
+        // If channel already bound, mirror the port now.
+        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+        if fd >= 0 {
+            if let Ok(local) = ctx.fd_table().tcp_local_addr(fd as u32) {
+                let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                ctx.set_field(ss, 0, Value::Int(port));
+            }
+        }
+        ctx.set_field(this, 3, Value::Object(Some(ss)));
+        Ok(Some(Value::Object(Some(ss))))
+    });
+    // ServerSocketChannel.getLocalAddress() — return InetSocketAddress with local port
+    r.register(ssc, "getLocalAddress", "()Ljava/net/SocketAddress;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+        if fd < 0 { return Ok(Some(Value::Object(None))); }
+        let local = match ctx.fd_table().tcp_local_addr(fd as u32) {
+            Ok(s) => s,
+            Err(_) => return Ok(Some(Value::Object(None))),
+        };
+        let (host, port_s) = match local.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => ("0.0.0.0", "0"),
+        };
+        let port = port_s.parse::<i32>().unwrap_or(0);
+        let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+        let host_str = ctx.create_string(host);
+        ctx.set_field(isa, 0, Value::Object(Some(host_str)));
+        ctx.set_field(isa, 1, Value::Int(port));
+        Ok(Some(Value::Object(Some(isa))))
     });
     r.register(ssc, "accept", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -34895,7 +34949,51 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _ = (ctx, this);
+        // Channel-backed wrapper (created by ServerSocketChannel.socket()) has a 5th
+        // field holding a back-ref to the SocketChannel. Delegate the bind to the
+        // channel so the underlying TCP listener lives in fd_table (visible to the
+        // selector). For a plain ServerSocket, keep using s2_alloc_listener.
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+                let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+                match ctx.fd_table().open_tcp_listener(&addr_str) {
+                    Ok(fd) => {
+                        ctx.set_field(ssc, 1, Value::Int(1));
+                        ctx.set_field(ssc, 2, Value::Int(fd as i32));
+                        let port = ctx.fd_table().tcp_local_addr(fd)
+                            .ok()
+                            .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
+                            .unwrap_or(0);
+                        ctx.set_field(this, 0, Value::Int(port)); // SS_PORT mirror
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(RuntimeError::IOException {
+                            message: format!("bind {addr_str}: {e}"),
+                        }.into());
+                    }
+                }
+            }
+        }
+        // Plain ServerSocket path — bind a real TcpListener via s2_alloc_listener.
+        use crate::servlet::s2_alloc_listener;
+        use std::net::TcpListener;
+        let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        match TcpListener::bind(&addr_str) {
+            Ok(listener) => {
+                let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                let id = s2_alloc_listener(listener);
+                ctx.set_field(this, 0, Value::Int(actual_port));
+                ctx.set_field(this, 3, Value::Int(id));
+            }
+            Err(e) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("bind {addr_str}: {e}"),
+                }.into());
+            }
+        }
         Ok(None)
     });
     r.register(ss, "bind", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
@@ -34903,7 +35001,41 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         if let Some(Value::Int(backlog)) = args.get(2) {
             ctx.set_field(this, 1, Value::Int(*backlog));
         }
+        // Reuse single-arg bind path
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+                let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+                if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
+                    ctx.set_field(ssc, 1, Value::Int(1));
+                    ctx.set_field(ssc, 2, Value::Int(fd as i32));
+                    let port = ctx.fd_table().tcp_local_addr(fd)
+                        .ok()
+                        .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
+                        .unwrap_or(0);
+                    ctx.set_field(this, 0, Value::Int(port));
+                }
+                return Ok(None);
+            }
+        }
         Ok(None)
+    });
+    r.register(ss, "getLocalPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // For channel-backed wrappers, recompute from the channel's fd.
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let fd = ctx.get_field(ssc, 2).as_int().unwrap_or(-1);
+                if fd >= 0 {
+                    let port = ctx.fd_table().tcp_local_addr(fd as u32)
+                        .ok()
+                        .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
+                        .unwrap_or(0);
+                    return Ok(Some(Value::Int(port)));
+                }
+            }
+        }
+        Ok(Some(ctx.get_field(this, 0)))
     });
     r.register(ss, "isBound", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.register(

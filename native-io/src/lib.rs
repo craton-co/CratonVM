@@ -9774,7 +9774,13 @@ fn register_phase92_io_completeness(registry: &mut NativeMethodRegistry) {
     register_async_file_channel(registry);
     register_watch_service(registry);
     register_datagram_channel(registry);
-    register_selector(registry);
+    // Wave 3 / Task C: register_selector here used to install a stale
+    // do_select that read channel.field 0 as an fd_table id, which is
+    // wrong for the WP3.4 SSC layout (field 0 = open flag, real
+    // listener id lives in F_REG_ID = field 2). The modern selector
+    // implementation in `nio_selector.rs` (registered earlier via
+    // `register_nio_selector`) is the source of truth; we no longer
+    // re-register the legacy variant here.
 }
 
 // ---------------------------------------------------------------------------
