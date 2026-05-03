@@ -1225,23 +1225,73 @@ fn cl_get_platform_class_loader(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     Ok(Some(Value::Object(Some(platform))))
 }
 
+/// Public re-export of the `getResource` (singular) native so
+/// `register_essential_natives` can install it in real-JDK mode. Without
+/// this the JDK's own `ClassLoader.getResource` runs — and in real-JDK
+/// mode the URLClassPath `<clinit>` swallow leaves the loader's resource
+/// tables empty, so it returns null even for resources the bulk
+/// `getResources` enumerator finds. Wave-1 Task B consistency fix.
+pub fn cl_get_resource_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    cl_get_resource(ctx, args)
+}
+
 fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ClassLoader.getResource(String) → URL
-    let name_obj = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let name = ctx.read_string(name_obj).unwrap_or_default();
-    let resource_name = name.trim_start_matches('/');
-    match ctx.find_resource(resource_name) {
-        Some(_) => {
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-            let full_str = ctx.create_string(&format!("classpath:{name}"));
-            ctx.set_field(url, 5, Value::Object(Some(full_str)));
-            Ok(Some(Value::Object(Some(url))))
+    //
+    // Spec contract: returns the FIRST URL the parent-delegated search
+    // would return for `name`, or null. Must be consistent with
+    // `getResources`: if `getResources(name)` returns N≥1 URLs, then
+    // `getResource(name)` must return the first of those URLs (not null,
+    // not a different URL form). The bulk path walks every classpath
+    // entry via `find_all_resource_urls`; the singular path here mirrors
+    // that walk and returns its first element so the two stay in lock-step.
+    //
+    // We scan `args` for the LAST String-typed slot (mirroring the bulk
+    // path) so the same native can serve `getSystemResource` (static —
+    // name at index 0) and instance `getResource` (name at index 1).
+    let name = {
+        let mut found: Option<String> = None;
+        for v in args.iter().rev() {
+            if let Value::Object(Some(o)) = v {
+                if let Some(s) = ctx.read_string(*o) {
+                    found = Some(s);
+                    break;
+                }
+            }
         }
-        None => Ok(Some(Value::Object(None))),
-    }
+        found.unwrap_or_default()
+    };
+    let resource_name = name.trim_start_matches('/');
+
+    // Prefer the structured URL (jar:file:/... or jrt:/... or file:/...)
+    // so getResource and getResources return the same URL form for the
+    // same name. Fall back to "classpath:<name>" when only `find_resource`
+    // (raw bytes) succeeds — covers synthetic test loaders that override
+    // find_resource without participating in the structured walk.
+    let urls = ctx.find_all_resource_urls(resource_name);
+    let url_str = if let Some(first) = urls.first() {
+        first.clone()
+    } else if ctx.find_resource(resource_name).is_some() {
+        format!("classpath:{name}")
+    } else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::resources",
+        resource = %resource_name,
+        url = %url_str,
+        "ClassLoader.getResource resolved"
+    );
+
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+    let full_str = ctx.create_string(&url_str);
+    // Populate field 0 (read by net_phase_e's openStream fallback) and
+    // field 5 (synthetic "full URL string" slot). Mirrors the bulk
+    // getResources path which also writes both slots.
+    ctx.set_field(url, 0, Value::Object(Some(full_str)));
+    ctx.set_field(url, 5, Value::Object(Some(full_str)));
+    Ok(Some(Value::Object(Some(url))))
 }
 
 /// Public re-export of the `getResources` native for `register_essential_natives`

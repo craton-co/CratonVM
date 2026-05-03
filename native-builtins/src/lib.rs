@@ -221,6 +221,9 @@ pub mod inet_address;
 // WP5.9: sun.net.spi.DefaultProxySelector — JVM args + env-driven proxy
 // selection with NO_PROXY / nonProxyHosts pattern matching.
 pub mod proxy_selector;
+// Wave1.D: javax.xml.stream (StAX) cursor API backed by quick-xml. Required
+// by Maven, Spring, Hibernate, every build/runtime that consumes XML.
+pub mod xml_stax;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -3020,6 +3023,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
         classloader::cl_get_resources_essential,
     );
+    // Wave-1 Task B: install the singular `getResource(String)` override
+    // alongside the bulk `getResources` one so the two stay consistent in
+    // real-JDK mode. Without this, the JDK's own implementation runs and
+    // returns null whenever URLClassPath.<clinit> swallowed in real-JDK
+    // bootstrap (the same root cause RSLF4J.1 fixed for the bulk path).
+    registry.register(
+        "java/lang/ClassLoader",
+        "getResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        classloader::cl_get_resource_essential,
+    );
+    registry.register(
+        "java/lang/ClassLoader",
+        "getSystemResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        classloader::cl_get_resource_essential,
+    );
     // Natives for the synthetic `java/util/Enumeration$Impl` helper the
     // getResources override returns.  These are idempotent (re-registered
     // by `register_classloader_natives` in synthetic-JDK mode).
@@ -3328,6 +3348,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `DriverManager.getConnection`. Registered LAST so it overrides any
     // earlier stub registrations of the same triples.
     jdbc::register_jdbc_driver_natives(registry);
+
+    // Wave1.D — javax.xml.stream (StAX) cursor API backed by quick-xml.
+    // Enables Maven, Spring XML config, Hibernate `hibernate.cfg.xml`,
+    // and any tool that consumes XML to parse arbitrary documents
+    // without depending on the JDK Xerces/XMLStringBuffer code path.
+    xml_stax::register(registry);
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
