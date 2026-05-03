@@ -1169,24 +1169,6 @@ impl ClassManager {
                 // Parse and register with the loader that found it
                 self.define_class(name, &bytes, loader_id)
             }
-            Err(_) if is_jboss_logging_locale_lookup(name) => {
-                // JBoss-Logging probes locale-specific implementation classes
-                // (e.g. `Foo_$logger_en_US`, `Foo_$bundle_en`) via
-                // `Class.forName(...)` wrapped in a `catch (ClassNotFoundException)`
-                // block.  When the locale-specific class does not ship as a
-                // .class file, the lookup must propagate as CNFE so the
-                // caller falls back to the locale-less `_$logger` / `_$bundle`.
-                // Synthesising a stub here returns an INTERFACE class (the
-                // synth path marks any name containing `$` as an interface),
-                // which then makes JBoss-Logging's `asSubclass(Logger.class)`
-                // throw `ClassCastException("interface <stub>")` — escaping
-                // the CNFE catch and surfacing as a B6 swallow during
-                // `<clinit>` of `org/jboss/as/server/logging/ServerLogger`.
-                // See KC16 boot regression notes (Block B6, ServerLogger).
-                Err(VmError::ClassFile(ClassFileError::ClassNotFound {
-                    class_name: name.to_string(),
-                }))
-            }
             Err(_) if is_jdk_class(name) => {
                 // JDK class not found as a .class file — create a synthetic stub.
                 // Our VM handles JDK classes natively, so we just need a minimal
@@ -3233,15 +3215,6 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl" =>
             "java/util/concurrent/atomic/AtomicLongFieldUpdater",
 
-        // Block 2C / Path A: synthetic JBoss LogManager extends the JDK
-        // LogManager. Without this mapping, the synthetic stub's superclass
-        // defaults to java/lang/Object — and the JDK initLogManager bytecode
-        // does `checkcast java/util/logging/LogManager` on the result of
-        // `Class.newInstance()`. With the wrong parent, the checkcast fails
-        // and the WARNING about `Failed to load the specified log manager`
-        // (or in JDK 25 `Could not load Logmanager "..."`) prints.
-        "org/jboss/logmanager/LogManager" => "java/util/logging/LogManager",
-
         // Default: everything else extends Object
         _ => "java/lang/Object",
     }
@@ -3320,27 +3293,6 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         | "java/util/function/Predicate$Negate" => &["java/util/function/Predicate"],
         _ => &[],
     }
-}
-
-/// JBoss-Logging probes locale-specific generated implementation classes
-/// (e.g. `Foo_$logger_en_US`, `Foo_$bundle_en`) by name with
-/// `Class.forName(...)` wrapped in a `catch (ClassNotFoundException)`.
-/// The expected fallback is to retry without the locale suffix.
-///
-/// We must propagate CNFE for these names rather than synthesising a stub —
-/// the synth path marks any name with `$` as an INTERFACE, which breaks
-/// `asSubclass(Logger.class)` with a ClassCastException whose message is
-/// `Class.toString()` ("interface ...") rather than the CNFE that the
-/// caller catches.
-///
-/// Match the JBoss-Logging convention: `<base>_$logger_<locale>` or
-/// `<base>_$bundle_<locale>` (with at least one locale segment after the
-/// `_$logger` / `_$bundle` token).  The locale-less `_$logger` /
-/// `_$bundle` forms (which are the precompiled implementation classes)
-/// must NOT be diverted — they ship as real .class files in the
-/// project's JAR and are loaded normally above.
-fn is_jboss_logging_locale_lookup(name: &str) -> bool {
-    name.contains("_$logger_") || name.contains("_$bundle_")
 }
 
 /// Check if a class name belongs to the JDK (should get a synthetic stub
