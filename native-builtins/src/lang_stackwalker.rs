@@ -169,6 +169,40 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         "(JIII[Ljava/lang/Object;[Ljava/lang/Class;)Ljava/lang/Object;",
         native_call_stack_walk,
     );
+    // JDK 25 splits the long `mode` into two ints and inserts
+    // ContinuationScope + Continuation references between mode/skip and
+    // batch/startIndex/frameBuffer:
+    //   callStackWalk(int mode, int flags, ContinuationScope,
+    //                 Continuation, int batch, int startIndex,
+    //                 Object[] frameBuffer)
+    // We collapse it onto `native_call_stack_walk` by reordering args into
+    // the original (this, mode, skip, batch, startIndex, frameBuffer, _)
+    // shape. The two int "mode/flags" are merged into the long mode slot;
+    // the ContinuationScope / Continuation are dropped (we have no
+    // virtual-thread continuation support so the user-visible behaviour
+    // matches the platform-thread code path).
+    registry.register(
+        asw,
+        "callStackWalk",
+        "(IILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args = (this, mode, flags, contScope, continuation,
+            //         batch, startIndex, frameBuffer)
+            let mode_lo = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i64;
+            let mode_hi = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i64;
+            let mode = (mode_hi << 32) | (mode_lo & 0xFFFF_FFFF);
+            let reordered = [
+                args.first().copied().unwrap_or(Value::Object(None)),
+                Value::Long(mode),
+                Value::Int(0), // skip — JDK 25 absorbs this into mode/flags
+                args.get(5).copied().unwrap_or(Value::Int(0)),
+                args.get(6).copied().unwrap_or(Value::Int(0)),
+                args.get(7).copied().unwrap_or(Value::Object(None)),
+                Value::Object(None),
+            ];
+            native_call_stack_walk(ctx, &reordered)
+        },
+    );
     // JDK 21+ changed the signature slightly (added ContinuationScope,
     // Continuation params) — register the old variant too so both paths
     // resolve.

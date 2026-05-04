@@ -10674,6 +10674,67 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
         p59_spring_boot_jar_archive_get_class_path_urls,
     );
+
+    // -------------------------------------------------------------------
+    // Spring Boot 2.x fat-jar launcher overrides.
+    //
+    // SB2 uses an OLDER launcher at `org.springframework.boot.loader.*`
+    // (no `.launch.` subpackage). The launcher instance's `archive` field
+    // is left null in our impl because the SB2 `JarFileArchive` constructor
+    // chain depends on internal `org/springframework/boot/loader/jar/JarFile`
+    // plumbing whose central-directory parser doesn't fully execute under
+    // our synthetic-mode VM.  Rather than fix every transitive Stream /
+    // RandomAccessDataFile / CentralDirectoryParser detail, we short-circuit
+    // the three `ExecutableArchiveLauncher` methods that would otherwise
+    // dereference the null archive — `getMainClass`, `isExploded`,
+    // `getClassPathArchives` (SB2 v1) / `getClassPathArchivesIterator`
+    // (SB2 v2.3+). Each native reads the fat-jar directly via the source
+    // path resolved from the launcher's class mirror.
+    // Register on every concrete SB2 launcher class plus the abstract
+    // base. The parent-walk in `try_stackless_invoke` short-circuits when
+    // the immediate parent has its own bytecode for the method, so a
+    // native registered only on the abstract base would be shadowed by
+    // EAL's own bytecode for a `JarLauncher` / `WarLauncher` receiver.
+    // The duplicate registrations cost nothing and ensure the native
+    // wins regardless of which leaf class the user invokes.
+    let eal_classes: &[&str] = &[
+        "org/springframework/boot/loader/ExecutableArchiveLauncher",
+        "org/springframework/boot/loader/JarLauncher",
+        "org/springframework/boot/loader/WarLauncher",
+        "org/springframework/boot/loader/PropertiesLauncher",
+    ];
+    for cls in eal_classes {
+        r.register(
+            cls,
+            "getMainClass",
+            "()Ljava/lang/String;",
+            sb2_launcher_get_main_class,
+        );
+        r.register(
+            cls,
+            "isExploded",
+            "()Z",
+            |_ctx, _args| Ok(Some(Value::Int(0))),
+        );
+        r.register(
+            cls,
+            "isPostProcessingClassPathArchives",
+            "()Z",
+            |_ctx, _args| Ok(Some(Value::Int(0))),
+        );
+        r.register(
+            cls,
+            "getClassPathArchives",
+            "()Ljava/util/List;",
+            sb2_launcher_get_class_path_archives_list,
+        );
+        r.register(
+            cls,
+            "getClassPathArchivesIterator",
+            "()Ljava/util/Iterator;",
+            sb2_launcher_get_class_path_archives_iterator,
+        );
+    }
 }
 
 // =============================================================================
@@ -10858,6 +10919,178 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(urls.len() as i32));
     Ok(Some(Value::Object(Some(list))))
+}
+
+/// Resolve the on-disk fat-jar path of a Spring Boot 2 launcher instance.
+///
+/// The launcher's `this.archive` field is left null in our impl (its SB2
+/// `JarFileArchive` ctor depends on plumbing we don't fully implement), so
+/// instead of dereferencing it we re-derive the fat-jar path by asking the
+/// classpath where the launcher's own subclass was loaded from. For
+/// `--jar foo.jar` mode this yields `foo.jar`; for exploded layouts it
+/// yields the directory root which the caller must filter out via
+/// `isExploded()`.
+fn sb2_launcher_jar_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let cid = ctx.class_id_of_object(this);
+    let class_name = ctx.class_name_of_id(cid)?;
+    ctx.find_class_source_path(&class_name)
+}
+
+/// Read the Start-Class manifest entry from the fat-jar and return it as a
+/// String. Falls back to "Main-Class" if Start-Class is absent (matching the
+/// SB2 launcher's own behaviour on partially-formed manifests).
+fn sb2_read_start_class(jar_path: &str) -> Option<String> {
+    let file = std::fs::File::open(jar_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name("META-INF/MANIFEST.MF").ok()?;
+    use std::io::Read;
+    let mut buf = String::new();
+    entry.read_to_string(&mut buf).ok()?;
+    let mut start_class: Option<String> = None;
+    let mut main_class: Option<String> = None;
+    // Manifest is line-oriented; continuation lines start with a single
+    // space. Spring Boot only writes single-line attributes for these
+    // keys so we skip continuation handling and just split on '\n'.
+    for line in buf.lines() {
+        if let Some(v) = line.strip_prefix("Start-Class: ") {
+            start_class = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Main-Class: ") {
+            main_class = Some(v.trim().to_string());
+        }
+    }
+    start_class.or(main_class)
+}
+
+/// `org/springframework/boot/loader/ExecutableArchiveLauncher.getMainClass()`
+/// — return the `Start-Class` manifest entry from the fat-jar directly,
+/// bypassing the null `this.archive` field. Matches the SB2 launcher's
+/// own contract: throws IllegalStateException when no Start-Class is
+/// declared.
+fn sb2_launcher_get_main_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let jar_path = sb2_launcher_jar_path(ctx, this).unwrap_or_default();
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getMainClass jar_path={:?}", jar_path);
+    }
+    let start_class = sb2_read_start_class(&jar_path);
+    match start_class {
+        Some(name) => Ok(Some(Value::Object(Some(ctx.create_string(&name))))),
+        None => {
+            // Spec-correct behaviour: throw IllegalStateException so callers
+            // see the same surface as a real JDK + valid SB2 launcher.
+            Err(RuntimeError::IllegalStateException {
+                message: format!(
+                    "No 'Start-Class' manifest entry specified in {}",
+                    jar_path
+                ),
+            }
+            .into())
+        }
+    }
+}
+
+/// Build a `JarFileArchive`-shaped result for SB2's `getClassPathArchives*`.
+/// Each element of the returned List/Iterator is an SB2-style nested-archive
+/// stand-in whose only required surface is `getUrl()` returning a `URL`.
+/// We allocate `JarFileArchive` instances and pre-populate slot 1 (the `url`
+/// field per SB2's instance layout) so the launcher's
+/// `createClassLoader(List)` loop receives valid URLs.
+fn sb2_launcher_build_archive_list(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<Value> {
+    let mut archives: Vec<Value> = Vec::new();
+    let jar_path = match sb2_launcher_jar_path(ctx, this) {
+        Some(p) => p,
+        None => return archives,
+    };
+    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
+
+    // Always include BOOT-INF/classes/ as the first classpath URL (matches
+    // SB2 JarLauncher.isNestedArchive's BOOT-INF/classes/ branch).
+    let archive_class = "org/springframework/boot/loader/archive/JarFileArchive";
+    let classes_url_str = format!("jar:file:/{jar_uri_path}!/BOOT-INF/classes!/");
+    let classes_url = p59_alloc_url(ctx, &classes_url_str);
+    let classes_archive = alloc_concurrent_synthetic(ctx, archive_class, 3);
+    // SB2 JarFileArchive layout: 0=jarFile, 1=url, 2=tempUnpackDirectory
+    ctx.set_field(classes_archive, 1, Value::Object(Some(classes_url)));
+    archives.push(Value::Object(Some(classes_archive)));
+
+    if let Ok(file) = std::fs::File::open(&jar_path) {
+        if let Ok(mut zip) = zip::ZipArchive::new(file) {
+            for i in 0..zip.len() {
+                if let Ok(entry) = zip.by_index(i) {
+                    let name = entry.name().to_string();
+                    if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
+                        let url_str = format!("jar:file:/{jar_uri_path}!/{name}!/");
+                        let url = p59_alloc_url(ctx, &url_str);
+                        let nested = alloc_concurrent_synthetic(ctx, archive_class, 3);
+                        ctx.set_field(nested, 1, Value::Object(Some(url)));
+                        archives.push(Value::Object(Some(nested)));
+                    }
+                }
+            }
+        }
+    }
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchives -> {} entries", archives.len());
+    }
+    archives
+}
+
+/// `getClassPathArchives()` — SB2 v1 returns List<Archive>.
+fn sb2_launcher_get_class_path_archives_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let archives = sb2_launcher_build_archive_list(ctx, this);
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, archives.len());
+    for (i, v) in archives.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(archives.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `getClassPathArchivesIterator()` — SB2 v2.3+ returns Iterator<Archive>.
+/// Build the synthetic ArrayList of archives and return an `ArrayList$Itr`
+/// iterator wired up by `native_collections`. The downstream
+/// `Launcher.createClassLoader(Iterator)` only calls `Iterator.hasNext()`
+/// / `Iterator.next()` which the existing collections-crate natives serve.
+fn sb2_launcher_get_class_path_archives_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let archives = sb2_launcher_build_archive_list(ctx, this);
+    // Wrap the archive array in `java/util/Enumeration$Impl` — a synthetic
+    // class with `hasNext`/`next` natives already registered by
+    // `register_enumeration_impl_natives` (layout: field 0 = elements
+    // array, field 1 = cursor). This sidesteps the layout mismatch
+    // between our synthetic `ArrayList$Itr` and real-JDK's
+    // `ArrayList$Itr` (whose `cursor`/`this$0` fields sit at different
+    // slots than our 2-field layout) — JDK bytecode for the iteration
+    // loop dispatches `Iterator.hasNext()` via `invokeinterface`, which
+    // our `try_stackless_invoke` resolves against the receiver's class:
+    // `Enumeration$Impl` has the native registered, so the JDK bytecode
+    // never runs.
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, archives.len());
+    for (i, v) in archives.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries", archives.len());
+    }
+    Ok(Some(Value::Object(Some(itr))))
 }
 
 /// Allocate a 13-field synthetic URL with `protocol`, `host`, `port`, `file`,

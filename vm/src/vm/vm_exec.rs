@@ -5123,6 +5123,41 @@ fn invoke_on_class_shared_inner(
                         // central directory.
                         || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
                             && method_name == "getClassPathUrls")
+                        // Spring Boot 2 fat-jar launcher (no `.launch.`
+                        // subpackage): override the methods that read the
+                        // launcher's null `archive` field. The natives
+                        // re-derive the fat-jar path from the launcher's
+                        // class mirror via `find_class_source_path`.
+                        // Register on every concrete launcher class plus
+                        // the abstract base — when the receiver is a
+                        // concrete subclass (e.g. JarLauncher) the
+                        // parent-walk in `try_stackless_invoke` would
+                        // otherwise short-circuit on EAL's own bytecode.
+                        || (matches!(class_name,
+                                "org/springframework/boot/loader/ExecutableArchiveLauncher"
+                                | "org/springframework/boot/loader/JarLauncher"
+                                | "org/springframework/boot/loader/WarLauncher"
+                                | "org/springframework/boot/loader/PropertiesLauncher"
+                            )
+                            && matches!(
+                                method_name,
+                                "getMainClass"
+                                | "isExploded"
+                                | "isPostProcessingClassPathArchives"
+                                | "getClassPathArchives"
+                                | "getClassPathArchivesIterator"
+                            ))
+                        // SB2 launcher's `getClassPathArchivesIterator()`
+                        // returns an `ArrayList$Itr`. The downstream
+                        // `Launcher.createClassLoader(Iterator)` calls
+                        // `it.hasNext()` / `it.next()`. Real-JDK bytecode
+                        // reads `cursor` and `this$0` fields whose offsets
+                        // don't match our synthetic Itr layout. Force the
+                        // native overrides registered in
+                        // `native-collections::register_arraylist_natives`
+                        // so the launcher iteration walks every URL.
+                        || (class_name == "java/util/ArrayList$Itr"
+                            && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Boot fat-jar launcher: ArrayList.toArray(T[])
                         // bytecode calls `Arrays.copyOf(elementData, size,
                         // a.getClass())` which NPEs on our synthetic ArrayList

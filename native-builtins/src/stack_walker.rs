@@ -66,11 +66,35 @@ fn alloc_walker(
     retain_class_ref: bool,
 ) -> ObjectRef {
     let walker = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT);
-    ctx.set_field(walker, FIELD_OPTIONS, options);
-    ctx.set_field(walker, FIELD_ESTIMATE_DEPTH, Value::Int(estimate_depth));
+    // Real-JDK field declaration order is:
+    //   continuation, contScope, options, extendedOption, estimateDepth, retainClassRef
+    // Our synthetic-mode hard-coded indices (FIELD_OPTIONS=0,
+    // FIELD_ESTIMATE_DEPTH=1, FIELD_RETAIN_CLASS_REF=3) only line up when
+    // the synthetic StackWalker class is in use; in real-JDK mode (Spring
+    // Boot 3 + JDK 25 boot path) those indices land on `continuation` and
+    // `contScope`, leaving `options` null — which makes
+    // `StackStreamFactory.toStackWalkMode` NPE in
+    // `StackWalker.hasOption(options.contains(...))` at JDK 25 line 635.
+    //
+    // Resolve by name so both layouts get the right slot. Fall back to
+    // the legacy synthetic indices if the lookup fails (synthetic-mode
+    // tests that don't load the real class).
+    let cid = ctx.class_id_of_object(walker);
+    let opt_idx = ctx
+        .resolve_field_index("java/lang/StackWalker", "options")
+        .or_else(|| ctx.class_name_of_id(cid).and_then(|n| ctx.resolve_field_index(&n, "options")))
+        .unwrap_or(FIELD_OPTIONS);
+    let depth_idx = ctx
+        .resolve_field_index("java/lang/StackWalker", "estimateDepth")
+        .unwrap_or(FIELD_ESTIMATE_DEPTH);
+    let retain_idx = ctx
+        .resolve_field_index("java/lang/StackWalker", "retainClassRef")
+        .unwrap_or(FIELD_RETAIN_CLASS_REF);
+    ctx.set_field(walker, opt_idx, options);
+    ctx.set_field(walker, depth_idx, Value::Int(estimate_depth));
     ctx.set_field(
         walker,
-        FIELD_RETAIN_CLASS_REF,
+        retain_idx,
         Value::Int(if retain_class_ref { 1 } else { 0 }),
     );
     walker
@@ -81,9 +105,32 @@ pub(crate) fn native_get_instance_default(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let options = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    // Use a fully-initialised HashSet rather than a half-built EnumSet.
+    // HashSet.<init>() runs and populates its internal HashMap, so a
+    // subsequent `contains(option)` query returns false instead of NPEing.
+    // EnumSet is abstract (RegularEnumSet/JumboEnumSet are package-private)
+    // so allocating it as synthetic leaves Set methods broken under real-JDK
+    // dispatch.
+    let options = build_options_set(ctx, &[]);
     let walker = alloc_walker(ctx, Value::Object(Some(options)), 1, false);
     Ok(Some(Value::Object(Some(walker))))
+}
+
+/// Helper: allocate a real `java.util.HashSet` and add each provided option
+/// reference to it. Used by every `getInstance(...)` variant so the stored
+/// option set is queryable via standard `Set.contains` without NPE.
+fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> ObjectRef {
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0);
+    let _ = ctx.invoke("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
+    for opt in opts {
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(set)), Value::Object(Some(*opt))],
+        );
+    }
+    set
 }
 
 /// `StackWalker.getInstance(StackWalker$Option)` — build a one-option walker.
@@ -105,8 +152,7 @@ pub(crate) fn native_get_instance_one_option(
             .into())
         }
     };
-    let options = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    ctx.set_field(options, 0, Value::Object(Some(option)));
+    let options = build_options_set(ctx, &[option]);
     let walker = alloc_walker(ctx, Value::Object(Some(options)), 1, true);
     Ok(Some(Value::Object(Some(walker))))
 }

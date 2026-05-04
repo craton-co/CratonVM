@@ -1978,6 +1978,9 @@ fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] native_al_itr_has_next called");
+    }
     let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Int(0))),

@@ -392,6 +392,40 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // SPB.1 (Session 112) — provisional blanket ban for the Spring
+        // Framework `org/springframework/util/` package. `ClassUtils.
+        // <clinit>` runs `registerCommonClasses(...)` ~10 times for
+        // primitive / wrapper / collection / common-types groups, putting
+        // ~100 entries into a fresh HashMap. With JIT enabled the run
+        // segfaults right after the log4j-api StatusLogger warning; with
+        // `RUSTJVM_DISABLE_JIT=1` the segfault disappears (a different
+        // downstream gap surfaces in PropertiesUtil.<clinit>). The frame
+        // trace shows the very last frame popping is
+        // `ClassUtils.registerCommonClasses` after a long sequence of
+        // `put -> putVal -> newNode -> Node.<init> -> afterNodeInsertion`
+        // cycles — the same allocate-then-putfield archetype documented
+        // in W2-CHM / RBC.1 / EXEC.1. The narrow HashMap entries above
+        // (`putVal`, `newNode`, `treeifyBin`, `hash`, `afterNode*`) cover
+        // the JDK side, but the Spring `ClassUtils.registerCommonClasses`
+        // method itself iterates the input array and calls
+        // `clazz.getName() -> Class.getName() -> String allocation` per
+        // element, which the JIT may compile after the second batch and
+        // miscompile the new String's value/coder slots. Spring's
+        // `ReflectionUtils`, `StringUtils`, etc. share the same
+        // allocate-heavy idioms.
+        //
+        // Like the BouncyCastle ban above, this is a coarse-grained
+        // safety net so SportMe boot can progress past `ClassUtils.
+        // <clinit>`. Lifted by
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/util/`. Track
+        // for a real fix once the underlying allocate-then-putfield
+        // miscompile is root-caused.
+        if class_name.starts_with("org/springframework/util/")
+            && !package_allowed("org/springframework/util/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
     }
 
     None
@@ -412,6 +446,51 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         ("java/util/HashMap", "put")
         | ("java/util/HashMap", "get")
         | ("java/util/HashMap", "resize")
+        // SPB.1 (Session 112) — `apps/SportMe-master`'s Spring Boot
+        // bootstrap segfaults in `org/springframework/util/ClassUtils.
+        // <clinit>` when `registerCommonClasses(Class...)` does ~100 back-
+        // to-back `HashMap.put` calls into a freshly allocated
+        // `commonClassCache` map. With JIT enabled the run terminates
+        // with rc=139 (STATUS_ACCESS_VIOLATION) right after the log4j-api
+        // StatusLogger "no log4j-core" warning; with `RUSTJVM_DISABLE_JIT=1`
+        // the segfault disappears (and a different downstream gap surfaces
+        // in PropertiesUtil.<clinit>). The `RUSTJVM_FRAME_TRACE=1` capture
+        // shows the very last frame is `ClassUtils.registerCommonClasses`
+        // popping after a long sequence of `put -> putVal -> newNode ->
+        // Node.<init> -> afterNodeInsertion` cycles, with `putVal` and
+        // `newNode` being JIT-eligible (only `put` was previously skipped
+        // via NEW-1.3).
+        //
+        // `putVal` is the canonical allocate-then-putfield archetype
+        // documented in W2-CHM / RBC.1 / EXEC.1: it allocates a fresh
+        // `HashMap$Node` and immediately stores it into `table[i]` via
+        // putfield-equivalent IASTORE; under the per-callee invocation
+        // threshold (2000) this hits the same regalloc clobber that bites
+        // `Integer.valueOf` / `String.toLowerCase`. `newNode` wraps the
+        // raw `new Node(...)` allocation, `treeifyBin` rebuilds the bin
+        // into a TreeNode (allocate + putfield-heavy), and `hash` is on
+        // the call site of every put/get. Skip-listing these four extends
+        // the W2-CHM containment to the Spring boot path. Other HashMap
+        // methods (size, containsKey, isEmpty, clear, etc.) stay
+        // JIT-eligible because they don't allocate-then-putfield.
+        | ("java/util/HashMap", "putVal")
+        | ("java/util/HashMap", "newNode")
+        | ("java/util/HashMap", "treeifyBin")
+        | ("java/util/HashMap", "hash")
+        | ("java/util/HashMap", "afterNodeInsertion")
+        | ("java/util/HashMap", "afterNodeAccess")
+        | ("java/util/HashMap", "afterNodeRemoval")
+        // LinkedHashMap inherits the same allocate-then-putfield idiom in
+        // its overridden `newNode` / `newTreeNode` (which allocate
+        // `LinkedHashMap$Entry` whose ctor sets `before`/`after` via
+        // putfield), and is the backing map for every Spring config /
+        // ServiceLoader cache. Skip-list it preemptively to avoid a
+        // second iteration if the next downstream gap exposes it.
+        | ("java/util/LinkedHashMap", "newNode")
+        | ("java/util/LinkedHashMap", "newTreeNode")
+        | ("java/util/LinkedHashMap", "afterNodeInsertion")
+        | ("java/util/LinkedHashMap", "afterNodeAccess")
+        | ("java/util/LinkedHashMap", "afterNodeRemoval")
         // NEW-1.4 — regalloc parameter-mapping bug, surfaces as
         // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
         // Tracked by the committed reproducer in
@@ -455,6 +534,17 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // backing array and stay JIT-eligible.
         | ("java/lang/String", "toLowerCase")
         | ("java/lang/String", "toUpperCase")
+        // SPB.1 (Session 112) — `String.hashCode()` caches its result in
+        // the `hash` field on first invocation (`if (h == 0) hash = h;` —
+        // a putfield). Under heavy `HashMap.put`-of-String-keys load
+        // (Spring's `ClassUtils.registerCommonClasses` puts ~100 String
+        // keys via `clazz.getName()`, and Spring config loading puts
+        // thousands more), the JIT hits the per-callee threshold and
+        // produces the same allocate-then-putfield clobber that bites
+        // `Integer.valueOf`. Skip-listing keeps `String.hashCode` in the
+        // interpreter for the boot phase. Other String methods that don't
+        // putfield (length, charAt, isEmpty) stay JIT-eligible.
+        | ("java/lang/String", "hashCode")
         // RBC.1 cont. — `java/security/Provider$ServiceKey.<init>` /
         // `hashCode` are on the hot path of `Provider.put` and exhibit the
         // same allocate-then-putfield pattern as `Integer.valueOf`. The

@@ -1662,6 +1662,83 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(stream))))
     });
 
+    // URL.openConnection() — return a synthetic URLConnection that defers
+    // its `getInputStream()` to the URL's `openStream()` resolver above.
+    //
+    // The real-JDK path is `handler.openConnection(this)`, but the
+    // URL objects we hand out for resources synthesised by
+    // `ClassLoader.getResource(s)` and `Class.getProtectionDomain` were
+    // never run through the real `URL.<init>` (which would have populated
+    // the package-private `handler` field via `URL.getURLStreamHandler`),
+    // so the JDK call NPEs at line 1209. Spring's `UrlResource.getInputStream`
+    // and `JarFile.getInputStream` go through `URL.openConnection().
+    // getInputStream()`, so a working override is the difference between
+    // SB3's `SpringFactoriesLoader` finding `META-INF/spring.factories`
+    // entries and the launcher dying with `InvocationTargetException`
+    // wrapping a `NullPointerException` at `URL.openConnection`.
+    //
+    // We pick `java/net/HttpURLConnection` as the carrier class. It is
+    // concrete (so allocation succeeds), it is a subclass of URLConnection
+    // (so `URLConnection`-typed locals accept it), and the existing
+    // HttpURLConnection natives below cover `connect`, `getResponseCode`,
+    // `getInputStream`, `setRequestMethod`, etc. for the http(s) case.
+    // For non-http schemes we override `getInputStream` here to delegate
+    // back to URL.openStream so file:/jar:/classpath:/nested:/jrt: all
+    // serve bytes consistently with the resource resolver.
+    r.register(
+        url,
+        "openConnection",
+        "()Ljava/net/URLConnection;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let conn = alloc_concurrent_synthetic(ctx, "java/net/HttpURLConnection", 16);
+            // Field HUC_URL holds the originating URL so `huc_url_string`
+            // and `getInputStream` can recover its external form.
+            ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
+            // Default request method "GET" so `huc_perform` doesn't trip
+            // on a missing method when the http(s) path is exercised.
+            let m = ctx.create_string("GET");
+            ctx.set_field(conn, HUC_METHOD, Value::Object(Some(m)));
+            ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
+            ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+            Ok(Some(Value::Object(Some(conn))))
+        },
+    );
+    // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
+    // `ResourceUtils.useCachesIfNecessary` calls setUseCaches(false) on
+    // file: URLs; without these no-op natives the call would fall through
+    // to the real-JDK setter, which probes the (uninitialised) connected
+    // field and throws IllegalStateException. Make them no-ops on both
+    // URLConnection and HttpURLConnection (registered separately).
+    r.register("java/net/URLConnection", "setUseCaches", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(
+        "java/net/URLConnection",
+        "setDefaultUseCaches",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| Ok(None));
+    // URLConnection.getInputStream — defer to URL.openStream by reading
+    // the URL stored in HUC_URL during openConnection above.
+    r.register(
+        "java/net/URLConnection",
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("URLConnection.getInputStream: no URL")),
+            };
+            ctx.invoke_virtual(
+                url_obj,
+                "openStream",
+                "()Ljava/io/InputStream;",
+                &[],
+            )
+        },
+    );
+
     let huc = "java/net/HttpURLConnection";
     r.register(huc, "connect", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
