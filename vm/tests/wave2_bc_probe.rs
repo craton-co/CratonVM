@@ -44,6 +44,31 @@
 //!
 //! When the throughput gap is closed, this test should be tightened to
 //! assert `bc.added providers=` in stdout (the first println).
+//!
+//! ## RBC.1 (Session 109) — JIT-disabled path now reaches first println
+//!
+//! Diagnostic narrowing showed that with `RUSTJVM_DISABLE_JIT=1` the
+//! Windows `STATUS_ACCESS_VIOLATION` disappears entirely and BcProbe
+//! emits its first println `bc.added providers=14` before failing
+//! later in `DirectoryStream.iterator()` (a separate, JIT-independent
+//! gap). This pins one half of the diagnosis: the segfault under the
+//! default policy is a JIT codegen issue triggered by BC's
+//! ~thousand-class `<clinit>` avalanche, not a heap or native shim
+//! bug. The complement test
+//! `bc_probe_reaches_first_println_with_jit_disabled` runs the probe
+//! with `RUSTJVM_DISABLE_JIT=1` and asserts the first println.
+//!
+//! The targeted JIT-skip-list extensions in
+//! `vm/src/jit/skip_list.rs::is_known_miscompile` for
+//! `String.toLowerCase`/`toUpperCase`,
+//! `Provider$ServiceKey.{hashCode,equals}`,
+//! `Provider.{put,parseLegacy,putService,implPut}` and the blanket
+//! `org/bouncycastle/*` Conservative ban reduce the number of JIT'd
+//! methods on the failing path but do NOT eliminate the segfault on
+//! their own — the underlying allocate-then-putfield miscompile
+//! reaches at least one BC-touched method that this list does not
+//! cover. A real fix needs a Windows-debugger backtrace at the SEH
+//! AV moment to identify the precise miscompiled method.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,6 +134,13 @@ fn classpath() -> Option<String> {
 }
 
 fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
+    run_probe_with_env(timeout, &[])
+}
+
+fn run_probe_with_env(
+    timeout: Duration,
+    env_vars: &[(&str, &str)],
+) -> Option<(String, String, Option<i32>)> {
     let bin = rustjvm_binary()?;
     let cp = classpath()?;
     let mut cmd = Command::new(&bin);
@@ -116,6 +148,9 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
         cmd.arg("--java-home").arg(&home);
     }
     cmd.arg("-c").arg(&cp).arg("BcProbe");
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let mut child = match cmd.spawn() {
@@ -228,4 +263,59 @@ fn bc_probe_reaches_provider_init_without_segfault() {
             stdout
         );
     }
+}
+
+/// RBC.1 (Session 109) — pin the diagnostic finding that
+/// `RUSTJVM_DISABLE_JIT=1` clears the Windows `STATUS_ACCESS_VIOLATION`
+/// and lets BcProbe reach its first println.
+///
+/// Today: with `RUSTJVM_DISABLE_JIT=1` the probe prints
+/// `bc.added providers=14` and then exits non-zero on
+/// `DirectoryStream.iterator()` (a separate, JIT-independent gap that
+/// does not block this test). Without the env var the probe segfaults
+/// in <10 s on Windows and never produces the println.
+///
+/// This test is the regression ratchet: any change that breaks the
+/// JIT-disabled path (e.g., reintroduces a SIGSEGV under the
+/// interpreter, or deletes the env-var kill switch) fires here. The
+/// default-policy test above stays as the documented gap until the
+/// underlying JIT codegen issue is root-caused.
+#[test]
+fn bc_probe_reaches_first_println_with_jit_disabled() {
+    let (stdout, _stderr, rc) = match run_probe_with_env(
+        Duration::from_secs(45),
+        &[("RUSTJVM_DISABLE_JIT", "1")],
+    ) {
+        Some(o) => o,
+        None => {
+            eprintln!(
+                "[wave2_bc] skipping JIT-disabled path — binary, BcProbe.class, or bcprov \
+                 JAR missing."
+            );
+            return;
+        }
+    };
+
+    // The probe must NOT segfault under the JIT-disabled path. If it
+    // does, that's a real regression — the interpreter-only path is
+    // supposed to be the safety net.
+    let is_segfault_exit_code = matches!(
+        rc,
+        Some(139)
+        | Some(-1_073_741_819)
+        | Some(-1_073_740_791)
+    );
+    assert!(
+        !is_segfault_exit_code,
+        "wave2_bc: BcProbe segfaulted even with RUSTJVM_DISABLE_JIT=1 \
+         (rc={:?}). The interpreter-only path must be SIGSEGV-free.",
+        rc
+    );
+
+    assert!(
+        stdout.contains("bc.added providers="),
+        "wave2_bc: with RUSTJVM_DISABLE_JIT=1, BcProbe must reach the \
+         first println `bc.added providers=`. Got stdout={:?}",
+        stdout
+    );
 }

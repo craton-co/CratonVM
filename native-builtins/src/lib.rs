@@ -692,6 +692,34 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
 
+    // S109 Wave3 — `java/lang/Module.canUse(Class)`. The real bytecode reads
+    // `this.descriptor` (a real-Module field that does not exist on our
+    // synthetic 2-field Module shape) and dereferences it, producing a
+    // NullPointer deep inside `ServiceLoader.checkCaller(Class, Class)`
+    // during `Console.instantiateConsole()` static-init. The override
+    // returns true (every module is treated as permissively
+    // `uses`-declared); null-receiver returns false; null service-class
+    // throws NPE per spec. Registered universally so both real-JDK and
+    // synthetic-jdk modes are protected — see vm/tests/wave3_console_module.rs.
+    registry.register(
+        "java/lang/Module",
+        "canUse",
+        "(Ljava/lang/Class;)Z",
+        |_ctx, args| {
+            match args.first() {
+                Some(Value::Object(Some(_))) => {}
+                _ => return Ok(Some(Value::Int(0))),
+            }
+            match args.get(1) {
+                Some(Value::Object(Some(_))) => Ok(Some(Value::Int(1))),
+                _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Module.canUse: service class is null".into()),
+                }
+                .into()),
+            }
+        },
+    );
+
     registry.register(
         "java/lang/String", "trim", "()Ljava/lang/String;",
         |ctx, args| {

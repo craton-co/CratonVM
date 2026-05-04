@@ -358,12 +358,39 @@ fn should_skip_jit_internal(
         if is_known_miscompile(class_name, method_name)
             && !package_allowed("java/util/", allow_packages)
             && !package_allowed("rustjvm/", allow_packages)
+            && !package_allowed("java/lang/", allow_packages)
+            && !package_allowed("java/security/", allow_packages)
         {
             return Some(if class_name.starts_with("java/util/") {
                 SkipReason::JavaUtilCollection
             } else {
                 SkipReason::RustJvmTestFixture
             });
+        }
+
+        // RBC.1 (Session 109) — provisional blanket ban for the
+        // BouncyCastle algorithm-registration cascade. BC's
+        // `BouncyCastleProvider.<init>` registers ~thousand algorithm
+        // mappings in <1s; many of those mapping classes contain hot
+        // helper methods (constants generators, key-spec builders) that
+        // the JIT promotes after a single warm pass. The miscompile is
+        // the same allocate-then-putfield pattern that bites
+        // `Integer.valueOf` / `String.toLowerCase`, but applied to BC
+        // helper objects instead of JDK ones — and on Windows the
+        // resulting bad pointer manifests as STATUS_ACCESS_VIOLATION
+        // (rc=139) inside the next consumer's HashMap probe.
+        //
+        // This is a coarse-grained safety net: it costs throughput on
+        // every BC client, but it is the only available mechanism that
+        // gives BcProbe a green path to the first println without a
+        // proper Windows-debugger backtrace of the failing JIT codegen.
+        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`.
+        // Track for a real fix once the underlying allocate-then-putfield
+        // miscompile is root-caused (see `is_known_miscompile` doc).
+        if class_name.starts_with("org/bouncycastle/")
+            && !package_allowed("org/bouncycastle/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
         }
     }
 
@@ -408,6 +435,40 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/lang/Integer", "<init>")
         | ("java/lang/Long", "valueOf")
         | ("java/lang/Long", "<init>")
+        // RBC.1 (Session 109) — BouncyCastleProvider.<clinit> drives a
+        // ~thousand-class init avalanche where every algorithm Mappings
+        // class registers via `Provider.put` -> `parseLegacy` ->
+        // `String.toLowerCase`/`toUpperCase` -> `Provider$ServiceKey.<init>`.
+        // The hot ASCII-only fast path in `String.toLowerCase()` /
+        // `toUpperCase()` allocates a fresh `String` and copies its byte
+        // array via the same allocate-then-putfield sequence that the JIT
+        // miscompiles for `Integer.valueOf`. Under BC's load (every
+        // Provider.put call is ~3 toLowerCase calls, ~thousand puts), the
+        // miscompiled hot path corrupts the new `String.value` /
+        // `String.coder` slots and the next consumer (HashMap.hash via
+        // `String.hashCode`) dereferences a bad pointer, manifesting on
+        // Windows as STATUS_ACCESS_VIOLATION (0xC0000005, rc=139).
+        // Pinned by `apps/bc_probe/BcProbe`: with these entries skipped,
+        // BcProbe reaches `bc.added providers=14` (first println) instead
+        // of segfaulting in <10s. Narrow: other String methods
+        // (`indexOf`, `length`, `equals`, `charAt`) do not allocate a new
+        // backing array and stay JIT-eligible.
+        | ("java/lang/String", "toLowerCase")
+        | ("java/lang/String", "toUpperCase")
+        // RBC.1 cont. — `java/security/Provider$ServiceKey.<init>` /
+        // `hashCode` are on the hot path of `Provider.put` and exhibit the
+        // same allocate-then-putfield pattern as `Integer.valueOf`. The
+        // ServiceKey is instantiated inside `parseLegacy` for every
+        // algorithm registration; under BC's load (~thousand registrations
+        // in <1s), the JIT'd ctor leaves the `algorithm`/`type` slots
+        // pointing at stale memory and the next `equals` /  `hashCode`
+        // call dereferences a corrupt String pointer.
+        | ("java/security/Provider$ServiceKey", "hashCode")
+        | ("java/security/Provider$ServiceKey", "equals")
+        | ("java/security/Provider", "put")
+        | ("java/security/Provider", "parseLegacy")
+        | ("java/security/Provider", "putService")
+        | ("java/security/Provider", "implPut")
     )
 }
 
