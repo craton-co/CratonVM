@@ -7790,23 +7790,23 @@ const BOS_FIELD_COUNT: usize = 2;
 const _BOS_NUM_FIELDS: usize = 3;
 
 fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
-    // BufferedInputStream
-    let bis = "java/io/BufferedInputStream";
-    registry.register(bis, "<init>", "(Ljava/io/InputStream;)V", native_bis_init);
-    registry.register(
-        bis,
-        "<init>",
-        "(Ljava/io/InputStream;I)V",
-        native_bis_init_size,
-    );
-    registry.register(bis, "read", "()I", native_bis_read);
-    registry.register(bis, "read", "([BII)I", native_bis_read_bulk);
-    registry.register(bis, "available", "()I", native_bis_available);
-    registry.register(bis, "skip", "(J)J", native_bis_skip);
-    registry.register(bis, "mark", "(I)V", native_bis_noop);
-    registry.register(bis, "reset", "()V", native_bis_noop);
-    registry.register(bis, "markSupported", "()Z", native_bis_mark_supported);
-    registry.register(bis, "close", "()V", native_bis_noop);
+    // BufferedInputStream — Wave2 H2 fix:
+    // The synthetic 4-field overrides (in/buf/pos/count) collide with the
+    // real JDK 25 BIS field layout (initialSize/buf/count/pos/markpos/
+    // marklimit on top of `in` inherited from FilterInputStream). Storing
+    // into wrong slots leaves `buf` null and `markpos` 0, so `BIS.read()`
+    // returns -1 immediately and `DataInputStream(BIS(FIS(tzdb.dat)))
+    // .readByte()` reports EOF, which throws StreamCorruptedException
+    // out of `ZoneInfoFile.load`. Letting the real bytecode run uses
+    // `Unsafe.compareAndSetReference` (already implemented) to lazily
+    // allocate `buf`, and the FIS read-bytes native already works.
+    //
+    // We deliberately leave BOS/PIS/POS untouched — those are still served
+    // by their existing synthetic natives because they don't sit in the
+    // JDK boot path. If a future regression appears for those streams we
+    // should drop them too rather than adding more layout-coupled hacks.
+    // BIS naming is preserved here for grep-discoverability of the fix.
+    let _bis_dropped_overrides = "java/io/BufferedInputStream";
 
     // BufferedOutputStream
     let bos = "java/io/BufferedOutputStream";
@@ -7862,6 +7862,7 @@ fn native_bis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn native_bis_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -7980,6 +7981,7 @@ fn native_bis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Int(byte_val)))
 }
 
+#[allow(dead_code)]
 fn native_bis_read_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -8066,6 +8068,7 @@ fn native_bis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(buffered + inner_avail)))
 }
 
+#[allow(dead_code)]
 fn native_bis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -8093,6 +8096,7 @@ fn native_bis_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn native_bis_mark_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }

@@ -1118,7 +1118,17 @@ pub fn execute(
             crate::jit::skip_list::allow_packages_from_env(),
             init_complexity,
         );
-        if already_skipped || static_skip_reason.is_some() {
+        // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
+        // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
+        // under deep recursion and must run in the interpreter pending a
+        // proper regalloc fix.
+        let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
+        // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+        // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
+        // `try_osr` so the user-facing RUSTJVM_DISABLE_JIT flag actually disables
+        // the FIRST-CALL JIT compile path here too.
+        let env_disable_jit = std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip {
             // Method has known JIT issues — skip JIT.
         } else {
         {
@@ -8828,6 +8838,13 @@ fn try_osr(
     class_id: ClassId,
     entry_pc: usize,
 ) -> Option<Option<Value>> {
+    // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+    // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
+    // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
+    // RUSTJVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
+    if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        return None;
+    }
     let frame = &thread.frames[frame_idx];
     // Respect the JIT skip list for OSR — classes that are skipped from
     // normal JIT compilation must also be skipped from OSR to avoid
@@ -9309,6 +9326,58 @@ fn try_jit_upgrade_with_gate(
     cached: &Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
 ) -> Option<CachedInvokeTarget> {
+    // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+    // Mirrors the gate in `try_jit_compile_callee` so the user-facing
+    // RUSTJVM_DISABLE_JIT flag actually disables BOTH JIT entry points
+    // (the caller-method counter path here, and the dispatcher path there).
+    // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
+    if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        return None;
+    }
+    // W2-CHM: honor the JIT skip list on this caller-method-counter
+    // promotion path too. Previously only the first-call compile path
+    // (interpreter.rs::~1112) and the callee-dispatcher path
+    // (try_jit_compile_callee) consulted `should_skip_jit`; promotions
+    // triggered by the caller's invocation count silently bypassed the
+    // list and JIT'd skip-listed methods (notably `Integer.valueOf` /
+    // `Integer.<init>`) anyway, defeating the W2-CHM box-method ban.
+    // Reproducer: `apps/chm_basic/ChmScale` lost entries `k992..k999`
+    // even after `is_known_miscompile` listed `Integer.valueOf` because
+    // ChmScale's `main` outer-frame loops crossed the per-callee
+    // invocation threshold (2000) and re-promoted `Integer.valueOf`
+    // here.
+    {
+        let policy = if shared.config.jit_aggressive_compilation {
+            crate::jit::skip_list::SkipPolicy::Aggressive
+        } else {
+            crate::jit::skip_list::SkipPolicy::Conservative
+        };
+        let init_complexity = if &*cached.method_name == "<init>" || &*cached.method_name == "<clinit>" {
+            // Re-classify the constructor body so trivial `<init>` /
+            // `<clinit>` chains stay JIT-eligible (matches the
+            // first-call compile path's gate at line ~1107).
+            crate::jit::skip_list::classify_init_complexity(&cached.code)
+        } else {
+            crate::jit::skip_list::InitComplexity::Unknown
+        };
+        let is_interface_default = {
+            let cm = shared.class_manager.read();
+            cm.get_class(cached.declaring_class_id).map_or(false, |c| c.is_interface())
+        };
+        if crate::jit::skip_list::should_skip_jit_with_init(
+            &cached.class_name,
+            &cached.method_name,
+            is_interface_default,
+            std::thread::current().name().is_some(),
+            policy,
+            crate::jit::skip_list::allow_packages_from_env(),
+            init_complexity,
+        )
+        .is_some()
+        {
+            return None;
+        }
+    }
     // Check shared JIT cache first
     {
         let jit_cache = shared.jit_cache.read();
@@ -9426,6 +9495,11 @@ fn try_jit_upgrade_with_gate(
     // the callee and return (entry_ptr, needs_context). Used for cross-method direct calls.
     let callee_compiler =
         |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
+            // RFJP.1 — never JIT a callee on a class transitively extending
+            // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
+            if is_fjp_subclass_blocklisted(shared, callee_class) {
+                return None;
+            }
             // Check JIT cache first
             let callee_class_arc: Arc<str> = Arc::from(callee_class);
             let callee_method_arc: Arc<str> = Arc::from(callee_method);
@@ -9651,6 +9725,50 @@ fn try_jit_upgrade_with_gate(
     })
 }
 
+/// RFJP.1 — JIT correctness workaround for `RecursiveTask<Long>.compute()`.
+///
+/// Methods defined on a class transitively extending
+/// `java/util/concurrent/ForkJoinTask` miscompile under deep recursion: the
+/// JIT'd `compute()` body returns 0 once the recursion depth is ~10+, because
+/// a long local on the operand stack of the caller is held in a register that
+/// the recursive callee clobbers. The proper fix lives in regalloc / spill
+/// handling around `invokevirtual`; until that lands, we force the interpreter
+/// for any method on an FJP-subclass class. This is narrow enough to leave
+/// FjpSum (single-task) and CompletableFuture paths JIT-eligible because they
+/// don't extend `ForkJoinTask` directly in the hot path.
+///
+/// Returns `true` if the named class transitively extends
+/// `java/util/concurrent/ForkJoinTask` and therefore must not be JIT-compiled
+/// pending the regalloc fix.
+pub fn is_fjp_subclass_blocklisted(shared: &SharedVm, class_name: &str) -> bool {
+    // Cheap exact-name fast path — the JDK classes themselves are always
+    // affected by the same regalloc shape if they ever get to JIT.
+    if class_name == "java/util/concurrent/ForkJoinTask"
+        || class_name == "java/util/concurrent/RecursiveTask"
+        || class_name == "java/util/concurrent/RecursiveAction"
+        || class_name == "java/util/concurrent/CountedCompleter"
+    {
+        return true;
+    }
+    let cm = shared.class_manager.read();
+    let Some(start_cid) = cm.find_class_by_name(class_name) else {
+        return false;
+    };
+    let mut cid = start_cid;
+    // Bound the walk so a corrupt/circular hierarchy can't loop forever.
+    for _ in 0..64 {
+        let Some(class) = cm.get_class(cid) else { return false; };
+        if &*class.name == "java/util/concurrent/ForkJoinTask" {
+            return true;
+        }
+        match class.superclass {
+            Some(parent_id) => cid = parent_id,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Compile a callee method by name, storing it in the JIT cache.
 /// Called from `jit_invoke_dispatch` when a callee becomes hot.
 /// Returns (entry_ptr, needs_context) on success.
@@ -9663,6 +9781,14 @@ pub fn try_jit_compile_callee(
     // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        return None;
+    }
+    // RFJP.1 — never JIT a method whose declaring class transitively extends
+    // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
+    // miscompiles under deep recursion (returns 0 from depth ~10), and the
+    // proper regalloc fix is out of scope here. Returning `None` here forces
+    // the interpreter for both direct and dispatcher-cached callee paths.
+    if is_fjp_subclass_blocklisted(shared, class_name) {
         return None;
     }
     // FJP fix: refuse to compile a method that has a Rust native override

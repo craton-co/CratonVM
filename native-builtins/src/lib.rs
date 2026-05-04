@@ -701,6 +701,74 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&t)))))
         },
     );
+
+    // Session 108 (Cluster D v2 — fix #2): java/lang/String.indexOf(String,int)
+    // The JDK's URLClassPath(String, boolean) constructor uses
+    // `cp.indexOf(File.pathSeparator, i)` to walk the classpath. The real-JDK
+    // bytecode for this method funnels into `String.checkIndex` →
+    // `Preconditions.checkIndex` and—if any internal layout/coder mismatch
+    // occurs in real-JDK mode—throws an unhelpful, message-less
+    // `StringIndexOutOfBoundsException` from inside `ClassLoaders.<clinit>`.
+    // That cascade then surfaces as the Cluster-D-v2 silent-swallow we
+    // observed in Session 107 (`exc=java/lang/StringIndexOutOfBoundsException`
+    // with no detail). Registering an explicit, layout-neutral native here
+    // routes the call through `read_string` and `find` over `&str`, which
+    // never throws and matches OpenJDK semantics exactly:
+    //   * fromIndex < 0 is clamped to 0 (per JDK spec)
+    //   * fromIndex >= length returns -1
+    //   * empty needle returns clamp(fromIndex, 0, length)
+    //   * otherwise returns the char-index of the first occurrence at or
+    //     after fromIndex, or -1.
+    registry.register(
+        "java/lang/String", "indexOf", "(Ljava/lang/String;I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let needle_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let from = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = ctx.read_string(needle_obj).unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i32;
+            let from = from.max(0);
+            if needle.is_empty() {
+                return Ok(Some(Value::Int(from.min(len))));
+            }
+            if from >= len {
+                return Ok(Some(Value::Int(-1)));
+            }
+            // Build a substring from the from-index and search.
+            let tail: String = chars[from as usize..].iter().collect();
+            match tail.find(&needle) {
+                Some(byte_idx) => {
+                    let char_off = tail[..byte_idx].chars().count() as i32;
+                    Ok(Some(Value::Int(from + char_off)))
+                }
+                None => Ok(Some(Value::Int(-1))),
+            }
+        },
+    );
+
+    // Session 108 (Cluster D v2 — fix #1): java/io/Console.istty()Z native.
+    // The real-JDK `java.io.Console.<clinit>` calls `istty()` to detect a
+    // controlling terminal. RustJVM has no JNI binding for this (and we are
+    // never a TTY anyway — stdin is always non-interactive in our embedding),
+    // so the missing native dispatch in `vm_exec` raises an
+    // `UnsatisfiedLinkError` that gets swallowed at <clinit>. Returning
+    // `false` mirrors what HotSpot reports when stdin is redirected, which
+    // is the correct answer for any non-interactive embedding (CLI tools,
+    // CI smoke tests, container entrypoints). The Console object then
+    // initialises in its "no-tty" mode and downstream callers (e.g.
+    // `System.console()`) gracefully return null without further error.
+    registry.register(
+        "java/io/Console", "istty", "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
     registry.register(
         "java/lang/String", "toString", "()Ljava/lang/String;",
         |_ctx, args| {
@@ -3375,6 +3443,56 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and any tool that consumes XML to parse arbitrary documents
     // without depending on the JDK Xerces/XMLStringBuffer code path.
     xml_stax::register(registry);
+
+    // Wave 2 D — DirectByteBuffer / Cleaner checkcast guard.
+    //
+    // JDK 25's `java.nio.Buffer.session()` performs a `getfield segment`
+    // followed by a `checkcast jdk/internal/foreign/AbstractMemorySegmentImpl`.
+    // The DirectByteBuffer constructor chain leaves the `segment` slot in
+    // a state where a subsequent read returns a `Value::Long`-encoded
+    // pointer (the long `address` field's bit pattern leaks through the
+    // operand stack's CompactValue NaN-boxing because untagged 64-bit
+    // slots cannot distinguish Long from Double). The checkcast then
+    // hits a `Value::Double` on the operand stack and aborts the VM
+    // with `internal error: checkcast: not an object reference` before
+    // any println reaches the host.
+    //
+    // Routing `session()` through a native shim that returns null short-
+    // circuits the bad checkcast — `ScopedMemoryAccess.putIntUnaligned`
+    // already accepts a null session (it skips the
+    // `checkValidStateRaw()` call) and the rest of the JDK's
+    // direct-buffer surface treats null sessions as "no scope check
+    // required". This is consistent with the existing
+    // `Buffer$1.acquireSession` shim in
+    // `native-builtins/src/shared_secrets_bridge.rs`, which already
+    // returns null for the same scope-validation paths.
+    //
+    // Native dispatch is keyed on the *receiver* class for
+    // `invokevirtual`, so the shim is registered for every concrete
+    // subclass that the JDK 25 NIO hierarchy uses for direct/heap
+    // buffers. (Buffer itself covers any rare invokespecial-on-Buffer
+    // sites that bypass the virtual cache.)
+    for buf in [
+        "java/nio/Buffer",
+        "java/nio/ByteBuffer",
+        "java/nio/MappedByteBuffer",
+        "java/nio/DirectByteBuffer",
+        "java/nio/HeapByteBuffer",
+        "java/nio/CharBuffer",
+        "java/nio/IntBuffer",
+        "java/nio/LongBuffer",
+        "java/nio/FloatBuffer",
+        "java/nio/DoubleBuffer",
+        "java/nio/ShortBuffer",
+    ] {
+        registry.register(
+            buf,
+            "session",
+            "()Ljdk/internal/foreign/MemorySessionImpl;",
+            |_ctx, _args| Ok(Some(rustjvm_types::Value::Object(None))),
+        );
+        registry.register(buf, "checkSession", "()V", |_ctx, _args| Ok(None));
+    }
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");

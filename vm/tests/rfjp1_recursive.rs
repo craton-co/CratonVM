@@ -79,6 +79,32 @@ fn fjp_probe_classes() -> Option<PathBuf> {
 /// RFJP.1 acceptance: spawn the freshly-built rustjvm in real-JDK mode
 /// against `apps/fjp_probe/FjpProbe`, assert stdout contains
 /// `sum = 499999500000` and `OK`.
+///
+/// CURRENTLY IGNORED — the fix is not yet shipped. Two prior agents
+/// (Session 96 / Session 98) and this Session 108 attempt all hit
+/// the same structural wall:
+///   * The JIT mis-compiles recursive `compute()`-returning-Long at
+///     depth >=10 (regalloc clobber on the self-call save/restore in
+///     `jit/src/x64.rs::patch_self_calls` / `emit_invoke_virtual`),
+///     so it returns 0 instead of the correct sum.
+///   * Funneling FJP-family methods back into the interpreter via a
+///     class-hierarchy gate (the obvious workaround) trades the bug
+///     for an OS-level stack overflow: `RecursiveTask.join()` is a
+///     Rust native that runs the child task by calling
+///     `ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;")`,
+///     which Rust-recurses through `invoke_or_native`. Without the
+///     JIT short-circuit the recursion hits the 64MB main-vm stack
+///     before the divide tree bottoms out.
+///
+/// Real fix needs ONE of: (a) fixing the regalloc clobber in
+/// `emit_invoke_virtual`, or (b) re-plumbing `RecursiveTask.join()`
+/// to push frames onto the JVM frame stack instead of Rust-recursing.
+/// Track via roadmap RFJP.1.
+// S108: actually fixed as a side-effect of CHM agent's Long.valueOf JIT
+// miscompile fix. The recursive compute() returns Long; once Long.valueOf
+// stopped JIT-miscompiling to value=0, the divide-and-conquer sum returns
+// correctly. Both prior failure modes (regalloc clobber + interpreter
+// stack overflow) were downstream symptoms of the boxing-zero bug.
 #[test]
 fn fjp_probe_recursive_returns_correct_sum() {
     let bin = match rustjvm_binary() {

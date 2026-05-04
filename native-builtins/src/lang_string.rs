@@ -3208,6 +3208,160 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
         "(III)I",
         native_string_check_bounds_off_count,
     );
+
+    // T19.H1 fix: cglib TypeUtils.map relies on String.indexOf(String, int)
+    // which JDK 25 implements via the package-private static helper
+    // String.indexOf([BBILjava/lang/String;I)I. That helper dispatches into
+    // StringLatin1.indexOf / StringUTF16.indexOf / StringUTF16.indexOfLatin1
+    // — none of which we wire up. The fall-through path corrupts/loops in
+    // the cglib map() loop because the helper returns 0 every iteration.
+    // Register the public 2-arg form directly AND the static helper, so the
+    // dispatch is short-circuited regardless of how it's called.
+    registry.register(
+        "java/lang/String",
+        "indexOf",
+        "(Ljava/lang/String;I)I",
+        native_string_index_of_str_from,
+    );
+    registry.register(
+        "java/lang/String",
+        "indexOf",
+        "([BBILjava/lang/String;I)I",
+        native_string_index_of_static_helper,
+    );
+}
+
+/// `String.indexOf(String tgt, int fromIndex)` — the public 2-arg form.
+/// Cglib's TypeUtils.map sits in a tight loop calling this with a needle of
+/// "[]" and incrementing `from`; if the implementation does not honor `from`
+/// (or returns 0 when "[]" is absent) the loop never terminates. This is the
+/// unambiguous, authoritative implementation: read both strings, search the
+/// substring of `this` at offset `from`.
+fn native_string_index_of_str_from(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let tgt = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let from_raw = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let src = ctx.read_string(this).unwrap_or_default();
+    let needle = ctx.read_string(tgt).unwrap_or_default();
+    let src_chars: Vec<char> = src.chars().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let src_len = src_chars.len() as i32;
+    let from = from_raw.max(0);
+    if needle_chars.is_empty() {
+        // JDK: empty needle → clamp(from, 0, length)
+        return Ok(Some(Value::Int(from.min(src_len))));
+    }
+    if from >= src_len {
+        return Ok(Some(Value::Int(-1)));
+    }
+    let nlen = needle_chars.len();
+    let max_start = src_chars.len().saturating_sub(nlen);
+    let mut i = from as usize;
+    while i <= max_start {
+        if src_chars[i..i + nlen] == needle_chars[..] {
+            return Ok(Some(Value::Int(i as i32)));
+        }
+        i += 1;
+    }
+    Ok(Some(Value::Int(-1)))
+}
+
+/// `String.indexOf(byte[] src, byte coder, int srcCount, String tgt, int from)`
+/// — the package-private static helper invoked by `indexOf(String,int)` in JDK
+/// 25's compact-string layout. We bypass the byte-array decoding entirely:
+/// the source bytes are exactly the receiver's `value` field of *some* String
+/// just decomposed by the JDK bytecode; rather than reverse-engineer the
+/// coder format, we recompute the same answer character-wise from the target
+/// alone if `srcCount` and `coder` are sufficient. Concretely we decode the
+/// `[B` array per `coder` (0 = LATIN1 single-byte zero-extended, 1 = UTF16
+/// big-endian u16 pairs) and search for the target's UTF-16 code units.
+fn native_string_index_of_static_helper(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let src_arr = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let coder = match args.get(1) {
+        Some(Value::Int(v)) => *v & 0xff,
+        _ => 0,
+    };
+    let src_count = match args.get(2) {
+        Some(Value::Int(v)) => (*v).max(0) as usize,
+        _ => 0,
+    };
+    let tgt = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let from_raw = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+
+    // Decode src bytes -> Vec<u16> per coder.
+    let src_bytes_len = ctx.array_length(src_arr);
+    let mut src_units: Vec<u16> = Vec::with_capacity(src_count);
+    if coder == 1 {
+        // UTF-16: big-endian u16 pairs, srcCount = number of code units.
+        let pairs = src_count.min(src_bytes_len / 2);
+        for i in 0..pairs {
+            let hi = match ctx.get_array_element(src_arr, i * 2) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            let lo = match ctx.get_array_element(src_arr, i * 2 + 1) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            src_units.push((hi << 8) | lo);
+        }
+    } else {
+        // LATIN1: 1 byte per code unit, zero-extended.
+        let n = src_count.min(src_bytes_len);
+        for i in 0..n {
+            let b = match ctx.get_array_element(src_arr, i) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            src_units.push(b);
+        }
+    }
+
+    let needle_str = ctx.read_string(tgt).unwrap_or_default();
+    let needle_units: Vec<u16> = needle_str.encode_utf16().collect();
+
+    let src_len = src_units.len() as i32;
+    let from = from_raw.max(0);
+    if needle_units.is_empty() {
+        return Ok(Some(Value::Int(from.min(src_len))));
+    }
+    if from >= src_len {
+        return Ok(Some(Value::Int(-1)));
+    }
+    let nlen = needle_units.len();
+    let max_start = src_units.len().saturating_sub(nlen);
+    let mut i = from as usize;
+    while i <= max_start {
+        if src_units[i..i + nlen] == needle_units[..] {
+            return Ok(Some(Value::Int(i as i32)));
+        }
+        i += 1;
+    }
+    Ok(Some(Value::Int(-1)))
 }
 
 // ---------------------------------------------------------------------------

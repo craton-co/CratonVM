@@ -998,6 +998,17 @@ impl SharedVm {
         sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("stdout.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("stderr.encoding".to_string(), "UTF-8".to_string());
+        // Session 108 (Cluster D v2 — Console.<clinit> companion fix):
+        // `java/io/Console.<clinit>` calls
+        // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)`. The
+        // 2-arg `forName` only catches `IllegalCharsetNameException`, NOT the
+        // `IllegalArgumentException("Null charset name")` that
+        // `Charset.lookup(null)` throws — so a null property here trips the
+        // Console.<clinit> swallow we observed in Session 108. The
+        // `stdin.encoding` key was missing from the bootstrap seed (only
+        // `stdout.encoding` / `stderr.encoding` were pinned). Mirror what
+        // HotSpot's launcher native code does: pin to UTF-8 unconditionally.
+        sys_props.insert("stdin.encoding".to_string(), "UTF-8".to_string());
 
         // Force BufferedInputStream/etc. to use synchronized blocks instead
         // of InternalLock/ReentrantLock. This avoids potential issues with

@@ -253,6 +253,15 @@ fn native_vm_properties(
     props.push(("sun.stderr.encoding", "UTF-8".to_string()));
     props.push(("stdout.encoding", "UTF-8".to_string()));
     props.push(("stderr.encoding", "UTF-8".to_string()));
+    // Session 108: stdin.encoding is consulted by `java/io/Console.<clinit>`
+    // (JDK 21+) when computing STDIN_CHARSET. The bytecode is
+    // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)` which
+    // *would* fall back to UTF_8 only when `lookup(name)` throws an
+    // IllegalCharsetNameException — but `lookup(null)` throws
+    // IllegalArgumentException("Null charset name") which is NOT caught,
+    // tripping a Console.<clinit> swallow in real-JDK mode. Setting the
+    // property explicitly mirrors what HotSpot's launcher native code does.
+    props.push(("stdin.encoding", "UTF-8".to_string()));
     props.push(("native.encoding", "UTF-8".to_string()));
     props.push(("sun.jnu.encoding", "UTF-8".to_string()));
 

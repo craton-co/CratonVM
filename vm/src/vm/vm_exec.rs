@@ -1392,7 +1392,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .set_interrupted_flag(tid, pre_interrupted.clone());
 
         let thread_obj_for_spawn = thread_obj;
-        let handle = std::thread::spawn(move || {
+        // RKC16N.30 — child Java threads need the same 64 MB native stack
+        // that the main-vm thread gets in `vm-cli/src/main.rs`. The default
+        // Rust thread stack (2 MB on Windows) overflows during deeply
+        // recursive Java callees (e.g. BouncyCastle provider self-test
+        // chains thousands of `<clinit>` levels deep, JDK Stream pipeline
+        // composition, recursive parser combinators), and the Windows
+        // SEH-converted SIGSEGV is opaque — no Java stack trace, no panic,
+        // just a process exit code 139. Match the main-vm sizing so any
+        // user `Thread.start()` gets the same headroom as the entry point.
+        // Stack size honours `RUST_MIN_STACK` so callers can override.
+        let child_stack_size = std::env::var("RUST_MIN_STACK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64 * 1024 * 1024);
+        let thread_name_for_builder = name.clone();
+        let handle = std::thread::Builder::new()
+            .name(thread_name_for_builder)
+            .stack_size(child_stack_size)
+            .spawn(move || {
             let mut jvm_thread = JvmThread::new(tid, &name);
             // Use the pre-created shared state
             jvm_thread.park_state = pre_park;
@@ -1520,7 +1538,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let _ = shared_arc
                 .monitors
                 .exit(thread_obj_for_spawn, tid);
-        });
+        })
+        .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 
         self.shared.thread_registry.set_join_handle(tid, handle);
         Ok(None)

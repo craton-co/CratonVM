@@ -1,0 +1,149 @@
+//! Wave 2 — H2 JDBC connection regression.
+//!
+//! Pins the contract that `DriverManager.getConnection("jdbc:h2:mem:...",
+//! "sa", "")` succeeds end-to-end: driver-class load, ConnectionInfo
+//! parsing, SessionLocal init (which transitively reads `sun/util/
+//! calendar/ZoneInfoFile.<clinit>` -> `loadTZDB` from
+//! `<javaHome>/lib/tzdb.dat`), schema DDL, INSERT, and SELECT.
+//!
+//! The bug this guards against: the synthetic `BufferedInputStream`
+//! native overrides in `native-io/src/lib.rs` stored fields by slot index
+//! using a stale 4-field layout (in/buf/pos/count) that does not match
+//! the JDK 25 BIS instance layout (initialSize/buf/count/pos/markpos/
+//! marklimit on top of `in` from FilterInputStream). The result was
+//! `buf == null` after `<init>`, `markpos == 0` instead of `-1`, and
+//! `BIS.read()` returning `-1` immediately. That EOF then caused
+//! `DataInputStream(BIS(FIS(tzdb.dat))).readByte()` to fall into the
+//! "File format not recognised" branch of `ZoneInfoFile.load`, throwing
+//! `StreamCorruptedException` out of `JdbcConnection.<init>` as a
+//! `SQLException("GeneralError")`.
+//!
+//! The fix dropped the BIS overrides so the real JDK 25 bytecode runs
+//! end-to-end (it lazily allocates `buf` via `Unsafe.compareAndSetReference`,
+//! which is already implemented). This test pins:
+//!   * H2Test's `count=2` line (proves CREATE/INSERT/SELECT roundtrip)
+//!   * The literal `H2Test: PASS` (final marker)
+//!   * Exit code 0 (no swallowed/raised exceptions on the boot path)
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+fn manifest_dir() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn h2_dir() -> PathBuf {
+    manifest_dir().parent().unwrap().join("apps").join("h2")
+}
+
+fn h2_jar() -> PathBuf {
+    h2_dir().join("lib").join("h2-2.2.224.jar")
+}
+
+fn rustjvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let target = manifest_dir().parent().unwrap().join("target");
+    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    for profile in &["release", "debug"] {
+        let candidate = target.join(profile).join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn java_home() -> Option<String> {
+    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+        return Some(h);
+    }
+    if let Ok(h) = std::env::var("JAVA_HOME") {
+        return Some(h);
+    }
+    let candidate = "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot";
+    if Path::new(candidate).exists() {
+        return Some(candidate.to_string());
+    }
+    None
+}
+
+#[test]
+fn h2test_connect_and_select_roundtrip() {
+    let bin = match rustjvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("[wave2_h2] skipping: rustjvm binary not built");
+            return;
+        }
+    };
+    let probe = h2_dir();
+    if !probe.join("H2Test.class").exists() {
+        eprintln!("[wave2_h2] skipping: H2Test.class missing");
+        return;
+    }
+    if !h2_jar().exists() {
+        eprintln!("[wave2_h2] skipping: h2-2.2.224.jar missing under apps/h2/lib");
+        return;
+    }
+    let mut cmd = Command::new(&bin);
+    if let Some(home) = java_home() {
+        cmd.arg("--java-home").arg(&home);
+    }
+    let cp = format!("{};{}", probe.display(), h2_jar().display());
+    cmd.arg("-c").arg(&cp).arg("H2Test");
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[wave2_h2] failed to spawn rustjvm: {e}");
+            return;
+        }
+    };
+    let timeout = Duration::from_secs(120);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("[wave2_h2] H2Test timed out after {:?}", timeout);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("[wave2_h2] try_wait failed: {e}");
+                return;
+            }
+        }
+    }
+    let out = child.wait_with_output().expect("wait_with_output");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "wave2_h2: rustjvm exited rc={:?}, stdout={:?}, stderr={:?}",
+        out.status.code(),
+        stdout,
+        stderr,
+    );
+    assert!(
+        stdout.contains("count=2"),
+        "wave2_h2: expected `count=2`. Got stdout={:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("H2Test: PASS"),
+        "wave2_h2: expected `H2Test: PASS`. Got stdout={:?}",
+        stdout
+    );
+}
