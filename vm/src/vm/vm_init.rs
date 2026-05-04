@@ -888,6 +888,74 @@ impl SharedVm {
             // open the archive directly). Paired with the `check_override`
             // allow-list entry for `java/util/jar/JarFile`.
             rustjvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+            // Spring Boot 3 fat-jar launcher: `Launcher.createClassLoader`
+            // calls `urls.toArray(new URL[0])` on the 67-element URL list
+            // returned by `JarFileArchive.getClassPathUrls`. The real-JDK
+            // bytecode for `ArrayList.toArray(T[])` (and the inherited
+            // `AbstractCollection.toArray(T[])`) takes the
+            // `Arrays.copyOf(elementData, size, a.getClass())` path which
+            // NPEs in our VM because the array-component-type metadata
+            // path on `Object.getClass()` for an array receiver is
+            // incomplete. Register a real-JDK-aware native that reads
+            // `elementData` / `size` by name (so it works against the
+            // real ArrayList field layout, not the synthetic 2-field
+            // stub). Paired with the `check_override` allow-list entry
+            // for `java/util/ArrayList` / `java/util/AbstractCollection`
+            // in `vm_exec.rs`. Synthetic-jdk mode registers the same
+            // native via `register_collections_natives`; this branch
+            // covers the real-JDK path which never calls that bulk
+            // registration.
+            fn real_jdk_to_array_typed(
+                ctx: &mut dyn rustjvm_native_api::NativeContext,
+                args: &[rustjvm_types::Value],
+            ) -> rustjvm_types::error::MethodCallResult {
+                use rustjvm_types::Value;
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let template = args.get(1).copied().unwrap_or(Value::Object(None));
+                // Read fields by name so the same native works for
+                // ArrayList, Vector, CopyOnWriteArrayList, etc. Falls
+                // back to iterator-based copy if the receiver isn't an
+                // ArrayList-shaped object (no elementData).
+                let data = match ctx.get_field_by_name(this, "elementData") {
+                    Value::Object(Some(arr)) => Some(arr),
+                    _ => None,
+                };
+                let size = match ctx.get_field_by_name(this, "size") {
+                    Value::Int(s) => s.max(0) as usize,
+                    _ => 0,
+                };
+                let target = match template {
+                    Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                    _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+                };
+                if let Some(d) = data {
+                    let d_len = ctx.array_length(d);
+                    let copy = size.min(d_len);
+                    for i in 0..copy {
+                        ctx.set_array_element(target, i, ctx.get_array_element(d, i));
+                    }
+                }
+                let target_len = ctx.array_length(target);
+                if target_len > size {
+                    ctx.set_array_element(target, size, Value::Object(None));
+                }
+                Ok(Some(Value::Object(Some(target))))
+            }
+            native_methods.register(
+                "java/util/ArrayList",
+                "toArray",
+                "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                real_jdk_to_array_typed,
+            );
+            native_methods.register(
+                "java/util/AbstractCollection",
+                "toArray",
+                "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                real_jdk_to_array_typed,
+            );
             rustjvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
             rustjvm_native_builtins::register_charset_natives_pub(&mut native_methods);
             rustjvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);

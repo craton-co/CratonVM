@@ -257,6 +257,21 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         0 // built-in loaders don't use this field
     };
     ctx.set_field(obj, CL_LOADER_ID, Value::Int(lid));
+    // Built-in loaders (platform & app) extend `jdk.internal.loader.BuiltinClassLoader`,
+    // whose constructor (`BuiltinClassLoader(String, BuiltinClassLoader, URLClassPath)`)
+    // initializes the inherited `nameToModule` and `moduleToReader` Map fields to
+    // empty `ConcurrentHashMap` instances. We bypass that constructor (going through
+    // `alloc_concurrent_synthetic` instead), so JDK methods like
+    // `BuiltinClassLoader.findMiscResource` NPE with "Cannot invoke values on null"
+    // when they `getfield nameToModule` and call `Map.values()` on it. Initialize
+    // those fields by name with empty ConcurrentHashMaps so the JDK bytecode path
+    // works without additional intercepts.
+    if loader_type == LOADER_PLATFORM || loader_type == LOADER_APP {
+        let name_to_module = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        ctx.set_field_by_name(obj, "nameToModule", Value::Object(Some(name_to_module)));
+        let module_to_reader = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        ctx.set_field_by_name(obj, "moduleToReader", Value::Object(Some(module_to_reader)));
+    }
     obj
 }
 
