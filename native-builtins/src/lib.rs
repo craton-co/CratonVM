@@ -8404,8 +8404,13 @@ fn native_unsafe_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(v)) => *v != 0,
         _ => false,
     };
-    let time = match args.get(2) {
+    // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+    // tag-loss for category-2 longs (CompactValue::long stores raw i64 untagged,
+    // and `to_value()` decodes untagged bits as Double). Recover via bit-reinterpret.
+    let time: i64 = match args.get(2) {
         Some(Value::Long(t)) => *t,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(t)) => *t as i64,
         _ => 0,
     };
 
@@ -9838,8 +9843,13 @@ fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
         if ctx.is_interrupted(false) {
             return Ok(None);
         }
-        let nanos = match args.first() {
+        // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+        // tag-loss for category-2 longs (CompactValue::long stores raw i64 untagged,
+        // and `to_value()` decodes untagged bits as Double). Recover via bit-reinterpret.
+        let nanos: i64 = match args.first() {
             Some(Value::Long(n)) => *n,
+            Some(Value::Double(d)) => d.to_bits() as i64,
+            Some(Value::Int(n)) => *n as i64,
             _ => 0,
         };
         if nanos > 0 {
@@ -9883,8 +9893,12 @@ fn native_lock_support_park_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -
     if ctx.is_interrupted(false) {
         return Ok(None);
     }
-    let nanos = match args.get(1) {
+    // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+    // tag-loss for category-2 longs. Recover via bit-reinterpret.
+    let nanos: i64 = match args.get(1) {
         Some(Value::Long(n)) => *n,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(n)) => *n as i64,
         _ => 0,
     };
     if nanos > 0 {
@@ -9899,8 +9913,12 @@ fn native_lock_support_park_until(ctx: &mut dyn NativeContext, args: &[Value]) -
     if ctx.is_interrupted(false) {
         return Ok(None);
     }
-    let deadline = match args.get(1) {
+    // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+    // tag-loss for category-2 longs. Recover via bit-reinterpret.
+    let deadline: i64 = match args.get(1) {
         Some(Value::Long(d)) => *d,
+        Some(Value::Double(x)) => x.to_bits() as i64,
+        Some(Value::Int(x)) => *x as i64,
         _ => 0,
     };
     if deadline > 0 {
@@ -22639,6 +22657,10 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(None),
     };
     let msg = args.get(1).cloned().unwrap_or(Value::Object(None));
+    // Mirror to both the named field (real-JDK Throwable layout has
+    // detailMessage at slot 1, after backtrace) and slot 0 (synthetic-stub
+    // layout with unnamed `_f0`). See `lang_misc::write_throwable_detail_message`.
+    ctx.set_field_by_name(this, "detailMessage", msg);
     if ctx.object_num_fields(this) >= 1 {
         ctx.set_field(this, 0, msg);
     }
@@ -22650,6 +22672,11 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Real-JDK layout: detailMessage at slot 1; synthetic stubs put it at 0.
+    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    if matches!(by_name, Value::Object(Some(_))) {
+        return Ok(Some(by_name));
+    }
     if ctx.object_num_fields(this) >= 1 {
         Ok(Some(ctx.get_field(this, 0)))
     } else {

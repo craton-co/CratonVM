@@ -1434,7 +1434,37 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 &[Value::Object(Some(thread_obj_for_spawn))],
             );
             if let Err(e) = result {
-                eprintln!("Thread {} terminated with error: {:?}", tid, e);
+                // W1-C: dispatch the per-Thread (or default)
+                // UncaughtExceptionHandler before dropping the exception.
+                // HotSpot calls Thread.dispatchUncaughtException(Throwable)
+                // when Thread.run() escapes; we do the same. The Java method
+                // walks the per-instance handler -> ThreadGroup -> default
+                // chain itself, so we just need to call it. Any error from
+                // the handler dispatch is swallowed (HotSpot does the same:
+                // a buggy handler can't take down the VM further than the
+                // original exception already did).
+                if let MethodCallFailed::ExceptionThrown(exc) = &e {
+                    let exc_ref = *exc;
+                    let dispatch_result = invoke_on_class_shared(
+                        &shared_arc,
+                        &mut jvm_thread,
+                        recv_cid,
+                        "dispatchUncaughtException",
+                        "(Ljava/lang/Throwable;)V",
+                        &[
+                            Value::Object(Some(thread_obj_for_spawn)),
+                            Value::Object(Some(exc_ref)),
+                        ],
+                    );
+                    if let Err(de) = dispatch_result {
+                        eprintln!(
+                            "Thread {} terminated with error: {:?} (dispatchUncaughtException also failed: {:?})",
+                            tid, e, de
+                        );
+                    }
+                } else {
+                    eprintln!("Thread {} terminated with error: {:?}", tid, e);
+                }
             }
             if is_virtual {
                 // Release carrier permit on thread exit.
@@ -3532,6 +3562,15 @@ pub fn invoke_or_native(
             if let Some(mut cid) = cm.get_loaded_class_id(effective_class) {
                 while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
                     if let Some(parent) = cm.get_class(parent_id) {
+                        // S107 collection-toString fix: if this parent has its
+                        // own bytecode for the method (e.g.
+                        // AbstractCollection.toString), the bytecode override
+                        // wins over any deeper native ancestor (e.g.
+                        // Object.toString). Stop walking so the bytecode
+                        // dispatch path runs.
+                        if parent.find_method(method_name, descriptor).is_some() {
+                            break;
+                        }
                         if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
                             if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
                                 eprintln!("[invoke_or_native] hierarchy walk hit on parent={}", parent.name);

@@ -8053,6 +8053,14 @@ fn try_stackless_invoke(
             loop {
                 let parent_id = cm.get_class(cid)?.superclass?;
                 let parent = cm.get_class(parent_id)?;
+                // S107 collection-toString fix: if this parent has its own
+                // bytecode for the method (e.g. AbstractCollection.toString),
+                // the bytecode override wins over any deeper native ancestor
+                // (e.g. Object.toString). Stop walking — return None so the
+                // bytecode dispatch path executes.
+                if parent.find_method(method_name, descriptor).is_some() {
+                    return None;
+                }
                 if let Some(cb) = shared.native_methods.find(&parent.name, method_name, descriptor) {
                     return Some(cb);
                 }
@@ -10427,6 +10435,13 @@ fn execute_invokevirtual_vtable_fast(
             let mut cid = receiver_class_id;
             while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
                 if let Some(parent) = cm.get_class(parent_id) {
+                    // S107 collection-toString fix: if this parent has its
+                    // own bytecode for the method, the bytecode override wins
+                    // over any deeper native ancestor (e.g. Object.toString).
+                    // Stop walking so the vtable bytecode path runs.
+                    if parent.find_method(&method_name, &method_descriptor).is_some() {
+                        break;
+                    }
                     if shared
                         .native_methods
                         .find(&parent.name, &method_name, &method_descriptor)
@@ -10898,6 +10913,14 @@ fn populate_virtual_invoke_cache(
         let mut cid = receiver_class_id;
         while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
             if let Some(parent) = cm.get_class(parent_id) {
+                // S107 collection-toString fix: if this parent has its own
+                // bytecode for the method (e.g. AbstractCollection.toString),
+                // the bytecode override wins over any deeper native ancestor
+                // (e.g. Object.toString). Stop walking so the bytecode dispatch
+                // path runs (via find_method_recursive below).
+                if parent.find_method(&method_name, &descriptor).is_some() {
+                    break;
+                }
                 let parent_name = parent.name.to_string();
                 if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
                     let gate = RedefineGate::snapshot(

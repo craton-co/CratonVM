@@ -13778,18 +13778,6 @@ fn native_chm_tab_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     ctx.monitor_enter(tab);
     let v = ctx.get_array_element(tab, i);
     ctx.monitor_exit(tab);
-    static TA_NULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static TA_NONNULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if matches!(v, Value::Object(None)) {
-        TA_NULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        TA_NONNULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let n_null = TA_NULL.load(std::sync::atomic::Ordering::Relaxed);
-    let n_nn = TA_NONNULL.load(std::sync::atomic::Ordering::Relaxed);
-    if (n_null + n_nn) % 200 == 0 {
-        eprintln!("DEBUG tabAt n_null={} n_nonnull={}", n_null, n_nn);
-    }
     Ok(Some(v))
 }
 
@@ -13819,18 +13807,6 @@ fn native_chm_cas_tab_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_array_element(tab, i, new_val);
     }
     ctx.monitor_exit(tab);
-    static CAS_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static CAS_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if ok {
-        CAS_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        CAS_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let n_ok = CAS_OK.load(std::sync::atomic::Ordering::Relaxed);
-    let n_fail = CAS_FAIL.load(std::sync::atomic::Ordering::Relaxed);
-    if (n_ok + n_fail) % 100 == 0 {
-        eprintln!("DEBUG casTabAt n_ok={} n_fail={}", n_ok, n_fail);
-    }
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 

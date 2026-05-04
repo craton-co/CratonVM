@@ -6,10 +6,32 @@ use rustjvm_types::error::MethodCallResult;
 
 use crate::obj_arg;
 
-/// Exception <init>(Ljava/lang/String;)V — sets detailMessage (field 0)
+/// Helper: write Throwable.detailMessage on a Throwable subclass.
+///
+/// In real-JDK Throwable, detailMessage is at slot 1 (after backtrace at
+/// slot 0). In our synthetic-stub layout, it's at slot 0 (the stubs use
+/// unnamed `_f0`, `_f1`). Use `set_field_by_name` to honour the real-JDK
+/// layout when present, then mirror to slot 0 so synthetic-stub code paths
+/// (which read slot 0 directly) still observe the message.
+fn write_throwable_detail_message(ctx: &mut dyn NativeContext, this: ObjectRef, msg: Value) {
+    ctx.set_field_by_name(this, "detailMessage", msg);
+    ctx.set_field(this, 0, msg);
+}
+
+/// Helper: write Throwable.cause on a Throwable subclass.
+///
+/// Mirrors `write_throwable_detail_message`: by-name first (real-JDK slot
+/// is `cause` at slot 2 after backtrace+detailMessage), then slot 1 to
+/// keep the synthetic-stub layout in sync.
+fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
+    ctx.set_field_by_name(this, "cause", cause);
+    ctx.set_field(this, 1, cause);
+}
+
+/// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
 pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(msg)) = (args.first(), args.get(1)) {
-        ctx.set_field(*this, 0, *msg);
+        write_throwable_detail_message(ctx, *this, *msg);
     }
     Ok(None)
 }
@@ -18,19 +40,19 @@ pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value
 pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         if let Some(msg) = args.get(1) {
-            ctx.set_field(*this, 0, *msg);
+            write_throwable_detail_message(ctx, *this, *msg);
         }
         if let Some(cause) = args.get(2) {
-            ctx.set_field(*this, 1, *cause);
+            write_throwable_cause(ctx, *this, *cause);
         }
     }
     Ok(None)
 }
 
-/// Exception <init>(Ljava/lang/Throwable;)V — sets cause (field 1)
+/// Exception <init>(Ljava/lang/Throwable;)V — sets cause.
 pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(cause)) = (args.first(), args.get(1)) {
-        ctx.set_field(*this, 1, *cause);
+        write_throwable_cause(ctx, *this, *cause);
     }
     Ok(None)
 }
@@ -152,46 +174,76 @@ pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // detailMessage is typically at field index 0 for Throwable
-    // (after backtrace which is transient). In our VM, field layout depends
-    // on the class hierarchy. Try field 0 first (detailMessage for simple throwables).
-    let detail = ctx.get_field(this, 0);
+    // Real-JDK Throwable layout has `detailMessage` at slot 1 (after
+    // `backtrace` at slot 0); synthetic-stub layout puts it at slot 0
+    // (unnamed `_f0`). Prefer the field-name lookup so the real-JDK
+    // bytecode (which writes via `putfield detailMessage`) and our
+    // native init helpers (which now mirror to both) agree.
+    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    let detail = match by_name {
+        Value::Object(Some(_)) => by_name,
+        // Fallback: synthetic-stub layout where the field has no `detailMessage`
+        // name and the canonical slot is index 0.
+        _ => ctx.get_field(this, 0),
+    };
+    // Return the field value directly. The previous `read_string` validation
+    // dropped legitimate JDK String references whose internal layout
+    // `read_java_string` couldn't parse during early boot — for the common
+    // `Throwable(String)` ctor the field holds a real `java/lang/String`
+    // and the caller treats the returned reference as one regardless.
     match detail {
-        Value::Object(Some(str_ref)) => {
-            // Verify it's a string by trying to read it
-            if ctx.read_string(str_ref).is_some() {
-                Ok(Some(Value::Object(Some(str_ref))))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
-        }
+        Value::Object(obj_opt) => Ok(Some(Value::Object(obj_opt))),
         _ => Ok(Some(Value::Object(None))),
     }
 }
 
 // --- Throwable additional methods ---
 
-/// getCause() — read field 1 (cause)
+/// getCause() — read the cause field.
+///
+/// Real-JDK Throwable has `cause` at slot 2 (after backtrace, detailMessage).
+/// Our synthetic-stub layout puts it at slot 1 (unnamed `_f1`). Prefer the
+/// field-name lookup so this works regardless of layout.
+///
+/// `InvocationTargetException` (and similar wrappers) override `getCause()`
+/// in bytecode to return their own field (`target`). When the dispatch path
+/// routes here anyway — e.g. via the Throwable-base hierarchy walk after a
+/// stale invoke-cache miss — we mimic the override by reading `target` when
+/// the synthesized cause field is null. The check is field-name-driven so
+/// it stays layout-agnostic.
 pub(crate) fn native_throwable_get_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cause = ctx.get_field(this, 1);
-    match cause {
+    let by_name_cause = ctx.get_field_by_name(this, "cause");
+    if let Value::Object(Some(_)) = by_name_cause {
+        return Ok(Some(by_name_cause));
+    }
+    // ITE / other wrappers: getCause() returns the dedicated `target`
+    // field, not the inherited Throwable.cause. Mirror that here so the
+    // wrapper exception propagates the correct cause to JLS-spec callers.
+    let by_name_target = ctx.get_field_by_name(this, "target");
+    if let Value::Object(Some(_)) = by_name_target {
+        return Ok(Some(by_name_target));
+    }
+    // Synthetic-stub fallback: layout has no named `cause` but reserves
+    // slot 1 for the cause reference.
+    let slot1 = ctx.get_field(this, 1);
+    match slot1 {
         Value::Object(obj_opt) => Ok(Some(Value::Object(obj_opt))),
         _ => Ok(Some(Value::Object(None))),
     }
 }
 
-/// initCause(Throwable) — set field 1, return this
+/// initCause(Throwable) — set the cause field, return this.
 pub(crate) fn native_throwable_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
     let cause_val = args.get(1).cloned().unwrap_or(Value::Object(None));
-    ctx.set_field(this, 1, cause_val);
+    write_throwable_cause(ctx, this, cause_val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -209,8 +261,13 @@ pub(crate) fn native_throwable_to_string(ctx: &mut dyn NativeContext, args: &[Va
         .unwrap_or_else(|| "java/lang/Throwable".to_string())
         .replace('/', ".");
 
-    // Get the message (field 0)
-    let detail = ctx.get_field(this, 0);
+    // Read detailMessage by name first (real-JDK Throwable layout has it
+    // at slot 1), with slot-0 fallback for synthetic stubs.
+    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    let detail = match by_name {
+        Value::Object(Some(_)) => by_name,
+        _ => ctx.get_field(this, 0),
+    };
     let result = match detail {
         Value::Object(Some(str_ref)) => {
             if let Some(msg) = ctx.read_string(str_ref) {
@@ -629,9 +686,16 @@ pub(crate) fn native_ste_to_string(ctx: &mut dyn NativeContext, args: &[Value]) 
 pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
     let rec = "java/lang/Record";
     // Records are just normal classes with some special semantics
-    // We register equals/hashCode/toString stubs that work via fields
+    // We register equals/hashCode/toString stubs that work via fields.
+    //
+    // S107 fix (constructor_probe test 10): the no-arg `<init>()V` is void,
+    // so it must return `Ok(None)`. Returning `Ok(Some(Value::Object(None)))`
+    // pushes a stray null onto the operand stack, which silently corrupts
+    // the caller record's `<init>` frame — for compact-canonical records
+    // with a validation body, this can shift max_stack and cause the
+    // throw branch to be skipped or mis-dispatched. See WP2.6.
     r.register(rec, "<init>", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+        Ok(None)
     });
     r.register(rec, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
