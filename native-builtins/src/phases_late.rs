@@ -10414,7 +10414,23 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         jf,
         "getJarEntry",
         "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            // Reuse the central-directory lookup so callers that walk via
+            // getJarEntry (e.g. JarFileArchive.getNestedJarUrl ->
+            // JarUrl.create) see a populated synthetic JarEntry instead of
+            // null.
+            let this = obj_arg(args, 0)?;
+            let entry_name = if let Some(Value::Object(Some(s))) = args.get(1) {
+                ctx.read_string(*s).unwrap_or_default()
+            } else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let path = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(p59_jar_lookup_entry(ctx, &path, &entry_name)))
+        },
     );
     r.register(jf, "close", "()V", |ctx, args| {
         // JarFile is 2-field (path=0, manifest=1). Mark closed by clearing the path field.
@@ -10428,6 +10444,29 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    // JarFile.stream() — Spring Boot 3 fat-jar launcher
+    // (org.springframework.boot.loader.launch.JarFileArchive.getClassPathUrls)
+    // walks the JarFile via stream() to enumerate BOOT-INF/lib/*.jar entries
+    // for the LaunchedClassLoader URL set. Real-JDK bytecode delegates this
+    // through SharedSecrets.JUZFA -> ZipFile.jarStream which dereferences a
+    // private `res.zsrc` field that our 2-field synthetic JarFile does not
+    // populate, NPE-ing in ZipFile.ensureOpen. Override returns a synthetic
+    // 1-field Stream populated with synthetic JarEntry instances built from
+    // the central directory via the Rust `zip` crate.
+    r.register(
+        jf,
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        p59_jar_file_stream,
+    );
+    // JarFile.entries() — Enumeration<JarEntry>. Same backing data as
+    // stream(); used by classpath scanners that prefer the legacy iteration.
+    r.register(
+        jf,
+        "entries",
+        "()Ljava/util/Enumeration;",
+        p59_jar_file_entries,
+    );
 
     // JarEntry extends ZipEntry — 4-field (name, size, compressedSize, method)
     let je = "java/util/jar/JarEntry";
@@ -10442,6 +10481,50 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     r.register(je, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
+    });
+    // JarEntry inherits ZipEntry accessors. Spring Boot's JarFileArchive
+    // walks each entry via getName / isDirectory (for the include-filter)
+    // and getComment (only consulted when checking the UNPACK: marker on
+    // nested-JAR entries; we do not pack any UNPACK markers so null is
+    // the right answer). Register them on JarEntry directly so the
+    // override-allow-list (which forces native-only dispatch on certain
+    // jar/zip entry points) sees a non-null result.
+    r.register(je, "isDirectory", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let is_dir = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => {
+                let name = ctx.read_string(s).unwrap_or_default();
+                name.ends_with('/')
+            }
+            _ => false,
+        };
+        Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
+    });
+    r.register(je, "getComment", "()Ljava/lang/String;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
+    r.register(je, "getSize", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field(this, 1) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(-1),
+        }))
+    });
+    r.register(je, "getCompressedSize", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field(this, 2) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(-1),
+        }))
+    });
+    r.register(je, "getMethod", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field(this, 3) {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(-1),
+        }))
     });
 
     // Manifest = 2-field (mainAttrs=0, entries=1)
@@ -10527,6 +10610,123 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+}
+
+// =============================================================================
+// JarFile.stream() / .entries() — Spring Boot 3 fat-jar launcher support.
+// Reads the central directory of the JAR backing the synthetic JarFile and
+// builds a synthetic Stream<JarEntry> / Enumeration<JarEntry> populated with
+// 4-field synthetic JarEntry instances (name, size, compressedSize, method).
+// =============================================================================
+
+/// Read the central directory of `path` and return a Vec of allocated
+/// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
+/// any I/O / zip-parse error so callers see an empty Stream rather than
+/// an exception path.
+fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
+    let len = archive.len();
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let (name, size, csize, method) = match archive.by_index(i) {
+            Ok(entry) => {
+                let name = entry.name().to_string();
+                let size = entry.size() as i64;
+                let csize = entry.compressed_size() as i64;
+                #[allow(deprecated)]
+                let method = entry.compression().to_u16() as i32;
+                (name, size, csize, method)
+            }
+            Err(_) => continue,
+        };
+        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+        let name_s = ctx.create_string(&name);
+        ctx.set_field(je, 0, Value::Object(Some(name_s)));
+        ctx.set_field(je, 1, Value::Long(size));
+        ctx.set_field(je, 2, Value::Long(csize));
+        ctx.set_field(je, 3, Value::Int(method));
+        out.push(Value::Object(Some(je)));
+    }
+    out
+}
+
+/// Look up a single entry by name in the JAR at `path`, returning a synthetic
+/// JarEntry or `Value::Object(None)` if missing. Mirrors getEntry but
+/// produces a `java/util/jar/JarEntry` (vs the older `java/util/zip/ZipEntry`).
+fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &str) -> Value {
+    if path.is_empty() || entry_name.is_empty() {
+        return Value::Object(None);
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Value::Object(None),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return Value::Object(None),
+    };
+    let (name, size, csize, method) = match archive.by_name(entry_name) {
+        Ok(entry) => {
+            let name = entry.name().to_string();
+            let size = entry.size() as i64;
+            let csize = entry.compressed_size() as i64;
+            #[allow(deprecated)]
+            let method = entry.compression().to_u16() as i32;
+            (name, size, csize, method)
+        }
+        Err(_) => return Value::Object(None),
+    };
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let name_s = ctx.create_string(&name);
+    ctx.set_field(je, 0, Value::Object(Some(name_s)));
+    ctx.set_field(je, 1, Value::Long(size));
+    ctx.set_field(je, 2, Value::Long(csize));
+    ctx.set_field(je, 3, Value::Int(method));
+    Value::Object(Some(je))
+}
+
+fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let path = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let elems = p59_jar_collect_entries(ctx, &path);
+    Ok(Some(Value::Object(Some(p56_build_stream(
+        ctx,
+        elems,
+        "java/util/stream/Stream",
+    )))))
+}
+
+fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let path = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let elems = p59_jar_collect_entries(ctx, &path);
+    // Pack into a 2-field Enumeration synthetic: array=0, cursor=1. The
+    // existing Enumeration.hasMoreElements/nextElement natives walk this
+    // shape (see register_p59_spliterator / Iterator collateral).
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, elems.len());
+    for (i, v) in elems.into_iter().enumerate() {
+        ctx.set_array_element(arr, i, v);
+    }
+    let enumeration = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+    ctx.set_field(enumeration, 0, Value::Object(Some(arr)));
+    ctx.set_field(enumeration, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(enumeration))))
 }
 
 // JarFile = 2-field (name=0 String, manifest=1)

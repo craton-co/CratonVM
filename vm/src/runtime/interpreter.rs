@@ -10293,9 +10293,34 @@ fn execute_jit_call(
     needs_heap: bool,
     cached: &Arc<CachedBytecodeMethod>,
 ) -> Result<CachedCallResult, MethodCallFailed> {
-    // Pop raw u64 args directly — avoids decode_value/Value enum overhead
+    // Pop raw u64 args directly — avoids decode_value/Value enum overhead.
+    //
+    // The JIT backend wires Java params via ARG_REGS only (no stack-arg
+    // marshalling): on Windows x64 ARG_REGS has 4 slots, on System V x64
+    // it has 6. When `needs_heap` is set, ARG_REGS[0] holds the SharedVm
+    // pointer, which leaves one fewer slot for Java params. If the
+    // method's parameter count exceeds the platform's available register
+    // slots, the JIT codegen would silently truncate (see x64.rs prologue
+    // — `ARG_REGS.iter()...take(self.num_params)`), producing a method
+    // body that reads uninitialised locals for the missing tail params.
+    // Bail to the bytecode interpreter in that case instead of dispatching
+    // a miscompiled call.
+    //
+    // Reproducer (before this gate): Spring Boot 2.x's
+    // `ExecutableArchiveLauncher.getMainClass` → `ZipFile`/`JarFile`
+    // chain calls into a 5+-arg JIT'd method on Windows and panics with
+    // "index out of bounds: the len is 4 but the index is 4" at the
+    // pop-into-`jit_args` loop below.
+    #[cfg(target_os = "windows")]
+    const JIT_ABI_REG_SLOTS: usize = 4;
+    #[cfg(not(target_os = "windows"))]
+    const JIT_ABI_REG_SLOTS: usize = 6;
     let np = num_params as usize; // Widening: parameter count conversion
-    let mut jit_args = [0i64; 4]; // max 4 args for our JIT
+    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    if np > max_java_params {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
         jit_args[i] = thread.frames[frame_idx].stack.pop_raw() as i64; // Cast: JIT ABI -- i64 register convention
     }
