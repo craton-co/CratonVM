@@ -433,6 +433,37 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(dst))))
     });
 
+    // Arrays.copyOf(Object[], int, Class) → Object[]
+    // Real-JDK `ArrayList.toArray(T[])` calls this 3-arg overload to
+    // produce a new typed array (the runtime class of the supplied
+    // template). We treat the Class arg as advisory metadata only —
+    // every reference array in our heap is the same Object[] kind, and
+    // checkcast at the call site validates the component type. Without
+    // this native the call falls through to bytecode that dereferences
+    // unsupported `arrayClass` reflection internals and NPEs.
+    r.register(
+        arrays,
+        "copyOf",
+        "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
+        |ctx, args| {
+            let src = match args.first() {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let new_len = match args.get(1) {
+                Some(Value::Int(n)) => *n as usize,
+                _ => 0,
+            };
+            let src_len = ctx.array_length(src);
+            let dst = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_len);
+            let copy_len = src_len.min(new_len);
+            for i in 0..copy_len {
+                ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
+            }
+            Ok(Some(Value::Object(Some(dst))))
+        },
+    );
+
     // Arrays.copyOf(int[], int) → int[]
     r.register(arrays, "copyOf", "([II)[I", |ctx, args| {
         let src = match args.first() {

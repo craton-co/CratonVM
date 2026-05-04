@@ -6204,6 +6204,80 @@ pub(crate) fn native_class_cast(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(obj))
 }
 
+/// Native override for `java.lang.Class.getClassLoader()`.
+///
+/// JVM spec §5.3: classes loaded by the bootstrap loader return `null`,
+/// otherwise return the defining loader.  In CratonVM:
+///
+/// - Bootstrap classes (java/*, javax/*, jdk/*, sun/*, com/sun/*) → null.
+/// - Anything else (app classpath via `-c`, user-defined hidden classes,
+///   synthetic test fixtures, primitive-mirror lookups that arrive here) →
+///   the singleton application `ClassLoader` instance.  This must be
+///   non-null so callers like `commons-logging`'s
+///   `LogFactory.<clinit>` (which does
+///   `LogFactory.class.getClassLoader().loadClass(IMPL)`) don't NPE on
+///   the next `loadClass` invocation.
+///
+/// The fix lives in `register_essential_natives` (real-JDK mode); the
+/// JDK 25 bytecode for `Class.getClassLoader()` is just
+/// `getfield classLoader; areturn`, which would always read `null`
+/// (the field is never populated by VM-internal mirror creation).  The
+/// native dispatch path in `try_stackless_invoke` / `invoke_or_native`
+/// checks the registry first, so this override wins over the bytecode.
+pub(crate) fn native_class_get_class_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mirror = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Prefer the authoritative reverse map; fall back to the legacy
+    // slot-0 ClassId encoding for synthetic test fixtures.
+    let class_id_opt = ctx.class_id_from_mirror(mirror).or_else(|| {
+        if let Value::Int(v) = ctx.get_field(mirror, 0) {
+            if v > 0 {
+                return Some(rustjvm_types::ClassId::new(v as u32));
+            }
+        }
+        None
+    });
+    let class_id = match class_id_opt {
+        Some(cid) => cid,
+        None => {
+            // No resolvable ClassId — return the app loader so
+            // `Class.getClassLoader()` is never null for a non-bootstrap
+            // class.  The only path that yields null is the explicit
+            // bootstrap-package case below.
+            let cl = crate::classloader::get_or_create_app_loader(ctx);
+            return Ok(Some(Value::Object(Some(cl))));
+        }
+    };
+    let loader_type = ctx.loader_id_of_class(class_id);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_jdk_pkg = class_name.starts_with("java/")
+        || class_name.starts_with("javax/")
+        || class_name.starts_with("jdk/")
+        || class_name.starts_with("sun/")
+        || class_name.starts_with("com/sun/");
+    if loader_type == 0 && is_jdk_pkg {
+        // Bootstrap loader → null per JVM spec.
+        return Ok(Some(Value::Object(None)));
+    }
+    if loader_type == 1 {
+        // Platform/extension loader — return singleton.
+        let cl = crate::classloader::get_or_create_platform_loader(ctx);
+        return Ok(Some(Value::Object(Some(cl))));
+    }
+    // Application class (`-c` classpath), user-defined loader, or a
+    // class whose stored loader id is bootstrap but whose name is NOT
+    // in a JDK package (= app classpath class registered before the
+    // loader-id plumbing was wired up).  Return the singleton app
+    // loader so `loadClass` works.
+    let cl = crate::classloader::get_or_create_app_loader(ctx);
+    Ok(Some(Value::Object(Some(cl))))
+}
+
 pub(crate) fn native_class_as_subclass(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Return this class
     Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))

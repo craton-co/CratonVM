@@ -308,6 +308,33 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
         native_collection_to_array_generator,
     );
+    // ArrayList.toArray(T[]) — Spring Boot fat-jar launcher's
+    // `Launcher.createClassLoader(Collection)` calls `c.toArray(new URL[0])`
+    // to obtain a typed `URL[]`. Real-JDK bytecode reads `elementData` and
+    // calls `Arrays.copyOf(elementData, size, a.getClass())`, but that path
+    // NPEs on our synthetic ArrayList because `a.getClass()` returns a
+    // mirror without the array-component-type metadata `Arrays.copyOf`
+    // walks. Provide an explicit override that copies into the supplied
+    // array (or allocates a fresh one) without consulting the runtime
+    // class of the template. Returning a simple Object[] is fine because
+    // checkcast at the call site only verifies the array's component
+    // class; our `alloc_ref_array` produces a raw reference array that
+    // checkcasts to any `Object[]` subtype.
+    r.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_al_to_array_typed,
+    );
+    // Also register on AbstractCollection (where the inherited bytecode
+    // resolves) so the dispatch path that walks the superclass chain
+    // finds the native before reaching the broken bytecode.
+    r.register(
+        "java/util/AbstractCollection",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_al_to_array_typed,
+    );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
     r.register(c, "ensureCapacity", "(I)V", native_al_ensure_capacity);
     r.register(c, "trimToSize", "()V", native_al_trim_to_size);
@@ -621,6 +648,46 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// `ArrayList.toArray(T[])` / `AbstractCollection.toArray(T[])` —
+/// produce a typed array (or grow the supplied template) without going
+/// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
+/// path which NPEs on synthetic ArrayLists.
+pub fn native_al_to_array_typed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let template = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    let size = size as usize;
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!(
+            "[DBG_SBLOAD] AL.toArray(T[]) size={} data_some={} template_some={}",
+            size,
+            data.is_some(),
+            matches!(template, Value::Object(Some(_)))
+        );
+    }
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        _ => alloc_ref_array(ctx, size),
+    };
+    if let Some(d) = data {
+        for i in 0..size {
+            let val = ctx.get_array_element(d, i);
+            ctx.set_array_element(target, i, val);
+        }
+    }
+    let target_len = ctx.array_length(target);
+    if target_len > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    Ok(Some(Value::Object(Some(target))))
 }
 
 /// Collection.toArray(IntFunction) — delegates to toArray() since RustJVM uses Object[] uniformly.

@@ -1628,6 +1628,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;", lang_class::native_class_get_superclass);
     registry.register("java/lang/Class", "getInterfaces0", "()[Ljava/lang/Class;", lang_class::native_class_get_interfaces);
     registry.register("java/lang/Class", "getModifiers", "()I", lang_class::native_class_get_modifiers);
+    // Class.getClassLoader() — JDK 25 bytecode is just `getfield classLoader;
+    // areturn`, which always returns null because we never populate that
+    // field on Class mirrors.  Override with a native that returns the
+    // singleton app loader for non-bootstrap classes (and null for
+    // bootstrap classes per JVM spec §5.3).  Without this, e.g.
+    // commons-logging's `LogFactory.<clinit>` does
+    // `LogFactory.class.getClassLoader().loadClass(...)` and NPEs on
+    // the second invokevirtual.  See `lang_class.rs::native_class_get_class_loader`.
+    registry.register(
+        "java/lang/Class",
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        lang_class::native_class_get_class_loader,
+    );
+    // `getClassLoader0()` is the package-private cousin invoked from
+    // `ClassLoader.getClassLoader(Class<?>)` and other JDK internals;
+    // same semantics so route to the same native.
+    registry.register(
+        "java/lang/Class",
+        "getClassLoader0",
+        "()Ljava/lang/ClassLoader;",
+        lang_class::native_class_get_class_loader,
+    );
     // NEW-8: Class.isHidden() — consult the real hidden flag set by
     // `Lookup.defineHiddenClass`. The previous stub always returned 0
     // which broke JEP 371 class-identity checks.
@@ -18685,10 +18708,39 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let nfields = ctx.object_num_fields(this);
     let full = match ctx.get_field(this, URL_FIELD_FULL) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
+    // Real-JDK URL has 13-field layout where field 5 = authority (often null
+    // for our synthetic file: URLs allocated in Class.getProtectionDomain).
+    // Fall back to reconstructing from field 0=protocol + ":" + field 3=file.
+    let full = if !full.is_empty() {
+        full
+    } else if nfields >= 7 {
+        let protocol = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let file = match ctx.get_field(this, 3) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => match ctx.get_field(this, 6) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
+        };
+        if !protocol.is_empty() && !file.is_empty() {
+            format!("{protocol}:{file}")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] URL.toURI() nfields={} full={:?}", nfields, full);
+    }
     let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
     url_parse(ctx, uri, &full);
     Ok(Some(Value::Object(Some(uri))))
@@ -24788,48 +24840,7 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         c,
         "getClassLoader",
         "()Ljava/lang/ClassLoader;",
-        |ctx, args| {
-            // JVM spec §5.3: bootstrap classes return null, others return the
-            // defining loader. We read the ClassId from the mirror (field 0)
-            // and look up which loader defined it. For mirrors that don't
-            // carry a resolvable class id (synthetic test fixtures, or
-            // application-user classes that haven't been registered with
-            // the class manager yet), we default to the application
-            // class loader — matching HotSpot behaviour for
-            // dynamically-loaded user classes.
-            let mirror = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let class_id = match ctx.get_field(mirror, 0) {
-                Value::Int(v) => rustjvm_types::ClassId::new(v as u32),
-                _ => {
-                    // Synthetic mirror with no stored ClassId — return the
-                    // app loader so `Class.getClassLoader()` is never null
-                    // for a non-bootstrap class. The only path that should
-                    // yield null is the explicit Bootstrap case below.
-                    let cl = crate::classloader::get_or_create_app_loader(ctx);
-                    return Ok(Some(Value::Object(Some(cl))));
-                }
-            };
-            let loader_type = ctx.loader_id_of_class(class_id);
-            match loader_type {
-                0 => {
-                    // Bootstrap loader → null per JVM spec
-                    Ok(Some(Value::Object(None)))
-                }
-                1 => {
-                    // Platform/extension loader — return singleton
-                    let cl = crate::classloader::get_or_create_platform_loader(ctx);
-                    Ok(Some(Value::Object(Some(cl))))
-                }
-                _ => {
-                    // Application or user-defined loader — return singleton
-                    let cl = crate::classloader::get_or_create_app_loader(ctx);
-                    Ok(Some(Value::Object(Some(cl))))
-                }
-            }
-        },
+        lang_class::native_class_get_class_loader,
     );
     registry.register(
         c,

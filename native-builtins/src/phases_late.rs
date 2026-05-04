@@ -3618,6 +3618,44 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Path.of(URI) — Spring Boot 3.4 fat-jar launcher uses
+    // `Path.of(URL.toURI()).toFile()` to convert a `file:/C:/...jar` URL
+    // back into a `File`. Read the URI's `path` field via `get_field_by_name`
+    // (real-JDK URI declares 16+ fields; using by-name access keeps us
+    // independent of layout drift). Fall back to URI's `string` (full URI
+    // text) and strip the `file:` scheme prefix when path is unset.
+    r.register(
+        path,
+        "of",
+        "(Ljava/net/URI;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let uri = obj_arg(args, 0)?;
+            let mut path_str = match ctx.get_field_by_name(uri, "path") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if path_str.is_empty() {
+                let full_val = ctx.get_field_by_name(uri, "string");
+                if let Value::Object(Some(s)) = full_val {
+                    let full = ctx.read_string(s).unwrap_or_default();
+                    if let Some(stripped) = full.strip_prefix("file://") {
+                        path_str = stripped.to_string();
+                    } else if let Some(stripped) = full.strip_prefix("file:") {
+                        path_str = stripped.to_string();
+                    } else {
+                        path_str = full;
+                    }
+                }
+            }
+            let os_path = p57_to_os_path(&path_str);
+            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+                eprintln!("[DBG_SBLOAD] Path.of(URI) -> {:?}", os_path);
+            }
+            let result = p57_alloc_path(ctx, &os_path);
+            Ok(Some(Value::Object(Some(result))))
+        },
+    );
+
     // --- Path.getFileSystem() → synthetic FileSystem singleton ---
     // FileSystem = 1-field synthetic (field 0 = separator String)
     r.register(
@@ -6467,6 +6505,9 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let exists = std::path::Path::new(&path).exists();
+        if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            eprintln!("[DBG_SBLOAD] File.exists() path={:?} -> {}", path, exists);
+        }
         Ok(Some(Value::Int(if exists { 1 } else { 0 })))
     });
     r.register(file, "isFile", "()Z", |ctx, args| {
@@ -6479,6 +6520,9 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let result = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+        if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            eprintln!("[DBG_SBLOAD] File.isDirectory() path={:?} -> {}", path, result);
+        }
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     });
     r.register(file, "isHidden", "()Z", |ctx, args| {
@@ -10610,6 +10654,26 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+
+    // Spring Boot 3.x fat-jar launcher: short-circuit
+    // `JarFileArchive.getClassPathUrls(Predicate, Predicate)` so we don't
+    // depend on a working `Stream.map / Stream.filter / Stream.collect`
+    // pipeline (which our synthetic Stream lacks). Read the JarFile field
+    // directly, walk its central directory via the Rust `zip` crate, and
+    // build a HashSet<URL> populated with `jar:nested:.../!/<entry>`
+    // URLs for `BOOT-INF/lib/*.jar` and `BOOT-INF/classes/`.
+    //
+    // The synthetic HashSet (3-field: backing-array, size, capacity) is the
+    // same shape every other Set.of native produces, so the downstream
+    // `Launcher.createClassLoader(Collection)` -> `collection.toArray()`
+    // round-trip lands the URLs in `URL[]` for the LaunchedClassLoader.
+    let jfa = "org/springframework/boot/loader/launch/JarFileArchive";
+    r.register(
+        jfa,
+        "getClassPathUrls",
+        "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
+        p59_spring_boot_jar_archive_get_class_path_urls,
+    );
 }
 
 // =============================================================================
@@ -10702,11 +10766,128 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => String::new(),
     };
     let elems = p59_jar_collect_entries(ctx, &path);
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFile.stream() path={:?} entries={}", path, elems.len());
+    }
     Ok(Some(Value::Object(Some(p56_build_stream(
         ctx,
         elems,
         "java/util/stream/Stream",
     )))))
+}
+
+/// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
+/// the central directory, build URL set for `BOOT-INF/classes/` (always
+/// included) plus every `BOOT-INF/lib/*.jar` entry.
+///
+/// Real-bytecode stream pipeline:
+///   `jarFile.stream().map(JarArchiveEntry::new).filter(p1).map(this::getNestedJarUrl).collect(toCollection(LinkedHashSet::new))`
+///
+/// Replacing it with a single native that materialises the URL set directly
+/// avoids the dependency on `Stream.map / Stream.filter / Stream.collect`
+/// (whose synthetic-Stream implementation does not support arbitrary
+/// `Function` / `Predicate` lambdas yet) and on `Collectors.toCollection`.
+fn p59_spring_boot_jar_archive_get_class_path_urls(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // JarFileArchive layout: field 0 = file (java.io.File), field 1 = jarFile.
+    // Both `file_read_path` and JarFile field 0 store the path string, so
+    // either route gets us the absolute path on disk.
+    let file_obj = ctx.get_field(this, 0);
+    let jar_path = match file_obj {
+        Value::Object(Some(file_ref)) => {
+            // File.field 0 = path String (set in register_phase57_file).
+            match ctx.get_field(file_ref, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}", jar_path);
+    }
+
+    // Collect all BOOT-INF/lib/*.jar entry names from the central directory.
+    let mut urls: Vec<Value> = Vec::new();
+
+    // Always include BOOT-INF/classes/ as the first classpath URL.
+    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
+    let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
+    let classes_url = p59_alloc_url(ctx, &classes_url_str);
+    urls.push(Value::Object(Some(classes_url)));
+
+    if !jar_path.is_empty() {
+        if let Ok(file) = std::fs::File::open(&jar_path) {
+            if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                for i in 0..archive.len() {
+                    if let Ok(entry) = archive.by_index(i) {
+                        let name = entry.name().to_string();
+                        if name.starts_with("BOOT-INF/lib/")
+                            && name.ends_with(".jar")
+                        {
+                            let url_str = format!(
+                                "jar:nested:/{jar_uri_path}/!{name}!/"
+                            );
+                            let url = p59_alloc_url(ctx, &url_str);
+                            urls.push(Value::Object(Some(url)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls", urls.len());
+    }
+
+    // Build a 2-field synthetic ArrayList (backing-array, size). The bytecode
+    // declares `Set` as the return type but only ever calls
+    // `Collection.toArray(Object[])` on it, which is implemented by
+    // ArrayList via `native_collections`. Returning ArrayList sidesteps
+    // the synthetic-HashSet layout drift between `phases_early::Set.of`
+    // (3-field) and `native_collections::HashSet` (1-field).
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    for (i, v) in urls.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(urls.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Allocate a 13-field synthetic URL with `protocol`, `host`, `port`, `file`,
+/// `path`, and `full` populated so URL.toString / URL.toURI / URL.getPath
+/// all return the right thing for downstream classpath consumers.
+fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRef {
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+    let proto = if let Some(idx) = full.find(':') {
+        &full[..idx]
+    } else {
+        ""
+    };
+    let rest = if proto.is_empty() {
+        full
+    } else {
+        &full[proto.len() + 1..]
+    };
+    let proto_s = ctx.create_string(proto);
+    let file_s = ctx.create_string(rest);
+    let full_s = ctx.create_string(full);
+    let host_s = ctx.create_string("");
+    ctx.set_field(url, 0, Value::Object(Some(proto_s))); // protocol
+    ctx.set_field(url, 1, Value::Object(Some(host_s)));  // host
+    ctx.set_field(url, 2, Value::Int(-1));                // port
+    ctx.set_field(url, 3, Value::Object(Some(file_s)));  // file
+    ctx.set_field(url, 4, Value::Object(None));           // query
+    // Slot 5 = authority — leave null to satisfy our URL.toString fallback.
+    ctx.set_field(url, 5, Value::Object(Some(full_s)));  // authority/full
+    ctx.set_field(url, 6, Value::Object(Some(file_s)));  // path
+    url
 }
 
 fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10759,6 +10940,9 @@ fn p59_jar_file_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     } else {
         String::new()
     };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFile.<init>(File) path={:?}", path);
+    }
     let manifest = p98_read_jar_manifest(ctx, &path);
     ctx.set_field(this, 1, manifest);
     Ok(None)

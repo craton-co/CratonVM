@@ -5113,6 +5113,34 @@ fn invoke_on_class_shared_inner(
                                 | "close"
                                 | "getName"
                             ))
+                        // Spring Boot 3 fat-jar launcher: short-circuit
+                        // JarFileArchive.getClassPathUrls so our native
+                        // wins over the bytecode that walks
+                        // `JarFile.stream().map().filter().map().collect()` —
+                        // that pipeline depends on Stream operations our
+                        // synthetic Stream does not implement. The native
+                        // materialises the URL set directly from the
+                        // central directory.
+                        || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
+                            && method_name == "getClassPathUrls")
+                        // Spring Boot fat-jar launcher: ArrayList.toArray(T[])
+                        // bytecode calls `Arrays.copyOf(elementData, size,
+                        // a.getClass())` which NPEs on our synthetic ArrayList
+                        // because the array-component-type metadata path is
+                        // incomplete. Force our native to win for the typed
+                        // toArray overload. NOTE: `toArray(T[])` is declared
+                        // on `AbstractCollection`, not `ArrayList`, so we
+                        // match the parent class name here. The native is
+                        // registered on every concrete collection class
+                        // separately (see `register_arraylist_natives`).
+                        || (matches!(
+                                class_name,
+                                "java/util/AbstractCollection"
+                                | "java/util/ArrayList"
+                                | "java/util/HashSet"
+                                | "java/util/LinkedHashSet"
+                            )
+                            && method_name == "toArray")
                         // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
                         // bytecode resolution is failing for these basic methods
                         // during JDK class clinits like
