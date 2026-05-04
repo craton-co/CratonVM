@@ -469,6 +469,85 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/security/Provider", "parseLegacy")
         | ("java/security/Provider", "putService")
         | ("java/security/Provider", "implPut")
+        // EXEC.1 (Session 111) — `apps/executor_probe/ExecProbe` test2
+        // builds an `Executors.newFixedThreadPool(4)` and submits 4000
+        // tasks that each call `AtomicInteger.incrementAndGet()` and
+        // `CountDownLatch.countDown()`. With JIT enabled the run
+        // segfaults (rc=139, STATUS_ACCESS_VIOLATION on Windows) right
+        // after `test1=42`; with `RUSTJVM_DISABLE_JIT=1` the entire test
+        // suite passes (test2/test3/test4 all OK).
+        //
+        // The j.u.c. concurrency primitives are dominated by the same
+        // allocate-then-putfield idiom that bites `Integer.valueOf` /
+        // `String.toLowerCase`: AQS allocates a fresh `ConditionNode` /
+        // `ExclusiveNode` and immediately `putfield`s `prev`/`next`/
+        // `waiter` into it, AtomicInteger's CAS retry path produces and
+        // unwraps boxed Integers via `Integer.valueOf`, ThreadPoolExecutor
+        // re-uses internal `Worker` objects whose ctor stores `firstTask`
+        // / `thread` immediately after allocation, etc. Under the 4000-
+        // iteration submit/run loop, every one of those callees crosses
+        // the OSR (1000) and per-callee (2000) thresholds in the same
+        // outer frame, so the regalloc clobber in `patch_self_calls` /
+        // `emit_invoke_virtual` (vm/src/jit/x64.rs ~10266 / ~9696) leaves
+        // a stale pointer in a callee-saved register and the next field
+        // dereference faults.
+        //
+        // Per the S108 / S109 precedent (`Integer.valueOf`,
+        // `String.toLowerCase`), the workaround is a targeted skip list
+        // until the underlying regalloc bug is fixed in `x64.rs`. The
+        // entries below cover the j.u.c. submit / atomic / AQS hot paths
+        // exercised by ExecProbe; other j.u.c. methods stay JIT-eligible.
+        //
+        // ThreadPoolExecutor + LinkedBlockingQueue submit/run path —
+        // both LBQ.offer and LBQ.enqueue allocate a fresh `Node` and
+        // immediately `putfield` `item` / `next` into it; under 4000
+        // iterations this hits the same allocate-then-putfield
+        // miscompile as `Integer.valueOf` and corrupts the queue tail
+        // pointer. ThreadPoolExecutor.execute is the public submit
+        // entry; runWorker/getTask are the worker-thread loops.
+        | ("java/util/concurrent/ThreadPoolExecutor", "execute")
+        | ("java/util/concurrent/ThreadPoolExecutor", "runWorker")
+        | ("java/util/concurrent/ThreadPoolExecutor", "getTask")
+        | ("java/util/concurrent/LinkedBlockingQueue", "offer")
+        | ("java/util/concurrent/LinkedBlockingQueue", "enqueue")
+        | ("java/util/concurrent/LinkedBlockingQueue", "take")
+        | ("java/util/concurrent/LinkedBlockingQueue", "dequeue")
+        // AtomicInteger CAS retry loops + Integer.valueOf interaction
+        | ("java/util/concurrent/atomic/AtomicInteger", "incrementAndGet")
+        | ("java/util/concurrent/atomic/AtomicInteger", "getAndIncrement")
+        // CountDownLatch — `countDown` must dispatch correctly to
+        // `Sync.tryReleaseShared` which CAS-decrements the count and
+        // signals waiters at zero. The JIT'd inner Sync method
+        // miscompiles the CAS retry loop's allocate-then-putfield
+        // (the retry uses `getStateVolatile` -> `compareAndSetState`),
+        // leaving the count stuck above zero so `await` never wakes.
+        | ("java/util/concurrent/CountDownLatch", "countDown")
+        | ("java/util/concurrent/CountDownLatch", "await")
+        | ("java/util/concurrent/CountDownLatch$Sync", "tryReleaseShared")
+        | ("java/util/concurrent/CountDownLatch$Sync", "tryAcquireShared")
+        // AbstractQueuedSynchronizer hot dispatch + node alloc paths.
+        // AQS allocates an `ExclusiveNode` / `ConditionNode` for every
+        // contended acquire/release; that allocate-then-putfield in the
+        // node ctor is the same miscompile signature. The do*/signalNext
+        // inner helpers walk the waiter list and re-link nodes via
+        // putfield-on-fresh-allocation; without skipping them, the
+        // signaling path corrupts the next-pointer and waiters are
+        // never woken (latch.await stays parked indefinitely).
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "release")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireShared")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "releaseShared")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "signalNext")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "signalNextIfShared")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signal")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signalAll")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "doSignal")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "await")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "newConditionNode")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "enableWait")
+        // ReentrantLock guards LBQ — every offer/take takes the lock
+        | ("java/util/concurrent/locks/ReentrantLock", "lock")
+        | ("java/util/concurrent/locks/ReentrantLock", "unlock")
     )
 }
 

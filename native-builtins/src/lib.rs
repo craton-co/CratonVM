@@ -1565,15 +1565,45 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/URL;",
         lang_class::native_class_get_resource,
     );
-    // Class.getModule returns null — our Class mirrors are unnamed, and
-    // downstream code that calls Module.isNamed() on null must be guarded
-    // by the caller.  This is safe because our Class.getResource* overrides
-    // above intercept the primary users of getModule during bootstrap.
+    // Class.getModule returns a non-null synthetic Module mirror.  Older
+    // versions returned null, which broke any downstream `Module.isNamed()`,
+    // `Module.canUse(svc)`, or `Module.canRead(other)` callsite in JDK
+    // bytecode that immediately dereferences the returned module without
+    // a null check (e.g. `ServiceLoader.checkCaller` does
+    // `caller.getModule().canUse(svc)` directly, NPE'ing inside
+    // `Console.<clinit>` and tripping ByteBuddy/CGLib bootstrap).
+    //
+    // Returning a synthetic 2-field Module (name=field 0 from
+    // `module_name_of_class`, layer=field 1 unset) is safe because:
+    //   * `Module.canUse(Class)` is overridden as a native that always
+    //     returns true on a non-null receiver (see this file's
+    //     S109 Wave3 registration).
+    //   * `Module.isNamed()` consults field 0 — non-null name yields
+    //     true for named modules, false for the unnamed module.
+    //   * Every other `Module.*` Java method that bytecode reaches
+    //     during boot is either overridden in `phases_late.rs::register_p59_module`
+    //     (synthetic mode) or guarded by `canUse`/`canRead` first.
+    //
+    // This intentionally mirrors the synthetic-mode override at
+    // `phases_late.rs::register_p59_module` so real-JDK and synthetic-jdk
+    // boot paths see the same Module shape — see vm/tests/wave3_console_module.rs.
     registry.register(
         "java/lang/Class",
         "getModule",
         "()Ljava/lang/Module;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
+                let class_id = ctx.class_id_of_object(*mirror);
+                ctx.module_name_of_class(class_id)
+                    .map(|name| Value::Object(Some(ctx.create_string(&name))))
+                    .unwrap_or(Value::Object(None))
+            } else {
+                Value::Object(None)
+            };
+            ctx.set_field(m_obj, 0, module_name_val);
+            Ok(Some(Value::Object(Some(m_obj))))
+        },
     );
     registry.register("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     registry.register("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;", native_class_for_name);
