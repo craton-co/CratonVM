@@ -2173,12 +2173,31 @@ fn native_scanner_init_inputstream(
             }
         }
     } else if let Value::Int(fd) = field0 {
-        // fd-based stream (FileInputStream)
+        // fd-based stream (synthetic FileInputStream layout where slot 0 is
+        // already an int — written by `native_fis_init_string` for files
+        // opened by name).
         let fd = fd as FdId;
         loop {
             match ctx.fd_table().read_byte(fd) {
                 Ok(b) if b >= 0 => bytes.push(b as u8),
                 _ => break,
+            }
+        }
+    } else if let Value::Int(encoded) = field1 {
+        // S110 — System.in encoding. The `native_system_init_phase1` path
+        // in `native-builtins/src/lang_system.rs` cannot store the stdin
+        // fd id (= 0) in slot 0 because the real-JDK FileInputStream
+        // descriptor (`Ljava/io/FileDescriptor;`) makes the heap coerce
+        // `Value::Int(0)` to `Value::Object(None)`. Instead it writes
+        // `Int(fd + 1)` to slot 1; we decode here. `encoded > 0` filters
+        // out the zero / negative residue from coerced reference slots.
+        if encoded > 0 {
+            let fd = (encoded - 1) as FdId;
+            loop {
+                match ctx.fd_table().read_byte(fd) {
+                    Ok(b) if b >= 0 => bytes.push(b as u8),
+                    _ => break,
+                }
             }
         }
     }

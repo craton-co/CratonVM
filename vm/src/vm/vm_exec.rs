@@ -5069,6 +5069,50 @@ fn invoke_on_class_shared_inner(
                         // path when the engine lookup fails).
                         || (class_name == "java/security/Provider"
                             && method_name == "getEngineName")
+                        // Spring Boot 3.2 fat-jar launcher: Archive.create(File)
+                        // takes `URI.getSchemeSpecificPart()` (e.g. `/C:/foo.jar`)
+                        // and feeds it to `new File(...)`. Rust's
+                        // `Path::is_absolute` treats a leading `/<drive>:`
+                        // as relative on Windows, so the real-JDK
+                        // `File.<init>(String)` bytecode (which delegates
+                        // to `WinNTFileSystem.normalize`, then
+                        // `prefixLength`) leaves the path unnormalised
+                        // for our std::fs callers. Route File constructors
+                        // and accessors through our normalising natives so
+                        // the URI -> File round-trip resolves to the same
+                        // absolute path HotSpot produces.
+                        || (class_name == "java/io/File"
+                            && (method_name == "<init>"
+                                || method_name == "getAbsolutePath"
+                                || method_name == "getCanonicalPath"
+                                || method_name == "exists"
+                                || method_name == "isFile"
+                                || method_name == "isDirectory"
+                                || method_name == "getPath"
+                                || method_name == "toPath"
+                                || method_name == "getName"
+                                || method_name == "toURI"))
+                        // Spring Boot 3.2 fat-jar launcher: JarFileArchive
+                        // opens the fat-jar via `new JarFile(File)` and walks
+                        // entries via `jarFile.stream() -> JarEntry`. The
+                        // real-JDK ZipFile bytecode trips over native
+                        // primitives (`ZipFile.ensureOpen`, etc.) we don't
+                        // wire up. Force our `p59_jar_*` natives (which use
+                        // the Rust `zip` crate directly) to win.
+                        || (class_name == "java/util/jar/JarFile"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getManifest"
+                                | "stream"
+                                | "entries"
+                                | "getEntry"
+                                | "getJarEntry"
+                                | "getInputStream"
+                                | "size"
+                                | "close"
+                                | "getName"
+                            ))
                         // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
                         // bytecode resolution is failing for these basic methods
                         // during JDK class clinits like

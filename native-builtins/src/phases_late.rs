@@ -6212,10 +6212,42 @@ fn raf_read_fully(ctx: &mut dyn NativeContext, fd_id: i32, buf: &mut [u8]) -> Re
 
 /// Read the path string from a File object (field 0).
 fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, 0) {
+    let raw = match ctx.get_field(this, 0) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
+    };
+    // Defensive: Spring Boot's URI -> File round-trip can hand us a
+    // raw URI-style `/C:/...` path on Windows when the real-JDK File
+    // bytecode (which would normalise it) is bypassed. Normalise here
+    // so std::fs callers see a path Rust's `Path::is_absolute` recognises.
+    file_normalise_path(&raw)
+}
+
+/// Normalise a path string the way `java.io.WinNTFileSystem.normalize` does.
+/// On Windows, real-JDK File.<init> strips a leading `/` before a drive
+/// letter so URI-style `/C:/Users/foo` round-trips to `C:\Users\foo`. This
+/// matters for `URL.toURI().getSchemeSpecificPart() -> new File(...)` —
+/// the round-trip Spring Boot's fat-jar launcher relies on. On non-Windows
+/// the input is returned unchanged.
+#[cfg(windows)]
+fn file_normalise_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    // Strip leading `/<drive>:` -> `<drive>:` (e.g. `/C:/foo` -> `C:/foo`).
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        return path[1..].replace('/', "\\");
     }
+    // Otherwise normalise forward slashes for consistency with Java's
+    // canonical Windows path separator.
+    path.replace('/', "\\")
+}
+
+#[cfg(not(windows))]
+fn file_normalise_path(path: &str) -> String {
+    path.to_string()
 }
 
 /// Allocate a new File synthetic with the given path.
@@ -6226,17 +6258,25 @@ fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     obj
 }
 
-pub(crate) fn register_phase57_file(r: &mut NativeMethodRegistry) {
+pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     let file = "java/io/File";
 
     // <init>(String path)V
+    //
+    // Real JDK's File.<init>(String) runs `FileSystem.normalize(...)` which
+    // on Windows strips a leading `/` before a drive letter — e.g. the
+    // URI-style `/C:/Users/foo` produced by `URL.toURI().getSchemeSpecificPart()`
+    // round-trips to `C:\Users\foo`. Spring Boot's fat-jar launcher relies
+    // on that round-trip in Archive.create(File). Apply the same
+    // normalisation so our synthetic File matches HotSpot semantics.
     r.register(file, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let s = ctx.create_string(&path);
+        let normalised = file_normalise_path(&path);
+        let s = ctx.create_string(&normalised);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -10324,7 +10364,7 @@ fn get_process_rss_bytes() -> i64 {
 // Manifest = 2-field synthetic (mainAttrs=0 HashMap, entries=1 HashMap)
 // =============================================================================
 
-pub(crate) fn register_p59_jar(r: &mut NativeMethodRegistry) {
+pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     let jf = "java/util/jar/JarFile";
     r.register(jf, "<init>", "(Ljava/lang/String;)V", p59_jar_file_init);
     r.register(jf, "<init>", "(Ljava/io/File;)V", p59_jar_file_init_file);

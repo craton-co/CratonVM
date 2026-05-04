@@ -869,6 +869,25 @@ impl SharedVm {
             // C4: BootLoader natives (see comment at first registration site above).
             rustjvm_native_builtins::boot_loader::register_boot_loader_natives(&mut native_methods);
             rustjvm_native_builtins::phases_late::register_phase57_nio_file(&mut native_methods);
+            // Spring Boot 3.2 fat-jar launcher needs File.<init>(String) to
+            // normalise URI-style `/<drive>:/...` paths so the round-trip
+            // `URL.toURI().getSchemeSpecificPart() -> new File(...)` lands on
+            // an existing path. The real-JDK File constructor invokes
+            // FileSystem.normalize via bytecode that doesn't run cleanly in
+            // our interpreter (no `WinNTFileSystem.normalize` native
+            // override), so route File constructors and metadata accessors
+            // through our Rust natives in `register_phase57_file`. Paired
+            // with the `check_override` allow-list entry for `java/io/File`.
+            rustjvm_native_builtins::phases_late::register_phase57_file(&mut native_methods);
+            // Spring Boot 3.2: JarFileArchive.<init> opens the fat-jar via
+            // `new JarFile(File)` and immediately calls `jarFile.stream()`
+            // / `jarFile.getManifest()` to walk `BOOT-INF/lib/*.jar`. The
+            // real-JDK ZipFile bytecode reaches into native primitives we
+            // don't wire up, so route JarFile constructors and accessors
+            // through `register_p59_jar` (which uses the `zip` crate to
+            // open the archive directly). Paired with the `check_override`
+            // allow-list entry for `java/util/jar/JarFile`.
+            rustjvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
             rustjvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
             rustjvm_native_builtins::register_charset_natives_pub(&mut native_methods);
             rustjvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);

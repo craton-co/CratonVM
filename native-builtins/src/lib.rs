@@ -1227,9 +1227,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/Class", "desiredAssertionStatus", "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // S110 — initPhase1 wires up System.out/err synthetic streams *and*
+    // System.in (a FileInputStream-shaped object whose slot 0 holds the
+    // stdin fd id 0). Without the System.in install, `new Scanner(System.in)`
+    // sees a null stream and `nextLine()` / `nextInt()` immediately throw
+    // NoSuchElementException. The full init also drops `lineSeparator` into
+    // place so `String.format("%n")` matches HotSpot.
     registry.register(
         "java/lang/System", "initPhase1", "()V",
-        |_ctx, _args| Ok(None),
+        lang_system::native_system_init_phase1,
     );
 
     // --- java.lang.String (native methods + overrides) ---
@@ -1737,13 +1743,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             } else {
                 fwd
             };
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 8);
+            // Allocate a real `java.net.URL` and populate the JDK 25
+            // instance-field layout so both real-JDK URL methods and our
+            // native shims resolve a usable `file:/<path>` URL.
+            //
+            // Real JDK URL fields (declaration order, matching reflection):
+            //   0=protocol, 1=host, 2=port (int), 3=file, 4=query,
+            //   5=authority, 6=path, 7=userInfo, 8=ref,
+            //   9=hostAddress, 10=handler, 11=hashCode (int), 12=tempState.
+            //
+            // Spring Boot 3.2's fat-jar launcher path takes
+            // `pd.getCodeSource().getLocation().toURI().getSchemeSpecificPart()`
+            // and feeds it to `new File(...)`. For that round-trip to
+            // produce a path the Windows File ctor can resolve, we need
+            // `URL.toString()` to emit `file:/<path>`, which real-JDK code
+            // builds from `protocol + ":" + file`. We deliberately leave
+            // `authority` (slot 5) null so URL.toURI doesn't take its
+            // `isBuiltinStreamHandler(handler)` branch and NPE on the
+            // null `handler` slot.
+            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
             let path_str = ctx.create_string(&path);
             let proto_str = ctx.create_string("file");
             let host_str = ctx.create_string("");
-            ctx.set_field(url, 0, Value::Object(Some(path_str)));  // path
-            ctx.set_field(url, 1, Value::Object(Some(proto_str))); // protocol
-            ctx.set_field(url, 2, Value::Object(Some(host_str)));  // host
+            ctx.set_field(url, 0, Value::Object(Some(proto_str))); // protocol
+            ctx.set_field(url, 1, Value::Object(Some(host_str)));  // host
+            ctx.set_field(url, 2, Value::Int(-1));                 // port: -1 = unspecified
+            ctx.set_field(url, 3, Value::Object(Some(path_str)));  // file
+            ctx.set_field(url, 6, Value::Object(Some(path_str)));  // path
             let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
             ctx.set_field(cs, 0, Value::Object(Some(url)));
             ctx.set_field(cs, 1, Value::Object(None));

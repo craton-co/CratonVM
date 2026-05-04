@@ -1155,34 +1155,70 @@ pub(crate) fn native_system_init_phase1(
     _args: &[Value],
 ) -> MethodCallResult {
     // Step 1: Ensure System class is initialized so static fields exist
-    let sys_id = ctx.ensure_class_initialized("java/lang/System")?;
+    ctx.ensure_class_initialized("java/lang/System")?;
 
     // Step 2: Set System.out and System.err from VM-managed streams.
     // The interpreter already intercepts getstatic on System.out/err,
-    // but for completeness we also try to set the static fields.
+    // but we also write the static fields so direct heap reads see them.
+    // `resolve_field_index` is instance-only; `out`/`err`/`in`/`lineSeparator`
+    // are all statics, so we use the static-by-name path (the same one
+    // `setIn0`/`setOut0`/`setErr0` use elsewhere in this crate).
     if let Some(out_stream) = ctx.get_system_stream("out") {
-        if let Some(out_idx) = ctx.resolve_field_index("java/lang/System", "out") {
-            ctx.set_static_field(sys_id, out_idx, Value::Object(Some(out_stream)));
-        }
+        ctx.set_static_field_by_name("java/lang/System", "out", Value::Object(Some(out_stream)));
     }
     if let Some(err_stream) = ctx.get_system_stream("err") {
-        if let Some(err_idx) = ctx.resolve_field_index("java/lang/System", "err") {
-            ctx.set_static_field(sys_id, err_idx, Value::Object(Some(err_stream)));
-        }
+        ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }
-    // System.in — we don't create a real InputStream yet, but set null
-    // so that callers don't hit an uninitialized-field crash.
-    if let Some(in_idx) = ctx.resolve_field_index("java/lang/System", "in") {
-        ctx.set_static_field(sys_id, in_idx, Value::Object(None));
+    // S110 — System.in: wire up to OS stdin (fd id 0 in our FileDescriptorTable,
+    // which pre-registers it). The synthetic `Scanner.<init>(InputStream)`
+    // native in `native-io/src/lib.rs` reads field 0 of the stream object;
+    // when it sees `Value::Int(fd)` it pulls bytes via `fd_table().read_byte`.
+    // Allocating a FileInputStream-shaped object with field 0 = Int(0) is
+    // therefore enough to make `new Scanner(System.in)` consume real stdin.
+    //
+    // Without this install, `System.in` was null, so `new Scanner(System.in)`
+    // got the empty-string fallback in the native and `nextLine()`/`nextInt()`
+    // immediately threw `NoSuchElementException: no more elements`.
+    {
+        // S110 — wire System.in to OS stdin. The real FileInputStream layout
+        // has slot 0 typed `Ljava/io/FileDescriptor;` (a reference); writing
+        // `Value::Int(0)` (= stdin fd id 0) into that slot via `set_field`
+        // hits the descriptor-aware coercion in `gc::heap` which rewrites
+        // `Int(0)` as `Object(None)` — defeating the whole point.
+        //
+        // Two-slot encoding gets around it without touching the heap:
+        //   * slot 0 stays a reference slot (coerced to `Object(None)`,
+        //     which is fine — readers ignore it and check slot 1)
+        //   * slot 1 holds the fd id as `Value::Int(fd + 1)` so the value is
+        //     never zero (zero would also be coerced if slot 1 turns out
+        //     to be a reference).
+        //
+        // The Scanner native at `native-io/src/lib.rs::native_scanner_init_inputstream`
+        // mirrors this: it checks slot 1 for `Int(n)` with `n > 0`, treats
+        // `n - 1` as the fd id, and falls through to the existing
+        // ByteArrayInputStream / fd-based detection paths.
+        let fis_class_id = ctx.ensure_class_initialized("java/io/FileInputStream")?;
+        let num_fields = ctx.class_num_total_fields(fis_class_id).max(2);
+        let in_obj = ctx.alloc_object(fis_class_id, num_fields);
+        // Stdin fd id is 0; encode as `Int(1)` so `coerce_field_value_by_descriptor`
+        // does not collapse it to `Object(None)` on the way into the slot.
+        ctx.set_field(in_obj, 1, Value::Int(1));
+        ctx.set_static_field_by_name(
+            "java/lang/System",
+            "in",
+            Value::Object(Some(in_obj)),
+        );
     }
 
     // Step 3: Set System.lineSeparator from the line.separator property
     let line_sep = ctx.get_system_property("line.separator")
         .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     let line_sep_obj = ctx.create_string(&line_sep);
-    if let Some(ls_idx) = ctx.resolve_field_index("java/lang/System", "lineSeparator") {
-        ctx.set_static_field(sys_id, ls_idx, Value::Object(Some(line_sep_obj)));
-    }
+    ctx.set_static_field_by_name(
+        "java/lang/System",
+        "lineSeparator",
+        Value::Object(Some(line_sep_obj)),
+    );
 
     Ok(None)
 }

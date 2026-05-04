@@ -1499,22 +1499,85 @@ fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
 
-    // Our getResources override returns synthetic URL objects that never run
-    // java.net.URL.<init>, so the real-JDK toString()/toExternalForm() NPE
-    // when they read the (null) protocol/host fields.  Override both to
-    // return field 5 (our stored full URL string) or field 0 as a fallback.
+    // Our getResources / Class.getProtectionDomain overrides return URL
+    // objects that never run java.net.URL.<init>, so the real-JDK
+    // toString()/toExternalForm() NPE when they invoke the (null)
+    // URLStreamHandler. We build the external form ourselves.
+    //
+    // Two layouts must be supported:
+    //   * Synthetic-mode 6-field URL where field 5 holds the full URL string
+    //     (populated by our `url_parse` constructor).
+    //   * Real-JDK 13-field URL where field 0=protocol, 1=host, 2=port (int),
+    //     3=file, 4=query, 5=authority, 6=path, 8=ref, 10=handler. The full
+    //     external form is `protocol:[//host[:port]]file[#ref]` per
+    //     java.net.URL.toString.
+    //
+    // We try the synthetic field-5 fast path first (works whenever url_parse
+    // ran), then the real-JDK reconstruction (matches HotSpot output for
+    // synthetic URLs allocated by Class.getProtectionDomain).
     let url_to_string = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let s = match ctx.get_field(this, 5) {
+        // Synthetic fast path: a non-empty field-5 string is the cached
+        // full URL written by url_parse.  We treat any string containing
+        // ":" as a full URL so we don't mistake the real-JDK `authority`
+        // slot for a synthetic full-URL cache.
+        let synth_full = match ctx.get_field(this, 5) {
             Value::Object(Some(o)) => ctx.read_string(o),
             _ => None,
+        };
+        if let Some(ref s) = synth_full {
+            if s.contains(':') && !s.is_empty() {
+                return Ok(Some(Value::Object(Some(ctx.create_string(s)))));
+            }
         }
-        .or_else(|| match ctx.get_field(this, 0) {
+        // Real-JDK reconstruction: protocol:[//host[:port]]file[#ref].
+        let proto = match ctx.get_field(this, 0) {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let host = match ctx.get_field(this, 1) {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let port = match ctx.get_field(this, 2) {
+            Value::Int(i) => i,
+            _ => -1,
+        };
+        let file = match ctx.get_field(this, 3) {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let ref_str = match ctx.get_field(this, 8) {
             Value::Object(Some(o)) => ctx.read_string(o),
             _ => None,
-        })
-        .unwrap_or_default();
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        };
+        let mut out = String::new();
+        if !proto.is_empty() {
+            out.push_str(&proto);
+            out.push(':');
+        }
+        if !host.is_empty() || port >= 0 {
+            out.push_str("//");
+            out.push_str(&host);
+            if port >= 0 {
+                out.push(':');
+                out.push_str(&port.to_string());
+            }
+        }
+        out.push_str(&file);
+        if let Some(r) = ref_str {
+            out.push('#');
+            out.push_str(&r);
+        }
+        // Ultimate fallback: if we built nothing useful, fall back to the
+        // legacy field-0 read for synthetic-mode URLs that stored the
+        // full path at slot 0.
+        if out.is_empty() || out == ":" {
+            if let Some(s) = synth_full {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&s)))));
+            }
+        }
+        Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
     };
     r.register(url, "toString", "()Ljava/lang/String;", url_to_string);
     r.register(url, "toExternalForm", "()Ljava/lang/String;", url_to_string);
