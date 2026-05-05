@@ -3294,11 +3294,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // LaunchedURLClassLoader -> URLClassLoader.<init>(URL[], ClassLoader)
     // -> URLClassPath.<init>(URL[]) at line 131 (`new ArrayList<>(urls.length)`)
     // because `urls` arrives as null. Install a defensive constructor that
-    // treats null-or-empty URL[] as empty and initialises the `path`,
-    // `unopenedUrls`, and `jarHandler` instance fields with real
-    // ArrayList / ArrayDeque instances. The other instance-init fields
-    // (`loaders`, `lmap`, `closed`) are populated by the JVM's instance
-    // initializer block before our native runs, so we don't touch them.
+    // treats null-or-empty URL[] as empty and initialises every instance
+    // field that the real Java code would populate (either through inline
+    // field initializers folded into the bytecode constructor, or via the
+    // explicit `this.path = ...` / `this.unopenedUrls = ...` assignments).
+    //
+    // SB3 (S111r15): Spring's CandidateComponentsIndexLoader enumerates
+    // `META-INF/spring.components` via ClassLoader.getResources, which
+    // descends into URLClassPath.getLoader(int). Line 393 reads
+    // `loaders.size()`; if `loaders` is null we NPE. Real Java relies on
+    // the inline field initializers at URLClassPath.java:108/111/117
+    //     private final ArrayList<Loader> loaders = new ArrayList<>();
+    //     private final HashMap<String, Loader> lmap = new HashMap<>();
+    //     private boolean closed = false;
+    // which the bytecode compiler folds into the constructor before any
+    // explicit assignments. Our native replaces the constructor outright,
+    // so those initializers never run unless we do them by hand.
     fn ucp_init_2(
         ctx: &mut dyn NativeContext,
         args: &[Value],
@@ -3330,6 +3341,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "()V",
             &[Value::Object(Some(unopened))],
         )?;
+        // Construct loaders = new ArrayList<>() — required for getLoader(int)
+        // which reads loaders.size() at URLClassPath.java:393.
+        let loaders = match ctx.new_object("java/util/ArrayList")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(loaders))],
+        )?;
+        // Construct lmap = new HashMap<>() — guards getLoader(int)'s
+        // `lmap.containsKey(...)` check at URLClassPath.java:402.
+        let lmap = match ctx.new_object("java/util/HashMap")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/HashMap",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(lmap))],
+        )?;
         // Iterate URLs (if non-null) and seed both collections.
         if let Value::Object(Some(arr)) = urls_val {
             let len = ctx.array_length(arr);
@@ -3351,7 +3386,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
         ctx.set_field_by_name(this, "path", Value::Object(Some(path)));
         ctx.set_field_by_name(this, "unopenedUrls", Value::Object(Some(unopened)));
+        ctx.set_field_by_name(this, "loaders", Value::Object(Some(loaders)));
+        ctx.set_field_by_name(this, "lmap", Value::Object(Some(lmap)));
         ctx.set_field_by_name(this, "jarHandler", Value::Object(None));
+        ctx.set_field_by_name(this, "closed", Value::Int(0));
         Ok(None)
     }
     fn ucp_init_1(
@@ -3735,6 +3773,83 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(buf, "checkSession", "()V", |_ctx, _args| Ok(None));
     }
+
+    // S111r15 — Character.toLowerCase / toUpperCase native overrides for
+    // real-JDK mode. The JDK bytecode delegates `(C)C` to `(I)I`, which
+    // walks `CharacterData.of(I)CharacterData` and an invokevirtual on the
+    // returned subclass. After ~2000 invocations the JIT compiles `build()`
+    // (or any caller of `Character.toLowerCase`) and the resulting machine
+    // code returns 0 for most inputs — corrupting Spring's
+    // `BeanPropertyName.toDashedForm`: `bannerMode` becomes
+    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`, tripping
+    // `InvalidConfigurationPropertyNameException` in SportMe boot.
+    // Routing the (C)C / (I)I forms through Rust's `char::to_lowercase` /
+    // `char::to_uppercase` defeats the JIT path entirely. Symmetric
+    // registration of all four forms keeps the native-shadow guard on
+    // every JIT entry point (callee_compiler / try_jit_compile_callee /
+    // try_jit_upgrade_with_gate / first-call / OSR) honored uniformly.
+    registry.register(
+        "java/lang/Character",
+        "toLowerCase",
+        "(C)C",
+        |_ctx, args| {
+            let ch = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let result = char::from_u32(ch)
+                .and_then(|c| c.to_lowercase().next())
+                .unwrap_or('\0') as u32;
+            Ok(Some(Value::Int(result as i32)))
+        },
+    );
+    registry.register(
+        "java/lang/Character",
+        "toUpperCase",
+        "(C)C",
+        |_ctx, args| {
+            let ch = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let result = char::from_u32(ch)
+                .and_then(|c| c.to_uppercase().next())
+                .unwrap_or('\0') as u32;
+            Ok(Some(Value::Int(result as i32)))
+        },
+    );
+    registry.register(
+        "java/lang/Character",
+        "toLowerCase",
+        "(I)I",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let result = char::from_u32(cp as u32)
+                .and_then(|c| c.to_lowercase().next())
+                .map(|c| c as u32 as i32)
+                .unwrap_or(cp);
+            Ok(Some(Value::Int(result)))
+        },
+    );
+    registry.register(
+        "java/lang/Character",
+        "toUpperCase",
+        "(I)I",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let result = char::from_u32(cp as u32)
+                .and_then(|c| c.to_uppercase().next())
+                .map(|c| c as u32 as i32)
+                .unwrap_or(cp);
+            Ok(Some(Value::Int(result)))
+        },
+    );
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
@@ -20612,6 +20727,107 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Map;)V",
         |_ctx, _args| Ok(None),
     );
+
+    // SB2-NPE: Spring Boot 2.x fat-jars hit
+    // `LogAdapter$Slf4jLog.<init>(Logger)` with a null logger because the
+    // bytecode flow `LoggerFactory.getLogger(name) -> getILoggerFactory()
+    // -> ILoggerFactory.getLogger(name)` lands on the synthetic
+    // ILoggerFactory we returned above, which has no `getLogger` native
+    // and so returns null (default-Object reference) → NPE on
+    // `logger.getName()` at LogAdapter.java:279.
+    //
+    // Mirror the synthetic-jdk `LoggerFactory.getLogger(String)` stub on
+    // the real-JDK path: register `ILoggerFactory.getLogger(String)` to
+    // hand back a synthetic Logger whose `name` field is the requested
+    // string, plus the small surface (`getName`, `is*Enabled`, `trace/
+    // debug/info/warn/error`) that LogAdapter and friends invoke.
+    //
+    // We use BOTH `set_field_by_name("name", ...)` (matches the real
+    // `org.slf4j.helpers.NamedLoggerBase.name` slot when the synthetic
+    // Logger object happens to share that layout) and a slot-0 fallback
+    // (matches our synthetic-jdk `SLF4J_NAME = 0` invariant) so the
+    // accessor below can find the name regardless of which path
+    // allocated the Logger.
+    registry.register(
+        "org/slf4j/ILoggerFactory",
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/slf4j/Logger;",
+        |ctx, args| {
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            // Best-effort dual-write: name-by-name (real layout) +
+            // name-at-slot-0 (synthetic layout).
+            ctx.set_field_by_name(logger, "name", name);
+            ctx.set_field(logger, 0, name);
+            Ok(Some(Value::Object(Some(logger))))
+        },
+    );
+
+    // Logger.getName() — read by-name first, fall back to slot 0. The
+    // synthetic-jdk `register_slf4j_natives` registers a slot-0-reading
+    // version that is replayed AFTER this fn (last-writer-wins is
+    // harmless because both versions return the same value when both
+    // writes happened).
+    registry.register(
+        "org/slf4j/Logger",
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Prefer real-layout `name` field; fall back to synthetic
+            // slot 0; final fallback is empty string so callers like
+            // `Slf4jLog.<init>` never see null.
+            let v = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(s)) => Value::Object(Some(s)),
+                    _ => Value::Object(Some(ctx.create_string(""))),
+                },
+            };
+            Ok(Some(v))
+        },
+    );
+
+    // Level checks — return false so log call sites short-circuit. The
+    // synthetic-jdk path overrides these with level-aware versions,
+    // which is fine because the registration order in
+    // `register_slf4j_natives` is binder-LAST and we only get called
+    // there if no level-aware override has been registered yet.
+    fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(0)))
+    }
+    registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
+
+    // No-op log methods (covers the most common arities that JCL /
+    // commons-logging / direct-SLF4J callers use). The synthetic-jdk
+    // `register_slf4j_natives` overrides several of these with
+    // dispatched-to-stdout versions; that override is harmless because
+    // the binder helper runs last in synthetic mode, but here in
+    // real-JDK mode we want pure no-ops.
+    fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(None)
+    }
+    let lg = "org/slf4j/Logger";
+    for sig in [
+        "(Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;[Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ] {
+        registry.register(lg, "trace", sig, slf4j_noop);
+        registry.register(lg, "debug", sig, slf4j_noop);
+        registry.register(lg, "info", sig, slf4j_noop);
+        registry.register(lg, "warn", sig, slf4j_noop);
+        registry.register(lg, "error", sig, slf4j_noop);
+    }
 }
 
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {

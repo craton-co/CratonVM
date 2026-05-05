@@ -1392,12 +1392,24 @@ pub fn execute(
         // under deep recursion and must run in the interpreter pending a
         // proper regalloc fix.
         let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
+        // S111r15 — refuse to JIT a method shadowed by a Rust native at this
+        // FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
+        // (whose JDK bytecode delegates to `(I)I` → `CharacterData.of/
+        // toLowerCase` virtual chain) gets JIT-compiled, and after warm-up
+        // the resulting machine code returns 0 for most inputs, corrupting
+        // Spring's `BeanPropertyName.toDashedForm` (`bannerMode` →
+        // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
+        // `InvalidConfigurationPropertyNameException` during SportMe boot.
+        let native_skip = shared
+            .native_methods
+            .find(&class_name_str, method_name, method_descriptor)
+            .is_some();
         // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing RUSTJVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
-        if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip {
+        if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip || native_skip {
             // Method has known JIT issues — skip JIT.
         } else {
         {
@@ -9365,6 +9377,16 @@ fn try_osr(
     }
     // Get method info from frame metadata
     let method_descriptor = frame.method_descriptor().to_string();
+    // S111r15 — same native-shadow guard as the other JIT entry points
+    // (`try_jit_compile_callee`, `try_jit_upgrade_with_gate`, first-call
+    // compile path). OSR must respect the native registration too.
+    if shared
+        .native_methods
+        .find(class_name_check, method_name_check, &method_descriptor)
+        .is_some()
+    {
+        return None;
+    }
     let class_name = frame.class_name().to_string();
     let method_name = frame.method_name().to_string();
     let code = frame.code.clone();
@@ -9800,6 +9822,26 @@ fn try_jit_upgrade_with_gate(
     if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
         return None;
     }
+    // S111r15 — refuse to JIT a method that has a Rust native shadow.
+    // Mirrors the equivalent gate in `try_jit_compile_callee` so the
+    // caller-method-counter path doesn't bypass natives that the
+    // dispatcher path correctly defers to. Concretely: without this
+    // check, `Character.toLowerCase(C)C` got JIT-compiled (its JDK
+    // bytecode delegates to `(I)I` → `CharacterData.of/toLowerCase`
+    // virtual chain), and the resulting machine code returned 0 for
+    // most inputs after warm-up, corrupting Spring's
+    // `BeanPropertyName.toDashedForm` (`bannerMode` →
+    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
+    // `InvalidConfigurationPropertyNameException` during SportMe boot.
+    {
+        if shared
+            .native_methods
+            .find(&cached.class_name, &cached.method_name, &cached.method_descriptor)
+            .is_some()
+        {
+            return None;
+        }
+    }
     // W2-CHM: honor the JIT skip list on this caller-method-counter
     // promotion path too. Previously only the first-call compile path
     // (interpreter.rs::~1112) and the callee-dispatcher path
@@ -9964,6 +10006,24 @@ fn try_jit_upgrade_with_gate(
             // RFJP.1 — never JIT a callee on a class transitively extending
             // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
             if is_fjp_subclass_blocklisted(shared, callee_class) {
+                return None;
+            }
+            // S111r15 — refuse to compile a callee that has a Rust native
+            // shadow. Mirrors the gate in `try_jit_compile_callee` /
+            // `try_jit_upgrade_with_gate` / first-call JIT / OSR. Without
+            // this check, the recursive callee-compile path direct-called
+            // `Character.toLowerCase(C)C`'s JDK bytecode (which delegates
+            // to `(I)I` → `CharacterData.of/toLowerCase` virtual chain),
+            // and the resulting machine code returned 0 for most inputs
+            // after warm-up. Result: Spring's
+            // `BeanPropertyName.toDashedForm` produced
+            // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
+            // `InvalidConfigurationPropertyNameException` in SportMe.
+            if shared
+                .native_methods
+                .find(callee_class, callee_method, callee_desc)
+                .is_some()
+            {
                 return None;
             }
             // Check JIT cache first

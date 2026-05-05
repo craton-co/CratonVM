@@ -336,6 +336,29 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "(C)C",
         native_character_to_lower_case,
     );
+    // S111r15 — Character.toLowerCase(I)I / toUpperCase(I)I:
+    // The (C)C variants delegate to (I)I via JDK bytecode (`iload_0;
+    // invokestatic toLowerCase(I)I; i2c; ireturn`). When the JIT compiles
+    // the (I)I overload (which itself calls CharacterData.of + virtual
+    // toLowerCase), the resulting machine code returns 0 for some
+    // inputs, corrupting Spring's `BeanPropertyName.toDashedForm` to
+    // produce names like "r\0\0\0\0\0\0\0-\0\0\0\0\0\0" and tripping
+    // `InvalidConfigurationPropertyNameException` in SportMe boot. The
+    // (C)C variant only triggers because the (I)I bug poisons the
+    // CharacterData chain. Register the (I)I forms as natives so the
+    // JIT bypass kicks in for the entire chain.
+    registry.register(
+        "java/lang/Character",
+        "toLowerCase",
+        "(I)I",
+        native_character_to_lower_case_int,
+    );
+    registry.register(
+        "java/lang/Character",
+        "toUpperCase",
+        "(I)I",
+        native_character_to_upper_case_int,
+    );
     registry.register(
         "java/lang/Character",
         "isLetterOrDigit",
@@ -2436,6 +2459,44 @@ pub(crate) fn native_character_to_lower_case(
         .and_then(|c| c.to_lowercase().next())
         .unwrap_or('\0') as u32;
     Ok(Some(Value::Int(result as i32)))
+}
+
+/// `Character.toLowerCase(int)` — code-point variant. Fall-through to the
+/// same Rust `char::to_lowercase` for valid scalar values; pass invalid /
+/// out-of-range code points back unchanged (matching JDK behaviour for
+/// non-character integers).
+pub(crate) fn native_character_to_lower_case_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let cp = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let result = char::from_u32(cp as u32)
+        .and_then(|c| c.to_lowercase().next())
+        .map(|c| c as u32 as i32)
+        .unwrap_or(cp);
+    Ok(Some(Value::Int(result)))
+}
+
+/// `Character.toUpperCase(int)` — code-point variant, mirror of
+/// `toLowerCase(I)I` to keep the JIT-bypass symmetric (the same compile
+/// path that miscompiles the lowercase chain miscompiles the uppercase
+/// chain — register both pre-emptively).
+pub(crate) fn native_character_to_upper_case_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let cp = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let result = char::from_u32(cp as u32)
+        .and_then(|c| c.to_uppercase().next())
+        .map(|c| c as u32 as i32)
+        .unwrap_or(cp);
+    Ok(Some(Value::Int(result)))
 }
 
 pub(crate) fn native_character_is_letter_or_digit(
