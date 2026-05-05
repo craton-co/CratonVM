@@ -1748,9 +1748,143 @@ pub fn make_hashset_with_elements(
     ctx: &mut dyn NativeContext,
     elems: &[Value],
 ) -> ObjectRef {
+    // S111r13: Build the backing HashMap using the real-JDK field layout
+    // (`table`, `size`, `threshold`, `loadFactor`, `entrySet`) instead of
+    // the synthetic 3-field `(buckets, size, capacity)` layout.
+    //
+    // Why: JDK `HashSet.spliterator()` does
+    //   `new HashMap.KeySpliterator<>(this.map, ...)` and reads the map's
+    // `table` field directly via `getfield`. With the synthetic layout,
+    // slot 2 held `Int(capacity=16)` rather than the bucket array, so
+    // downstream `arraylength` panicked with
+    //   `internal error: expected object reference, got int(16)`.
+    //
+    // Strategy: resolve the real HashMap / HashMap$Node field slot indices
+    // via `resolve_field_index`. If every required field is resolvable,
+    // allocate enough field slots to cover the real layout, populate at
+    // the real indices, and build the bucket array + Node chain so that
+    // bytecode `getfield`/`arraylength` see the correct types. Falls back
+    // to the legacy synthetic 3-field layout if any slot resolution fails
+    // (e.g. running before bootstrap completes or against a synthetic stub).
+    //
+    // Hashing follows the JDK formula: `h = key.hashCode() ^ (h >>> 16)`,
+    // and bucket index is `(n - 1) & hash` for power-of-two `n`.
+    let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+
+    // Best-effort: ensure the real classes are loaded so the field-index
+    // resolver can see them.
+    let hashmap_class_id = ctx
+        .ensure_class_initialized("java/util/HashMap")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/util/HashMap"))
+        .unwrap_or(ClassId::new(0));
+    let _ = ctx.ensure_class_initialized("java/util/HashMap$Node");
+    let node_class_id = ctx
+        .class_id_by_name("java/util/HashMap$Node")
+        .unwrap_or(ClassId::new(0));
+
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+    let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+    let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+    let n_hash = ctx.resolve_field_index("java/util/HashMap$Node", "hash");
+    let n_key = ctx.resolve_field_index("java/util/HashMap$Node", "key");
+    let n_value = ctx.resolve_field_index("java/util/HashMap$Node", "value");
+    let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
+
+    if let (
+        Some(f_table),
+        Some(f_size),
+        Some(f_threshold),
+        Some(f_loadfactor),
+        Some(f_entryset),
+        Some(n_hash),
+        Some(n_key),
+        Some(n_value),
+        Some(n_next),
+    ) = (
+        f_table, f_size, f_threshold, f_loadfactor, f_entryset, n_hash, n_key,
+        n_value, n_next,
+    ) {
+        let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let node_n_fields = [n_hash, n_key, n_value, n_next]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let buckets = alloc_ref_array(ctx, cap);
+        let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
+        ctx.set_field(backing_map, f_size, Value::Int(0));
+        ctx.set_field(backing_map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        ctx.set_field(backing_map, f_loadfactor, Value::Float(0.75));
+        ctx.set_field(backing_map, f_entryset, Value::Object(None));
+
+        // Resolve HashSet's `map` slot too, with a defensive fallback to
+        // the synthetic `HS_FIELD_MAP = 0` if unresolved.
+        let hs_map_slot = ctx
+            .resolve_field_index("java/util/HashSet", "map")
+            .unwrap_or(HS_FIELD_MAP);
+        let hs_n_fields = std::cmp::max(hs_map_slot + 1, HS_NUM_FIELDS);
+        let set = alloc_synthetic(ctx, "java/util/HashSet", hs_n_fields);
+        ctx.set_field(set, hs_map_slot, Value::Object(Some(backing_map)));
+
+        let sentinel = Value::Object(None); // PRESENT marker; null is fine for "is in set"
+        let mut size = 0i32;
+        for elem in elems {
+            let key_obj = match elem {
+                Value::Object(Some(obj)) => *obj,
+                _ => continue, // skip nulls / primitives we can't hash
+            };
+            let raw_hash = map_hash_key(ctx, key_obj);
+            // map_hash_key already applies the (h ^ h>>>16) spread; the
+            // bucket index uses raw_hash as-is for power-of-two cap.
+            let idx = ((cap as u32 - 1) & raw_hash as u32) as usize;
+
+            // Skip duplicates (real-JDK Set.of rejects them; we just no-op).
+            let mut existing_head = ctx.get_array_element(buckets, idx);
+            let mut dup = false;
+            let mut probe = existing_head;
+            while let Value::Object(Some(probe_obj)) = probe {
+                let probe_key = ctx.get_field(probe_obj, n_key);
+                if let Value::Object(Some(pk)) = probe_key {
+                    if map_keys_equal(ctx, pk, key_obj) {
+                        dup = true;
+                        break;
+                    }
+                }
+                probe = ctx.get_field(probe_obj, n_next);
+            }
+            if dup {
+                continue;
+            }
+            // Re-read head in case ctx mutated between probes (defensive).
+            existing_head = ctx.get_array_element(buckets, idx);
+
+            let node = ctx.alloc_object(node_class_id, node_n_fields);
+            ctx.set_field(node, n_hash, Value::Int(raw_hash));
+            ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
+            ctx.set_field(node, n_value, sentinel);
+            ctx.set_field(node, n_next, existing_head);
+            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+            size += 1;
+        }
+        ctx.set_field(backing_map, f_size, Value::Int(size));
+        return set;
+    }
+
+    // Legacy fallback: synthetic 3-field (buckets, size, capacity) layout.
+    // Used when real HashMap/Node classes aren't resolvable yet.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
-    let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));

@@ -862,6 +862,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // parseCookie, …).  Registered after the T19.H2 shim so the
     // WP1.4 widened method set overrides the T19.H2 minimum.
     shared_secrets_bridge::register_wp1_4_shared_secrets(registry);
+
+    // S111r12 SB3 follow-on: post-banner Spring Boot 3 boot reaches
+    // `PathMatchingResourcePatternResolver.<clinit>` which calls
+    // `SystemModuleFinders.ofSystem()` → `SystemModules$all.moduleDescriptors()`
+    // → `jdk.internal.module.Builder.newExports(...)`.  `Builder.newExports`
+    // (Builder.java:99) delegates to the static field
+    // `JLMA = SharedSecrets.getJavaLangModuleAccess()` which we never wired
+    // up — so JLMA is null and `JLMA.newExports(...)` NPEs.
+    //
+    // Fix: register native overrides for the five `Builder.new*` static
+    // factories (`newExports` x2, `newOpens` x2, `newProvides`, `newRequires`
+    // x2, `newVersion`) so the JLMA dereference is bypassed.  Each native
+    // allocates a synthetic instance of the corresponding `ModuleDescriptor$*`
+    // inner class with the original constructor arguments stashed in
+    // recognisable named fields (`source`, `targets`, `mods`, `name`,
+    // `version`, `service`, `providers`).  Spring's `<clinit>` only requires
+    // the descriptor walk to NOT throw; it does not deeply inspect the
+    // returned objects, so synthetic stand-ins are sufficient.
+    //
+    // The fields are written via `set_field_by_name` which is layout-tolerant
+    // (slot-resolved at runtime), so the same code path works whether the
+    // real-JDK ModuleDescriptor inner classes are loaded with their full
+    // private fields or our synthetic minimum-field allocation is in play.
+    register_module_builder_overrides(registry);
     // T19.H2: Lookup clinit dependency natives — Reflection.registerFieldsToFilter,
     // ClassFileDumper.getInstance, Set.of(Obj,…) overloads up to 8-arg.
     register_t19_h2_lookup_clinit_deps(registry);
@@ -11922,6 +11946,358 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread;",
         native_jla_current_carrier_thread,
     );
+}
+
+// ---------------------------------------------------------------------------
+// S111r12 SB3 follow-on: jdk.internal.module.Builder.new* static overrides
+// ---------------------------------------------------------------------------
+//
+// Real-JDK `Builder.newExports` (Builder.java:99) bytecode is:
+//
+//     return JLMA.newExports(ms, pn, targets);
+//
+// where `JLMA = SharedSecrets.getJavaLangModuleAccess()`.  Rustjvm's
+// SharedSecrets bridge (`shared_secrets_bridge.rs`) does not wire up a
+// `JavaLangModuleAccess` singleton (that interface holds 13 methods,
+// most of which require a fully-implemented module-descriptor builder
+// surface that goes far beyond what SB3 boot exercises).  Without a
+// JLMA, the static field is null and the `invokeinterface` NPEs.
+//
+// Spring Boot 3's only consumer of `SystemModuleFinders.ofSystem` →
+// `SystemModules$all.moduleDescriptors` is the `<clinit>` of
+// `PathMatchingResourcePatternResolver` (Spring uses the class loader's
+// boot ModuleLayer to enumerate resource roots).  That walk only needs
+// each `Builder.new*` call to NOT throw; the returned objects flow into
+// `Set.of(...)` and ultimately into `newModuleDescriptor(...)` whose
+// result is also synthetic in our boot path.
+//
+// Strategy: register native overrides for each static factory that
+// allocate a synthetic instance of the matching `ModuleDescriptor$*`
+// inner class and stash the original args under JDK-standard field
+// names (`source`, `targets`, `mods`, `name`, `compiledVersion`,
+// `service`, `providers`).  `set_field_by_name` is slot-resolved so it
+// is robust to either the real-JDK private-field layout or our
+// synthetic minimum-field allocation.
+
+fn module_builder_alloc_with_named_fields(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    fields: &[(&str, Value)],
+) -> ObjectRef {
+    // Allocate enough slots for the named fields plus a safety margin;
+    // `alloc_concurrent_synthetic` widens to the real-JDK field count
+    // when the class is loaded.
+    let obj = alloc_concurrent_synthetic(ctx, class_name, fields.len().max(4));
+    for (name, value) in fields {
+        ctx.set_field_by_name(obj, name, *value);
+    }
+    obj
+}
+
+fn native_module_builder_new_exports_qualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String source, Set<String> targets) -> Exports
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        &[("mods", mods), ("source", source), ("targets", targets)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_exports_unqualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String source) -> Exports
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        &[("mods", mods), ("source", source)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_opens_qualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Opens",
+        &[("mods", mods), ("source", source), ("targets", targets)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_opens_unqualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Opens",
+        &[("mods", mods), ("source", source)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_requires_versioned(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String mn, String compiledVersion) -> Requires
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Requires",
+        &[
+            ("mods", mods),
+            ("name", mn),
+            ("compiledVersion", compiled),
+        ],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_requires_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String mn) -> Requires
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Requires",
+        &[("mods", mods), ("name", mn)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_provides(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String service, List<String> providers) -> Provides
+    let service = args.first().copied().unwrap_or(Value::Object(None));
+    let providers = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Provides",
+        &[("service", service), ("providers", providers)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_version(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String v) -> Version
+    let v = args.first().copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Version",
+        &[("version", v)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_build(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Instance method: build(int hashCode) -> ModuleDescriptor
+    // args[0] = this (Builder), args[1] = hashCode int
+    // The real impl calls JLMA.newModuleDescriptor(name, version, …) — JLMA
+    // is null in our boot.  Allocate a synthetic ModuleDescriptor and copy
+    // over the readable Builder state into matching named fields.
+    let this = args.first().copied().unwrap_or(Value::Object(None));
+    let md = alloc_concurrent_synthetic(
+        ctx,
+        "java/lang/module/ModuleDescriptor",
+        16,
+    );
+    if let Value::Object(Some(builder)) = this {
+        for f in [
+            "name",
+            "version",
+            "requires",
+            "exports",
+            "opens",
+            "uses",
+            "provides",
+            "packages",
+            "mainClass",
+        ] {
+            let v = ctx.get_field_by_name(builder, f);
+            ctx.set_field_by_name(md, f, v);
+        }
+    }
+    if let Some(Value::Int(h)) = args.get(1) {
+        ctx.set_field_by_name(md, "hashCode", Value::Int(*h));
+    }
+    Ok(Some(Value::Object(Some(md))))
+}
+
+fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
+    let owner = "jdk/internal/module/Builder";
+    // newExports(Set<Modifier>, String, Set<String>) -> Exports (qualified)
+    registry.register(
+        owner,
+        "newExports",
+        "(Ljava/util/Set;Ljava/lang/String;Ljava/util/Set;)Ljava/lang/module/ModuleDescriptor$Exports;",
+        native_module_builder_new_exports_qualified,
+    );
+    // newExports(Set<Modifier>, String) -> Exports (unqualified)
+    registry.register(
+        owner,
+        "newExports",
+        "(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Exports;",
+        native_module_builder_new_exports_unqualified,
+    );
+    // newOpens(Set<Modifier>, String, Set<String>) -> Opens (qualified)
+    registry.register(
+        owner,
+        "newOpens",
+        "(Ljava/util/Set;Ljava/lang/String;Ljava/util/Set;)Ljava/lang/module/ModuleDescriptor$Opens;",
+        native_module_builder_new_opens_qualified,
+    );
+    // newOpens(Set<Modifier>, String) -> Opens (unqualified)
+    registry.register(
+        owner,
+        "newOpens",
+        "(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Opens;",
+        native_module_builder_new_opens_unqualified,
+    );
+    // newRequires(Set<Modifier>, String, String) -> Requires (with version)
+    registry.register(
+        owner,
+        "newRequires",
+        "(Ljava/util/Set;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Requires;",
+        native_module_builder_new_requires_versioned,
+    );
+    // newRequires(Set<Modifier>, String) -> Requires
+    registry.register(
+        owner,
+        "newRequires",
+        "(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Requires;",
+        native_module_builder_new_requires_short,
+    );
+    // newProvides(String, List<String>) -> Provides
+    registry.register(
+        owner,
+        "newProvides",
+        "(Ljava/lang/String;Ljava/util/List;)Ljava/lang/module/ModuleDescriptor$Provides;",
+        native_module_builder_new_provides,
+    );
+    // build(int) -> ModuleDescriptor (instance method, also goes through JLMA)
+    registry.register(
+        owner,
+        "build",
+        "(I)Ljava/lang/module/ModuleDescriptor;",
+        native_module_builder_build,
+    );
+    // The Builder.version(String) bytecode goes through Version.parse —
+    // we override the Builder method to skip parse and stash the raw
+    // string in a synthetic Version object so the static cache field
+    // does not feed downstream NPE paths.  We register against
+    // `Version.parse` directly because Builder.version() doesn't have
+    // a separate factory entry; Builder uses Version.parse().
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
+        native_module_builder_new_version,
+    );
+
+    // S111r12 SB3 follow-on (continued): downstream of `Builder.newExports`
+    // is `Builder.exports(Exports[])` which delegates to
+    // `Set.of(exports)`.  `ImmutableCollections$SetN.probe` calls
+    // `Exports.hashCode()` which dereferences the private `mods`,
+    // `source`, `targets` fields:
+    //
+    //     int hash = modsHashCode(mods);                // NPE on null mods
+    //     hash = hash * 43 + source.hashCode();
+    //     return hash * 43 + targets.hashCode();
+    //
+    // Our synthetic stand-ins may have any of those null (Builder is called
+    // from generated `SystemModules$all.moduleDescriptors` which builds the
+    // Sets first).  Override `hashCode`/`equals` on the four
+    // ModuleDescriptor$* inner classes to identity-based defaults.  The
+    // descriptor walk only needs hashCode to be well-defined and equals
+    // to be reflexive — Set.of's duplicate detection just needs a
+    // consistent hash; identity hashing is consistent because we allocate
+    // a fresh object per `Builder.new*` call anyway.
+    for inner in [
+        "java/lang/module/ModuleDescriptor$Exports",
+        "java/lang/module/ModuleDescriptor$Opens",
+        "java/lang/module/ModuleDescriptor$Requires",
+        "java/lang/module/ModuleDescriptor$Provides",
+        "java/lang/module/ModuleDescriptor$Version",
+    ] {
+        registry.register(inner, "hashCode", "()I", |ctx, args| {
+            // Identity-based hash: stable per object, never NPEs on
+            // null private fields.
+            if let Some(Value::Object(Some(o))) = args.first() {
+                let h = ctx.identity_hash_code(*o);
+                Ok(Some(Value::Int(h)))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        });
+        registry.register(
+            inner,
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            |_ctx, args| {
+                // Reference equality.  Set.of's duplicate detection
+                // works because we allocate a fresh stand-in per call.
+                let a = args.first().copied().unwrap_or(Value::Object(None));
+                let b = args.get(1).copied().unwrap_or(Value::Object(None));
+                let eq = matches!(
+                    (a, b),
+                    (Value::Object(Some(x)), Value::Object(Some(y))) if x == y
+                );
+                Ok(Some(Value::Int(if eq { 1 } else { 0 })))
+            },
+        );
+        registry.register(
+            inner,
+            "compareTo",
+            "(Ljava/lang/Object;)I",
+            |ctx, args| {
+                // Identity-based ordering; Set.of doesn't sort, but
+                // ModuleDescriptor's later TreeSet wrappings might.
+                let a = args.first().copied();
+                let b = args.get(1).copied();
+                let ha = match a {
+                    Some(Value::Object(Some(o))) => ctx.identity_hash_code(o),
+                    _ => 0,
+                };
+                let hb = match b {
+                    Some(Value::Object(Some(o))) => ctx.identity_hash_code(o),
+                    _ => 0,
+                };
+                Ok(Some(Value::Int(ha.cmp(&hb) as i32)))
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

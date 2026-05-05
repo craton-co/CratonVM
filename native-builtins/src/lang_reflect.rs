@@ -1135,6 +1135,118 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/Type;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+
+    // S111r13 — Real-JDK ParameterizedTypeImpl native overrides.
+    //
+    // SportMe (Spring Boot) reaches `Method.invoke(pti, "getActualTypeArguments", ...)`
+    // via Spring's `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke:236`.
+    // The receiver is a real `sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl`
+    // built by JDK reifier code. The PTI's instance fields (in declaration order)
+    // are: actualTypeArguments[0], rawType[1], ownerType[2] — and `get_field_by_name`
+    // confirms they're populated correctly. However, dispatching the PTI bytecode
+    // for `getActualTypeArguments` (which does `aload_0; getfield actualTypeArguments;
+    // invokevirtual [Type;.clone()`) returns null, causing the calling Spring code
+    // to NPE on `arraylength` at TPIH:236. The bytecode's `getfield #7` constant-
+    // pool resolution must mis-map to a wrong slot for these JDK reifier classes.
+    //
+    // Bypass the broken bytecode path by registering native overrides that read
+    // the fields by name. This is consistent with how we already handle the
+    // `java/lang/reflect/ParameterizedType` interface natives above (which fire
+    // for our synthetically-built PTIs).
+    let pti_real = "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl";
+    registry.register(
+        pti_real,
+        "getRawType",
+        "()Ljava/lang/Class;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "rawType")))
+        },
+    );
+    registry.register(
+        pti_real,
+        "getRawType",
+        "()Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "rawType")))
+        },
+    );
+    registry.register(
+        pti_real,
+        "getActualTypeArguments",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Clone the array so callers that mutate it (e.g. Arrays.asList wrappers)
+            // don't observe shared state — matches the real PTI bytecode contract
+            // (`return actualTypeArguments.clone();`).
+            let ata = ctx.get_field_by_name(this, "actualTypeArguments");
+            if let Value::Object(Some(arr)) = ata {
+                let len = ctx.array_length(arr);
+                let clone = ctx.new_ref_array(rustjvm_types::ClassId::new(0), len);
+                for i in 0..len {
+                    let el = ctx.get_array_element(arr, i);
+                    ctx.set_array_element(clone, i, el);
+                }
+                Ok(Some(Value::Object(Some(clone))))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+    registry.register(
+        pti_real,
+        "getOwnerType",
+        "()Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "ownerType")))
+        },
+    );
+
+    // Same field-resolution issue affects TypeVariableImpl / WildcardTypeImpl /
+    // GenericArrayTypeImpl. Provide field-by-name natives so they keep working
+    // when reached via real-JDK reifier code paths.
+    let tvi_real = "sun/reflect/generics/reflectiveObjects/TypeVariableImpl";
+    registry.register(
+        tvi_real,
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "name")))
+        },
+    );
+    let wti_real = "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl";
+    registry.register(
+        wti_real,
+        "getUpperBounds",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "upperBounds")))
+        },
+    );
+    registry.register(
+        wti_real,
+        "getLowerBounds",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "lowerBounds")))
+        },
+    );
+    let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";
+    registry.register(
+        gat_real,
+        "getGenericComponentType",
+        "()Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "genericComponentType")))
+        },
+    );
     registry.register(
         "java/lang/reflect/TypeVariable",
         "getName",

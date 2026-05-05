@@ -686,7 +686,22 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 }
                 .into())
             }
-            // Propagate exceptions thrown by the classloader (CNFE,
+            // S111r12 — NSME on `loader.loadClass` rescue. Spring Boot 2's
+            // SB2 launcher path delivers a `LaunchedURLClassLoader`
+            // instance whose `class_id_of` returns `java/lang/Comparable`
+            // (the loader inherited that stub class_id somewhere in the
+            // boot chain). The receiver-driven virtual dispatch then
+            // resolves to `Comparable.loadClass` and raises NSME.
+            // Fall back to bootstrap-style class loading so the
+            // `Class.forName(name, init, loader)` chain still resolves.
+            Err(rustjvm_types::error::MethodCallFailed::InternalError(
+                rustjvm_types::error::VmError::Linkage(
+                    rustjvm_types::error::LinkageError::NoSuchMethodError { .. },
+                ),
+            )) => {
+                // Fall through to bootstrap-style ensure_class_initialized below.
+            }
+            // Propagate other exceptions thrown by the classloader (CNFE,
             // LinkageError, etc.) without re-wrapping.
             Err(e) => return Err(e),
         }

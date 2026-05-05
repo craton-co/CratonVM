@@ -7469,12 +7469,43 @@ fn execute_invoke(
                         if let Some(iface) = lambda_iface {
                             iface
                         } else {
-                            shared
-                                .class_manager
-                                .read()
-                                .get_class(cid)
-                                .map(|c| Arc::from(&*c.name))
-                                .unwrap_or(method_class_name)
+                            // S111r12 — receiver's runtime class is an interface
+                            // (e.g. `java/lang/Comparable`) but the CP method-ref
+                            // class is a concrete/abstract class with the actual
+                            // method declared (`java/lang/ClassLoader.loadClass`).
+                            // This pattern surfaces when a native-allocated
+                            // ClassLoader instance lost its concrete class_id
+                            // somewhere in the boot chain and `class_id_of`
+                            // returns a stub interface cid instead. Routing
+                            // dispatch through the CP class lets the slow path
+                            // find the registered native or bytecode method.
+                            // Mirrors the S111r8 cid=0 → CP-class fallback.
+                            // Guard: only fires when the receiver's class is an
+                            // interface AND the CP class is NOT that same
+                            // interface (avoid changing well-formed
+                            // `Iterator.hasNext()` etc. dispatches).
+                            let cm_read = shared.class_manager.read();
+                            let recv_class = cm_read.get_class(cid);
+                            let recv_is_iface = recv_class
+                                .map(|c| c.is_interface())
+                                .unwrap_or(false);
+                            let recv_name_opt = recv_class
+                                .map(|c| Arc::from(&*c.name));
+                            drop(cm_read);
+                            if recv_is_iface
+                                && !crate::vm::is_object_member(
+                                    &method_name,
+                                    &method_descriptor,
+                                )
+                                && recv_name_opt
+                                    .as_ref()
+                                    .map(|n: &Arc<str>| &**n != &*method_class_name)
+                                    .unwrap_or(true)
+                            {
+                                method_class_name.clone()
+                            } else {
+                                recv_name_opt.unwrap_or(method_class_name)
+                            }
                         }
                     }
                 }
