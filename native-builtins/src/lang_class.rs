@@ -1065,6 +1065,13 @@ fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> rustjvm_ty
 /// e.g. "(ILjava/lang/String;)V" → (["I", "Ljava/lang/String;"], "V")
 pub(crate) fn parse_descriptor_param_and_return(desc: &str) -> (Vec<String>, String) {
     let mut params = Vec::new();
+    // Tolerant: an empty / malformed descriptor (no leading `(`) yields an
+    // empty param list and `"V"` return — the same shape Spring's
+    // `SerializableTypeWrapper` proxy handler expects when it has no
+    // descriptor cached for an internally-synthesised method.
+    if desc.is_empty() || !desc.starts_with('(') {
+        return (params, "V".to_string());
+    }
     let inner = &desc[1..]; // skip '('
     let mut i = 0;
     let bytes = inner.as_bytes();

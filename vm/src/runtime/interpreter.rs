@@ -1045,6 +1045,20 @@ pub fn execute(
                   class_id, method_name, method_descriptor, args.len());
     }
     // Find the method
+    //
+    // S112r9 — when the resolved method has no Code attribute (abstract or
+    // interface declaration), throw a real Java `AbstractMethodError` instead
+    // of returning an opaque `VmError::Internal`. Java callers (e.g. Spring's
+    // `try { ... } catch (Throwable t) { handleRunFailure(...); throw new
+    // IllegalStateException(t); }`) can then catch and rewrap. Previously
+    // this produced a Rust-side `MethodCallFailed::InternalError` that
+    // propagated past Java try/catch handlers and was either converted to a
+    // CLI `bail!()` (rc=1, JIT off) or — when it crossed a JIT dispatch
+    // boundary — silently dropped (rc=0, JIT on). Either way Spring Boot
+    // never reached `printBanner`. Throwing AbstractMethodError lets
+    // SpringApplication.run() catch the failure, log it through its own
+    // failure path, and at least produce a partial banner / startup-failure
+    // banner before exiting.
     let (code_attr, source_file, class_name_str) = {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
@@ -1059,17 +1073,40 @@ pub fn execute(
                     method_descriptor: method_descriptor.to_string(),
                 })
             })?;
-        let code_attr = method.code().ok_or_else(|| VmError::Internal {
-            message: format!(
-                "method {}.{}{} has no Code attribute",
-                class.name, method_name, method_descriptor
-            ),
-        })?;
-        (
-            code_attr.clone(),
-            class.source_file.clone(),
-            class.name.to_string(),
-        )
+        let has_code = method.code().is_some();
+        let class_name_owned = class.name.to_string();
+        let code_attr_opt = method.code().cloned();
+        let source_file = class.source_file.clone();
+        drop(cm);
+        if !has_code {
+            // Build an AbstractMethodError so Java try/catch can see it.
+            let msg = format!(
+                "method {class_name_owned}.{method_name}{method_descriptor} has no Code attribute"
+            );
+            if std::env::var_os("RUSTJVM_DBG_NOCODE").is_some() {
+                eprintln!("[DBG_NOCODE] {msg}");
+            }
+            match super::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/AbstractMethodError",
+                Some(&msg),
+            ) {
+                Ok(exc) => {
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+                Err(_) => {
+                    // Heap-exhausted or class-load failure during exception
+                    // construction — fall back to the legacy InternalError so
+                    // we never lose the diagnostic entirely.
+                    return Err(MethodCallFailed::InternalError(VmError::Internal {
+                        message: msg,
+                    }));
+                }
+            }
+        }
+        let code_attr = code_attr_opt.expect("has_code true implies code present");
+        (code_attr, source_file, class_name_owned)
     };
 
     // If the JIT early-compile path encounters an exception from a callee

@@ -792,6 +792,59 @@ thread_local! {
 /// Invocation threshold for triggering JIT compilation from the dispatch helper.
 const DISPATCH_JIT_THRESHOLD: u32 = 500;
 
+/// S112r9 — JIT dispatch error handler. When a JIT-dispatched callee returns
+/// an error, route it through `JIT_PENDING_EXCEPTION` so the interpreter's
+/// post-JIT exception-routing path can find a handler (or propagate to the
+/// top of the JVM with a printable message).
+///
+/// Previously only `MethodCallFailed::ExceptionThrown` was captured, and
+/// `MethodCallFailed::InternalError` was silently dropped — the JIT helper
+/// returned 0/null to the JIT caller, which would proceed as if the call
+/// returned a benign null. That was the root cause of Spring Boot 3 fat-jars
+/// exiting silently with rc=0 between `prepareEnvironment` and `printBanner`:
+/// some downstream invoke produced an `InternalError` ("method has no Code
+/// attribute" or similar linkage gap), the JIT swallowed it, the JIT'd
+/// `prepareEnvironment` continued with corrupt state and returned, then the
+/// caller `run()` returned cleanly without ever reaching `printBanner`.
+///
+/// Wrapping the InternalError in a Java `java/lang/InternalError` gives the
+/// VM a real Throwable to walk through exception tables. If the heap is
+/// exhausted or the class can't be loaded, we fall back to leaving the
+/// error unstored — the original "swallow and return 0" behaviour. That
+/// keeps this purely additive: it never makes a previously-working scenario
+/// worse, only converts silent rc=0 into a visible stack trace.
+fn handle_jit_dispatch_error(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+    info: &JitInvokeInfo,
+) {
+    use crate::error::MethodCallFailed;
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => {
+            set_jit_pending_exception(exc);
+        }
+        MethodCallFailed::InternalError(vm_err) => {
+            // Format a message that points at the failing dispatch site so
+            // the user can see WHICH callee blew up. This is the difference
+            // between a silent rc=0 and a visible "Exception in thread main"
+            // for Spring Boot.
+            let msg = format!(
+                "JIT dispatch into {}.{}{} failed: {}",
+                info.class_name, info.method_name, info.descriptor, vm_err,
+            );
+            // Try to wrap in a Java `InternalError`; on any allocation /
+            // load failure, fall through to the legacy silent drop so we
+            // never make things worse than before this fix.
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm, thread, "java/lang/InternalError", Some(&msg),
+            ) {
+                set_jit_pending_exception(exc);
+            }
+        }
+    }
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo (heap-allocated, outlives this call).
 // args_ptr/num_args form a valid i64 slice of JIT-encoded arguments.
@@ -1089,9 +1142,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    if let crate::error::MethodCallFailed::ExceptionThrown(exc) = e {
-                        set_jit_pending_exception(exc);
-                    }
+                    handle_jit_dispatch_error(vm, thread, e, info);
                     return 0;
                 }
             }
@@ -1108,9 +1159,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             match r {
                 Ok(v) => v,
                 Err(e) => {
-                    if let crate::error::MethodCallFailed::ExceptionThrown(exc) = e {
-                        set_jit_pending_exception(exc);
-                    }
+                    handle_jit_dispatch_error(vm, thread, e, info);
                     return 0;
                 }
             }
