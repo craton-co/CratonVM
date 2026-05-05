@@ -857,6 +857,18 @@ impl SharedVm {
                 rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
+                // Spring Boot 2.x fat-jars: SLF4J 1.7's MDC.<clinit> /
+                // LoggerFactory.<clinit> call StaticMDCBinder.getSingleton()
+                // / StaticLoggerBinder.getSingleton() which only resolve
+                // when an SLF4J impl JAR (slf4j-log4j12, logback-classic,
+                // slf4j-simple, ...) is on the runtime classpath. Boot's
+                // nested BOOT-INF/lib/ visibility makes those JARs invisible
+                // to our class loader, so the static call site raises
+                // NoSuchMethodError → JIT linkage error and the boot dies.
+                // Register synthetic singletons + a no-op BasicMDCAdapter so
+                // <clinit> completes; the existing MDC / Logger natives
+                // already cover the actual API surface.
+                rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
         }
@@ -1002,6 +1014,10 @@ impl SharedVm {
             rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
             rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
+            // SLF4J 1.7 binder stubs — see companion call in the synthetic-jdk
+            // branch above for the rationale (Spring Boot 2.x fat-jar
+            // <clinit> survival).
+            rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support

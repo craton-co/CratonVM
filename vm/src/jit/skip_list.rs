@@ -448,6 +448,134 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // SPB.4 (Session 113 r1) — provisional blanket ban for the Spring
+        // Boot configuration-property binder package. ms-course-youtube
+        // `admin-service` SIGSEGVs (rc=139) deep inside the property bind
+        // path: `JavaBeanBinder$Bean.<init>` -> `BeanProperties.<init>`
+        // -> `BeanProperties.addProperties` -> `getSorted`. The
+        // `RUSTJVM_FRAME_TRACE=1` capture shows the very last frames
+        // before the crash are `Banner$Mode.<clinit>` returning into
+        // `Class$ReflectionData.<init>` then `Reflection.filter` —
+        // i.e. the JavaBeanBinder is reflectively scanning a class for
+        // bindable properties via `Class.getDeclaredMethods()` /
+        // `Class.getDeclaredFields()`, sorting the filtered Member array,
+        // and storing each into a `LinkedHashMap` keyed by property name.
+        //
+        // The signature matches W2-CHM / RBC.1 / SPB.1 / SPB.2 / SPB.3:
+        // every method on this hot path is allocate-then-putfield-heavy.
+        // `BeanProperties.addProperties` calls `addMethod`/`addField`
+        // which allocate a fresh `BeanProperty` and immediately store
+        // `name`/`type`/`getter`/`setter`/`field` slots; `Bean.<init>`
+        // builds a `Bindable.BindMethod` enum and a `Constructor`
+        // reference; the SAM `BiPredicate.lambda$or$0` captured by the
+        // tight `ConfigurationPropertyName.isAncestorOf` loop allocates
+        // a fresh `lambda$or$0` capture object on each invocation. With
+        // `RUSTJVM_DISABLE_JIT=1` the SIGSEGV is replaced by a clean
+        // `NullPointerException` in `PathMatchingResourcePatternResolver.
+        // <clinit>` (a different downstream gap, not a JIT issue).
+        //
+        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/
+        // context/properties/bind/`. The narrow per-method entries
+        // (SPB.3) for `SpringIterableConfigurationPropertySource` cover
+        // the upstream cache-key build path; this blanket ban covers the
+        // downstream binder dispatch.
+        if class_name.starts_with("org/springframework/boot/context/properties/bind/")
+            && !package_allowed(
+                "org/springframework/boot/context/properties/bind/",
+                allow_packages,
+            )
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.4b (Session 113 r1) — broaden the SPB.4 ban to cover the
+        // surrounding Spring Boot context-property plumbing. After SPB.4
+        // pins the binder dispatch, the very next consumer is
+        // `org/springframework/boot/context/properties/source/
+        // SystemEnvironmentPropertyMapper.processElementValue`, which
+        // calls `String.toLowerCase` (already covered) but also
+        // allocates fresh `CharSequence` views via `String.subSequence`
+        // on every property name. The companion package
+        // `org/springframework/boot/context/properties/source/` (where
+        // SPB.3 has narrow per-method pins) plus the umbrella
+        // `org/springframework/boot/context/` are blanket-banned here so
+        // the JIT cannot promote any method on the bind path. The
+        // SportMe agent's SPB.3 narrow pins remain in effect; this
+        // broader ban is additive, not replacing those entries. Lifted
+        // by `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/context/`.
+        if class_name.starts_with("org/springframework/boot/context/")
+            && !package_allowed(
+                "org/springframework/boot/context/",
+                allow_packages,
+            )
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.4c (Session 113 r1) — Spring Boot's top-level
+        // `SpringApplication`, `Banner$Mode`, `ApplicationEnvironment`,
+        // `DefaultApplicationContextFactory`, `ApplicationInfoPropertySource`,
+        // and friends are also on the boot critical path observed in the
+        // ms-course-youtube admin-service frame trace. Those classes
+        // execute exactly once at boot but do thousand+ allocations
+        // each, putting them above the JIT thresholds. Lifted by
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/`. (This
+        // is the umbrella ban; subpackages like `boot/loader/` are
+        // already past their ctor by the time the binder runs, so the
+        // throughput loss is bounded to startup.)
+        if class_name.starts_with("org/springframework/boot/")
+            && !class_name.starts_with("org/springframework/boot/loader/")
+            && !package_allowed("org/springframework/boot/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.5 (Session 113 r1) — provisional blanket ban for Spring
+        // Cloud. ms-course-youtube `admin-service` is a Spring Cloud
+        // Eureka client; once the property binder is unblocked (SPB.4),
+        // the next downstream consumers are Spring Cloud's
+        // `BootstrapApplicationListener`, `ConfigDataLocationResolver`,
+        // and `EnvironmentChangeEvent` plumbing — all of which exhibit
+        // the same allocate-then-putfield idiom on `ConcurrentHashMap`
+        // / `LinkedHashMap` containers. The ban is pre-emptive: it
+        // costs throughput on every Spring Cloud boot path but avoids
+        // a second iteration if the next downstream gap surfaces there.
+        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/cloud/`.
+        if class_name.starts_with("org/springframework/cloud/")
+            && !package_allowed("org/springframework/cloud/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.6 (Session 113 r1) — provisional blanket ban for the
+        // Netflix Eureka discovery client. `com/netflix/discovery/
+        // DiscoveryClient.<init>` allocates Eureka `InstanceInfo` /
+        // `ApplicationInfoManager` objects whose ctors store
+        // `metadata`/`leaseInfo`/`port` immediately after allocation
+        // — the same allocate-then-putfield archetype. Eureka also
+        // installs a `ScheduledExecutorService` whose task submit path
+        // is the same `LinkedBlockingQueue.offer` / `enqueue` pair
+        // already covered by EXEC.1; this per-package ban covers the
+        // Eureka-specific allocations. Lifted by
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=com/netflix/discovery/`.
+        if class_name.starts_with("com/netflix/discovery/")
+            && !package_allowed("com/netflix/discovery/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.7 (Session 113 r1) — provisional blanket ban for Feign /
+        // OpenFeign HTTP client allocations. Spring Cloud OpenFeign
+        // builds a `feign.Feign$Builder` that allocates per-method
+        // `MethodMetadata` and `RequestTemplate` objects, each storing
+        // `template` / `headers` / `body` slots immediately after `new`.
+        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=feign/`.
+        if class_name.starts_with("feign/")
+            && !package_allowed("feign/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
     }
 
     None
@@ -679,6 +807,260 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("sun/reflect/generics/repository/ClassRepository", "getSuperclass")
         | ("sun/reflect/generics/repository/ClassRepository", "make")
         | ("sun/reflect/generics/repository/AbstractRepository", "getTree")
+        // SPB.3 (Session 111 r14) — `apps/SportMe-master`'s Spring Boot
+        // bootstrap segfaults (rc=139) deep in Spring's
+        // `ConfigurationPropertySources` cache-key build path. Per r13
+        // SportMe agent's `RUSTJVM_FRAME_TRACE=1` capture, the very last
+        // frames before the crash are
+        // `MapPropertySource.getPropertyNames` -> `StringUtils.
+        // toStringArray(Collection)` -> `HashMap.keysToArray(Object[])`
+        // and `SpringIterableConfigurationPropertySource$CacheKey.<init>`
+        // / `HashSet.<init>(Collection)` -> `HashMap$KeySet.iterator()`
+        // -> `HashMap$KeyIterator.<init>` -> `HashMap$HashIterator.<init>`
+        // -> `HashMap$HashIterator.hasNext()`. With `RUSTJVM_DISABLE_JIT=1`
+        // the seg vanishes (a clean SLF4J `NoSuchMethodError` surfaces
+        // instead — the boot reaches a much later phase). The signature
+        // matches W2-CHM / RBC.1 / SPB.1 / SPB.2: every one of these
+        // methods is allocate-then-putfield-heavy (HashIterator's ctor
+        // stores `next`/`expectedModCount`/`current`; `keysToArray`
+        // allocates a fresh array and writes via IASTORE per key;
+        // `CacheKey` stores `key`/`source` immediately after `new`).
+        //
+        // Skip-list these per-method (do not blanket-ban the package, to
+        // stay non-overlapping with the parallel msyt-segfault agent's
+        // Spring Cloud / Eureka entries). `MapPropertySource.getProperty`
+        // already shows up in the frame trace right before the crash
+        // (it's a getter that `HashMap.get`s the source map then
+        // `getProperty(name)`s), so include it too.
+        | ("java/util/HashMap$HashIterator", "<init>")
+        | ("java/util/HashMap$HashIterator", "hasNext")
+        | ("java/util/HashMap$HashIterator", "nextNode")
+        | ("java/util/HashMap$KeyIterator", "next")
+        | ("java/util/HashMap$EntryIterator", "next")
+        | ("java/util/HashMap$ValueIterator", "next")
+        | ("java/util/HashMap", "keysToArray")
+        | ("java/util/HashMap", "valuesToArray")
+        | ("java/util/HashMap", "prepareArray")
+        | ("java/util/HashSet", "<init>")
+        | ("java/util/HashSet", "iterator")
+        | ("java/util/AbstractCollection", "addAll")
+        | ("java/util/AbstractCollection", "toArray")
+        | ("org/springframework/util/StringUtils", "toStringArray")
+        | ("org/springframework/core/env/MapPropertySource", "getPropertyNames")
+        | ("org/springframework/core/env/MapPropertySource", "getProperty")
+        | ("org/springframework/core/env/MapPropertySource", "containsProperty")
+        | (
+            "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$CacheKey",
+            "<init>",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$CacheKey",
+            "equals",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$CacheKey",
+            "hashCode",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource",
+            "getCacheKey",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource",
+            "getPropertyMappings",
+        )
+        // SPB.3 cont. — `SourcesIterator.fetchNext` / `hasNext` / `next` are
+        // the outer loop driving CacheKey.equals/hashCode through
+        // ConcurrentReferenceHashMap.get for every PropertySource in the
+        // environment. Under SportMe's ~12-source pipeline the loop runs
+        // hundreds of times (each property name is searched across every
+        // source) and crosses both JIT thresholds. The same allocate-then-
+        // putfield miscompile applies — `fetchNext` builds intermediate
+        // SourcesIterator state and a fresh ConcurrentReferenceHashMap
+        // probe context per call.
+        | (
+            "org/springframework/boot/context/properties/source/SpringConfigurationPropertySources$SourcesIterator",
+            "fetchNext",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringConfigurationPropertySources$SourcesIterator",
+            "hasNext",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringConfigurationPropertySources$SourcesIterator",
+            "next",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/SpringConfigurationPropertySources$SourcesIterator",
+            "isIgnored",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyState",
+            "search",
+        )
+        // ConcurrentReferenceHashMap.get/getReference/getEntryIfAvailable
+        // and the Segment.findInChain/getReference helpers are the inner
+        // loop. The Segment ctor allocates fresh Reference[] arrays and
+        // stores the bucket head via putfield — same archetype.
+        | ("org/springframework/util/ConcurrentReferenceHashMap", "get")
+        | ("org/springframework/util/ConcurrentReferenceHashMap", "getReference")
+        | (
+            "org/springframework/util/ConcurrentReferenceHashMap",
+            "getEntryIfAvailable",
+        )
+        | (
+            "org/springframework/util/ConcurrentReferenceHashMap$Segment",
+            "getReference",
+        )
+        | (
+            "org/springframework/util/ConcurrentReferenceHashMap$Segment",
+            "findInChain",
+        )
+        | (
+            "org/springframework/util/ConcurrentReferenceHashMap$Segment",
+            "restructureIfNecessary",
+        )
+        // AbstractSet.equals dispatches to AbstractCollection.containsAll
+        // which iterates and probes HashMap. CacheKey.equals delegates to
+        // nullSafeEquals -> AbstractSet.equals — banning these closes the
+        // remaining JIT-eligible methods on the SportMe seg path.
+        | ("java/util/AbstractSet", "equals")
+        | ("java/util/AbstractCollection", "containsAll")
+        | ("org/springframework/util/ObjectUtils", "nullSafeEquals")
+        | ("org/springframework/util/ObjectUtils", "nullSafeHashCode")
+        // SPB.4 cont. (Session 113 r1) — `apps/ms-course-youtube/admin-
+        // service` segfaults inside the Spring Boot bind path. The
+        // `RUSTJVM_FRAME_TRACE=1` capture shows the most-called methods
+        // (12k+ / 10k+ invocations) are
+        // `java/io/BufferedInputStream.read` / `getBufIfOpen` — those
+        // are well past the per-callee threshold (2000) and they
+        // putfield-cache `pos`/`count` after refilling the buffer. The
+        // SignatureParser hot loop (`current` / `advance`, ~4k+ calls
+        // each) reads the generic-signature char array and increments a
+        // putfield index — same archetype. These are the inner loops
+        // driving `Class.getGenericInterfaces()` (which Spring's
+        // SerializableTypeWrapper invokes via reflection on every
+        // `@ConfigurationProperties` candidate).
+        | ("java/io/BufferedInputStream", "read")
+        | ("java/io/BufferedInputStream", "read1")
+        | ("java/io/BufferedInputStream", "getBufIfOpen")
+        | ("java/io/BufferedInputStream", "ensureOpen")
+        | ("java/io/BufferedInputStream", "fill")
+        | ("sun/reflect/generics/parser/SignatureParser", "current")
+        | ("sun/reflect/generics/parser/SignatureParser", "advance")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseTypeSignature")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseFieldTypeSignature")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseClassTypeSignature")
+        | ("sun/reflect/generics/parser/SignatureParser", "parsePackageNameAndSimpleClassTypeSignature")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseTypeArguments")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseTypeArgument")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseIdentifier")
+        | ("sun/reflect/generics/parser/SignatureParser", "parseSimpleClassTypeSignature")
+        // SPB.4 cont. — `java/util/function/BiPredicate.lambda$or$0`
+        // is the synthetic capture that `BiPredicate.or` returns. The
+        // tight `ConfigurationPropertyName.isAncestorOf` loop dispatches
+        // through this lambda thousands of times; its allocate-on-call
+        // capture frame builder is the same archetype. Companion
+        // `Predicate.lambda$and$1` etc. follow the same pattern.
+        | ("java/util/function/BiPredicate", "lambda$or$0")
+        | ("java/util/function/BiPredicate", "lambda$and$0")
+        | ("java/util/function/Predicate", "lambda$or$0")
+        | ("java/util/function/Predicate", "lambda$and$1")
+        | ("java/util/function/Predicate", "lambda$negate$0")
+        // SPB.4 cont. — `Reference.<init>` already banned via the
+        // generic <init> ban; here we ensure the SoftReference / Reference
+        // companion methods (referent setters, get/clear) are also
+        // pinned. Spring's ConcurrentReferenceHashMap allocates a
+        // SoftReference per entry; `enqueue` / `clear` trigger the
+        // GC-side queue manipulation putfield path.
+        | ("java/lang/ref/Reference", "clear")
+        | ("java/lang/ref/Reference", "clear0")
+        | ("java/lang/ref/Reference", "enqueue")
+        | ("java/lang/ref/SoftReference", "get")
+        // SPB.4 cont. — `ConfigurationPropertyName.isAncestorOf` /
+        // `elementsEqual` / `fastElementEquals` etc. are the property-name
+        // hot loop in the Spring Boot bind path. The class is in the
+        // `org/springframework/boot/context/properties/source/` package
+        // which is now blanket-banned via SPB.4b, but make these explicit
+        // so the targeted check fires before the package check (and so
+        // the bind agent can lift the package ban while keeping these).
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName",
+            "isAncestorOf",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName",
+            "elementsEqual",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName",
+            "elementDiffers",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName",
+            "fastElementEquals",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName$ElementsParser",
+            "updateType",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName$ElementsParser",
+            "isValidChar",
+        )
+        | (
+            "org/springframework/boot/context/properties/source/ConfigurationPropertyName$ElementsParser",
+            "add",
+        )
+        // SPB.4 cont. (Session 113 r1) — `RUSTJVM_DBG_JIT_COMPILE` shows
+        // the LAST JIT compile before the SIGSEGV is `java/lang/Class.
+        // copyFields([Ljava/lang/reflect/Field;)[Ljava/lang/reflect/Field;`,
+        // which allocates a fresh Field[] and iterates the input,
+        // calling `ReflectionFactory.copyField` per slot — the same
+        // allocate-then-iterate-and-store archetype that bites
+        // `Integer.valueOf` / `String.toLowerCase`. The companion
+        // `copyMethods` and `copyConstructors` do the same. The
+        // upstream `getDeclaredFields` / `privateGetDeclaredFields` /
+        // `reflectionData` build the cache lazily and putfield-store
+        // the result; same archetype. Filtering through
+        // `Reflection.filterFields` is also on the hot path. Skip-list
+        // these to keep them in the interpreter; other Class methods
+        // (`getName`, `getSimpleName`, etc.) stay JIT-eligible.
+        | ("java/lang/Class", "copyFields")
+        | ("java/lang/Class", "copyMethods")
+        | ("java/lang/Class", "copyConstructors")
+        | ("java/lang/Class", "getDeclaredFields")
+        | ("java/lang/Class", "getDeclaredMethods")
+        | ("java/lang/Class", "getDeclaredConstructors")
+        | ("java/lang/Class", "privateGetDeclaredFields")
+        | ("java/lang/Class", "privateGetDeclaredMethods")
+        | ("java/lang/Class", "privateGetDeclaredConstructors")
+        | ("java/lang/Class", "privateGetPublicFields")
+        | ("java/lang/Class", "privateGetPublicMethods")
+        | ("java/lang/Class", "reflectionData")
+        | ("java/lang/Class", "newReflectionData")
+        | ("jdk/internal/reflect/Reflection", "filterFields")
+        | ("jdk/internal/reflect/Reflection", "filterMethods")
+        | ("jdk/internal/reflect/Reflection", "filter")
+        // ReflectionFactory.copyField / copyMethod / copyConstructor —
+        // each allocates a fresh Field/Method/Constructor and copies the
+        // declaring class / name / type / modifiers / etc. via field
+        // stores. Same archetype.
+        | ("jdk/internal/reflect/ReflectionFactory", "copyField")
+        | ("jdk/internal/reflect/ReflectionFactory", "copyMethod")
+        | ("jdk/internal/reflect/ReflectionFactory", "copyConstructor")
+        | ("java/lang/reflect/Field", "copy")
+        | ("java/lang/reflect/Method", "copy")
+        | ("java/lang/reflect/Constructor", "copy")
+        // ImmutableCollections.MapN.get / probe — Set.of / Map.of return
+        // these immutable collections; their `get` / `probe` walk the
+        // open-addressed table. With putfield on the entries' fields they
+        // share the allocate-then-putfield issue. Set.of is heavily used
+        // by Spring Boot reflection filtering.
+        | ("java/util/ImmutableCollections$MapN", "get")
+        | ("java/util/ImmutableCollections$MapN", "probe")
+        | ("java/util/ImmutableCollections$SetN", "contains")
+        | ("java/util/ImmutableCollections$SetN", "probe")
     )
 }
 

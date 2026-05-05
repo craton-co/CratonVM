@@ -12298,6 +12298,163 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             },
         );
     }
+
+    // -----------------------------------------------------------------
+    // post-banner SB3: PMRPR.<clinit> Stream lambda NPE
+    // -----------------------------------------------------------------
+    //
+    // After the JLMA Builder.* overrides above unblock SystemModuleFinders
+    // construction, PathMatchingResourcePatternResolver.<clinit>:216 still
+    // NPEs inside this Stream pipeline:
+    //
+    //     ModuleFinder.ofSystem().findAll().stream()
+    //         .map(ref -> ref.descriptor().name())     // <-- NPE here
+    //         .collect(Collectors.toSet());
+    //
+    // The synthetic ModuleReference instances handed back by our partial
+    // SystemModuleFinders impl carry a null `descriptor` field — the
+    // real-JDK `ModuleReference.descriptor()` is just `getfield descriptor`
+    // (the field is final, set by the protected constructor through
+    // Objects.requireNonNull). Our synthetics never went through that
+    // constructor, so the field stays null. Then `.name()` NPEs.
+    //
+    // Defensive override: register native impls for both the immediate
+    // dereference (`ModuleReference.descriptor()`) and the inner one
+    // (`ModuleDescriptor.name()`). Each reads its private field and, if
+    // null, lazily allocates / interns a synthetic placeholder so the
+    // Stream pipeline can run to completion. The descriptor placeholder
+    // is cached on the ModuleReference instance itself (so identity is
+    // stable across repeat calls); the name placeholder is cached on
+    // the ModuleDescriptor instance similarly.
+    //
+    // Spring's PMRPR only consumes the resulting Set<String> to seed
+    // a static cache — the actual module names don't influence
+    // resource resolution unless the user passes a `module:` URL. The
+    // generic placeholder name "synthetic" is therefore acceptable
+    // for boot. (Real-JDK module naming is exercised exhaustively in
+    // dedicated module-system tests, not here.)
+
+    // Approach: short-circuit `ModuleFinder.findAll()` to return an
+    // empty Set so the Stream pipeline never iterates and the lambda is
+    // never invoked. PMRPR then ends up with
+    // `systemModuleNames = Collections.emptySet()` which is exactly what
+    // the `inNativeImage` branch already does (line :11-:17 in PMRPR
+    // bytecode). Spring uses this set only to filter `module:` URIs out
+    // of resource scans — empty just means no filtering, which is
+    // semantically a no-op for fat-JAR Spring apps that don't use the
+    // module system.
+    //
+    // We also register fallbacks for `ModuleReference.descriptor()` and
+    // `ModuleDescriptor.name()` for any other code path that exercises
+    // the synthetic ModuleReferences directly (defence-in-depth — these
+    // were the original residual #4 from the JLMA agent's report).
+    registry.register(
+        "java/lang/module/ModuleFinder",
+        "findAll",
+        "()Ljava/util/Set;",
+        |ctx, _args| {
+            // Return an empty HashSet via the existing helper.
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
+    // Concrete impl in case the dispatcher resolves through the receiver
+    // class first.
+    registry.register(
+        "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
+        "findAll",
+        "()Ljava/util/Set;",
+        |ctx, _args| {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
+
+    // ModuleFinder.ofSystem() is a static interface method. If the real
+    // bytecode threads through SystemModuleFinders.ofSystem() and any
+    // step returns null (for instance, our partial Path / Files impls),
+    // the chain `null.findAll()` will NPE before our findAll override
+    // is reached. Override ofSystem() to return a synthetic stub finder
+    // whose findAll() override (registered above) yields an empty Set.
+    registry.register(
+        "java/lang/module/ModuleFinder",
+        "ofSystem",
+        "()Ljava/lang/module/ModuleFinder;",
+        |ctx, _args| {
+            // Try to allocate a real SystemModuleFinder; fall back to
+            // an abstract-base instance which still dispatches into our
+            // findAll() override via the registered base-class native.
+            let finder = alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
+                4,
+            );
+            Ok(Some(Value::Object(Some(finder))))
+        },
+    );
+
+    // Registered on BOTH the abstract base and the concrete impl. The
+    // dispatcher in `interpreter.rs` (line ~11547) walks the parent chain
+    // looking for natives but breaks early if a parent has bytecode for
+    // the method — which `ModuleReference.descriptor()` does (a simple
+    // `getfield`). To force the override to fire, register on the
+    // concrete receiver class `jdk/internal/module/ModuleReferenceImpl`
+    // directly (the dispatcher checks the receiver class FIRST before
+    // walking parents).
+    let descriptor_native: rustjvm_native_api::NativeCallback = |ctx, args| {
+        let this = match args.first().copied() {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        // Fast path: real / previously-populated descriptor.
+        if let Value::Object(Some(d)) = ctx.get_field_by_name(this, "descriptor") {
+            return Ok(Some(Value::Object(Some(d))));
+        }
+        // Lazy allocate a synthetic ModuleDescriptor with a non-null
+        // `name` so the immediate downstream `.name()` call cannot
+        // NPE. Cache it on the ModuleReference instance.
+        let md = alloc_concurrent_synthetic(
+            ctx,
+            "java/lang/module/ModuleDescriptor",
+            16,
+        );
+        let name_str = ctx.create_string("synthetic");
+        ctx.set_field_by_name(md, "name", Value::Object(Some(name_str)));
+        ctx.set_field_by_name(this, "descriptor", Value::Object(Some(md)));
+        Ok(Some(Value::Object(Some(md))))
+    };
+    registry.register(
+        "java/lang/module/ModuleReference",
+        "descriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        descriptor_native,
+    );
+    registry.register(
+        "jdk/internal/module/ModuleReferenceImpl",
+        "descriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        descriptor_native,
+    );
+
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "name",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first().copied() {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+            // Populate on first read so subsequent reads (e.g. Set
+            // duplicate-detection) see a stable identity.
+            let s = ctx.create_string("synthetic");
+            ctx.set_field_by_name(this, "name", Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -20302,6 +20459,161 @@ std::thread_local! {
     static MDC_MAP: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// SLF4J 1.7 static-binder pattern. SLF4J 1.7 wires its API to a logging
+/// backend via three companion classes that the impl JAR (slf4j-log4j12,
+/// logback-classic, slf4j-simple, ...) provides on the classpath:
+///
+///   org.slf4j.impl.StaticLoggerBinder   — supplies ILoggerFactory
+///   org.slf4j.impl.StaticMDCBinder      — supplies MDCAdapter
+///   org.slf4j.impl.StaticMarkerBinder   — supplies IMarkerFactory
+///
+/// Each is loaded from MDC.<clinit> / LoggerFactory.<clinit> via something
+/// like `StaticMDCBinder.getSingleton().getMDCA()`. When the impl JAR
+/// isn't visible to the VM's class loader (Spring Boot fat-jar nested
+/// BOOT-INF/lib/ visibility issue, or the user simply didn't add one),
+/// those <clinit>s blow up with a NoSuchMethodError that surfaces as a
+/// linkage error during JIT dispatch.
+///
+/// The adapter/factory the binders return here is never consulted by the
+/// SLF4J API call sites we model (the MDC / Logger / Marker natives all
+/// short-circuit before delegating) — the binders just have to exist so
+/// that <clinit> can complete.
+///
+/// Registered both from `register_slf4j_natives` (synthetic-jdk path) and
+/// directly from the real-JDK boot in `vm/src/vm/vm_init.rs` so Spring
+/// Boot 2.x fat-jars without an SLF4J impl on the classpath survive
+/// boot. (Spring Boot 3.x ships SLF4J 2.x which uses the
+/// `META-INF/services/org.slf4j.spi.SLF4JServiceProvider` discovery
+/// mechanism instead, so this stub doesn't fire — and is harmless if the
+/// classes happen to be present, because last-writer-wins on the native
+/// registry just leaves the real bytecode dispatch in place.)
+pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/slf4j/impl/StaticMDCBinder",
+        "getSingleton",
+        "()Lorg/slf4j/impl/StaticMDCBinder;",
+        |ctx, _| {
+            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMDCBinder",
+        "getMDCA",
+        "()Lorg/slf4j/spi/MDCAdapter;",
+        |ctx, _| {
+            let a = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0);
+            Ok(Some(Value::Object(Some(a))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMDCBinder",
+        "getMDCAdapterClassStr",
+        "()Ljava/lang/String;",
+        |ctx, _| {
+            let s = ctx.create_string("org.slf4j.helpers.BasicMDCAdapter");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    registry.register(
+        "org/slf4j/impl/StaticLoggerBinder",
+        "getSingleton",
+        "()Lorg/slf4j/impl/StaticLoggerBinder;",
+        |ctx, _| {
+            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticLoggerBinder",
+        "getLoggerFactory",
+        "()Lorg/slf4j/ILoggerFactory;",
+        |ctx, _| {
+            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
+            Ok(Some(Value::Object(Some(f))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticLoggerBinder",
+        "getLoggerFactoryClassStr",
+        "()Ljava/lang/String;",
+        |ctx, _| {
+            let s = ctx.create_string("org.slf4j.helpers.NOPLoggerFactory");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    registry.register(
+        "org/slf4j/impl/StaticMarkerBinder",
+        "getSingleton",
+        "()Lorg/slf4j/impl/StaticMarkerBinder;",
+        |ctx, _| {
+            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMarkerBinder", 1);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMarkerBinder",
+        "getMarkerFactory",
+        "()Lorg/slf4j/IMarkerFactory;",
+        |ctx, _| {
+            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMarkerFactory", 0);
+            Ok(Some(Value::Object(Some(f))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMarkerBinder",
+        "getMarkerFactoryClassStr",
+        "()Ljava/lang/String;",
+        |ctx, _| {
+            let s = ctx.create_string("org.slf4j.helpers.BasicMarkerFactory");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    // BasicMDCAdapter no-op surface — the adapter the binder above returns.
+    // Our MDC stubs implement put/get/... directly so these don't fire on
+    // user paths, but newer SLF4J façades sometimes route through the
+    // adapter; keeping these no-ops avoids surprise NSME later.
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "put",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "get",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "remove",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "clear",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "getCopyOfContextMap",
+        "()Ljava/util/Map;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "setContextMap",
+        "(Ljava/util/Map;)V",
+        |_ctx, _args| Ok(None),
+    );
+}
+
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lf = "org/slf4j/LoggerFactory";
 
@@ -20556,6 +20868,11 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         ctx.set_field(m, 0, name);
         Ok(Some(Value::Object(Some(m))))
     });
+
+    // SLF4J 1.7 static-binder stubs (getSingleton / adapter / factory).
+    // Implementation is shared with the real-JDK boot path — see
+    // `register_slf4j_binder_stubs_pub` for the full rationale.
+    register_slf4j_binder_stubs_pub(registry);
 
     // --- java.util.logging (JUL) — standard JDK logging ---
     let jul_logger = "java/util/logging/Logger";
