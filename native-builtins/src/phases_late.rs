@@ -10767,6 +10767,51 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             sb2_launcher_get_class_path_archives_iterator,
         );
     }
+
+    // -------------------------------------------------------------------
+    // Spring Boot 2.x: short-circuit `Handler.setUseFastConnectionExceptions`
+    // to a no-op. The real method body delegates to
+    // `JarURLConnection.setUseFastExceptions(boolean)`, which triggers
+    // SB2's `JarURLConnection.<clinit>`. The static initialiser builds a
+    // sentinel "not found" connection by calling the 3-arg private ctor
+    // with `(null, null, null)`, which chains into
+    // `java.net.JarURLConnection.<init>(URL)` ->
+    // `java.net.URLConnection.<init>(URL)` -> `URL.getProtocol()` ->
+    // `URLConnection.getDefaultUseCaches(protocol)` ->
+    // `URL.lowerCaseProtocol(null).equals("jrt")` -> NPE
+    // ("Cannot invoke equals on null"). Because the caller is
+    // `LaunchedURLClassLoader.findResource` (called from
+    // `ClassPathResource.exists` for the optional Spring `banner.gif/png/
+    // jpg` lookup) the failure aborts `SpringApplication.run` before the
+    // banner prints. The fast-exception flag is a pure perf hint; making
+    // the setter a no-op preserves correctness while sidestepping the
+    // cascading static init failure.
+    let sb2_handler = "org/springframework/boot/loader/jar/Handler";
+    r.register(
+        sb2_handler,
+        "setUseFastConnectionExceptions",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // SB2 LaunchedURLClassLoader.findResource(String): the real impl wraps a
+    // call to super.findResource(name) (real-JDK URLClassLoader) in a
+    // `Handler.setUseFastConnectionExceptions(true) ... (false)` bracket.
+    // With the Handler stub above the bracket is harmless, but the
+    // super.findResource path still walks each URL[] entry through
+    // URLClassPath/URLUtil/URL.getDefaultPort, where a synthetic SB2 nested
+    // jar URL (whose handler field was never populated by URL.<init>)
+    // dereferences a null URLStreamHandler. Spring only calls findResource
+    // here for optional banner.gif/png/jpg lookups (and a few similar
+    // best-effort scans); returning null preserves the "no resource found"
+    // semantics the banner code already handles.
+    let luc = "org/springframework/boot/loader/LaunchedURLClassLoader";
+    r.register(
+        luc,
+        "findResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 }
 
 // =============================================================================

@@ -824,6 +824,39 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
         None => return Ok(Some(Value::Int(0))),
     };
     let target_class_id = ctx.class_id_of_object(target);
+
+    // Annotation proxy special case: our `create_annotation_proxy` allocates
+    // objects of class `java/lang/annotation/AnnotationProxy`, not of the
+    // actual annotation interface. JDK reflection and Spring's
+    // `AttributeMethods.assertAnnotation` do `annotationType.isInstance(ann)`
+    // which would otherwise return false (proxy class doesn't extend / implement
+    // the user-declared annotation interface), driving Spring into
+    // `Assert.instanceCheckFailed` and an unrelated NPE during message
+    // formatting. Read `ANN_PROXY_TYPE_MIRROR` (slot 1) and treat the proxy
+    // as an instance of the recorded annotation type (and any of its
+    // super-interfaces, including `java.lang.annotation.Annotation`).
+    if let Some(target_name) = ctx.class_name_of_id(target_class_id) {
+        if target_name == "java/lang/annotation/AnnotationProxy" {
+            if let Value::Object(Some(type_mirror)) = ctx.get_field(target, ANN_PROXY_TYPE_MIRROR) {
+                if let Some(ann_cid) = mirror_class_id(ctx, type_mirror) {
+                    let proxy_matches = ann_cid == this_class_id
+                        || ctx.is_subclass(ann_cid, this_class_id);
+                    if proxy_matches {
+                        return Ok(Some(Value::Int(1)));
+                    }
+                    // Always treat proxies as instances of `Annotation`
+                    // itself, even if the type-mirror class graph doesn't
+                    // record the implements-edge yet.
+                    if let Some(this_name) = ctx.class_name_of_id(this_class_id) {
+                        if this_name == "java/lang/annotation/Annotation" {
+                            return Ok(Some(Value::Int(1)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let result =
         target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
@@ -4677,7 +4710,7 @@ fn create_annotation_proxy(
 /// them as wrappers and compare by underlying value, and so the proxy's
 /// element accessor methods return wrappers that pass downstream
 /// `instanceof Integer` checks.
-fn annotation_element_to_java(
+pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &rustjvm_native_api::AnnotationElementValue,
 ) -> Value {
@@ -4755,7 +4788,47 @@ fn annotation_element_to_java(
             Value::Object(Some(proxy))
         }
         AnnotationElementValue::Array(elems) => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), elems.len());
+            // Pick a component class for the array based on the element kind so
+            // downstream `instanceof "[Lfoo;"` checks correctly distinguish
+            // between e.g. `String[]` and `Annotation[]`. Spring's
+            // `AnnotationUtils.adaptValue` runs an `instanceof
+            // "[Ljava/lang/annotation/Annotation;"` chain — if the array's
+            // component class is bare `Object` (cid=0), the lenient
+            // assignability fallback in `array_is_assignable_to`
+            // (interpreter.rs `if src_comp == "java/lang/Object" { return
+            // true; }`) green-lights the cast and a `String[]` flows into the
+            // `Annotation[]` branch, eventually surfacing as
+            // `String.annotationType()` NSME inside
+            // `retrieveAnnotationAttributes`.
+            //
+            // Pick by inspecting the first element variant — annotation
+            // attribute arrays are homogeneous per JLS §9.6.1.
+            use rustjvm_native_api::AnnotationElementValue as AEV;
+            let comp_name: &str = match elems.first() {
+                Some(AEV::StringVal(_)) => "java/lang/String",
+                Some(AEV::Class(_)) => "java/lang/Class",
+                Some(AEV::Annotation(_)) => "java/lang/annotation/AnnotationProxy",
+                Some(AEV::Enum(type_desc, _)) => type_desc
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                    .unwrap_or("java/lang/Enum"),
+                // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
+                // are still allocated as boxed wrapper arrays here per
+                // pre-existing behaviour — pick the wrapper class.
+                Some(AEV::Int(_)) => "java/lang/Integer",
+                Some(AEV::Long(_)) => "java/lang/Long",
+                Some(AEV::Float(_)) => "java/lang/Float",
+                Some(AEV::Double(_)) => "java/lang/Double",
+                _ => "java/lang/Object",
+            };
+            let comp_cid = ctx
+                .class_id_by_name(comp_name)
+                .or_else(|| {
+                    let _ = ctx.load_class(comp_name);
+                    ctx.class_id_by_name(comp_name)
+                })
+                .unwrap_or(rustjvm_types::ClassId::new(0));
+            let arr = ctx.new_ref_array(comp_cid, elems.len());
             for (i, elem) in elems.iter().enumerate() {
                 let v = annotation_element_to_java(ctx, elem);
                 ctx.set_array_element(arr, i, v);
@@ -5123,7 +5196,7 @@ pub(crate) fn field_class_and_name(
 }
 
 /// Helper: extract declaring class ID, method name, and descriptor from a Method reflection object.
-fn method_class_name_desc(
+pub(crate) fn method_class_name_desc(
     ctx: &dyn NativeContext,
     method_obj: ObjectRef,
 ) -> Option<(ClassId, String, String)> {

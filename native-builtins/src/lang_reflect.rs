@@ -33,8 +33,9 @@ use rustjvm_types::{ClassId, ObjectRef, Value};
 use rustjvm_types::error::MethodCallResult;
 
 use crate::lang_class::{
+    annotation_element_to_java,
     create_method_object, create_constructor_object, create_field_object,
-    descriptor_to_class_mirror, mirror_class_id, mirror_class_name,
+    descriptor_to_class_mirror, method_class_name_desc, mirror_class_id, mirror_class_name,
     parse_descriptor_param_and_return, read_method_descriptor,
     read_constructor_descriptor, read_field_meta,
 };
@@ -499,16 +500,35 @@ pub(crate) fn native_class_get_enclosing_constructor_public(
 // Method.getDefaultValue() — for annotation methods.
 // ---------------------------------------------------------------------------
 //
-// Returns null for non-annotation methods. For annotation interfaces,
-// returns the AnnotationDefault attribute value.
-// We don't fully parse AnnotationDefault yet; return null for everything,
-// which matches an annotation method without an explicit default.
+// Returns null for non-annotation methods or annotation methods without an
+// explicit default. For annotation-element methods that DO declare a default
+// (`String[] basePackages() default {}`, `int max() default 5`, ...), we
+// parse the JVMS §4.7.22 `AnnotationDefault` attribute via
+// `NativeContext::method_annotation_default` and convert it to a Java Value
+// using the same `annotation_element_to_java` path that populates default
+// element values inside annotation proxies.
+//
+// This is required for Spring's `AttributeMethods` constructor (which sets
+// `hasDefaultValueMethod` based on `m.getDefaultValue() != null`) and for
+// `AnnotationUtils.AliasDescriptor.validateDefaultValueConfiguration` (which
+// reads each element's default to verify aliased attributes share the same
+// default — null means "no default declared", which the validator rejects
+// for `@AliasFor`-targeted attributes).
 
 pub(crate) fn native_method_get_default_value(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+    let this = obj_arg(args, 0)?;
+    let (class_id, name, desc) = match method_class_name_desc(ctx, this) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let default = match ctx.method_annotation_default(class_id, &name, &desc) {
+        Some(v) => v,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(annotation_element_to_java(ctx, &default)))
 }
 
 // ---------------------------------------------------------------------------
