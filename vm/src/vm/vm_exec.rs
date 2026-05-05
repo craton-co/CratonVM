@@ -3914,16 +3914,33 @@ pub(super) fn proxy_invoke_handler(
         .alloc_object(method_class_id, total_fields.max(8));
     let zero_mirror = super::get_or_create_class_mirror(ctx.shared, ClassId::new(0));
     let name_str = super::create_java_string(ctx.shared, method_name);
-    let param_count = proxy_count_params(descriptor);
+    // Parse descriptor into per-parameter and return type descriptors so we
+    // can populate the synthetic Method's `returnType` and `parameterTypes`
+    // with semantically correct Class mirrors (e.g. real `Type.class`).
+    // Without this, Spring's `TypeProxyInvocationHandler.invoke` falls
+    // through to its default branch (`method.invoke(provider.getType())`)
+    // and our native_method_invoke virtual-dispatches the proxy method
+    // name on the underlying Type — calling e.g. `getGenericInterfaces`
+    // on a `ParameterizedTypeImpl` (NoSuchMethodError).
+    let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
+    let return_type_mirror = proxy_descriptor_to_class_mirror(ctx.shared, &ret_desc);
+    let param_count = param_descs.len();
     let param_arr = ctx.shared.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
         param_count,
     );
+    for (i, pdesc) in param_descs.iter().enumerate() {
+        let pmirror = proxy_descriptor_to_class_mirror(ctx.shared, pdesc);
+        ctx.shared
+            .heap
+            .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
+            .ok();
+    }
     let desc_str = super::create_java_string(ctx.shared, descriptor);
     proxy_method_set_field_by_name(ctx.shared, method_obj, "clazz", Value::Object(Some(zero_mirror)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "name", Value::Object(Some(name_str)));
-    proxy_method_set_field_by_name(ctx.shared, method_obj, "returnType", Value::Object(Some(zero_mirror)));
+    proxy_method_set_field_by_name(ctx.shared, method_obj, "returnType", Value::Object(Some(return_type_mirror)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "parameterTypes", Value::Object(Some(param_arr)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(ctx.shared, method_obj, "signature", Value::Object(Some(desc_str)));
@@ -3937,7 +3954,7 @@ pub(super) fn proxy_invoke_handler(
     } else {
         ctx.shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
         ctx.shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
-        ctx.shared.heap.set_field(method_obj, 2, Value::Object(Some(zero_mirror)));
+        ctx.shared.heap.set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         ctx.shared.heap.set_field(method_obj, 3, Value::Object(Some(param_arr)));
         ctx.shared.heap.set_field(method_obj, 4, Value::Int(1));
         ctx.shared.heap.set_field(method_obj, 5, Value::Object(Some(desc_str)));
@@ -4080,16 +4097,27 @@ pub(crate) fn proxy_invoke_handler_shared(
     let method_obj = shared.heap.alloc_object(method_class_id, total_fields.max(8));
     let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
     let name_str = super::create_java_string(shared, method_name);
-    let param_count = proxy_count_params(descriptor);
+    // Parse descriptor into per-parameter and return type descriptors —
+    // see `proxy_invoke_handler` above for rationale.
+    let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
+    let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
+    let param_count = param_descs.len();
     let param_arr = shared.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
         param_count,
     );
+    for (i, pdesc) in param_descs.iter().enumerate() {
+        let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
+        shared
+            .heap
+            .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
+            .ok();
+    }
     let desc_str = super::create_java_string(shared, descriptor);
     proxy_method_set_field_by_name(shared, method_obj, "clazz", Value::Object(Some(zero_mirror)));
     proxy_method_set_field_by_name(shared, method_obj, "name", Value::Object(Some(name_str)));
-    proxy_method_set_field_by_name(shared, method_obj, "returnType", Value::Object(Some(zero_mirror)));
+    proxy_method_set_field_by_name(shared, method_obj, "returnType", Value::Object(Some(return_type_mirror)));
     proxy_method_set_field_by_name(shared, method_obj, "parameterTypes", Value::Object(Some(param_arr)));
     proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(shared, method_obj, "signature", Value::Object(Some(desc_str)));
@@ -4100,7 +4128,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         // the values.
         shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
         shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
-        shared.heap.set_field(method_obj, 2, Value::Object(Some(zero_mirror)));
+        shared.heap.set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         shared.heap.set_field(method_obj, 3, Value::Object(Some(param_arr)));
         shared.heap.set_field(method_obj, 4, Value::Int(1));
         shared.heap.set_field(method_obj, 5, Value::Object(Some(desc_str)));
@@ -4772,6 +4800,102 @@ pub(super) fn proxy_count_params(descriptor: &str) -> usize {
         }
     }
     count
+}
+
+/// Split a method descriptor into individual parameter type descriptors and
+/// the return type descriptor. Each returned descriptor includes any leading
+/// `[` array prefix and (for `L`-types) the trailing `;`.
+///
+/// `()V` -> (vec![], "V")
+/// `(Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;`
+///   -> (vec!["Ljava/lang/reflect/Method;", "[Ljava/lang/Object;"], "Ljava/lang/Object;")
+pub(super) fn proxy_split_descriptor(descriptor: &str) -> (Vec<String>, String) {
+    let start = match descriptor.find('(') {
+        Some(s) => s,
+        None => return (Vec::new(), String::new()),
+    };
+    let end = match descriptor.find(')') {
+        Some(e) if e > start => e,
+        _ => return (Vec::new(), String::new()),
+    };
+    let inner = &descriptor[start + 1..end];
+    let ret = descriptor[end + 1..].to_string();
+    let mut params = Vec::new();
+    let mut buf = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        buf.push(ch);
+        match ch {
+            'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' | 'V' => {
+                params.push(std::mem::take(&mut buf));
+            }
+            'L' => {
+                for c in chars.by_ref() {
+                    buf.push(c);
+                    if c == ';' {
+                        break;
+                    }
+                }
+                params.push(std::mem::take(&mut buf));
+            }
+            '[' => {
+                // array prefix — keep accumulating until we get a base type
+            }
+            _ => {
+                buf.clear();
+            }
+        }
+    }
+    (params, ret)
+}
+
+/// Resolve a single JVMS field-type descriptor (e.g. `Ljava/lang/Object;`,
+/// `[Ljava/lang/reflect/Type;`, `I`, `V`) to a Class mirror. Used by
+/// `proxy_invoke_handler` so the synthetic `Method` object's `returnType`
+/// and `parameterTypes` carry semantically correct mirrors — Spring's
+/// `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke` branches on
+/// `method.getReturnType() == Type.class` / `Type[].class`, which only works
+/// when those mirrors point at the real `java.lang.reflect.Type` Class.
+pub(super) fn proxy_descriptor_to_class_mirror(
+    shared: &SharedVm,
+    desc: &str,
+) -> ObjectRef {
+    if desc.is_empty() {
+        return super::get_or_create_class_mirror(shared, ClassId::new(0));
+    }
+    // Primitive types -> primitive mirror.
+    let prim_name = match desc {
+        "V" => Some("void"),
+        "Z" => Some("boolean"),
+        "B" => Some("byte"),
+        "C" => Some("char"),
+        "S" => Some("short"),
+        "I" => Some("int"),
+        "J" => Some("long"),
+        "F" => Some("float"),
+        "D" => Some("double"),
+        _ => None,
+    };
+    if let Some(p) = prim_name {
+        return super::get_or_create_primitive_mirror(shared, p);
+    }
+    // Reference / array: load by JVMS internal name.
+    //   `Ljava/lang/Object;` -> "java/lang/Object"
+    //   `[Ljava/lang/reflect/Type;` -> "[Ljava/lang/reflect/Type;"  (array name)
+    //   `[I` -> "[I"
+    let load_name: String = if desc.starts_with('[') {
+        desc.to_string()
+    } else if desc.starts_with('L') && desc.ends_with(';') {
+        desc[1..desc.len() - 1].to_string()
+    } else {
+        return super::get_or_create_class_mirror(shared, ClassId::new(0));
+    };
+    let cid = shared
+        .class_manager
+        .write()
+        .load_class(&load_name)
+        .unwrap_or(ClassId::new(0));
+    super::get_or_create_class_mirror(shared, cid)
 }
 
 /// Box a JVM value into a Java wrapper object for use in Object[] arrays.
