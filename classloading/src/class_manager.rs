@@ -3408,6 +3408,20 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/function/Predicate$And"
         | "java/util/function/Predicate$Or"
         | "java/util/function/Predicate$Negate" => &["java/util/function/Predicate"],
+
+        // S111r17 — Our internal `AnnotationProxy` must declare
+        // `java.lang.annotation.Annotation` as a superinterface so that
+        // class-graph walks (`is_subclass_of`, `array_is_assignable_to`)
+        // recognise an `[Ljava/lang/annotation/AnnotationProxy;` array as
+        // an `[Ljava/lang/annotation/Annotation;` array.  Spring 5.x
+        // (SB2) `AnnotationUtils.adaptValue` does exactly that
+        // `instanceof [Ljava.lang.annotation.Annotation;` check before
+        // converting nested-annotation arrays to `AnnotationAttributes[]`,
+        // and without the implements-edge the conversion silently
+        // skips, leaving Spring to feed the raw `AnnotationProxy[]`
+        // into `AnnotationAttributes.assertAttributeType` which then
+        // throws `IllegalArgumentException`.
+        "java/lang/annotation/AnnotationProxy" => &["java/lang/annotation/Annotation"],
         _ => &[],
     }
 }

@@ -576,6 +576,84 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // SPB.8 (Session 113 r2) — provisional blanket ban for the JBoss
+        // Modules class-graph and resource loading code paths.
+        // `apps/wildfly-39.0.1.Final` boot SIGSEGVs (rc=139) right after the
+        // BigInteger ZERO/ONE/TWO post-clinit fixup and the two upstream
+        // `<clinit>` swallows (`SimpleLoggerContext`, `ConcurrentClassLoader`)
+        // handled by parallel agents. With `RUSTJVM_DISABLE_JIT=1` the
+        // SIGSEGV is replaced by a clean `NoSuchMethodError` for
+        // `Object.loadClass(...)` followed by an orderly `System.exit(1)`
+        // — i.e. boot proceeds far past the JIT-on crash point. This
+        // confirms a JIT miscompile, not a native gap.
+        //
+        // The `RUSTJVM_DBG_JIT_DISPATCH=1` capture shows the very last
+        // dispatched method before the SIGSEGV is
+        // `java/lang/Long.parseLong(Ljava/lang/String;I)J` invoked with a
+        // corrupted reference arg0 (`0xfffd_026d_7b3e_5570` — the high
+        // `0xfffd` half is a tag-bit corruption signature, not a valid heap
+        // pointer). The upstream traffic is JBoss Modules's
+        // `PropertyReadAction.run` / `Module$1.run` lambdas iterating module
+        // descriptors, plus the JBoss AS `PluggableMBeanServerImpl$
+        // TcclMBeanServer$4.run` thread-context-classloader doPrivileged
+        // chain. Both are allocate-then-putfield-heavy: `Module.<init>`
+        // stores `name`/`mainClass`/`fallbackLoader` slots, and the
+        // class-graph traversal walks `LocalLoader` / `PathFilter` chains
+        // that allocate a fresh `ResourceLoaderSpec` / `Resource` per visit.
+        // This matches the W2-CHM / RBC.1 / SPB.1-7 archetype.
+        //
+        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/jboss/modules/`. The
+        // companion `org/jboss/as/` ban below covers the WildFly server
+        // boot path that consumes the module graph.
+        if class_name.starts_with("org/jboss/modules/")
+            && !package_allowed("org/jboss/modules/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.8b (Session 113 r2) — companion blanket ban for the WildFly
+        // server boot path (`org/jboss/as/`). Once JBoss Modules is
+        // unblocked by SPB.8, the next downstream consumer is the JBoss AS
+        // server bootstrap (`org/jboss/as/server`, `org/jboss/as/controller`,
+        // `org/jboss/as/jmx`, etc.), which exhibits the same
+        // allocate-then-putfield pattern: `ServerLogger_$logger_en_US`
+        // ctors store i18n message slots, `PluggableMBeanServerImpl`
+        // delegates allocate fresh `Subject` / `ClassLoader` references
+        // per invocation, and `ServerEnvironment.<init>` resolves dozens
+        // of `-Djboss.*` properties via `Long.parseLong` /
+        // `Boolean.parseBoolean`. Pre-emptive to avoid a second iteration
+        // if the next gap surfaces in this layer. Lifted by
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/jboss/as/`.
+        if class_name.starts_with("org/jboss/as/")
+            && !package_allowed("org/jboss/as/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.8c (Session 113 r2) — companion blanket ban for the WildFly
+        // security-manager package (`org/wildfly/`). The
+        // `RUSTJVM_DBG_JIT_DISPATCH=1` capture shows the very last JIT
+        // dispatches before the SIGSEGV are
+        // `org/wildfly/security/manager/WildFlySecurityManager.<init>` and
+        // `WildFlySecurityManager$2.run`, plus
+        // `GetAccessibleDeclaredFieldAction.run` and
+        // `ReadPropertyAction.run`, immediately followed by a
+        // `java/lang/reflect/AccessibleObject.setAccessible0(Z)Z` chain
+        // that culminates in `java/lang/Long.parseLong(String,int)` being
+        // dispatched with a corrupted reference arg0
+        // (`0xfffd_<heap-ptr>`). The 16-bit-tag corruption at offset 48
+        // is the same JIT codegen archetype that bites
+        // `Integer.valueOf` / `String.toLowerCase` — the JIT promotes
+        // `ReadPropertyAction.run` and miscompiles the field load that
+        // returns the property value, OR-ing the high tag bits into the
+        // String reference before it is forwarded to `Long.parseLong`.
+        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/wildfly/`.
+        if class_name.starts_with("org/wildfly/")
+            && !package_allowed("org/wildfly/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
     }
 
     None
@@ -664,6 +742,21 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/lang/Integer", "<init>")
         | ("java/lang/Long", "valueOf")
         | ("java/lang/Long", "<init>")
+        // SPB.8 (Session 113 r2) — `java/lang/Long.parseLong(String,int)`
+        // and friends. WildFly boot dispatch trace shows this method
+        // invoked with a 16-bit-tag-corrupted reference arg0
+        // (`0xfffd_<heap-ptr>`) right after a `setAccessible0` chain,
+        // crashing in the JIT prologue before any Java bytecode runs.
+        // The miscompile is in the JIT calling convention for the
+        // (String, int) -> long signature: an int local slot is being
+        // mapped onto the String parameter register. Banning these keeps
+        // the parse path in the interpreter where calling-convention
+        // marshalling is correct. Also covers `parseInt` for symmetry —
+        // same archetype (String, int) -> int. Other parsing helpers
+        // (Integer.valueOf, Long.valueOf already banned above) cover the
+        // (String) -> Number boxing path.
+        | ("java/lang/Long", "parseLong")
+        | ("java/lang/Integer", "parseInt")
         // RBC.1 (Session 109) — BouncyCastleProvider.<clinit> drives a
         // ~thousand-class init avalanche where every algorithm Mappings
         // class registers via `Provider.put` -> `parseLegacy` ->

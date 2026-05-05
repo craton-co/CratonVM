@@ -272,6 +272,20 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         let module_to_reader = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
         ctx.set_field_by_name(obj, "moduleToReader", Value::Object(Some(module_to_reader)));
     }
+    // S111r17: `java/lang/ClassLoader` declares `packages:ConcurrentHashMap`
+    // (instance field) which the real-JDK ctor initializes via
+    // `new ConcurrentHashMap()`.  We bypass the ctor through
+    // `alloc_concurrent_synthetic`, so `packages` defaults to null. The JDK's
+    // `ClassLoader.packages()` instance method does
+    // `getfield packages → ConcurrentHashMap.values()`, NPE'ing with
+    // "Cannot invoke values on null" — observed during
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (JBoss Modules /
+    // WildFly 39 boot), whose static initializer calls
+    // `Package.getPackages()` → `ClassLoader.getClassLoader(...).getPackages()`
+    // → `packages()`. Pre-populate an empty CHM so the bytecode path runs
+    // without additional intercepts.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(obj, "packages", Value::Object(Some(packages_map)));
     obj
 }
 
@@ -329,6 +343,10 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+    // S111r17: see alloc_classloader — initialize `packages` CHM so
+    // ClassLoader.packages() doesn't NPE on `getfield + values()`.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
 
@@ -343,6 +361,9 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+    // S111r17: see alloc_classloader.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
 
@@ -358,6 +379,9 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+    // S111r17: see alloc_classloader.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     // Assign unique loader ID for namespace isolation
     let lid = ctx.allocate_loader_id();
     ctx.set_field(this, CL_LOADER_ID, Value::Int(lid as i32));

@@ -3515,6 +3515,72 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // works in real-JDK mode too.
     crate::securerandom::register_random_and_securerandom_natives(registry);
 
+    // S111r17: `Class.getPackage()` real-JDK override. The JDK Java body of
+    // `Class.getPackage()` delegates to `ClassLoader.definePackage(c)` →
+    // `getDefinedPackage(name)` (we override to null) → `getNamedPackage(
+    // name, module)` (we override) — but `getNamedPackage` doesn't have
+    // access to the Class and so cannot populate
+    // `implementationVersion` from the source jar's manifest. Result:
+    // `SpringBootVersion.class.getPackage().getImplementationVersion()`
+    // returns null, the JarURLConnection fallback path NPEs at line 61,
+    // and the SB2.3.8 banner crashes before printing the version.
+    // Registering the same `native_class_get_package` body that
+    // synthetic-jdk uses fixes the version probe at the root.
+    registry.register(
+        "java/lang/Class",
+        "getPackage",
+        "()Ljava/lang/Package;",
+        crate::lang_class::native_class_get_package,
+    );
+
+    // S111r17: `Package.getImplementationVersion()` and friends. The
+    // `native_class_get_package` builder writes `implVersion` and
+    // friends into Package's slots 1..=6 directly, bypassing the JDK's
+    // `versionInfo: VersionInfo` indirection. The JDK Java body for
+    // `Package.getImplementationVersion()` reads `versionInfo.implVersion`
+    // — but `versionInfo` is null on our synthetic Package, NPE.
+    // Override the field-reader methods to return slot N directly.
+    // Slot layout (must match `native_class_get_package`):
+    //   0=name, 1=specTitle, 2=specVersion, 3=specVendor,
+    //   4=implTitle, 5=implVersion, 6=implVendor.
+    let pkg_cls = "java/lang/Package";
+    fn pkg_obj_arg(args: &[Value]) -> Result<rustjvm_types::ObjectRef, rustjvm_types::error::RuntimeError> {
+        match args.first() {
+            Some(Value::Object(Some(o))) => Ok(*o),
+            _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Package method called on null".to_string()),
+            }),
+        }
+    }
+    registry.register(pkg_cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    registry.register(pkg_cls, "getSpecificationTitle", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    registry.register(pkg_cls, "getSpecificationVersion", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 2)))
+    });
+    registry.register(pkg_cls, "getSpecificationVendor", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 3)))
+    });
+    registry.register(pkg_cls, "getImplementationTitle", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 4)))
+    });
+    registry.register(pkg_cls, "getImplementationVersion", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 5)))
+    });
+    registry.register(pkg_cls, "getImplementationVendor", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 6)))
+    });
+
     // WP6.2 follow-up — `java.util.HexFormat.formatHex(byte[])` /
     // `formatHex(byte[],int,int)` for `apps/digest_probe/DigestProbe.java`.
     // Real-JDK bytecode for `HexFormat` produces empty strings in real-JDK

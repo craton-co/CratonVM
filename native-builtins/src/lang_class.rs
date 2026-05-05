@@ -825,6 +825,30 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
     };
     let target_class_id = ctx.class_id_of_object(target);
 
+    // S111r17 — Array-aware isInstance.  Heap-stored `class_id_of` for an
+    // array returns the COMPONENT class id (e.g. `java/lang/Class` for a
+    // `Class[]` array), NOT the synthetic `[Lcomponent;` array class id.
+    // Without this branch, `Class[].isInstance(myClassArray)` reduces to
+    // `is_subclass(java/lang/Class, [Ljava/lang/Class;)` which is always
+    // false — the same bug that the interpreter's `instanceof` bytecode
+    // already works around in `array_descriptor_of` /
+    // `array_is_assignable_to`.  Mirror that logic here so reflection
+    // callers (Spring's `TypeMappedAnnotation.adapt`, which throws
+    // `IllegalArgumentException` when `type.isInstance(value)` returns
+    // false for a wrapped attribute array) see consistent results.
+    let target_is_array = ctx.heap_kind_of(target) == rustjvm_types::ObjectKind::Array;
+    if target_is_array {
+        let src_desc = array_descriptor_for(ctx, target);
+        let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+        if array_is_assignable(ctx, &src_desc, &this_name) {
+            return Ok(Some(Value::Int(1)));
+        }
+        // Fall through to legacy id-based check below (covers some
+        // edge cases where the target is an array but the type mirror
+        // is a non-array Class — those reduce to assignable-to-Object
+        // via `array_is_assignable` already, so this is just defensive).
+    }
+
     // Annotation proxy special case: our `create_annotation_proxy` allocates
     // objects of class `java/lang/annotation/AnnotationProxy`, not of the
     // actual annotation interface. JDK reflection and Spring's
@@ -862,6 +886,103 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// S111r17 — Build the JVMS array descriptor (e.g. `[Ljava/lang/Class;`,
+/// `[I`, `[[Ljava/lang/String;`) for an array heap object.  Mirrors the
+/// interpreter's `array_descriptor_of` (vm/src/runtime/interpreter.rs)
+/// but lives in NativeContext-land so reflection natives can use it.
+fn array_descriptor_for(ctx: &dyn NativeContext, obj: rustjvm_types::ObjectRef) -> String {
+    use rustjvm_types::ArrayElementType;
+    let et = ctx.heap_element_type_of(obj);
+    match et {
+        ArrayElementType::Boolean => "[Z".to_string(),
+        ArrayElementType::Char => "[C".to_string(),
+        ArrayElementType::Float => "[F".to_string(),
+        ArrayElementType::Double => "[D".to_string(),
+        ArrayElementType::Byte => "[B".to_string(),
+        ArrayElementType::Short => "[S".to_string(),
+        ArrayElementType::Int => "[I".to_string(),
+        ArrayElementType::Long => "[J".to_string(),
+        ArrayElementType::Reference => {
+            let comp_id = ctx.class_id_of_object(obj);
+            let comp_name = ctx.class_name_of_id(comp_id).unwrap_or_default();
+            if comp_name.is_empty() {
+                "[Ljava/lang/Object;".to_string()
+            } else if comp_name.starts_with('[') {
+                format!("[{}", comp_name)
+            } else {
+                format!("[L{};", comp_name)
+            }
+        }
+    }
+}
+
+/// S111r17 — Recursive array assignability check, mirroring the
+/// interpreter's `array_is_assignable_to`.  `target_name` is a
+/// "raw" class name (slash-separated, no `L...;` wrapping for
+/// non-array types) — matches what `mirror_class_name` returns.
+fn array_is_assignable(ctx: &dyn NativeContext, src_desc: &str, target_name: &str) -> bool {
+    if target_name == "java/lang/Object"
+        || target_name == "java/io/Serializable"
+        || target_name == "java/lang/Cloneable"
+    {
+        return true;
+    }
+    if !target_name.starts_with('[') {
+        return false;
+    }
+    if src_desc == target_name {
+        return true;
+    }
+    let src_rest = &src_desc[1..];
+    let tgt_rest = &target_name[1..];
+    if src_rest.len() == 1 && "ZCBSIJFD".contains(&src_rest[..1]) {
+        return src_rest == tgt_rest;
+    }
+    if tgt_rest.len() == 1 && "ZCBSIJFD".contains(&tgt_rest[..1]) {
+        return false;
+    }
+    let extract = |desc: &str| -> Option<(bool, String)> {
+        if desc.starts_with('[') {
+            Some((true, desc.to_string()))
+        } else if desc.starts_with('L') && desc.ends_with(';') {
+            Some((false, desc[1..desc.len() - 1].to_string()))
+        } else {
+            None
+        }
+    };
+    let (src_is_arr, src_comp) = match extract(src_rest) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (tgt_is_arr, tgt_comp) = match extract(tgt_rest) {
+        Some(x) => x,
+        None => return false,
+    };
+    if src_is_arr && tgt_is_arr {
+        return array_is_assignable(ctx, &src_comp, &tgt_comp);
+    }
+    if src_is_arr != tgt_is_arr {
+        if !src_is_arr {
+            return false;
+        }
+        return tgt_comp == "java/lang/Object"
+            || tgt_comp == "java/io/Serializable"
+            || tgt_comp == "java/lang/Cloneable";
+    }
+    if src_comp == "java/lang/Object" {
+        return true;
+    }
+    let src_id = match ctx.class_id_by_name(&src_comp) {
+        Some(id) => id,
+        None => return false,
+    };
+    let tgt_id = match ctx.class_id_by_name(&tgt_comp) {
+        Some(id) => id,
+        None => return false,
+    };
+    src_id == tgt_id || ctx.is_subclass(src_id, tgt_id)
+}
+
 pub(crate) fn native_class_is_assignable_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -879,6 +1000,52 @@ pub(crate) fn native_class_is_assignable_from(
             .into())
         }
     };
+
+    // S111r17 — Array-aware isAssignableFrom.  Same root cause as
+    // `native_class_is_instance` above: when `this` represents an array
+    // Class (descriptor like `[Lfoo;` recoverable from the mirror's
+    // name field) and `other` represents an array Class, the simple
+    // `is_subclass` walk doesn't traverse JVM-level array covariance
+    // (e.g. `String[] -> Object[]`, `AnnotationProxy[] ->
+    // Annotation[]`).  Reuse the same descriptor / assignability
+    // helpers we added for `isInstance`.  Spring 5.x's
+    // `Assert.isAssignable(supertype, subtype)` is the visible caller
+    // — it throws `IllegalArgumentException` from
+    // `assignableCheckFailed` when this returns false, masking the
+    // underlying type-system gap.
+    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    let other_name = mirror_class_name(ctx, other).unwrap_or_default();
+    if this_name.starts_with('[') || other_name.starts_with('[') {
+        // Build descriptors. Non-array Class mirrors get an `L...;`
+        // wrap to match the array_is_assignable contract; array
+        // mirrors keep their leading `[`.
+        let to_desc = |n: &str| -> String {
+            if n.starts_with('[') {
+                n.to_string()
+            } else if n.is_empty() {
+                "Ljava/lang/Object;".to_string()
+            } else {
+                format!("L{};", n)
+            }
+        };
+        let other_desc = to_desc(&other_name);
+        let this_desc = to_desc(&this_name);
+        // For arrays, dispatch to array_is_assignable (which expects
+        // a target that may be an array name, raw class name, or
+        // Object/Serializable/Cloneable). Pass other's full descriptor
+        // as src and this's name (NOT descriptor) as target.
+        if other_desc.starts_with('[') && array_is_assignable(ctx, &other_desc, &this_name) {
+            return Ok(Some(Value::Int(1)));
+        }
+        if this_desc.starts_with('[') && other_desc == this_desc {
+            return Ok(Some(Value::Int(1)));
+        }
+        // Fall through to id-based check below for non-array vs array
+        // mismatches (e.g. `String.class.isAssignableFrom(stringArray.class)`
+        // → false, handled by the legacy is_subclass which always
+        // returns false for these).
+    }
+
     let this_class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => return Ok(Some(Value::Int(0))),
@@ -5967,22 +6134,67 @@ pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &
 
 /// Read a manifest attribute by name from the class's source jar, if any.
 /// Returns `None` for classes loaded from a directory or the boot path.
+///
+/// Supports three CodeSource URL forms:
+///   * `file:/C:/.../foo.jar`                              — plain jar
+///   * `jar:file:/C:/.../outer.jar!/BOOT-INF/lib/inner.jar!/` — Spring Boot 2.x
+///   * `jar:nested:/C:/.../outer.jar/!BOOT-INF/lib/inner.jar!/` — Spring Boot 3.x
+///
+/// For the nested forms, opens the outer jar, extracts the inner jar entry
+/// to a byte buffer, reads `META-INF/MANIFEST.MF` from the inner zip, and
+/// parses out the requested attribute. This is what unblocks
+/// `SpringBootVersion.class.getPackage().getImplementationVersion()` for
+/// Spring Boot fat-jar deployments where the class lives in a nested jar.
 fn t19_h10_class_manifest_attr(
     ctx: &mut dyn NativeContext,
     class_id: rustjvm_types::ClassId,
     attr: &str,
 ) -> Option<String> {
     let url = ctx.class_code_base(class_id)?;
-    // The CodeSource URL is the jar that holds the class, e.g.
-    // `file:/C:/.../org.keycloak.keycloak-common-26.2.4.jar`.
-    // Strip the `file:` prefix and percent-decoding so we can hand the path
-    // to the same manifest reader the launcher uses.
+
+    // Spring Boot nested-jar handling.
+    // 2.x: `jar:file:/<outer>!/BOOT-INF/lib/<inner>.jar!/`
+    // 3.x: `jar:nested:/<outer>/!BOOT-INF/lib/<inner>.jar!/`
+    if let Some(rest) = url
+        .strip_prefix("jar:file:")
+        .or_else(|| url.strip_prefix("jar:nested:"))
+    {
+        // Split on the first `!/` (or `/!` for 3.x's `nested:` form which
+        // separates the outer-jar path from the inner entry with `/!`).
+        let (outer_part, inner_part) = if let Some(idx) = rest.find("!/") {
+            (&rest[..idx], &rest[idx + 2..])
+        } else if let Some(idx) = rest.find("/!") {
+            (&rest[..idx], &rest[idx + 2..])
+        } else {
+            ("", "")
+        };
+        if !outer_part.is_empty() && !inner_part.is_empty() {
+            // Strip trailing `!/` from inner, then split inner on first `!/`
+            // (some forms include a trailing entry-name section).
+            let inner_entry = inner_part
+                .trim_end_matches('/')
+                .trim_end_matches('!')
+                .trim_end_matches('/');
+            // Strip leading slashes from outer path; keep the rest as a path.
+            let outer_path = outer_part.trim_start_matches('/');
+            let outer_pb = if cfg!(windows) {
+                std::path::PathBuf::from(outer_path)
+            } else {
+                std::path::PathBuf::from(format!("/{}", outer_path))
+            };
+            if outer_pb.is_file() {
+                if let Some(val) = nested_jar_manifest_attr(&outer_pb, inner_entry, attr) {
+                    return Some(val);
+                }
+            }
+        }
+        // Fall through to None if the nested form failed to resolve.
+        return None;
+    }
+
+    // Plain `file:` URL (single jar).
     let path = url.strip_prefix("file:").unwrap_or(&url);
     let path = path.trim_start_matches('/');
-    // On Windows, the URL form is `file:/C:/...`; without the prefix we
-    // get `C:/...`, which is already a valid path. On POSIX, stripping a
-    // single leading `/` would break absolute paths — re-add it for the
-    // POSIX case.
     let path = if cfg!(windows) {
         std::path::PathBuf::from(path)
     } else {
@@ -5993,6 +6205,45 @@ fn t19_h10_class_manifest_attr(
     }
     let manifest = rustjvm_classloading::ClassPath::read_jar_manifest(&path)?;
     manifest.attributes.get(attr).cloned()
+}
+
+/// Open the outer jar, extract the inner-jar entry into memory, and read
+/// the requested `META-INF/MANIFEST.MF` attribute from inside the inner jar.
+/// Returns `None` on any I/O / format failure (best-effort).
+fn nested_jar_manifest_attr(
+    outer_jar: &std::path::Path,
+    inner_entry: &str,
+    attr: &str,
+) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(outer_jar).ok()?;
+    let mut outer = zip::ZipArchive::new(file).ok()?;
+    // Inner entry path inside the outer zip — strip any leading `/`.
+    let entry_name = inner_entry.trim_start_matches('/');
+    let mut inner_bytes: Vec<u8> = Vec::new();
+    {
+        let mut entry = outer.by_name(entry_name).ok()?;
+        entry.read_to_end(&mut inner_bytes).ok()?;
+    }
+    // Spring Boot 2.x stores BOOT-INF/lib/*.jar uncompressed (STORED) so we
+    // can read it directly as a zip from the byte buffer.
+    let cursor = std::io::Cursor::new(inner_bytes);
+    let mut inner = zip::ZipArchive::new(cursor).ok()?;
+    let mut mf_str = String::new();
+    {
+        let mut mf = inner.by_name("META-INF/MANIFEST.MF").ok()?;
+        mf.read_to_string(&mut mf_str).ok()?;
+    }
+    // Parse MANIFEST.MF main attributes (no continuation-line handling for
+    // the simple `Implementation-Version: X.Y.Z` cases we care about).
+    for line in mf_str.lines() {
+        if let Some((k, v)) = line.split_once(": ") {
+            if k.trim().eq_ignore_ascii_case(attr) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Real `Class.getPackage()` native — returns a `java.lang.Package` mirror
@@ -6163,6 +6414,16 @@ pub(crate) fn i2_classloader_define_package_string_module(
 /// single-arg overload called by `Class.getPackage()`'s JDK Java body
 /// when the native override (registered separately for `Class.getPackage`)
 /// isn't taken.
+///
+/// Also populates the manifest-derived fields (`implementationTitle`,
+/// `implementationVersion`, `specification*`, `implementationVendor`) from
+/// the class's source jar — same data path as `native_class_get_package`.
+/// Without this, callers like `Foo.class.getPackage().getImplementationVersion()`
+/// in real-JDK mode see slot 5 = null (because real `Class.getPackage()`
+/// delegates here), even though the synthetic-jdk override correctly
+/// populated those fields. This caused Spring Boot 2.x to NPE in
+/// `SpringBootVersion.determineSpringBootVersion()` on the JarURLConnection
+/// fallback path.
 pub(crate) fn i2_classloader_define_package_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6181,7 +6442,35 @@ pub(crate) fn i2_classloader_define_package_class(
     } else {
         String::new()
     };
+    // Read manifest attributes (best-effort) from the class's source jar.
+    let (impl_title, impl_version, spec_title, spec_version, spec_vendor, impl_vendor) =
+        if let Some(class_id) = mirror_class_id(ctx, class_arg) {
+            (
+                t19_h10_class_manifest_attr(ctx, class_id, "Implementation-Title"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Implementation-Version"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Specification-Title"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Specification-Version"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Specification-Vendor"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Implementation-Vendor"),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
+    let write_optional = |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
+        let obj = match val {
+            Some(s) => Value::Object(Some(ctx.create_string(&s))),
+            None => Value::Object(None),
+        };
+        ctx.set_field(pkg, slot, obj);
+        ctx.set_field_by_name(pkg, field, obj);
+    };
+    write_optional(ctx, 1, "specTitle", spec_title);
+    write_optional(ctx, 2, "specVersion", spec_version);
+    write_optional(ctx, 3, "specVendor", spec_vendor);
+    write_optional(ctx, 4, "implTitle", impl_title);
+    write_optional(ctx, 5, "implVersion", impl_version);
+    write_optional(ctx, 6, "implVendor", impl_vendor);
     Ok(Some(Value::Object(Some(pkg))))
 }
 

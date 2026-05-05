@@ -847,6 +847,43 @@ fn native_properties_contains_value(
     native_properties_contains(ctx, args)
 }
 
+/// Native `Properties.forEach(BiConsumer)V` — iterates the side-table
+/// and invokes `action.accept(key, value)` for each entry.  JDK 25's
+/// `Properties.forEach` (Properties.java:1464) forwards directly to
+/// `map.forEach(action)`, but our synthetic Properties has a null
+/// internal `map` field (see `System.getProperties` allocation), so the
+/// real-JDK path NPEs with "Cannot invoke forEach on null".
+///
+/// log4j-api 2.23 `StatusLogger$PropertiesUtilsDouble.normalizeProperties`
+/// calls `properties.forEach(BiConsumer)` once per Properties source
+/// (System, env, .properties file) during `StatusLogger$Config.<clinit>`.
+/// Without this override, WildFly fails to bootstrap the status logger.
+fn native_properties_for_each(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let snapshot = snapshot_kv(this);
+    for (k, v) in &snapshot {
+        let ks = ctx.create_string(k);
+        let vs = ctx.create_string(v);
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[Value::Object(Some(ks)), Value::Object(Some(vs))],
+        )?;
+    }
+    Ok(None)
+}
+
 /// Register the side-table-backed `Properties` natives.  Called from
 /// `register_essential_natives` (real-JDK mode) so KeycloakMain's
 /// `Version.<clinit>` finds a non-null `version` value.
@@ -964,6 +1001,18 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "containsValue",
         "(Ljava/lang/Object;)Z",
         native_properties_contains_value,
+    );
+    // WildFly / log4j-api 2.23 StatusLogger$Config.<clinit> →
+    // PropertiesUtilsDouble.normalizeProperties calls
+    // `properties.forEach(BiConsumer)` on `System.getProperties()` (and
+    // a freshly-built env/file Properties).  JDK 25's Properties.forEach
+    // dereferences `map.forEach`; on our synthetic Properties `map` is
+    // null, so route forEach through the side-table directly.
+    registry.register(
+        "java/util/Properties",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_properties_for_each,
     );
 }
 
