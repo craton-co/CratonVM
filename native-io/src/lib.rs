@@ -7149,6 +7149,12 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
 const RAF_FIELD_FD: usize = 0;
 const RAF_FIELD_PATH: usize = 1;
 
+// RAF natives use `fd_table.open_read_write(...)` so that the underlying
+// `FileEntry::FileReadWrite` variant supports `rw_seek`/`rw_read`/`rw_write`
+// (the `open_read`/`open_write` variants used here previously do not, which
+// turned `seek(J)V` into a silent no-op and broke any caller that walked
+// the file backward — e.g. Spring Boot 2's internal jar reader scanning
+// for the ZIP End-Of-Central-Directory record).
 fn native_raf_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -7162,11 +7168,8 @@ fn native_raf_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => "r".to_string(),
     };
-    let fd = if mode.contains('w') {
-        ctx.fd_table().open_write(&path, false).map_err(io_err)?
-    } else {
-        ctx.fd_table().open_read(&path).map_err(io_err)?
-    };
+    let writable = mode.contains('w');
+    let fd = ctx.fd_table().open_read_write(&path, writable).map_err(io_err)?;
     ctx.set_field(this, RAF_FIELD_FD, Value::Int(fd as i32));
     let path_str = ctx.create_string(&path);
     ctx.set_field(this, RAF_FIELD_PATH, Value::Object(Some(path_str)));
@@ -7190,11 +7193,8 @@ fn native_raf_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => "r".to_string(),
     };
-    let fd = if mode.contains('w') {
-        ctx.fd_table().open_write(&path, false).map_err(io_err)?
-    } else {
-        ctx.fd_table().open_read(&path).map_err(io_err)?
-    };
+    let writable = mode.contains('w');
+    let fd = ctx.fd_table().open_read_write(&path, writable).map_err(io_err)?;
     ctx.set_field(this, RAF_FIELD_FD, Value::Int(fd as i32));
     let path_str = ctx.create_string(&path);
     ctx.set_field(this, RAF_FIELD_PATH, Value::Object(Some(path_str)));
@@ -7210,8 +7210,12 @@ fn native_raf_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(v) => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let b = ctx.fd_table().read_byte(fd).unwrap_or(-1);
-    Ok(Some(Value::Int(b)))
+    let mut buf = [0u8; 1];
+    match ctx.fd_table().rw_read(fd, &mut buf) {
+        Ok(0) => Ok(Some(Value::Int(-1))),
+        Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
+        Err(_) => Ok(Some(Value::Int(-1))),
+    }
 }
 
 fn native_raf_read_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7235,20 +7239,19 @@ fn native_raf_read_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Int(v) => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let mut count = 0;
-    for i in 0..len {
-        let b = ctx.fd_table().read_byte(fd).unwrap_or(-1);
-        if b < 0 {
-            break;
-        }
-        ctx.set_array_element(buf, off + i, Value::Int(b));
-        count += 1;
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
     }
-    Ok(Some(Value::Int(if count == 0 && len > 0 {
-        -1
-    } else {
-        count
-    })))
+    let mut tmp = vec![0u8; len];
+    let n = match ctx.fd_table().rw_read(fd, &mut tmp) {
+        Ok(0) => return Ok(Some(Value::Int(-1))),
+        Ok(n) => n,
+        Err(_) => return Ok(Some(Value::Int(-1))),
+    };
+    for i in 0..n {
+        ctx.set_array_element(buf, off + i, Value::Int(tmp[i] as i8 as i32));
+    }
+    Ok(Some(Value::Int(n as i32)))
 }
 
 fn native_raf_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7264,7 +7267,7 @@ fn native_raf_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().write_bytes(fd, &[b]);
+    let _ = ctx.fd_table().rw_write(fd, &[b]);
     Ok(None)
 }
 
@@ -7295,7 +7298,7 @@ fn native_raf_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             bytes.push(b as u8);
         }
     }
-    let _ = ctx.fd_table().write_bytes(fd, &bytes);
+    let _ = ctx.fd_table().rw_write(fd, &bytes);
     Ok(None)
 }
 
@@ -7304,21 +7307,38 @@ fn native_raf_seek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let _pos = match args.get(1) {
+    // RKC23B: the operand-stack tag for category-2 long arguments crossing
+    // an `invokevirtual` boundary may arrive as `Double` (same 64-bit
+    // payload, different Value tag) when the upstream method passed the
+    // long via `lload_<n>` from a slot the JIT has cached as a double.
+    // Accept either tag and reinterpret the bits as i64. Same defensive
+    // pattern is applied to every J-typed RAF native below.
+    let pos = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
         _ => 0,
     };
-    let _fd = match ctx.get_field(this, RAF_FIELD_FD) {
+    let fd = match ctx.get_field(this, RAF_FIELD_FD) {
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    // Simplified: seek not fully implemented for fd_table
+    let _ = ctx
+        .fd_table()
+        .rw_seek(fd, std::io::SeekFrom::Start(pos.max(0) as u64));
     Ok(None)
 }
 
-fn native_raf_get_file_pointer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Simplified: return 0
-    Ok(Some(Value::Long(0)))
+fn native_raf_get_file_pointer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let fd = match ctx.get_field(this, RAF_FIELD_FD) {
+        Value::Int(v) => v as u32,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let pos = ctx.fd_table().rw_position(fd).unwrap_or(0);
+    Ok(Some(Value::Long(pos as i64)))
 }
 
 fn native_raf_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

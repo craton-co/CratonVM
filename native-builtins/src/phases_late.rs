@@ -3605,6 +3605,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- Paths.get extras ---
     // Already registered in earlier phase, but let's register Path.of (Java 11)
+    //
+    // S111r11 SB3: previously this implementation ignored the varargs and
+    // returned just `first`. That broke `SystemModuleFinders.ofSystem()` which
+    // calls `Path.of(javaHome, "lib", "modules")` — we returned `javaHome`,
+    // `Files.isRegularFile(javaHome)` was false, and the JDK fell through to
+    // `ModulePath.of(patcher, Path.of(javaHome, "modules"))` (which we also
+    // collapsed to `javaHome`) → `ModulePath.scan` threw FindException
+    // "Module format not recognized: <javaHome>". That FindException then
+    // propagates out of `PathMatchingResourcePatternResolver.<clinit>` (Spring
+    // calls `ModuleFinder.ofSystem().findAll()` at line 216). Fix: walk the
+    // varargs array and resolve each component onto the running path.
     r.register(
         path,
         "of",
@@ -3612,8 +3623,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let first_ref = obj_arg(args, 0)?;
             let first = ctx.read_string(first_ref).unwrap_or_default();
-            // Ignore extra args for simplicity
-            let result = p57_alloc_path(ctx, &first);
+            let mut acc = first;
+            if let Some(Value::Object(Some(arr))) = args.get(1) {
+                let len = ctx.array_length(*arr);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                        let part = ctx.read_string(s).unwrap_or_default();
+                        if !part.is_empty() {
+                            acc = p57_resolve_paths(&acc, &part);
+                        }
+                    }
+                }
+            }
+            let result = p57_alloc_path(ctx, &acc);
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -5793,7 +5815,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         };
         let writable = mode_str.contains('w');
         let fd_id = ctx.fd_table().open_read_write(&path, writable)
-            .map_err(|e| RuntimeError::IOException { message: format!("Cannot open: {}", e) })?;
+            .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
         ctx.set_field(this, 0, Value::Int(fd_id as i32));
         ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
         Ok(None)
@@ -5963,8 +5985,14 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "seek", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let pos = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-        ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos as u64))
+        // RKC23B: J-typed args may arrive tagged as Double across some
+        // native dispatch paths; reinterpret bits to recover the long.
+        let pos = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+            _ => 0,
+        };
+        ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
             .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
         Ok(None)
     });
@@ -5989,7 +6017,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "setLength", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let new_len = match args.get(1) { Some(Value::Long(v)) => *v as u64, _ => 0 };
+        let new_len = match args.get(1) {
+            Some(Value::Long(v)) => *v as u64,
+            Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()) as u64,
+            _ => 0,
+        };
         ctx.fd_table().rw_set_length(fd_id as u32, new_len)
             .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
         Ok(None)
@@ -11755,6 +11787,25 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         p59_collection_spliterator,
     );
+
+    // S111r12: `HashSet.spliterator()` — JDK bytecode constructs a
+    // `HashMap.KeySpliterator(this.map, ...)` and later does
+    // `getfield m.table` on the wrapped map. With our synthetic HashMap
+    // layout (slot 2 = capacity Int(16)), that read returns `Int(16)` and
+    // `arraylength` on it surfaces as
+    //   `internal error: expected object reference, got int(16)`.
+    // Same family of failure as S111r7 (`System.getenv()` HashMap layout)
+    // and S111r11 (`Properties.size`). Register `HashSet.spliterator()`
+    // as a native that walks the synthetic backing map and returns a
+    // synthetic Spliterator (data_array, cursor) — the existing
+    // `p59_stream_from_spliterator` and `Spliterator.*` natives already
+    // know how to consume that layout.
+    r.register(
+        "java/util/HashSet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        p59_hashset_spliterator,
+    );
 }
 
 fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11826,6 +11877,58 @@ fn p59_collection_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
     ctx.set_field(spl, 1, Value::Int(0)); // cursor at start
+    Ok(Some(Value::Object(Some(spl))))
+}
+
+/// `HashSet.spliterator()` — bypass the JDK bytecode (which would build a
+/// `HashMap.KeySpliterator(this.map, ...)` and then read `m.table` from
+/// the synthetic backing HashMap, hitting the `int(16)` layout-mismatch).
+/// Snapshot the keys via the synthetic HashMap layout and hand back a
+/// synthetic `(data, cursor)` Spliterator that the rest of the
+/// `Spliterator.*` and `StreamSupport.stream(...)` natives understand.
+fn p59_hashset_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Walk the synthetic HashSet to collect keys. Two layouts in use:
+    //   * Wrapped-HashMap layout: slot 0 = HashMap (`HS_FIELD_MAP`), the
+    //     HashMap holds buckets at slot 0 and each Node has key at slot 0,
+    //     next at slot 3.
+    //   * Legacy 2-field layout: slot 0 = Object[] of keys directly (used by
+    //     some older synthetic builders before the HashMap wrap).
+    let mut keys: Vec<Value> = Vec::new();
+    let slot0 = ctx.get_field(this, 0);
+    if let Value::Object(Some(inner)) = slot0 {
+        // Disambiguate by looking at slot 0 of the inner object. If it's an
+        // array we treat the inner as a HashMap (buckets array). Otherwise
+        // we treat the inner array as the legacy data array.
+        let inner_slot0 = ctx.get_field(inner, 0);
+        if let Value::Object(Some(buckets)) = inner_slot0 {
+            // Wrapped-HashMap path.
+            let n = ctx.array_length(buckets);
+            for i in 0..n {
+                let mut node = ctx.get_array_element(buckets, i);
+                while let Value::Object(Some(node_ref)) = node {
+                    keys.push(ctx.get_field(node_ref, 0));
+                    node = ctx.get_field(node_ref, 3);
+                }
+            }
+        } else {
+            // Legacy direct-array path: `inner` itself is the Object[] data.
+            let n = ctx.array_length(inner);
+            for i in 0..n {
+                keys.push(ctx.get_array_element(inner, i));
+            }
+        }
+    }
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(spl))))
 }
 

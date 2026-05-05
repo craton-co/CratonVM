@@ -211,26 +211,45 @@ pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[
 /// stale invoke-cache miss — we mimic the override by reading `target` when
 /// the synthesized cause field is null. The check is field-name-driven so
 /// it stays layout-agnostic.
+///
+/// JDK-spec sentinel: real-JDK `Throwable` declares `private Throwable
+/// cause = this;` — a self-reference means "no cause set yet" — and
+/// `getCause()` returns `null` in that case. Real-JDK bytecode running
+/// through our interpreter (and any path that mirrors that initializer)
+/// can therefore land here with `cause == this`. Returning `this` would
+/// drive Spring Boot's `getExitCodeFromExitCodeGeneratorException`
+/// recursion into a `StackOverflowError`. Map the sentinel to `null` per
+/// the JDK contract.
 pub(crate) fn native_throwable_get_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
     let by_name_cause = ctx.get_field_by_name(this, "cause");
-    if let Value::Object(Some(_)) = by_name_cause {
+    if let Value::Object(Some(cause_obj)) = by_name_cause {
+        // JDK sentinel: cause==this means "uninitialized cause"; report null.
+        if cause_obj == this {
+            return Ok(Some(Value::Object(None)));
+        }
         return Ok(Some(by_name_cause));
     }
     // ITE / other wrappers: getCause() returns the dedicated `target`
     // field, not the inherited Throwable.cause. Mirror that here so the
     // wrapper exception propagates the correct cause to JLS-spec callers.
     let by_name_target = ctx.get_field_by_name(this, "target");
-    if let Value::Object(Some(_)) = by_name_target {
+    if let Value::Object(Some(target_obj)) = by_name_target {
+        // Same self-reference guard, in case any wrapper's bytecode
+        // initializes its `target` field with `this` as a sentinel.
+        if target_obj == this {
+            return Ok(Some(Value::Object(None)));
+        }
         return Ok(Some(by_name_target));
     }
     // Synthetic-stub fallback: layout has no named `cause` but reserves
     // slot 1 for the cause reference.
     let slot1 = ctx.get_field(this, 1);
     match slot1 {
+        Value::Object(Some(obj)) if obj == this => Ok(Some(Value::Object(None))),
         Value::Object(obj_opt) => Ok(Some(Value::Object(obj_opt))),
         _ => Ok(Some(Value::Object(None))),
     }

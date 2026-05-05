@@ -1146,6 +1146,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `properties_sidetable.rs` to keep the registration here lean.
     crate::properties_sidetable::register_properties_sidetable(registry);
 
+    // S111r11 SB3: `jdk.internal.module.ModuleBootstrap.<clinit>` calls
+    // `getAndRemoveProperty(key) = (String) System.getProperties().remove(key)`
+    // for `jdk.module.path`, `jdk.module.upgrade.path`, `jdk.module.main.class`,
+    // etc. (see ModuleBootstrap.java:976). Our synthetic `System.getProperties()`
+    // is a `Properties` object whose private `ConcurrentHashMap<Object,Object> map`
+    // field is null, so JDK 25's `Properties.remove(Object)` (Properties.java:1348:
+    // `return map.remove(key);`) NPEs. The NPE bubbles up through `<clinit>`,
+    // wrecks the module-bootstrap state, and cascades to
+    // `PathMatchingResourcePatternResolver.<clinit>` later (Spring core touches
+    // the same module subsystem to walk the boot ModuleLayer).
+    //
+    // Override `Properties.remove(Object) Object` to return null. This matches
+    // the semantics of "key not present" — which is correct for our empty
+    // synthetic Properties (none of the jdk.module.* keys are set) and lets
+    // ModuleBootstrap's `getAndRemoveProperty` return null cleanly. The
+    // side-table-backed Properties used by setProperty/getProperty don't go
+    // through this path in our current bootstrap, so this is a safe stub.
+    registry.register(
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
     // JDK 25 additional System natives:
     registry.register("java/lang/System", "setIn0", "(Ljava/io/InputStream;)V", |ctx, args| {
         // JVM spec: setIn0 directly writes System.in via Unsafe.
@@ -11622,6 +11646,147 @@ pub(crate) fn alloc_concurrent_synthetic(
         }
         Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), num_fields),
     }
+}
+
+/// Build a `java.util.HashSet` with a real-layout `java.util.HashMap` inside,
+/// populated with the supplied String keys (each mapped to the canonical
+/// `HashSet.PRESENT` singleton — represented here as the same `Boolean.TRUE`
+/// substitute / null sentinel: JDK code only ever does `containsKey`, never
+/// reads the value).
+///
+/// Falls back to the legacy synthetic-2-field layout (data_array, size) when
+/// the real `HashMap` / `HashMap$Node` field layout cannot be resolved (i.e.
+/// classes not yet loaded). This matches the pattern S111r7 introduced in
+/// `lang_system::native_system_getenv_all` so JDK bytecode for
+/// `HashSet.spliterator()` (which constructs a `HashMap.KeySpliterator` from
+/// the wrapped HashMap and later does `getfield m.table`) reads valid slots
+/// instead of seeing the synthetic `(data_array, size)` placement.
+///
+/// This is a generic collection-layout helper, NOT vendor-specific.
+pub(crate) fn build_real_layout_string_hashset(
+    ctx: &mut dyn NativeContext,
+    keys: &[ObjectRef],
+) -> ObjectRef {
+    use rustjvm_types::ClassId;
+
+    // Resolve real HashMap + HashMap$Node + HashSet field layout.
+    let _ = ctx.ensure_class_initialized("java/util/HashMap");
+    let _ = ctx.ensure_class_initialized("java/util/HashMap$Node");
+    let _ = ctx.ensure_class_initialized("java/util/HashSet");
+    let hashmap_cid = ctx
+        .ensure_class_initialized("java/util/HashMap")
+        .unwrap_or(ClassId::new(0));
+    let node_cid = ctx
+        .ensure_class_initialized("java/util/HashMap$Node")
+        .unwrap_or(ClassId::new(0));
+    let hashset_cid = ctx
+        .ensure_class_initialized("java/util/HashSet")
+        .unwrap_or(ClassId::new(0));
+
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+    let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+    let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+    let n_hash = ctx.resolve_field_index("java/util/HashMap$Node", "hash");
+    let n_key = ctx.resolve_field_index("java/util/HashMap$Node", "key");
+    let n_value = ctx.resolve_field_index("java/util/HashMap$Node", "value");
+    let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
+    let s_map = ctx.resolve_field_index("java/util/HashSet", "map");
+
+    fn jdk_string_hash_from_obj(ctx: &mut dyn NativeContext, k: ObjectRef) -> i32 {
+        // Use String.hashCode equivalent: per-char folded with 31, then JDK
+        // HashMap.hash post-mix `h ^ (h >>> 16)`.
+        let s = ctx.read_string(k).unwrap_or_default();
+        let mut h: i32 = 0;
+        for ch in s.chars() {
+            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        h ^ ((h as u32 >> 16) as i32)
+    }
+
+    if let (
+        Some(f_table),
+        Some(f_size),
+        Some(f_threshold),
+        Some(f_loadfactor),
+        Some(f_entryset),
+        Some(n_hash),
+        Some(n_key),
+        Some(n_value),
+        Some(n_next),
+        Some(s_map),
+    ) = (
+        f_table,
+        f_size,
+        f_threshold,
+        f_loadfactor,
+        f_entryset,
+        n_hash,
+        n_key,
+        n_value,
+        n_next,
+        s_map,
+    ) {
+        // Pick a power-of-two capacity >= size / 0.75 so we never exceed
+        // the threshold during insertion. Default to 16 (matches JDK).
+        let mut cap: usize = 16;
+        while cap < (keys.len() * 4 / 3 + 1).max(16) {
+            cap <<= 1;
+        }
+        let buckets = ctx.new_ref_array(ClassId::new(0), cap);
+
+        let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let node_n_fields = [n_hash, n_key, n_value, n_next]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let map = ctx.alloc_object(hashmap_cid, map_n_fields);
+        ctx.set_field(map, f_table, Value::Object(Some(buckets)));
+        ctx.set_field(map, f_size, Value::Int(keys.len() as i32));
+        ctx.set_field(map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        ctx.set_field(map, f_loadfactor, Value::Float(0.75));
+        ctx.set_field(map, f_entryset, Value::Object(None));
+
+        for &k in keys {
+            let hash = jdk_string_hash_from_obj(ctx, k);
+            let idx = ((cap as u32 - 1) & hash as u32) as usize;
+            let node = ctx.alloc_object(node_cid, node_n_fields);
+            ctx.set_field(node, n_hash, Value::Int(hash));
+            ctx.set_field(node, n_key, Value::Object(Some(k)));
+            // Value: null is fine — JDK HashSet uses the static PRESENT
+            // sentinel, but bytecode that walks the keySet only inspects the
+            // key field, never the value.
+            ctx.set_field(node, n_value, Value::Object(None));
+            let existing = ctx.get_array_element(buckets, idx);
+            ctx.set_field(node, n_next, existing);
+            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+        }
+
+        // Allocate HashSet with the real layout (single field `map`).
+        let set_n_fields = (s_map + 1).max(ctx.class_num_total_fields(hashset_cid));
+        let set = ctx.alloc_object(hashset_cid, set_n_fields);
+        ctx.set_field(set, s_map, Value::Object(Some(map)));
+        return set;
+    }
+
+    // Fallback: legacy synthetic-2-field (data_array, size) layout used by
+    // older callers that don't go through the JDK spliterator/stream path.
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    for (i, &k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(k)));
+    }
+    ctx.set_field(set, 0, Value::Object(Some(arr)));
+    ctx.set_field(set, 1, Value::Int(keys.len() as i32));
+    set
 }
 
 // ---------------------------------------------------------------------------

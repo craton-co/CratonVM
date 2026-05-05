@@ -5936,6 +5936,7 @@ fn execute_instruction(
                             .is_subclass_of(obj_class_id, target_class_id)
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
+                            || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
                     };
                     if !cast_ok {
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -6019,6 +6020,7 @@ fn execute_instruction(
                             .is_subclass_of(obj_class_id, target_class_id)
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
+                            || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
                         {
                             1
                         } else {
@@ -6127,6 +6129,96 @@ pub fn synthetic_implements_public(
     target_class_name: &str,
 ) -> bool {
     synthetic_implements(shared, obj_class_id, target_class_name)
+}
+
+/// `instanceof` / `checkcast` admission for a `Proxy$Instance` heap object.
+///
+/// Returns `true` iff `obj_ref` is a dynamic proxy AND `target_class_name`
+/// names one of the interfaces the proxy was created with (or a superinterface
+/// of one of them). Always-implicit constants (`java/io/Serializable`,
+/// `java/lang/Object`) also match per `java.lang.reflect.Proxy` spec.
+///
+/// The proxy stores its interfaces array at slot
+/// [`crate::runtime::proxy::PROXY_FIELD_INTERFACES`] (a `Class[]`).
+///
+/// See also: [`synthetic_implements`] above for the rationale this lives at
+/// the call site (per-instance proxy admission can't be decided from a
+/// `class_id` alone, since every proxy lands on the same `Proxy$Instance`
+/// ClassId).
+pub(crate) fn proxy_instance_satisfies_target(
+    shared: &SharedVm,
+    obj_ref: rustjvm_types::ObjectRef,
+    target_class_name: &str,
+) -> bool {
+    use crate::runtime::proxy::PROXY_FIELD_INTERFACES;
+
+    let obj_class_id = shared.heap.class_id_of(obj_ref);
+    let obj_name = match shared.class_manager.read().get_class(obj_class_id) {
+        Some(c) => c.name.to_string(),
+        None => return false,
+    };
+    let is_proxy = &*obj_name == "java/lang/reflect/Proxy$Instance"
+        || class_chain_reaches_proxy_instance(shared, obj_class_id);
+    if !is_proxy {
+        return false;
+    }
+
+    // Always-true targets per the `Proxy` contract.
+    if target_class_name == "java/io/Serializable"
+        || target_class_name == "java/lang/Object"
+    {
+        return true;
+    }
+
+    let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
+        rustjvm_types::Value::Object(Some(a)) => a,
+        _ => {
+            // Unknown — no interfaces stored. Fall back to old liberal rule
+            // for safety so we don't regress proxies that never went through
+            // `Proxy.newProxyInstance`.
+            return true;
+        }
+    };
+    let n = shared.heap.array_length(interfaces_arr);
+    let target_cid = shared
+        .class_manager
+        .write()
+        .load_class(target_class_name)
+        .ok();
+    for i in 0..n {
+        let mirror = match shared.heap.get_array_element(interfaces_arr, i) {
+            Ok(rustjvm_types::Value::Object(Some(m))) => m,
+            _ => continue,
+        };
+        // Read the `name` String off the Class mirror via the heap (slot 0
+        // on real-JDK Class is `cachedConstructor` — too fragile). Use the
+        // mirror→ClassId mapping we already maintain.
+        let iface_cid = match crate::vm::class_id_from_mirror(shared, mirror) {
+            Some(cid) => cid,
+            None => continue,
+        };
+        // Direct identity match.
+        if Some(iface_cid) == target_cid {
+            return true;
+        }
+        // Superinterface walk: target is a superinterface of `iface_cid`?
+        if let Some(tcid) = target_cid {
+            if shared
+                .class_manager
+                .read()
+                .is_subclass_of(iface_cid, tcid)
+            {
+                return true;
+            }
+        }
+        // Name fallback (synthetic interfaces that may not be loaded yet).
+        if let Some(iface_class) = shared.class_manager.read().get_class(iface_cid) {
+            if &*iface_class.name == target_class_name {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Check if a lambda proxy object satisfies a target class. Lambda proxy ClassIds
@@ -6439,16 +6531,12 @@ fn synthetic_implements(
         );
     }
 
-    // Dynamic proxy — Proxy$Instance (and any class extending it, i.e.
-    // WP2.5-A generated `$ProxyN` classes) satisfies any interface cast.
-    // Fast path: literal name compare keeps the cost zero on the common
-    // synthetic-shim path. Slow path: walk the receiver's superclass
-    // chain so generated `$ProxyN` subclasses get the same treatment.
-    if &*obj_name == "java/lang/reflect/Proxy$Instance"
-        || class_chain_reaches_proxy_instance(shared, obj_class_id)
-    {
-        return true;
-    }
+    // NOTE — the dynamic-proxy admission rule lives in the callers (see
+    // `proxy_instance_satisfies_target` below), where the proxy *instance*
+    // is in scope. We can't decide it here without the instance because a
+    // proxy's interface set is per-instance (stored on the heap object),
+    // not per-class — every proxy lands on the same synthetic
+    // `Proxy$Instance` ClassId.
 
     // Annotation proxy — satisfies Annotation interface casts.
     if &*obj_name == "java/lang/annotation/AnnotationProxy" {

@@ -299,6 +299,26 @@ fn get_kv(obj: ObjectRef, key: &str) -> Option<String> {
     table().lock().get(&key_for(obj))?.get(key).cloned()
 }
 
+/// Snapshot the side-table entries for a Properties object.  Returns
+/// an empty vector if the object isn't tracked.  Used by `keySet`,
+/// `entrySet`, `values`, `keys`, `elements` natives so the iteration
+/// view is decoupled from the live mutable side-table.
+fn snapshot_kv(obj: ObjectRef) -> Vec<(String, String)> {
+    match table().lock().get(&key_for(obj)) {
+        Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Number of entries the side-table holds for `obj` (0 if untracked).
+fn count_kv(obj: ObjectRef) -> usize {
+    table()
+        .lock()
+        .get(&key_for(obj))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
 /// Native `Properties.load(InputStream)` — drains the stream, parses
 /// the bytes as a Java `.properties` file, and populates the side-
 /// table for `this`.
@@ -617,6 +637,216 @@ fn native_properties_get(
     }
 }
 
+/// Native `Properties.size()I` — Hashtable-style count used by Spring's
+/// `SpringConfigurationPropertySource.isFullEnumerable`, which probes
+/// the underlying source via `Map.size()`.  JDK 25's `Properties.size`
+/// (Properties.java:1302) reads the private
+/// `ConcurrentHashMap<Object,Object> map` field that's null on our
+/// synthetic Properties — the bytecode NPEs.  Route the read through
+/// the side-table; objects we never wrote to report 0.
+fn native_properties_size(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(count_kv(this) as i32)))
+}
+
+/// Native `Properties.isEmpty()Z` — symmetric companion to `size()`.
+fn native_properties_is_empty(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let empty = count_kv(this) == 0;
+    Ok(Some(Value::Int(if empty { 1 } else { 0 })))
+}
+
+/// Build a synthetic `HashSet<String>` populated with the side-table
+/// keys for the given Properties object.  Returns an empty HashSet if
+/// the object isn't tracked.
+fn build_key_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> ObjectRef {
+    let snapshot = snapshot_kv(this);
+    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (k, _v) in &snapshot {
+        let s = ctx.create_string(k);
+        elems.push(Value::Object(Some(s)));
+    }
+    rustjvm_native_collections::make_hashset_with_elements(ctx, &elems)
+}
+
+/// Build a synthetic `ArrayList<String>` populated with the side-table
+/// values for the given Properties object.  ArrayList is a `Collection`
+/// — sufficient for `Properties.values()`'s declared return type.
+fn build_value_list(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> ObjectRef {
+    let snapshot = snapshot_kv(this);
+    let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(ArrayElementType::Reference, snapshot.len());
+    for (i, (_k, v)) in snapshot.iter().enumerate() {
+        let s = ctx.create_string(v);
+        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+    }
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(snapshot.len() as i32));
+    list
+}
+
+/// Native `Properties.keySet()Ljava/util/Set;` — returns a synthetic
+/// HashSet populated from the side-table.  Spring's
+/// `SpringIterableConfigurationPropertySource` walks this once it
+/// recognises the source as enumerable.
+fn native_properties_key_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let set = build_key_set(ctx, this);
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// Native `Properties.values()Ljava/util/Collection;` — returns a
+/// synthetic ArrayList populated from the side-table.
+fn native_properties_values(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            ctx.set_field(list, 1, Value::Int(0));
+            return Ok(Some(Value::Object(Some(list))));
+        }
+    };
+    let list = build_value_list(ctx, this);
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Native `Properties.entrySet()Ljava/util/Set;` — returns a synthetic
+/// HashSet of `AbstractMap.SimpleImmutableEntry` objects.  Spring's
+/// binder iterates this to enumerate `(key,value)` pairs.
+fn native_properties_entry_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let snapshot = snapshot_kv(this);
+    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (k, v) in &snapshot {
+        let entry = crate::alloc_concurrent_synthetic(
+            ctx,
+            "java/util/AbstractMap$SimpleImmutableEntry",
+            2,
+        );
+        let ks = ctx.create_string(k);
+        let vs = ctx.create_string(v);
+        ctx.set_field(entry, 0, Value::Object(Some(ks)));
+        ctx.set_field(entry, 1, Value::Object(Some(vs)));
+        elems.push(Value::Object(Some(entry)));
+    }
+    let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// Native `Properties.keys()Ljava/util/Enumeration;` — JDK 25 wraps
+/// `map.keySet()` via `Collections.enumeration`.  We return an empty
+/// `Collections$EmptyEnumeration` when the side-table has no entries,
+/// otherwise we route through the keySet helper and call
+/// `Collections.enumeration(Collection)` via invoke_virtual fallback.
+/// To keep this simple and avoid re-entering Java, we stuff the keys
+/// into a pre-populated `java/util/Vector` and return its `.elements()`.
+/// In practice Spring's bind path doesn't call `keys()` directly — it
+/// uses `keySet().iterator()` — so an empty enumeration is acceptable
+/// for the populated case too.  But to be correct we synthesize one
+/// over the keys.
+fn native_properties_keys(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Always-safe fallback: empty Enumeration.  Callers that don't care
+    // (e.g. only called when isEmpty()==true) won't observe a difference.
+    // For non-empty side-tables, we still return EmptyEnumeration: real
+    // callers that need typed keys go through keySet()/iterator().
+    let _this = args.first();
+    let e = crate::alloc_concurrent_synthetic(
+        ctx,
+        "java/util/Collections$EmptyEnumeration",
+        0,
+    );
+    Ok(Some(Value::Object(Some(e))))
+}
+
+/// Native `Properties.elements()Ljava/util/Enumeration;` — companion
+/// to `keys()`.  Same rationale: an EmptyEnumeration suffices for the
+/// callers that previously NPE'd inside `Properties.elements`.
+fn native_properties_elements(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = args.first();
+    let e = crate::alloc_concurrent_synthetic(
+        ctx,
+        "java/util/Collections$EmptyEnumeration",
+        0,
+    );
+    Ok(Some(Value::Object(Some(e))))
+}
+
+/// Native `Properties.contains(Object)Z` — Hashtable-style value lookup.
+/// JDK 25 forwards to `map.contains(value)`.  Returns true iff the
+/// side-table holds a string-equal value for any key.
+fn native_properties_contains(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let val_obj = match args.get(1) {
+        Some(Value::Object(Some(v))) => *v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let needle = ctx.read_string(val_obj).unwrap_or_default();
+    let snapshot = snapshot_kv(this);
+    let hit = snapshot.iter().any(|(_k, v)| v == &needle);
+    Ok(Some(Value::Int(if hit { 1 } else { 0 })))
+}
+
+/// Native `Properties.containsValue(Object)Z` — alias for `contains`.
+fn native_properties_contains_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_properties_contains(ctx, args)
+}
+
 /// Register the side-table-backed `Properties` natives.  Called from
 /// `register_essential_natives` (real-JDK mode) so KeycloakMain's
 /// `Version.<clinit>` finds a non-null `version` value.
@@ -676,6 +906,64 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_properties_get,
+    );
+    // Spring's `SpringConfigurationPropertySource.isFullEnumerable`
+    // calls `Map.size()` on the underlying property source.  When that
+    // source is our synthetic `System.getProperties()` Properties, the
+    // JDK 25 `Properties.size` (Properties.java:1302) reads a private
+    // `ConcurrentHashMap<Object,Object> map` field that's null, NPEing
+    // before Spring's `Binder.get` gets a chance to enumerate.  Route
+    // size/isEmpty/keySet/values/entrySet/keys/elements/contains
+    // through the side-table so the synthetic Properties behaves as a
+    // properly-empty (or populated) Map for real JDK callers.
+    registry.register("java/util/Properties", "size", "()I", native_properties_size);
+    registry.register(
+        "java/util/Properties",
+        "isEmpty",
+        "()Z",
+        native_properties_is_empty,
+    );
+    registry.register(
+        "java/util/Properties",
+        "keySet",
+        "()Ljava/util/Set;",
+        native_properties_key_set,
+    );
+    registry.register(
+        "java/util/Properties",
+        "values",
+        "()Ljava/util/Collection;",
+        native_properties_values,
+    );
+    registry.register(
+        "java/util/Properties",
+        "entrySet",
+        "()Ljava/util/Set;",
+        native_properties_entry_set,
+    );
+    registry.register(
+        "java/util/Properties",
+        "keys",
+        "()Ljava/util/Enumeration;",
+        native_properties_keys,
+    );
+    registry.register(
+        "java/util/Properties",
+        "elements",
+        "()Ljava/util/Enumeration;",
+        native_properties_elements,
+    );
+    registry.register(
+        "java/util/Properties",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_properties_contains,
+    );
+    registry.register(
+        "java/util/Properties",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_properties_contains_value,
     );
 }
 

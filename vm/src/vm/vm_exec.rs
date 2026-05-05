@@ -3864,6 +3864,58 @@ fn proxy_method_set_field_by_name(
     }
 }
 
+/// S111r11 — write the RustJVM extra metadata slots on a synthetic
+/// proxy `Method` object so that
+/// `native-builtins/.../lang_class.rs::native_method_invoke` finds the
+/// descriptor + parameter-count when it later reflects through.
+///
+/// `native_method_invoke` reads the descriptor from the extra slot
+/// (`base + METHOD_EXTRA_OFFSET_DESC`), NOT from the JDK `signature`
+/// field — leaving these blank produces a `descriptor=""` virtual
+/// dispatch that misses the real bridge method on the receiver class
+/// (e.g. `ParameterizedTypeImpl.getRawType` covariant bridge) and
+/// surfaces as a confusing `NoSuchMethodError`.
+///
+/// Constants mirror those in
+/// `native-builtins/src/lang_class.rs::METHOD_EXTRA_*`. We don't import
+/// them across the crate boundary because `vm` doesn't depend on
+/// `native-builtins` (the dependency goes the other way).
+fn proxy_method_write_extra_slots(
+    shared: &SharedVm,
+    method_obj: ObjectRef,
+    descriptor: &str,
+    param_count: usize,
+) {
+    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+    const METHOD_EXTRA_OFFSET_DESC: usize = 0;
+    const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
+
+    let class_id = shared.heap.class_id_of(method_obj);
+    let total_fields = shared
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
+        .unwrap_or(0);
+    let base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
+
+    // Defensive: only write if the heap object was allocated wide enough.
+    // `proxy_invoke_handler` and `proxy_invoke_handler_shared` both call
+    // `alloc_object(method_class_id, total_fields.max(8))` — that gives
+    // us at least the JDK width, but no extra slots when running against
+    // a synthetic-stub Method class. In that case skip the writes; the
+    // legacy hard-coded slots above already covered the synthetic path.
+    let num_obj_fields = shared.heap.num_fields(method_obj);
+    let extra_desc_slot = base + METHOD_EXTRA_OFFSET_DESC;
+    let extra_pc_slot = base + METHOD_EXTRA_OFFSET_PARAM_COUNT;
+    if num_obj_fields <= extra_pc_slot {
+        return;
+    }
+    let desc_str = super::create_java_string(shared, descriptor);
+    shared.heap.set_field(method_obj, extra_desc_slot, Value::Object(Some(desc_str)));
+    shared.heap.set_field(method_obj, extra_pc_slot, Value::Int(param_count as i32));
+}
+
 /// When a method is called on a `Proxy$Instance` object, this function
 /// intercepts it and forwards to the `InvocationHandler.invoke()`.
 ///
@@ -3908,10 +3960,16 @@ pub(super) fn proxy_invoke_handler(
         .get_class(method_class_id)
         .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
         .unwrap_or(8);
+    // S111r11: allocate METHOD_EXTRA_SLOTS more than the JDK layout so
+    // `proxy_method_write_extra_slots` can write descriptor + param count
+    // for `native_method_invoke` to read back.
+    const METHOD_EXTRA_SLOTS: usize = 3;
+    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+    let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
     let method_obj = ctx
         .shared
         .heap
-        .alloc_object(method_class_id, total_fields.max(8));
+        .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(ctx.shared, ClassId::new(0));
     let name_str = super::create_java_string(ctx.shared, method_name);
     // Parse descriptor into per-parameter and return type descriptors so we
@@ -3945,6 +4003,14 @@ pub(super) fn proxy_invoke_handler(
     proxy_method_set_field_by_name(ctx.shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(ctx.shared, method_obj, "signature", Value::Object(Some(desc_str)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "slot", Value::Int(0));
+    // S111r11: also populate the RustJVM extra-slot descriptor +
+    // parameter-count cache so `native_method_invoke` (which reads via
+    // `read_method_descriptor`, NOT `signature`) sees a non-empty
+    // descriptor when the proxy fallback path reflectively re-invokes
+    // the method on the underlying Type — fixes
+    // `NoSuchMethodError: ParameterizedTypeImpl.getRawType` (descriptor
+    // was empty, so virtual dispatch couldn't match the bridge method).
+    proxy_method_write_extra_slots(ctx.shared, method_obj, descriptor, param_count);
     // Belt-and-suspenders: also write the legacy hard-coded slots so any
     // surviving raw-index reader (notably the lambda dispatch path that
     // pulls `Method.getName` via `get_field_by_name` already lands on
@@ -3961,19 +4027,36 @@ pub(super) fn proxy_invoke_handler(
         ctx.shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
 
-    // Build Object[] of args вЂ” box primitives so InvocationHandler receives Object[]
-    let args_arr = ctx.shared.heap.alloc_array(
-        ClassId::new(0),
-        crate::memory::heap::ArrayElementType::Reference,
-        args.len(),
-    );
-    for (i, arg) in args.iter().enumerate() {
-        let boxed = proxy_box_value(ctx.shared, *arg);
-        ctx.shared
-            .heap
-            .set_array_element(args_arr, i, boxed)
-            .ok();
-    }
+    // Build Object[] of args вЂ” box primitives so InvocationHandler receives Object[].
+    //
+    // Per `java.lang.reflect.InvocationHandler.invoke` contract: when the
+    // intercepted interface method takes no arguments, the `args` parameter
+    // MUST be `null` (not an empty array). Spring's
+    // `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke` relies on
+    // this — its `Type[].class` return-type branch is gated on `args == null`
+    // (`aload_3 / ifnonnull -> default`), and the default branch reflectively
+    // calls `method.invoke(provider.getType(), args)`. For 0-arg methods like
+    // `getGenericInterfaces()`, passing an empty array (instead of null) makes
+    // the branch fall through to the default, which then virtually dispatches
+    // `getGenericInterfaces` on `provider.getType()` — a `ParameterizedTypeImpl`
+    // that has no such method, surfacing as `NoSuchMethodError`.
+    let args_value = if args.is_empty() {
+        Value::Object(None)
+    } else {
+        let args_arr = ctx.shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            args.len(),
+        );
+        for (i, arg) in args.iter().enumerate() {
+            let boxed = proxy_box_value(ctx.shared, *arg);
+            ctx.shared
+                .heap
+                .set_array_element(args_arr, i, boxed)
+                .ok();
+        }
+        Value::Object(Some(args_arr))
+    };
 
     // Call InvocationHandler.invoke(Object proxy, Method method, Object[] args)
     // Resolve the handler's actual class for dispatch (may be anonymous).
@@ -3992,7 +4075,7 @@ pub(super) fn proxy_invoke_handler(
         let call_args = [
             Value::Object(Some(proxy)),
             Value::Object(Some(method_obj)),
-            Value::Object(Some(args_arr)),
+            args_value,
         ];
         let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
             ctx.shared,
@@ -4022,7 +4105,7 @@ pub(super) fn proxy_invoke_handler(
         Value::Object(Some(handler_ref)),
         Value::Object(Some(proxy)),
         Value::Object(Some(method_obj)),
-        Value::Object(Some(args_arr)),
+        args_value,
     ];
     ctx.invoke_or_native(
         &handler_class_name,
@@ -4094,7 +4177,11 @@ pub(crate) fn proxy_invoke_handler_shared(
         .get_class(method_class_id)
         .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
         .unwrap_or(8);
-    let method_obj = shared.heap.alloc_object(method_class_id, total_fields.max(8));
+    // S111r11 — see `proxy_invoke_handler` above.
+    const METHOD_EXTRA_SLOTS: usize = 3;
+    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+    let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
+    let method_obj = shared.heap.alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
     let name_str = super::create_java_string(shared, method_name);
     // Parse descriptor into per-parameter and return type descriptors —
@@ -4122,6 +4209,8 @@ pub(crate) fn proxy_invoke_handler_shared(
     proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(shared, method_obj, "signature", Value::Object(Some(desc_str)));
     proxy_method_set_field_by_name(shared, method_obj, "slot", Value::Int(0));
+    // S111r11 — see `proxy_invoke_handler` above for rationale.
+    proxy_method_write_extra_slots(shared, method_obj, descriptor, param_count);
     if total_fields < 8 {
         // Synthetic-mode fallback (no JDK Method class loaded): keep the
         // old hard-coded layout so callers reading raw slots still find
@@ -4135,16 +4224,25 @@ pub(crate) fn proxy_invoke_handler_shared(
         shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
 
-    // Build Object[] of args вЂ” box primitives
-    let args_arr = shared.heap.alloc_array(
-        ClassId::new(0),
-        crate::memory::heap::ArrayElementType::Reference,
-        args.len(),
-    );
-    for (i, arg) in args.iter().enumerate() {
-        let boxed = proxy_box_value(shared, *arg);
-        shared.heap.set_array_element(args_arr, i, boxed).ok();
-    }
+    // Build Object[] of args вЂ” box primitives. Per
+    // `java.lang.reflect.InvocationHandler.invoke` contract, when the
+    // intercepted method takes no arguments, `args` MUST be `null` (not an
+    // empty Object[]). See `proxy_invoke_handler` above for the SportMe /
+    // Spring `SerializableTypeWrapper` case that depends on this.
+    let args_value = if args.is_empty() {
+        Value::Object(None)
+    } else {
+        let args_arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            args.len(),
+        );
+        for (i, arg) in args.iter().enumerate() {
+            let boxed = proxy_box_value(shared, *arg);
+            shared.heap.set_array_element(args_arr, i, boxed).ok();
+        }
+        Value::Object(Some(args_arr))
+    };
 
     // Call InvocationHandler.invoke(Object proxy, Method method, Object[] args)
     // Resolve the handler's actual class for dispatch (it may be an anonymous class
@@ -4164,7 +4262,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         let call_args = [
             Value::Object(Some(proxy)),
             Value::Object(Some(method_obj)),
-            Value::Object(Some(args_arr)),
+            args_value,
         ];
         let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
             shared,
@@ -4196,7 +4294,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         Value::Object(Some(handler_ref)),
         Value::Object(Some(proxy)),
         Value::Object(Some(method_obj)),
-        Value::Object(Some(args_arr)),
+        args_value,
     ];
     invoke_or_native(
         shared,
@@ -5243,6 +5341,21 @@ fn invoke_on_class_shared_inner(
                             && matches!(
                                 method_name,
                                 "iterator" | "size" | "isEmpty" | "contains" | "add" | "remove" | "clear"
+                                // S111r12: `HashSet.spliterator()` JDK
+                                // bytecode would build a `KeySpliterator`
+                                // over the synthetic backing HashMap and
+                                // later `getfield m.table` reads slot 2
+                                // (real JDK layout) which our synthetic
+                                // populates with `Int(16)` (capacity),
+                                // surfacing as
+                                //   `expected object reference, got int(16)`.
+                                // Same family as the S111r7 `getenv()`
+                                // HashMap-layout fix. Force the native
+                                // (`p59_hashset_spliterator`) which walks
+                                // the synthetic map and returns a synthetic
+                                // `(data, cursor)` Spliterator the rest of
+                                // our stream pipeline already consumes.
+                                | "spliterator"
                             ))
                         // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a

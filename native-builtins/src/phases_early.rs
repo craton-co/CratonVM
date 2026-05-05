@@ -4,7 +4,7 @@ use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectRef, Value};
 
-use crate::{native_noop, native_noop_with_this, native_return_false, native_return_zero, obj_arg, alloc_concurrent_synthetic};
+use crate::{native_noop, native_noop_with_this, native_return_false, native_return_zero, obj_arg, alloc_concurrent_synthetic, build_real_layout_string_hashset};
 use crate::{native_return_null, native_return_first_arg};
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
@@ -1819,25 +1819,34 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     r.register(props, "stringPropertyNames", "()Ljava/util/Set;", |ctx, args| {
+        // S111r11+: collect the keys we need to expose, then return a HashSet
+        // that wraps a real-layout HashMap so JDK-bytecode stream / spliterator
+        // / iterator paths see the layout slots they expect.
+        //
+        // Previous synthetic-2-field (data_array, size) layout broke
+        // `HashSet.spliterator()` (inherited bytecode does
+        // `new HashMap.KeySpliterator<>(this.map, ...)` reading slot 0 as
+        // the wrapped HashMap; later forEachRemaining does
+        // `getfield m.table` which on the synthetic resolved to slot 2
+        // (real HashMap layout) and produced
+        //   `expected object reference, got int(16)`
+        // — same failure pattern S111r7 fixed for `System.getenv()`.
         let this = obj_arg(args, 0)?;
-        let data = match ctx.get_field(this, 0) {
-            Value::Object(Some(d)) => d,
-            _ => {
-                let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-                ctx.set_field(set, 1, Value::Int(0));
-                return Ok(Some(Value::Object(Some(set))));
+        let mut keys: Vec<ObjectRef> = Vec::new();
+        if let Value::Object(Some(data)) = ctx.get_field(this, 0) {
+            let size = match ctx.get_field(this, 1) {
+                Value::Int(s) => s as usize,
+                _ => 0,
+            };
+            for i in 0..size {
+                if let Value::Object(Some(k)) = ctx.get_array_element(data, i * 2) {
+                    keys.push(k);
+                }
             }
-        };
-        let size = match ctx.get_field(this, 1) { Value::Int(s) => s as usize, _ => 0 };
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
-        for i in 0..size {
-            let k = ctx.get_array_element(data, i * 2);
-            ctx.set_array_element(arr, i, k);
         }
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(size as i32));
-        Ok(Some(Value::Object(Some(set))))
+        Ok(Some(Value::Object(Some(build_real_layout_string_hashset(
+            ctx, &keys,
+        )))))
     });
 
     // --- Map.forEach / Map.compute / Map.putIfAbsent (Phase 48) ---

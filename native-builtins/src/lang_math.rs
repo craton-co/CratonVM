@@ -1101,6 +1101,21 @@ pub(crate) fn native_long_bits_to_double(_ctx: &mut dyn NativeContext, args: &[V
 // Step 5: Math natives
 // ---------------------------------------------------------------------------
 
+/// Extract an i64 from a Value that may carry a long-typed payload under
+/// either the `Long` or `Double` CompactValue tag.  Long arguments crossing
+/// the native-invocation boundary may arrive tagged as `Double` (CompactValue
+/// stores untagged 64-bit values whose `tag()` returns `Double` whenever the
+/// bit-pattern doesn't collide with a NaN-tag); reinterpret bits to recover
+/// the original i64.  Same defensive pattern as `value_stack::pop_long`.
+fn long_arg(args: &[Value], idx: usize) -> i64 {
+    match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
 // --- abs ---
 pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
@@ -1111,10 +1126,7 @@ pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_math_abs_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
+    let v = long_arg(args, 0);
     Ok(Some(Value::Long(v.wrapping_abs())))
 }
 
@@ -1148,14 +1160,8 @@ pub(crate) fn native_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_math_max_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
-    let b = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
+    let a = long_arg(args, 0);
+    let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::max(a, b))))
 }
 
@@ -1197,14 +1203,8 @@ pub(crate) fn native_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_math_min_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
-    let b = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
+    let a = long_arg(args, 0);
+    let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::min(a, b))))
 }
 
