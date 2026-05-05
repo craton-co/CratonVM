@@ -11787,16 +11787,19 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 //     dumper object (so downstream `dumper.isEnabled()` returns false).
 
 /// Build a synthetic `java.util.HashSet` with the given elements.
+///
+/// S111r7: previously this allocated a 3-field HashSet (bucket array,
+/// size, capacity) which conflicts with the real-JDK HashSet field
+/// layout (single `map:Ljava/util/HashMap;` at offset 0). When real
+/// bytecode for `HashSet.iterator()` then ran `getfield map →
+/// invokevirtual HashMap.keySet()`, the receiver class came back as
+/// bare `java/lang/Object` (the bucket Object[]) and dispatch raised
+/// `NoSuchMethodError Object.keySet()`. The fix delegates to the
+/// native-collections helper that uses the correct 1-field-with-
+/// backing-HashMap layout, matching `<init>()` / 0..3-arg `Set.of`
+/// behaviour and unblocking Spring `getConvertibleTypes()` paths.
 fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, args.len());
-    for (i, v) in args.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
-    }
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    ctx.set_field(set, 1, Value::Int(args.len() as i32));
-    ctx.set_field(set, 2, Value::Int(16));
-    set
+    rustjvm_native_collections::make_hashset_with_elements(ctx, args)
 }
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {

@@ -375,10 +375,10 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(cu, "emptySet", "()Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // S111r7: use the native-collections HashSet layout (single
+        // `map` field holding the backing HashMap) so real-JDK
+        // `HashSet.iterator()` bytecode reads the correct receiver.
+        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(cu, "emptyIterator", "()Ljava/util/Iterator;", |ctx, _args| {
@@ -954,19 +954,25 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     r.register(li, "copyOf", "(Ljava/util/Collection;)Ljava/util/List;", native_return_first_arg);
 
     // --- Set.of() ---
+    // S111r7: use the native-collections HashSet layout (single `map`
+    // field → backing HashMap) so real-JDK `HashSet.iterator()` /
+    // `AbstractSet.equals()` bytecode finds a HashMap on `getfield map`.
     let si = "java/util/Set";
     r.register(si, "of", "()Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
         Ok(Some(Value::Object(Some(set))))
     });
-    r.register(si, "of", "([Ljava/lang/Object;)Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+    r.register(si, "of", "([Ljava/lang/Object;)Ljava/util/Set;", |ctx, args| {
+        // Materialise the Object[] into a Vec<Value> and let the
+        // shared helper allocate + populate the HashSet.
+        let mut elems: Vec<Value> = Vec::new();
+        if let Some(Value::Object(Some(arr))) = args.first().copied() {
+            let len = ctx.array_length(arr);
+            for i in 0..len {
+                elems.push(ctx.get_array_element(arr, i));
+            }
+        }
+        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(si, "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;", native_return_first_arg);

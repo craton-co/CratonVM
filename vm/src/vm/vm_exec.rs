@@ -4810,6 +4810,27 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
     }
 }
 
+/// S111r7 — return `true` for methods declared on `java.lang.Object` so we
+/// don't accidentally divert legitimate `Object.equals`/`hashCode`/etc.
+/// calls into the receiver-driven fallback.
+fn is_object_member(method_name: &str, descriptor: &str) -> bool {
+    matches!(
+        (method_name, descriptor),
+        ("equals", "(Ljava/lang/Object;)Z")
+        | ("hashCode", "()I")
+        | ("toString", "()Ljava/lang/String;")
+        | ("getClass", "()Ljava/lang/Class;")
+        | ("notify", "()V")
+        | ("notifyAll", "()V")
+        | ("wait", "()V")
+        | ("wait", "(J)V")
+        | ("wait", "(JI)V")
+        | ("clone", "()Ljava/lang/Object;")
+        | ("finalize", "()V")
+        | ("<init>", "()V")
+    )
+}
+
 /// Invoke a method on a specific class by ClassId.
 pub fn invoke_on_class_shared(
     shared: &SharedVm,
@@ -5055,6 +5076,49 @@ fn invoke_on_class_shared_inner(
                                 | "setProperty"
                                 | "put"
                                 | "containsKey"
+                            ))
+                        // S111r7: HashMap / LinkedHashMap / Hashtable /
+                        // ConcurrentHashMap and HashSet view-method
+                        // overrides. Real-JDK bytecode for `keySet()`,
+                        // `values()`, `entrySet()`, `iterator()` etc.
+                        // allocates inner-class views
+                        // (`HashMap$KeySet`, `HashMap$KeyIterator`,
+                        // `HashSet$1` reflection over backing-map
+                        // entries) we do not load from the JDK module
+                        // image — so the views land on the heap with
+                        // `cid=0` and every subsequent
+                        // `invokeinterface Set.iterator()` /
+                        // `Iterator.hasNext()` dispatches to bare
+                        // `java.lang.Object` and surfaces a swallowed
+                        // `NoSuchMethodError`. Forcing the natives in
+                        // `native-collections` to win materialises a
+                        // properly-typed `java/util/HashSet`
+                        // (single-field-with-backing-HashMap layout) /
+                        // `HashMap$KeyItr` / `ArrayList` whose
+                        // `iterator()` / `hasNext()` then dispatches
+                        // normally, unblocking Spring's
+                        // `GenericConversionService.addConverter()` →
+                        // `getConvertibleTypes().iterator()` boot path.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap"
+                                | "java/util/LinkedHashMap"
+                                | "java/util/Hashtable"
+                                | "java/util/concurrent/ConcurrentHashMap"
+                            )
+                            && matches!(
+                                method_name,
+                                "keySet" | "values" | "entrySet"
+                            ))
+                        || (matches!(
+                                class_name,
+                                "java/util/HashSet"
+                                | "java/util/LinkedHashSet"
+                                | "java/util/TreeSet"
+                            )
+                            && matches!(
+                                method_name,
+                                "iterator" | "size" | "isEmpty" | "contains" | "add" | "remove" | "clear"
                             ))
                         // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a
@@ -5437,6 +5501,86 @@ fn invoke_on_class_shared_inner(
                                 return safe_native_call(shared, thread, callback, args);
                             }
                         }
+                    }
+                }
+
+                // S111r7 — receiver-driven fallback for bare `Object`
+                // dispatch. When real-JDK bytecode allocates an inner-class
+                // view (e.g. `HashMap$KeySet`, `HashMap$KeyIterator`) we
+                // don't load from the JDK module image, the heap object
+                // ends up with `cid=0` and `class_id_of` propagates as
+                // `java/lang/Object`. Without this rescue, the eventual
+                // `invokeinterface Set.iterator()` /
+                // `Iterator.hasNext()` etc. dispatches against
+                // `Object.<missing>` and surfaces a swallowed
+                // `NoSuchMethodError`. Spring boot's
+                // `GenericConversionService.addConverter()` →
+                // `getConvertibleTypes().iterator()` is the canonical
+                // tripwire — fixing it unblocks 9+ Spring boot apps.
+                //
+                // Strategy: if the dispatch class is `Object` AND the
+                // method isn't an `Object` method, route the call through
+                // a name-based native lookup against the well-known
+                // collection-view fallbacks. The `keySet/values/entrySet`
+                // wrappers we materialise via `make_hashset_with_elements`
+                // expose the same external contract, so dispatching to
+                // those natives against the original receiver's
+                // surrounding HashMap recovers the iterator.
+                if class_name == "java/lang/Object"
+                    && !is_object_member(method_name, descriptor)
+                {
+                    // Try receiver class chain — covers the case where
+                    // recv_cid is a valid non-Object class but the CP
+                    // dispatch resolved to Object due to a synthetic alloc.
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        let cm2 = shared.class_manager.read();
+                        let recv_name = cm2
+                            .class_store
+                            .get(recv_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        drop(cm2);
+                        if !recv_name.is_empty() && recv_name != "java/lang/Object" {
+                            // Native registered on the receiver's class
+                            // (or any superclass on the chain).
+                            let cm3 = shared.class_manager.read();
+                            let mut walk_cid = Some(recv_cid);
+                            while let Some(cid) = walk_cid {
+                                if let Some(cls) = cm3.class_store.get(cid) {
+                                    if let Some(cb) = shared.native_methods.find(
+                                        &cls.name, method_name, descriptor,
+                                    ) {
+                                        drop(cm3);
+                                        return safe_native_call(shared, thread, cb, args);
+                                    }
+                                    walk_cid = cls.superclass;
+                                } else {
+                                    break;
+                                }
+                            }
+                            // Bytecode method on the receiver's class chain.
+                            if let Some((_method, declaring_id)) =
+                                crate::classloading::find_method_recursive(
+                                    recv_cid,
+                                    method_name,
+                                    descriptor,
+                                    &cm3.class_store,
+                                )
+                            {
+                                drop(cm3);
+                                return invoke_on_class_shared(
+                                    shared,
+                                    thread,
+                                    declaring_id,
+                                    method_name,
+                                    descriptor,
+                                    args,
+                                );
+                            }
+                            drop(cm3);
+                        }
+
                     }
                 }
 

@@ -872,27 +872,127 @@ pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Val
 
     // Build a HashMap with all environment variables.
     //
-    // RKC16N.14: allocate the backing object with the real `java/util/HashMap`
-    // class_id (when available) so that interpreter virtual dispatch on the
-    // returned reference resolves through HashMap's registered native methods
-    // (e.g. `get(Object)Object`).
+    // S111r7: previously this routine allocated `java/util/HashMap` with only
+    // 3 fields and stored `(buckets, size, capacity)` at slot indices 0/1/2,
+    // matching the synthetic layout used by `native-collections::native_map_*`.
+    // That works while every Map operation routes through a registered native,
+    // but `SystemEnvironmentPropertySource.containsKey` (Spring core) reaches
+    // the bytecode interpreter for `HashMap.containsKey -> getNode`, where
+    // `getfield #105 // table:[Ljava/util/HashMap$Node;` resolves to the real
+    // HashMap layout's slot for `table` — slot 2 in JDK 25 (AbstractMap
+    // inherits `keySet` (0) and `values` (1); HashMap declares `table` next).
+    // Reading slot 2 returned `Int(16)` (our synthetic CAPACITY value), then
+    // `arraylength` on `Int(16)` produced
+    //   `internal error: expected object reference, got int(16)`.
     //
-    // Pre-fix the object was allocated with `ClassId::new(0)`; the dispatcher's
-    // stale-pointer detector then sees a non-zero header (identity hash etc.)
-    // and falls through to "Genuinely java.lang.Object", routing
-    // `Map.get(key)` invokeinterface dispatch to `java/lang/Object`. Since
-    // `Object` declares no `get(Object)Object` method, the slow path emitted
-    // `WARN NoSuchMethodError method="java/lang/Object.get(Object)Object"`
-    // and `Main.determineEnvironment` propagated null upward —
-    // surfaced during KC16 boot inside
-    // `ServerEnvironment.configureQualifiedHostName` against the
-    // `WildFlySecurityManager.getSystemEnvironmentPrivileged()` Map.
+    // Fix: resolve the real HashMap / HashMap$Node field slot indices via
+    // `resolve_field_index`, allocate enough field slots to cover the real
+    // layout, and populate the object so the interpreter's bytecode getfield
+    // sees correct values. Falls back to the legacy synthetic-3-field layout
+    // if the real class wasn't loaded (e.g. running before bootstrap completes
+    // or against a synthetic stub).
     let hashmap_class_id = ctx
         .ensure_class_initialized("java/util/HashMap")
         .unwrap_or(ClassId::new(0));
-    let map = ctx.alloc_object(hashmap_class_id, 3); // MAP_NUM_FIELDS = 3
+    // Best-effort: also load the Node class so its real field layout is known.
+    let _ = ctx.ensure_class_initialized("java/util/HashMap$Node");
+
+    // Real-layout slot resolution. Each `Some(idx)` means we know the
+    // bytecode interpreter will read that field at `idx`; if every required
+    // field is resolvable AND the resolved indices are mutually consistent
+    // (no aliasing), we use the real layout; otherwise fall back.
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+    let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+    let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+    let n_hash = ctx.resolve_field_index("java/util/HashMap$Node", "hash");
+    let n_key = ctx.resolve_field_index("java/util/HashMap$Node", "key");
+    let n_value = ctx.resolve_field_index("java/util/HashMap$Node", "value");
+    let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
+
     let cap = 16usize;
     let buckets = ctx.new_ref_array(ClassId::new(0), cap);
+
+    // JDK HashMap.hash: (h = key.hashCode()) ^ (h >>> 16). For Strings,
+    // hashCode = sum of 31*h + ch. Then bucket index is (n-1) & hash for
+    // power-of-two capacity (16 here).
+    fn jdk_string_hash(s: &str) -> i32 {
+        let mut h: i32 = 0;
+        // String.hashCode is per-char (UTF-16 code unit). For ASCII env vars
+        // this is identical to per-byte; for non-ASCII fall back to chars.
+        for ch in s.chars() {
+            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        h ^ ((h as u32 >> 16) as i32)
+    }
+
+    if let (
+        Some(f_table),
+        Some(f_size),
+        Some(f_threshold),
+        Some(f_loadfactor),
+        Some(f_entryset),
+        Some(n_hash),
+        Some(n_key),
+        Some(n_value),
+        Some(n_next),
+    ) = (
+        f_table, f_size, f_threshold, f_loadfactor, f_entryset, n_hash, n_key,
+        n_value, n_next,
+    ) {
+        // Allocate enough slots to cover the real layout.
+        let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let node_n_fields = [n_hash, n_key, n_value, n_next]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        ctx.set_field(map, f_table, Value::Object(Some(buckets)));
+        ctx.set_field(map, f_size, Value::Int(0));
+        // threshold = (int)(capacity * 0.75) for the default load factor.
+        ctx.set_field(map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        ctx.set_field(map, f_loadfactor, Value::Float(0.75));
+        ctx.set_field(map, f_entryset, Value::Object(None));
+
+        let node_class_id = ctx
+            .ensure_class_initialized("java/util/HashMap$Node")
+            .unwrap_or(ClassId::new(0));
+
+        for (key, value) in std::env::vars() {
+            let key_obj = ctx.create_string(&key);
+            let val_obj = ctx.create_string(&value);
+            let hash = jdk_string_hash(&key);
+            // (n-1) & hash, since cap=16 is power of two.
+            let idx = ((cap as u32 - 1) & hash as u32) as usize;
+            let node = ctx.alloc_object(node_class_id, node_n_fields);
+            ctx.set_field(node, n_hash, Value::Int(hash));
+            ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
+            ctx.set_field(node, n_value, Value::Object(Some(val_obj)));
+            let existing = ctx.get_array_element(buckets, idx);
+            ctx.set_field(node, n_next, existing);
+            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+
+            let old_size = match ctx.get_field(map, f_size) {
+                Value::Int(s) => s,
+                _ => 0,
+            };
+            ctx.set_field(map, f_size, Value::Int(old_size + 1));
+        }
+
+        return Ok(Some(Value::Object(Some(map))));
+    }
+
+    // Legacy fallback: synthetic 3-field layout for environments where
+    // the real HashMap class hierarchy isn't fully resolvable.
+    let map = ctx.alloc_object(hashmap_class_id, 3); // MAP_NUM_FIELDS = 3
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
     ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
     ctx.set_field(map, 2, Value::Int(cap as i32)); // MAP_FIELD_CAPACITY
@@ -900,18 +1000,8 @@ pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Val
     for (key, value) in std::env::vars() {
         let key_obj = ctx.create_string(&key);
         let val_obj = ctx.create_string(&value);
-        // Use the same map_put approach as collections.rs
-        // We need to do manual insertion since we can't call native_map_put from here.
-        // For simplicity, just set a few env vars — the map will be mostly empty.
-        // Actually, let's manually do the hash-bucket insert.
-        let hash = {
-            let mut h = 0i32;
-            for c in key.chars() {
-                h = h.wrapping_mul(31).wrapping_add(c as i32);
-            }
-            h
-        };
-        let idx = ((hash as u32) % (cap as u32)) as usize;
+        let hash = jdk_string_hash(&key);
+        let idx = ((cap as u32 - 1) & hash as u32) as usize;
         let node = ctx.alloc_object(ClassId::new(0), 4); // hash, key, value, next
         ctx.set_field(node, 0, Value::Int(hash));
         ctx.set_field(node, 1, Value::Object(Some(key_obj)));
@@ -921,7 +1011,6 @@ pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Val
         ctx.set_field(node, 3, existing); // next = existing bucket head
         ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
 
-        // Increment size
         let old_size = match ctx.get_field(map, 1) {
             Value::Int(s) => s,
             _ => 0,

@@ -83,10 +83,19 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
 
 /// Allocate a synthetic object, trying to load the real class first.
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(class_id) => ctx.alloc_object(class_id, num_fields),
-        Err(_) => ctx.alloc_object(ClassId::new(0), num_fields),
-    }
+    // S111r7: when `<clinit>` fails (e.g. transient state where a class
+    // is mid-initialization on a parent frame), fall back to a name-only
+    // lookup before degrading to bare `Object`. The previous behaviour
+    // returned objects whose `class_id_of` reported `java/lang/Object`,
+    // which then propagated to virtual dispatch sites (e.g.
+    // `HashSet.iterator()`'s `invokeinterface Set.iterator()` on the
+    // HashMap.keySet result) and surfaced as a swallowed
+    // `NoSuchMethodError Object.iterator()`.
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(class_id) => class_id,
+        Err(_) => ctx.class_id_by_name(class_name).unwrap_or(ClassId::new(0)),
+    };
+    ctx.alloc_object(cid, num_fields)
 }
 
 /// Allocate a reference array (Object[]) of the given length.
@@ -1722,6 +1731,42 @@ fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef>
         Value::Object(Some(m)) => Some(m),
         _ => None,
     }
+}
+
+/// Public helper: allocate a properly-initialised HashSet containing `elems`.
+///
+/// Field layout matches `make_set_of` / `native_hs_init`: a single
+/// instance field at offset 0 holding the backing `java/util/HashMap`. This
+/// is what real-JDK HashSet bytecode expects (`getfield map` reads field 0
+/// → must be a HashMap; `HashMap.keySet()` then dispatches normally).
+///
+/// Used by `native-builtins/src/lib.rs::build_hashset_from_args` so that
+/// the higher-arity `Set.of(...)` natives (4..=10 args) produce HashSets
+/// whose layout is compatible with real-JDK `HashSet.iterator()` /
+/// `AbstractSet.equals()` etc.
+pub fn make_hashset_with_elements(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+) -> ObjectRef {
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+
+    let sentinel = Value::Int(1);
+    for elem in elems {
+        // Best-effort populate; ignore errors so callers see a non-empty
+        // set even if a single put failed (e.g. unhashable wrapper).
+        let _ = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), *elem, sentinel],
+        );
+    }
+    set
 }
 
 fn register_hashset_natives(r: &mut NativeMethodRegistry) {
