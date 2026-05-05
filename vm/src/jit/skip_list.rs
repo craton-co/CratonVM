@@ -426,6 +426,28 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // SPB.2 (Session 112 r8) — provisional blanket ban for
+        // `org/springframework/core/`. SerializableTypeWrapper.forTypeProvider
+        // hangs after Assert.notNull POP when the lambda body
+        // `lambda$forGenericInterfaces$<hash>$1(Class, int)` is dispatched.
+        // The lambda body calls `Class.getGenericInterfaces()` which the
+        // JIT promotes after the heavy ConcurrentReferenceHashMap segment
+        // initialisation in SerializableTypeWrapper.<clinit> (16 segments
+        // x 10 maps = 160 segment ctor entries). With JIT enabled the
+        // SAM dispatch into the lambda body never returns; with
+        // `RUSTJVM_DISABLE_JIT=1` boot proceeds past the lambda (and a
+        // different downstream gap surfaces in log4j PropertiesUtil
+        // <clinit>). The same allocate-then-putfield-vs-OSR pattern that
+        // bites Integer.valueOf / String.toLowerCase applies here:
+        // ConcurrentReferenceHashMap.Reference / Node allocation paths
+        // store fields immediately after `new`. Lifted by
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/core/`.
+        if class_name.starts_with("org/springframework/core/")
+            && !package_allowed("org/springframework/core/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
     }
 
     None
@@ -638,6 +660,25 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // ReentrantLock guards LBQ — every offer/take takes the lock
         | ("java/util/concurrent/locks/ReentrantLock", "lock")
         | ("java/util/concurrent/locks/ReentrantLock", "unlock")
+        // SPB.2 (Session 112 r8) — `Class.getGenericInterfaces()` and the
+        // companion `Class.getGenericSuperclass()` / `Class.getGenericInfo()`
+        // walk the lazily-built `ClassRepository` cache; the cache
+        // population path stores into volatile `genericInfo` immediately
+        // after `new ClassRepository(...)`, hitting the same allocate-then-
+        // putfield miscompile that bites `Integer.valueOf`. Spring's
+        // `SerializableTypeWrapper.lambda$forGenericInterfaces$<hash>$1`
+        // hangs on the second invocation (the first pre-warms the JIT,
+        // the second is dispatched into JIT'd code that loops). The
+        // `ClassRepository.getSuperInterfaces` / `getSuperclass` getters
+        // are similarly lazy-then-store. Skip-listing these forces
+        // interpreter dispatch and unblocks Spring's deep-generic walk.
+        | ("java/lang/Class", "getGenericInterfaces")
+        | ("java/lang/Class", "getGenericSuperclass")
+        | ("java/lang/Class", "getGenericInfo")
+        | ("sun/reflect/generics/repository/ClassRepository", "getSuperInterfaces")
+        | ("sun/reflect/generics/repository/ClassRepository", "getSuperclass")
+        | ("sun/reflect/generics/repository/ClassRepository", "make")
+        | ("sun/reflect/generics/repository/AbstractRepository", "getTree")
     )
 }
 

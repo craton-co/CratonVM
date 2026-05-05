@@ -4813,7 +4813,7 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
 /// S111r7 — return `true` for methods declared on `java.lang.Object` so we
 /// don't accidentally divert legitimate `Object.equals`/`hashCode`/etc.
 /// calls into the receiver-driven fallback.
-fn is_object_member(method_name: &str, descriptor: &str) -> bool {
+pub fn is_object_member(method_name: &str, descriptor: &str) -> bool {
     matches!(
         (method_name, descriptor),
         ("equals", "(Ljava/lang/Object;)Z")

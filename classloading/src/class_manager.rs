@@ -942,6 +942,80 @@ impl ClassManager {
             "java/util/concurrent/Phaser",
         ];
 
+        // Tier 4b: Inner-class views of core collections.
+        // These are not loaded automatically because their outer class's
+        // <clinit> doesn't reference them; they're allocated on-demand by
+        // bytecode like `HashMap.keySet()` which calls `new KeySet()`. If
+        // they're not bootstrapped, the views land with cid=0 and
+        // class_id_of() reports `java/lang/Object`, breaking virtual
+        // dispatch on `iterator()`, `size()`, `contains()`, etc.
+        // (S111r8 — fixes Spring Boot fat-jar boot which iterates env-var
+        // keysets via the URLClassLoader path.)
+        let view_classes = [
+            // HashMap views and iterators
+            "java/util/HashMap$Node",
+            "java/util/HashMap$TreeNode",
+            "java/util/HashMap$KeySet",
+            "java/util/HashMap$Values",
+            "java/util/HashMap$EntrySet",
+            "java/util/HashMap$HashIterator",
+            "java/util/HashMap$KeyIterator",
+            "java/util/HashMap$ValueIterator",
+            "java/util/HashMap$EntryIterator",
+            "java/util/HashMap$KeySpliterator",
+            "java/util/HashMap$ValueSpliterator",
+            "java/util/HashMap$EntrySpliterator",
+            // LinkedHashMap views and iterators
+            "java/util/LinkedHashMap$Entry",
+            "java/util/LinkedHashMap$LinkedKeySet",
+            "java/util/LinkedHashMap$LinkedValues",
+            "java/util/LinkedHashMap$LinkedEntrySet",
+            "java/util/LinkedHashMap$LinkedHashIterator",
+            "java/util/LinkedHashMap$LinkedKeyIterator",
+            "java/util/LinkedHashMap$LinkedValueIterator",
+            "java/util/LinkedHashMap$LinkedEntryIterator",
+            // ConcurrentHashMap views and iterators
+            "java/util/concurrent/ConcurrentHashMap$Node",
+            "java/util/concurrent/ConcurrentHashMap$TreeNode",
+            "java/util/concurrent/ConcurrentHashMap$TreeBin",
+            "java/util/concurrent/ConcurrentHashMap$KeySetView",
+            "java/util/concurrent/ConcurrentHashMap$ValuesView",
+            "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+            "java/util/concurrent/ConcurrentHashMap$Traverser",
+            "java/util/concurrent/ConcurrentHashMap$BaseIterator",
+            "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+            "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+            "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+            // TreeMap views and iterators
+            "java/util/TreeMap$Entry",
+            "java/util/TreeMap$KeySet",
+            "java/util/TreeMap$Values",
+            "java/util/TreeMap$EntrySet",
+            "java/util/TreeMap$NavigableSubMap",
+            "java/util/TreeMap$AscendingSubMap",
+            "java/util/TreeMap$DescendingSubMap",
+            "java/util/TreeMap$PrivateEntryIterator",
+            "java/util/TreeMap$EntryIterator",
+            "java/util/TreeMap$KeyIterator",
+            "java/util/TreeMap$ValueIterator",
+            "java/util/TreeMap$DescendingKeyIterator",
+            // ArrayList iterator
+            "java/util/ArrayList$Itr",
+            "java/util/ArrayList$ListItr",
+            "java/util/ArrayList$SubList",
+            // LinkedList iterator
+            "java/util/LinkedList$Node",
+            "java/util/LinkedList$ListItr",
+            "java/util/LinkedList$DescendingIterator",
+            // HashSet/LinkedHashSet/TreeSet share Map's views internally
+            // but Hashtable has its own.
+            "java/util/Hashtable$Entry",
+            "java/util/Hashtable$KeySet",
+            "java/util/Hashtable$ValueCollection",
+            "java/util/Hashtable$EntrySet",
+            "java/util/Hashtable$Enumerator",
+        ];
+
         // Tier 5: Functional interfaces and streams
         let functional_classes = [
             "java/util/function/Function",
@@ -1073,6 +1147,7 @@ impl ClassManager {
             .chain(extended_classes.iter())
             .chain(exception_classes.iter())
             .chain(collections_classes.iter())
+            .chain(view_classes.iter())
             .chain(functional_classes.iter())
             .chain(io_classes.iter())
             .chain(internal_classes.iter())

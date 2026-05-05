@@ -7011,7 +7011,26 @@ fn execute_invoke(
                 // method dispatch must go through java.lang.Object (JVMS §4.4.1).
                 // Check heap kind first to avoid misrouting clone()/toString()/etc.
                 if shared.heap.kind_of(*obj_ref) == rustjvm_types::ObjectKind::Array {
-                    Arc::from("java/lang/Object")
+                    // S111r8: an Object[] array (cid=0 component class)
+                    // being dispatched for a non-Object method like
+                    // iterator()/hasNext()/size() typically means a
+                    // synthetic native return-shape leaked into a
+                    // typed-collection caller (e.g. HashSet.iterator
+                    // bytecode read its `map` field which our synthetic
+                    // HashSet stores as an Object[] backing array rather
+                    // than a real HashMap). Object's vtable can't service
+                    // these calls; falling back to the CP-resolved
+                    // interface class lets the slow path's
+                    // `check_override` list and the receiver-driven
+                    // fallback in `invoke_on_class_shared_inner`
+                    // recover. Object members (equals/hashCode/toString/
+                    // clone/etc.) still dispatch via Object per
+                    // JVMS §4.4.1.
+                    if !crate::vm::is_object_member(&method_name, &method_descriptor) {
+                        method_class_name.clone()
+                    } else {
+                        Arc::from("java/lang/Object")
+                    }
                 } else {
                     let cid = shared.heap.class_id_of(*obj_ref);
 
@@ -7050,8 +7069,37 @@ fn execute_invoke(
                             );
                             method_class_name.clone()
                         } else {
-                            // Genuinely java.lang.Object
-                            Arc::from("java/lang/Object")
+                            // S111r8: cid=0 with non-zero header means a
+                            // synthetic alloc lost its class_id (e.g.
+                            // `alloc_object(ClassId::new(0), …)` from a
+                            // native fallback). The previous code returned
+                            // bare `java/lang/Object`, which then sent
+                            // `Set.iterator()` / `Map.keySet()` /
+                            // `Iterator.hasNext()` invokes through
+                            // Object's vtable and surfaced as
+                            // `NoSuchMethodError Object.iterator()`.
+                            //
+                            // The CP method-ref class (e.g.
+                            // `java/util/Set`) already resolved at link
+                            // time and is the correct dispatch class for
+                            // any non-Object method. Use it as the
+                            // fallback so the slow path can locate the
+                            // registered native (`HashSet.iterator`,
+                            // `HashMap.keySet`, etc.) even though the
+                            // receiver header is corrupt. Object members
+                            // (equals/hashCode/toString/getClass/wait/
+                            // notify/notifyAll/clone/finalize) still
+                            // dispatch on Object so subclass overrides
+                            // through the slow path's Object-fallback
+                            // logic still apply.
+                            if crate::vm::is_object_member(
+                                &method_name,
+                                &method_descriptor,
+                            ) {
+                                Arc::from("java/lang/Object")
+                            } else {
+                                method_class_name.clone()
+                            }
                         }
                     } else {
                         // If receiver is a lambda proxy calling a non-SAM method
@@ -7528,6 +7576,18 @@ pub(crate) fn try_lambda_dispatch(
             None => return Ok(None), // Not a lambda proxy
         }
     };
+    if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+        eprintln!(
+            "[rustjvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
+            obj_class_id,
+            call_site.functional_interface,
+            method_name,
+            call_site.impl_handle.class_name,
+            call_site.impl_handle.member_name,
+            call_site.impl_handle.descriptor,
+            call_site.impl_handle.kind,
+        );
+    }
 
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
@@ -7747,6 +7807,15 @@ pub(crate) fn try_lambda_dispatch(
                 false,
                 num_captures,
             )?;
+            if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+                eprintln!(
+                    "[rustjvm-dbg] lambda static-pre-invoke: {}.{}{} args={}",
+                    call_site.impl_handle.class_name,
+                    call_site.impl_handle.member_name,
+                    call_site.impl_handle.descriptor,
+                    full_args.len(),
+                );
+            }
             let result = invoke_shared(
                 shared,
                 thread,
@@ -7755,6 +7824,15 @@ pub(crate) fn try_lambda_dispatch(
                 &call_site.impl_handle.descriptor,
                 &full_args,
             )?;
+            if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+                eprintln!(
+                    "[rustjvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
+                    call_site.impl_handle.class_name,
+                    call_site.impl_handle.member_name,
+                    call_site.impl_handle.descriptor,
+                    result.is_some(),
+                );
+            }
             Ok(Some(coerce_return(shared, thread, &sam_ret, &impl_ret, result)?))
         }
         MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
