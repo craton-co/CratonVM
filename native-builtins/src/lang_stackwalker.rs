@@ -62,12 +62,67 @@ fn populate_sfi(
         None => Value::Object(None),
     };
     let decl_internal = ctx.create_string(&entry.class_name);
-    ctx.set_field(sf, SF_CLASSNAME, Value::Object(Some(cls_str)));
-    ctx.set_field(sf, SF_METHODNAME, Value::Object(Some(meth_str)));
-    ctx.set_field(sf, SF_FILENAME, file_str);
-    ctx.set_field(sf, SF_LINENUMBER, Value::Int(entry.line_number));
-    ctx.set_field(sf, SF_BCI, Value::Int(entry.byte_code_index));
-    ctx.set_field(sf, SF_DECL_INTERNAL, Value::Object(Some(decl_internal)));
+
+    // Real-JDK layout (jdk-25):
+    //   class ClassFrameInfo { Object classOrMemberName; int flags; }
+    //   class StackFrameInfo extends ClassFrameInfo {
+    //       String name; Object type; int bci;
+    //       ContinuationScope contScope; volatile StackTraceElement ste;
+    //   }
+    // The Spring-Boot deduceMainApplicationClass path iterates
+    // `Stream<StackFrame>` via the StackFrameTraverser Spliterator, which
+    // calls `frame.getMethodName()`. The real-JDK StackFrameInfo
+    // implementation reads `name` (slot for `name`); if null it invokes
+    // the native `expandStackFrameInfo` (which we don't implement). And
+    // `getDeclaringClass()` / `getClassName()` go through
+    // `ClassFrameInfo.declaringClass()` → `JLIA.getDeclaringClass(
+    // classOrMemberName)` which casts `classOrMemberName` to
+    // `ResolvedMethodName` and crashes on anything else.
+    //
+    // Resolve fields by NAME so the right slot is hit on whichever real
+    // class layout is present, and pre-fill them with the values our
+    // own native overrides would also return.
+    let class_mirror = ctx
+        .class_id_by_name(&entry.class_name)
+        .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
+        .unwrap_or(Value::Object(None));
+
+    let try_set = |ctx: &mut dyn NativeContext, owner: &str, fname: &str, val: Value| {
+        if let Some(idx) = ctx.resolve_field_index(owner, fname) {
+            ctx.set_field(sf, idx, val);
+            true
+        } else {
+            false
+        }
+    };
+    // ClassFrameInfo.classOrMemberName <- Class mirror (real-JDK
+    // declaringClass() unwraps via JLIA which handles Class instances).
+    let mut filled_classmem = try_set(ctx, "java/lang/ClassFrameInfo", "classOrMemberName", class_mirror);
+    if !filled_classmem {
+        filled_classmem = try_set(ctx, "java/lang/StackFrameInfo", "classOrMemberName", class_mirror);
+    }
+    // StackFrameInfo.name <- method name (avoid expandStackFrameInfo path).
+    let filled_name = try_set(ctx, "java/lang/StackFrameInfo", "name", Value::Object(Some(meth_str)));
+    // StackFrameInfo.bci <- byte code index.
+    try_set(ctx, "java/lang/StackFrameInfo", "bci", Value::Int(entry.byte_code_index));
+
+    // Always also write our own legacy 6-slot synthetic layout. Our
+    // native getter overrides (`getClassName`, `getMethodName`,
+    // `getDeclaringClass`, etc.) read from these fixed slots, so even
+    // when the real-JDK class is loaded our overrides keep working as
+    // long as we register them with the same dispatch precedence.
+    if !filled_classmem || !filled_name {
+        ctx.set_field(sf, SF_CLASSNAME, Value::Object(Some(cls_str)));
+        ctx.set_field(sf, SF_METHODNAME, Value::Object(Some(meth_str)));
+        ctx.set_field(sf, SF_FILENAME, file_str);
+        ctx.set_field(sf, SF_LINENUMBER, Value::Int(entry.line_number));
+        ctx.set_field(sf, SF_BCI, Value::Int(entry.byte_code_index));
+        ctx.set_field(sf, SF_DECL_INTERNAL, Value::Object(Some(decl_internal)));
+    } else {
+        // Suppress unused-variable warnings on the synthetic-mode
+        // fallback values when real-JDK layout was hit.
+        let _ = (cls_str, file_str, decl_internal);
+    }
     sf
 }
 
@@ -98,6 +153,15 @@ pub(crate) fn native_call_stack_walk(
     // args[4] = startIndex (Int)
     // args[5] = frameBuffer (Object[])
     // args[6] = classBuffer (Class[] or null)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let mode_long = match args.get(1) {
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => *n as i64,
+        _ => 0,
+    };
     let skip = match args.get(2) {
         Some(Value::Int(n)) => (*n).max(0) as usize,
         _ => 0,
@@ -112,7 +176,7 @@ pub(crate) fn native_call_stack_walk(
     };
     let frame_buffer = match args.get(5) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
+        _ => return Ok(Some(Value::Object(None))),
     };
 
     let trace = ctx.capture_stack_trace(0);
@@ -120,8 +184,45 @@ pub(crate) fn native_call_stack_walk(
     let slack = buf_len.saturating_sub(start_index);
     let capacity = if batch == 0 { slack } else { slack.min(batch) };
 
+    // `capture_stack_trace` produces frames in outermost → innermost order
+    // (oldest frame first, current frame last). The JDK StackWalker
+    // contract is the opposite: the stream begins with the *caller* of
+    // `walk()` and proceeds down toward `main`. So we walk the trace in
+    // reverse, then skip walker / reflection internals so the user-visible
+    // first frame is the one that called `StackWalker.walk(...)`.
+    fn is_walker_internal(name: &str, method: &str) -> bool {
+        name == "java/lang/StackWalker"
+            || name.starts_with("java/lang/StackWalker$")
+            || name == "java/lang/StackStreamFactory"
+            || name.starts_with("java/lang/StackStreamFactory$")
+            || (name == "java/lang/Thread" && method == "getStackTrace")
+            || name.starts_with("jdk/internal/reflect/")
+            || name == "java/lang/reflect/Method"
+            || name.starts_with("java/lang/invoke/MethodHandle")
+            || name.starts_with("sun/reflect/")
+    }
+
     let mut written = 0usize;
-    for entry in trace.iter().skip(skip) {
+    // Count how many trace entries we walked over (skipped internals +
+    // user-requested `skip` + the entries we materialized). The anchor we
+    // return encodes this cursor so a follow-up `fetchStackFrames` can
+    // resume from the right place.
+    let mut consumed = 0usize;
+    let mut iter = trace.iter().rev().peekable();
+    while let Some(e) = iter.peek() {
+        if is_walker_internal(&e.class_name, &e.method_name) {
+            iter.next();
+            consumed += 1;
+        } else {
+            break;
+        }
+    }
+    for _ in 0..skip {
+        if iter.next().is_some() {
+            consumed += 1;
+        }
+    }
+    for entry in iter {
         if written >= capacity {
             break;
         }
@@ -132,31 +233,132 @@ pub(crate) fn native_call_stack_walk(
             Value::Object(Some(sfi)),
         );
         written += 1;
+        consumed += 1;
     }
 
-    // Anchor = number of frames written. The JDK uses this as a
-    // continuation token; any non-zero anchor is permitted, and zero
-    // signals "no more frames".
-    Ok(Some(Value::Long(written as i64)))
+    // Real-JDK contract: `callStackWalk` is supposed to invoke
+    // `this.doStackWalk(anchor, skip, batch, startIndex, endIndex)` and
+    // return whatever doStackWalk returns. doStackWalk in turn binds the
+    // FrameBuffer's batch range and calls `consumeFrames()`, which is the
+    // abstract method the StackWalker subclass overrides to apply the
+    // user-supplied `Function<Stream<StackFrame>, R>` to a Stream over the
+    // frame buffer slice [startIndex, endIndex).
+    //
+    // Without this callback the user's lambda never runs and the native
+    // returns a meaningless Long, which Spring's
+    // `findFirst().map(...).orElse(null)` truncates to null — that's why
+    // the SpringApplication banner never fires.
+    let end_index = (start_index + written) as i32;
+    let _ = mode_long;
+    if let Some(this_ref) = this {
+        // Pass `endIndex = startIndex + written` so the FrameBuffer's
+        // (origin, fence) range exactly covers the frames we populated.
+        // Using `batch` here would set fence past the array length and
+        // throw AIOOBE on the second iteration step.
+        //
+        // Encode the trace cursor in the anchor so a follow-up
+        // `fetchStackFrames` invocation knows how many trace entries we
+        // already consumed and can resume from the next frame.
+        return ctx.invoke(
+            "java/lang/StackStreamFactory$AbstractStackWalker",
+            "doStackWalk",
+            "(JIIII)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(this_ref)),
+                Value::Long(consumed as i64),
+                Value::Int(skip as i32),
+                Value::Int(written as i32),
+                Value::Int(start_index as i32),
+                Value::Int(end_index),
+            ],
+        );
+    }
+    Ok(Some(Value::Object(None)))
 }
 
-/// `AbstractStackWalker.fetchStackFrames(long mode, long anchor,
-///                                       int batchSize, int startIndex,
-///                                       Object[] frameBuffer)`.
+/// `AbstractStackWalker.fetchStackFrames(int mode, long anchor,
+///                                       int numFrames, int batchSize,
+///                                       int startIndex, T[] frameBuffer)`.
 ///
 /// Called by the JDK's lazy Stream when additional frames are needed
-/// after the initial batch. We return 0 because our initial
-/// `callStackWalk` already materialized everything — this matches the
-/// JDK's "stack is fully consumed" sentinel.
+/// after the initial batch. We use `anchor` as a cursor over the trace
+/// captured at the original `callStackWalk` (the live thread is paused
+/// in the native frame, so re-capturing produces the same trace) and
+/// resume populating from there.
 pub(crate) fn native_fetch_stack_frames(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // args: [this, mode, anchor, batchSize, startIndex, frameBuffer]
-    // Our `callStackWalk` returns every frame in the initial batch, so
-    // continuation calls always report "0 more frames" which cleanly
-    // closes the Stream.
-    Ok(Some(Value::Int(0)))
+    // The JDK 25 signature is
+    //   fetchStackFrames(int mode, long anchor, int numFrames,
+    //                    int batchSize, int startIndex, T[] frames)
+    // The legacy signatures used `(long mode, long anchor, ...)`. Probe
+    // both shapes when extracting `anchor` so a single implementation
+    // handles all registered overloads.
+    let mut anchor: i64 = 0;
+    let mut start_index: i32 = 0;
+    let mut frame_buffer = None;
+    // Try JDK 25 layout: this(0), mode:int(1), anchor:long(2-3), numFrames:int(4),
+    // batchSize:int(5), startIndex:int(6), frames(7).
+    if let Some(Value::Long(a)) = args.get(2) {
+        anchor = *a;
+        if let Some(Value::Int(s)) = args.get(6) {
+            start_index = *s;
+        }
+        if let Some(Value::Object(Some(f))) = args.get(7) {
+            frame_buffer = Some(*f);
+        }
+    }
+    // Legacy layout: this(0), mode:long(1-2), anchor:long(3-4), batch(5),
+    // startIndex(6), frames(7).
+    if frame_buffer.is_none() {
+        if let Some(Value::Long(a)) = args.get(3) {
+            anchor = *a;
+        }
+        if let Some(Value::Int(s)) = args.get(5) {
+            start_index = *s;
+        }
+        if let Some(Value::Object(Some(f))) = args.get(6) {
+            frame_buffer = Some(*f);
+        }
+    }
+    let buffer = match frame_buffer {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
+
+    let cursor = anchor.max(0) as usize;
+    let trace = ctx.capture_stack_trace(0);
+    let buf_len = ctx.array_length(buffer);
+    let start = start_index.max(0) as usize;
+    let slack = buf_len.saturating_sub(start);
+    let mut written = 0usize;
+    let mut new_cursor = cursor;
+    let entries: Vec<_> = trace.iter().rev().skip(cursor).collect();
+    for entry in entries {
+        if written >= slack {
+            break;
+        }
+        let sfi = populate_sfi(ctx, entry);
+        ctx.set_array_element(
+            buffer,
+            start + written,
+            Value::Object(Some(sfi)),
+        );
+        written += 1;
+        new_cursor += 1;
+    }
+    // Persist the new cursor back into `this.anchor` so a subsequent
+    // `fetchStackFrames` call resumes from the next trace frame.
+    if let Some(Value::Object(Some(this_ref))) = args.first() {
+        if let Some(idx) = ctx.resolve_field_index(
+            "java/lang/StackStreamFactory$AbstractStackWalker",
+            "anchor",
+        ) {
+            ctx.set_field(*this_ref, idx, Value::Long(new_cursor as i64));
+        }
+    }
+    Ok(Some(Value::Int(written as i32)))
 }
 
 /// Register the StackStreamFactory private natives.
@@ -241,6 +443,14 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         asw,
         "fetchStackFrames",
         "(JJII)I",
+        native_fetch_stack_frames,
+    );
+    // JDK 25: fetchStackFrames(int mode, long anchor, int batchSize,
+    //                           int startIndex, int endIndex, T[] frameBuffer)
+    registry.register(
+        asw,
+        "fetchStackFrames",
+        "(IJIII[Ljava/lang/Object;)I",
         native_fetch_stack_frames,
     );
 
@@ -332,6 +542,105 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             ctx.set_field(ste, 3, ctx.get_field(this, SF_LINENUMBER));
             Ok(Some(Value::Object(Some(ste))))
         },
+    );
+
+    // SB3 deduceMainApplicationClass path: real-JDK
+    // `StackFrameBuffer.at(int)` calls the package-private virtual
+    // `ClassFrameInfo.declaringClass()` (overridden by `StackFrameInfo`)
+    // for every populated frame as part of `setBatch()`. The default
+    // `StackFrameInfo` override delegates to
+    // `JavaLangInvokeAccess.getDeclaringClass(classOrMemberName)`, which
+    // casts to `ResolvedMethodName` — a hidden type whose internals
+    // require `expandStackFrameInfo` (a HotSpot intrinsic we don't
+    // implement) to populate. That cast is what surfaces as the
+    // `ClassCastException` Spring catches, suppressing the banner.
+    //
+    // Override the package-private `declaringClass()` to return the
+    // Class mirror straight from our `SF_DECL_INTERNAL` slot. Same for
+    // ClassFrameInfo proper (in case a frame ends up as a bare
+    // ClassFrameInfo elsewhere). And register `expandStackFrameInfo` as
+    // a no-op so any callers that get past our other overrides don't
+    // hit UnsatisfiedLinkError.
+    fn declaring_class_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        // Prefer the internal-name slot we always populate.
+        if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
+            let internal = ctx.read_string(s).unwrap_or_default();
+            if !internal.is_empty() {
+                if let Some(cid) = ctx.class_id_by_name(&internal) {
+                    return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+                }
+            }
+        }
+        // Fall back: real-JDK layout has `classOrMemberName` at the
+        // first ClassFrameInfo slot. Resolve by name and read it.
+        if let Some(idx) = ctx.resolve_field_index("java/lang/ClassFrameInfo", "classOrMemberName") {
+            let v = ctx.get_field(this, idx);
+            if let Value::Object(Some(_)) = v {
+                return Ok(Some(v));
+            }
+        }
+        Ok(Some(Value::Object(None)))
+    }
+    registry.register(
+        sfi,
+        "declaringClass",
+        "()Ljava/lang/Class;",
+        declaring_class_native,
+    );
+    registry.register(
+        "java/lang/ClassFrameInfo",
+        "declaringClass",
+        "()Ljava/lang/Class;",
+        declaring_class_native,
+    );
+    registry.register(
+        "java/lang/ClassFrameInfo",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+        declaring_class_native,
+    );
+    registry.register(
+        "java/lang/ClassFrameInfo",
+        "getClassName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(ctx.get_field(this, SF_CLASSNAME)))
+        },
+    );
+    registry.register(
+        "java/lang/ClassFrameInfo",
+        "getMethodName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(ctx.get_field(this, SF_METHODNAME)))
+        },
+    );
+    // expandStackFrameInfo is a private native on StackFrameInfo that
+    // populates `name`/`type`/`bci` from a HotSpot intrinsic. We
+    // pre-populate everything our getters need, so this is a no-op.
+    registry.register(sfi, "expandStackFrameInfo", "()V", |_ctx, _args| {
+        Ok(None)
+    });
+    // ensureRetainClassRefEnabled is package-private on ClassFrameInfo
+    // and asserts the walker had RETAIN_CLASS_REFERENCE. We always
+    // populate the class mirror, so this is also a no-op.
+    registry.register(
+        "java/lang/ClassFrameInfo",
+        "ensureRetainClassRefEnabled",
+        "()V",
+        |_ctx, _args| Ok(None),
     );
 }
 

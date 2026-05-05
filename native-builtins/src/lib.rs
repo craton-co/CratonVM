@@ -3241,6 +3241,93 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // by `register_classloader_natives` in synthetic-JDK mode).
     classloader::register_enumeration_impl_natives(registry);
 
+    // S111r6: URLClassPath.<init>(URL[],URLStreamHandlerFactory) NPEs in
+    // real-JDK mode when invoked indirectly via SB2 launcher's
+    // LaunchedURLClassLoader -> URLClassLoader.<init>(URL[], ClassLoader)
+    // -> URLClassPath.<init>(URL[]) at line 131 (`new ArrayList<>(urls.length)`)
+    // because `urls` arrives as null. Install a defensive constructor that
+    // treats null-or-empty URL[] as empty and initialises the `path`,
+    // `unopenedUrls`, and `jarHandler` instance fields with real
+    // ArrayList / ArrayDeque instances. The other instance-init fields
+    // (`loaders`, `lmap`, `closed`) are populated by the JVM's instance
+    // initializer block before our native runs, so we don't touch them.
+    fn ucp_init_2(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let urls_val = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Construct path = new ArrayList<>(len)
+        let path = match ctx.new_object("java/util/ArrayList")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(path))],
+        )?;
+        // Construct unopenedUrls = new ArrayDeque<>(len)
+        let unopened = match ctx.new_object("java/util/ArrayDeque")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/ArrayDeque",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(unopened))],
+        )?;
+        // Iterate URLs (if non-null) and seed both collections.
+        if let Value::Object(Some(arr)) = urls_val {
+            let len = ctx.array_length(arr);
+            for i in 0..len {
+                let elem = ctx.get_array_element(arr, i);
+                ctx.invoke(
+                    "java/util/ArrayList",
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(path)), elem],
+                )?;
+                ctx.invoke(
+                    "java/util/ArrayDeque",
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(unopened)), elem],
+                )?;
+            }
+        }
+        ctx.set_field_by_name(this, "path", Value::Object(Some(path)));
+        ctx.set_field_by_name(this, "unopenedUrls", Value::Object(Some(unopened)));
+        ctx.set_field_by_name(this, "jarHandler", Value::Object(None));
+        Ok(None)
+    }
+    fn ucp_init_1(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Single-arg ctor: forward to the 2-arg form with factory=null.
+        let this = args.first().copied().unwrap_or(Value::Object(None));
+        let urls = args.get(1).copied().unwrap_or(Value::Object(None));
+        ucp_init_2(ctx, &[this, urls, Value::Object(None)])
+    }
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "<init>",
+        "([Ljava/net/URL;Ljava/net/URLStreamHandlerFactory;)V",
+        ucp_init_2,
+    );
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "<init>",
+        "([Ljava/net/URL;)V",
+        ucp_init_1,
+    );
+
     // --- java.io.ObjectStreamClass native bindings (real-JDK mode) ---
     // ObjectStreamClass.<clinit> calls initNative(); without this registered
     // the class is flagged "initialized after non-critical exception" and

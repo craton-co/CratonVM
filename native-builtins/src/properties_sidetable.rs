@@ -580,6 +580,43 @@ fn native_properties_contains_key(
     Ok(Some(Value::Int(0)))
 }
 
+/// Native `Properties.get(Object)Object` — Hashtable-style read path used
+/// by callers that bypass `getProperty` (e.g. Spring's
+/// `PropertySourcesPropertyResolver` calling `Properties.get(key)` on the
+/// `MapPropertySource` backed by `System.getProperties()`).
+///
+/// JDK 25's `Properties.get` (Properties.java:1338) reads from a private
+/// `ConcurrentHashMap<Object, Object> map` field that's only populated by
+/// `Properties.<init>`'s body.  Our synthetic Properties allocations don't
+/// run that body, so `map` is null and the bytecode NPEs.  Override the
+/// method here to consult the side-table (and fall back to system
+/// properties for the System.getProperties() case), mirroring how
+/// `getProperty` already routes around the broken bytecode path.
+///
+/// Returns `null` when the key is absent — matches `Hashtable.get`
+/// semantics.
+fn native_properties_get(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_obj = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = ctx.read_string(key_obj).unwrap_or_default();
+    if let Some(v) = get_kv(this, &key) {
+        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+    }
+    match ctx.get_system_property(&key) {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 /// Register the side-table-backed `Properties` natives.  Called from
 /// `register_essential_natives` (real-JDK mode) so KeycloakMain's
 /// `Version.<clinit>` finds a non-null `version` value.
@@ -627,6 +664,18 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "containsKey",
         "(Ljava/lang/Object;)Z",
         native_properties_contains_key,
+    );
+    // Spring's PropertySourcesPropertyResolver reads through the
+    // Hashtable.get(Object) interface rather than getProperty(String),
+    // and the JDK 25 Properties.get override at Properties.java:1338
+    // dereferences a `ConcurrentHashMap<Object,Object> map` field that's
+    // null on our synthetic Properties.  Route the read through the
+    // side-table so MapPropertySource gets a sensible result.
+    registry.register(
+        "java/util/Properties",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_properties_get,
     );
 }
 
