@@ -4831,15 +4831,40 @@ fn create_annotation_proxy(
         }
     }
 
-    // Collect explicit elements
-    let mut all_elements: Vec<(String, rustjvm_native_api::AnnotationElementValue)> =
-        ann.elements.clone();
+    // Collect explicit elements with their declared return-type descriptor
+    // (read from the annotation interface's abstract method, when available).
+    // The descriptor is used as a fallback hint when the element value is an
+    // EMPTY array — we'd otherwise pick `java/lang/Object` as the component
+    // class, which trips Spring's `AnnotationUtils.adaptValue` into treating
+    // the array as `Annotation[]` (under the lenient `Object` fallback in
+    // `array_is_assignable`) and converts the empty `Object[]` into an empty
+    // `AnnotationAttributes[]`.  That collapse later surfaces as
+    // `IllegalArgumentException` in `AnnotationAttributes.assertAttributeType`
+    // on `getStringArray("pattern")` for `@ComponentScan.Filter` (S111r19).
+    let mut all_elements: Vec<(
+        String,
+        rustjvm_native_api::AnnotationElementValue,
+        Option<String>,
+    )> = ann
+        .elements
+        .iter()
+        .map(|(n, v)| (n.clone(), v.clone(), None))
+        .collect();
 
     // Fill in AnnotationDefault values for missing elements
     if let Some(ann_cid) = ann_class_id_opt {
         let methods = ctx.declared_methods(ann_cid);
         let explicit_names: std::collections::HashSet<String> =
-            all_elements.iter().map(|(n, _)| n.clone()).collect();
+            all_elements.iter().map(|(n, _, _)| n.clone()).collect();
+        // For explicit elements, also backfill the return-type descriptor
+        // so empty arrays carry the right component hint.
+        for (name, _, desc_slot) in all_elements.iter_mut() {
+            if let Some(m) = methods.iter().find(|m| &m.name == name) {
+                if let Some(ret) = m.descriptor.strip_prefix("()") {
+                    *desc_slot = Some(ret.to_string());
+                }
+            }
+        }
         for m in &methods {
             // Annotation elements are abstract no-arg methods
             if explicit_names.contains(&m.name) {
@@ -4850,7 +4875,8 @@ fn create_annotation_proxy(
                 continue;
             }
             if let Some(default_val) = ctx.method_annotation_default(ann_cid, &m.name, &m.descriptor) {
-                all_elements.push((m.name.clone(), default_val));
+                let ret_desc = m.descriptor.strip_prefix("()").map(|s| s.to_string());
+                all_elements.push((m.name.clone(), default_val, ret_desc));
             }
         }
     }
@@ -4859,10 +4885,11 @@ fn create_annotation_proxy(
     let n = all_elements.len();
     let names_arr = ctx.new_ref_array(ClassId::new(0), n);
     let values_arr = ctx.new_ref_array(ClassId::new(0), n);
-    for (i, (name, val)) in all_elements.iter().enumerate() {
+    for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
-        let java_val = annotation_element_to_java(ctx, val);
+        let java_val =
+            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref());
         ctx.set_array_element(values_arr, i, java_val);
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
@@ -4880,6 +4907,22 @@ fn create_annotation_proxy(
 pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &rustjvm_native_api::AnnotationElementValue,
+) -> Value {
+    annotation_element_to_java_typed(ctx, val, None)
+}
+
+/// S111r19 — typed variant: when called for a known annotation-element method,
+/// the caller passes the method's return-type descriptor (e.g.
+/// `[Ljava/lang/String;`).  Used to recover the array component class for
+/// **empty** array values, which would otherwise default to
+/// `java/lang/Object` and trip Spring's `AnnotationUtils.adaptValue` into
+/// converting the empty `Object[]` to an empty `AnnotationAttributes[]`
+/// (because our `array_is_assignable` lenient `Object` fallback green-lights
+/// `Annotation[].isInstance(Object[])`).
+pub(crate) fn annotation_element_to_java_typed(
+    ctx: &mut dyn NativeContext,
+    val: &rustjvm_native_api::AnnotationElementValue,
+    return_type_desc: Option<&str>,
 ) -> Value {
     use rustjvm_native_api::AnnotationElementValue;
     match val {
@@ -4914,8 +4957,23 @@ pub(crate) fn annotation_element_to_java(
                 .strip_prefix('L')
                 .and_then(|s| s.strip_suffix(';'))
                 .unwrap_or(type_desc);
-            // Try Enum.valueOf(Class, String) via invoke to get the real constant
-            if let Some(enum_cid) = ctx.class_id_by_name(class_name) {
+            // S111r19 — load the enum class on demand if not yet loaded.
+            // Annotation proxies are materialised eagerly during the
+            // declaring class's load, but the enum class referenced by the
+            // annotation's element values (e.g. `FilterType` in
+            // `@ComponentScan.Filter.type`) often is **not** yet loaded.
+            // Previously we fell straight through to the synthetic fallback
+            // which writes ordinal=0 — collapsing `FilterType.CUSTOM`
+            // (real ordinal 4) onto `ANNOTATION` (ordinal 0) and sending
+            // Spring's `ComponentScanAnnotationParser.typeFiltersFor` into
+            // the wrong switch case, surfacing as `IllegalArgumentException`
+            // wrapped at `ConfigurationClassParser.parse:181`.  Load the
+            // class on demand, mirroring the sibling `Class` arm (C29).
+            let enum_cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
+                let _ = ctx.load_class(class_name);
+                ctx.class_id_by_name(class_name)
+            });
+            if let Some(enum_cid) = enum_cid_opt {
                 let class_mirror = ctx.get_class_mirror(enum_cid);
                 let name_str = ctx.create_string(const_name);
                 if let Ok(Some(val)) = ctx.invoke(
@@ -4987,6 +5045,13 @@ pub(crate) fn annotation_element_to_java(
             // `F4.class`, which `isAnnotation()` returns `true` for, and the
             // synthesize loop then runs as expected.
             use rustjvm_native_api::AnnotationElementValue as AEV;
+            // S111r19 — when the array is **empty** (no first element to
+            // probe), fall back to the caller-provided method return-type
+            // descriptor.  This recovers the right component class for
+            // empty `String[]` / `Class[]` defaults like `@Filter.pattern()`
+            // = `{}`, which would otherwise become an `Object[]` and trip
+            // Spring's `AnnotationUtils.adaptValue` Annotation[]-detection
+            // (the lenient `Object` fallback in `array_is_assignable`).
             let comp_name_owned: String = match elems.first() {
                 Some(AEV::StringVal(_)) => "java/lang/String".to_string(),
                 Some(AEV::Class(_)) => "java/lang/Class".to_string(),
@@ -5007,6 +5072,38 @@ pub(crate) fn annotation_element_to_java(
                 Some(AEV::Long(_)) => "java/lang/Long".to_string(),
                 Some(AEV::Float(_)) => "java/lang/Float".to_string(),
                 Some(AEV::Double(_)) => "java/lang/Double".to_string(),
+                None => {
+                    // Empty array — derive component from method return type.
+                    if let Some(rd) = return_type_desc {
+                        if let Some(comp) = rd.strip_prefix('[') {
+                            if let Some(stripped) =
+                                comp.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                stripped.to_string()
+                            } else if comp.len() == 1 && "ZBCSIJFD".contains(&comp[..1]) {
+                                // Empty primitive array — boxed wrapper
+                                // (matches the non-empty primitive arms).
+                                match &comp[..1] {
+                                    "Z" => "java/lang/Boolean".to_string(),
+                                    "B" => "java/lang/Byte".to_string(),
+                                    "C" => "java/lang/Character".to_string(),
+                                    "S" => "java/lang/Short".to_string(),
+                                    "I" => "java/lang/Integer".to_string(),
+                                    "J" => "java/lang/Long".to_string(),
+                                    "F" => "java/lang/Float".to_string(),
+                                    "D" => "java/lang/Double".to_string(),
+                                    _ => "java/lang/Object".to_string(),
+                                }
+                            } else {
+                                "java/lang/Object".to_string()
+                            }
+                        } else {
+                            "java/lang/Object".to_string()
+                        }
+                    } else {
+                        "java/lang/Object".to_string()
+                    }
+                }
                 _ => "java/lang/Object".to_string(),
             };
             let comp_cid = ctx

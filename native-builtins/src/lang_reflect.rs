@@ -528,7 +528,15 @@ pub(crate) fn native_method_get_default_value(
         Some(v) => v,
         None => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(annotation_element_to_java(ctx, &default)))
+    // S111r19 — pass the annotation method's return-type descriptor so
+    // empty arrays carry the correct component class (avoids the
+    // `Object[]`-as-`Annotation[]` aliasing in Spring's `adaptValue`).
+    let ret_desc = desc.strip_prefix("()").map(|s| s.to_string());
+    Ok(Some(crate::lang_class::annotation_element_to_java_typed(
+        ctx,
+        &default,
+        ret_desc.as_deref(),
+    )))
 }
 
 // ---------------------------------------------------------------------------

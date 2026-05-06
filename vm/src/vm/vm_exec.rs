@@ -4309,12 +4309,189 @@ pub(crate) fn proxy_invoke_handler_shared(
 /// Shared-interpreter version of `annotation_proxy_invoke`.
 pub(crate) fn annotation_proxy_invoke_shared(
     shared: &SharedVm,
-    _thread: &mut JvmThread,
+    thread: &mut JvmThread,
     proxy: ObjectRef,
     method_name: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // S111r19 — Spring's MergedAnnotation.adaptValueForMapOptions iterates
+    // a `[LMergedAnnotation;` array and calls `aa[i].asMap(factory, adapts)`.
+    // When `aa[i]` is one of our `AnnotationProxy` instances (because the
+    // upstream `adaptForAttribute` retained the original proxy array
+    // instead of building a fresh `[LMergedAnnotation;`), the dispatch
+    // routes here. Without an `asMap` handler, the element-accessor walk
+    // returns null and Spring stores null in the resulting
+    // `AnnotationAttributes[]`, surfacing as the `TypeFilterUtils.java:77`
+    // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
+    // (`@Filter` attribute is null).
+    if method_name == "asMap" {
+        return annotation_proxy_as_map(shared, thread, proxy, args);
+    }
     annotation_proxy_dispatch_impl(shared, proxy, method_name, args)
+}
+
+/// Implement `MergedAnnotation.asMap(Function, Adapt[])` for AnnotationProxy
+/// receivers. Builds the destination map by calling `factory.apply(proxy)`
+/// then populates with element name→value pairs. Nested annotation arrays
+/// are converted to `AnnotationAttributes[]` arrays containing
+/// recursively-asMap'd children.
+fn annotation_proxy_as_map(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    proxy: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    use crate::memory::heap::ObjectKind;
+
+    let factory = match args.first() {
+        Some(Value::Object(Some(o))) => {
+            if shared.heap.kind_of(*o) == ObjectKind::Object {
+                Some(*o)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let dest_map = if let Some(f) = factory {
+        let f_cid = shared.heap.class_id_of(f);
+        let is_lambda = shared.lambda_proxies.read().contains_key(&f_cid);
+        let res = if is_lambda {
+            let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
+                shared,
+                thread,
+                f,
+                f_cid,
+                "apply",
+                &[Value::Object(Some(proxy))],
+            )?;
+            dispatch.unwrap_or(None)
+        } else {
+            invoke_on_class_shared(
+                shared,
+                thread,
+                f_cid,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(f)), Value::Object(Some(proxy))],
+            )?
+        };
+        match res {
+            Some(Value::Object(Some(m))) => m,
+            _ => {
+                let cid = shared
+                    .load_class_concurrent(
+                        "org/springframework/core/annotation/AnnotationAttributes",
+                    )
+                    .or_else(|_| shared.load_class_concurrent("java/util/LinkedHashMap"))
+                    .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+                shared.heap.alloc_object(cid, 4)
+            }
+        }
+    } else {
+        let cid = shared
+            .load_class_concurrent("java/util/LinkedHashMap")
+            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+        shared.heap.alloc_object(cid, 4)
+    };
+
+    let names_arr = match shared.heap.get_field(proxy, 2) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(Some(dest_map)))),
+    };
+    let values_arr = match shared.heap.get_field(proxy, 3) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(Some(dest_map)))),
+    };
+    let n = shared.heap.array_length(names_arr);
+    for i in 0..n {
+        let name_val = match shared.heap.get_array_element(names_arr, i) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let elem_val = match shared.heap.get_array_element(values_arr, i) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let adapted = adapt_annotation_value_for_map(shared, thread, elem_val, args)?;
+        let dest_cid = shared.heap.class_id_of(dest_map);
+        let _ = invoke_on_class_shared(
+            shared,
+            thread,
+            dest_cid,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(dest_map)), name_val, adapted],
+        )?;
+    }
+    Ok(Some(Value::Object(Some(dest_map))))
+}
+
+/// Recursively adapt an annotation element value: nested annotation
+/// proxies become their asMap result; arrays of annotation proxies become
+/// an `AnnotationAttributes[]`-typed array of recursively-asMap'd children.
+fn adapt_annotation_value_for_map(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    val: Value,
+    asmap_args: &[Value],
+) -> Result<Value, MethodCallFailed> {
+    use crate::memory::heap::ObjectKind;
+    let obj = match val {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(val),
+    };
+    let cid = shared.heap.class_id_of(obj);
+    let kind = shared.heap.kind_of(obj);
+    let class_name = shared
+        .class_manager
+        .read()
+        .get_class(cid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_default();
+    if kind == ObjectKind::Object && class_name == "java/lang/annotation/AnnotationProxy" {
+        return annotation_proxy_as_map(shared, thread, obj, asmap_args).map(|res| {
+            res.unwrap_or(Value::Object(None))
+        });
+    }
+    if kind == ObjectKind::Array {
+        let len = shared.heap.array_length(obj);
+        let any_proxy = (0..len).any(|i| {
+            matches!(
+                shared.heap.get_array_element(obj, i),
+                Ok(Value::Object(Some(e)))
+                    if shared.heap.kind_of(e) == ObjectKind::Object
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_class(shared.heap.class_id_of(e))
+                            .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
+                            .unwrap_or(false)
+            )
+        });
+        if any_proxy {
+            let aa_cid = shared
+                .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
+                .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            let new_arr = shared
+                .heap
+                .alloc_array(aa_cid, rustjvm_types::ArrayElementType::Reference, len);
+            for i in 0..len {
+                let elem = shared
+                    .heap
+                    .get_array_element(obj, i)
+                    .unwrap_or(Value::Object(None));
+                let adapted = adapt_annotation_value_for_map(shared, thread, elem, asmap_args)?;
+                shared
+                    .heap
+                    .set_array_element(new_arr, i, adapted)
+                    .ok();
+            }
+            return Ok(Value::Object(Some(new_arr)));
+        }
+    }
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
