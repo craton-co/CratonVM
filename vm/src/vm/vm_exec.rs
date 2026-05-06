@@ -4838,6 +4838,25 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             let eq = annotation_proxy_equals(shared, proxy, other);
             return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
         }
+        // S111r18 — `getClass()` is a final native on Object, but our
+        // interception layer at `execute_invoke` routes EVERY method call
+        // on an `AnnotationProxy` here (because the receiver's class_id
+        // is the synthetic AnnotationProxy class, not Object). Without
+        // this branch the call falls through to the element-accessor walk
+        // below, finds no element named "getClass", and returns null —
+        // breaking Spring's `MergedAnnotation.adaptForAttribute` which
+        // calls `value.getClass().isArray()` on the raw attribute value
+        // and NPEs. Return the proxy's class mirror (the annotation
+        // type's mirror, stored in field 1 by `create_annotation_proxy`)
+        // so callers see something sensible. We deliberately return the
+        // annotation type Class — not the AnnotationProxy synthetic Class
+        // — to match real-JDK behaviour where `q.getClass()` reports the
+        // Proxy class and `q.annotationType()` reports the annotation
+        // interface, but Spring only needs *some* non-null Class with
+        // `isArray()==false` and `isAnnotation()==true`.
+        "getClass" => {
+            return Ok(Some(shared.heap.get_field(proxy, 1)));
+        }
         _ => {}
     }
 

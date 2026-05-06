@@ -4970,29 +4970,50 @@ pub(crate) fn annotation_element_to_java(
             //
             // Pick by inspecting the first element variant — annotation
             // attribute arrays are homogeneous per JLS §9.6.1.
+            //
+            // S111r18 — for nested-annotation arrays, use the annotation
+            // interface type (e.g. `F4` for `@CScan(excludeFilters=@F4...)`)
+            // as the component class, NOT the bare `AnnotationProxy` synthetic.
+            // Spring's `MergedAnnotation.adaptForAttribute` walks
+            // `returnType.componentType().isAnnotation()` — when our array
+            // reports its component as `AnnotationProxy` (which is
+            // `isAnnotation()=false`), the adapt-array branch is taken on
+            // returnType but the receiving array allocation in the same
+            // method later fails its checkcast / isInstance check, and the
+            // built `MergedAnnotation[]` collapses into a single-element
+            // value path that surfaces in `AnnotationAttributes` as
+            // `[null]`. Routing the component class to the actual annotation
+            // interface (F4) makes the array's `componentType()` report
+            // `F4.class`, which `isAnnotation()` returns `true` for, and the
+            // synthesize loop then runs as expected.
             use rustjvm_native_api::AnnotationElementValue as AEV;
-            let comp_name: &str = match elems.first() {
-                Some(AEV::StringVal(_)) => "java/lang/String",
-                Some(AEV::Class(_)) => "java/lang/Class",
-                Some(AEV::Annotation(_)) => "java/lang/annotation/AnnotationProxy",
+            let comp_name_owned: String = match elems.first() {
+                Some(AEV::StringVal(_)) => "java/lang/String".to_string(),
+                Some(AEV::Class(_)) => "java/lang/Class".to_string(),
+                Some(AEV::Annotation(nested)) => annotation_desc_to_class_name(
+                    &nested.type_descriptor,
+                )
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "java/lang/annotation/AnnotationProxy".to_string()),
                 Some(AEV::Enum(type_desc, _)) => type_desc
                     .strip_prefix('L')
                     .and_then(|s| s.strip_suffix(';'))
-                    .unwrap_or("java/lang/Enum"),
+                    .unwrap_or("java/lang/Enum")
+                    .to_string(),
                 // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
                 // are still allocated as boxed wrapper arrays here per
                 // pre-existing behaviour — pick the wrapper class.
-                Some(AEV::Int(_)) => "java/lang/Integer",
-                Some(AEV::Long(_)) => "java/lang/Long",
-                Some(AEV::Float(_)) => "java/lang/Float",
-                Some(AEV::Double(_)) => "java/lang/Double",
-                _ => "java/lang/Object",
+                Some(AEV::Int(_)) => "java/lang/Integer".to_string(),
+                Some(AEV::Long(_)) => "java/lang/Long".to_string(),
+                Some(AEV::Float(_)) => "java/lang/Float".to_string(),
+                Some(AEV::Double(_)) => "java/lang/Double".to_string(),
+                _ => "java/lang/Object".to_string(),
             };
             let comp_cid = ctx
-                .class_id_by_name(comp_name)
+                .class_id_by_name(&comp_name_owned)
                 .or_else(|| {
-                    let _ = ctx.load_class(comp_name);
-                    ctx.class_id_by_name(comp_name)
+                    let _ = ctx.load_class(&comp_name_owned);
+                    ctx.class_id_by_name(&comp_name_owned)
                 })
                 .unwrap_or(rustjvm_types::ClassId::new(0));
             let arr = ctx.new_ref_array(comp_cid, elems.len());

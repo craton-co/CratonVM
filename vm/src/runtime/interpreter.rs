@@ -5958,6 +5958,60 @@ fn execute_instruction(
                             .get_class(actual_class_id)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| "?".to_string());
+                        if std::env::var_os("RUSTJVM_DBG_CCE").is_some() {
+                            eprintln!(
+                                "[CCE_DBG] checkcast fail: obj_cid={} obj_class={} target={} caller={}.{}{}",
+                                actual_class_id,
+                                obj_class_name,
+                                target_class_name,
+                                thread.frames[frame_idx].class_name(),
+                                thread.frames[frame_idx].method_name(),
+                                thread.frames[frame_idx].method_descriptor(),
+                            );
+                        }
+                        // S-trinity #1: when the runtime class is a bare
+                        // `Object` / cid=0 (synthetic alloc that lost
+                        // class_id) and the checkcast target is a
+                        // ClassLoader-shaped type — i.e. log4j's
+                        // `LoaderUtil.getThreadContextClassLoader` / the
+                        // `(ClassLoader) priv.run()` chain in
+                        // `Logger.doGetMessageLogger` — substitute the
+                        // singleton app ClassLoader. The unidentifiable
+                        // value can only have come from one of our
+                        // classloader-returning natives (every concrete
+                        // `Class.getClassLoader` / `Thread.getContextClassLoader`
+                        // path ends in `get_or_create_app_loader`), so the
+                        // app loader is the spec-correct standin and lets
+                        // the caller's `loadClass` chain proceed instead
+                        // of poisoning `<clinit>` with an EIIE.
+                        let is_classloader_target = target_class_name
+                            == "java/lang/ClassLoader"
+                            || target_class_name == "java/security/SecureClassLoader"
+                            || target_class_name
+                                == "jdk/internal/loader/BuiltinClassLoader"
+                            || target_class_name
+                                == "jdk/internal/loader/ClassLoaders$AppClassLoader"
+                            || target_class_name
+                                == "jdk/internal/loader/ClassLoaders$PlatformClassLoader";
+                        let obj_is_bare_object =
+                            actual_class_id == ClassId::new(0)
+                                || obj_class_name == "java/lang/Object";
+                        if is_classloader_target && obj_is_bare_object {
+                            if let Some(loader_obj) =
+                                rustjvm_native_builtins::classloader::peek_app_loader()
+                            {
+                                tracing::debug!(
+                                    target: "rustjvm::interp::checkcast",
+                                    "S-trinity #1 — substituting app ClassLoader for cid=0 \
+                                     Object on checkcast → {}",
+                                    target_class_name,
+                                );
+                                thread.frames[frame_idx]
+                                    .stack
+                                    .push(Value::Object(Some(loader_obj)))?;
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
                         return Err(RuntimeError::ClassCastException {
                             message: format!(
                                 "{obj_class_name} cannot be cast to {target_class_name}"
@@ -7496,6 +7550,21 @@ fn execute_invoke(
                             // interface AND the CP class is NOT that same
                             // interface (avoid changing well-formed
                             // `Iterator.hasNext()` etc. dispatches).
+                            //
+                            // S-trinity #2 — symmetric extension: receiver's
+                            // runtime class is plain `java/lang/Object` (e.g.
+                            // a value just returned from
+                            // `PrivilegedAction.run()` whose declared return
+                            // is `Object`, or a synthetic native return that
+                            // landed without subclass info), and the CP
+                            // method-ref class is `java/lang/ClassLoader` (or
+                            // any concrete class declaring the method). Treat
+                            // it the same as the interface case so the
+                            // `(ClassLoader) priv.run()` chain in
+                            // `LoaderUtil.getClassLoader` and
+                            // `Logger.getMessageLogger` can dispatch the
+                            // subsequent `loadClass` instead of NSME'ing on
+                            // `Object.loadClass`.
                             let cm_read = shared.class_manager.read();
                             let recv_class = cm_read.get_class(cid);
                             let recv_is_iface = recv_class
@@ -7504,7 +7573,14 @@ fn execute_invoke(
                             let recv_name_opt = recv_class
                                 .map(|c| Arc::from(&*c.name));
                             drop(cm_read);
-                            if recv_is_iface
+                            let recv_is_bare_object = recv_name_opt
+                                .as_ref()
+                                .map(|n: &Arc<str>| &**n == "java/lang/Object")
+                                .unwrap_or(false);
+                            let cp_is_not_object =
+                                &*method_class_name != "java/lang/Object";
+                            if (recv_is_iface || recv_is_bare_object)
+                                && cp_is_not_object
                                 && !crate::vm::is_object_member(
                                     &method_name,
                                     &method_descriptor,
@@ -7617,7 +7693,26 @@ fn execute_invoke(
     }
 
     // Annotation proxy dispatch: method calls on annotation proxies
-    if &*invoke_class == "java/lang/annotation/AnnotationProxy" && !is_special {
+    //
+    // S111r18 — gate the dispatch on `kind == Object`. A reference array
+    // whose component class is `AnnotationProxy` (e.g. `Annotation[]` for
+    // a repeatable annotation or `excludeFilters` on `@ComponentScan`)
+    // shares the same `class_id_of` value because our heap stores the
+    // component class id on the array header. Without this guard, every
+    // method call on such an array (Object.getClass / Object.toString /
+    // Array.getLength via reflection) gets routed through
+    // `annotation_proxy_invoke_shared`, which reads element-value slots
+    // out of array memory — surfacing as `getClass() returns null` or
+    // wrong-component types in Spring's `MergedAnnotation.adaptForAttribute`
+    // and breaking the `excludeFilters` array iteration that builds the
+    // `MergedAnnotation[]`.
+    if &*invoke_class == "java/lang/annotation/AnnotationProxy"
+        && !is_special
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(r))) if shared.heap.kind_of(*r) == rustjvm_types::ObjectKind::Object
+        )
+    {
         if let Value::Object(Some(ann_ref)) = &args[0] {
             let invoke_args: &[Value] = if args.len() >= 1 { &args[1..] } else { &[] };
             let result = crate::vm::annotation_proxy_invoke_shared(

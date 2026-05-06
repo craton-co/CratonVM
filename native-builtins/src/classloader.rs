@@ -27,6 +27,15 @@ fn app_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     INSTANCE.get_or_init(|| Mutex::new(None))
 }
 
+/// Read-only accessor for the singleton app `ClassLoader` already created
+/// by [`get_or_create_app_loader`]. Returns `None` when boot hasn't yet
+/// touched any path that allocates the loader. Intended for VM-side
+/// rescues that need to substitute the canonical app loader without a
+/// `&mut NativeContext` (e.g. `interpreter::execute_checkcast`).
+pub fn peek_app_loader() -> Option<ObjectRef> {
+    *app_loader_store().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Reset singleton loader instances. Called when creating a new VM to avoid
 /// stale ObjectRefs from a previous VM instance.
 pub fn reset_loader_singletons() {

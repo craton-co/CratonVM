@@ -654,6 +654,149 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // SPB.9 (Session 114) — provisional blanket ban for the SLF4J /
+        // Logback / commons-logging facades. `apps/insurance-backend` Spring
+        // Boot 3.2 boot reaches the Spring banner then crashes with
+        // `expected object reference, got int(1)` while
+        // `SpringApplication.prepareEnvironment` walks the
+        // `SystemEnvironmentPropertyMapper.processElementValue` chain (frame
+        // depth 18). With `RUSTJVM_DISABLE_JIT=1` the same int(1) crash
+        // surfaces — but the very last methods JIT-dispatched before the
+        // failure (`RUSTJVM_DBG_JIT_DISPATCH=1` capture) are an extremely
+        // tight loop of `LogAdapter$Slf4jLog.<init>`,
+        // `LogAdapter$Slf4jLocationAwareLog.<init>`,
+        // `LoggerFactory.getLogger`, `LoggerFactory.getProvider`,
+        // `SLF4JServiceProvider.getLoggerFactory`,
+        // `ILoggerFactory.getLogger`, and
+        // `LoggerContext.getLogger` — Spring Boot's per-class logger
+        // wiring during component scan. Each call returns a JIT-compiled
+        // `Logger` reference that is then stored into the
+        // `Slf4jLog.logger` slot via the same allocate-then-putfield
+        // archetype that bites W2-CHM / RBC.1 / SPB.1-8. The miscompiled
+        // store leaves an `int(1)` (likely the `LocationAwareLogger`
+        // instance test boolean) where a `Logger` reference belongs; the
+        // next interpreter `pop_object_ref` on that slot raises the
+        // observed `expected object reference, got int(1)` crash.
+        //
+        // The three logging facades are tightly coupled at boot:
+        // `org/slf4j/` (the API), `ch/qos/logback/` (Spring Boot 3.2's
+        // default backend), and `org/apache/commons/logging/` (the
+        // bridge Spring uses internally). Banning all three together
+        // covers the full per-class logger wiring path. Lifted by
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/slf4j/,ch/qos/logback/,
+        // org/apache/commons/logging/`.
+        if class_name.starts_with("org/slf4j/")
+            && !package_allowed("org/slf4j/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("ch/qos/logback/")
+            && !package_allowed("ch/qos/logback/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/apache/commons/logging/")
+            && !package_allowed("org/apache/commons/logging/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.9b (Session 114) — companion blanket ban for the Spring
+        // Boot loader + reactive web context, plus the Spring Beans
+        // factory support layer. After SPB.9 pins the per-class logger
+        // wiring, the next downstream consumers that allocate-then-putfield
+        // on the `prepareEnvironment` -> component-scan critical path are:
+        //   * `org/springframework/boot/loader/` — JarLauncher /
+        //     LaunchedURLClassLoader allocate per-jar `Archive` /
+        //     `Source` records and store them via putfield. Note this
+        //     intentionally overrides the SPB.4c `loader/` exemption
+        //     because the insurance-backend JarLauncher.launch frame is
+        //     itself the entry point that fails dispatch.
+        //   * `org/springframework/web/reactive/` and
+        //     `org/springframework/boot/web/reactive/` — insurance-backend
+        //     uses Spring WebFlux; `ReactiveWebServerApplicationContext`
+        //     and `ReactiveWebServerFactory` allocate Reactor Netty
+        //     handler chains (`HttpHandler`, `WebFilter`) whose ctors
+        //     store config slots immediately after `new`.
+        //   * `org/springframework/beans/factory/support/` —
+        //     `DefaultListableBeanFactory.registerBeanDefinition` and
+        //     `BeanDefinitionMap.put` are called once per scanned
+        //     component (~50+ beans for a minimal Spring Boot 3.2
+        //     reactive app), and the `RootBeanDefinition.<init>` ctor
+        //     copies ~15 fields (factoryClass, factoryMethod, scope,
+        //     ctorArgs, ...) via putfield — exact W2-CHM archetype.
+        // Lifted per-package via
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/loader/,
+        // org/springframework/web/reactive/,
+        // org/springframework/boot/web/reactive/,
+        // org/springframework/beans/factory/support/`.
+        if class_name.starts_with("org/springframework/boot/loader/")
+            && !package_allowed("org/springframework/boot/loader/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/springframework/web/reactive/")
+            && !package_allowed("org/springframework/web/reactive/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/springframework/boot/web/reactive/")
+            && !package_allowed("org/springframework/boot/web/reactive/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/springframework/beans/factory/support/")
+            && !package_allowed("org/springframework/beans/factory/support/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // SPB.9c (Session 114) — companion blanket bans for the Spring
+        // component-scan critical path. With SPB.9 and SPB.9b in place,
+        // insurance-backend boot reaches `SpringApplication.run` ->
+        // `AbstractApplicationContext.refresh` ->
+        // `PostProcessorRegistrationDelegate.invokeBeanFactoryPostProcessors`
+        // -> `ConfigurationClassPostProcessor.processConfigBeanDefinitions`
+        // -> `ConfigurationClassParser.parse` ->
+        // `ClassPathBeanDefinitionScanner.doScan` ->
+        // `ClassPathScanningCandidateComponentProvider.scanCandidateComponents`
+        // -> `PathMatchingResourcePatternResolver.getResources` /
+        // `findAllModulePathResources` -> `ModuleLayer.configuration` /
+        // `Configuration.modules()` (frame trace depth 15-18 immediately
+        // before the int(1) crash). Each of these makes putfield-heavy
+        // allocations: `ConfigurationClassParser.SourceClass.<init>`
+        // stores `metadata`/`source`/`importBy` slots, and the
+        // `PathMatching` resolver allocates a `Resource[]` per scanned
+        // package and stores resolved `Resource` references via aastore.
+        // Same W2-CHM / RBC.1 / SPB.1-9 archetype.
+        //
+        // Lifted per-package via
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/context/annotation/,
+        // org/springframework/context/support/,
+        // org/springframework/core/io/support/,
+        // org/springframework/beans/factory/`.
+        if class_name.starts_with("org/springframework/context/annotation/")
+            && !package_allowed("org/springframework/context/annotation/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/springframework/context/support/")
+            && !package_allowed("org/springframework/context/support/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/springframework/core/io/support/")
+            && !package_allowed("org/springframework/core/io/support/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/springframework/beans/factory/")
+            && !class_name.starts_with("org/springframework/beans/factory/support/")
+            && !package_allowed("org/springframework/beans/factory/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
     }
 
     None

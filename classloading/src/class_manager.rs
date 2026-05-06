@@ -1244,6 +1244,22 @@ impl ClassManager {
                 // Parse and register with the loader that found it
                 self.define_class(name, &bytes, loader_id)
             }
+            Err(_) if is_jboss_logging_locale_lookup(name) => {
+                // S-trinity #3: JBoss Logging i18n probes locale-specific
+                // implementation classes (`_$logger_<locale>` /
+                // `_$bundle_<locale>`) inside a try/catch
+                // (ClassNotFoundException) and falls back to the locale-less
+                // `_$logger` / `_$bundle` when the probe fails. Our
+                // `is_jdk_class("org/jboss/...")` returns true for these
+                // names, so without this branch we would synthesize a stub
+                // — and `create_synthetic_stub`'s heuristic flags any
+                // name containing `$` as an interface, which then fails
+                // `Class.asSubclass(ServerLogger.class)` with a CCE that
+                // escapes the JBoss-Logging CNFE catch.
+                Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                    class_name: name.to_string(),
+                }))
+            }
             Err(_) if is_jdk_class(name) => {
                 // JDK class not found as a .class file — create a synthetic stub.
                 // Our VM handles JDK classes natively, so we just need a minimal
@@ -2800,7 +2816,20 @@ impl ClassManager {
         let iface_names = jdk_interfaces(name).to_vec();
 
         let id = self.class_store.next_id();
-        let access_flags = if name.contains("$") || name.ends_with("able") {
+        // S-trinity #1: the `$`-name-as-interface heuristic misclassifies
+        // concrete inner classes. Carve out the JDK loader chain
+        // (`ClassLoaders$AppClassLoader` etc.) which is concrete; without
+        // this exception, `alloc_classloader` produces objects whose
+        // class chain has the INTERFACE bit set, and downstream
+        // `(ClassLoader) priv.run()` checkcasts fail.
+        let is_concrete_dollar_class = matches!(
+            name,
+            "jdk/internal/loader/ClassLoaders$AppClassLoader"
+                | "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
+        );
+        let access_flags = if (name.contains("$") && !is_concrete_dollar_class)
+            || name.ends_with("able")
+        {
             // Likely an interface (Serializable, Comparable, Iterable, etc.)
             ClassAccessFlags::PUBLIC | ClassAccessFlags::INTERFACE | ClassAccessFlags::ABSTRACT
         } else {
@@ -3332,6 +3361,26 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl" =>
             "java/util/concurrent/atomic/AtomicLongFieldUpdater",
 
+        // ---- S-trinity #1: jdk.internal.loader ClassLoader chain.
+        // Without these the synthetic-stub for `ClassLoaders$AppClassLoader`
+        // / `ClassLoaders$PlatformClassLoader` defaults to `java/lang/Object`
+        // as superclass (and worse, the `$` in the name flips the
+        // access-flags heuristic at `class_manager.rs:2803` to mark them
+        // as interfaces). Both effects break
+        // `(ClassLoader) priv.run()` checkcasts in callers like
+        // `LoaderUtil.getClassLoader` because our app-loader instances
+        // (allocated by `alloc_classloader` with class
+        // `jdk/internal/loader/ClassLoaders$AppClassLoader`) end up not
+        // being recognised as a `ClassLoader`.
+        "jdk/internal/loader/ClassLoaders$AppClassLoader"
+        | "jdk/internal/loader/ClassLoaders$PlatformClassLoader" =>
+            "jdk/internal/loader/BuiltinClassLoader",
+        "jdk/internal/loader/BuiltinClassLoader" =>
+            "java/security/SecureClassLoader",
+        "java/security/SecureClassLoader" => "java/lang/ClassLoader",
+        "java/net/URLClassLoader" => "java/security/SecureClassLoader",
+        "java/lang/ClassLoader" => "java/lang/Object",
+
         // Default: everything else extends Object
         _ => "java/lang/Object",
     }
@@ -3424,6 +3473,34 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/lang/annotation/AnnotationProxy" => &["java/lang/annotation/Annotation"],
         _ => &[],
     }
+}
+
+/// Detect JBoss-Logging i18n locale-suffix probes (`_$logger_<locale>` /
+/// `_$bundle_<locale>`).
+///
+/// `Logger.doGetMessageLogger` walks a chain of generated implementation
+/// class names — most-specific locale variant down to the locale-less
+/// `_$logger` / `_$bundle` shipped in the JAR — wrapping each
+/// `Lookup.findClass` in a `try/catch (ClassNotFoundException)`. The
+/// locale-suffixed variants are *intentionally absent*; the catch is the
+/// signal to try the next variant. Without this special-case, our
+/// `is_jdk_class("org/jboss/...")` synthetic-stub fallback would succeed
+/// and the heuristic in `create_synthetic_stub` (treating any `$`-bearing
+/// name as an interface) leads to a `Class.asSubclass` CCE that escapes
+/// the caller's CNFE catch.
+fn is_jboss_logging_locale_lookup(name: &str) -> bool {
+    let suffix_start = name
+        .rfind("_$logger_")
+        .map(|i| i + "_$logger_".len())
+        .or_else(|| name.rfind("_$bundle_").map(|i| i + "_$bundle_".len()));
+    let Some(start) = suffix_start else {
+        return false;
+    };
+    let suffix = &name[start..];
+    !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Check if a class name belongs to the JDK (should get a synthetic stub

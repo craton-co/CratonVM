@@ -1582,6 +1582,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register(url, "toString", "()Ljava/lang/String;", url_to_string);
     r.register(url, "toExternalForm", "()Ljava/lang/String;", url_to_string);
 
+    // S111r18: URL.getDefaultPort() — JDK 25 reads `handler.getDefaultPort()`
+    // (URL.java:1015) which NPEs because synthetic URLs (alloc_url, real-JDK
+    // URL ctors) never populate the `handler` field. Per-protocol defaults
+    // match what URLStreamHandler subclasses report; this bypasses the null
+    // handler deref entirely. Spring's CandidateComponentsIndexLoader →
+    // LaunchedURLClassLoader$UseFastConnectionExceptionsEnumeration →
+    // URLClassPath.getLoader → URLUtil.urlNoFragString → getDefaultPort
+    // chain (scag-auth + sister jars) hit this NPE.
+    r.register(url, "getDefaultPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Read the protocol field (slot 0 in our synthetic URL layout).
+        let protocol = read_field_string_or(ctx, this, 0, "");
+        let port = match protocol.as_str() {
+            "http" => 80,
+            "https" => 443,
+            "ftp" => 21,
+            "gopher" => 70,
+            // file/jar/jrt/classpath/nested/etc. → -1 per JDK URLStreamHandler
+            _ => -1i32,
+        };
+        Ok(Some(Value::Int(port)))
+    });
+
     r.register(url, "openStream", "()Ljava/io/InputStream;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Prefer our synthetic "full URL" slots (field 5, then field 0),
