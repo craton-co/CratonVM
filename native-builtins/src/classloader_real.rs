@@ -151,6 +151,43 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Int(1))),
     );
 
+    // S111r9 — SecureClassLoader.<clinit> override.
+    //
+    // The real-JDK bytecode for `java/security/SecureClassLoader.<clinit>` is
+    // a single `invokestatic ClassLoader.registerAsParallelCapable(); pop;
+    // return` and should always succeed (our `registerAsParallelCapable`
+    // native returns 1). However, when this `<clinit>` runs as part of the
+    // singleton AppClassLoader allocation chain (`alloc_concurrent_synthetic`
+    // for `ClassLoaders$AppClassLoader` triggers the `ClassLoader →
+    // SecureClassLoader → BuiltinClassLoader → AppClassLoader` superclass
+    // init walk), an `IllegalStateException` gets attributed to it whose
+    // cause is `IOException("Unable to find ZIP central directory records
+    // after reading 65557 bytes")` — Spring Boot Loader's
+    // `CentralDirectoryEndRecord` error wrapped by
+    // `ExecutableArchiveLauncher.<init>`. The exception is constructed by
+    // Java code that runs LATER in the boot but the ObjectRef leaks back
+    // through the dispatch path during the first SCL <clinit>, defeating
+    // the swallow's Initialized state and breaking the rest of the
+    // ClassLoader chain (manifests as `Comparable.loadClass` NSME at the
+    // app's MainMethodRunner.run dispatch).
+    //
+    // Bypass the bytecode entirely with a no-op native — the only side
+    // effect of the original bytecode is `registerAsParallelCapable()` which
+    // we already make a no-op via the native above. Writing this override
+    // means the SCL <clinit> never enters the interpreter, never goes
+    // through the corrupt dispatch path, and always succeeds. The class
+    // state transitions cleanly to Initialized and the `URLClassLoader →
+    // BuiltinClassLoader → AppClassLoader` chain initialises end-to-end,
+    // unblocking real-app classloader dispatch (Spring Boot 2 fat-jar
+    // launcher's `LaunchedURLClassLoader.loadClass`, Spring Cloud Gateway
+    // demo, sister jars).
+    r.register(
+        "java/security/SecureClassLoader",
+        "<clinit>",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+
     // ClassLoader.loadClass(String) — delegate to VM class loading
     r.register(
         cl,

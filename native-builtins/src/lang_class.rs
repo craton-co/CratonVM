@@ -218,6 +218,53 @@ fn check_reflection_module_access(
         // internals. Allow; we are not invoked from Java code.
         None => return Ok(()),
     };
+    // JDK-internal callers (java.base classes performing reflection on
+    // their own private types — e.g. `StackStreamFactory$StackFrameBuffer.fill`
+    // constructing `StackFrameInfo` via `Constructor.newInstance`) must not
+    // be subject to the unnamed-module check. Our class loader does not
+    // always populate `module_name` for JDK inner classes, so the
+    // same-module rule (rule 1) misses and the check falls through to
+    // "module java.base does not opens java.lang to unnamed module".
+    // The accessor's *package*, not its module assignment, is the reliable
+    // signal that we are running JDK-internal code; trust it and skip.
+    if let Some(name) = ctx.class_name_of_id(accessor_cid) {
+        if name.starts_with("java/")
+            || name.starts_with("jdk/")
+            || name.starts_with("sun/")
+            || name.starts_with("com/sun/")
+        {
+            return Ok(());
+        }
+    }
+    // Second escape hatch — JDK-internal reflection driven from user code.
+    //
+    // The JDK reflectively constructs its own private types from inside
+    // boot-path machinery (e.g. `StackStreamFactory$StackFrameBuffer.fill`
+    // calling `Constructor.newInstance` to build `StackFrameInfo` while a
+    // user-code `StackWalker.walk(...)` is in progress). Our interpreter
+    // lacks a complete view of those nested JDK frames — `capture_stack_trace`
+    // sees only the outermost user frame (typically the SB3 launcher) — so
+    // the caller-class-based whitelist above misses and the call gets
+    // rejected as if user code were attempting deep reflection on
+    // encapsulated JDK internals.
+    //
+    // Use the *target class name* as a fallback signal: if the type being
+    // constructed is a JDK-internal type that user code does not normally
+    // instantiate directly (java.lang internal stack-walker frames,
+    // jdk.internal.* private impls, sun.* private impls), treat the access
+    // as JDK-mediated and allow it. This matches HotSpot's
+    // `Module.implAddOpensToAllUnnamed` behaviour for boot modules and the
+    // self-opening semantics of `java.base` for its own packages.
+    if target_class_name.starts_with("jdk/internal/")
+        || target_class_name.starts_with("sun/")
+        || target_class_name.starts_with("com/sun/")
+        || target_class_name.starts_with("java/lang/StackFrame")
+        || target_class_name.starts_with("java/lang/ClassFrame")
+        || target_class_name.starts_with("java/lang/StackStreamFactory")
+        || target_class_name.starts_with("java/lang/Module")
+    {
+        return Ok(());
+    }
     ctx.check_deep_reflection_access(accessor_cid, target_cid)
 }
 
@@ -639,7 +686,22 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 }
                 .into())
             }
-            // Propagate exceptions thrown by the classloader (CNFE,
+            // S111r12 — NSME on `loader.loadClass` rescue. Spring Boot 2's
+            // SB2 launcher path delivers a `LaunchedURLClassLoader`
+            // instance whose `class_id_of` returns `java/lang/Comparable`
+            // (the loader inherited that stub class_id somewhere in the
+            // boot chain). The receiver-driven virtual dispatch then
+            // resolves to `Comparable.loadClass` and raises NSME.
+            // Fall back to bootstrap-style class loading so the
+            // `Class.forName(name, init, loader)` chain still resolves.
+            Err(rustjvm_types::error::MethodCallFailed::InternalError(
+                rustjvm_types::error::VmError::Linkage(
+                    rustjvm_types::error::LinkageError::NoSuchMethodError { .. },
+                ),
+            )) => {
+                // Fall through to bootstrap-style ensure_class_initialized below.
+            }
+            // Propagate other exceptions thrown by the classloader (CNFE,
             // LinkageError, etc.) without re-wrapping.
             Err(e) => return Err(e),
         }
@@ -762,9 +824,163 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
         None => return Ok(Some(Value::Int(0))),
     };
     let target_class_id = ctx.class_id_of_object(target);
+
+    // S111r17 — Array-aware isInstance.  Heap-stored `class_id_of` for an
+    // array returns the COMPONENT class id (e.g. `java/lang/Class` for a
+    // `Class[]` array), NOT the synthetic `[Lcomponent;` array class id.
+    // Without this branch, `Class[].isInstance(myClassArray)` reduces to
+    // `is_subclass(java/lang/Class, [Ljava/lang/Class;)` which is always
+    // false — the same bug that the interpreter's `instanceof` bytecode
+    // already works around in `array_descriptor_of` /
+    // `array_is_assignable_to`.  Mirror that logic here so reflection
+    // callers (Spring's `TypeMappedAnnotation.adapt`, which throws
+    // `IllegalArgumentException` when `type.isInstance(value)` returns
+    // false for a wrapped attribute array) see consistent results.
+    let target_is_array = ctx.heap_kind_of(target) == rustjvm_types::ObjectKind::Array;
+    if target_is_array {
+        let src_desc = array_descriptor_for(ctx, target);
+        let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+        if array_is_assignable(ctx, &src_desc, &this_name) {
+            return Ok(Some(Value::Int(1)));
+        }
+        // Fall through to legacy id-based check below (covers some
+        // edge cases where the target is an array but the type mirror
+        // is a non-array Class — those reduce to assignable-to-Object
+        // via `array_is_assignable` already, so this is just defensive).
+    }
+
+    // Annotation proxy special case: our `create_annotation_proxy` allocates
+    // objects of class `java/lang/annotation/AnnotationProxy`, not of the
+    // actual annotation interface. JDK reflection and Spring's
+    // `AttributeMethods.assertAnnotation` do `annotationType.isInstance(ann)`
+    // which would otherwise return false (proxy class doesn't extend / implement
+    // the user-declared annotation interface), driving Spring into
+    // `Assert.instanceCheckFailed` and an unrelated NPE during message
+    // formatting. Read `ANN_PROXY_TYPE_MIRROR` (slot 1) and treat the proxy
+    // as an instance of the recorded annotation type (and any of its
+    // super-interfaces, including `java.lang.annotation.Annotation`).
+    if let Some(target_name) = ctx.class_name_of_id(target_class_id) {
+        if target_name == "java/lang/annotation/AnnotationProxy" {
+            if let Value::Object(Some(type_mirror)) = ctx.get_field(target, ANN_PROXY_TYPE_MIRROR) {
+                if let Some(ann_cid) = mirror_class_id(ctx, type_mirror) {
+                    let proxy_matches = ann_cid == this_class_id
+                        || ctx.is_subclass(ann_cid, this_class_id);
+                    if proxy_matches {
+                        return Ok(Some(Value::Int(1)));
+                    }
+                    // Always treat proxies as instances of `Annotation`
+                    // itself, even if the type-mirror class graph doesn't
+                    // record the implements-edge yet.
+                    if let Some(this_name) = ctx.class_name_of_id(this_class_id) {
+                        if this_name == "java/lang/annotation/Annotation" {
+                            return Ok(Some(Value::Int(1)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let result =
         target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
+}
+
+/// S111r17 — Build the JVMS array descriptor (e.g. `[Ljava/lang/Class;`,
+/// `[I`, `[[Ljava/lang/String;`) for an array heap object.  Mirrors the
+/// interpreter's `array_descriptor_of` (vm/src/runtime/interpreter.rs)
+/// but lives in NativeContext-land so reflection natives can use it.
+fn array_descriptor_for(ctx: &dyn NativeContext, obj: rustjvm_types::ObjectRef) -> String {
+    use rustjvm_types::ArrayElementType;
+    let et = ctx.heap_element_type_of(obj);
+    match et {
+        ArrayElementType::Boolean => "[Z".to_string(),
+        ArrayElementType::Char => "[C".to_string(),
+        ArrayElementType::Float => "[F".to_string(),
+        ArrayElementType::Double => "[D".to_string(),
+        ArrayElementType::Byte => "[B".to_string(),
+        ArrayElementType::Short => "[S".to_string(),
+        ArrayElementType::Int => "[I".to_string(),
+        ArrayElementType::Long => "[J".to_string(),
+        ArrayElementType::Reference => {
+            let comp_id = ctx.class_id_of_object(obj);
+            let comp_name = ctx.class_name_of_id(comp_id).unwrap_or_default();
+            if comp_name.is_empty() {
+                "[Ljava/lang/Object;".to_string()
+            } else if comp_name.starts_with('[') {
+                format!("[{}", comp_name)
+            } else {
+                format!("[L{};", comp_name)
+            }
+        }
+    }
+}
+
+/// S111r17 — Recursive array assignability check, mirroring the
+/// interpreter's `array_is_assignable_to`.  `target_name` is a
+/// "raw" class name (slash-separated, no `L...;` wrapping for
+/// non-array types) — matches what `mirror_class_name` returns.
+fn array_is_assignable(ctx: &dyn NativeContext, src_desc: &str, target_name: &str) -> bool {
+    if target_name == "java/lang/Object"
+        || target_name == "java/io/Serializable"
+        || target_name == "java/lang/Cloneable"
+    {
+        return true;
+    }
+    if !target_name.starts_with('[') {
+        return false;
+    }
+    if src_desc == target_name {
+        return true;
+    }
+    let src_rest = &src_desc[1..];
+    let tgt_rest = &target_name[1..];
+    if src_rest.len() == 1 && "ZCBSIJFD".contains(&src_rest[..1]) {
+        return src_rest == tgt_rest;
+    }
+    if tgt_rest.len() == 1 && "ZCBSIJFD".contains(&tgt_rest[..1]) {
+        return false;
+    }
+    let extract = |desc: &str| -> Option<(bool, String)> {
+        if desc.starts_with('[') {
+            Some((true, desc.to_string()))
+        } else if desc.starts_with('L') && desc.ends_with(';') {
+            Some((false, desc[1..desc.len() - 1].to_string()))
+        } else {
+            None
+        }
+    };
+    let (src_is_arr, src_comp) = match extract(src_rest) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (tgt_is_arr, tgt_comp) = match extract(tgt_rest) {
+        Some(x) => x,
+        None => return false,
+    };
+    if src_is_arr && tgt_is_arr {
+        return array_is_assignable(ctx, &src_comp, &tgt_comp);
+    }
+    if src_is_arr != tgt_is_arr {
+        if !src_is_arr {
+            return false;
+        }
+        return tgt_comp == "java/lang/Object"
+            || tgt_comp == "java/io/Serializable"
+            || tgt_comp == "java/lang/Cloneable";
+    }
+    if src_comp == "java/lang/Object" {
+        return true;
+    }
+    let src_id = match ctx.class_id_by_name(&src_comp) {
+        Some(id) => id,
+        None => return false,
+    };
+    let tgt_id = match ctx.class_id_by_name(&tgt_comp) {
+        Some(id) => id,
+        None => return false,
+    };
+    src_id == tgt_id || ctx.is_subclass(src_id, tgt_id)
 }
 
 pub(crate) fn native_class_is_assignable_from(
@@ -784,6 +1000,52 @@ pub(crate) fn native_class_is_assignable_from(
             .into())
         }
     };
+
+    // S111r17 — Array-aware isAssignableFrom.  Same root cause as
+    // `native_class_is_instance` above: when `this` represents an array
+    // Class (descriptor like `[Lfoo;` recoverable from the mirror's
+    // name field) and `other` represents an array Class, the simple
+    // `is_subclass` walk doesn't traverse JVM-level array covariance
+    // (e.g. `String[] -> Object[]`, `AnnotationProxy[] ->
+    // Annotation[]`).  Reuse the same descriptor / assignability
+    // helpers we added for `isInstance`.  Spring 5.x's
+    // `Assert.isAssignable(supertype, subtype)` is the visible caller
+    // — it throws `IllegalArgumentException` from
+    // `assignableCheckFailed` when this returns false, masking the
+    // underlying type-system gap.
+    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    let other_name = mirror_class_name(ctx, other).unwrap_or_default();
+    if this_name.starts_with('[') || other_name.starts_with('[') {
+        // Build descriptors. Non-array Class mirrors get an `L...;`
+        // wrap to match the array_is_assignable contract; array
+        // mirrors keep their leading `[`.
+        let to_desc = |n: &str| -> String {
+            if n.starts_with('[') {
+                n.to_string()
+            } else if n.is_empty() {
+                "Ljava/lang/Object;".to_string()
+            } else {
+                format!("L{};", n)
+            }
+        };
+        let other_desc = to_desc(&other_name);
+        let this_desc = to_desc(&this_name);
+        // For arrays, dispatch to array_is_assignable (which expects
+        // a target that may be an array name, raw class name, or
+        // Object/Serializable/Cloneable). Pass other's full descriptor
+        // as src and this's name (NOT descriptor) as target.
+        if other_desc.starts_with('[') && array_is_assignable(ctx, &other_desc, &this_name) {
+            return Ok(Some(Value::Int(1)));
+        }
+        if this_desc.starts_with('[') && other_desc == this_desc {
+            return Ok(Some(Value::Int(1)));
+        }
+        // Fall through to id-based check below for non-array vs array
+        // mismatches (e.g. `String.class.isAssignableFrom(stringArray.class)`
+        // → false, handled by the legacy is_subclass which always
+        // returns false for these).
+    }
+
     let this_class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => return Ok(Some(Value::Int(0))),
@@ -1018,6 +1280,13 @@ fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> rustjvm_ty
 /// e.g. "(ILjava/lang/String;)V" → (["I", "Ljava/lang/String;"], "V")
 pub(crate) fn parse_descriptor_param_and_return(desc: &str) -> (Vec<String>, String) {
     let mut params = Vec::new();
+    // Tolerant: an empty / malformed descriptor (no leading `(`) yields an
+    // empty param list and `"V"` return — the same shape Spring's
+    // `SerializableTypeWrapper` proxy handler expects when it has no
+    // descriptor cached for an internally-synthesised method.
+    if desc.is_empty() || !desc.starts_with('(') {
+        return (params, "V".to_string());
+    }
     let inner = &desc[1..]; // skip '('
     let mut i = 0;
     let bytes = inner.as_bytes();
@@ -4562,15 +4831,40 @@ fn create_annotation_proxy(
         }
     }
 
-    // Collect explicit elements
-    let mut all_elements: Vec<(String, rustjvm_native_api::AnnotationElementValue)> =
-        ann.elements.clone();
+    // Collect explicit elements with their declared return-type descriptor
+    // (read from the annotation interface's abstract method, when available).
+    // The descriptor is used as a fallback hint when the element value is an
+    // EMPTY array — we'd otherwise pick `java/lang/Object` as the component
+    // class, which trips Spring's `AnnotationUtils.adaptValue` into treating
+    // the array as `Annotation[]` (under the lenient `Object` fallback in
+    // `array_is_assignable`) and converts the empty `Object[]` into an empty
+    // `AnnotationAttributes[]`.  That collapse later surfaces as
+    // `IllegalArgumentException` in `AnnotationAttributes.assertAttributeType`
+    // on `getStringArray("pattern")` for `@ComponentScan.Filter` (S111r19).
+    let mut all_elements: Vec<(
+        String,
+        rustjvm_native_api::AnnotationElementValue,
+        Option<String>,
+    )> = ann
+        .elements
+        .iter()
+        .map(|(n, v)| (n.clone(), v.clone(), None))
+        .collect();
 
     // Fill in AnnotationDefault values for missing elements
     if let Some(ann_cid) = ann_class_id_opt {
         let methods = ctx.declared_methods(ann_cid);
         let explicit_names: std::collections::HashSet<String> =
-            all_elements.iter().map(|(n, _)| n.clone()).collect();
+            all_elements.iter().map(|(n, _, _)| n.clone()).collect();
+        // For explicit elements, also backfill the return-type descriptor
+        // so empty arrays carry the right component hint.
+        for (name, _, desc_slot) in all_elements.iter_mut() {
+            if let Some(m) = methods.iter().find(|m| &m.name == name) {
+                if let Some(ret) = m.descriptor.strip_prefix("()") {
+                    *desc_slot = Some(ret.to_string());
+                }
+            }
+        }
         for m in &methods {
             // Annotation elements are abstract no-arg methods
             if explicit_names.contains(&m.name) {
@@ -4581,7 +4875,8 @@ fn create_annotation_proxy(
                 continue;
             }
             if let Some(default_val) = ctx.method_annotation_default(ann_cid, &m.name, &m.descriptor) {
-                all_elements.push((m.name.clone(), default_val));
+                let ret_desc = m.descriptor.strip_prefix("()").map(|s| s.to_string());
+                all_elements.push((m.name.clone(), default_val, ret_desc));
             }
         }
     }
@@ -4590,10 +4885,11 @@ fn create_annotation_proxy(
     let n = all_elements.len();
     let names_arr = ctx.new_ref_array(ClassId::new(0), n);
     let values_arr = ctx.new_ref_array(ClassId::new(0), n);
-    for (i, (name, val)) in all_elements.iter().enumerate() {
+    for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
-        let java_val = annotation_element_to_java(ctx, val);
+        let java_val =
+            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref());
         ctx.set_array_element(values_arr, i, java_val);
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
@@ -4608,9 +4904,25 @@ fn create_annotation_proxy(
 /// them as wrappers and compare by underlying value, and so the proxy's
 /// element accessor methods return wrappers that pass downstream
 /// `instanceof Integer` checks.
-fn annotation_element_to_java(
+pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &rustjvm_native_api::AnnotationElementValue,
+) -> Value {
+    annotation_element_to_java_typed(ctx, val, None)
+}
+
+/// S111r19 — typed variant: when called for a known annotation-element method,
+/// the caller passes the method's return-type descriptor (e.g.
+/// `[Ljava/lang/String;`).  Used to recover the array component class for
+/// **empty** array values, which would otherwise default to
+/// `java/lang/Object` and trip Spring's `AnnotationUtils.adaptValue` into
+/// converting the empty `Object[]` to an empty `AnnotationAttributes[]`
+/// (because our `array_is_assignable` lenient `Object` fallback green-lights
+/// `Annotation[].isInstance(Object[])`).
+pub(crate) fn annotation_element_to_java_typed(
+    ctx: &mut dyn NativeContext,
+    val: &rustjvm_native_api::AnnotationElementValue,
+    return_type_desc: Option<&str>,
 ) -> Value {
     use rustjvm_native_api::AnnotationElementValue;
     match val {
@@ -4645,8 +4957,23 @@ fn annotation_element_to_java(
                 .strip_prefix('L')
                 .and_then(|s| s.strip_suffix(';'))
                 .unwrap_or(type_desc);
-            // Try Enum.valueOf(Class, String) via invoke to get the real constant
-            if let Some(enum_cid) = ctx.class_id_by_name(class_name) {
+            // S111r19 — load the enum class on demand if not yet loaded.
+            // Annotation proxies are materialised eagerly during the
+            // declaring class's load, but the enum class referenced by the
+            // annotation's element values (e.g. `FilterType` in
+            // `@ComponentScan.Filter.type`) often is **not** yet loaded.
+            // Previously we fell straight through to the synthetic fallback
+            // which writes ordinal=0 — collapsing `FilterType.CUSTOM`
+            // (real ordinal 4) onto `ANNOTATION` (ordinal 0) and sending
+            // Spring's `ComponentScanAnnotationParser.typeFiltersFor` into
+            // the wrong switch case, surfacing as `IllegalArgumentException`
+            // wrapped at `ConfigurationClassParser.parse:181`.  Load the
+            // class on demand, mirroring the sibling `Class` arm (C29).
+            let enum_cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
+                let _ = ctx.load_class(class_name);
+                ctx.class_id_by_name(class_name)
+            });
+            if let Some(enum_cid) = enum_cid_opt {
                 let class_mirror = ctx.get_class_mirror(enum_cid);
                 let name_str = ctx.create_string(const_name);
                 if let Ok(Some(val)) = ctx.invoke(
@@ -4686,7 +5013,107 @@ fn annotation_element_to_java(
             Value::Object(Some(proxy))
         }
         AnnotationElementValue::Array(elems) => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), elems.len());
+            // Pick a component class for the array based on the element kind so
+            // downstream `instanceof "[Lfoo;"` checks correctly distinguish
+            // between e.g. `String[]` and `Annotation[]`. Spring's
+            // `AnnotationUtils.adaptValue` runs an `instanceof
+            // "[Ljava/lang/annotation/Annotation;"` chain — if the array's
+            // component class is bare `Object` (cid=0), the lenient
+            // assignability fallback in `array_is_assignable_to`
+            // (interpreter.rs `if src_comp == "java/lang/Object" { return
+            // true; }`) green-lights the cast and a `String[]` flows into the
+            // `Annotation[]` branch, eventually surfacing as
+            // `String.annotationType()` NSME inside
+            // `retrieveAnnotationAttributes`.
+            //
+            // Pick by inspecting the first element variant — annotation
+            // attribute arrays are homogeneous per JLS §9.6.1.
+            //
+            // S111r18 — for nested-annotation arrays, use the annotation
+            // interface type (e.g. `F4` for `@CScan(excludeFilters=@F4...)`)
+            // as the component class, NOT the bare `AnnotationProxy` synthetic.
+            // Spring's `MergedAnnotation.adaptForAttribute` walks
+            // `returnType.componentType().isAnnotation()` — when our array
+            // reports its component as `AnnotationProxy` (which is
+            // `isAnnotation()=false`), the adapt-array branch is taken on
+            // returnType but the receiving array allocation in the same
+            // method later fails its checkcast / isInstance check, and the
+            // built `MergedAnnotation[]` collapses into a single-element
+            // value path that surfaces in `AnnotationAttributes` as
+            // `[null]`. Routing the component class to the actual annotation
+            // interface (F4) makes the array's `componentType()` report
+            // `F4.class`, which `isAnnotation()` returns `true` for, and the
+            // synthesize loop then runs as expected.
+            use rustjvm_native_api::AnnotationElementValue as AEV;
+            // S111r19 — when the array is **empty** (no first element to
+            // probe), fall back to the caller-provided method return-type
+            // descriptor.  This recovers the right component class for
+            // empty `String[]` / `Class[]` defaults like `@Filter.pattern()`
+            // = `{}`, which would otherwise become an `Object[]` and trip
+            // Spring's `AnnotationUtils.adaptValue` Annotation[]-detection
+            // (the lenient `Object` fallback in `array_is_assignable`).
+            let comp_name_owned: String = match elems.first() {
+                Some(AEV::StringVal(_)) => "java/lang/String".to_string(),
+                Some(AEV::Class(_)) => "java/lang/Class".to_string(),
+                Some(AEV::Annotation(nested)) => annotation_desc_to_class_name(
+                    &nested.type_descriptor,
+                )
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "java/lang/annotation/AnnotationProxy".to_string()),
+                Some(AEV::Enum(type_desc, _)) => type_desc
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                    .unwrap_or("java/lang/Enum")
+                    .to_string(),
+                // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
+                // are still allocated as boxed wrapper arrays here per
+                // pre-existing behaviour — pick the wrapper class.
+                Some(AEV::Int(_)) => "java/lang/Integer".to_string(),
+                Some(AEV::Long(_)) => "java/lang/Long".to_string(),
+                Some(AEV::Float(_)) => "java/lang/Float".to_string(),
+                Some(AEV::Double(_)) => "java/lang/Double".to_string(),
+                None => {
+                    // Empty array — derive component from method return type.
+                    if let Some(rd) = return_type_desc {
+                        if let Some(comp) = rd.strip_prefix('[') {
+                            if let Some(stripped) =
+                                comp.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                stripped.to_string()
+                            } else if comp.len() == 1 && "ZBCSIJFD".contains(&comp[..1]) {
+                                // Empty primitive array — boxed wrapper
+                                // (matches the non-empty primitive arms).
+                                match &comp[..1] {
+                                    "Z" => "java/lang/Boolean".to_string(),
+                                    "B" => "java/lang/Byte".to_string(),
+                                    "C" => "java/lang/Character".to_string(),
+                                    "S" => "java/lang/Short".to_string(),
+                                    "I" => "java/lang/Integer".to_string(),
+                                    "J" => "java/lang/Long".to_string(),
+                                    "F" => "java/lang/Float".to_string(),
+                                    "D" => "java/lang/Double".to_string(),
+                                    _ => "java/lang/Object".to_string(),
+                                }
+                            } else {
+                                "java/lang/Object".to_string()
+                            }
+                        } else {
+                            "java/lang/Object".to_string()
+                        }
+                    } else {
+                        "java/lang/Object".to_string()
+                    }
+                }
+                _ => "java/lang/Object".to_string(),
+            };
+            let comp_cid = ctx
+                .class_id_by_name(&comp_name_owned)
+                .or_else(|| {
+                    let _ = ctx.load_class(&comp_name_owned);
+                    ctx.class_id_by_name(&comp_name_owned)
+                })
+                .unwrap_or(rustjvm_types::ClassId::new(0));
+            let arr = ctx.new_ref_array(comp_cid, elems.len());
             for (i, elem) in elems.iter().enumerate() {
                 let v = annotation_element_to_java(ctx, elem);
                 ctx.set_array_element(arr, i, v);
@@ -5054,7 +5481,7 @@ pub(crate) fn field_class_and_name(
 }
 
 /// Helper: extract declaring class ID, method name, and descriptor from a Method reflection object.
-fn method_class_name_desc(
+pub(crate) fn method_class_name_desc(
     ctx: &dyn NativeContext,
     method_obj: ObjectRef,
 ) -> Option<(ClassId, String, String)> {
@@ -5825,22 +6252,67 @@ pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &
 
 /// Read a manifest attribute by name from the class's source jar, if any.
 /// Returns `None` for classes loaded from a directory or the boot path.
+///
+/// Supports three CodeSource URL forms:
+///   * `file:/C:/.../foo.jar`                              — plain jar
+///   * `jar:file:/C:/.../outer.jar!/BOOT-INF/lib/inner.jar!/` — Spring Boot 2.x
+///   * `jar:nested:/C:/.../outer.jar/!BOOT-INF/lib/inner.jar!/` — Spring Boot 3.x
+///
+/// For the nested forms, opens the outer jar, extracts the inner jar entry
+/// to a byte buffer, reads `META-INF/MANIFEST.MF` from the inner zip, and
+/// parses out the requested attribute. This is what unblocks
+/// `SpringBootVersion.class.getPackage().getImplementationVersion()` for
+/// Spring Boot fat-jar deployments where the class lives in a nested jar.
 fn t19_h10_class_manifest_attr(
     ctx: &mut dyn NativeContext,
     class_id: rustjvm_types::ClassId,
     attr: &str,
 ) -> Option<String> {
     let url = ctx.class_code_base(class_id)?;
-    // The CodeSource URL is the jar that holds the class, e.g.
-    // `file:/C:/.../org.keycloak.keycloak-common-26.2.4.jar`.
-    // Strip the `file:` prefix and percent-decoding so we can hand the path
-    // to the same manifest reader the launcher uses.
+
+    // Spring Boot nested-jar handling.
+    // 2.x: `jar:file:/<outer>!/BOOT-INF/lib/<inner>.jar!/`
+    // 3.x: `jar:nested:/<outer>/!BOOT-INF/lib/<inner>.jar!/`
+    if let Some(rest) = url
+        .strip_prefix("jar:file:")
+        .or_else(|| url.strip_prefix("jar:nested:"))
+    {
+        // Split on the first `!/` (or `/!` for 3.x's `nested:` form which
+        // separates the outer-jar path from the inner entry with `/!`).
+        let (outer_part, inner_part) = if let Some(idx) = rest.find("!/") {
+            (&rest[..idx], &rest[idx + 2..])
+        } else if let Some(idx) = rest.find("/!") {
+            (&rest[..idx], &rest[idx + 2..])
+        } else {
+            ("", "")
+        };
+        if !outer_part.is_empty() && !inner_part.is_empty() {
+            // Strip trailing `!/` from inner, then split inner on first `!/`
+            // (some forms include a trailing entry-name section).
+            let inner_entry = inner_part
+                .trim_end_matches('/')
+                .trim_end_matches('!')
+                .trim_end_matches('/');
+            // Strip leading slashes from outer path; keep the rest as a path.
+            let outer_path = outer_part.trim_start_matches('/');
+            let outer_pb = if cfg!(windows) {
+                std::path::PathBuf::from(outer_path)
+            } else {
+                std::path::PathBuf::from(format!("/{}", outer_path))
+            };
+            if outer_pb.is_file() {
+                if let Some(val) = nested_jar_manifest_attr(&outer_pb, inner_entry, attr) {
+                    return Some(val);
+                }
+            }
+        }
+        // Fall through to None if the nested form failed to resolve.
+        return None;
+    }
+
+    // Plain `file:` URL (single jar).
     let path = url.strip_prefix("file:").unwrap_or(&url);
     let path = path.trim_start_matches('/');
-    // On Windows, the URL form is `file:/C:/...`; without the prefix we
-    // get `C:/...`, which is already a valid path. On POSIX, stripping a
-    // single leading `/` would break absolute paths — re-add it for the
-    // POSIX case.
     let path = if cfg!(windows) {
         std::path::PathBuf::from(path)
     } else {
@@ -5851,6 +6323,45 @@ fn t19_h10_class_manifest_attr(
     }
     let manifest = rustjvm_classloading::ClassPath::read_jar_manifest(&path)?;
     manifest.attributes.get(attr).cloned()
+}
+
+/// Open the outer jar, extract the inner-jar entry into memory, and read
+/// the requested `META-INF/MANIFEST.MF` attribute from inside the inner jar.
+/// Returns `None` on any I/O / format failure (best-effort).
+fn nested_jar_manifest_attr(
+    outer_jar: &std::path::Path,
+    inner_entry: &str,
+    attr: &str,
+) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(outer_jar).ok()?;
+    let mut outer = zip::ZipArchive::new(file).ok()?;
+    // Inner entry path inside the outer zip — strip any leading `/`.
+    let entry_name = inner_entry.trim_start_matches('/');
+    let mut inner_bytes: Vec<u8> = Vec::new();
+    {
+        let mut entry = outer.by_name(entry_name).ok()?;
+        entry.read_to_end(&mut inner_bytes).ok()?;
+    }
+    // Spring Boot 2.x stores BOOT-INF/lib/*.jar uncompressed (STORED) so we
+    // can read it directly as a zip from the byte buffer.
+    let cursor = std::io::Cursor::new(inner_bytes);
+    let mut inner = zip::ZipArchive::new(cursor).ok()?;
+    let mut mf_str = String::new();
+    {
+        let mut mf = inner.by_name("META-INF/MANIFEST.MF").ok()?;
+        mf.read_to_string(&mut mf_str).ok()?;
+    }
+    // Parse MANIFEST.MF main attributes (no continuation-line handling for
+    // the simple `Implementation-Version: X.Y.Z` cases we care about).
+    for line in mf_str.lines() {
+        if let Some((k, v)) = line.split_once(": ") {
+            if k.trim().eq_ignore_ascii_case(attr) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Real `Class.getPackage()` native — returns a `java.lang.Package` mirror
@@ -6021,6 +6532,16 @@ pub(crate) fn i2_classloader_define_package_string_module(
 /// single-arg overload called by `Class.getPackage()`'s JDK Java body
 /// when the native override (registered separately for `Class.getPackage`)
 /// isn't taken.
+///
+/// Also populates the manifest-derived fields (`implementationTitle`,
+/// `implementationVersion`, `specification*`, `implementationVendor`) from
+/// the class's source jar — same data path as `native_class_get_package`.
+/// Without this, callers like `Foo.class.getPackage().getImplementationVersion()`
+/// in real-JDK mode see slot 5 = null (because real `Class.getPackage()`
+/// delegates here), even though the synthetic-jdk override correctly
+/// populated those fields. This caused Spring Boot 2.x to NPE in
+/// `SpringBootVersion.determineSpringBootVersion()` on the JarURLConnection
+/// fallback path.
 pub(crate) fn i2_classloader_define_package_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6039,7 +6560,35 @@ pub(crate) fn i2_classloader_define_package_class(
     } else {
         String::new()
     };
+    // Read manifest attributes (best-effort) from the class's source jar.
+    let (impl_title, impl_version, spec_title, spec_version, spec_vendor, impl_vendor) =
+        if let Some(class_id) = mirror_class_id(ctx, class_arg) {
+            (
+                t19_h10_class_manifest_attr(ctx, class_id, "Implementation-Title"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Implementation-Version"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Specification-Title"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Specification-Version"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Specification-Vendor"),
+                t19_h10_class_manifest_attr(ctx, class_id, "Implementation-Vendor"),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
+    let write_optional = |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
+        let obj = match val {
+            Some(s) => Value::Object(Some(ctx.create_string(&s))),
+            None => Value::Object(None),
+        };
+        ctx.set_field(pkg, slot, obj);
+        ctx.set_field_by_name(pkg, field, obj);
+    };
+    write_optional(ctx, 1, "specTitle", spec_title);
+    write_optional(ctx, 2, "specVersion", spec_version);
+    write_optional(ctx, 3, "specVendor", spec_vendor);
+    write_optional(ctx, 4, "implTitle", impl_title);
+    write_optional(ctx, 5, "implVersion", impl_version);
+    write_optional(ctx, 6, "implVendor", impl_vendor);
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -6202,6 +6751,80 @@ pub(crate) fn native_class_cast(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Simplified: just return the object (no type checking)
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
     Ok(Some(obj))
+}
+
+/// Native override for `java.lang.Class.getClassLoader()`.
+///
+/// JVM spec §5.3: classes loaded by the bootstrap loader return `null`,
+/// otherwise return the defining loader.  In CratonVM:
+///
+/// - Bootstrap classes (java/*, javax/*, jdk/*, sun/*, com/sun/*) → null.
+/// - Anything else (app classpath via `-c`, user-defined hidden classes,
+///   synthetic test fixtures, primitive-mirror lookups that arrive here) →
+///   the singleton application `ClassLoader` instance.  This must be
+///   non-null so callers like `commons-logging`'s
+///   `LogFactory.<clinit>` (which does
+///   `LogFactory.class.getClassLoader().loadClass(IMPL)`) don't NPE on
+///   the next `loadClass` invocation.
+///
+/// The fix lives in `register_essential_natives` (real-JDK mode); the
+/// JDK 25 bytecode for `Class.getClassLoader()` is just
+/// `getfield classLoader; areturn`, which would always read `null`
+/// (the field is never populated by VM-internal mirror creation).  The
+/// native dispatch path in `try_stackless_invoke` / `invoke_or_native`
+/// checks the registry first, so this override wins over the bytecode.
+pub(crate) fn native_class_get_class_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mirror = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Prefer the authoritative reverse map; fall back to the legacy
+    // slot-0 ClassId encoding for synthetic test fixtures.
+    let class_id_opt = ctx.class_id_from_mirror(mirror).or_else(|| {
+        if let Value::Int(v) = ctx.get_field(mirror, 0) {
+            if v > 0 {
+                return Some(rustjvm_types::ClassId::new(v as u32));
+            }
+        }
+        None
+    });
+    let class_id = match class_id_opt {
+        Some(cid) => cid,
+        None => {
+            // No resolvable ClassId — return the app loader so
+            // `Class.getClassLoader()` is never null for a non-bootstrap
+            // class.  The only path that yields null is the explicit
+            // bootstrap-package case below.
+            let cl = crate::classloader::get_or_create_app_loader(ctx);
+            return Ok(Some(Value::Object(Some(cl))));
+        }
+    };
+    let loader_type = ctx.loader_id_of_class(class_id);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_jdk_pkg = class_name.starts_with("java/")
+        || class_name.starts_with("javax/")
+        || class_name.starts_with("jdk/")
+        || class_name.starts_with("sun/")
+        || class_name.starts_with("com/sun/");
+    if loader_type == 0 && is_jdk_pkg {
+        // Bootstrap loader → null per JVM spec.
+        return Ok(Some(Value::Object(None)));
+    }
+    if loader_type == 1 {
+        // Platform/extension loader — return singleton.
+        let cl = crate::classloader::get_or_create_platform_loader(ctx);
+        return Ok(Some(Value::Object(Some(cl))));
+    }
+    // Application class (`-c` classpath), user-defined loader, or a
+    // class whose stored loader id is bootstrap but whose name is NOT
+    // in a JDK package (= app classpath class registered before the
+    // loader-id plumbing was wired up).  Return the singleton app
+    // loader so `loadClass` works.
+    let cl = crate::classloader::get_or_create_app_loader(ctx);
+    Ok(Some(Value::Object(Some(cl))))
 }
 
 pub(crate) fn native_class_as_subclass(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

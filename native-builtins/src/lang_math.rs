@@ -336,6 +336,29 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "(C)C",
         native_character_to_lower_case,
     );
+    // S111r15 — Character.toLowerCase(I)I / toUpperCase(I)I:
+    // The (C)C variants delegate to (I)I via JDK bytecode (`iload_0;
+    // invokestatic toLowerCase(I)I; i2c; ireturn`). When the JIT compiles
+    // the (I)I overload (which itself calls CharacterData.of + virtual
+    // toLowerCase), the resulting machine code returns 0 for some
+    // inputs, corrupting Spring's `BeanPropertyName.toDashedForm` to
+    // produce names like "r\0\0\0\0\0\0\0-\0\0\0\0\0\0" and tripping
+    // `InvalidConfigurationPropertyNameException` in SportMe boot. The
+    // (C)C variant only triggers because the (I)I bug poisons the
+    // CharacterData chain. Register the (I)I forms as natives so the
+    // JIT bypass kicks in for the entire chain.
+    registry.register(
+        "java/lang/Character",
+        "toLowerCase",
+        "(I)I",
+        native_character_to_lower_case_int,
+    );
+    registry.register(
+        "java/lang/Character",
+        "toUpperCase",
+        "(I)I",
+        native_character_to_upper_case_int,
+    );
     registry.register(
         "java/lang/Character",
         "isLetterOrDigit",
@@ -1101,6 +1124,21 @@ pub(crate) fn native_long_bits_to_double(_ctx: &mut dyn NativeContext, args: &[V
 // Step 5: Math natives
 // ---------------------------------------------------------------------------
 
+/// Extract an i64 from a Value that may carry a long-typed payload under
+/// either the `Long` or `Double` CompactValue tag.  Long arguments crossing
+/// the native-invocation boundary may arrive tagged as `Double` (CompactValue
+/// stores untagged 64-bit values whose `tag()` returns `Double` whenever the
+/// bit-pattern doesn't collide with a NaN-tag); reinterpret bits to recover
+/// the original i64.  Same defensive pattern as `value_stack::pop_long`.
+fn long_arg(args: &[Value], idx: usize) -> i64 {
+    match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
 // --- abs ---
 pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
@@ -1111,10 +1149,7 @@ pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_math_abs_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
+    let v = long_arg(args, 0);
     Ok(Some(Value::Long(v.wrapping_abs())))
 }
 
@@ -1148,14 +1183,8 @@ pub(crate) fn native_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_math_max_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
-    let b = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
+    let a = long_arg(args, 0);
+    let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::max(a, b))))
 }
 
@@ -1197,14 +1226,8 @@ pub(crate) fn native_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_math_min_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
-    let b = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
+    let a = long_arg(args, 0);
+    let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::min(a, b))))
 }
 
@@ -2436,6 +2459,44 @@ pub(crate) fn native_character_to_lower_case(
         .and_then(|c| c.to_lowercase().next())
         .unwrap_or('\0') as u32;
     Ok(Some(Value::Int(result as i32)))
+}
+
+/// `Character.toLowerCase(int)` — code-point variant. Fall-through to the
+/// same Rust `char::to_lowercase` for valid scalar values; pass invalid /
+/// out-of-range code points back unchanged (matching JDK behaviour for
+/// non-character integers).
+pub(crate) fn native_character_to_lower_case_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let cp = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let result = char::from_u32(cp as u32)
+        .and_then(|c| c.to_lowercase().next())
+        .map(|c| c as u32 as i32)
+        .unwrap_or(cp);
+    Ok(Some(Value::Int(result)))
+}
+
+/// `Character.toUpperCase(int)` — code-point variant, mirror of
+/// `toLowerCase(I)I` to keep the JIT-bypass symmetric (the same compile
+/// path that miscompiles the lowercase chain miscompiles the uppercase
+/// chain — register both pre-emptively).
+pub(crate) fn native_character_to_upper_case_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let cp = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let result = char::from_u32(cp as u32)
+        .and_then(|c| c.to_uppercase().next())
+        .map(|c| c as u32 as i32)
+        .unwrap_or(cp);
+    Ok(Some(Value::Int(result)))
 }
 
 pub(crate) fn native_character_is_letter_or_digit(

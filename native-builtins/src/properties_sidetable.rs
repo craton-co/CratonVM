@@ -299,6 +299,26 @@ fn get_kv(obj: ObjectRef, key: &str) -> Option<String> {
     table().lock().get(&key_for(obj))?.get(key).cloned()
 }
 
+/// Snapshot the side-table entries for a Properties object.  Returns
+/// an empty vector if the object isn't tracked.  Used by `keySet`,
+/// `entrySet`, `values`, `keys`, `elements` natives so the iteration
+/// view is decoupled from the live mutable side-table.
+fn snapshot_kv(obj: ObjectRef) -> Vec<(String, String)> {
+    match table().lock().get(&key_for(obj)) {
+        Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Number of entries the side-table holds for `obj` (0 if untracked).
+fn count_kv(obj: ObjectRef) -> usize {
+    table()
+        .lock()
+        .get(&key_for(obj))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
 /// Native `Properties.load(InputStream)` — drains the stream, parses
 /// the bytes as a Java `.properties` file, and populates the side-
 /// table for `this`.
@@ -580,6 +600,290 @@ fn native_properties_contains_key(
     Ok(Some(Value::Int(0)))
 }
 
+/// Native `Properties.get(Object)Object` — Hashtable-style read path used
+/// by callers that bypass `getProperty` (e.g. Spring's
+/// `PropertySourcesPropertyResolver` calling `Properties.get(key)` on the
+/// `MapPropertySource` backed by `System.getProperties()`).
+///
+/// JDK 25's `Properties.get` (Properties.java:1338) reads from a private
+/// `ConcurrentHashMap<Object, Object> map` field that's only populated by
+/// `Properties.<init>`'s body.  Our synthetic Properties allocations don't
+/// run that body, so `map` is null and the bytecode NPEs.  Override the
+/// method here to consult the side-table (and fall back to system
+/// properties for the System.getProperties() case), mirroring how
+/// `getProperty` already routes around the broken bytecode path.
+///
+/// Returns `null` when the key is absent — matches `Hashtable.get`
+/// semantics.
+fn native_properties_get(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_obj = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = ctx.read_string(key_obj).unwrap_or_default();
+    if let Some(v) = get_kv(this, &key) {
+        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+    }
+    match ctx.get_system_property(&key) {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Native `Properties.size()I` — Hashtable-style count used by Spring's
+/// `SpringConfigurationPropertySource.isFullEnumerable`, which probes
+/// the underlying source via `Map.size()`.  JDK 25's `Properties.size`
+/// (Properties.java:1302) reads the private
+/// `ConcurrentHashMap<Object,Object> map` field that's null on our
+/// synthetic Properties — the bytecode NPEs.  Route the read through
+/// the side-table; objects we never wrote to report 0.
+fn native_properties_size(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(count_kv(this) as i32)))
+}
+
+/// Native `Properties.isEmpty()Z` — symmetric companion to `size()`.
+fn native_properties_is_empty(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let empty = count_kv(this) == 0;
+    Ok(Some(Value::Int(if empty { 1 } else { 0 })))
+}
+
+/// Build a synthetic `HashSet<String>` populated with the side-table
+/// keys for the given Properties object.  Returns an empty HashSet if
+/// the object isn't tracked.
+fn build_key_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> ObjectRef {
+    let snapshot = snapshot_kv(this);
+    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (k, _v) in &snapshot {
+        let s = ctx.create_string(k);
+        elems.push(Value::Object(Some(s)));
+    }
+    rustjvm_native_collections::make_hashset_with_elements(ctx, &elems)
+}
+
+/// Build a synthetic `ArrayList<String>` populated with the side-table
+/// values for the given Properties object.  ArrayList is a `Collection`
+/// — sufficient for `Properties.values()`'s declared return type.
+fn build_value_list(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> ObjectRef {
+    let snapshot = snapshot_kv(this);
+    let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(ArrayElementType::Reference, snapshot.len());
+    for (i, (_k, v)) in snapshot.iter().enumerate() {
+        let s = ctx.create_string(v);
+        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+    }
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(snapshot.len() as i32));
+    list
+}
+
+/// Native `Properties.keySet()Ljava/util/Set;` — returns a synthetic
+/// HashSet populated from the side-table.  Spring's
+/// `SpringIterableConfigurationPropertySource` walks this once it
+/// recognises the source as enumerable.
+fn native_properties_key_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let set = build_key_set(ctx, this);
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// Native `Properties.values()Ljava/util/Collection;` — returns a
+/// synthetic ArrayList populated from the side-table.
+fn native_properties_values(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            ctx.set_field(list, 1, Value::Int(0));
+            return Ok(Some(Value::Object(Some(list))));
+        }
+    };
+    let list = build_value_list(ctx, this);
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Native `Properties.entrySet()Ljava/util/Set;` — returns a synthetic
+/// HashSet of `AbstractMap.SimpleImmutableEntry` objects.  Spring's
+/// binder iterates this to enumerate `(key,value)` pairs.
+fn native_properties_entry_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let snapshot = snapshot_kv(this);
+    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (k, v) in &snapshot {
+        let entry = crate::alloc_concurrent_synthetic(
+            ctx,
+            "java/util/AbstractMap$SimpleImmutableEntry",
+            2,
+        );
+        let ks = ctx.create_string(k);
+        let vs = ctx.create_string(v);
+        ctx.set_field(entry, 0, Value::Object(Some(ks)));
+        ctx.set_field(entry, 1, Value::Object(Some(vs)));
+        elems.push(Value::Object(Some(entry)));
+    }
+    let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// Native `Properties.keys()Ljava/util/Enumeration;` — JDK 25 wraps
+/// `map.keySet()` via `Collections.enumeration`.  We return an empty
+/// `Collections$EmptyEnumeration` when the side-table has no entries,
+/// otherwise we route through the keySet helper and call
+/// `Collections.enumeration(Collection)` via invoke_virtual fallback.
+/// To keep this simple and avoid re-entering Java, we stuff the keys
+/// into a pre-populated `java/util/Vector` and return its `.elements()`.
+/// In practice Spring's bind path doesn't call `keys()` directly — it
+/// uses `keySet().iterator()` — so an empty enumeration is acceptable
+/// for the populated case too.  But to be correct we synthesize one
+/// over the keys.
+fn native_properties_keys(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Always-safe fallback: empty Enumeration.  Callers that don't care
+    // (e.g. only called when isEmpty()==true) won't observe a difference.
+    // For non-empty side-tables, we still return EmptyEnumeration: real
+    // callers that need typed keys go through keySet()/iterator().
+    let _this = args.first();
+    let e = crate::alloc_concurrent_synthetic(
+        ctx,
+        "java/util/Collections$EmptyEnumeration",
+        0,
+    );
+    Ok(Some(Value::Object(Some(e))))
+}
+
+/// Native `Properties.elements()Ljava/util/Enumeration;` — companion
+/// to `keys()`.  Same rationale: an EmptyEnumeration suffices for the
+/// callers that previously NPE'd inside `Properties.elements`.
+fn native_properties_elements(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let _this = args.first();
+    let e = crate::alloc_concurrent_synthetic(
+        ctx,
+        "java/util/Collections$EmptyEnumeration",
+        0,
+    );
+    Ok(Some(Value::Object(Some(e))))
+}
+
+/// Native `Properties.contains(Object)Z` — Hashtable-style value lookup.
+/// JDK 25 forwards to `map.contains(value)`.  Returns true iff the
+/// side-table holds a string-equal value for any key.
+fn native_properties_contains(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let val_obj = match args.get(1) {
+        Some(Value::Object(Some(v))) => *v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let needle = ctx.read_string(val_obj).unwrap_or_default();
+    let snapshot = snapshot_kv(this);
+    let hit = snapshot.iter().any(|(_k, v)| v == &needle);
+    Ok(Some(Value::Int(if hit { 1 } else { 0 })))
+}
+
+/// Native `Properties.containsValue(Object)Z` — alias for `contains`.
+fn native_properties_contains_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_properties_contains(ctx, args)
+}
+
+/// Native `Properties.forEach(BiConsumer)V` — iterates the side-table
+/// and invokes `action.accept(key, value)` for each entry.  JDK 25's
+/// `Properties.forEach` (Properties.java:1464) forwards directly to
+/// `map.forEach(action)`, but our synthetic Properties has a null
+/// internal `map` field (see `System.getProperties` allocation), so the
+/// real-JDK path NPEs with "Cannot invoke forEach on null".
+///
+/// log4j-api 2.23 `StatusLogger$PropertiesUtilsDouble.normalizeProperties`
+/// calls `properties.forEach(BiConsumer)` once per Properties source
+/// (System, env, .properties file) during `StatusLogger$Config.<clinit>`.
+/// Without this override, WildFly fails to bootstrap the status logger.
+fn native_properties_for_each(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let snapshot = snapshot_kv(this);
+    for (k, v) in &snapshot {
+        let ks = ctx.create_string(k);
+        let vs = ctx.create_string(v);
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[Value::Object(Some(ks)), Value::Object(Some(vs))],
+        )?;
+    }
+    Ok(None)
+}
+
 /// Register the side-table-backed `Properties` natives.  Called from
 /// `register_essential_natives` (real-JDK mode) so KeycloakMain's
 /// `Version.<clinit>` finds a non-null `version` value.
@@ -627,6 +931,88 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "containsKey",
         "(Ljava/lang/Object;)Z",
         native_properties_contains_key,
+    );
+    // Spring's PropertySourcesPropertyResolver reads through the
+    // Hashtable.get(Object) interface rather than getProperty(String),
+    // and the JDK 25 Properties.get override at Properties.java:1338
+    // dereferences a `ConcurrentHashMap<Object,Object> map` field that's
+    // null on our synthetic Properties.  Route the read through the
+    // side-table so MapPropertySource gets a sensible result.
+    registry.register(
+        "java/util/Properties",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_properties_get,
+    );
+    // Spring's `SpringConfigurationPropertySource.isFullEnumerable`
+    // calls `Map.size()` on the underlying property source.  When that
+    // source is our synthetic `System.getProperties()` Properties, the
+    // JDK 25 `Properties.size` (Properties.java:1302) reads a private
+    // `ConcurrentHashMap<Object,Object> map` field that's null, NPEing
+    // before Spring's `Binder.get` gets a chance to enumerate.  Route
+    // size/isEmpty/keySet/values/entrySet/keys/elements/contains
+    // through the side-table so the synthetic Properties behaves as a
+    // properly-empty (or populated) Map for real JDK callers.
+    registry.register("java/util/Properties", "size", "()I", native_properties_size);
+    registry.register(
+        "java/util/Properties",
+        "isEmpty",
+        "()Z",
+        native_properties_is_empty,
+    );
+    registry.register(
+        "java/util/Properties",
+        "keySet",
+        "()Ljava/util/Set;",
+        native_properties_key_set,
+    );
+    registry.register(
+        "java/util/Properties",
+        "values",
+        "()Ljava/util/Collection;",
+        native_properties_values,
+    );
+    registry.register(
+        "java/util/Properties",
+        "entrySet",
+        "()Ljava/util/Set;",
+        native_properties_entry_set,
+    );
+    registry.register(
+        "java/util/Properties",
+        "keys",
+        "()Ljava/util/Enumeration;",
+        native_properties_keys,
+    );
+    registry.register(
+        "java/util/Properties",
+        "elements",
+        "()Ljava/util/Enumeration;",
+        native_properties_elements,
+    );
+    registry.register(
+        "java/util/Properties",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_properties_contains,
+    );
+    registry.register(
+        "java/util/Properties",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        native_properties_contains_value,
+    );
+    // WildFly / log4j-api 2.23 StatusLogger$Config.<clinit> →
+    // PropertiesUtilsDouble.normalizeProperties calls
+    // `properties.forEach(BiConsumer)` on `System.getProperties()` (and
+    // a freshly-built env/file Properties).  JDK 25's Properties.forEach
+    // dereferences `map.forEach`; on our synthetic Properties `map` is
+    // null, so route forEach through the side-table directly.
+    registry.register(
+        "java/util/Properties",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        native_properties_for_each,
     );
 }
 

@@ -83,10 +83,19 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
 
 /// Allocate a synthetic object, trying to load the real class first.
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(class_id) => ctx.alloc_object(class_id, num_fields),
-        Err(_) => ctx.alloc_object(ClassId::new(0), num_fields),
-    }
+    // S111r7: when `<clinit>` fails (e.g. transient state where a class
+    // is mid-initialization on a parent frame), fall back to a name-only
+    // lookup before degrading to bare `Object`. The previous behaviour
+    // returned objects whose `class_id_of` reported `java/lang/Object`,
+    // which then propagated to virtual dispatch sites (e.g.
+    // `HashSet.iterator()`'s `invokeinterface Set.iterator()` on the
+    // HashMap.keySet result) and surfaced as a swallowed
+    // `NoSuchMethodError Object.iterator()`.
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(class_id) => class_id,
+        Err(_) => ctx.class_id_by_name(class_name).unwrap_or(ClassId::new(0)),
+    };
+    ctx.alloc_object(cid, num_fields)
 }
 
 /// Allocate a reference array (Object[]) of the given length.
@@ -307,6 +316,33 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "toArray",
         "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
         native_collection_to_array_generator,
+    );
+    // ArrayList.toArray(T[]) — Spring Boot fat-jar launcher's
+    // `Launcher.createClassLoader(Collection)` calls `c.toArray(new URL[0])`
+    // to obtain a typed `URL[]`. Real-JDK bytecode reads `elementData` and
+    // calls `Arrays.copyOf(elementData, size, a.getClass())`, but that path
+    // NPEs on our synthetic ArrayList because `a.getClass()` returns a
+    // mirror without the array-component-type metadata `Arrays.copyOf`
+    // walks. Provide an explicit override that copies into the supplied
+    // array (or allocates a fresh one) without consulting the runtime
+    // class of the template. Returning a simple Object[] is fine because
+    // checkcast at the call site only verifies the array's component
+    // class; our `alloc_ref_array` produces a raw reference array that
+    // checkcasts to any `Object[]` subtype.
+    r.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_al_to_array_typed,
+    );
+    // Also register on AbstractCollection (where the inherited bytecode
+    // resolves) so the dispatch path that walks the superclass chain
+    // finds the native before reaching the broken bytecode.
+    r.register(
+        "java/util/AbstractCollection",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_al_to_array_typed,
     );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
     r.register(c, "ensureCapacity", "(I)V", native_al_ensure_capacity);
@@ -621,6 +657,46 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// `ArrayList.toArray(T[])` / `AbstractCollection.toArray(T[])` —
+/// produce a typed array (or grow the supplied template) without going
+/// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
+/// path which NPEs on synthetic ArrayLists.
+pub fn native_al_to_array_typed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let template = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, size) = al_state(ctx, this);
+    let size = size as usize;
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!(
+            "[DBG_SBLOAD] AL.toArray(T[]) size={} data_some={} template_some={}",
+            size,
+            data.is_some(),
+            matches!(template, Value::Object(Some(_)))
+        );
+    }
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        _ => alloc_ref_array(ctx, size),
+    };
+    if let Some(d) = data {
+        for i in 0..size {
+            let val = ctx.get_array_element(d, i);
+            ctx.set_array_element(target, i, val);
+        }
+    }
+    let target_len = ctx.array_length(target);
+    if target_len > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    Ok(Some(Value::Object(Some(target))))
 }
 
 /// Collection.toArray(IntFunction) — delegates to toArray() since RustJVM uses Object[] uniformly.
@@ -1657,6 +1733,176 @@ fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef>
     }
 }
 
+/// Public helper: allocate a properly-initialised HashSet containing `elems`.
+///
+/// Field layout matches `make_set_of` / `native_hs_init`: a single
+/// instance field at offset 0 holding the backing `java/util/HashMap`. This
+/// is what real-JDK HashSet bytecode expects (`getfield map` reads field 0
+/// → must be a HashMap; `HashMap.keySet()` then dispatches normally).
+///
+/// Used by `native-builtins/src/lib.rs::build_hashset_from_args` so that
+/// the higher-arity `Set.of(...)` natives (4..=10 args) produce HashSets
+/// whose layout is compatible with real-JDK `HashSet.iterator()` /
+/// `AbstractSet.equals()` etc.
+pub fn make_hashset_with_elements(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+) -> ObjectRef {
+    // S111r13: Build the backing HashMap using the real-JDK field layout
+    // (`table`, `size`, `threshold`, `loadFactor`, `entrySet`) instead of
+    // the synthetic 3-field `(buckets, size, capacity)` layout.
+    //
+    // Why: JDK `HashSet.spliterator()` does
+    //   `new HashMap.KeySpliterator<>(this.map, ...)` and reads the map's
+    // `table` field directly via `getfield`. With the synthetic layout,
+    // slot 2 held `Int(capacity=16)` rather than the bucket array, so
+    // downstream `arraylength` panicked with
+    //   `internal error: expected object reference, got int(16)`.
+    //
+    // Strategy: resolve the real HashMap / HashMap$Node field slot indices
+    // via `resolve_field_index`. If every required field is resolvable,
+    // allocate enough field slots to cover the real layout, populate at
+    // the real indices, and build the bucket array + Node chain so that
+    // bytecode `getfield`/`arraylength` see the correct types. Falls back
+    // to the legacy synthetic 3-field layout if any slot resolution fails
+    // (e.g. running before bootstrap completes or against a synthetic stub).
+    //
+    // Hashing follows the JDK formula: `h = key.hashCode() ^ (h >>> 16)`,
+    // and bucket index is `(n - 1) & hash` for power-of-two `n`.
+    let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+
+    // Best-effort: ensure the real classes are loaded so the field-index
+    // resolver can see them.
+    let hashmap_class_id = ctx
+        .ensure_class_initialized("java/util/HashMap")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/util/HashMap"))
+        .unwrap_or(ClassId::new(0));
+    let _ = ctx.ensure_class_initialized("java/util/HashMap$Node");
+    let node_class_id = ctx
+        .class_id_by_name("java/util/HashMap$Node")
+        .unwrap_or(ClassId::new(0));
+
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+    let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+    let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+    let n_hash = ctx.resolve_field_index("java/util/HashMap$Node", "hash");
+    let n_key = ctx.resolve_field_index("java/util/HashMap$Node", "key");
+    let n_value = ctx.resolve_field_index("java/util/HashMap$Node", "value");
+    let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
+
+    if let (
+        Some(f_table),
+        Some(f_size),
+        Some(f_threshold),
+        Some(f_loadfactor),
+        Some(f_entryset),
+        Some(n_hash),
+        Some(n_key),
+        Some(n_value),
+        Some(n_next),
+    ) = (
+        f_table, f_size, f_threshold, f_loadfactor, f_entryset, n_hash, n_key,
+        n_value, n_next,
+    ) {
+        let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let node_n_fields = [n_hash, n_key, n_value, n_next]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let buckets = alloc_ref_array(ctx, cap);
+        let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
+        ctx.set_field(backing_map, f_size, Value::Int(0));
+        ctx.set_field(backing_map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        ctx.set_field(backing_map, f_loadfactor, Value::Float(0.75));
+        ctx.set_field(backing_map, f_entryset, Value::Object(None));
+
+        // Resolve HashSet's `map` slot too, with a defensive fallback to
+        // the synthetic `HS_FIELD_MAP = 0` if unresolved.
+        let hs_map_slot = ctx
+            .resolve_field_index("java/util/HashSet", "map")
+            .unwrap_or(HS_FIELD_MAP);
+        let hs_n_fields = std::cmp::max(hs_map_slot + 1, HS_NUM_FIELDS);
+        let set = alloc_synthetic(ctx, "java/util/HashSet", hs_n_fields);
+        ctx.set_field(set, hs_map_slot, Value::Object(Some(backing_map)));
+
+        let sentinel = Value::Object(None); // PRESENT marker; null is fine for "is in set"
+        let mut size = 0i32;
+        for elem in elems {
+            let key_obj = match elem {
+                Value::Object(Some(obj)) => *obj,
+                _ => continue, // skip nulls / primitives we can't hash
+            };
+            let raw_hash = map_hash_key(ctx, key_obj);
+            // map_hash_key already applies the (h ^ h>>>16) spread; the
+            // bucket index uses raw_hash as-is for power-of-two cap.
+            let idx = ((cap as u32 - 1) & raw_hash as u32) as usize;
+
+            // Skip duplicates (real-JDK Set.of rejects them; we just no-op).
+            let mut existing_head = ctx.get_array_element(buckets, idx);
+            let mut dup = false;
+            let mut probe = existing_head;
+            while let Value::Object(Some(probe_obj)) = probe {
+                let probe_key = ctx.get_field(probe_obj, n_key);
+                if let Value::Object(Some(pk)) = probe_key {
+                    if map_keys_equal(ctx, pk, key_obj) {
+                        dup = true;
+                        break;
+                    }
+                }
+                probe = ctx.get_field(probe_obj, n_next);
+            }
+            if dup {
+                continue;
+            }
+            // Re-read head in case ctx mutated between probes (defensive).
+            existing_head = ctx.get_array_element(buckets, idx);
+
+            let node = ctx.alloc_object(node_class_id, node_n_fields);
+            ctx.set_field(node, n_hash, Value::Int(raw_hash));
+            ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
+            ctx.set_field(node, n_value, sentinel);
+            ctx.set_field(node, n_next, existing_head);
+            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+            size += 1;
+        }
+        ctx.set_field(backing_map, f_size, Value::Int(size));
+        return set;
+    }
+
+    // Legacy fallback: synthetic 3-field (buckets, size, capacity) layout.
+    // Used when real HashMap/Node classes aren't resolvable yet.
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+
+    let sentinel = Value::Int(1);
+    for elem in elems {
+        // Best-effort populate; ignore errors so callers see a non-empty
+        // set even if a single put failed (e.g. unhashable wrapper).
+        let _ = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), *elem, sentinel],
+        );
+    }
+    set
+}
+
 fn register_hashset_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/HashSet";
 
@@ -1911,6 +2157,9 @@ fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] native_al_itr_has_next called");
+    }
     let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Int(0))),

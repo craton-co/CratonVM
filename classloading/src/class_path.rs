@@ -1202,7 +1202,7 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::JImageFile {
-                    path, reader, resource_to_modules, class_to_module, ..
+                    reader, resource_to_modules, class_to_module, ..
                 } => {
                     let attempts: Vec<String> = if let Some(class_name) =
                         name.strip_suffix(".class")
@@ -1223,10 +1223,12 @@ impl ClassPath {
                     };
                     for attempt in attempts {
                         if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
-                            let p = path.to_string_lossy().replace('\\', "/");
-                            let p = p.trim_start_matches('/');
-                            // Use jrt: scheme for jimage, matching the JDK.
-                            urls.push(format!("jrt:/{p}!{attempt}"));
+                            // JEP 220 jrt URL scheme: `jrt:/<module>/<resource>`.
+                            // The TOC entry path is already `/<module>/<resource>`,
+                            // so emit it verbatim with the `jrt:` scheme prefix.
+                            // HotSpot's BuiltinClassLoader.findMiscResource builds
+                            // the same URL via JNUFileSystemProvider.
+                            urls.push(format!("jrt:{attempt}"));
                         }
                     }
                 }

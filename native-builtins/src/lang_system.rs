@@ -463,11 +463,47 @@ pub(crate) fn native_system_nano_time(_ctx: &mut dyn NativeContext, _args: &[Val
     Ok(Some(Value::Long(nanos)))
 }
 
-pub(crate) fn native_system_exit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let code = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+
+    // RUSTJVM_DBG_EXIT=1 — capture and log the Java caller chain BEFORE we
+    // either soft-return or terminate. Helps identify which class/method in
+    // the upstream code invoked System.exit. Env-gated so default output is
+    // unchanged.
+    if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
+        let trace = ctx.capture_stack_trace(0);
+        let mut rendered = String::new();
+        for (i, entry) in trace.iter().take(20).enumerate() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                rendered,
+                "\n  #{i} {cls}.{m} (bci={bci})",
+                cls = entry.class_name,
+                m = entry.method_name,
+                bci = entry.byte_code_index,
+            );
+        }
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[RUSTJVM_DBG_EXIT] System.exit({code}) caller chain:{rendered}"
+        );
+    }
+
+    // RUSTJVM_SOFT_EXIT=1 — opt-in. Convert ANY System.exit(I)V into a soft
+    // return so the calling Java frame keeps executing (and `main` can reach
+    // further). Used to expose downstream failures hidden behind an explicit
+    // upstream exit. Default behaviour (env unset) is unchanged: terminate.
+    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[rustjvm] System.exit({code}) soft-returned (RUSTJVM_SOFT_EXIT=1)"
+        );
+        return Ok(None);
+    }
+
     // B6: Surface System.exit calls — Kotlin/Scala programs often reach exit
     // via an uncaught-exception handler after some earlier failure that would
     // otherwise be invisible. Log to stderr directly since tracing may not be
@@ -613,7 +649,7 @@ pub(crate) fn native_runtime_free_memory(_ctx: &mut dyn NativeContext, _args: &[
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
-pub(crate) fn native_runtime_exit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let code = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => match args.first() {
@@ -621,6 +657,35 @@ pub(crate) fn native_runtime_exit(_ctx: &mut dyn NativeContext, args: &[Value]) 
             _ => 0,
         },
     };
+
+    // Mirror native_system_exit: env-gated caller-chain dump and soft-return.
+    if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
+        let trace = ctx.capture_stack_trace(0);
+        let mut rendered = String::new();
+        for (i, entry) in trace.iter().take(20).enumerate() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                rendered,
+                "\n  #{i} {cls}.{m} (bci={bci})",
+                cls = entry.class_name,
+                m = entry.method_name,
+                bci = entry.byte_code_index,
+            );
+        }
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[RUSTJVM_DBG_EXIT] Runtime.exit({code}) caller chain:{rendered}"
+        );
+    }
+
+    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[rustjvm] Runtime.exit({code}) soft-returned (RUSTJVM_SOFT_EXIT=1)"
+        );
+        return Ok(None);
+    }
+
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[rustjvm] Runtime.exit({code}) called — process terminating");
     std::process::exit(code);
@@ -805,10 +870,129 @@ pub(crate) fn native_system_getenv(ctx: &mut dyn NativeContext, args: &[Value]) 
 pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     use rustjvm_types::ClassId;
 
-    // Build a HashMap with all environment variables
-    let map = ctx.alloc_object(ClassId::new(0), 3); // MAP_NUM_FIELDS = 3
+    // Build a HashMap with all environment variables.
+    //
+    // S111r7: previously this routine allocated `java/util/HashMap` with only
+    // 3 fields and stored `(buckets, size, capacity)` at slot indices 0/1/2,
+    // matching the synthetic layout used by `native-collections::native_map_*`.
+    // That works while every Map operation routes through a registered native,
+    // but `SystemEnvironmentPropertySource.containsKey` (Spring core) reaches
+    // the bytecode interpreter for `HashMap.containsKey -> getNode`, where
+    // `getfield #105 // table:[Ljava/util/HashMap$Node;` resolves to the real
+    // HashMap layout's slot for `table` — slot 2 in JDK 25 (AbstractMap
+    // inherits `keySet` (0) and `values` (1); HashMap declares `table` next).
+    // Reading slot 2 returned `Int(16)` (our synthetic CAPACITY value), then
+    // `arraylength` on `Int(16)` produced
+    //   `internal error: expected object reference, got int(16)`.
+    //
+    // Fix: resolve the real HashMap / HashMap$Node field slot indices via
+    // `resolve_field_index`, allocate enough field slots to cover the real
+    // layout, and populate the object so the interpreter's bytecode getfield
+    // sees correct values. Falls back to the legacy synthetic-3-field layout
+    // if the real class wasn't loaded (e.g. running before bootstrap completes
+    // or against a synthetic stub).
+    let hashmap_class_id = ctx
+        .ensure_class_initialized("java/util/HashMap")
+        .unwrap_or(ClassId::new(0));
+    // Best-effort: also load the Node class so its real field layout is known.
+    let _ = ctx.ensure_class_initialized("java/util/HashMap$Node");
+
+    // Real-layout slot resolution. Each `Some(idx)` means we know the
+    // bytecode interpreter will read that field at `idx`; if every required
+    // field is resolvable AND the resolved indices are mutually consistent
+    // (no aliasing), we use the real layout; otherwise fall back.
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+    let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+    let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+    let n_hash = ctx.resolve_field_index("java/util/HashMap$Node", "hash");
+    let n_key = ctx.resolve_field_index("java/util/HashMap$Node", "key");
+    let n_value = ctx.resolve_field_index("java/util/HashMap$Node", "value");
+    let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
+
     let cap = 16usize;
     let buckets = ctx.new_ref_array(ClassId::new(0), cap);
+
+    // JDK HashMap.hash: (h = key.hashCode()) ^ (h >>> 16). For Strings,
+    // hashCode = sum of 31*h + ch. Then bucket index is (n-1) & hash for
+    // power-of-two capacity (16 here).
+    fn jdk_string_hash(s: &str) -> i32 {
+        let mut h: i32 = 0;
+        // String.hashCode is per-char (UTF-16 code unit). For ASCII env vars
+        // this is identical to per-byte; for non-ASCII fall back to chars.
+        for ch in s.chars() {
+            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        h ^ ((h as u32 >> 16) as i32)
+    }
+
+    if let (
+        Some(f_table),
+        Some(f_size),
+        Some(f_threshold),
+        Some(f_loadfactor),
+        Some(f_entryset),
+        Some(n_hash),
+        Some(n_key),
+        Some(n_value),
+        Some(n_next),
+    ) = (
+        f_table, f_size, f_threshold, f_loadfactor, f_entryset, n_hash, n_key,
+        n_value, n_next,
+    ) {
+        // Allocate enough slots to cover the real layout.
+        let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let node_n_fields = [n_hash, n_key, n_value, n_next]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        ctx.set_field(map, f_table, Value::Object(Some(buckets)));
+        ctx.set_field(map, f_size, Value::Int(0));
+        // threshold = (int)(capacity * 0.75) for the default load factor.
+        ctx.set_field(map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        ctx.set_field(map, f_loadfactor, Value::Float(0.75));
+        ctx.set_field(map, f_entryset, Value::Object(None));
+
+        let node_class_id = ctx
+            .ensure_class_initialized("java/util/HashMap$Node")
+            .unwrap_or(ClassId::new(0));
+
+        for (key, value) in std::env::vars() {
+            let key_obj = ctx.create_string(&key);
+            let val_obj = ctx.create_string(&value);
+            let hash = jdk_string_hash(&key);
+            // (n-1) & hash, since cap=16 is power of two.
+            let idx = ((cap as u32 - 1) & hash as u32) as usize;
+            let node = ctx.alloc_object(node_class_id, node_n_fields);
+            ctx.set_field(node, n_hash, Value::Int(hash));
+            ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
+            ctx.set_field(node, n_value, Value::Object(Some(val_obj)));
+            let existing = ctx.get_array_element(buckets, idx);
+            ctx.set_field(node, n_next, existing);
+            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+
+            let old_size = match ctx.get_field(map, f_size) {
+                Value::Int(s) => s,
+                _ => 0,
+            };
+            ctx.set_field(map, f_size, Value::Int(old_size + 1));
+        }
+
+        return Ok(Some(Value::Object(Some(map))));
+    }
+
+    // Legacy fallback: synthetic 3-field layout for environments where
+    // the real HashMap class hierarchy isn't fully resolvable.
+    let map = ctx.alloc_object(hashmap_class_id, 3); // MAP_NUM_FIELDS = 3
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
     ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
     ctx.set_field(map, 2, Value::Int(cap as i32)); // MAP_FIELD_CAPACITY
@@ -816,18 +1000,8 @@ pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Val
     for (key, value) in std::env::vars() {
         let key_obj = ctx.create_string(&key);
         let val_obj = ctx.create_string(&value);
-        // Use the same map_put approach as collections.rs
-        // We need to do manual insertion since we can't call native_map_put from here.
-        // For simplicity, just set a few env vars — the map will be mostly empty.
-        // Actually, let's manually do the hash-bucket insert.
-        let hash = {
-            let mut h = 0i32;
-            for c in key.chars() {
-                h = h.wrapping_mul(31).wrapping_add(c as i32);
-            }
-            h
-        };
-        let idx = ((hash as u32) % (cap as u32)) as usize;
+        let hash = jdk_string_hash(&key);
+        let idx = ((cap as u32 - 1) & hash as u32) as usize;
         let node = ctx.alloc_object(ClassId::new(0), 4); // hash, key, value, next
         ctx.set_field(node, 0, Value::Int(hash));
         ctx.set_field(node, 1, Value::Object(Some(key_obj)));
@@ -837,7 +1011,6 @@ pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Val
         ctx.set_field(node, 3, existing); // next = existing bucket head
         ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
 
-        // Increment size
         let old_size = match ctx.get_field(map, 1) {
             Value::Int(s) => s,
             _ => 0,
@@ -1071,34 +1244,70 @@ pub(crate) fn native_system_init_phase1(
     _args: &[Value],
 ) -> MethodCallResult {
     // Step 1: Ensure System class is initialized so static fields exist
-    let sys_id = ctx.ensure_class_initialized("java/lang/System")?;
+    ctx.ensure_class_initialized("java/lang/System")?;
 
     // Step 2: Set System.out and System.err from VM-managed streams.
     // The interpreter already intercepts getstatic on System.out/err,
-    // but for completeness we also try to set the static fields.
+    // but we also write the static fields so direct heap reads see them.
+    // `resolve_field_index` is instance-only; `out`/`err`/`in`/`lineSeparator`
+    // are all statics, so we use the static-by-name path (the same one
+    // `setIn0`/`setOut0`/`setErr0` use elsewhere in this crate).
     if let Some(out_stream) = ctx.get_system_stream("out") {
-        if let Some(out_idx) = ctx.resolve_field_index("java/lang/System", "out") {
-            ctx.set_static_field(sys_id, out_idx, Value::Object(Some(out_stream)));
-        }
+        ctx.set_static_field_by_name("java/lang/System", "out", Value::Object(Some(out_stream)));
     }
     if let Some(err_stream) = ctx.get_system_stream("err") {
-        if let Some(err_idx) = ctx.resolve_field_index("java/lang/System", "err") {
-            ctx.set_static_field(sys_id, err_idx, Value::Object(Some(err_stream)));
-        }
+        ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }
-    // System.in — we don't create a real InputStream yet, but set null
-    // so that callers don't hit an uninitialized-field crash.
-    if let Some(in_idx) = ctx.resolve_field_index("java/lang/System", "in") {
-        ctx.set_static_field(sys_id, in_idx, Value::Object(None));
+    // S110 — System.in: wire up to OS stdin (fd id 0 in our FileDescriptorTable,
+    // which pre-registers it). The synthetic `Scanner.<init>(InputStream)`
+    // native in `native-io/src/lib.rs` reads field 0 of the stream object;
+    // when it sees `Value::Int(fd)` it pulls bytes via `fd_table().read_byte`.
+    // Allocating a FileInputStream-shaped object with field 0 = Int(0) is
+    // therefore enough to make `new Scanner(System.in)` consume real stdin.
+    //
+    // Without this install, `System.in` was null, so `new Scanner(System.in)`
+    // got the empty-string fallback in the native and `nextLine()`/`nextInt()`
+    // immediately threw `NoSuchElementException: no more elements`.
+    {
+        // S110 — wire System.in to OS stdin. The real FileInputStream layout
+        // has slot 0 typed `Ljava/io/FileDescriptor;` (a reference); writing
+        // `Value::Int(0)` (= stdin fd id 0) into that slot via `set_field`
+        // hits the descriptor-aware coercion in `gc::heap` which rewrites
+        // `Int(0)` as `Object(None)` — defeating the whole point.
+        //
+        // Two-slot encoding gets around it without touching the heap:
+        //   * slot 0 stays a reference slot (coerced to `Object(None)`,
+        //     which is fine — readers ignore it and check slot 1)
+        //   * slot 1 holds the fd id as `Value::Int(fd + 1)` so the value is
+        //     never zero (zero would also be coerced if slot 1 turns out
+        //     to be a reference).
+        //
+        // The Scanner native at `native-io/src/lib.rs::native_scanner_init_inputstream`
+        // mirrors this: it checks slot 1 for `Int(n)` with `n > 0`, treats
+        // `n - 1` as the fd id, and falls through to the existing
+        // ByteArrayInputStream / fd-based detection paths.
+        let fis_class_id = ctx.ensure_class_initialized("java/io/FileInputStream")?;
+        let num_fields = ctx.class_num_total_fields(fis_class_id).max(2);
+        let in_obj = ctx.alloc_object(fis_class_id, num_fields);
+        // Stdin fd id is 0; encode as `Int(1)` so `coerce_field_value_by_descriptor`
+        // does not collapse it to `Object(None)` on the way into the slot.
+        ctx.set_field(in_obj, 1, Value::Int(1));
+        ctx.set_static_field_by_name(
+            "java/lang/System",
+            "in",
+            Value::Object(Some(in_obj)),
+        );
     }
 
     // Step 3: Set System.lineSeparator from the line.separator property
     let line_sep = ctx.get_system_property("line.separator")
         .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     let line_sep_obj = ctx.create_string(&line_sep);
-    if let Some(ls_idx) = ctx.resolve_field_index("java/lang/System", "lineSeparator") {
-        ctx.set_static_field(sys_id, ls_idx, Value::Object(Some(line_sep_obj)));
-    }
+    ctx.set_static_field_by_name(
+        "java/lang/System",
+        "lineSeparator",
+        Value::Object(Some(line_sep_obj)),
+    );
 
     Ok(None)
 }

@@ -3605,6 +3605,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- Paths.get extras ---
     // Already registered in earlier phase, but let's register Path.of (Java 11)
+    //
+    // S111r11 SB3: previously this implementation ignored the varargs and
+    // returned just `first`. That broke `SystemModuleFinders.ofSystem()` which
+    // calls `Path.of(javaHome, "lib", "modules")` — we returned `javaHome`,
+    // `Files.isRegularFile(javaHome)` was false, and the JDK fell through to
+    // `ModulePath.of(patcher, Path.of(javaHome, "modules"))` (which we also
+    // collapsed to `javaHome`) → `ModulePath.scan` threw FindException
+    // "Module format not recognized: <javaHome>". That FindException then
+    // propagates out of `PathMatchingResourcePatternResolver.<clinit>` (Spring
+    // calls `ModuleFinder.ofSystem().findAll()` at line 216). Fix: walk the
+    // varargs array and resolve each component onto the running path.
     r.register(
         path,
         "of",
@@ -3612,8 +3623,57 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let first_ref = obj_arg(args, 0)?;
             let first = ctx.read_string(first_ref).unwrap_or_default();
-            // Ignore extra args for simplicity
-            let result = p57_alloc_path(ctx, &first);
+            let mut acc = first;
+            if let Some(Value::Object(Some(arr))) = args.get(1) {
+                let len = ctx.array_length(*arr);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                        let part = ctx.read_string(s).unwrap_or_default();
+                        if !part.is_empty() {
+                            acc = p57_resolve_paths(&acc, &part);
+                        }
+                    }
+                }
+            }
+            let result = p57_alloc_path(ctx, &acc);
+            Ok(Some(Value::Object(Some(result))))
+        },
+    );
+
+    // Path.of(URI) — Spring Boot 3.4 fat-jar launcher uses
+    // `Path.of(URL.toURI()).toFile()` to convert a `file:/C:/...jar` URL
+    // back into a `File`. Read the URI's `path` field via `get_field_by_name`
+    // (real-JDK URI declares 16+ fields; using by-name access keeps us
+    // independent of layout drift). Fall back to URI's `string` (full URI
+    // text) and strip the `file:` scheme prefix when path is unset.
+    r.register(
+        path,
+        "of",
+        "(Ljava/net/URI;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let uri = obj_arg(args, 0)?;
+            let mut path_str = match ctx.get_field_by_name(uri, "path") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if path_str.is_empty() {
+                let full_val = ctx.get_field_by_name(uri, "string");
+                if let Value::Object(Some(s)) = full_val {
+                    let full = ctx.read_string(s).unwrap_or_default();
+                    if let Some(stripped) = full.strip_prefix("file://") {
+                        path_str = stripped.to_string();
+                    } else if let Some(stripped) = full.strip_prefix("file:") {
+                        path_str = stripped.to_string();
+                    } else {
+                        path_str = full;
+                    }
+                }
+            }
+            let os_path = p57_to_os_path(&path_str);
+            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+                eprintln!("[DBG_SBLOAD] Path.of(URI) -> {:?}", os_path);
+            }
+            let result = p57_alloc_path(ctx, &os_path);
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -5755,7 +5815,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         };
         let writable = mode_str.contains('w');
         let fd_id = ctx.fd_table().open_read_write(&path, writable)
-            .map_err(|e| RuntimeError::IOException { message: format!("Cannot open: {}", e) })?;
+            .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
         ctx.set_field(this, 0, Value::Int(fd_id as i32));
         ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
         Ok(None)
@@ -5925,8 +5985,14 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "seek", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let pos = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-        ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos as u64))
+        // RKC23B: J-typed args may arrive tagged as Double across some
+        // native dispatch paths; reinterpret bits to recover the long.
+        let pos = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+            _ => 0,
+        };
+        ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
             .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
         Ok(None)
     });
@@ -5951,7 +6017,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "setLength", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let new_len = match args.get(1) { Some(Value::Long(v)) => *v as u64, _ => 0 };
+        let new_len = match args.get(1) {
+            Some(Value::Long(v)) => *v as u64,
+            Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()) as u64,
+            _ => 0,
+        };
         ctx.fd_table().rw_set_length(fd_id as u32, new_len)
             .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
         Ok(None)
@@ -6212,10 +6282,42 @@ fn raf_read_fully(ctx: &mut dyn NativeContext, fd_id: i32, buf: &mut [u8]) -> Re
 
 /// Read the path string from a File object (field 0).
 fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, 0) {
+    let raw = match ctx.get_field(this, 0) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
+    };
+    // Defensive: Spring Boot's URI -> File round-trip can hand us a
+    // raw URI-style `/C:/...` path on Windows when the real-JDK File
+    // bytecode (which would normalise it) is bypassed. Normalise here
+    // so std::fs callers see a path Rust's `Path::is_absolute` recognises.
+    file_normalise_path(&raw)
+}
+
+/// Normalise a path string the way `java.io.WinNTFileSystem.normalize` does.
+/// On Windows, real-JDK File.<init> strips a leading `/` before a drive
+/// letter so URI-style `/C:/Users/foo` round-trips to `C:\Users\foo`. This
+/// matters for `URL.toURI().getSchemeSpecificPart() -> new File(...)` —
+/// the round-trip Spring Boot's fat-jar launcher relies on. On non-Windows
+/// the input is returned unchanged.
+#[cfg(windows)]
+fn file_normalise_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    // Strip leading `/<drive>:` -> `<drive>:` (e.g. `/C:/foo` -> `C:/foo`).
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        return path[1..].replace('/', "\\");
     }
+    // Otherwise normalise forward slashes for consistency with Java's
+    // canonical Windows path separator.
+    path.replace('/', "\\")
+}
+
+#[cfg(not(windows))]
+fn file_normalise_path(path: &str) -> String {
+    path.to_string()
 }
 
 /// Allocate a new File synthetic with the given path.
@@ -6226,17 +6328,25 @@ fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     obj
 }
 
-pub(crate) fn register_phase57_file(r: &mut NativeMethodRegistry) {
+pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     let file = "java/io/File";
 
     // <init>(String path)V
+    //
+    // Real JDK's File.<init>(String) runs `FileSystem.normalize(...)` which
+    // on Windows strips a leading `/` before a drive letter — e.g. the
+    // URI-style `/C:/Users/foo` produced by `URL.toURI().getSchemeSpecificPart()`
+    // round-trips to `C:\Users\foo`. Spring Boot's fat-jar launcher relies
+    // on that round-trip in Archive.create(File). Apply the same
+    // normalisation so our synthetic File matches HotSpot semantics.
     r.register(file, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let s = ctx.create_string(&path);
+        let normalised = file_normalise_path(&path);
+        let s = ctx.create_string(&normalised);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -6427,6 +6537,9 @@ pub(crate) fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let exists = std::path::Path::new(&path).exists();
+        if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            eprintln!("[DBG_SBLOAD] File.exists() path={:?} -> {}", path, exists);
+        }
         Ok(Some(Value::Int(if exists { 1 } else { 0 })))
     });
     r.register(file, "isFile", "()Z", |ctx, args| {
@@ -6439,6 +6552,9 @@ pub(crate) fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let result = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+        if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            eprintln!("[DBG_SBLOAD] File.isDirectory() path={:?} -> {}", path, result);
+        }
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     });
     r.register(file, "isHidden", "()Z", |ctx, args| {
@@ -8429,13 +8545,14 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 2)))
     });
 
-    // ServerSocketChannel = 3-field synthetic (open=0, bound=1, fd_id=2)
+    // ServerSocketChannel = 4-field synthetic (open=0, bound=1, fd_id=2, cached_socket=3)
     let ssc = "java/nio/channels/ServerSocketChannel";
     r.register(ssc, "open", "()Ljava/nio/channels/ServerSocketChannel;", |ctx, _args| {
-        let ssc = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 3);
+        let ssc = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 4);
         ctx.set_field(ssc, 0, Value::Int(1));
         ctx.set_field(ssc, 1, Value::Int(0));
         ctx.set_field(ssc, 2, Value::Int(-1));
+        ctx.set_field(ssc, 3, Value::Object(None));
         Ok(Some(Value::Object(Some(ssc))))
     });
     r.register(ssc, "bind", "(Ljava/net/SocketAddress;)Ljava/nio/channels/ServerSocketChannel;", |ctx, args| {
@@ -8445,8 +8562,61 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
             ctx.set_field(this, 1, Value::Int(1));
             ctx.set_field(this, 2, Value::Int(fd as i32));
+            // If a wrapper ServerSocket has been cached, mirror the actual local port
+            // so getLocalPort/getLocalSocketAddress return the OS-chosen port.
+            if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+                if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
+                    let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                    ctx.set_field(s, 0, Value::Int(port)); // SS_PORT
+                }
+            }
         }
         Ok(Some(Value::Object(Some(this))))
+    });
+    // ServerSocketChannel.socket() — return a wrapper ServerSocket linked to this channel.
+    // Cached on first call. The wrapper's bind/getLocalPort delegate back to the channel.
+    r.register(ssc, "socket", "()Ljava/net/ServerSocket;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(cached)) = ctx.get_field(this, 3) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+        // 5-field ServerSocket: SS_PORT=0, SS_BACKLOG=1, SS_CLOSED=2, SS_LISTENER_ID=3, channel_ref=4
+        let ss = alloc_concurrent_synthetic(ctx, "java/net/ServerSocket", 5);
+        ctx.set_field(ss, 0, Value::Int(0));
+        ctx.set_field(ss, 1, Value::Int(50));
+        ctx.set_field(ss, 2, Value::Int(0));
+        ctx.set_field(ss, 3, Value::Int(-1));
+        ctx.set_field(ss, 4, Value::Object(Some(this)));
+        // If channel already bound, mirror the port now.
+        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+        if fd >= 0 {
+            if let Ok(local) = ctx.fd_table().tcp_local_addr(fd as u32) {
+                let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                ctx.set_field(ss, 0, Value::Int(port));
+            }
+        }
+        ctx.set_field(this, 3, Value::Object(Some(ss)));
+        Ok(Some(Value::Object(Some(ss))))
+    });
+    // ServerSocketChannel.getLocalAddress() — return InetSocketAddress with local port
+    r.register(ssc, "getLocalAddress", "()Ljava/net/SocketAddress;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+        if fd < 0 { return Ok(Some(Value::Object(None))); }
+        let local = match ctx.fd_table().tcp_local_addr(fd as u32) {
+            Ok(s) => s,
+            Err(_) => return Ok(Some(Value::Object(None))),
+        };
+        let (host, port_s) = match local.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => ("0.0.0.0", "0"),
+        };
+        let port = port_s.parse::<i32>().unwrap_or(0);
+        let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+        let host_str = ctx.create_string(host);
+        ctx.set_field(isa, 0, Value::Object(Some(host_str)));
+        ctx.set_field(isa, 1, Value::Int(port));
+        Ok(Some(Value::Object(Some(isa))))
     });
     r.register(ssc, "accept", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10270,7 +10440,7 @@ fn get_process_rss_bytes() -> i64 {
 // Manifest = 2-field synthetic (mainAttrs=0 HashMap, entries=1 HashMap)
 // =============================================================================
 
-pub(crate) fn register_p59_jar(r: &mut NativeMethodRegistry) {
+pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     let jf = "java/util/jar/JarFile";
     r.register(jf, "<init>", "(Ljava/lang/String;)V", p59_jar_file_init);
     r.register(jf, "<init>", "(Ljava/io/File;)V", p59_jar_file_init_file);
@@ -10320,7 +10490,23 @@ pub(crate) fn register_p59_jar(r: &mut NativeMethodRegistry) {
         jf,
         "getJarEntry",
         "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            // Reuse the central-directory lookup so callers that walk via
+            // getJarEntry (e.g. JarFileArchive.getNestedJarUrl ->
+            // JarUrl.create) see a populated synthetic JarEntry instead of
+            // null.
+            let this = obj_arg(args, 0)?;
+            let entry_name = if let Some(Value::Object(Some(s))) = args.get(1) {
+                ctx.read_string(*s).unwrap_or_default()
+            } else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let path = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(p59_jar_lookup_entry(ctx, &path, &entry_name)))
+        },
     );
     r.register(jf, "close", "()V", |ctx, args| {
         // JarFile is 2-field (path=0, manifest=1). Mark closed by clearing the path field.
@@ -10334,6 +10520,29 @@ pub(crate) fn register_p59_jar(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    // JarFile.stream() — Spring Boot 3 fat-jar launcher
+    // (org.springframework.boot.loader.launch.JarFileArchive.getClassPathUrls)
+    // walks the JarFile via stream() to enumerate BOOT-INF/lib/*.jar entries
+    // for the LaunchedClassLoader URL set. Real-JDK bytecode delegates this
+    // through SharedSecrets.JUZFA -> ZipFile.jarStream which dereferences a
+    // private `res.zsrc` field that our 2-field synthetic JarFile does not
+    // populate, NPE-ing in ZipFile.ensureOpen. Override returns a synthetic
+    // 1-field Stream populated with synthetic JarEntry instances built from
+    // the central directory via the Rust `zip` crate.
+    r.register(
+        jf,
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        p59_jar_file_stream,
+    );
+    // JarFile.entries() — Enumeration<JarEntry>. Same backing data as
+    // stream(); used by classpath scanners that prefer the legacy iteration.
+    r.register(
+        jf,
+        "entries",
+        "()Ljava/util/Enumeration;",
+        p59_jar_file_entries,
+    );
 
     // JarEntry extends ZipEntry — 4-field (name, size, compressedSize, method)
     let je = "java/util/jar/JarEntry";
@@ -10348,6 +10557,50 @@ pub(crate) fn register_p59_jar(r: &mut NativeMethodRegistry) {
     r.register(je, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
+    });
+    // JarEntry inherits ZipEntry accessors. Spring Boot's JarFileArchive
+    // walks each entry via getName / isDirectory (for the include-filter)
+    // and getComment (only consulted when checking the UNPACK: marker on
+    // nested-JAR entries; we do not pack any UNPACK markers so null is
+    // the right answer). Register them on JarEntry directly so the
+    // override-allow-list (which forces native-only dispatch on certain
+    // jar/zip entry points) sees a non-null result.
+    r.register(je, "isDirectory", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let is_dir = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => {
+                let name = ctx.read_string(s).unwrap_or_default();
+                name.ends_with('/')
+            }
+            _ => false,
+        };
+        Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
+    });
+    r.register(je, "getComment", "()Ljava/lang/String;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
+    r.register(je, "getSize", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field(this, 1) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(-1),
+        }))
+    });
+    r.register(je, "getCompressedSize", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field(this, 2) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(-1),
+        }))
+    });
+    r.register(je, "getMethod", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match ctx.get_field(this, 3) {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(-1),
+        }))
     });
 
     // Manifest = 2-field (mainAttrs=0, entries=1)
@@ -10433,6 +10686,538 @@ pub(crate) fn register_p59_jar(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+
+    // Spring Boot 3.x fat-jar launcher: short-circuit
+    // `JarFileArchive.getClassPathUrls(Predicate, Predicate)` so we don't
+    // depend on a working `Stream.map / Stream.filter / Stream.collect`
+    // pipeline (which our synthetic Stream lacks). Read the JarFile field
+    // directly, walk its central directory via the Rust `zip` crate, and
+    // build a HashSet<URL> populated with `jar:nested:.../!/<entry>`
+    // URLs for `BOOT-INF/lib/*.jar` and `BOOT-INF/classes/`.
+    //
+    // The synthetic HashSet (3-field: backing-array, size, capacity) is the
+    // same shape every other Set.of native produces, so the downstream
+    // `Launcher.createClassLoader(Collection)` -> `collection.toArray()`
+    // round-trip lands the URLs in `URL[]` for the LaunchedClassLoader.
+    let jfa = "org/springframework/boot/loader/launch/JarFileArchive";
+    r.register(
+        jfa,
+        "getClassPathUrls",
+        "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
+        p59_spring_boot_jar_archive_get_class_path_urls,
+    );
+
+    // -------------------------------------------------------------------
+    // Spring Boot 2.x fat-jar launcher overrides.
+    //
+    // SB2 uses an OLDER launcher at `org.springframework.boot.loader.*`
+    // (no `.launch.` subpackage). The launcher instance's `archive` field
+    // is left null in our impl because the SB2 `JarFileArchive` constructor
+    // chain depends on internal `org/springframework/boot/loader/jar/JarFile`
+    // plumbing whose central-directory parser doesn't fully execute under
+    // our synthetic-mode VM.  Rather than fix every transitive Stream /
+    // RandomAccessDataFile / CentralDirectoryParser detail, we short-circuit
+    // the three `ExecutableArchiveLauncher` methods that would otherwise
+    // dereference the null archive — `getMainClass`, `isExploded`,
+    // `getClassPathArchives` (SB2 v1) / `getClassPathArchivesIterator`
+    // (SB2 v2.3+). Each native reads the fat-jar directly via the source
+    // path resolved from the launcher's class mirror.
+    // Register on every concrete SB2 launcher class plus the abstract
+    // base. The parent-walk in `try_stackless_invoke` short-circuits when
+    // the immediate parent has its own bytecode for the method, so a
+    // native registered only on the abstract base would be shadowed by
+    // EAL's own bytecode for a `JarLauncher` / `WarLauncher` receiver.
+    // The duplicate registrations cost nothing and ensure the native
+    // wins regardless of which leaf class the user invokes.
+    let eal_classes: &[&str] = &[
+        "org/springframework/boot/loader/ExecutableArchiveLauncher",
+        "org/springframework/boot/loader/JarLauncher",
+        "org/springframework/boot/loader/WarLauncher",
+        "org/springframework/boot/loader/PropertiesLauncher",
+    ];
+    for cls in eal_classes {
+        r.register(
+            cls,
+            "getMainClass",
+            "()Ljava/lang/String;",
+            sb2_launcher_get_main_class,
+        );
+        r.register(
+            cls,
+            "isExploded",
+            "()Z",
+            |_ctx, _args| Ok(Some(Value::Int(0))),
+        );
+        r.register(
+            cls,
+            "isPostProcessingClassPathArchives",
+            "()Z",
+            |_ctx, _args| Ok(Some(Value::Int(0))),
+        );
+        r.register(
+            cls,
+            "getClassPathArchives",
+            "()Ljava/util/List;",
+            sb2_launcher_get_class_path_archives_list,
+        );
+        r.register(
+            cls,
+            "getClassPathArchivesIterator",
+            "()Ljava/util/Iterator;",
+            sb2_launcher_get_class_path_archives_iterator,
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Spring Boot 2.x: short-circuit `Handler.setUseFastConnectionExceptions`
+    // to a no-op. The real method body delegates to
+    // `JarURLConnection.setUseFastExceptions(boolean)`, which triggers
+    // SB2's `JarURLConnection.<clinit>`. The static initialiser builds a
+    // sentinel "not found" connection by calling the 3-arg private ctor
+    // with `(null, null, null)`, which chains into
+    // `java.net.JarURLConnection.<init>(URL)` ->
+    // `java.net.URLConnection.<init>(URL)` -> `URL.getProtocol()` ->
+    // `URLConnection.getDefaultUseCaches(protocol)` ->
+    // `URL.lowerCaseProtocol(null).equals("jrt")` -> NPE
+    // ("Cannot invoke equals on null"). Because the caller is
+    // `LaunchedURLClassLoader.findResource` (called from
+    // `ClassPathResource.exists` for the optional Spring `banner.gif/png/
+    // jpg` lookup) the failure aborts `SpringApplication.run` before the
+    // banner prints. The fast-exception flag is a pure perf hint; making
+    // the setter a no-op preserves correctness while sidestepping the
+    // cascading static init failure.
+    let sb2_handler = "org/springframework/boot/loader/jar/Handler";
+    r.register(
+        sb2_handler,
+        "setUseFastConnectionExceptions",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // SB2 LaunchedURLClassLoader.findResource(String): the real impl wraps a
+    // call to super.findResource(name) (real-JDK URLClassLoader) in a
+    // `Handler.setUseFastConnectionExceptions(true) ... (false)` bracket.
+    // With the Handler stub above the bracket is harmless, but the
+    // super.findResource path still walks each URL[] entry through
+    // URLClassPath/URLUtil/URL.getDefaultPort, where a synthetic SB2 nested
+    // jar URL (whose handler field was never populated by URL.<init>)
+    // dereferences a null URLStreamHandler. Spring only calls findResource
+    // here for optional banner.gif/png/jpg lookups (and a few similar
+    // best-effort scans); returning null preserves the "no resource found"
+    // semantics the banner code already handles.
+    let luc = "org/springframework/boot/loader/LaunchedURLClassLoader";
+    r.register(
+        luc,
+        "findResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+}
+
+// =============================================================================
+// JarFile.stream() / .entries() — Spring Boot 3 fat-jar launcher support.
+// Reads the central directory of the JAR backing the synthetic JarFile and
+// builds a synthetic Stream<JarEntry> / Enumeration<JarEntry> populated with
+// 4-field synthetic JarEntry instances (name, size, compressedSize, method).
+// =============================================================================
+
+/// Read the central directory of `path` and return a Vec of allocated
+/// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
+/// any I/O / zip-parse error so callers see an empty Stream rather than
+/// an exception path.
+fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
+    let len = archive.len();
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let (name, size, csize, method) = match archive.by_index(i) {
+            Ok(entry) => {
+                let name = entry.name().to_string();
+                let size = entry.size() as i64;
+                let csize = entry.compressed_size() as i64;
+                #[allow(deprecated)]
+                let method = entry.compression().to_u16() as i32;
+                (name, size, csize, method)
+            }
+            Err(_) => continue,
+        };
+        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+        let name_s = ctx.create_string(&name);
+        ctx.set_field(je, 0, Value::Object(Some(name_s)));
+        ctx.set_field(je, 1, Value::Long(size));
+        ctx.set_field(je, 2, Value::Long(csize));
+        ctx.set_field(je, 3, Value::Int(method));
+        out.push(Value::Object(Some(je)));
+    }
+    out
+}
+
+/// Look up a single entry by name in the JAR at `path`, returning a synthetic
+/// JarEntry or `Value::Object(None)` if missing. Mirrors getEntry but
+/// produces a `java/util/jar/JarEntry` (vs the older `java/util/zip/ZipEntry`).
+fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &str) -> Value {
+    if path.is_empty() || entry_name.is_empty() {
+        return Value::Object(None);
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Value::Object(None),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return Value::Object(None),
+    };
+    let (name, size, csize, method) = match archive.by_name(entry_name) {
+        Ok(entry) => {
+            let name = entry.name().to_string();
+            let size = entry.size() as i64;
+            let csize = entry.compressed_size() as i64;
+            #[allow(deprecated)]
+            let method = entry.compression().to_u16() as i32;
+            (name, size, csize, method)
+        }
+        Err(_) => return Value::Object(None),
+    };
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let name_s = ctx.create_string(&name);
+    ctx.set_field(je, 0, Value::Object(Some(name_s)));
+    ctx.set_field(je, 1, Value::Long(size));
+    ctx.set_field(je, 2, Value::Long(csize));
+    ctx.set_field(je, 3, Value::Int(method));
+    Value::Object(Some(je))
+}
+
+fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let path = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let elems = p59_jar_collect_entries(ctx, &path);
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFile.stream() path={:?} entries={}", path, elems.len());
+    }
+    Ok(Some(Value::Object(Some(p56_build_stream(
+        ctx,
+        elems,
+        "java/util/stream/Stream",
+    )))))
+}
+
+/// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
+/// the central directory, build URL set for `BOOT-INF/classes/` (always
+/// included) plus every `BOOT-INF/lib/*.jar` entry.
+///
+/// Real-bytecode stream pipeline:
+///   `jarFile.stream().map(JarArchiveEntry::new).filter(p1).map(this::getNestedJarUrl).collect(toCollection(LinkedHashSet::new))`
+///
+/// Replacing it with a single native that materialises the URL set directly
+/// avoids the dependency on `Stream.map / Stream.filter / Stream.collect`
+/// (whose synthetic-Stream implementation does not support arbitrary
+/// `Function` / `Predicate` lambdas yet) and on `Collectors.toCollection`.
+fn p59_spring_boot_jar_archive_get_class_path_urls(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // JarFileArchive layout: field 0 = file (java.io.File), field 1 = jarFile.
+    // Both `file_read_path` and JarFile field 0 store the path string, so
+    // either route gets us the absolute path on disk.
+    let file_obj = ctx.get_field(this, 0);
+    let jar_path = match file_obj {
+        Value::Object(Some(file_ref)) => {
+            // File.field 0 = path String (set in register_phase57_file).
+            match ctx.get_field(file_ref, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}", jar_path);
+    }
+
+    // Collect all BOOT-INF/lib/*.jar entry names from the central directory.
+    let mut urls: Vec<Value> = Vec::new();
+
+    // Always include BOOT-INF/classes/ as the first classpath URL.
+    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
+    let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
+    let classes_url = p59_alloc_url(ctx, &classes_url_str);
+    urls.push(Value::Object(Some(classes_url)));
+
+    if !jar_path.is_empty() {
+        if let Ok(file) = std::fs::File::open(&jar_path) {
+            if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                for i in 0..archive.len() {
+                    if let Ok(entry) = archive.by_index(i) {
+                        let name = entry.name().to_string();
+                        if name.starts_with("BOOT-INF/lib/")
+                            && name.ends_with(".jar")
+                        {
+                            let url_str = format!(
+                                "jar:nested:/{jar_uri_path}/!{name}!/"
+                            );
+                            let url = p59_alloc_url(ctx, &url_str);
+                            urls.push(Value::Object(Some(url)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls", urls.len());
+    }
+
+    // Build a 2-field synthetic ArrayList (backing-array, size). The bytecode
+    // declares `Set` as the return type but only ever calls
+    // `Collection.toArray(Object[])` on it, which is implemented by
+    // ArrayList via `native_collections`. Returning ArrayList sidesteps
+    // the synthetic-HashSet layout drift between `phases_early::Set.of`
+    // (3-field) and `native_collections::HashSet` (1-field).
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    for (i, v) in urls.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(urls.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Resolve the on-disk fat-jar path of a Spring Boot 2 launcher instance.
+///
+/// The launcher's `this.archive` field is left null in our impl (its SB2
+/// `JarFileArchive` ctor depends on plumbing we don't fully implement), so
+/// instead of dereferencing it we re-derive the fat-jar path by asking the
+/// classpath where the launcher's own subclass was loaded from. For
+/// `--jar foo.jar` mode this yields `foo.jar`; for exploded layouts it
+/// yields the directory root which the caller must filter out via
+/// `isExploded()`.
+fn sb2_launcher_jar_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let cid = ctx.class_id_of_object(this);
+    let class_name = ctx.class_name_of_id(cid)?;
+    ctx.find_class_source_path(&class_name)
+}
+
+/// Read the Start-Class manifest entry from the fat-jar and return it as a
+/// String. Falls back to "Main-Class" if Start-Class is absent (matching the
+/// SB2 launcher's own behaviour on partially-formed manifests).
+fn sb2_read_start_class(jar_path: &str) -> Option<String> {
+    let file = std::fs::File::open(jar_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name("META-INF/MANIFEST.MF").ok()?;
+    use std::io::Read;
+    let mut buf = String::new();
+    entry.read_to_string(&mut buf).ok()?;
+    let mut start_class: Option<String> = None;
+    let mut main_class: Option<String> = None;
+    // Manifest is line-oriented; continuation lines start with a single
+    // space. Spring Boot only writes single-line attributes for these
+    // keys so we skip continuation handling and just split on '\n'.
+    for line in buf.lines() {
+        if let Some(v) = line.strip_prefix("Start-Class: ") {
+            start_class = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Main-Class: ") {
+            main_class = Some(v.trim().to_string());
+        }
+    }
+    start_class.or(main_class)
+}
+
+/// `org/springframework/boot/loader/ExecutableArchiveLauncher.getMainClass()`
+/// — return the `Start-Class` manifest entry from the fat-jar directly,
+/// bypassing the null `this.archive` field. Matches the SB2 launcher's
+/// own contract: throws IllegalStateException when no Start-Class is
+/// declared.
+fn sb2_launcher_get_main_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let jar_path = sb2_launcher_jar_path(ctx, this).unwrap_or_default();
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getMainClass jar_path={:?}", jar_path);
+    }
+    let start_class = sb2_read_start_class(&jar_path);
+    match start_class {
+        Some(name) => Ok(Some(Value::Object(Some(ctx.create_string(&name))))),
+        None => {
+            // Spec-correct behaviour: throw IllegalStateException so callers
+            // see the same surface as a real JDK + valid SB2 launcher.
+            Err(RuntimeError::IllegalStateException {
+                message: format!(
+                    "No 'Start-Class' manifest entry specified in {}",
+                    jar_path
+                ),
+            }
+            .into())
+        }
+    }
+}
+
+/// Build a `JarFileArchive`-shaped result for SB2's `getClassPathArchives*`.
+/// Each element of the returned List/Iterator is an SB2-style nested-archive
+/// stand-in whose only required surface is `getUrl()` returning a `URL`.
+/// We allocate `JarFileArchive` instances and pre-populate slot 1 (the `url`
+/// field per SB2's instance layout) so the launcher's
+/// `createClassLoader(List)` loop receives valid URLs.
+fn sb2_launcher_build_archive_list(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<Value> {
+    let mut archives: Vec<Value> = Vec::new();
+    let jar_path = match sb2_launcher_jar_path(ctx, this) {
+        Some(p) => p,
+        None => return archives,
+    };
+    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
+
+    // Always include BOOT-INF/classes/ as the first classpath URL (matches
+    // SB2 JarLauncher.isNestedArchive's BOOT-INF/classes/ branch).
+    let archive_class = "org/springframework/boot/loader/archive/JarFileArchive";
+    let classes_url_str = format!("jar:file:/{jar_uri_path}!/BOOT-INF/classes!/");
+    let classes_url = p59_alloc_url(ctx, &classes_url_str);
+    let classes_archive = alloc_concurrent_synthetic(ctx, archive_class, 3);
+    // SB2 JarFileArchive layout: 0=jarFile, 1=url, 2=tempUnpackDirectory
+    ctx.set_field(classes_archive, 1, Value::Object(Some(classes_url)));
+    archives.push(Value::Object(Some(classes_archive)));
+
+    if let Ok(file) = std::fs::File::open(&jar_path) {
+        if let Ok(mut zip) = zip::ZipArchive::new(file) {
+            for i in 0..zip.len() {
+                if let Ok(entry) = zip.by_index(i) {
+                    let name = entry.name().to_string();
+                    if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
+                        let url_str = format!("jar:file:/{jar_uri_path}!/{name}!/");
+                        let url = p59_alloc_url(ctx, &url_str);
+                        let nested = alloc_concurrent_synthetic(ctx, archive_class, 3);
+                        ctx.set_field(nested, 1, Value::Object(Some(url)));
+                        archives.push(Value::Object(Some(nested)));
+                    }
+                }
+            }
+        }
+    }
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchives -> {} entries", archives.len());
+    }
+    archives
+}
+
+/// `getClassPathArchives()` — SB2 v1 returns List<Archive>.
+fn sb2_launcher_get_class_path_archives_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let archives = sb2_launcher_build_archive_list(ctx, this);
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, archives.len());
+    for (i, v) in archives.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(archives.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `getClassPathArchivesIterator()` — SB2 v2.3+ returns Iterator<Archive>.
+/// Build the synthetic ArrayList of archives and return an `ArrayList$Itr`
+/// iterator wired up by `native_collections`. The downstream
+/// `Launcher.createClassLoader(Iterator)` only calls `Iterator.hasNext()`
+/// / `Iterator.next()` which the existing collections-crate natives serve.
+fn sb2_launcher_get_class_path_archives_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let archives = sb2_launcher_build_archive_list(ctx, this);
+    // Wrap the archive array in `java/util/Enumeration$Impl` — a synthetic
+    // class with `hasNext`/`next` natives already registered by
+    // `register_enumeration_impl_natives` (layout: field 0 = elements
+    // array, field 1 = cursor). This sidesteps the layout mismatch
+    // between our synthetic `ArrayList$Itr` and real-JDK's
+    // `ArrayList$Itr` (whose `cursor`/`this$0` fields sit at different
+    // slots than our 2-field layout) — JDK bytecode for the iteration
+    // loop dispatches `Iterator.hasNext()` via `invokeinterface`, which
+    // our `try_stackless_invoke` resolves against the receiver's class:
+    // `Enumeration$Impl` has the native registered, so the JDK bytecode
+    // never runs.
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, archives.len());
+    for (i, v) in archives.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries", archives.len());
+    }
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+/// Allocate a 13-field synthetic URL with `protocol`, `host`, `port`, `file`,
+/// `path`, and `full` populated so URL.toString / URL.toURI / URL.getPath
+/// all return the right thing for downstream classpath consumers.
+fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRef {
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+    let proto = if let Some(idx) = full.find(':') {
+        &full[..idx]
+    } else {
+        ""
+    };
+    let rest = if proto.is_empty() {
+        full
+    } else {
+        &full[proto.len() + 1..]
+    };
+    let proto_s = ctx.create_string(proto);
+    let file_s = ctx.create_string(rest);
+    let full_s = ctx.create_string(full);
+    let host_s = ctx.create_string("");
+    ctx.set_field(url, 0, Value::Object(Some(proto_s))); // protocol
+    ctx.set_field(url, 1, Value::Object(Some(host_s)));  // host
+    ctx.set_field(url, 2, Value::Int(-1));                // port
+    ctx.set_field(url, 3, Value::Object(Some(file_s)));  // file
+    ctx.set_field(url, 4, Value::Object(None));           // query
+    // Slot 5 = authority — leave null to satisfy our URL.toString fallback.
+    ctx.set_field(url, 5, Value::Object(Some(full_s)));  // authority/full
+    ctx.set_field(url, 6, Value::Object(Some(file_s)));  // path
+    url
+}
+
+fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let path = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let elems = p59_jar_collect_entries(ctx, &path);
+    // Pack into a 2-field Enumeration synthetic: array=0, cursor=1. The
+    // existing Enumeration.hasMoreElements/nextElement natives walk this
+    // shape (see register_p59_spliterator / Iterator collateral).
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, elems.len());
+    for (i, v) in elems.into_iter().enumerate() {
+        ctx.set_array_element(arr, i, v);
+    }
+    let enumeration = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+    ctx.set_field(enumeration, 0, Value::Object(Some(arr)));
+    ctx.set_field(enumeration, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(enumeration))))
 }
 
 // JarFile = 2-field (name=0 String, manifest=1)
@@ -10465,6 +11250,9 @@ fn p59_jar_file_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     } else {
         String::new()
     };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] JarFile.<init>(File) path={:?}", path);
+    }
     let manifest = p98_read_jar_manifest(ctx, &path);
     ctx.set_field(this, 1, manifest);
     Ok(None)
@@ -11044,6 +11832,25 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         p59_collection_spliterator,
     );
+
+    // S111r12: `HashSet.spliterator()` — JDK bytecode constructs a
+    // `HashMap.KeySpliterator(this.map, ...)` and later does
+    // `getfield m.table` on the wrapped map. With our synthetic HashMap
+    // layout (slot 2 = capacity Int(16)), that read returns `Int(16)` and
+    // `arraylength` on it surfaces as
+    //   `internal error: expected object reference, got int(16)`.
+    // Same family of failure as S111r7 (`System.getenv()` HashMap layout)
+    // and S111r11 (`Properties.size`). Register `HashSet.spliterator()`
+    // as a native that walks the synthetic backing map and returns a
+    // synthetic Spliterator (data_array, cursor) — the existing
+    // `p59_stream_from_spliterator` and `Spliterator.*` natives already
+    // know how to consume that layout.
+    r.register(
+        "java/util/HashSet",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        p59_hashset_spliterator,
+    );
 }
 
 fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11115,6 +11922,58 @@ fn p59_collection_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
     ctx.set_field(spl, 1, Value::Int(0)); // cursor at start
+    Ok(Some(Value::Object(Some(spl))))
+}
+
+/// `HashSet.spliterator()` — bypass the JDK bytecode (which would build a
+/// `HashMap.KeySpliterator(this.map, ...)` and then read `m.table` from
+/// the synthetic backing HashMap, hitting the `int(16)` layout-mismatch).
+/// Snapshot the keys via the synthetic HashMap layout and hand back a
+/// synthetic `(data, cursor)` Spliterator that the rest of the
+/// `Spliterator.*` and `StreamSupport.stream(...)` natives understand.
+fn p59_hashset_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Walk the synthetic HashSet to collect keys. Two layouts in use:
+    //   * Wrapped-HashMap layout: slot 0 = HashMap (`HS_FIELD_MAP`), the
+    //     HashMap holds buckets at slot 0 and each Node has key at slot 0,
+    //     next at slot 3.
+    //   * Legacy 2-field layout: slot 0 = Object[] of keys directly (used by
+    //     some older synthetic builders before the HashMap wrap).
+    let mut keys: Vec<Value> = Vec::new();
+    let slot0 = ctx.get_field(this, 0);
+    if let Value::Object(Some(inner)) = slot0 {
+        // Disambiguate by looking at slot 0 of the inner object. If it's an
+        // array we treat the inner as a HashMap (buckets array). Otherwise
+        // we treat the inner array as the legacy data array.
+        let inner_slot0 = ctx.get_field(inner, 0);
+        if let Value::Object(Some(buckets)) = inner_slot0 {
+            // Wrapped-HashMap path.
+            let n = ctx.array_length(buckets);
+            for i in 0..n {
+                let mut node = ctx.get_array_element(buckets, i);
+                while let Value::Object(Some(node_ref)) = node {
+                    keys.push(ctx.get_field(node_ref, 0));
+                    node = ctx.get_field(node_ref, 3);
+                }
+            }
+        } else {
+            // Legacy direct-array path: `inner` itself is the Object[] data.
+            let n = ctx.array_length(inner);
+            for i in 0..n {
+                keys.push(ctx.get_array_element(inner, i));
+            }
+        }
+    }
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -12451,10 +13310,6 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         let can = ctx.reads_module(&reader, &provider);
         Ok(Some(Value::Int(if can { 1 } else { 0 })))
     });
-
-    // Module.canUse(Class) is registered universally in
-    // `register_essential_natives` (lib.rs) so it is available in BOTH
-    // synthetic-jdk and real-JDK modes. See vm/tests/wave3_console_module.rs.
 
     // Module.addReads(Module) → Module (returns this)
     // Adds a dynamic read edge in the ModuleRegistry.
@@ -34602,23 +35457,39 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
-    // HttpServer = 3-field (address=0, started=1, contexts=2 ArrayList)
+    // Wave 3-B (RE.4): the real HttpServer/HttpExchange implementations live in
+    // `net_phase_e::register_re10_http_server`, which actually binds a TcpListener
+    // and dispatches HTTP/1.1 round-trips. Phase 72 used to register opaque stubs
+    // for the same `(class, method, descriptor)` keys; because Phase 72 runs AFTER
+    // Phase E, those stubs silently overrode the real impls and broke
+    // `URL.openConnection().getInputStream()` round-trips that target a loopback
+    // HttpServer. We keep ONLY the HttpServerImpl alias for `create` (Phase E
+    // registers `HttpServer` but not the impl class), the no-arg `create()`
+    // factory (Phase E only registers the 2-arg form), executor accessors,
+    // bind, removeContext, and the HttpContext / HttpHandler / Headers
+    // helpers that Phase E does not cover.
     let hs = "com/sun/net/httpserver/HttpServer";
     let hs_simple = "com/sun/net/httpserver/HttpServerImpl";
+
+    // HttpServerImpl alias — Phase E registers HttpServer; route the impl class
+    // to the same field layout so that invocations via `HttpServerImpl.create`
+    // do not fall through to a missing-native error.
+    r.register(
+        hs_simple,
+        "create",
+        "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
+        |ctx, _args| {
+            let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
+            ctx.set_field(srv, 1, Value::Int(0));
+            let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
+            ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
+            Ok(Some(Value::Object(Some(srv))))
+        },
+    );
+
+    // No-arg factory not covered by Phase E.
     for cls in [hs, hs_simple] {
-        r.register(
-            cls,
-            "create",
-            "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
-            |ctx, _args| {
-                let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
-                ctx.set_field(srv, 1, Value::Int(0));
-                let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
-                ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
-                Ok(Some(Value::Object(Some(srv))))
-            },
-        );
         r.register(
             cls,
             "create",
@@ -34632,23 +35503,6 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Object(Some(srv))))
             },
         );
-        r.register(cls, "start", "()V", |ctx, args| {
-            ctx.set_field(obj_arg(args, 0)?, 1, Value::Int(1));
-            Ok(None)
-        });
-        r.register(cls, "stop", "(I)V", |ctx, args| {
-            ctx.set_field(obj_arg(args, 0)?, 1, Value::Int(0));
-            Ok(None)
-        });
-        r.register(cls, "createContext", "(Ljava/lang/String;Lcom/sun/net/httpserver/HttpHandler;)Lcom/sun/net/httpserver/HttpContext;",
-            |ctx, args| {
-                let path = args.get(1).copied().unwrap_or(Value::Object(None));
-                let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-                let hctx = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
-                ctx.set_field(hctx, 0, path);
-                ctx.set_field(hctx, 1, handler);
-                Ok(Some(Value::Object(Some(hctx))))
-            });
         r.register(
             cls,
             "createContext",
@@ -34663,16 +35517,9 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         );
         r.register(
             cls,
-            "getAddress",
-            "()Ljava/net/InetSocketAddress;",
-            |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0))),
-        );
-        r.register(
-            cls,
             "setExecutor",
             "(Ljava/util/concurrent/Executor;)V",
             |ctx, args| {
-                // store executor if we have space, otherwise ignore
                 let this = obj_arg(args, 0)?;
                 let _ = (ctx, this);
                 Ok(None)
@@ -34694,20 +35541,12 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        r.register(cls, "removeContext", "(Ljava/lang/String;)V", |_ctx, _args| {
-            // HttpServer.removeContext: unregisters a path mapping. Our HttpServer model
-            // doesn't maintain a context map (handlers are dispatched via direct callback
-            // registration in createContext), so the removal is a logical no-op.
-            Ok(None)
-        });
+        r.register(cls, "removeContext", "(Ljava/lang/String;)V", |_ctx, _args| Ok(None));
         r.register(
             cls,
             "removeContext",
             "(Lcom/sun/net/httpserver/HttpContext;)V",
-            |_ctx, _args| {
-                // Same as above — no context map maintained.
-                Ok(None)
-            },
+            |_ctx, _args| Ok(None),
         );
     }
 
@@ -34740,56 +35579,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(m))))
     });
 
-    // HttpExchange = 6-field (method=0, uri=1, reqHeaders=2, respHeaders=3, reqBody=4, statusCode=5)
+    // HttpExchange method registrations (getRequestMethod, getRequestURI,
+    // getRequestHeaders, getResponseHeaders, getRequestBody, getResponseBody,
+    // sendResponseHeaders, close) are owned by `net_phase_e::register_re10_http_server`,
+    // which routes them through the live HTTP/1.1 dispatch loop. Phase 72 used
+    // to override those keys with naked field accessors that returned null
+    // OutputStreams and never wrote a response — that broke real-server probes.
+    // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
-    r.register(
-        hex,
-        "getRequestMethod",
-        "()Ljava/lang/String;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0))),
-    );
-    r.register(hex, "getRequestURI", "()Ljava/net/URI;", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1)))
-    });
-    r.register(
-        hex,
-        "getRequestHeaders",
-        "()Lcom/sun/net/httpserver/Headers;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2))),
-    );
-    r.register(
-        hex,
-        "getResponseHeaders",
-        "()Lcom/sun/net/httpserver/Headers;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3))),
-    );
-    r.register(
-        hex,
-        "getRequestBody",
-        "()Ljava/io/InputStream;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 4))),
-    );
-    r.register(
-        hex,
-        "getResponseBody",
-        "()Ljava/io/OutputStream;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(hex, "sendResponseHeaders", "(IJ)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let code = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 200,
-        };
-        ctx.set_field(this, 5, Value::Int(code));
-        Ok(None)
-    });
-    r.register(hex, "close", "()V", |_ctx, _args| {
-        // HttpExchange.close() is a request lifecycle hint. Our model doesn't hold
-        // OS-level connection state on the exchange object — the underlying socket
-        // is already closed by the HttpServer dispatch loop after the handler returns.
-        Ok(None)
-    });
     r.register(
         hex,
         "getLocalAddress",
@@ -34809,7 +35606,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
-    // HttpHandler interface
+    // HttpHandler interface (default no-op so abstract dispatch resolves).
     r.register(
         "com/sun/net/httpserver/HttpHandler",
         "handle",
@@ -34877,30 +35674,316 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
-    // W3-A2: ServerSocket / Socket public-API methods are owned by
-    // `native-builtins/src/net_phase_e.rs::register_re1_socket /
-    // register_re2_server_socket`, which uses real OS sockets via
-    // `s2_registry` and ObjectRef-keyed side-tables to bypass the
-    // synthetic-vs-real-JDK field-layout collision.  The stubs that
-    // formerly lived here pre-dated phase E and now collide with it
-    // (registry is last-writer-wins).  We retain only the implAccept
-    // bridge below, which phase E does not register.
-    let _ss = "java/net/ServerSocket";
-    // implAccept is unused: net_phase_e overrides `accept()` at the public
-    // API level, so the bytecode that would have called implAccept never
-    // runs.  Removing the stub here also avoids reading `field 3` which
-    // collides with the real-JDK `closed:boolean` field.
+    // ServerSocket extras — add methods not registered in phase 53
+    let ss = "java/net/ServerSocket";
+    r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let port = match args.get(1) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let backlog = match args.get(2) {
+            Some(Value::Int(i)) => *i,
+            _ => 50,
+        };
+        ctx.set_field(this, 0, Value::Int(port));
+        ctx.set_field(this, 1, Value::Int(backlog));
+        ctx.set_field(this, 2, Value::Int(0));
+        Ok(None)
+    });
+    r.register(ss, "accept", "()Ljava/net/Socket;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
+    r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Channel-backed wrapper (created by ServerSocketChannel.socket()) has a 5th
+        // field holding a back-ref to the SocketChannel. Delegate the bind to the
+        // channel so the underlying TCP listener lives in fd_table (visible to the
+        // selector). For a plain ServerSocket, keep using s2_alloc_listener.
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+                let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+                match ctx.fd_table().open_tcp_listener(&addr_str) {
+                    Ok(fd) => {
+                        ctx.set_field(ssc, 1, Value::Int(1));
+                        ctx.set_field(ssc, 2, Value::Int(fd as i32));
+                        let port = ctx.fd_table().tcp_local_addr(fd)
+                            .ok()
+                            .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
+                            .unwrap_or(0);
+                        ctx.set_field(this, 0, Value::Int(port)); // SS_PORT mirror
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(RuntimeError::IOException {
+                            message: format!("bind {addr_str}: {e}"),
+                        }.into());
+                    }
+                }
+            }
+        }
+        // Plain ServerSocket path — bind a real TcpListener via s2_alloc_listener.
+        use crate::servlet::s2_alloc_listener;
+        use std::net::TcpListener;
+        let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        match TcpListener::bind(&addr_str) {
+            Ok(listener) => {
+                let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                let id = s2_alloc_listener(listener);
+                ctx.set_field(this, 0, Value::Int(actual_port));
+                ctx.set_field(this, 3, Value::Int(id));
+            }
+            Err(e) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("bind {addr_str}: {e}"),
+                }.into());
+            }
+        }
+        Ok(None)
+    });
+    r.register(ss, "bind", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Int(backlog)) = args.get(2) {
+            ctx.set_field(this, 1, Value::Int(*backlog));
+        }
+        // Reuse single-arg bind path
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+                let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+                if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
+                    ctx.set_field(ssc, 1, Value::Int(1));
+                    ctx.set_field(ssc, 2, Value::Int(fd as i32));
+                    let port = ctx.fd_table().tcp_local_addr(fd)
+                        .ok()
+                        .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
+                        .unwrap_or(0);
+                    ctx.set_field(this, 0, Value::Int(port));
+                }
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    });
+    r.register(ss, "getLocalPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // For channel-backed wrappers, recompute from the channel's fd.
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let fd = ctx.get_field(ssc, 2).as_int().unwrap_or(-1);
+                if fd >= 0 {
+                    let port = ctx.fd_table().tcp_local_addr(fd as u32)
+                        .ok()
+                        .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
+                        .unwrap_or(0);
+                    return Ok(Some(Value::Int(port)));
+                }
+            }
+        }
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    r.register(ss, "isBound", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(
+        ss,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        ss,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(ss, "getSoTimeout", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    // ServerSocket setReuseAddress/setReceiveBufferSize: use real socket options
+    // Note: ServerSocket doesn't always have a stream_id, so we track these as fields if needed
+    // For now, these are kept as field-tracking stubs since ServerSocket doesn't expose
+    // the underlying listener to socket2 in the same way as Socket.
+    // Real implementations exist in phases_early.rs for Socket; ServerSocket is less critical.
+    r.register(ss, "implAccept", "(Ljava/net/Socket;)V", |ctx, args| {
+        // Accept a connection on the underlying TcpListener and populate the given
+        // Socket object's stream_id field. This is the JDK-internal hook called by
+        // ServerSocket.accept() to delegate the actual blocking accept.
+        use crate::servlet::{s2_registry, s2_alloc_stream};
+        let this = obj_arg(args, 0)?;
+        let target_socket = match args.get(1) {
+            Some(Value::Object(Some(s))) => *s,
+            _ => return Err(RuntimeError::IOException {
+                message: "implAccept: null socket".into(),
+            }
+            .into()),
+        };
+        let listener_id = ctx.get_field(this, 3).as_int().unwrap_or(-1); // SS_LISTENER_ID
+        if listener_id < 0 {
+            return Err(RuntimeError::IOException {
+                message: "ServerSocket not bound".into(),
+            }
+            .into());
+        }
+        // Block-accept via the s2_registry. Take the listener out, accept on it, put it back.
+        let stream = {
+            let mut reg = s2_registry().lock();
+            let listener = reg.listeners.get(&listener_id).ok_or_else(|| {
+                RuntimeError::IOException {
+                    message: "Listener not found".into(),
+                }
+            })?;
+            match listener.accept() {
+                Ok((stream, _addr)) => stream,
+                Err(e) => return Err(RuntimeError::IOException {
+                    message: format!("accept failed: {}", e),
+                }
+                .into()),
+            }
+        };
+        let stream_id = s2_alloc_stream(stream);
+        // Populate the target Socket's fields. Socket layout: host=0, port=1, localPort=2, closed=3, stream_id=4
+        ctx.set_field(target_socket, 3, Value::Int(0)); // not closed
+        ctx.set_field(target_socket, 4, Value::Int(stream_id));
+        Ok(None)
+    });
 
-    // W3-A2: Socket / ServerSocket public-API natives are owned by
-    // `net_phase_e::register_re1_socket / register_re2_server_socket`.
-    // Stubs that previously stored host/port directly in synthetic field
-    // slots collide with the real-JDK class layout (slot 0 != host on
-    // JDK 25's `Socket`).  Side-tables in net_phase_e make state
-    // layout-independent.  We keep only the secondary Socket extras
-    // below (shutdown, OOB, performance prefs) which net_phase_e doesn't
-    // touch and which are gated on `field 4` only when the side-table-
-    // driven phase E has already populated it.
+    // Socket extras — add methods not registered in phase 53
     let sock = "java/net/Socket";
+    r.register(sock, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let port = match args.get(2) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        ctx.set_field(this, 1, Value::Int(port));
+        ctx.set_field(this, 2, Value::Int(0));
+        ctx.set_field(this, 3, Value::Int(0));
+        Ok(None)
+    });
+    // Socket.bind(SocketAddress) — store the local address.
+    // SocketAddress (InetSocketAddress) field layout: 0=host String, 1=port Int.
+    r.register(sock, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(sa))) = args.get(1) {
+            // Store local port in field 2 (localPort)
+            let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+            ctx.set_field(this, 2, Value::Int(port));
+        }
+        Ok(None)
+    });
+    // Socket.connect(SocketAddress) — extract host/port, connect via std::net::TcpStream.
+    r.register(sock, "connect", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (host, port) = match args.get(1) {
+            Some(Value::Object(Some(sa))) => {
+                let host = match ctx.get_field(*sa, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
+                    _ => "127.0.0.1".into(),
+                };
+                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                (host, port)
+            }
+            _ => return Err(RuntimeError::IOException {
+                message: "Socket.connect: null address".into(),
+            }.into()),
+        };
+        // Connect and register in s2_registry
+        use crate::servlet::{s2_registry, s2_alloc_stream};
+        let addr = format!("{}:{}", host, port);
+        match std::net::TcpStream::connect(&addr) {
+            Ok(stream) => {
+                let stream_id = s2_alloc_stream(stream);
+                // Store host, port, stream_id in Socket fields
+                let host_s = ctx.create_string(&host);
+                ctx.set_field(this, 0, Value::Object(Some(host_s)));
+                ctx.set_field(this, 1, Value::Int(port));
+                ctx.set_field(this, 3, Value::Int(0)); // not closed
+                ctx.set_field(this, 4, Value::Int(stream_id));
+                Ok(None)
+            }
+            Err(e) => Err(RuntimeError::IOException {
+                message: format!("Socket.connect failed: {}", e),
+            }.into()),
+        }
+    });
+    // Socket.connect(SocketAddress, int timeout)
+    r.register(sock, "connect", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (host, port) = match args.get(1) {
+            Some(Value::Object(Some(sa))) => {
+                let host = match ctx.get_field(*sa, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
+                    _ => "127.0.0.1".into(),
+                };
+                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                (host, port)
+            }
+            _ => return Err(RuntimeError::IOException {
+                message: "Socket.connect: null address".into(),
+            }.into()),
+        };
+        let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        use crate::servlet::{s2_registry, s2_alloc_stream};
+        let addr = format!("{}:{}", host, port);
+        let result = if timeout_ms > 0 {
+            // Resolve address and use connect_timeout
+            match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
+                Ok(mut iter) => match iter.next() {
+                    Some(sock_addr) => std::net::TcpStream::connect_timeout(
+                        &sock_addr,
+                        std::time::Duration::from_millis(timeout_ms.max(0) as u64),
+                    ),
+                    None => Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address")),
+                },
+                Err(e) => Err(e),
+            }
+        } else {
+            std::net::TcpStream::connect(&addr)
+        };
+        match result {
+            Ok(stream) => {
+                let stream_id = s2_alloc_stream(stream);
+                let host_s = ctx.create_string(&host);
+                ctx.set_field(this, 0, Value::Object(Some(host_s)));
+                ctx.set_field(this, 1, Value::Int(port));
+                ctx.set_field(this, 3, Value::Int(0));
+                ctx.set_field(this, 4, Value::Int(stream_id));
+                Ok(None)
+            }
+            Err(e) => Err(RuntimeError::IOException {
+                message: format!("Socket.connect failed: {}", e),
+            }.into()),
+        }
+    });
+    r.register(
+        sock,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(sock, "isInputShutdown", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(sock, "isOutputShutdown", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(sock, "isBound", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
     // Socket options (setReuseAddress, setSoLinger, set/getReceiveBufferSize,
     // set/getSendBufferSize, getTcpNoDelay, getKeepAlive, getInputStream, getOutputStream)
     // are registered with REAL implementations in phases_early.rs — not re-registered here.

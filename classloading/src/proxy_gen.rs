@@ -800,8 +800,16 @@ fn emit_proxy_method(
         code.emit_iconst(i as i32);
         match kind {
             DescKind::Int => {
+                // For Z/B/C/S/I we must box via the matching wrapper so the
+                // InvocationHandler.invoke contract delivers the correct
+                // boxed type (`equals(Object)Z` → handler receives Boolean
+                // arg from caller, not Integer). Parse the actual descriptor
+                // byte at this parameter position.
+                let wrapper = int_family_param_wrapper(&m.descriptor, i);
+                let prim_letter = int_family_param_letter(&m.descriptor, i);
                 code.emit_iload(local_slot);
-                let r = cp.add_methodref("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;");
+                let valueof_desc = format!("({prim_letter})L{wrapper};");
+                let r = cp.add_methodref(wrapper, "valueOf", &valueof_desc);
                 code.emit_invokestatic(r);
             }
             DescKind::Long => {
@@ -851,9 +859,26 @@ fn emit_proxy_method(
             code.emit_areturn();
         }
         ReturnKind::Prim(DescKind::Int) => {
-            let cast_idx = cp.add_class("java/lang/Integer");
+            // The InvocationHandler returns a wrapper of the *exact*
+            // declared return type. For `equals(Object)Z` the spec
+            // requires `Boolean` — casting to `Integer` here triggers
+            // ClassCastException at $Proxy<n>.equals (the failure mode
+            // observed when Spring's Binder calls
+            // ObjectUtils.nullSafeEquals on a proxied source). Pick the
+            // wrapper / unboxing helper from the actual return-byte.
+            let bytes = m.descriptor.as_bytes();
+            let close = bytes.iter().position(|&b| b == b')').unwrap_or(0);
+            let ret_byte = *bytes.get(close + 1).unwrap_or(&b'I');
+            let (wrapper, value_method, value_desc) = match ret_byte {
+                b'Z' => ("java/lang/Boolean", "booleanValue", "()Z"),
+                b'B' => ("java/lang/Byte", "byteValue", "()B"),
+                b'C' => ("java/lang/Character", "charValue", "()C"),
+                b'S' => ("java/lang/Short", "shortValue", "()S"),
+                _ => ("java/lang/Integer", "intValue", "()I"),
+            };
+            let cast_idx = cp.add_class(wrapper);
             code.emit_checkcast(cast_idx);
-            let r = cp.add_methodref("java/lang/Integer", "intValue", "()I");
+            let r = cp.add_methodref(wrapper, value_method, value_desc);
             code.emit_invokevirtual(r);
             code.emit_ireturn();
         }
@@ -1044,6 +1069,64 @@ fn emit_clinit(
         max_locals,
         code.bytes,
     )
+}
+
+/// Find the actual descriptor byte for the parameter at logical index
+/// `j` (long/double counted as 1, NOT JVM slots — matches
+/// `descriptor_param_slots` indexing). For reference parameters this
+/// returns `b'L'` or `b'['`; for primitives it returns the canonical
+/// JVMS letter (`B`, `C`, `D`, `F`, `I`, `J`, `S`, `Z`).
+fn descriptor_param_byte_at(desc: &str, j: usize) -> u8 {
+    let bytes = desc.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'(').unwrap_or(0) + 1;
+    let end = bytes
+        .iter()
+        .position(|&b| b == b')')
+        .unwrap_or(bytes.len());
+    let mut i = start;
+    let mut k = 0usize;
+    while i < end {
+        let head = bytes[i];
+        let (_, next) = parse_one_field(desc, i);
+        if k == j {
+            // Walk past array dimensions for the reporting byte. For
+            // primitives `head` already is the canonical letter; for
+            // reference types we return `L`.
+            return head;
+        }
+        i = next;
+        k += 1;
+    }
+    b'I'
+}
+
+/// Wrapper class for an `Int`-family parameter at logical index `j` in
+/// `desc`. Used by `emit_proxy_method` so a `Z` param boxes via
+/// `Boolean.valueOf(Z)Boolean` rather than the wrong
+/// `Integer.valueOf(I)Integer`.
+fn int_family_param_wrapper(desc: &str, j: usize) -> &'static str {
+    match descriptor_param_byte_at(desc, j) {
+        b'B' => "java/lang/Byte",
+        b'C' => "java/lang/Character",
+        b'I' => "java/lang/Integer",
+        b'S' => "java/lang/Short",
+        b'Z' => "java/lang/Boolean",
+        _ => "java/lang/Integer",
+    }
+}
+
+/// JVMS letter for an `Int`-family parameter at logical index `j`. Used
+/// to assemble the matching `valueOf` descriptor (e.g. `(Z)` for a
+/// `boolean` param).
+fn int_family_param_letter(desc: &str, j: usize) -> &'static str {
+    match descriptor_param_byte_at(desc, j) {
+        b'B' => "B",
+        b'C' => "C",
+        b'I' => "I",
+        b'S' => "S",
+        b'Z' => "Z",
+        _ => "I",
+    }
 }
 
 /// Map descriptor letter at parameter position `j` (in descriptor `desc`)

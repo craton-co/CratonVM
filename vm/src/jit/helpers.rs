@@ -792,6 +792,59 @@ thread_local! {
 /// Invocation threshold for triggering JIT compilation from the dispatch helper.
 const DISPATCH_JIT_THRESHOLD: u32 = 500;
 
+/// S112r9 — JIT dispatch error handler. When a JIT-dispatched callee returns
+/// an error, route it through `JIT_PENDING_EXCEPTION` so the interpreter's
+/// post-JIT exception-routing path can find a handler (or propagate to the
+/// top of the JVM with a printable message).
+///
+/// Previously only `MethodCallFailed::ExceptionThrown` was captured, and
+/// `MethodCallFailed::InternalError` was silently dropped — the JIT helper
+/// returned 0/null to the JIT caller, which would proceed as if the call
+/// returned a benign null. That was the root cause of Spring Boot 3 fat-jars
+/// exiting silently with rc=0 between `prepareEnvironment` and `printBanner`:
+/// some downstream invoke produced an `InternalError` ("method has no Code
+/// attribute" or similar linkage gap), the JIT swallowed it, the JIT'd
+/// `prepareEnvironment` continued with corrupt state and returned, then the
+/// caller `run()` returned cleanly without ever reaching `printBanner`.
+///
+/// Wrapping the InternalError in a Java `java/lang/InternalError` gives the
+/// VM a real Throwable to walk through exception tables. If the heap is
+/// exhausted or the class can't be loaded, we fall back to leaving the
+/// error unstored — the original "swallow and return 0" behaviour. That
+/// keeps this purely additive: it never makes a previously-working scenario
+/// worse, only converts silent rc=0 into a visible stack trace.
+fn handle_jit_dispatch_error(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+    info: &JitInvokeInfo,
+) {
+    use crate::error::MethodCallFailed;
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => {
+            set_jit_pending_exception(exc);
+        }
+        MethodCallFailed::InternalError(vm_err) => {
+            // Format a message that points at the failing dispatch site so
+            // the user can see WHICH callee blew up. This is the difference
+            // between a silent rc=0 and a visible "Exception in thread main"
+            // for Spring Boot.
+            let msg = format!(
+                "JIT dispatch into {}.{}{} failed: {}",
+                info.class_name, info.method_name, info.descriptor, vm_err,
+            );
+            // Try to wrap in a Java `InternalError`; on any allocation /
+            // load failure, fall through to the legacy silent drop so we
+            // never make things worse than before this fix.
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm, thread, "java/lang/InternalError", Some(&msg),
+            ) {
+                set_jit_pending_exception(exc);
+            }
+        }
+    }
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo (heap-allocated, outlives this call).
 // args_ptr/num_args form a valid i64 slice of JIT-encoded arguments.
@@ -1079,20 +1132,74 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 _ => return 0,
             };
             let method_args: Vec<Value> = values[1..].to_vec();
-            let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
-            use crate::native::registry::NativeContext;
-            match ctx.invoke_virtual(
-                receiver_ref,
-                info.method_name,
-                info.descriptor,
-                &method_args,
-            ) {
+            let virt_result = {
+                let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
+                use crate::native::registry::NativeContext;
+                ctx.invoke_virtual(
+                    receiver_ref,
+                    info.method_name,
+                    info.descriptor,
+                    &method_args,
+                )
+            };
+            match virt_result {
                 Ok(v) => v,
                 Err(e) => {
-                    if let crate::error::MethodCallFailed::ExceptionThrown(exc) = e {
-                        set_jit_pending_exception(exc);
+                    // S111r12 — JIT virtual-dispatch rescue: when the
+                    // receiver's `class_id_of` returns a stub class
+                    // (e.g. `java/lang/Comparable` for a malformed
+                    // ClassLoader instance) that doesn't declare the
+                    // CP-resolved method, `invoke_virtual` raises
+                    // `NoSuchMethodError`. The CP method-ref class
+                    // carried in `info.class_name` (e.g.
+                    // `java/lang/ClassLoader`) is the spec-correct
+                    // resolution target — retry the dispatch through
+                    // it. Mirrors the S111r10 receiver-walk fallback
+                    // for invokeinterface and the S111r8 cid=0 →
+                    // CP-class fallback in `execute_invoke`.
+                    let is_nsme = matches!(
+                        &e,
+                        crate::error::MethodCallFailed::InternalError(
+                            crate::error::VmError::Linkage(
+                                crate::error::LinkageError::NoSuchMethodError { .. },
+                            ),
+                        ),
+                    );
+                    if is_nsme && !info.class_name.is_empty() {
+                        let recv_cid = vm.heap.class_id_of(receiver_ref);
+                        let recv_name_opt = {
+                            let cm = vm.class_manager.read();
+                            cm.get_class(recv_cid)
+                                .map(|c| c.name.to_string())
+                        };
+                        let cp_differs = recv_name_opt
+                            .as_deref()
+                            .map(|n| n != info.class_name)
+                            .unwrap_or(true);
+                        if cp_differs {
+                            let r = crate::vm::invoke_or_native(
+                                vm,
+                                thread,
+                                info.class_name,
+                                info.method_name,
+                                info.descriptor,
+                                &values,
+                            );
+                            match r {
+                                Ok(v) => v,
+                                Err(e2) => {
+                                    handle_jit_dispatch_error(vm, thread, e2, info);
+                                    return 0;
+                                }
+                            }
+                        } else {
+                            handle_jit_dispatch_error(vm, thread, e, info);
+                            return 0;
+                        }
+                    } else {
+                        handle_jit_dispatch_error(vm, thread, e, info);
+                        return 0;
                     }
-                    return 0;
                 }
             }
         }
@@ -1108,9 +1215,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             match r {
                 Ok(v) => v,
                 Err(e) => {
-                    if let crate::error::MethodCallFailed::ExceptionThrown(exc) = e {
-                        set_jit_pending_exception(exc);
-                    }
+                    handle_jit_dispatch_error(vm, thread, e, info);
                     return 0;
                 }
             }
@@ -1275,18 +1380,43 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
         }
 
-        let result = crate::vm::invoke_or_native(
+        let invoke_res = crate::vm::invoke_or_native(
             vm,
             thread,
             &class_name,
             info.method_name,
             info.descriptor,
             &full_args,
-        )
-        .unwrap_or_else(|e| {
-            tracing::error!("JIT virtual MIC dispatch error: {:?}", e);
-            None
-        });
+        );
+        // S111r12 — JIT MIC fast-path rescue: same CP-class fallback
+        // as the cache-miss branch below (see comment there).
+        let result = match invoke_res {
+            Ok(v) => v,
+            Err(crate::error::MethodCallFailed::InternalError(
+                crate::error::VmError::Linkage(
+                    crate::error::LinkageError::NoSuchMethodError { .. },
+                ),
+            )) if !info.class_name.is_empty()
+                && &*class_name != info.class_name =>
+            {
+                crate::vm::invoke_or_native(
+                    vm,
+                    thread,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &full_args,
+                )
+                .unwrap_or_else(|e2| {
+                    tracing::error!("JIT MIC fast-path CP-class rescue error: {:?}", e2);
+                    None
+                })
+            }
+            Err(e) => {
+                tracing::error!("JIT virtual MIC dispatch error: {:?}", e);
+                None
+            }
+        };
 
         return match result {
             Some(Value::Int(v)) => v as i64,
@@ -1322,18 +1452,49 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     full_args.push(Value::Object(Some(receiver_ref)));
     full_args.extend_from_slice(&method_args);
 
-    let result = crate::vm::invoke_or_native(
+    let invoke_res = crate::vm::invoke_or_native(
         vm,
         thread,
         &class_name,
         info.method_name,
         info.descriptor,
         &full_args,
-    )
-    .unwrap_or_else(|e| {
-        tracing::error!("JIT virtual MIC dispatch error: {:?}", e);
-        None
-    });
+    );
+    // S111r12 — JIT MIC virtual-dispatch rescue. When the receiver's
+    // runtime class (e.g. `java/lang/Comparable` for a malformed
+    // ClassLoader instance) does not declare the CP-resolved method,
+    // `invoke_or_native` raises `NoSuchMethodError`. The CP method-ref
+    // class carried in `info.class_name` (e.g. `java/lang/ClassLoader`)
+    // is the spec-correct resolution target — retry through it.
+    // Mirrors the S111r10 receiver-walk fallback for invokeinterface
+    // and the S111r8 cid=0 → CP-class fallback in `execute_invoke`.
+    let result = match invoke_res {
+        Ok(v) => v,
+        Err(crate::error::MethodCallFailed::InternalError(
+            crate::error::VmError::Linkage(
+                crate::error::LinkageError::NoSuchMethodError { .. },
+            ),
+        )) if !info.class_name.is_empty()
+            && &*class_name != info.class_name =>
+        {
+            crate::vm::invoke_or_native(
+                vm,
+                thread,
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+                &full_args,
+            )
+            .unwrap_or_else(|e2| {
+                tracing::error!("JIT MIC CP-class rescue error: {:?}", e2);
+                None
+            })
+        }
+        Err(e) => {
+            tracing::error!("JIT virtual MIC dispatch error: {:?}", e);
+            None
+        }
+    };
 
     match result {
         Some(Value::Int(v)) => v as i64,

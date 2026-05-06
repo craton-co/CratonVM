@@ -1086,11 +1086,15 @@ fn run() -> Result<()> {
                     .get_class(cid).map(|c| c.name.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 // Find fields by name so we work regardless of layout.
-                let (msg_idx, cause_idx, stack_idx) = {
+                // Also probe `target` (used by InvocationTargetException
+                // in lieu of Throwable.cause — see its `getCause()` override)
+                // so that `Caused by:` chains still walk through the wrapper.
+                let (msg_idx, cause_idx, stack_idx, target_idx) = {
                     let cm = vm.shared.class_manager.read();
                     let mut msg_i: Option<usize> = None;
                     let mut cause_i: Option<usize> = None;
                     let mut stack_i: Option<usize> = None;
+                    let mut target_i: Option<usize> = None;
                     // Walk from Throwable down
                     let mut walk = Some(cid);
                     while let Some(k) = walk {
@@ -1108,13 +1112,16 @@ fn run() -> Result<()> {
                                     if &*f.name == "stackTrace" && stack_i.is_none() {
                                         stack_i = Some(abs);
                                     }
+                                    if &*f.name == "target" && target_i.is_none() {
+                                        target_i = Some(abs);
+                                    }
                                     inst += 1;
                                 }
                             }
                             walk = cls.superclass;
                         } else { break; }
                     }
-                    (msg_i, cause_i, stack_i)
+                    (msg_i, cause_i, stack_i, target_i)
                 };
                 let message = if let Some(i) = msg_idx {
                     let v = vm.shared.heap.get_field(cur, i);
@@ -1236,16 +1243,31 @@ fn run() -> Result<()> {
                     }
                 }
 
-                // Follow cause
-                if let Some(i) = cause_idx {
-                    let v = vm.shared.heap.get_field(cur, i);
-                    if let Value::Object(Some(c)) = v {
-                        // Same object as self (Throwable default) — stop
-                        if c == cur { break; }
-                        cur = c;
-                        prefix = "Caused by:";
-                        continue;
+                // Follow cause. Throwable.cause is the canonical chain link,
+                // but InvocationTargetException stores the wrapped exception
+                // in its own `target` field and its `getCause()` override
+                // returns that — so the heap-level `cause` is null/self while
+                // the real cause lives in `target`. Probe both.
+                let next_cause = {
+                    let mut next = None;
+                    if let Some(i) = cause_idx {
+                        if let Value::Object(Some(c)) = vm.shared.heap.get_field(cur, i) {
+                            if c != cur { next = Some(c); }
+                        }
                     }
+                    if next.is_none() {
+                        if let Some(i) = target_idx {
+                            if let Value::Object(Some(t)) = vm.shared.heap.get_field(cur, i) {
+                                if t != cur { next = Some(t); }
+                            }
+                        }
+                    }
+                    next
+                };
+                if let Some(c) = next_cause {
+                    cur = c;
+                    prefix = "Caused by:";
+                    continue;
                 }
                 let _ = depth;
                 break;

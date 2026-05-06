@@ -849,9 +849,26 @@ impl SharedVm {
                 rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+                // Wave 1 / Task A: per-pool / per-manager MXBean natives
+                // so ManagementFactory.getXxxMXBeans() returns at least
+                // one usable bean per type (not just empty arrays).
+                rustjvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+                rustjvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
                 rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
+                // Spring Boot 2.x fat-jars: SLF4J 1.7's MDC.<clinit> /
+                // LoggerFactory.<clinit> call StaticMDCBinder.getSingleton()
+                // / StaticLoggerBinder.getSingleton() which only resolve
+                // when an SLF4J impl JAR (slf4j-log4j12, logback-classic,
+                // slf4j-simple, ...) is on the runtime classpath. Boot's
+                // nested BOOT-INF/lib/ visibility makes those JARs invisible
+                // to our class loader, so the static call site raises
+                // NoSuchMethodError → JIT linkage error and the boot dies.
+                // Register synthetic singletons + a no-op BasicMDCAdapter so
+                // <clinit> completes; the existing MDC / Logger natives
+                // already cover the actual API surface.
+                rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
         }
@@ -864,6 +881,93 @@ impl SharedVm {
             // C4: BootLoader natives (see comment at first registration site above).
             rustjvm_native_builtins::boot_loader::register_boot_loader_natives(&mut native_methods);
             rustjvm_native_builtins::phases_late::register_phase57_nio_file(&mut native_methods);
+            // Spring Boot 3.2 fat-jar launcher needs File.<init>(String) to
+            // normalise URI-style `/<drive>:/...` paths so the round-trip
+            // `URL.toURI().getSchemeSpecificPart() -> new File(...)` lands on
+            // an existing path. The real-JDK File constructor invokes
+            // FileSystem.normalize via bytecode that doesn't run cleanly in
+            // our interpreter (no `WinNTFileSystem.normalize` native
+            // override), so route File constructors and metadata accessors
+            // through our Rust natives in `register_phase57_file`. Paired
+            // with the `check_override` allow-list entry for `java/io/File`.
+            rustjvm_native_builtins::phases_late::register_phase57_file(&mut native_methods);
+            // Spring Boot 3.2: JarFileArchive.<init> opens the fat-jar via
+            // `new JarFile(File)` and immediately calls `jarFile.stream()`
+            // / `jarFile.getManifest()` to walk `BOOT-INF/lib/*.jar`. The
+            // real-JDK ZipFile bytecode reaches into native primitives we
+            // don't wire up, so route JarFile constructors and accessors
+            // through `register_p59_jar` (which uses the `zip` crate to
+            // open the archive directly). Paired with the `check_override`
+            // allow-list entry for `java/util/jar/JarFile`.
+            rustjvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+            // Spring Boot 3 fat-jar launcher: `Launcher.createClassLoader`
+            // calls `urls.toArray(new URL[0])` on the 67-element URL list
+            // returned by `JarFileArchive.getClassPathUrls`. The real-JDK
+            // bytecode for `ArrayList.toArray(T[])` (and the inherited
+            // `AbstractCollection.toArray(T[])`) takes the
+            // `Arrays.copyOf(elementData, size, a.getClass())` path which
+            // NPEs in our VM because the array-component-type metadata
+            // path on `Object.getClass()` for an array receiver is
+            // incomplete. Register a real-JDK-aware native that reads
+            // `elementData` / `size` by name (so it works against the
+            // real ArrayList field layout, not the synthetic 2-field
+            // stub). Paired with the `check_override` allow-list entry
+            // for `java/util/ArrayList` / `java/util/AbstractCollection`
+            // in `vm_exec.rs`. Synthetic-jdk mode registers the same
+            // native via `register_collections_natives`; this branch
+            // covers the real-JDK path which never calls that bulk
+            // registration.
+            fn real_jdk_to_array_typed(
+                ctx: &mut dyn rustjvm_native_api::NativeContext,
+                args: &[rustjvm_types::Value],
+            ) -> rustjvm_types::error::MethodCallResult {
+                use rustjvm_types::Value;
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let template = args.get(1).copied().unwrap_or(Value::Object(None));
+                // Read fields by name so the same native works for
+                // ArrayList, Vector, CopyOnWriteArrayList, etc. Falls
+                // back to iterator-based copy if the receiver isn't an
+                // ArrayList-shaped object (no elementData).
+                let data = match ctx.get_field_by_name(this, "elementData") {
+                    Value::Object(Some(arr)) => Some(arr),
+                    _ => None,
+                };
+                let size = match ctx.get_field_by_name(this, "size") {
+                    Value::Int(s) => s.max(0) as usize,
+                    _ => 0,
+                };
+                let target = match template {
+                    Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                    _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+                };
+                if let Some(d) = data {
+                    let d_len = ctx.array_length(d);
+                    let copy = size.min(d_len);
+                    for i in 0..copy {
+                        ctx.set_array_element(target, i, ctx.get_array_element(d, i));
+                    }
+                }
+                let target_len = ctx.array_length(target);
+                if target_len > size {
+                    ctx.set_array_element(target, size, Value::Object(None));
+                }
+                Ok(Some(Value::Object(Some(target))))
+            }
+            native_methods.register(
+                "java/util/ArrayList",
+                "toArray",
+                "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                real_jdk_to_array_typed,
+            );
+            native_methods.register(
+                "java/util/AbstractCollection",
+                "toArray",
+                "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                real_jdk_to_array_typed,
+            );
             rustjvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
             rustjvm_native_builtins::register_charset_natives_pub(&mut native_methods);
             rustjvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
@@ -903,9 +1007,17 @@ impl SharedVm {
             rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+            // Wave 1 / Task A: per-pool / per-manager MXBean natives.
+            // See companion call in the synthetic-jdk branch above.
+            rustjvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+            rustjvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
             rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
             rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
+            // SLF4J 1.7 binder stubs — see companion call in the synthetic-jdk
+            // branch above for the rationale (Spring Boot 2.x fat-jar
+            // <clinit> survival).
+            rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support
@@ -989,6 +1101,17 @@ impl SharedVm {
         sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("stdout.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("stderr.encoding".to_string(), "UTF-8".to_string());
+        // Session 108 (Cluster D v2 — Console.<clinit> companion fix):
+        // `java/io/Console.<clinit>` calls
+        // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)`. The
+        // 2-arg `forName` only catches `IllegalCharsetNameException`, NOT the
+        // `IllegalArgumentException("Null charset name")` that
+        // `Charset.lookup(null)` throws — so a null property here trips the
+        // Console.<clinit> swallow we observed in Session 108. The
+        // `stdin.encoding` key was missing from the bootstrap seed (only
+        // `stdout.encoding` / `stderr.encoding` were pinned). Mirror what
+        // HotSpot's launcher native code does: pin to UTF-8 unconditionally.
+        sys_props.insert("stdin.encoding".to_string(), "UTF-8".to_string());
 
         // Force BufferedInputStream/etc. to use synchronized blocks instead
         // of InternalLock/ReentrantLock. This avoids potential issues with

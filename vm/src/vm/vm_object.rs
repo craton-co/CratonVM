@@ -221,10 +221,20 @@ fn read_java_string_inner(heap: &VmHeap, obj_ref: ObjectRef, _compact_override: 
             }
         }
         _ => {
-            // Unknown array type — try legacy bulk read as fallback
-            let utf16 = heap.read_char_array_bulk(value_array);
-            if utf16.is_empty() { return None; }
-            Some(String::from_utf16_lossy(&utf16))
+            // Field 0 is an array but it's neither a char[] nor a byte[].
+            // This means `obj_ref` is NOT a java.lang.String — it's some
+            // other class that happens to have a non-string array in its
+            // first field (e.g. Guava's ImmutableList where field 0 is the
+            // backing Object[] of elements).
+            //
+            // Returning Some(garbage) here causes value_to_string /
+            // invoke_to_string to short-circuit and treat the object as a
+            // pre-decoded String, skipping the toString() virtual call. The
+            // garbage chars come from interpreting the reference array's
+            // raw bytes as UTF-16 code units (Wave 2 string-decode bug).
+            //
+            // Return None so callers fall back to dispatching toString().
+            None
         }
     }
 }
@@ -993,6 +1003,30 @@ mod tests {
         let obj1 = create_java_string(&shared, "same");
         let obj2 = create_java_string(&shared, "same");
         assert_eq!(obj1.as_ptr(), obj2.as_ptr());
+    }
+
+    /// Wave 2 (S108) regression: a non-String object whose `field 0` holds an
+    /// `Object[]` (Reference array) — e.g. Guava's `ImmutableList` or any
+    /// collection backing — must NOT short-circuit `read_java_string` into
+    /// returning `Some(garbage)`. Returning `Some(_)` would tell callers
+    /// "this is already a String" and skip the proper `toString()` virtual
+    /// dispatch, producing the `xs=㊘粹ƈ` mojibake the S107 GuavaTest hit.
+    /// The fix returns `None` for any non-Char/Byte array element type so
+    /// callers fall through to the toString() path.
+    #[test]
+    fn read_string_returns_none_for_reference_array_field() {
+        let shared = test_shared();
+        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let elem_a = shared.heap.alloc_object(ClassId::new(0), 0);
+        let elem_b = shared.heap.alloc_object(ClassId::new(0), 0);
+        let elem_c = shared.heap.alloc_object(ClassId::new(0), 0);
+        let arr = shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
+        shared.heap.set_array_element(arr, 0, Value::Object(Some(elem_a))).unwrap();
+        shared.heap.set_array_element(arr, 1, Value::Object(Some(elem_b))).unwrap();
+        shared.heap.set_array_element(arr, 2, Value::Object(Some(elem_c))).unwrap();
+        shared.heap.set_field(obj, 0, Value::Object(Some(arr)));
+        // Pre-fix this returned Some(garbage); post-fix must return None.
+        assert_eq!(read_java_string(&shared.heap, obj), None);
     }
 
     // -----------------------------------------------------------------------

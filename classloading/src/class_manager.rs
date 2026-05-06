@@ -942,6 +942,80 @@ impl ClassManager {
             "java/util/concurrent/Phaser",
         ];
 
+        // Tier 4b: Inner-class views of core collections.
+        // These are not loaded automatically because their outer class's
+        // <clinit> doesn't reference them; they're allocated on-demand by
+        // bytecode like `HashMap.keySet()` which calls `new KeySet()`. If
+        // they're not bootstrapped, the views land with cid=0 and
+        // class_id_of() reports `java/lang/Object`, breaking virtual
+        // dispatch on `iterator()`, `size()`, `contains()`, etc.
+        // (S111r8 — fixes Spring Boot fat-jar boot which iterates env-var
+        // keysets via the URLClassLoader path.)
+        let view_classes = [
+            // HashMap views and iterators
+            "java/util/HashMap$Node",
+            "java/util/HashMap$TreeNode",
+            "java/util/HashMap$KeySet",
+            "java/util/HashMap$Values",
+            "java/util/HashMap$EntrySet",
+            "java/util/HashMap$HashIterator",
+            "java/util/HashMap$KeyIterator",
+            "java/util/HashMap$ValueIterator",
+            "java/util/HashMap$EntryIterator",
+            "java/util/HashMap$KeySpliterator",
+            "java/util/HashMap$ValueSpliterator",
+            "java/util/HashMap$EntrySpliterator",
+            // LinkedHashMap views and iterators
+            "java/util/LinkedHashMap$Entry",
+            "java/util/LinkedHashMap$LinkedKeySet",
+            "java/util/LinkedHashMap$LinkedValues",
+            "java/util/LinkedHashMap$LinkedEntrySet",
+            "java/util/LinkedHashMap$LinkedHashIterator",
+            "java/util/LinkedHashMap$LinkedKeyIterator",
+            "java/util/LinkedHashMap$LinkedValueIterator",
+            "java/util/LinkedHashMap$LinkedEntryIterator",
+            // ConcurrentHashMap views and iterators
+            "java/util/concurrent/ConcurrentHashMap$Node",
+            "java/util/concurrent/ConcurrentHashMap$TreeNode",
+            "java/util/concurrent/ConcurrentHashMap$TreeBin",
+            "java/util/concurrent/ConcurrentHashMap$KeySetView",
+            "java/util/concurrent/ConcurrentHashMap$ValuesView",
+            "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+            "java/util/concurrent/ConcurrentHashMap$Traverser",
+            "java/util/concurrent/ConcurrentHashMap$BaseIterator",
+            "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+            "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+            "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+            // TreeMap views and iterators
+            "java/util/TreeMap$Entry",
+            "java/util/TreeMap$KeySet",
+            "java/util/TreeMap$Values",
+            "java/util/TreeMap$EntrySet",
+            "java/util/TreeMap$NavigableSubMap",
+            "java/util/TreeMap$AscendingSubMap",
+            "java/util/TreeMap$DescendingSubMap",
+            "java/util/TreeMap$PrivateEntryIterator",
+            "java/util/TreeMap$EntryIterator",
+            "java/util/TreeMap$KeyIterator",
+            "java/util/TreeMap$ValueIterator",
+            "java/util/TreeMap$DescendingKeyIterator",
+            // ArrayList iterator
+            "java/util/ArrayList$Itr",
+            "java/util/ArrayList$ListItr",
+            "java/util/ArrayList$SubList",
+            // LinkedList iterator
+            "java/util/LinkedList$Node",
+            "java/util/LinkedList$ListItr",
+            "java/util/LinkedList$DescendingIterator",
+            // HashSet/LinkedHashSet/TreeSet share Map's views internally
+            // but Hashtable has its own.
+            "java/util/Hashtable$Entry",
+            "java/util/Hashtable$KeySet",
+            "java/util/Hashtable$ValueCollection",
+            "java/util/Hashtable$EntrySet",
+            "java/util/Hashtable$Enumerator",
+        ];
+
         // Tier 5: Functional interfaces and streams
         let functional_classes = [
             "java/util/function/Function",
@@ -1073,6 +1147,7 @@ impl ClassManager {
             .chain(extended_classes.iter())
             .chain(exception_classes.iter())
             .chain(collections_classes.iter())
+            .chain(view_classes.iter())
             .chain(functional_classes.iter())
             .chain(io_classes.iter())
             .chain(internal_classes.iter())
@@ -1168,6 +1243,22 @@ impl ClassManager {
             Ok((bytes, loader_id)) => {
                 // Parse and register with the loader that found it
                 self.define_class(name, &bytes, loader_id)
+            }
+            Err(_) if is_jboss_logging_locale_lookup(name) => {
+                // S-trinity #3: JBoss Logging i18n probes locale-specific
+                // implementation classes (`_$logger_<locale>` /
+                // `_$bundle_<locale>`) inside a try/catch
+                // (ClassNotFoundException) and falls back to the locale-less
+                // `_$logger` / `_$bundle` when the probe fails. Our
+                // `is_jdk_class("org/jboss/...")` returns true for these
+                // names, so without this branch we would synthesize a stub
+                // — and `create_synthetic_stub`'s heuristic flags any
+                // name containing `$` as an interface, which then fails
+                // `Class.asSubclass(ServerLogger.class)` with a CCE that
+                // escapes the JBoss-Logging CNFE catch.
+                Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                    class_name: name.to_string(),
+                }))
             }
             Err(_) if is_jdk_class(name) => {
                 // JDK class not found as a .class file — create a synthetic stub.
@@ -1376,6 +1467,29 @@ impl ClassManager {
         // Compute field layout
         let (first_field_index, num_total_fields) =
             compute_field_layout(&class_file.fields, superclass_id, &self.class_store);
+
+        // Wave 3-B (RE.4): some real-JDK classes (e.g. java.net.InetSocketAddress
+        // = 1 instance field `holder`) have a much smaller declared field count
+        // than the synthetic-mode field layout used by `native-builtins`. Native
+        // `<init>` methods write to the synthetic indices; without padding the
+        // object would lack slots for those writes (panic on set_field) or the
+        // slots would never be allocated (so reads see uninitialised slots and
+        // misreport as e.g. `port is not an int`). Pad with the larger of the
+        // declared count and the synthetic stub layout.
+        let stub_fields = synthetic_stub_fields(name);
+        let stub_instance_count = stub_fields
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        let stub_parent_fields = match superclass_id {
+            Some(super_id) => self
+                .class_store
+                .get(super_id)
+                .map_or(0, |c| c.num_total_fields),
+            None => 0,
+        };
+        let stub_total = stub_parent_fields + stub_instance_count;
+        let num_total_fields = num_total_fields.max(stub_total);
 
         // Build the runtime Class
         let id = self.class_store.next_id();
@@ -2702,7 +2816,20 @@ impl ClassManager {
         let iface_names = jdk_interfaces(name).to_vec();
 
         let id = self.class_store.next_id();
-        let access_flags = if name.contains("$") || name.ends_with("able") {
+        // S-trinity #1: the `$`-name-as-interface heuristic misclassifies
+        // concrete inner classes. Carve out the JDK loader chain
+        // (`ClassLoaders$AppClassLoader` etc.) which is concrete; without
+        // this exception, `alloc_classloader` produces objects whose
+        // class chain has the INTERFACE bit set, and downstream
+        // `(ClassLoader) priv.run()` checkcasts fail.
+        let is_concrete_dollar_class = matches!(
+            name,
+            "jdk/internal/loader/ClassLoaders$AppClassLoader"
+                | "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
+        );
+        let access_flags = if (name.contains("$") && !is_concrete_dollar_class)
+            || name.ends_with("able")
+        {
             // Likely an interface (Serializable, Comparable, Iterable, etc.)
             ClassAccessFlags::PUBLIC | ClassAccessFlags::INTERFACE | ClassAccessFlags::ABSTRACT
         } else {
@@ -3001,6 +3128,25 @@ impl ClassManager {
         let (first_field_index, num_total_fields) =
             compute_field_layout(&class_file.fields, superclass_id, &self.class_store);
 
+        // Wave 3-B (RE.4): pad to the synthetic stub field count when defined
+        // (mirrors `define_class_with_options`). Required for classes that are
+        // upgraded from a synthetic stub but whose real bytecode field count
+        // is smaller than the synthetic-mode layout used by native helpers.
+        let stub_fields_for_pad = synthetic_stub_fields(name);
+        let stub_instance_count_for_pad = stub_fields_for_pad
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        let stub_parent_fields_for_pad = match superclass_id {
+            Some(super_id) => self
+                .class_store
+                .get(super_id)
+                .map_or(0, |c| c.num_total_fields),
+            None => 0,
+        };
+        let stub_total_for_pad = stub_parent_fields_for_pad + stub_instance_count_for_pad;
+        let num_total_fields = num_total_fields.max(stub_total_for_pad);
+
         // Extract source file
         let source_file = class_file.source_file().map(|s| s.to_string());
 
@@ -3215,21 +3361,25 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl" =>
             "java/util/concurrent/atomic/AtomicLongFieldUpdater",
 
-        // Block 2C — `org.jboss.logmanager.LogManager` extends
-        // `java.util.logging.LogManager`. The JDK `LogManager.<clinit>`
-        // bytecode does `clz.newInstance()` then `checkcast` to
-        // `java.util.logging.LogManager`; the cast only succeeds when the
-        // synthetic stub's superclass chain reaches the JDK class. Without
-        // this entry, KC16 boot prints
-        //   `WARNING: Failed to load the specified log manager class
-        //    org.jboss.logmanager.LogManager`
-        // and falls back to the default `java.util.logging.LogManager`,
-        // silently dropping every WildFly log line. Pairs with
-        // `native-builtins::logmanager::register_logmanager_natives` which
-        // intercepts the `<init>` so the JBoss ctor's handler-chain wiring
-        // doesn't NPE on our minimal field layout. See WP6.5 / Block 2C.
-        "org/jboss/logmanager/LogManager" => "java/util/logging/LogManager",
-        "java/util/logging/LogManager" => "java/lang/Object",
+        // ---- S-trinity #1: jdk.internal.loader ClassLoader chain.
+        // Without these the synthetic-stub for `ClassLoaders$AppClassLoader`
+        // / `ClassLoaders$PlatformClassLoader` defaults to `java/lang/Object`
+        // as superclass (and worse, the `$` in the name flips the
+        // access-flags heuristic at `class_manager.rs:2803` to mark them
+        // as interfaces). Both effects break
+        // `(ClassLoader) priv.run()` checkcasts in callers like
+        // `LoaderUtil.getClassLoader` because our app-loader instances
+        // (allocated by `alloc_classloader` with class
+        // `jdk/internal/loader/ClassLoaders$AppClassLoader`) end up not
+        // being recognised as a `ClassLoader`.
+        "jdk/internal/loader/ClassLoaders$AppClassLoader"
+        | "jdk/internal/loader/ClassLoaders$PlatformClassLoader" =>
+            "jdk/internal/loader/BuiltinClassLoader",
+        "jdk/internal/loader/BuiltinClassLoader" =>
+            "java/security/SecureClassLoader",
+        "java/security/SecureClassLoader" => "java/lang/ClassLoader",
+        "java/net/URLClassLoader" => "java/security/SecureClassLoader",
+        "java/lang/ClassLoader" => "java/lang/Object",
 
         // Default: everything else extends Object
         _ => "java/lang/Object",
@@ -3307,8 +3457,50 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/function/Predicate$And"
         | "java/util/function/Predicate$Or"
         | "java/util/function/Predicate$Negate" => &["java/util/function/Predicate"],
+
+        // S111r17 — Our internal `AnnotationProxy` must declare
+        // `java.lang.annotation.Annotation` as a superinterface so that
+        // class-graph walks (`is_subclass_of`, `array_is_assignable_to`)
+        // recognise an `[Ljava/lang/annotation/AnnotationProxy;` array as
+        // an `[Ljava/lang/annotation/Annotation;` array.  Spring 5.x
+        // (SB2) `AnnotationUtils.adaptValue` does exactly that
+        // `instanceof [Ljava.lang.annotation.Annotation;` check before
+        // converting nested-annotation arrays to `AnnotationAttributes[]`,
+        // and without the implements-edge the conversion silently
+        // skips, leaving Spring to feed the raw `AnnotationProxy[]`
+        // into `AnnotationAttributes.assertAttributeType` which then
+        // throws `IllegalArgumentException`.
+        "java/lang/annotation/AnnotationProxy" => &["java/lang/annotation/Annotation"],
         _ => &[],
     }
+}
+
+/// Detect JBoss-Logging i18n locale-suffix probes (`_$logger_<locale>` /
+/// `_$bundle_<locale>`).
+///
+/// `Logger.doGetMessageLogger` walks a chain of generated implementation
+/// class names — most-specific locale variant down to the locale-less
+/// `_$logger` / `_$bundle` shipped in the JAR — wrapping each
+/// `Lookup.findClass` in a `try/catch (ClassNotFoundException)`. The
+/// locale-suffixed variants are *intentionally absent*; the catch is the
+/// signal to try the next variant. Without this special-case, our
+/// `is_jdk_class("org/jboss/...")` synthetic-stub fallback would succeed
+/// and the heuristic in `create_synthetic_stub` (treating any `$`-bearing
+/// name as an interface) leads to a `Class.asSubclass` CCE that escapes
+/// the caller's CNFE catch.
+fn is_jboss_logging_locale_lookup(name: &str) -> bool {
+    let suffix_start = name
+        .rfind("_$logger_")
+        .map(|i| i + "_$logger_".len())
+        .or_else(|| name.rfind("_$bundle_").map(|i| i + "_$bundle_".len()));
+    let Some(start) = suffix_start else {
+        return false;
+    };
+    let suffix = &name[start..];
+    !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Check if a class name belongs to the JDK (should get a synthetic stub
@@ -3741,6 +3933,42 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/nio/channels/DatagramChannel" => instance_fields(5),
         // MulticastSocket = 5 (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
         "java/net/MulticastSocket" => instance_fields(5),
+        // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
+        // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
+        // allocates enough slots for the synthetic-mode field layout used by
+        // `native-builtins::net_phase_e`. The real-JDK classes have a much
+        // smaller `num_total_fields` (e.g. InetSocketAddress has 1: holder),
+        // and `upgrade_synthetic_class` preserves max(synthetic, real) so we
+        // get the wider layout once the real bytecode loads.
+        //
+        // InetSocketAddress = 3 (holder=0 InetSocketAddressHolder, port=1 Int, addr=2 InetAddress).
+        // Slot 0 mirrors the real-JDK layout (`private final InetSocketAddressHolder holder`)
+        // so bytecode `getfield holder` sees the holder our synthetic helpers populate.
+        "java/net/InetSocketAddress" => instance_fields(3),
+        // InetSocketAddressHolder = 3 (hostname=0 String, addr=1 InetAddress, port=2 Int).
+        // Wave 3-B² fix for the deeper dispatch bug: `InetSocketAddress.getPort()`
+        // bytecode reads `this.holder` and invokevirtuals `Holder.getPort()` on it,
+        // so the holder's class id MUST be honored — putting a String at slot 0 of
+        // the InetSocketAddress would route the sub-invokevirtual to
+        // `java/lang/String.getPort()` (NoSuchMethodError).
+        "java/net/InetSocketAddress$InetSocketAddressHolder" => instance_fields(3),
+        // InetAddress = 2 (hostName=0 String, address=1 String)
+        "java/net/InetAddress"
+        | "java/net/Inet4Address"
+        | "java/net/Inet6Address" => instance_fields(2),
+        // HttpServer (com.sun.net.httpserver) = 5 (address, started, contexts,
+        // server_id, port) per `net_phase_e::HS_*` constants.
+        "com/sun/net/httpserver/HttpServer"
+        | "com/sun/net/httpserver/HttpServerImpl" => instance_fields(5),
+        // HttpExchange = 8 (method, uri, reqHeaders, respHeaders, reqBody,
+        // statusCode, owner_socket, response_chunks)
+        "com/sun/net/httpserver/HttpExchange" => instance_fields(8),
+        // HttpExchange$ResponseBody = 2 (owner exchange, dummy)
+        "com/sun/net/httpserver/HttpExchange$ResponseBody" => instance_fields(2),
+        // HttpContext = 2 (path, handler)
+        "com/sun/net/httpserver/HttpContext" => instance_fields(2),
+        // Headers = 1 (delegate HashMap)
+        "com/sun/net/httpserver/Headers" => instance_fields(1),
 
         // ---- T19.5: sun.nio.ch.Net TCP cluster ----
         // Layouts shared with `native-io::net::register_sun_nio_ch_net`.

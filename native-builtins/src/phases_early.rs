@@ -4,7 +4,7 @@ use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectRef, Value};
 
-use crate::{native_noop, native_noop_with_this, native_return_false, native_return_zero, obj_arg, alloc_concurrent_synthetic};
+use crate::{native_noop, native_noop_with_this, native_return_false, native_return_zero, obj_arg, alloc_concurrent_synthetic, build_real_layout_string_hashset};
 use crate::{native_return_null, native_return_first_arg};
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
@@ -375,10 +375,10 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(cu, "emptySet", "()Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // S111r7: use the native-collections HashSet layout (single
+        // `map` field holding the backing HashMap) so real-JDK
+        // `HashSet.iterator()` bytecode reads the correct receiver.
+        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(cu, "emptyIterator", "()Ljava/util/Iterator;", |ctx, _args| {
@@ -432,6 +432,37 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(dst))))
     });
+
+    // Arrays.copyOf(Object[], int, Class) → Object[]
+    // Real-JDK `ArrayList.toArray(T[])` calls this 3-arg overload to
+    // produce a new typed array (the runtime class of the supplied
+    // template). We treat the Class arg as advisory metadata only —
+    // every reference array in our heap is the same Object[] kind, and
+    // checkcast at the call site validates the component type. Without
+    // this native the call falls through to bytecode that dereferences
+    // unsupported `arrayClass` reflection internals and NPEs.
+    r.register(
+        arrays,
+        "copyOf",
+        "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
+        |ctx, args| {
+            let src = match args.first() {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let new_len = match args.get(1) {
+                Some(Value::Int(n)) => *n as usize,
+                _ => 0,
+            };
+            let src_len = ctx.array_length(src);
+            let dst = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_len);
+            let copy_len = src_len.min(new_len);
+            for i in 0..copy_len {
+                ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
+            }
+            Ok(Some(Value::Object(Some(dst))))
+        },
+    );
 
     // Arrays.copyOf(int[], int) → int[]
     r.register(arrays, "copyOf", "([II)[I", |ctx, args| {
@@ -923,19 +954,25 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     r.register(li, "copyOf", "(Ljava/util/Collection;)Ljava/util/List;", native_return_first_arg);
 
     // --- Set.of() ---
+    // S111r7: use the native-collections HashSet layout (single `map`
+    // field → backing HashMap) so real-JDK `HashSet.iterator()` /
+    // `AbstractSet.equals()` bytecode finds a HashMap on `getfield map`.
     let si = "java/util/Set";
     r.register(si, "of", "()Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
         Ok(Some(Value::Object(Some(set))))
     });
-    r.register(si, "of", "([Ljava/lang/Object;)Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+    r.register(si, "of", "([Ljava/lang/Object;)Ljava/util/Set;", |ctx, args| {
+        // Materialise the Object[] into a Vec<Value> and let the
+        // shared helper allocate + populate the HashSet.
+        let mut elems: Vec<Value> = Vec::new();
+        if let Some(Value::Object(Some(arr))) = args.first().copied() {
+            let len = ctx.array_length(arr);
+            for i in 0..len {
+                elems.push(ctx.get_array_element(arr, i));
+            }
+        }
+        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(si, "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;", native_return_first_arg);
@@ -1782,25 +1819,34 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     r.register(props, "stringPropertyNames", "()Ljava/util/Set;", |ctx, args| {
+        // S111r11+: collect the keys we need to expose, then return a HashSet
+        // that wraps a real-layout HashMap so JDK-bytecode stream / spliterator
+        // / iterator paths see the layout slots they expect.
+        //
+        // Previous synthetic-2-field (data_array, size) layout broke
+        // `HashSet.spliterator()` (inherited bytecode does
+        // `new HashMap.KeySpliterator<>(this.map, ...)` reading slot 0 as
+        // the wrapped HashMap; later forEachRemaining does
+        // `getfield m.table` which on the synthetic resolved to slot 2
+        // (real HashMap layout) and produced
+        //   `expected object reference, got int(16)`
+        // — same failure pattern S111r7 fixed for `System.getenv()`.
         let this = obj_arg(args, 0)?;
-        let data = match ctx.get_field(this, 0) {
-            Value::Object(Some(d)) => d,
-            _ => {
-                let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-                ctx.set_field(set, 1, Value::Int(0));
-                return Ok(Some(Value::Object(Some(set))));
+        let mut keys: Vec<ObjectRef> = Vec::new();
+        if let Value::Object(Some(data)) = ctx.get_field(this, 0) {
+            let size = match ctx.get_field(this, 1) {
+                Value::Int(s) => s as usize,
+                _ => 0,
+            };
+            for i in 0..size {
+                if let Value::Object(Some(k)) = ctx.get_array_element(data, i * 2) {
+                    keys.push(k);
+                }
             }
-        };
-        let size = match ctx.get_field(this, 1) { Value::Int(s) => s as usize, _ => 0 };
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
-        for i in 0..size {
-            let k = ctx.get_array_element(data, i * 2);
-            ctx.set_array_element(arr, i, k);
         }
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(size as i32));
-        Ok(Some(Value::Object(Some(set))))
+        Ok(Some(Value::Object(Some(build_real_layout_string_hashset(
+            ctx, &keys,
+        )))))
     });
 
     // --- Map.forEach / Map.compute / Map.putIfAbsent (Phase 48) ---
@@ -5187,9 +5233,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             };
             let (done, cached) = fjp_state_get(task);
             if done {
-                if std::env::var("FJPTRACE").is_ok() {
-                    eprintln!("[FJPTRACE] pool.invoke task=0x{:x} done=true cached={:?}", fjp_key(task), cached);
-                }
+                tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), cached = ?cached, "pool.invoke done");
                 return Ok(Some(cached));
             }
             let result = match ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]) {
@@ -5199,9 +5243,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                     Value::Object(None)
                 }
             };
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] pool.invoke task=0x{:x} result={:?}", fjp_key(task), result);
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), result = ?result, "pool.invoke result");
             fjp_state_set_done(task, result);
             Ok(Some(result))
         },
@@ -5219,9 +5261,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] fjt.fork (lazy) task=0x{:x}", fjp_key(this));
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), "fjt.fork (lazy)");
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -5229,16 +5269,12 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, cached) = fjp_state_get(this);
         if done {
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] fjt.join task=0x{:x} cached={:?}", fjp_key(this), cached);
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "fjt.join cached");
             return Ok(Some(cached));
         }
         let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
             .ok().flatten().unwrap_or(Value::Object(None));
-        if std::env::var("FJPTRACE").is_ok() {
-            eprintln!("[FJPTRACE] fjt.join (recompute) task=0x{:x} result={:?}", fjp_key(this), result);
-        }
+        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "fjt.join recompute");
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -5305,9 +5341,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] rt.fork (lazy) task=0x{:x}", fjp_key(this));
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), "rt.fork (lazy)");
             // Lazy: do not eagerly compute. The next `join()` / `get()` /
             // `invoke()` on this task will run `compute()` if not done.
             Ok(Some(Value::Object(Some(this))))
@@ -5317,16 +5351,12 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, cached) = fjp_state_get(this);
         if done {
-            if std::env::var("FJPTRACE").is_ok() {
-                eprintln!("[FJPTRACE] rt.join task=0x{:x} cached={:?}", fjp_key(this), cached);
-            }
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "rt.join cached");
             return Ok(Some(cached));
         }
         let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
             .ok().flatten().unwrap_or(Value::Object(None));
-        if std::env::var("FJPTRACE").is_ok() {
-            eprintln!("[FJPTRACE] rt.join (compute) task=0x{:x} result={:?}", fjp_key(this), result);
-        }
+        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "rt.join compute");
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -13794,18 +13824,6 @@ fn native_chm_tab_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     ctx.monitor_enter(tab);
     let v = ctx.get_array_element(tab, i);
     ctx.monitor_exit(tab);
-    static TA_NULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static TA_NONNULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if matches!(v, Value::Object(None)) {
-        TA_NULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        TA_NONNULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let n_null = TA_NULL.load(std::sync::atomic::Ordering::Relaxed);
-    let n_nn = TA_NONNULL.load(std::sync::atomic::Ordering::Relaxed);
-    if (n_null + n_nn) % 200 == 0 {
-        eprintln!("DEBUG tabAt n_null={} n_nonnull={}", n_null, n_nn);
-    }
     Ok(Some(v))
 }
 
@@ -13835,18 +13853,6 @@ fn native_chm_cas_tab_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_array_element(tab, i, new_val);
     }
     ctx.monitor_exit(tab);
-    static CAS_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static CAS_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if ok {
-        CAS_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        CAS_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let n_ok = CAS_OK.load(std::sync::atomic::Ordering::Relaxed);
-    let n_fail = CAS_FAIL.load(std::sync::atomic::Ordering::Relaxed);
-    if (n_ok + n_fail) % 100 == 0 {
-        eprintln!("DEBUG casTabAt n_ok={} n_fail={}", n_ok, n_fail);
-    }
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 

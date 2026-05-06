@@ -1392,7 +1392,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .set_interrupted_flag(tid, pre_interrupted.clone());
 
         let thread_obj_for_spawn = thread_obj;
-        let handle = std::thread::spawn(move || {
+        // RKC16N.30 — child Java threads need the same 64 MB native stack
+        // that the main-vm thread gets in `vm-cli/src/main.rs`. The default
+        // Rust thread stack (2 MB on Windows) overflows during deeply
+        // recursive Java callees (e.g. BouncyCastle provider self-test
+        // chains thousands of `<clinit>` levels deep, JDK Stream pipeline
+        // composition, recursive parser combinators), and the Windows
+        // SEH-converted SIGSEGV is opaque — no Java stack trace, no panic,
+        // just a process exit code 139. Match the main-vm sizing so any
+        // user `Thread.start()` gets the same headroom as the entry point.
+        // Stack size honours `RUST_MIN_STACK` so callers can override.
+        let child_stack_size = std::env::var("RUST_MIN_STACK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64 * 1024 * 1024);
+        let thread_name_for_builder = name.clone();
+        let handle = std::thread::Builder::new()
+            .name(thread_name_for_builder)
+            .stack_size(child_stack_size)
+            .spawn(move || {
             let mut jvm_thread = JvmThread::new(tid, &name);
             // Use the pre-created shared state
             jvm_thread.park_state = pre_park;
@@ -1434,60 +1452,37 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 &[Value::Object(Some(thread_obj_for_spawn))],
             );
             if let Err(e) = result {
-                // Wave1-C: dispatch the per-Thread (or default)
-                // UncaughtExceptionHandler before dropping the
-                // exception. Without this, code that relies on
-                // `Thread.setUncaughtExceptionHandler(...)` to observe
-                // worker failures (web servers, async pipelines) sees
-                // the exception silently disappear.
-                //
-                // Spec order (Thread.dispatchUncaughtException):
-                //   1. per-instance handler (set via
-                //      `setUncaughtExceptionHandler`),
-                //   2. ThreadGroup.uncaughtException — we approximate
-                //      by falling through to (3),
-                //   3. default handler (set via static
-                //      `setDefaultUncaughtExceptionHandler`).
-                //
-                // We only invoke the handler when `e` carries a Java
-                // throwable (`ExceptionThrown(exc)`). Internal VM
-                // errors keep the existing eprintln so they remain
-                // visible during diagnostics.
-                if let MethodCallFailed::ExceptionThrown(exc) = e {
-                    let handler = rustjvm_native_builtins::uncaught_handlers::take_uncaught_handler(thread_obj_for_spawn)
-                        .or_else(rustjvm_native_builtins::uncaught_handlers::default_uncaught_handler);
-                    if let Some(h) = handler {
-                        // Best-effort dispatch: invoke the handler's
-                        // `uncaughtException(Thread, Throwable)` via
-                        // virtual dispatch. Any error from the handler
-                        // itself is swallowed — HotSpot does the same
-                        // (a misbehaving handler can't take down the
-                        // VM further than the original exception
-                        // already did).
-                        let recv_cid = shared_arc.heap.class_id_of(h);
-                        let _ = invoke_on_class_shared(
-                            &shared_arc,
-                            &mut jvm_thread,
-                            recv_cid,
-                            "uncaughtException",
-                            "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
-                            &[
-                                Value::Object(Some(h)),
-                                Value::Object(Some(thread_obj_for_spawn)),
-                                Value::Object(Some(exc)),
-                            ],
+                // W1-C: dispatch the per-Thread (or default)
+                // UncaughtExceptionHandler before dropping the exception.
+                // HotSpot calls Thread.dispatchUncaughtException(Throwable)
+                // when Thread.run() escapes; we do the same. The Java method
+                // walks the per-instance handler -> ThreadGroup -> default
+                // chain itself, so we just need to call it. Any error from
+                // the handler dispatch is swallowed (HotSpot does the same:
+                // a buggy handler can't take down the VM further than the
+                // original exception already did).
+                if let MethodCallFailed::ExceptionThrown(exc) = &e {
+                    let exc_ref = *exc;
+                    let dispatch_result = invoke_on_class_shared(
+                        &shared_arc,
+                        &mut jvm_thread,
+                        recv_cid,
+                        "dispatchUncaughtException",
+                        "(Ljava/lang/Throwable;)V",
+                        &[
+                            Value::Object(Some(thread_obj_for_spawn)),
+                            Value::Object(Some(exc_ref)),
+                        ],
+                    );
+                    if let Err(de) = dispatch_result {
+                        eprintln!(
+                            "Thread {} terminated with error: {:?} (dispatchUncaughtException also failed: {:?})",
+                            tid, e, de
                         );
-                    } else {
-                        eprintln!("Thread {} terminated with error: ExceptionThrown(...)", tid);
                     }
                 } else {
                     eprintln!("Thread {} terminated with error: {:?}", tid, e);
                 }
-            } else {
-                // Successful return — drop any registered handler so
-                // the side-table doesn't accumulate entries for dead
-                // threads.
-                let _ = rustjvm_native_builtins::uncaught_handlers::take_uncaught_handler(thread_obj_for_spawn);
             }
             if is_virtual {
                 // Release carrier permit on thread exit.
@@ -1543,7 +1538,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let _ = shared_arc
                 .monitors
                 .exit(thread_obj_for_spawn, tid);
-        });
+        })
+        .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 
         self.shared.thread_registry.set_join_handle(tid, handle);
         Ok(None)
@@ -3868,6 +3864,58 @@ fn proxy_method_set_field_by_name(
     }
 }
 
+/// S111r11 — write the RustJVM extra metadata slots on a synthetic
+/// proxy `Method` object so that
+/// `native-builtins/.../lang_class.rs::native_method_invoke` finds the
+/// descriptor + parameter-count when it later reflects through.
+///
+/// `native_method_invoke` reads the descriptor from the extra slot
+/// (`base + METHOD_EXTRA_OFFSET_DESC`), NOT from the JDK `signature`
+/// field — leaving these blank produces a `descriptor=""` virtual
+/// dispatch that misses the real bridge method on the receiver class
+/// (e.g. `ParameterizedTypeImpl.getRawType` covariant bridge) and
+/// surfaces as a confusing `NoSuchMethodError`.
+///
+/// Constants mirror those in
+/// `native-builtins/src/lang_class.rs::METHOD_EXTRA_*`. We don't import
+/// them across the crate boundary because `vm` doesn't depend on
+/// `native-builtins` (the dependency goes the other way).
+fn proxy_method_write_extra_slots(
+    shared: &SharedVm,
+    method_obj: ObjectRef,
+    descriptor: &str,
+    param_count: usize,
+) {
+    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+    const METHOD_EXTRA_OFFSET_DESC: usize = 0;
+    const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
+
+    let class_id = shared.heap.class_id_of(method_obj);
+    let total_fields = shared
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
+        .unwrap_or(0);
+    let base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
+
+    // Defensive: only write if the heap object was allocated wide enough.
+    // `proxy_invoke_handler` and `proxy_invoke_handler_shared` both call
+    // `alloc_object(method_class_id, total_fields.max(8))` — that gives
+    // us at least the JDK width, but no extra slots when running against
+    // a synthetic-stub Method class. In that case skip the writes; the
+    // legacy hard-coded slots above already covered the synthetic path.
+    let num_obj_fields = shared.heap.num_fields(method_obj);
+    let extra_desc_slot = base + METHOD_EXTRA_OFFSET_DESC;
+    let extra_pc_slot = base + METHOD_EXTRA_OFFSET_PARAM_COUNT;
+    if num_obj_fields <= extra_pc_slot {
+        return;
+    }
+    let desc_str = super::create_java_string(shared, descriptor);
+    shared.heap.set_field(method_obj, extra_desc_slot, Value::Object(Some(desc_str)));
+    shared.heap.set_field(method_obj, extra_pc_slot, Value::Int(param_count as i32));
+}
+
 /// When a method is called on a `Proxy$Instance` object, this function
 /// intercepts it and forwards to the `InvocationHandler.invoke()`.
 ///
@@ -3912,26 +3960,57 @@ pub(super) fn proxy_invoke_handler(
         .get_class(method_class_id)
         .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
         .unwrap_or(8);
+    // S111r11: allocate METHOD_EXTRA_SLOTS more than the JDK layout so
+    // `proxy_method_write_extra_slots` can write descriptor + param count
+    // for `native_method_invoke` to read back.
+    const METHOD_EXTRA_SLOTS: usize = 3;
+    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+    let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
     let method_obj = ctx
         .shared
         .heap
-        .alloc_object(method_class_id, total_fields.max(8));
+        .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(ctx.shared, ClassId::new(0));
     let name_str = super::create_java_string(ctx.shared, method_name);
-    let param_count = proxy_count_params(descriptor);
+    // Parse descriptor into per-parameter and return type descriptors so we
+    // can populate the synthetic Method's `returnType` and `parameterTypes`
+    // with semantically correct Class mirrors (e.g. real `Type.class`).
+    // Without this, Spring's `TypeProxyInvocationHandler.invoke` falls
+    // through to its default branch (`method.invoke(provider.getType())`)
+    // and our native_method_invoke virtual-dispatches the proxy method
+    // name on the underlying Type — calling e.g. `getGenericInterfaces`
+    // on a `ParameterizedTypeImpl` (NoSuchMethodError).
+    let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
+    let return_type_mirror = proxy_descriptor_to_class_mirror(ctx.shared, &ret_desc);
+    let param_count = param_descs.len();
     let param_arr = ctx.shared.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
         param_count,
     );
+    for (i, pdesc) in param_descs.iter().enumerate() {
+        let pmirror = proxy_descriptor_to_class_mirror(ctx.shared, pdesc);
+        ctx.shared
+            .heap
+            .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
+            .ok();
+    }
     let desc_str = super::create_java_string(ctx.shared, descriptor);
     proxy_method_set_field_by_name(ctx.shared, method_obj, "clazz", Value::Object(Some(zero_mirror)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "name", Value::Object(Some(name_str)));
-    proxy_method_set_field_by_name(ctx.shared, method_obj, "returnType", Value::Object(Some(zero_mirror)));
+    proxy_method_set_field_by_name(ctx.shared, method_obj, "returnType", Value::Object(Some(return_type_mirror)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "parameterTypes", Value::Object(Some(param_arr)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(ctx.shared, method_obj, "signature", Value::Object(Some(desc_str)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "slot", Value::Int(0));
+    // S111r11: also populate the RustJVM extra-slot descriptor +
+    // parameter-count cache so `native_method_invoke` (which reads via
+    // `read_method_descriptor`, NOT `signature`) sees a non-empty
+    // descriptor when the proxy fallback path reflectively re-invokes
+    // the method on the underlying Type — fixes
+    // `NoSuchMethodError: ParameterizedTypeImpl.getRawType` (descriptor
+    // was empty, so virtual dispatch couldn't match the bridge method).
+    proxy_method_write_extra_slots(ctx.shared, method_obj, descriptor, param_count);
     // Belt-and-suspenders: also write the legacy hard-coded slots so any
     // surviving raw-index reader (notably the lambda dispatch path that
     // pulls `Method.getName` via `get_field_by_name` already lands on
@@ -3941,26 +4020,43 @@ pub(super) fn proxy_invoke_handler(
     } else {
         ctx.shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
         ctx.shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
-        ctx.shared.heap.set_field(method_obj, 2, Value::Object(Some(zero_mirror)));
+        ctx.shared.heap.set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         ctx.shared.heap.set_field(method_obj, 3, Value::Object(Some(param_arr)));
         ctx.shared.heap.set_field(method_obj, 4, Value::Int(1));
         ctx.shared.heap.set_field(method_obj, 5, Value::Object(Some(desc_str)));
         ctx.shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
 
-    // Build Object[] of args вЂ” box primitives so InvocationHandler receives Object[]
-    let args_arr = ctx.shared.heap.alloc_array(
-        ClassId::new(0),
-        crate::memory::heap::ArrayElementType::Reference,
-        args.len(),
-    );
-    for (i, arg) in args.iter().enumerate() {
-        let boxed = proxy_box_value(ctx.shared, *arg);
-        ctx.shared
-            .heap
-            .set_array_element(args_arr, i, boxed)
-            .ok();
-    }
+    // Build Object[] of args вЂ” box primitives so InvocationHandler receives Object[].
+    //
+    // Per `java.lang.reflect.InvocationHandler.invoke` contract: when the
+    // intercepted interface method takes no arguments, the `args` parameter
+    // MUST be `null` (not an empty array). Spring's
+    // `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke` relies on
+    // this — its `Type[].class` return-type branch is gated on `args == null`
+    // (`aload_3 / ifnonnull -> default`), and the default branch reflectively
+    // calls `method.invoke(provider.getType(), args)`. For 0-arg methods like
+    // `getGenericInterfaces()`, passing an empty array (instead of null) makes
+    // the branch fall through to the default, which then virtually dispatches
+    // `getGenericInterfaces` on `provider.getType()` — a `ParameterizedTypeImpl`
+    // that has no such method, surfacing as `NoSuchMethodError`.
+    let args_value = if args.is_empty() {
+        Value::Object(None)
+    } else {
+        let args_arr = ctx.shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            args.len(),
+        );
+        for (i, arg) in args.iter().enumerate() {
+            let boxed = proxy_box_value(ctx.shared, *arg);
+            ctx.shared
+                .heap
+                .set_array_element(args_arr, i, boxed)
+                .ok();
+        }
+        Value::Object(Some(args_arr))
+    };
 
     // Call InvocationHandler.invoke(Object proxy, Method method, Object[] args)
     // Resolve the handler's actual class for dispatch (may be anonymous).
@@ -3979,7 +4075,7 @@ pub(super) fn proxy_invoke_handler(
         let call_args = [
             Value::Object(Some(proxy)),
             Value::Object(Some(method_obj)),
-            Value::Object(Some(args_arr)),
+            args_value,
         ];
         let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
             ctx.shared,
@@ -4009,7 +4105,7 @@ pub(super) fn proxy_invoke_handler(
         Value::Object(Some(handler_ref)),
         Value::Object(Some(proxy)),
         Value::Object(Some(method_obj)),
-        Value::Object(Some(args_arr)),
+        args_value,
     ];
     ctx.invoke_or_native(
         &handler_class_name,
@@ -4081,46 +4177,72 @@ pub(crate) fn proxy_invoke_handler_shared(
         .get_class(method_class_id)
         .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
         .unwrap_or(8);
-    let method_obj = shared.heap.alloc_object(method_class_id, total_fields.max(8));
+    // S111r11 — see `proxy_invoke_handler` above.
+    const METHOD_EXTRA_SLOTS: usize = 3;
+    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+    let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
+    let method_obj = shared.heap.alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
     let name_str = super::create_java_string(shared, method_name);
-    let param_count = proxy_count_params(descriptor);
+    // Parse descriptor into per-parameter and return type descriptors —
+    // see `proxy_invoke_handler` above for rationale.
+    let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
+    let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
+    let param_count = param_descs.len();
     let param_arr = shared.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
         param_count,
     );
+    for (i, pdesc) in param_descs.iter().enumerate() {
+        let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
+        shared
+            .heap
+            .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
+            .ok();
+    }
     let desc_str = super::create_java_string(shared, descriptor);
     proxy_method_set_field_by_name(shared, method_obj, "clazz", Value::Object(Some(zero_mirror)));
     proxy_method_set_field_by_name(shared, method_obj, "name", Value::Object(Some(name_str)));
-    proxy_method_set_field_by_name(shared, method_obj, "returnType", Value::Object(Some(zero_mirror)));
+    proxy_method_set_field_by_name(shared, method_obj, "returnType", Value::Object(Some(return_type_mirror)));
     proxy_method_set_field_by_name(shared, method_obj, "parameterTypes", Value::Object(Some(param_arr)));
     proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(shared, method_obj, "signature", Value::Object(Some(desc_str)));
     proxy_method_set_field_by_name(shared, method_obj, "slot", Value::Int(0));
+    // S111r11 — see `proxy_invoke_handler` above for rationale.
+    proxy_method_write_extra_slots(shared, method_obj, descriptor, param_count);
     if total_fields < 8 {
         // Synthetic-mode fallback (no JDK Method class loaded): keep the
         // old hard-coded layout so callers reading raw slots still find
         // the values.
         shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
         shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
-        shared.heap.set_field(method_obj, 2, Value::Object(Some(zero_mirror)));
+        shared.heap.set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         shared.heap.set_field(method_obj, 3, Value::Object(Some(param_arr)));
         shared.heap.set_field(method_obj, 4, Value::Int(1));
         shared.heap.set_field(method_obj, 5, Value::Object(Some(desc_str)));
         shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
 
-    // Build Object[] of args вЂ” box primitives
-    let args_arr = shared.heap.alloc_array(
-        ClassId::new(0),
-        crate::memory::heap::ArrayElementType::Reference,
-        args.len(),
-    );
-    for (i, arg) in args.iter().enumerate() {
-        let boxed = proxy_box_value(shared, *arg);
-        shared.heap.set_array_element(args_arr, i, boxed).ok();
-    }
+    // Build Object[] of args вЂ” box primitives. Per
+    // `java.lang.reflect.InvocationHandler.invoke` contract, when the
+    // intercepted method takes no arguments, `args` MUST be `null` (not an
+    // empty Object[]). See `proxy_invoke_handler` above for the SportMe /
+    // Spring `SerializableTypeWrapper` case that depends on this.
+    let args_value = if args.is_empty() {
+        Value::Object(None)
+    } else {
+        let args_arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            args.len(),
+        );
+        for (i, arg) in args.iter().enumerate() {
+            let boxed = proxy_box_value(shared, *arg);
+            shared.heap.set_array_element(args_arr, i, boxed).ok();
+        }
+        Value::Object(Some(args_arr))
+    };
 
     // Call InvocationHandler.invoke(Object proxy, Method method, Object[] args)
     // Resolve the handler's actual class for dispatch (it may be an anonymous class
@@ -4140,7 +4262,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         let call_args = [
             Value::Object(Some(proxy)),
             Value::Object(Some(method_obj)),
-            Value::Object(Some(args_arr)),
+            args_value,
         ];
         let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
             shared,
@@ -4172,7 +4294,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         Value::Object(Some(handler_ref)),
         Value::Object(Some(proxy)),
         Value::Object(Some(method_obj)),
-        Value::Object(Some(args_arr)),
+        args_value,
     ];
     invoke_or_native(
         shared,
@@ -4187,12 +4309,189 @@ pub(crate) fn proxy_invoke_handler_shared(
 /// Shared-interpreter version of `annotation_proxy_invoke`.
 pub(crate) fn annotation_proxy_invoke_shared(
     shared: &SharedVm,
-    _thread: &mut JvmThread,
+    thread: &mut JvmThread,
     proxy: ObjectRef,
     method_name: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // S111r19 — Spring's MergedAnnotation.adaptValueForMapOptions iterates
+    // a `[LMergedAnnotation;` array and calls `aa[i].asMap(factory, adapts)`.
+    // When `aa[i]` is one of our `AnnotationProxy` instances (because the
+    // upstream `adaptForAttribute` retained the original proxy array
+    // instead of building a fresh `[LMergedAnnotation;`), the dispatch
+    // routes here. Without an `asMap` handler, the element-accessor walk
+    // returns null and Spring stores null in the resulting
+    // `AnnotationAttributes[]`, surfacing as the `TypeFilterUtils.java:77`
+    // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
+    // (`@Filter` attribute is null).
+    if method_name == "asMap" {
+        return annotation_proxy_as_map(shared, thread, proxy, args);
+    }
     annotation_proxy_dispatch_impl(shared, proxy, method_name, args)
+}
+
+/// Implement `MergedAnnotation.asMap(Function, Adapt[])` for AnnotationProxy
+/// receivers. Builds the destination map by calling `factory.apply(proxy)`
+/// then populates with element name→value pairs. Nested annotation arrays
+/// are converted to `AnnotationAttributes[]` arrays containing
+/// recursively-asMap'd children.
+fn annotation_proxy_as_map(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    proxy: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    use crate::memory::heap::ObjectKind;
+
+    let factory = match args.first() {
+        Some(Value::Object(Some(o))) => {
+            if shared.heap.kind_of(*o) == ObjectKind::Object {
+                Some(*o)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let dest_map = if let Some(f) = factory {
+        let f_cid = shared.heap.class_id_of(f);
+        let is_lambda = shared.lambda_proxies.read().contains_key(&f_cid);
+        let res = if is_lambda {
+            let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
+                shared,
+                thread,
+                f,
+                f_cid,
+                "apply",
+                &[Value::Object(Some(proxy))],
+            )?;
+            dispatch.unwrap_or(None)
+        } else {
+            invoke_on_class_shared(
+                shared,
+                thread,
+                f_cid,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(f)), Value::Object(Some(proxy))],
+            )?
+        };
+        match res {
+            Some(Value::Object(Some(m))) => m,
+            _ => {
+                let cid = shared
+                    .load_class_concurrent(
+                        "org/springframework/core/annotation/AnnotationAttributes",
+                    )
+                    .or_else(|_| shared.load_class_concurrent("java/util/LinkedHashMap"))
+                    .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+                shared.heap.alloc_object(cid, 4)
+            }
+        }
+    } else {
+        let cid = shared
+            .load_class_concurrent("java/util/LinkedHashMap")
+            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+        shared.heap.alloc_object(cid, 4)
+    };
+
+    let names_arr = match shared.heap.get_field(proxy, 2) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(Some(dest_map)))),
+    };
+    let values_arr = match shared.heap.get_field(proxy, 3) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(Some(dest_map)))),
+    };
+    let n = shared.heap.array_length(names_arr);
+    for i in 0..n {
+        let name_val = match shared.heap.get_array_element(names_arr, i) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let elem_val = match shared.heap.get_array_element(values_arr, i) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let adapted = adapt_annotation_value_for_map(shared, thread, elem_val, args)?;
+        let dest_cid = shared.heap.class_id_of(dest_map);
+        let _ = invoke_on_class_shared(
+            shared,
+            thread,
+            dest_cid,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(dest_map)), name_val, adapted],
+        )?;
+    }
+    Ok(Some(Value::Object(Some(dest_map))))
+}
+
+/// Recursively adapt an annotation element value: nested annotation
+/// proxies become their asMap result; arrays of annotation proxies become
+/// an `AnnotationAttributes[]`-typed array of recursively-asMap'd children.
+fn adapt_annotation_value_for_map(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    val: Value,
+    asmap_args: &[Value],
+) -> Result<Value, MethodCallFailed> {
+    use crate::memory::heap::ObjectKind;
+    let obj = match val {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(val),
+    };
+    let cid = shared.heap.class_id_of(obj);
+    let kind = shared.heap.kind_of(obj);
+    let class_name = shared
+        .class_manager
+        .read()
+        .get_class(cid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_default();
+    if kind == ObjectKind::Object && class_name == "java/lang/annotation/AnnotationProxy" {
+        return annotation_proxy_as_map(shared, thread, obj, asmap_args).map(|res| {
+            res.unwrap_or(Value::Object(None))
+        });
+    }
+    if kind == ObjectKind::Array {
+        let len = shared.heap.array_length(obj);
+        let any_proxy = (0..len).any(|i| {
+            matches!(
+                shared.heap.get_array_element(obj, i),
+                Ok(Value::Object(Some(e)))
+                    if shared.heap.kind_of(e) == ObjectKind::Object
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_class(shared.heap.class_id_of(e))
+                            .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
+                            .unwrap_or(false)
+            )
+        });
+        if any_proxy {
+            let aa_cid = shared
+                .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
+                .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            let new_arr = shared
+                .heap
+                .alloc_array(aa_cid, rustjvm_types::ArrayElementType::Reference, len);
+            for i in 0..len {
+                let elem = shared
+                    .heap
+                    .get_array_element(obj, i)
+                    .unwrap_or(Value::Object(None));
+                let adapted = adapt_annotation_value_for_map(shared, thread, elem, asmap_args)?;
+                shared
+                    .heap
+                    .set_array_element(new_arr, i, adapted)
+                    .ok();
+            }
+            return Ok(Value::Object(Some(new_arr)));
+        }
+    }
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -4716,6 +5015,25 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             let eq = annotation_proxy_equals(shared, proxy, other);
             return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
         }
+        // S111r18 — `getClass()` is a final native on Object, but our
+        // interception layer at `execute_invoke` routes EVERY method call
+        // on an `AnnotationProxy` here (because the receiver's class_id
+        // is the synthetic AnnotationProxy class, not Object). Without
+        // this branch the call falls through to the element-accessor walk
+        // below, finds no element named "getClass", and returns null —
+        // breaking Spring's `MergedAnnotation.adaptForAttribute` which
+        // calls `value.getClass().isArray()` on the raw attribute value
+        // and NPEs. Return the proxy's class mirror (the annotation
+        // type's mirror, stored in field 1 by `create_annotation_proxy`)
+        // so callers see something sensible. We deliberately return the
+        // annotation type Class — not the AnnotationProxy synthetic Class
+        // — to match real-JDK behaviour where `q.getClass()` reports the
+        // Proxy class and `q.annotationType()` reports the annotation
+        // interface, but Spring only needs *some* non-null Class with
+        // `isArray()==false` and `isAnnotation()==true`.
+        "getClass" => {
+            return Ok(Some(shared.heap.get_field(proxy, 1)));
+        }
         _ => {}
     }
 
@@ -4778,6 +5096,102 @@ pub(super) fn proxy_count_params(descriptor: &str) -> usize {
     count
 }
 
+/// Split a method descriptor into individual parameter type descriptors and
+/// the return type descriptor. Each returned descriptor includes any leading
+/// `[` array prefix and (for `L`-types) the trailing `;`.
+///
+/// `()V` -> (vec![], "V")
+/// `(Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;`
+///   -> (vec!["Ljava/lang/reflect/Method;", "[Ljava/lang/Object;"], "Ljava/lang/Object;")
+pub(super) fn proxy_split_descriptor(descriptor: &str) -> (Vec<String>, String) {
+    let start = match descriptor.find('(') {
+        Some(s) => s,
+        None => return (Vec::new(), String::new()),
+    };
+    let end = match descriptor.find(')') {
+        Some(e) if e > start => e,
+        _ => return (Vec::new(), String::new()),
+    };
+    let inner = &descriptor[start + 1..end];
+    let ret = descriptor[end + 1..].to_string();
+    let mut params = Vec::new();
+    let mut buf = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        buf.push(ch);
+        match ch {
+            'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' | 'V' => {
+                params.push(std::mem::take(&mut buf));
+            }
+            'L' => {
+                for c in chars.by_ref() {
+                    buf.push(c);
+                    if c == ';' {
+                        break;
+                    }
+                }
+                params.push(std::mem::take(&mut buf));
+            }
+            '[' => {
+                // array prefix — keep accumulating until we get a base type
+            }
+            _ => {
+                buf.clear();
+            }
+        }
+    }
+    (params, ret)
+}
+
+/// Resolve a single JVMS field-type descriptor (e.g. `Ljava/lang/Object;`,
+/// `[Ljava/lang/reflect/Type;`, `I`, `V`) to a Class mirror. Used by
+/// `proxy_invoke_handler` so the synthetic `Method` object's `returnType`
+/// and `parameterTypes` carry semantically correct mirrors — Spring's
+/// `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke` branches on
+/// `method.getReturnType() == Type.class` / `Type[].class`, which only works
+/// when those mirrors point at the real `java.lang.reflect.Type` Class.
+pub(super) fn proxy_descriptor_to_class_mirror(
+    shared: &SharedVm,
+    desc: &str,
+) -> ObjectRef {
+    if desc.is_empty() {
+        return super::get_or_create_class_mirror(shared, ClassId::new(0));
+    }
+    // Primitive types -> primitive mirror.
+    let prim_name = match desc {
+        "V" => Some("void"),
+        "Z" => Some("boolean"),
+        "B" => Some("byte"),
+        "C" => Some("char"),
+        "S" => Some("short"),
+        "I" => Some("int"),
+        "J" => Some("long"),
+        "F" => Some("float"),
+        "D" => Some("double"),
+        _ => None,
+    };
+    if let Some(p) = prim_name {
+        return super::get_or_create_primitive_mirror(shared, p);
+    }
+    // Reference / array: load by JVMS internal name.
+    //   `Ljava/lang/Object;` -> "java/lang/Object"
+    //   `[Ljava/lang/reflect/Type;` -> "[Ljava/lang/reflect/Type;"  (array name)
+    //   `[I` -> "[I"
+    let load_name: String = if desc.starts_with('[') {
+        desc.to_string()
+    } else if desc.starts_with('L') && desc.ends_with(';') {
+        desc[1..desc.len() - 1].to_string()
+    } else {
+        return super::get_or_create_class_mirror(shared, ClassId::new(0));
+    };
+    let cid = shared
+        .class_manager
+        .write()
+        .load_class(&load_name)
+        .unwrap_or(ClassId::new(0));
+    super::get_or_create_class_mirror(shared, cid)
+}
+
 /// Box a JVM value into a Java wrapper object for use in Object[] arrays.
 /// Object references are passed through unchanged.
 pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
@@ -4812,6 +5226,27 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
         }
         other => other, // already an Object reference or null
     }
+}
+
+/// S111r7 — return `true` for methods declared on `java.lang.Object` so we
+/// don't accidentally divert legitimate `Object.equals`/`hashCode`/etc.
+/// calls into the receiver-driven fallback.
+pub fn is_object_member(method_name: &str, descriptor: &str) -> bool {
+    matches!(
+        (method_name, descriptor),
+        ("equals", "(Ljava/lang/Object;)Z")
+        | ("hashCode", "()I")
+        | ("toString", "()Ljava/lang/String;")
+        | ("getClass", "()Ljava/lang/Class;")
+        | ("notify", "()V")
+        | ("notifyAll", "()V")
+        | ("wait", "()V")
+        | ("wait", "(J)V")
+        | ("wait", "(JI)V")
+        | ("clone", "()Ljava/lang/Object;")
+        | ("finalize", "()V")
+        | ("<init>", "()V")
+    )
 }
 
 /// Invoke a method on a specific class by ClassId.
@@ -4914,6 +5349,34 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // RKC16N.12: System.loadLibrary / Runtime.loadLibrary0
+                        // — the real JDK bytecode walks down through
+                        // ClassLoader.loadLibrary which throws
+                        // UnsatisfiedLinkError("no <name> in java.library.path: ...")
+                        // when the library can't be found on disk (we ship
+                        // the JMM natives in-process via NativeMethodRegistry,
+                        // so libmanagement.dll is genuinely absent). The ULE
+                        // surfaces during ManagementFactory.<clinit> (which
+                        // calls System.loadLibrary("management")) as a B6
+                        // silent-swallow on Keycloak boot. Force the
+                        // no-op native override registered in
+                        // `lang_system::register_lang_system_natives` so the
+                        // bytecode never runs the throwing path.
+                        || ({
+                            let m = (class_name == "java/lang/System"
+                                && matches!(method_name, "loadLibrary" | "load"))
+                                || (class_name == "java/lang/Runtime"
+                                    && matches!(method_name, "loadLibrary0" | "load0"
+                                        | "loadLibrary" | "load"));
+                            if m {
+                                tracing::debug!(
+                                    target: "rkc16n12",
+                                    class=%class_name, method=%method_name, desc=%descriptor,
+                                    "RKC16N.12: forcing native override for loadLibrary path"
+                                );
+                            }
+                            m
+                        })
                         // C23: AtomicReferenceArray / AtomicIntegerArray /
                         // AtomicLongArray use VarHandle.compareAndSet on their
                         // inner array, which routes through VarHandles$Array$*
@@ -5032,6 +5495,64 @@ fn invoke_on_class_shared_inner(
                                 | "put"
                                 | "containsKey"
                             ))
+                        // S111r7: HashMap / LinkedHashMap / Hashtable /
+                        // ConcurrentHashMap and HashSet view-method
+                        // overrides. Real-JDK bytecode for `keySet()`,
+                        // `values()`, `entrySet()`, `iterator()` etc.
+                        // allocates inner-class views
+                        // (`HashMap$KeySet`, `HashMap$KeyIterator`,
+                        // `HashSet$1` reflection over backing-map
+                        // entries) we do not load from the JDK module
+                        // image — so the views land on the heap with
+                        // `cid=0` and every subsequent
+                        // `invokeinterface Set.iterator()` /
+                        // `Iterator.hasNext()` dispatches to bare
+                        // `java.lang.Object` and surfaces a swallowed
+                        // `NoSuchMethodError`. Forcing the natives in
+                        // `native-collections` to win materialises a
+                        // properly-typed `java/util/HashSet`
+                        // (single-field-with-backing-HashMap layout) /
+                        // `HashMap$KeyItr` / `ArrayList` whose
+                        // `iterator()` / `hasNext()` then dispatches
+                        // normally, unblocking Spring's
+                        // `GenericConversionService.addConverter()` →
+                        // `getConvertibleTypes().iterator()` boot path.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap"
+                                | "java/util/LinkedHashMap"
+                                | "java/util/Hashtable"
+                                | "java/util/concurrent/ConcurrentHashMap"
+                            )
+                            && matches!(
+                                method_name,
+                                "keySet" | "values" | "entrySet"
+                            ))
+                        || (matches!(
+                                class_name,
+                                "java/util/HashSet"
+                                | "java/util/LinkedHashSet"
+                                | "java/util/TreeSet"
+                            )
+                            && matches!(
+                                method_name,
+                                "iterator" | "size" | "isEmpty" | "contains" | "add" | "remove" | "clear"
+                                // S111r12: `HashSet.spliterator()` JDK
+                                // bytecode would build a `KeySpliterator`
+                                // over the synthetic backing HashMap and
+                                // later `getfield m.table` reads slot 2
+                                // (real JDK layout) which our synthetic
+                                // populates with `Int(16)` (capacity),
+                                // surfacing as
+                                //   `expected object reference, got int(16)`.
+                                // Same family as the S111r7 `getenv()`
+                                // HashMap-layout fix. Force the native
+                                // (`p59_hashset_spliterator`) which walks
+                                // the synthetic map and returns a synthetic
+                                // `(data, cursor)` Spliterator the rest of
+                                // our stream pipeline already consumes.
+                                | "spliterator"
+                            ))
                         // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a
                         // static HashMap) which `Provider.<clinit>` would
@@ -5045,6 +5566,113 @@ fn invoke_on_class_shared_inner(
                         // path when the engine lookup fails).
                         || (class_name == "java/security/Provider"
                             && method_name == "getEngineName")
+                        // Spring Boot 3.2 fat-jar launcher: Archive.create(File)
+                        // takes `URI.getSchemeSpecificPart()` (e.g. `/C:/foo.jar`)
+                        // and feeds it to `new File(...)`. Rust's
+                        // `Path::is_absolute` treats a leading `/<drive>:`
+                        // as relative on Windows, so the real-JDK
+                        // `File.<init>(String)` bytecode (which delegates
+                        // to `WinNTFileSystem.normalize`, then
+                        // `prefixLength`) leaves the path unnormalised
+                        // for our std::fs callers. Route File constructors
+                        // and accessors through our normalising natives so
+                        // the URI -> File round-trip resolves to the same
+                        // absolute path HotSpot produces.
+                        || (class_name == "java/io/File"
+                            && (method_name == "<init>"
+                                || method_name == "getAbsolutePath"
+                                || method_name == "getCanonicalPath"
+                                || method_name == "exists"
+                                || method_name == "isFile"
+                                || method_name == "isDirectory"
+                                || method_name == "getPath"
+                                || method_name == "toPath"
+                                || method_name == "getName"
+                                || method_name == "toURI"))
+                        // Spring Boot 3.2 fat-jar launcher: JarFileArchive
+                        // opens the fat-jar via `new JarFile(File)` and walks
+                        // entries via `jarFile.stream() -> JarEntry`. The
+                        // real-JDK ZipFile bytecode trips over native
+                        // primitives (`ZipFile.ensureOpen`, etc.) we don't
+                        // wire up. Force our `p59_jar_*` natives (which use
+                        // the Rust `zip` crate directly) to win.
+                        || (class_name == "java/util/jar/JarFile"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getManifest"
+                                | "stream"
+                                | "entries"
+                                | "getEntry"
+                                | "getJarEntry"
+                                | "getInputStream"
+                                | "size"
+                                | "close"
+                                | "getName"
+                            ))
+                        // Spring Boot 3 fat-jar launcher: short-circuit
+                        // JarFileArchive.getClassPathUrls so our native
+                        // wins over the bytecode that walks
+                        // `JarFile.stream().map().filter().map().collect()` —
+                        // that pipeline depends on Stream operations our
+                        // synthetic Stream does not implement. The native
+                        // materialises the URL set directly from the
+                        // central directory.
+                        || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
+                            && method_name == "getClassPathUrls")
+                        // Spring Boot 2 fat-jar launcher (no `.launch.`
+                        // subpackage): override the methods that read the
+                        // launcher's null `archive` field. The natives
+                        // re-derive the fat-jar path from the launcher's
+                        // class mirror via `find_class_source_path`.
+                        // Register on every concrete launcher class plus
+                        // the abstract base — when the receiver is a
+                        // concrete subclass (e.g. JarLauncher) the
+                        // parent-walk in `try_stackless_invoke` would
+                        // otherwise short-circuit on EAL's own bytecode.
+                        || (matches!(class_name,
+                                "org/springframework/boot/loader/ExecutableArchiveLauncher"
+                                | "org/springframework/boot/loader/JarLauncher"
+                                | "org/springframework/boot/loader/WarLauncher"
+                                | "org/springframework/boot/loader/PropertiesLauncher"
+                            )
+                            && matches!(
+                                method_name,
+                                "getMainClass"
+                                | "isExploded"
+                                | "isPostProcessingClassPathArchives"
+                                | "getClassPathArchives"
+                                | "getClassPathArchivesIterator"
+                            ))
+                        // SB2 launcher's `getClassPathArchivesIterator()`
+                        // returns an `ArrayList$Itr`. The downstream
+                        // `Launcher.createClassLoader(Iterator)` calls
+                        // `it.hasNext()` / `it.next()`. Real-JDK bytecode
+                        // reads `cursor` and `this$0` fields whose offsets
+                        // don't match our synthetic Itr layout. Force the
+                        // native overrides registered in
+                        // `native-collections::register_arraylist_natives`
+                        // so the launcher iteration walks every URL.
+                        || (class_name == "java/util/ArrayList$Itr"
+                            && matches!(method_name, "hasNext" | "next" | "remove"))
+                        // Spring Boot fat-jar launcher: ArrayList.toArray(T[])
+                        // bytecode calls `Arrays.copyOf(elementData, size,
+                        // a.getClass())` which NPEs on our synthetic ArrayList
+                        // because the array-component-type metadata path is
+                        // incomplete. Force our native to win for the typed
+                        // toArray overload. NOTE: `toArray(T[])` is declared
+                        // on `AbstractCollection`, not `ArrayList`, so we
+                        // match the parent class name here. The native is
+                        // registered on every concrete collection class
+                        // separately (see `register_arraylist_natives`).
+                        || (matches!(
+                                class_name,
+                                "java/util/AbstractCollection"
+                                | "java/util/ArrayList"
+                                | "java/util/HashSet"
+                                | "java/util/LinkedHashSet"
+                            )
+                            && method_name == "toArray")
                         // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
                         // bytecode resolution is failing for these basic methods
                         // during JDK class clinits like
@@ -5078,17 +5706,112 @@ fn invoke_on_class_shared_inner(
                                 | "contains"
                                 | "split"
                             ))
-                        // Session 100 KC16 boot: org/jboss/modules/log/JDKModuleLogger.<clinit>
-                        // calls Level.parse on non-standard names ("TRACE"/"DEBUG"/"WARN")
-                        // which transitively NPEs through a Class.getModule().isNamed()
-                        // chain in the JDK 25 logging stack under our synthetic Module
-                        // shim.  The native override in jboss_module_loader.rs
-                        // (`native_jdk_module_logger_clinit`) sets the three static
-                        // Level fields directly from JDK Level.FINEST/FINE/WARNING and
-                        // sidesteps the broken JDK path.  Force the override so the
-                        // bytecode <clinit> never runs.
-                        || (class_name == "org/jboss/modules/log/JDKModuleLogger"
-                            && method_name == "<clinit>");
+                        // Wave 3 Task C: NIO Selector — the real-JDK
+                        // SelectorImpl bytecode walks `keys` / `selectedKeys`
+                        // HashMaps that we don't populate (we don't run
+                        // SelectorImpl.<init>). Force our native overrides
+                        // to win for the public select / wakeup / close
+                        // entry points and for SelectorImpl's internal
+                        // `lockAndDoSelect` and accessor methods.
+                        || (matches!(
+                                class_name,
+                                "sun/nio/ch/SelectorImpl"
+                                | "sun/nio/ch/WindowsSelectorImpl"
+                                | "sun/nio/ch/EPollSelectorImpl"
+                                | "sun/nio/ch/KQueueSelectorImpl"
+                                | "java/nio/channels/Selector"
+                                | "java/nio/channels/spi/AbstractSelector"
+                            )
+                            && matches!(
+                                method_name,
+                                "select"
+                                | "selectNow"
+                                | "selectedKeys"
+                                | "keys"
+                                | "wakeup"
+                                | "close"
+                                | "isOpen"
+                                | "lockAndDoSelect"
+                            ))
+                        // Wave 3 Task C: SelectionKeyImpl.* accessors —
+                        // same reason: real-JDK bytecode reads internal
+                        // state populated by SelectorImpl.<init> chain.
+                        || (matches!(
+                                class_name,
+                                "sun/nio/ch/SelectionKeyImpl"
+                                | "java/nio/channels/SelectionKey"
+                            )
+                            && matches!(
+                                method_name,
+                                "channel"
+                                | "selector"
+                                | "interestOps"
+                                | "readyOps"
+                                | "isValid"
+                                | "cancel"
+                                | "attach"
+                                | "attachment"
+                            ))
+                        // Wave 3 Task C: ServerSocketChannel.socket() —
+                        // returns a wrapper ServerSocket whose bind /
+                        // getLocalPort delegate to the channel.
+                        || (matches!(
+                                class_name,
+                                "java/nio/channels/ServerSocketChannel"
+                                | "sun/nio/ch/ServerSocketChannelImpl"
+                            )
+                            && matches!(
+                                method_name,
+                                "socket" | "getLocalAddress"
+                            ))
+                        // Wave 3 Task C: ServerSocket adapter — when the
+                        // ServerSocket is the channel-backed wrapper its
+                        // bind / getLocalPort must reach our overrides
+                        // ahead of the real-JDK bytecode (which would
+                        // try to allocate a SocketImpl etc.).
+                        || (class_name == "java/net/ServerSocket"
+                            && matches!(
+                                method_name,
+                                "bind" | "getLocalPort" | "isBound" | "isClosed" | "getLocalSocketAddress" | "close"
+                            ))
+                        // Wave 3 Task C: SocketChannel/ServerSocketChannel
+                        // factories + connect/accept/configureBlocking — JDK
+                        // bytecode for these reaches into the SelectorProvider
+                        // chain (DefaultSelectorProvider) which we don't
+                        // wire up. Force our `WP3.4` natives to win.
+                        || (matches!(
+                                class_name,
+                                "java/nio/channels/SocketChannel"
+                                | "java/nio/channels/ServerSocketChannel"
+                                | "sun/nio/ch/SocketChannelImpl"
+                                | "sun/nio/ch/ServerSocketChannelImpl"
+                            )
+                            && matches!(
+                                method_name,
+                                "open"
+                                | "connect"
+                                | "accept"
+                                | "configureBlocking"
+                                | "isOpen"
+                                | "isBlocking"
+                                | "isConnected"
+                                | "close"
+                                | "bind"
+                                | "read"
+                                | "write"
+                                | "finishConnect"
+                                | "getRemoteAddress"
+                                | "getLocalAddress"
+                                | "socket"
+                            ))
+                        // SelectableChannel.register — JDK bytecode walks
+                        // SelectorProvider state we don't initialize.
+                        || (matches!(
+                                class_name,
+                                "java/nio/channels/SelectableChannel"
+                                | "java/nio/channels/spi/AbstractSelectableChannel"
+                            )
+                            && matches!(method_name, "register" | "configureBlocking"));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
@@ -5214,6 +5937,119 @@ fn invoke_on_class_shared_inner(
                     }
                 }
 
+                // S111r7 — receiver-driven fallback for bare `Object`
+                // dispatch. When real-JDK bytecode allocates an inner-class
+                // view (e.g. `HashMap$KeySet`, `HashMap$KeyIterator`) we
+                // don't load from the JDK module image, the heap object
+                // ends up with `cid=0` and `class_id_of` propagates as
+                // `java/lang/Object`. Without this rescue, the eventual
+                // `invokeinterface Set.iterator()` /
+                // `Iterator.hasNext()` etc. dispatches against
+                // `Object.<missing>` and surfaces a swallowed
+                // `NoSuchMethodError`. Spring boot's
+                // `GenericConversionService.addConverter()` →
+                // `getConvertibleTypes().iterator()` is the canonical
+                // tripwire — fixing it unblocks 9+ Spring boot apps.
+                //
+                // Strategy: if the dispatch class is `Object` AND the
+                // method isn't an `Object` method, route the call through
+                // a name-based native lookup against the well-known
+                // collection-view fallbacks. The `keySet/values/entrySet`
+                // wrappers we materialise via `make_hashset_with_elements`
+                // expose the same external contract, so dispatching to
+                // those natives against the original receiver's
+                // surrounding HashMap recovers the iterator.
+                if class_name == "java/lang/Object"
+                    && !is_object_member(method_name, descriptor)
+                {
+                    // Try receiver class chain — covers the case where
+                    // recv_cid is a valid non-Object class but the CP
+                    // dispatch resolved to Object due to a synthetic alloc.
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        let cm2 = shared.class_manager.read();
+                        let recv_name = cm2
+                            .class_store
+                            .get(recv_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        drop(cm2);
+                        if !recv_name.is_empty() && recv_name != "java/lang/Object" {
+                            // Native registered on the receiver's class
+                            // (or any superclass on the chain).
+                            let cm3 = shared.class_manager.read();
+                            let mut walk_cid = Some(recv_cid);
+                            while let Some(cid) = walk_cid {
+                                if let Some(cls) = cm3.class_store.get(cid) {
+                                    if let Some(cb) = shared.native_methods.find(
+                                        &cls.name, method_name, descriptor,
+                                    ) {
+                                        drop(cm3);
+                                        return safe_native_call(shared, thread, cb, args);
+                                    }
+                                    walk_cid = cls.superclass;
+                                } else {
+                                    break;
+                                }
+                            }
+                            // Bytecode method on the receiver's class chain.
+                            if let Some((_method, declaring_id)) =
+                                crate::classloading::find_method_recursive(
+                                    recv_cid,
+                                    method_name,
+                                    descriptor,
+                                    &cm3.class_store,
+                                )
+                            {
+                                drop(cm3);
+                                return invoke_on_class_shared(
+                                    shared,
+                                    thread,
+                                    declaring_id,
+                                    method_name,
+                                    descriptor,
+                                    args,
+                                );
+                            }
+                            drop(cm3);
+                        }
+
+                    }
+                }
+
+                if std::env::var_os("RUSTJVM_DBG_NSME").is_some() {
+                    // Diagnostic: when an NSME is about to be raised, capture
+                    // the receiver's actual concrete class and the caller's
+                    // method name so a wrong-dispatch (receiver vs. cp class
+                    // mismatch) shows up in logs without rebuilding.
+                    let recv_dbg = match args.first() {
+                        Some(Value::Object(Some(o))) => {
+                            let cid = shared.heap.class_id_of(*o);
+                            let cm3 = shared.class_manager.read();
+                            cm3.get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| format!("<cid {cid}>"))
+                        }
+                        Some(Value::Object(None)) => "<null>".to_string(),
+                        Some(v) => format!("<non-obj {v:?}>"),
+                        None => "<no-args>".to_string(),
+                    };
+                    let caller_dbg = thread
+                        .frames
+                        .last()
+                        .map(|f| {
+                            format!(
+                                "{}.{}{}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor()
+                            )
+                        })
+                        .unwrap_or_else(|| "<no-frame>".to_string());
+                    eprintln!(
+                        "[NSME_DBG] dispatch_class={class_name} method={method_name}{descriptor} receiver={recv_dbg} caller={caller_dbg}"
+                    );
+                }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),
                     "NoSuchMethodError"

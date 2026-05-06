@@ -27,6 +27,15 @@ fn app_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     INSTANCE.get_or_init(|| Mutex::new(None))
 }
 
+/// Read-only accessor for the singleton app `ClassLoader` already created
+/// by [`get_or_create_app_loader`]. Returns `None` when boot hasn't yet
+/// touched any path that allocates the loader. Intended for VM-side
+/// rescues that need to substitute the canonical app loader without a
+/// `&mut NativeContext` (e.g. `interpreter::execute_checkcast`).
+pub fn peek_app_loader() -> Option<ObjectRef> {
+    *app_loader_store().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Reset singleton loader instances. Called when creating a new VM to avoid
 /// stale ObjectRefs from a previous VM instance.
 pub fn reset_loader_singletons() {
@@ -257,6 +266,35 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         0 // built-in loaders don't use this field
     };
     ctx.set_field(obj, CL_LOADER_ID, Value::Int(lid));
+    // Built-in loaders (platform & app) extend `jdk.internal.loader.BuiltinClassLoader`,
+    // whose constructor (`BuiltinClassLoader(String, BuiltinClassLoader, URLClassPath)`)
+    // initializes the inherited `nameToModule` and `moduleToReader` Map fields to
+    // empty `ConcurrentHashMap` instances. We bypass that constructor (going through
+    // `alloc_concurrent_synthetic` instead), so JDK methods like
+    // `BuiltinClassLoader.findMiscResource` NPE with "Cannot invoke values on null"
+    // when they `getfield nameToModule` and call `Map.values()` on it. Initialize
+    // those fields by name with empty ConcurrentHashMaps so the JDK bytecode path
+    // works without additional intercepts.
+    if loader_type == LOADER_PLATFORM || loader_type == LOADER_APP {
+        let name_to_module = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        ctx.set_field_by_name(obj, "nameToModule", Value::Object(Some(name_to_module)));
+        let module_to_reader = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        ctx.set_field_by_name(obj, "moduleToReader", Value::Object(Some(module_to_reader)));
+    }
+    // S111r17: `java/lang/ClassLoader` declares `packages:ConcurrentHashMap`
+    // (instance field) which the real-JDK ctor initializes via
+    // `new ConcurrentHashMap()`.  We bypass the ctor through
+    // `alloc_concurrent_synthetic`, so `packages` defaults to null. The JDK's
+    // `ClassLoader.packages()` instance method does
+    // `getfield packages → ConcurrentHashMap.values()`, NPE'ing with
+    // "Cannot invoke values on null" — observed during
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (JBoss Modules /
+    // WildFly 39 boot), whose static initializer calls
+    // `Package.getPackages()` → `ClassLoader.getClassLoader(...).getPackages()`
+    // → `packages()`. Pre-populate an empty CHM so the bytecode path runs
+    // without additional intercepts.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(obj, "packages", Value::Object(Some(packages_map)));
     obj
 }
 
@@ -314,11 +352,14 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+    // S111r17: see alloc_classloader — initialize `packages` CHM so
+    // ClassLoader.packages() doesn't NPE on `getfield + values()`.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
 
 fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    eprintln!("[WP2.3 debug] cl_init_parent fired");
     let this = obj_arg(args, 0)?;
     let parent = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
@@ -329,6 +370,9 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+    // S111r17: see alloc_classloader.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
 
@@ -344,6 +388,9 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+    // S111r17: see alloc_classloader.
+    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     // Assign unique loader ID for namespace isolation
     let lid = ctx.allocate_loader_id();
     ctx.set_field(this, CL_LOADER_ID, Value::Int(lid as i32));
@@ -1226,23 +1273,73 @@ fn cl_get_platform_class_loader(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     Ok(Some(Value::Object(Some(platform))))
 }
 
+/// Public re-export of the `getResource` (singular) native so
+/// `register_essential_natives` can install it in real-JDK mode. Without
+/// this the JDK's own `ClassLoader.getResource` runs — and in real-JDK
+/// mode the URLClassPath `<clinit>` swallow leaves the loader's resource
+/// tables empty, so it returns null even for resources the bulk
+/// `getResources` enumerator finds. Wave-1 Task B consistency fix.
+pub fn cl_get_resource_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    cl_get_resource(ctx, args)
+}
+
 fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ClassLoader.getResource(String) → URL
-    let name_obj = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let name = ctx.read_string(name_obj).unwrap_or_default();
-    let resource_name = name.trim_start_matches('/');
-    match ctx.find_resource(resource_name) {
-        Some(_) => {
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-            let full_str = ctx.create_string(&format!("classpath:{name}"));
-            ctx.set_field(url, 5, Value::Object(Some(full_str)));
-            Ok(Some(Value::Object(Some(url))))
+    //
+    // Spec contract: returns the FIRST URL the parent-delegated search
+    // would return for `name`, or null. Must be consistent with
+    // `getResources`: if `getResources(name)` returns N≥1 URLs, then
+    // `getResource(name)` must return the first of those URLs (not null,
+    // not a different URL form). The bulk path walks every classpath
+    // entry via `find_all_resource_urls`; the singular path here mirrors
+    // that walk and returns its first element so the two stay in lock-step.
+    //
+    // We scan `args` for the LAST String-typed slot (mirroring the bulk
+    // path) so the same native can serve `getSystemResource` (static —
+    // name at index 0) and instance `getResource` (name at index 1).
+    let name = {
+        let mut found: Option<String> = None;
+        for v in args.iter().rev() {
+            if let Value::Object(Some(o)) = v {
+                if let Some(s) = ctx.read_string(*o) {
+                    found = Some(s);
+                    break;
+                }
+            }
         }
-        None => Ok(Some(Value::Object(None))),
-    }
+        found.unwrap_or_default()
+    };
+    let resource_name = name.trim_start_matches('/');
+
+    // Prefer the structured URL (jar:file:/... or jrt:/... or file:/...)
+    // so getResource and getResources return the same URL form for the
+    // same name. Fall back to "classpath:<name>" when only `find_resource`
+    // (raw bytes) succeeds — covers synthetic test loaders that override
+    // find_resource without participating in the structured walk.
+    let urls = ctx.find_all_resource_urls(resource_name);
+    let url_str = if let Some(first) = urls.first() {
+        first.clone()
+    } else if ctx.find_resource(resource_name).is_some() {
+        format!("classpath:{name}")
+    } else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::resources",
+        resource = %resource_name,
+        url = %url_str,
+        "ClassLoader.getResource resolved"
+    );
+
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+    let full_str = ctx.create_string(&url_str);
+    // Populate field 0 (read by net_phase_e's openStream fallback) and
+    // field 5 (synthetic "full URL string" slot). Mirrors the bulk
+    // getResources path which also writes both slots.
+    ctx.set_field(url, 0, Value::Object(Some(full_str)));
+    ctx.set_field(url, 5, Value::Object(Some(full_str)));
+    Ok(Some(Value::Object(Some(url))))
 }
 
 /// Public re-export of the `getResources` native for `register_essential_natives`

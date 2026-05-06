@@ -338,8 +338,11 @@ fn native_seek0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // Long arguments crossing native boundaries can arrive tagged as
+    // Double (same 64-bit payload, different Value tag). Reinterpret bits.
     let pos = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
         _ => 0,
     };
     if pos < 0 {
@@ -384,6 +387,7 @@ fn native_setLength0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let new_len = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
         _ => 0,
     };
     if new_len < 0 {

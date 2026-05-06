@@ -208,18 +208,87 @@ fn read_inet_socket_address(
     ctx: &dyn NativeContext,
     sa: ObjectRef,
 ) -> Result<(String, i32), rustjvm_types::error::MethodCallFailed> {
-    let host_val = ctx.get_field(sa, ISA_HOST);
-    let host = match host_val {
-        Value::Object(Some(s)) => match ctx.read_string(s) {
-            Some(t) => t,
-            None => read_field_string_or(ctx, s, IA_ADDR, "0.0.0.0"),
-        },
+    // Wave 3-B² (RE.4): the real JDK `InetSocketAddress` stores all of its
+    // logical state in a private inner `InetSocketAddressHolder` reachable
+    // through slot 0 (`holder`). The holder layout is:
+    //   slot 0 -> hostname : String
+    //   slot 1 -> addr     : InetAddress
+    //   slot 2 -> port     : int
+    // Bytecode `getPort()` is a final method that reads `this.holder.port`
+    // via two `getfield`s, so the synthetic "host at slot 0 / port at slot 1"
+    // layout we used in `alloc_inet_socket_address` would route the
+    // sub-`invokevirtual` for `Holder.getPort()` to the wrong receiver
+    // (a `String` masquerading as the holder). We mirror the real layout
+    // here so reads off a synthetic OR a real-JDK-`<init>`-allocated
+    // `InetSocketAddress` both yield the host+port pair.
+    let holder_val = ctx.get_field(sa, ISA_HOST);
+    let host = match holder_val {
+        Value::Object(Some(holder)) => {
+            // Holder may be (a) a `String` (legacy synthetic layout —
+            // pre-W3-B² helpers), or (b) an `InetSocketAddressHolder` whose
+            // slot 0 is `hostname:String`, slot 1 is `addr:InetAddress`,
+            // slot 2 is `port:int` (real-JDK layout). When hostname is null
+            // (real-JDK ctor that resolved successfully via getByName), we
+            // dig into the InetAddress at slot 1, which itself can be (a)
+            // a synthetic InetAddress with slot 0=hostName, slot 1=ip, or
+            // (b) a real-JDK InetAddress whose slot 0 holder carries
+            // hostName + a 4/16-byte address. Probe in that order; only
+            // fall back to "0.0.0.0" if every slot fails to yield a string.
+            if let Some(s) = ctx.read_string(holder) {
+                s
+            } else {
+                let mut resolved = None;
+                if let Value::Object(Some(name_obj)) = ctx.get_field(holder, 0) {
+                    if let Some(t) = ctx.read_string(name_obj) {
+                        resolved = Some(t);
+                    }
+                }
+                if resolved.is_none() {
+                    if let Value::Object(Some(addr_obj)) = ctx.get_field(holder, 1) {
+                        // synthetic InetAddress: slot 0 = hostName String, slot 1 = ip String
+                        for slot in [IA_HOST, IA_ADDR] {
+                            if let Value::Object(Some(s)) = ctx.get_field(addr_obj, slot) {
+                                if let Some(t) = ctx.read_string(s) {
+                                    if !t.is_empty() {
+                                        resolved = Some(t);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // real-JDK InetAddress: slot 0 = InetAddressHolder; the
+                        // holder's slot 0 is hostName, slot 1 packs address bytes.
+                        if resolved.is_none() {
+                            if let Value::Object(Some(inner_holder)) = ctx.get_field(addr_obj, 0) {
+                                if let Value::Object(Some(name_obj)) = ctx.get_field(inner_holder, 0) {
+                                    if let Some(t) = ctx.read_string(name_obj) {
+                                        if !t.is_empty() {
+                                            resolved = Some(t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                resolved.unwrap_or_else(|| "0.0.0.0".to_string())
+            }
+        }
         _ => "0.0.0.0".to_string(),
     };
-    let port = ctx
-        .get_field(sa, ISA_PORT)
-        .as_int()
-        .ok_or_else(|| ioex("InetSocketAddress port is not an int"))?;
+    // Port: synthetic legacy lives at slot 1; real-JDK lives at holder.slot 2.
+    let port = match ctx.get_field(sa, ISA_PORT) {
+        Value::Int(n) => n,
+        Value::Long(n) => n as i32,
+        _ => match holder_val {
+            Value::Object(Some(holder)) => match ctx.get_field(holder, 2) {
+                Value::Int(n) => n,
+                Value::Long(n) => n as i32,
+                _ => 0,
+            },
+            _ => 0,
+        },
+    };
     Ok((host, port))
 }
 
@@ -295,9 +364,28 @@ fn alloc_inet_socket_address(
     host: &str,
     port: i32,
 ) -> ObjectRef {
+    // Wave 3-B² (RE.4): the real JDK `InetSocketAddress.getPort()` is
+    //     getfield  holder
+    //     invokevirtual InetSocketAddressHolder.getPort()
+    // so the outer object's slot 0 MUST hold an
+    // `InetSocketAddress$InetSocketAddressHolder` — putting a `String`
+    // there causes the inner `invokevirtual` to retarget onto
+    // `java/lang/String.getPort()` and trip a NoSuchMethodError. We
+    // allocate the holder synthetically (its three fields hostname,
+    // addr, port match the real layout exactly) and link it so both
+    // the synthetic `read_inet_socket_address` reader AND real-JDK
+    // bytecode see consistent state.
     let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let holder = alloc_concurrent_synthetic(
+        ctx,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
     let h = ctx.create_string(host);
-    ctx.set_field(isa, ISA_HOST, Value::Object(Some(h)));
+    ctx.set_field(holder, 0, Value::Object(Some(h)));
+    ctx.set_field(holder, 1, Value::Object(None));
+    ctx.set_field(holder, 2, Value::Int(port));
+    ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
     ctx.set_field(isa, ISA_PORT, Value::Int(port));
     isa
 }
@@ -1523,25 +1611,111 @@ fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
 
-    // Our getResources override returns synthetic URL objects that never run
-    // java.net.URL.<init>, so the real-JDK toString()/toExternalForm() NPE
-    // when they read the (null) protocol/host fields.  Override both to
-    // return field 5 (our stored full URL string) or field 0 as a fallback.
+    // Our getResources / Class.getProtectionDomain overrides return URL
+    // objects that never run java.net.URL.<init>, so the real-JDK
+    // toString()/toExternalForm() NPE when they invoke the (null)
+    // URLStreamHandler. We build the external form ourselves.
+    //
+    // Two layouts must be supported:
+    //   * Synthetic-mode 6-field URL where field 5 holds the full URL string
+    //     (populated by our `url_parse` constructor).
+    //   * Real-JDK 13-field URL where field 0=protocol, 1=host, 2=port (int),
+    //     3=file, 4=query, 5=authority, 6=path, 8=ref, 10=handler. The full
+    //     external form is `protocol:[//host[:port]]file[#ref]` per
+    //     java.net.URL.toString.
+    //
+    // We try the synthetic field-5 fast path first (works whenever url_parse
+    // ran), then the real-JDK reconstruction (matches HotSpot output for
+    // synthetic URLs allocated by Class.getProtectionDomain).
     let url_to_string = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let s = match ctx.get_field(this, 5) {
+        // Synthetic fast path: a non-empty field-5 string is the cached
+        // full URL written by url_parse.  We treat any string containing
+        // ":" as a full URL so we don't mistake the real-JDK `authority`
+        // slot for a synthetic full-URL cache.
+        let synth_full = match ctx.get_field(this, 5) {
             Value::Object(Some(o)) => ctx.read_string(o),
             _ => None,
+        };
+        if let Some(ref s) = synth_full {
+            if s.contains(':') && !s.is_empty() {
+                return Ok(Some(Value::Object(Some(ctx.create_string(s)))));
+            }
         }
-        .or_else(|| match ctx.get_field(this, 0) {
+        // Real-JDK reconstruction: protocol:[//host[:port]]file[#ref].
+        let proto = match ctx.get_field(this, 0) {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let host = match ctx.get_field(this, 1) {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let port = match ctx.get_field(this, 2) {
+            Value::Int(i) => i,
+            _ => -1,
+        };
+        let file = match ctx.get_field(this, 3) {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let ref_str = match ctx.get_field(this, 8) {
             Value::Object(Some(o)) => ctx.read_string(o),
             _ => None,
-        })
-        .unwrap_or_default();
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        };
+        let mut out = String::new();
+        if !proto.is_empty() {
+            out.push_str(&proto);
+            out.push(':');
+        }
+        if !host.is_empty() || port >= 0 {
+            out.push_str("//");
+            out.push_str(&host);
+            if port >= 0 {
+                out.push(':');
+                out.push_str(&port.to_string());
+            }
+        }
+        out.push_str(&file);
+        if let Some(r) = ref_str {
+            out.push('#');
+            out.push_str(&r);
+        }
+        // Ultimate fallback: if we built nothing useful, fall back to the
+        // legacy field-0 read for synthetic-mode URLs that stored the
+        // full path at slot 0.
+        if out.is_empty() || out == ":" {
+            if let Some(s) = synth_full {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&s)))));
+            }
+        }
+        Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
     };
     r.register(url, "toString", "()Ljava/lang/String;", url_to_string);
     r.register(url, "toExternalForm", "()Ljava/lang/String;", url_to_string);
+
+    // S111r18: URL.getDefaultPort() — JDK 25 reads `handler.getDefaultPort()`
+    // (URL.java:1015) which NPEs because synthetic URLs (alloc_url, real-JDK
+    // URL ctors) never populate the `handler` field. Per-protocol defaults
+    // match what URLStreamHandler subclasses report; this bypasses the null
+    // handler deref entirely. Spring's CandidateComponentsIndexLoader →
+    // LaunchedURLClassLoader$UseFastConnectionExceptionsEnumeration →
+    // URLClassPath.getLoader → URLUtil.urlNoFragString → getDefaultPort
+    // chain (scag-auth + sister jars) hit this NPE.
+    r.register(url, "getDefaultPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Read the protocol field (slot 0 in our synthetic URL layout).
+        let protocol = read_field_string_or(ctx, this, 0, "");
+        let port = match protocol.as_str() {
+            "http" => 80,
+            "https" => 443,
+            "ftp" => 21,
+            "gopher" => 70,
+            // file/jar/jrt/classpath/nested/etc. → -1 per JDK URLStreamHandler
+            _ => -1i32,
+        };
+        Ok(Some(Value::Int(port)))
+    });
 
     r.register(url, "openStream", "()Ljava/io/InputStream;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1622,6 +1796,83 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         );
         Ok(Some(Value::Object(Some(stream))))
     });
+
+    // URL.openConnection() — return a synthetic URLConnection that defers
+    // its `getInputStream()` to the URL's `openStream()` resolver above.
+    //
+    // The real-JDK path is `handler.openConnection(this)`, but the
+    // URL objects we hand out for resources synthesised by
+    // `ClassLoader.getResource(s)` and `Class.getProtectionDomain` were
+    // never run through the real `URL.<init>` (which would have populated
+    // the package-private `handler` field via `URL.getURLStreamHandler`),
+    // so the JDK call NPEs at line 1209. Spring's `UrlResource.getInputStream`
+    // and `JarFile.getInputStream` go through `URL.openConnection().
+    // getInputStream()`, so a working override is the difference between
+    // SB3's `SpringFactoriesLoader` finding `META-INF/spring.factories`
+    // entries and the launcher dying with `InvocationTargetException`
+    // wrapping a `NullPointerException` at `URL.openConnection`.
+    //
+    // We pick `java/net/HttpURLConnection` as the carrier class. It is
+    // concrete (so allocation succeeds), it is a subclass of URLConnection
+    // (so `URLConnection`-typed locals accept it), and the existing
+    // HttpURLConnection natives below cover `connect`, `getResponseCode`,
+    // `getInputStream`, `setRequestMethod`, etc. for the http(s) case.
+    // For non-http schemes we override `getInputStream` here to delegate
+    // back to URL.openStream so file:/jar:/classpath:/nested:/jrt: all
+    // serve bytes consistently with the resource resolver.
+    r.register(
+        url,
+        "openConnection",
+        "()Ljava/net/URLConnection;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let conn = alloc_concurrent_synthetic(ctx, "java/net/HttpURLConnection", 16);
+            // Field HUC_URL holds the originating URL so `huc_url_string`
+            // and `getInputStream` can recover its external form.
+            ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
+            // Default request method "GET" so `huc_perform` doesn't trip
+            // on a missing method when the http(s) path is exercised.
+            let m = ctx.create_string("GET");
+            ctx.set_field(conn, HUC_METHOD, Value::Object(Some(m)));
+            ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
+            ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+            Ok(Some(Value::Object(Some(conn))))
+        },
+    );
+    // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
+    // `ResourceUtils.useCachesIfNecessary` calls setUseCaches(false) on
+    // file: URLs; without these no-op natives the call would fall through
+    // to the real-JDK setter, which probes the (uninitialised) connected
+    // field and throws IllegalStateException. Make them no-ops on both
+    // URLConnection and HttpURLConnection (registered separately).
+    r.register("java/net/URLConnection", "setUseCaches", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(
+        "java/net/URLConnection",
+        "setDefaultUseCaches",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| Ok(None));
+    // URLConnection.getInputStream — defer to URL.openStream by reading
+    // the URL stored in HUC_URL during openConnection above.
+    r.register(
+        "java/net/URLConnection",
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("URLConnection.getInputStream: no URL")),
+            };
+            ctx.invoke_virtual(
+                url_obj,
+                "openStream",
+                "()Ljava/io/InputStream;",
+                &[],
+            )
+        },
+    );
 
     let huc = "java/net/HttpURLConnection";
     r.register(huc, "connect", "()V", |ctx, args| {

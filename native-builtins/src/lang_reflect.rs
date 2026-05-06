@@ -33,8 +33,9 @@ use rustjvm_types::{ClassId, ObjectRef, Value};
 use rustjvm_types::error::MethodCallResult;
 
 use crate::lang_class::{
+    annotation_element_to_java,
     create_method_object, create_constructor_object, create_field_object,
-    descriptor_to_class_mirror, mirror_class_id, mirror_class_name,
+    descriptor_to_class_mirror, method_class_name_desc, mirror_class_id, mirror_class_name,
     parse_descriptor_param_and_return, read_method_descriptor,
     read_constructor_descriptor, read_field_meta,
 };
@@ -499,16 +500,43 @@ pub(crate) fn native_class_get_enclosing_constructor_public(
 // Method.getDefaultValue() — for annotation methods.
 // ---------------------------------------------------------------------------
 //
-// Returns null for non-annotation methods. For annotation interfaces,
-// returns the AnnotationDefault attribute value.
-// We don't fully parse AnnotationDefault yet; return null for everything,
-// which matches an annotation method without an explicit default.
+// Returns null for non-annotation methods or annotation methods without an
+// explicit default. For annotation-element methods that DO declare a default
+// (`String[] basePackages() default {}`, `int max() default 5`, ...), we
+// parse the JVMS §4.7.22 `AnnotationDefault` attribute via
+// `NativeContext::method_annotation_default` and convert it to a Java Value
+// using the same `annotation_element_to_java` path that populates default
+// element values inside annotation proxies.
+//
+// This is required for Spring's `AttributeMethods` constructor (which sets
+// `hasDefaultValueMethod` based on `m.getDefaultValue() != null`) and for
+// `AnnotationUtils.AliasDescriptor.validateDefaultValueConfiguration` (which
+// reads each element's default to verify aliased attributes share the same
+// default — null means "no default declared", which the validator rejects
+// for `@AliasFor`-targeted attributes).
 
 pub(crate) fn native_method_get_default_value(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+    let this = obj_arg(args, 0)?;
+    let (class_id, name, desc) = match method_class_name_desc(ctx, this) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let default = match ctx.method_annotation_default(class_id, &name, &desc) {
+        Some(v) => v,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    // S111r19 — pass the annotation method's return-type descriptor so
+    // empty arrays carry the correct component class (avoids the
+    // `Object[]`-as-`Annotation[]` aliasing in Spring's `adaptValue`).
+    let ret_desc = desc.strip_prefix("()").map(|s| s.to_string());
+    Ok(Some(crate::lang_class::annotation_element_to_java_typed(
+        ctx,
+        &default,
+        ret_desc.as_deref(),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1162,118 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "getOwnerType",
         "()Ljava/lang/reflect/Type;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // S111r13 — Real-JDK ParameterizedTypeImpl native overrides.
+    //
+    // SportMe (Spring Boot) reaches `Method.invoke(pti, "getActualTypeArguments", ...)`
+    // via Spring's `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke:236`.
+    // The receiver is a real `sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl`
+    // built by JDK reifier code. The PTI's instance fields (in declaration order)
+    // are: actualTypeArguments[0], rawType[1], ownerType[2] — and `get_field_by_name`
+    // confirms they're populated correctly. However, dispatching the PTI bytecode
+    // for `getActualTypeArguments` (which does `aload_0; getfield actualTypeArguments;
+    // invokevirtual [Type;.clone()`) returns null, causing the calling Spring code
+    // to NPE on `arraylength` at TPIH:236. The bytecode's `getfield #7` constant-
+    // pool resolution must mis-map to a wrong slot for these JDK reifier classes.
+    //
+    // Bypass the broken bytecode path by registering native overrides that read
+    // the fields by name. This is consistent with how we already handle the
+    // `java/lang/reflect/ParameterizedType` interface natives above (which fire
+    // for our synthetically-built PTIs).
+    let pti_real = "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl";
+    registry.register(
+        pti_real,
+        "getRawType",
+        "()Ljava/lang/Class;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "rawType")))
+        },
+    );
+    registry.register(
+        pti_real,
+        "getRawType",
+        "()Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "rawType")))
+        },
+    );
+    registry.register(
+        pti_real,
+        "getActualTypeArguments",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Clone the array so callers that mutate it (e.g. Arrays.asList wrappers)
+            // don't observe shared state — matches the real PTI bytecode contract
+            // (`return actualTypeArguments.clone();`).
+            let ata = ctx.get_field_by_name(this, "actualTypeArguments");
+            if let Value::Object(Some(arr)) = ata {
+                let len = ctx.array_length(arr);
+                let clone = ctx.new_ref_array(rustjvm_types::ClassId::new(0), len);
+                for i in 0..len {
+                    let el = ctx.get_array_element(arr, i);
+                    ctx.set_array_element(clone, i, el);
+                }
+                Ok(Some(Value::Object(Some(clone))))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+    registry.register(
+        pti_real,
+        "getOwnerType",
+        "()Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "ownerType")))
+        },
+    );
+
+    // Same field-resolution issue affects TypeVariableImpl / WildcardTypeImpl /
+    // GenericArrayTypeImpl. Provide field-by-name natives so they keep working
+    // when reached via real-JDK reifier code paths.
+    let tvi_real = "sun/reflect/generics/reflectiveObjects/TypeVariableImpl";
+    registry.register(
+        tvi_real,
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "name")))
+        },
+    );
+    let wti_real = "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl";
+    registry.register(
+        wti_real,
+        "getUpperBounds",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "upperBounds")))
+        },
+    );
+    registry.register(
+        wti_real,
+        "getLowerBounds",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "lowerBounds")))
+        },
+    );
+    let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";
+    registry.register(
+        gat_real,
+        "getGenericComponentType",
+        "()Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "genericComponentType")))
+        },
     );
     registry.register(
         "java/lang/reflect/TypeVariable",

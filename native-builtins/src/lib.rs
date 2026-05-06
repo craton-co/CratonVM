@@ -31,10 +31,6 @@ pub mod phases_late;
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
 // the loaded value instead of NPE.
 pub mod properties_sidetable;
-// Wave1-C: per-Thread UncaughtExceptionHandler side-table so
-// `Thread.setUncaughtExceptionHandler` actually has effect when the
-// thread terminates abruptly.
-pub mod uncaught_handlers;
 pub mod charset;
 pub mod panama;
 pub mod panama_libffi;
@@ -185,16 +181,6 @@ pub mod jboss_jdkspecific;
 // singleton + Logger registry (fixes KC26 ClassCastException where
 // LogManager.getLogManager() was returning a Class mirror).
 pub mod logmanager;
-// Block 2C: synthetic JBoss LogManager boot-log sink. Companion to
-// `logmanager.rs` — that one provides addLogger / getLogger /
-// readConfiguration; this one routes Logger.{info,warning,severe,log}
-// through to stderr + the file at `org.jboss.boot.log.file`. Required
-// so KC16 boot lines flow to disk even when the real JBoss-LogManager
-// JAR isn't on the classpath. See `class_manager.rs::jdk_superclass`
-// for the companion class-hierarchy fix that makes the synthetic
-// `org.jboss.logmanager.LogManager` extend `java.util.logging.LogManager`
-// so JDK's `LogManager.<clinit>` checkcast succeeds.
-pub mod jboss_logmanager;
 // T19.H5: AtomicReferenceFieldUpdater / AtomicIntegerFieldUpdater /
 // AtomicLongFieldUpdater `newUpdater` factories — unblock
 // `org.jboss.logmanager.ExtHandler.<clinit>` ClassCastException on
@@ -235,6 +221,9 @@ pub mod inet_address;
 // WP5.9: sun.net.spi.DefaultProxySelector — JVM args + env-driven proxy
 // selection with NO_PROXY / nonProxyHosts pattern matching.
 pub mod proxy_selector;
+// Wave1.D: javax.xml.stream (StAX) cursor API backed by quick-xml. Required
+// by Maven, Spring, Hibernate, every build/runtime that consumes XML.
+pub mod xml_stax;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -330,8 +319,28 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
-    eprintln!("[w3a2-lib] register_essential_natives ENTRY");
     let before = registry.len();
+
+    // RBIGDEC.1 — BigInteger / BigDecimal arithmetic + toString overrides.
+    //
+    // BigInteger.<clinit> can fail in real-JDK mode (intrinsic fallback,
+    // SunJCE side-effects, etc.), causing the BigDecimal cascade NPE on
+    // `Cannot read field 'signum' because the object is null`.  The
+    // post-clinit fixup in `vm/src/vm/vm_util.rs` populates the static
+    // constants but cannot patch the rest of BigInteger/BigDecimal's
+    // partially-initialized internal tables (POW10, BIG_TEN_POWERS, etc.)
+    // which the JDK's `add` / `multiply` bytecode dereferences.
+    //
+    // We register Rust-side arithmetic + `toString` overrides that read the
+    // operand decimal value via `bi_read` / `bd_read` (which now understand
+    // the real-JDK `signum`+`mag` and `intCompact`+`scale` layouts via
+    // `NativeContext::resolve_field_index`) and produce a fresh result that
+    // round-trips through `bi_alloc` / `bd_alloc`.  These overrides run
+    // BEFORE the JDK bytecode (native dispatch takes priority — see
+    // `try_stackless_invoke`), so the partially-init'd JDK internals are
+    // never touched at runtime.
+    register_biginteger_arithmetic_overrides(registry);
+    register_bigdecimal_arithmetic_overrides(registry);
 
     // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
     // surface for real-JDK mode. Real-JDK mode bytecode resolution is
@@ -683,7 +692,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
 
-    // Wave3 — `java/lang/Module.canUse(Class)`. The real bytecode reads
+    // S109 Wave3 — `java/lang/Module.canUse(Class)`. The real bytecode reads
     // `this.descriptor` (a real-Module field that does not exist on our
     // synthetic 2-field Module shape) and dereferences it, producing a
     // NullPointer deep inside `ServiceLoader.checkCaller(Class, Class)`
@@ -719,6 +728,74 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let t = s.trim_matches(|c: char| (c as u32) <= 0x20).to_string();
             Ok(Some(Value::Object(Some(ctx.create_string(&t)))))
         },
+    );
+
+    // Session 108 (Cluster D v2 — fix #2): java/lang/String.indexOf(String,int)
+    // The JDK's URLClassPath(String, boolean) constructor uses
+    // `cp.indexOf(File.pathSeparator, i)` to walk the classpath. The real-JDK
+    // bytecode for this method funnels into `String.checkIndex` →
+    // `Preconditions.checkIndex` and—if any internal layout/coder mismatch
+    // occurs in real-JDK mode—throws an unhelpful, message-less
+    // `StringIndexOutOfBoundsException` from inside `ClassLoaders.<clinit>`.
+    // That cascade then surfaces as the Cluster-D-v2 silent-swallow we
+    // observed in Session 107 (`exc=java/lang/StringIndexOutOfBoundsException`
+    // with no detail). Registering an explicit, layout-neutral native here
+    // routes the call through `read_string` and `find` over `&str`, which
+    // never throws and matches OpenJDK semantics exactly:
+    //   * fromIndex < 0 is clamped to 0 (per JDK spec)
+    //   * fromIndex >= length returns -1
+    //   * empty needle returns clamp(fromIndex, 0, length)
+    //   * otherwise returns the char-index of the first occurrence at or
+    //     after fromIndex, or -1.
+    registry.register(
+        "java/lang/String", "indexOf", "(Ljava/lang/String;I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let needle_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let from = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let needle = ctx.read_string(needle_obj).unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i32;
+            let from = from.max(0);
+            if needle.is_empty() {
+                return Ok(Some(Value::Int(from.min(len))));
+            }
+            if from >= len {
+                return Ok(Some(Value::Int(-1)));
+            }
+            // Build a substring from the from-index and search.
+            let tail: String = chars[from as usize..].iter().collect();
+            match tail.find(&needle) {
+                Some(byte_idx) => {
+                    let char_off = tail[..byte_idx].chars().count() as i32;
+                    Ok(Some(Value::Int(from + char_off)))
+                }
+                None => Ok(Some(Value::Int(-1))),
+            }
+        },
+    );
+
+    // Session 108 (Cluster D v2 — fix #1): java/io/Console.istty()Z native.
+    // The real-JDK `java.io.Console.<clinit>` calls `istty()` to detect a
+    // controlling terminal. RustJVM has no JNI binding for this (and we are
+    // never a TTY anyway — stdin is always non-interactive in our embedding),
+    // so the missing native dispatch in `vm_exec` raises an
+    // `UnsatisfiedLinkError` that gets swallowed at <clinit>. Returning
+    // `false` mirrors what HotSpot reports when stdin is redirected, which
+    // is the correct answer for any non-interactive embedding (CLI tools,
+    // CI smoke tests, container entrypoints). The Console object then
+    // initialises in its "no-tty" mode and downstream callers (e.g.
+    // `System.console()`) gracefully return null without further error.
+    registry.register(
+        "java/io/Console", "istty", "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
     );
     registry.register(
         "java/lang/String", "toString", "()Ljava/lang/String;",
@@ -785,6 +862,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // parseCookie, …).  Registered after the T19.H2 shim so the
     // WP1.4 widened method set overrides the T19.H2 minimum.
     shared_secrets_bridge::register_wp1_4_shared_secrets(registry);
+
+    // S111r12 SB3 follow-on: post-banner Spring Boot 3 boot reaches
+    // `PathMatchingResourcePatternResolver.<clinit>` which calls
+    // `SystemModuleFinders.ofSystem()` → `SystemModules$all.moduleDescriptors()`
+    // → `jdk.internal.module.Builder.newExports(...)`.  `Builder.newExports`
+    // (Builder.java:99) delegates to the static field
+    // `JLMA = SharedSecrets.getJavaLangModuleAccess()` which we never wired
+    // up — so JLMA is null and `JLMA.newExports(...)` NPEs.
+    //
+    // Fix: register native overrides for the five `Builder.new*` static
+    // factories (`newExports` x2, `newOpens` x2, `newProvides`, `newRequires`
+    // x2, `newVersion`) so the JLMA dereference is bypassed.  Each native
+    // allocates a synthetic instance of the corresponding `ModuleDescriptor$*`
+    // inner class with the original constructor arguments stashed in
+    // recognisable named fields (`source`, `targets`, `mods`, `name`,
+    // `version`, `service`, `providers`).  Spring's `<clinit>` only requires
+    // the descriptor walk to NOT throw; it does not deeply inspect the
+    // returned objects, so synthetic stand-ins are sufficient.
+    //
+    // The fields are written via `set_field_by_name` which is layout-tolerant
+    // (slot-resolved at runtime), so the same code path works whether the
+    // real-JDK ModuleDescriptor inner classes are loaded with their full
+    // private fields or our synthetic minimum-field allocation is in play.
+    register_module_builder_overrides(registry);
     // T19.H2: Lookup clinit dependency natives — Reflection.registerFieldsToFilter,
     // ClassFileDumper.getInstance, Set.of(Obj,…) overloads up to 8-arg.
     register_t19_h2_lookup_clinit_deps(registry);
@@ -819,7 +920,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // native to win over the real JDK bytecode for both
     // `(Ljava/lang/Runnable;)V` and `(Ljava/util/concurrent/ForkJoinTask;)V`.
 
-    // WP4.2 DEBUG: trace completeValue
+    // WP4.2: CompletableFuture.completeValue — manual CAS on the result slot.
     registry.register(
         "java/util/concurrent/CompletableFuture",
         "completeValue",
@@ -827,15 +928,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = match args.first().copied() {
                 Some(Value::Object(Some(r))) => r,
-                _ => { eprintln!("[WP4.2 cv] no this"); return Ok(Some(Value::Int(0))); }
+                _ => return Ok(Some(Value::Int(0))),
             };
             let val = args.get(1).copied().unwrap_or(Value::Object(None));
             let before = ctx.get_field(this, 0);
-            eprintln!("[WP4.2 cv] this.result BEFORE = {:?}, val = {:?}", before, val);
             // Manually do the CAS
             if matches!(before, Value::Object(None)) {
                 ctx.set_field(this, 0, val);
-                eprintln!("[WP4.2 cv] this.result AFTER set = {:?}", ctx.get_field(this, 0));
                 Ok(Some(Value::Int(1)))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -852,26 +951,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            // Trace which class the runnable is
-            let cid = ctx.class_id_of_object(runnable);
-            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
-            eprintln!("[WP4.2 essential] FJP.execute(Runnable) firing (runnable_class={cname})");
-            // Capture dep BEFORE run (since AsyncSupply.run clears it)
-            let dep_before = if cname.contains("AsyncSupply") || cname.contains("AsyncRun") {
-                let d = ctx.get_field(runnable, 2);
-                eprintln!("[WP4.2 essential] AsyncSupply.dep BEFORE run = {:?}", d);
-                if let Value::Object(Some(dep)) = d {
-                    eprintln!("[WP4.2 essential] dep.result(slot0) BEFORE = {:?}", ctx.get_field(dep, 0));
-                    eprintln!("[WP4.2 essential] dep.stack(slot1) BEFORE = {:?}", ctx.get_field(dep, 1));
-                }
-                d
-            } else { Value::Object(None) };
             ctx.invoke_virtual(runnable, "run", "()V", &[])?;
-            if let Value::Object(Some(dep)) = dep_before {
-                eprintln!("[WP4.2 essential] dep.result(slot0) AFTER = {:?}", ctx.get_field(dep, 0));
-                eprintln!("[WP4.2 essential] dep.stack(slot1) AFTER = {:?}", ctx.get_field(dep, 1));
-            }
-            eprintln!("[WP4.2 essential] FJP.execute(Runnable) done");
             Ok(None)
         },
     );
@@ -1090,6 +1170,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `properties_sidetable.rs` to keep the registration here lean.
     crate::properties_sidetable::register_properties_sidetable(registry);
 
+    // S111r11 SB3: `jdk.internal.module.ModuleBootstrap.<clinit>` calls
+    // `getAndRemoveProperty(key) = (String) System.getProperties().remove(key)`
+    // for `jdk.module.path`, `jdk.module.upgrade.path`, `jdk.module.main.class`,
+    // etc. (see ModuleBootstrap.java:976). Our synthetic `System.getProperties()`
+    // is a `Properties` object whose private `ConcurrentHashMap<Object,Object> map`
+    // field is null, so JDK 25's `Properties.remove(Object)` (Properties.java:1348:
+    // `return map.remove(key);`) NPEs. The NPE bubbles up through `<clinit>`,
+    // wrecks the module-bootstrap state, and cascades to
+    // `PathMatchingResourcePatternResolver.<clinit>` later (Spring core touches
+    // the same module subsystem to walk the boot ModuleLayer).
+    //
+    // Override `Properties.remove(Object) Object` to return null. This matches
+    // the semantics of "key not present" — which is correct for our empty
+    // synthetic Properties (none of the jdk.module.* keys are set) and lets
+    // ModuleBootstrap's `getAndRemoveProperty` return null cleanly. The
+    // side-table-backed Properties used by setProperty/getProperty don't go
+    // through this path in our current bootstrap, so this is a safe stub.
+    registry.register(
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
     // JDK 25 additional System natives:
     registry.register("java/lang/System", "setIn0", "(Ljava/io/InputStream;)V", |ctx, args| {
         // JVM spec: setIn0 directly writes System.in via Unsafe.
@@ -1171,9 +1275,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/Class", "desiredAssertionStatus", "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // S110 — initPhase1 wires up System.out/err synthetic streams *and*
+    // System.in (a FileInputStream-shaped object whose slot 0 holds the
+    // stdin fd id 0). Without the System.in install, `new Scanner(System.in)`
+    // sees a null stream and `nextLine()` / `nextInt()` immediately throw
+    // NoSuchElementException. The full init also drops `lineSeparator` into
+    // place so `String.format("%n")` matches HotSpot.
     registry.register(
         "java/lang/System", "initPhase1", "()V",
-        |_ctx, _args| Ok(None),
+        lang_system::native_system_init_phase1,
     );
 
     // --- java.lang.String (native methods + overrides) ---
@@ -1503,15 +1613,45 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/URL;",
         lang_class::native_class_get_resource,
     );
-    // Class.getModule returns null — our Class mirrors are unnamed, and
-    // downstream code that calls Module.isNamed() on null must be guarded
-    // by the caller.  This is safe because our Class.getResource* overrides
-    // above intercept the primary users of getModule during bootstrap.
+    // Class.getModule returns a non-null synthetic Module mirror.  Older
+    // versions returned null, which broke any downstream `Module.isNamed()`,
+    // `Module.canUse(svc)`, or `Module.canRead(other)` callsite in JDK
+    // bytecode that immediately dereferences the returned module without
+    // a null check (e.g. `ServiceLoader.checkCaller` does
+    // `caller.getModule().canUse(svc)` directly, NPE'ing inside
+    // `Console.<clinit>` and tripping ByteBuddy/CGLib bootstrap).
+    //
+    // Returning a synthetic 2-field Module (name=field 0 from
+    // `module_name_of_class`, layer=field 1 unset) is safe because:
+    //   * `Module.canUse(Class)` is overridden as a native that always
+    //     returns true on a non-null receiver (see this file's
+    //     S109 Wave3 registration).
+    //   * `Module.isNamed()` consults field 0 — non-null name yields
+    //     true for named modules, false for the unnamed module.
+    //   * Every other `Module.*` Java method that bytecode reaches
+    //     during boot is either overridden in `phases_late.rs::register_p59_module`
+    //     (synthetic mode) or guarded by `canUse`/`canRead` first.
+    //
+    // This intentionally mirrors the synthetic-mode override at
+    // `phases_late.rs::register_p59_module` so real-JDK and synthetic-jdk
+    // boot paths see the same Module shape — see vm/tests/wave3_console_module.rs.
     registry.register(
         "java/lang/Class",
         "getModule",
         "()Ljava/lang/Module;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
+                let class_id = ctx.class_id_of_object(*mirror);
+                ctx.module_name_of_class(class_id)
+                    .map(|name| Value::Object(Some(ctx.create_string(&name))))
+                    .unwrap_or(Value::Object(None))
+            } else {
+                Value::Object(None)
+            };
+            ctx.set_field(m_obj, 0, module_name_val);
+            Ok(Some(Value::Object(Some(m_obj))))
+        },
     );
     registry.register("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     registry.register("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;", native_class_for_name);
@@ -1536,6 +1676,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;", lang_class::native_class_get_superclass);
     registry.register("java/lang/Class", "getInterfaces0", "()[Ljava/lang/Class;", lang_class::native_class_get_interfaces);
     registry.register("java/lang/Class", "getModifiers", "()I", lang_class::native_class_get_modifiers);
+    // Class.getClassLoader() — JDK 25 bytecode is just `getfield classLoader;
+    // areturn`, which always returns null because we never populate that
+    // field on Class mirrors.  Override with a native that returns the
+    // singleton app loader for non-bootstrap classes (and null for
+    // bootstrap classes per JVM spec §5.3).  Without this, e.g.
+    // commons-logging's `LogFactory.<clinit>` does
+    // `LogFactory.class.getClassLoader().loadClass(...)` and NPEs on
+    // the second invokevirtual.  See `lang_class.rs::native_class_get_class_loader`.
+    registry.register(
+        "java/lang/Class",
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        lang_class::native_class_get_class_loader,
+    );
+    // `getClassLoader0()` is the package-private cousin invoked from
+    // `ClassLoader.getClassLoader(Class<?>)` and other JDK internals;
+    // same semantics so route to the same native.
+    registry.register(
+        "java/lang/Class",
+        "getClassLoader0",
+        "()Ljava/lang/ClassLoader;",
+        lang_class::native_class_get_class_loader,
+    );
     // NEW-8: Class.isHidden() — consult the real hidden flag set by
     // `Lookup.defineHiddenClass`. The previous stub always returned 0
     // which broke JEP 371 class-identity checks.
@@ -1681,13 +1844,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             } else {
                 fwd
             };
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 8);
+            // Allocate a real `java.net.URL` and populate the JDK 25
+            // instance-field layout so both real-JDK URL methods and our
+            // native shims resolve a usable `file:/<path>` URL.
+            //
+            // Real JDK URL fields (declaration order, matching reflection):
+            //   0=protocol, 1=host, 2=port (int), 3=file, 4=query,
+            //   5=authority, 6=path, 7=userInfo, 8=ref,
+            //   9=hostAddress, 10=handler, 11=hashCode (int), 12=tempState.
+            //
+            // Spring Boot 3.2's fat-jar launcher path takes
+            // `pd.getCodeSource().getLocation().toURI().getSchemeSpecificPart()`
+            // and feeds it to `new File(...)`. For that round-trip to
+            // produce a path the Windows File ctor can resolve, we need
+            // `URL.toString()` to emit `file:/<path>`, which real-JDK code
+            // builds from `protocol + ":" + file`. We deliberately leave
+            // `authority` (slot 5) null so URL.toURI doesn't take its
+            // `isBuiltinStreamHandler(handler)` branch and NPE on the
+            // null `handler` slot.
+            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
             let path_str = ctx.create_string(&path);
             let proto_str = ctx.create_string("file");
             let host_str = ctx.create_string("");
-            ctx.set_field(url, 0, Value::Object(Some(path_str)));  // path
-            ctx.set_field(url, 1, Value::Object(Some(proto_str))); // protocol
-            ctx.set_field(url, 2, Value::Object(Some(host_str)));  // host
+            ctx.set_field(url, 0, Value::Object(Some(proto_str))); // protocol
+            ctx.set_field(url, 1, Value::Object(Some(host_str)));  // host
+            ctx.set_field(url, 2, Value::Int(-1));                 // port: -1 = unspecified
+            ctx.set_field(url, 3, Value::Object(Some(path_str)));  // file
+            ctx.set_field(url, 6, Value::Object(Some(path_str)));  // path
             let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
             ctx.set_field(cs, 0, Value::Object(Some(url)));
             ctx.set_field(cs, 1, Value::Object(None));
@@ -3084,10 +3267,152 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
         classloader::cl_get_resources_essential,
     );
+    // Wave-1 Task B: install the singular `getResource(String)` override
+    // alongside the bulk `getResources` one so the two stay consistent in
+    // real-JDK mode. Without this, the JDK's own implementation runs and
+    // returns null whenever URLClassPath.<clinit> swallowed in real-JDK
+    // bootstrap (the same root cause RSLF4J.1 fixed for the bulk path).
+    registry.register(
+        "java/lang/ClassLoader",
+        "getResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        classloader::cl_get_resource_essential,
+    );
+    registry.register(
+        "java/lang/ClassLoader",
+        "getSystemResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        classloader::cl_get_resource_essential,
+    );
     // Natives for the synthetic `java/util/Enumeration$Impl` helper the
     // getResources override returns.  These are idempotent (re-registered
     // by `register_classloader_natives` in synthetic-JDK mode).
     classloader::register_enumeration_impl_natives(registry);
+
+    // S111r6: URLClassPath.<init>(URL[],URLStreamHandlerFactory) NPEs in
+    // real-JDK mode when invoked indirectly via SB2 launcher's
+    // LaunchedURLClassLoader -> URLClassLoader.<init>(URL[], ClassLoader)
+    // -> URLClassPath.<init>(URL[]) at line 131 (`new ArrayList<>(urls.length)`)
+    // because `urls` arrives as null. Install a defensive constructor that
+    // treats null-or-empty URL[] as empty and initialises every instance
+    // field that the real Java code would populate (either through inline
+    // field initializers folded into the bytecode constructor, or via the
+    // explicit `this.path = ...` / `this.unopenedUrls = ...` assignments).
+    //
+    // SB3 (S111r15): Spring's CandidateComponentsIndexLoader enumerates
+    // `META-INF/spring.components` via ClassLoader.getResources, which
+    // descends into URLClassPath.getLoader(int). Line 393 reads
+    // `loaders.size()`; if `loaders` is null we NPE. Real Java relies on
+    // the inline field initializers at URLClassPath.java:108/111/117
+    //     private final ArrayList<Loader> loaders = new ArrayList<>();
+    //     private final HashMap<String, Loader> lmap = new HashMap<>();
+    //     private boolean closed = false;
+    // which the bytecode compiler folds into the constructor before any
+    // explicit assignments. Our native replaces the constructor outright,
+    // so those initializers never run unless we do them by hand.
+    fn ucp_init_2(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let urls_val = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Construct path = new ArrayList<>(len)
+        let path = match ctx.new_object("java/util/ArrayList")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(path))],
+        )?;
+        // Construct unopenedUrls = new ArrayDeque<>(len)
+        let unopened = match ctx.new_object("java/util/ArrayDeque")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/ArrayDeque",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(unopened))],
+        )?;
+        // Construct loaders = new ArrayList<>() — required for getLoader(int)
+        // which reads loaders.size() at URLClassPath.java:393.
+        let loaders = match ctx.new_object("java/util/ArrayList")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(loaders))],
+        )?;
+        // Construct lmap = new HashMap<>() — guards getLoader(int)'s
+        // `lmap.containsKey(...)` check at URLClassPath.java:402.
+        let lmap = match ctx.new_object("java/util/HashMap")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/HashMap",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(lmap))],
+        )?;
+        // Iterate URLs (if non-null) and seed both collections.
+        if let Value::Object(Some(arr)) = urls_val {
+            let len = ctx.array_length(arr);
+            for i in 0..len {
+                let elem = ctx.get_array_element(arr, i);
+                ctx.invoke(
+                    "java/util/ArrayList",
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(path)), elem],
+                )?;
+                ctx.invoke(
+                    "java/util/ArrayDeque",
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(unopened)), elem],
+                )?;
+            }
+        }
+        ctx.set_field_by_name(this, "path", Value::Object(Some(path)));
+        ctx.set_field_by_name(this, "unopenedUrls", Value::Object(Some(unopened)));
+        ctx.set_field_by_name(this, "loaders", Value::Object(Some(loaders)));
+        ctx.set_field_by_name(this, "lmap", Value::Object(Some(lmap)));
+        ctx.set_field_by_name(this, "jarHandler", Value::Object(None));
+        ctx.set_field_by_name(this, "closed", Value::Int(0));
+        Ok(None)
+    }
+    fn ucp_init_1(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Single-arg ctor: forward to the 2-arg form with factory=null.
+        let this = args.first().copied().unwrap_or(Value::Object(None));
+        let urls = args.get(1).copied().unwrap_or(Value::Object(None));
+        ucp_init_2(ctx, &[this, urls, Value::Object(None)])
+    }
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "<init>",
+        "([Ljava/net/URL;Ljava/net/URLStreamHandlerFactory;)V",
+        ucp_init_2,
+    );
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "<init>",
+        "([Ljava/net/URL;)V",
+        ucp_init_1,
+    );
 
     // --- java.io.ObjectStreamClass native bindings (real-JDK mode) ---
     // ObjectStreamClass.<clinit> calls initNative(); without this registered
@@ -3189,6 +3514,72 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // only in `register_synthetic_overrides`; promoted here so it
     // works in real-JDK mode too.
     crate::securerandom::register_random_and_securerandom_natives(registry);
+
+    // S111r17: `Class.getPackage()` real-JDK override. The JDK Java body of
+    // `Class.getPackage()` delegates to `ClassLoader.definePackage(c)` →
+    // `getDefinedPackage(name)` (we override to null) → `getNamedPackage(
+    // name, module)` (we override) — but `getNamedPackage` doesn't have
+    // access to the Class and so cannot populate
+    // `implementationVersion` from the source jar's manifest. Result:
+    // `SpringBootVersion.class.getPackage().getImplementationVersion()`
+    // returns null, the JarURLConnection fallback path NPEs at line 61,
+    // and the SB2.3.8 banner crashes before printing the version.
+    // Registering the same `native_class_get_package` body that
+    // synthetic-jdk uses fixes the version probe at the root.
+    registry.register(
+        "java/lang/Class",
+        "getPackage",
+        "()Ljava/lang/Package;",
+        crate::lang_class::native_class_get_package,
+    );
+
+    // S111r17: `Package.getImplementationVersion()` and friends. The
+    // `native_class_get_package` builder writes `implVersion` and
+    // friends into Package's slots 1..=6 directly, bypassing the JDK's
+    // `versionInfo: VersionInfo` indirection. The JDK Java body for
+    // `Package.getImplementationVersion()` reads `versionInfo.implVersion`
+    // — but `versionInfo` is null on our synthetic Package, NPE.
+    // Override the field-reader methods to return slot N directly.
+    // Slot layout (must match `native_class_get_package`):
+    //   0=name, 1=specTitle, 2=specVersion, 3=specVendor,
+    //   4=implTitle, 5=implVersion, 6=implVendor.
+    let pkg_cls = "java/lang/Package";
+    fn pkg_obj_arg(args: &[Value]) -> Result<rustjvm_types::ObjectRef, rustjvm_types::error::RuntimeError> {
+        match args.first() {
+            Some(Value::Object(Some(o))) => Ok(*o),
+            _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Package method called on null".to_string()),
+            }),
+        }
+    }
+    registry.register(pkg_cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    registry.register(pkg_cls, "getSpecificationTitle", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    registry.register(pkg_cls, "getSpecificationVersion", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 2)))
+    });
+    registry.register(pkg_cls, "getSpecificationVendor", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 3)))
+    });
+    registry.register(pkg_cls, "getImplementationTitle", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 4)))
+    });
+    registry.register(pkg_cls, "getImplementationVersion", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 5)))
+    });
+    registry.register(pkg_cls, "getImplementationVendor", "()Ljava/lang/String;", |ctx, args| {
+        let this = pkg_obj_arg(args)?;
+        Ok(Some(ctx.get_field(this, 6)))
+    });
 
     // WP6.2 follow-up — `java.util.HexFormat.formatHex(byte[])` /
     // `formatHex(byte[],int,int)` for `apps/digest_probe/DigestProbe.java`.
@@ -3392,6 +3783,139 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `DriverManager.getConnection`. Registered LAST so it overrides any
     // earlier stub registrations of the same triples.
     jdbc::register_jdbc_driver_natives(registry);
+
+    // Wave1.D — javax.xml.stream (StAX) cursor API backed by quick-xml.
+    // Enables Maven, Spring XML config, Hibernate `hibernate.cfg.xml`,
+    // and any tool that consumes XML to parse arbitrary documents
+    // without depending on the JDK Xerces/XMLStringBuffer code path.
+    xml_stax::register(registry);
+
+    // Wave 2 D — DirectByteBuffer / Cleaner checkcast guard.
+    //
+    // JDK 25's `java.nio.Buffer.session()` performs a `getfield segment`
+    // followed by a `checkcast jdk/internal/foreign/AbstractMemorySegmentImpl`.
+    // The DirectByteBuffer constructor chain leaves the `segment` slot in
+    // a state where a subsequent read returns a `Value::Long`-encoded
+    // pointer (the long `address` field's bit pattern leaks through the
+    // operand stack's CompactValue NaN-boxing because untagged 64-bit
+    // slots cannot distinguish Long from Double). The checkcast then
+    // hits a `Value::Double` on the operand stack and aborts the VM
+    // with `internal error: checkcast: not an object reference` before
+    // any println reaches the host.
+    //
+    // Routing `session()` through a native shim that returns null short-
+    // circuits the bad checkcast — `ScopedMemoryAccess.putIntUnaligned`
+    // already accepts a null session (it skips the
+    // `checkValidStateRaw()` call) and the rest of the JDK's
+    // direct-buffer surface treats null sessions as "no scope check
+    // required". This is consistent with the existing
+    // `Buffer$1.acquireSession` shim in
+    // `native-builtins/src/shared_secrets_bridge.rs`, which already
+    // returns null for the same scope-validation paths.
+    //
+    // Native dispatch is keyed on the *receiver* class for
+    // `invokevirtual`, so the shim is registered for every concrete
+    // subclass that the JDK 25 NIO hierarchy uses for direct/heap
+    // buffers. (Buffer itself covers any rare invokespecial-on-Buffer
+    // sites that bypass the virtual cache.)
+    for buf in [
+        "java/nio/Buffer",
+        "java/nio/ByteBuffer",
+        "java/nio/MappedByteBuffer",
+        "java/nio/DirectByteBuffer",
+        "java/nio/HeapByteBuffer",
+        "java/nio/CharBuffer",
+        "java/nio/IntBuffer",
+        "java/nio/LongBuffer",
+        "java/nio/FloatBuffer",
+        "java/nio/DoubleBuffer",
+        "java/nio/ShortBuffer",
+    ] {
+        registry.register(
+            buf,
+            "session",
+            "()Ljdk/internal/foreign/MemorySessionImpl;",
+            |_ctx, _args| Ok(Some(rustjvm_types::Value::Object(None))),
+        );
+        registry.register(buf, "checkSession", "()V", |_ctx, _args| Ok(None));
+    }
+
+    // S111r15 — Character.toLowerCase / toUpperCase native overrides for
+    // real-JDK mode. The JDK bytecode delegates `(C)C` to `(I)I`, which
+    // walks `CharacterData.of(I)CharacterData` and an invokevirtual on the
+    // returned subclass. After ~2000 invocations the JIT compiles `build()`
+    // (or any caller of `Character.toLowerCase`) and the resulting machine
+    // code returns 0 for most inputs — corrupting Spring's
+    // `BeanPropertyName.toDashedForm`: `bannerMode` becomes
+    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`, tripping
+    // `InvalidConfigurationPropertyNameException` in SportMe boot.
+    // Routing the (C)C / (I)I forms through Rust's `char::to_lowercase` /
+    // `char::to_uppercase` defeats the JIT path entirely. Symmetric
+    // registration of all four forms keeps the native-shadow guard on
+    // every JIT entry point (callee_compiler / try_jit_compile_callee /
+    // try_jit_upgrade_with_gate / first-call / OSR) honored uniformly.
+    registry.register(
+        "java/lang/Character",
+        "toLowerCase",
+        "(C)C",
+        |_ctx, args| {
+            let ch = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let result = char::from_u32(ch)
+                .and_then(|c| c.to_lowercase().next())
+                .unwrap_or('\0') as u32;
+            Ok(Some(Value::Int(result as i32)))
+        },
+    );
+    registry.register(
+        "java/lang/Character",
+        "toUpperCase",
+        "(C)C",
+        |_ctx, args| {
+            let ch = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let result = char::from_u32(ch)
+                .and_then(|c| c.to_uppercase().next())
+                .unwrap_or('\0') as u32;
+            Ok(Some(Value::Int(result as i32)))
+        },
+    );
+    registry.register(
+        "java/lang/Character",
+        "toLowerCase",
+        "(I)I",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let result = char::from_u32(cp as u32)
+                .and_then(|c| c.to_lowercase().next())
+                .map(|c| c as u32 as i32)
+                .unwrap_or(cp);
+            Ok(Some(Value::Int(result)))
+        },
+    );
+    registry.register(
+        "java/lang/Character",
+        "toUpperCase",
+        "(I)I",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let result = char::from_u32(cp as u32)
+                .and_then(|c| c.to_uppercase().next())
+                .map(|c| c as u32 as i32)
+                .unwrap_or(cp);
+            Ok(Some(Value::Int(result)))
+        },
+    );
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
@@ -3968,15 +4492,6 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // java/util/logging/LogManager` by ensuring the native always
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
-
-    // Block 2C: synthetic JBoss LogManager boot-log sink. Routes
-    // Logger.{info,warning,severe,log} through to stderr + the file at
-    // `org.jboss.boot.log.file` so KC16 server.log gets the WildFly
-    // bootstrap-banner lines even when `jboss-logmanager-2.1.18.Final.jar`
-    // isn't loaded. Block 2A loads the real JAR (when present) and that
-    // path's bytecode-defined `Logger.log` wins over our native — the
-    // synthetic shim only fires when no Java method body exists.
-    jboss_logmanager::register_jboss_logmanager_natives(registry);
 
     // WP2.1: java.lang.reflect full coverage — net-new natives
     // (trySetAccessible, canAccess, getEnclosingClass, Parameter
@@ -5989,12 +6504,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // --- Phase 72: Preferences, Beans, JNDI, Datagram, HttpServer, ServerSocket extras ---
     register_phase72_natives(registry);
 
-    // Wave1-C: override the noop Thread.setUncaughtExceptionHandler /
-    // getUncaughtExceptionHandler from phase71 with a side-table-backed
-    // implementation so the handler actually fires when a thread
-    // terminates abruptly (consumed by vm_exec.rs::thread_start).
-    crate::uncaught_handlers::register_uncaught_handler_natives(registry);
-
     // --- NEW-15: Virtual threads / Loom (JEP 444 / 491) ---
     // Continuation, ContinuationScope, ForkJoinPool.commonPool.
     crate::phases_late::register_new15_loom(registry);
@@ -6149,18 +6658,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // do not silently win over the proper SPI implementation. Mirrors
     // the unconditional registration in `register_essential_natives`.
     jdbc::register_jdbc_driver_natives(registry);
-
-    // W3-A2 (Wave 3 Task A2): re-register `net_phase_e` AFTER every
-    // phase 50..72 so its real `Socket` / `ServerSocket` natives
-    // (backed by std::net::TcpStream / TcpListener through
-    // `s2_registry`, with ObjectRef-keyed side-tables to bypass
-    // synthetic-vs-real-JDK field-layout collisions) take precedence
-    // over the synthetic stubs registered earlier in
-    // `register_phase53_socket_stubs` and `register_p72_server_socket`.
-    // Without this re-registration, `new ServerSocket(0)` runs a stub
-    // that never binds, so `getLocalPort()` returns 0 and the loopback
-    // round-trip in SocketProbe fails immediately.
-    net_phase_e::register_phase_e_networking(registry);
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered synthetic overrides");
@@ -8448,8 +8945,13 @@ fn native_unsafe_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(v)) => *v != 0,
         _ => false,
     };
-    let time = match args.get(2) {
+    // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+    // tag-loss for category-2 longs (CompactValue::long stores raw i64 untagged,
+    // and `to_value()` decodes untagged bits as Double). Recover via bit-reinterpret.
+    let time: i64 = match args.get(2) {
         Some(Value::Long(t)) => *t,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(t)) => *t as i64,
         _ => 0,
     };
 
@@ -9882,8 +10384,13 @@ fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
         if ctx.is_interrupted(false) {
             return Ok(None);
         }
-        let nanos = match args.first() {
+        // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+        // tag-loss for category-2 longs (CompactValue::long stores raw i64 untagged,
+        // and `to_value()` decodes untagged bits as Double). Recover via bit-reinterpret.
+        let nanos: i64 = match args.first() {
             Some(Value::Long(n)) => *n,
+            Some(Value::Double(d)) => d.to_bits() as i64,
+            Some(Value::Int(n)) => *n as i64,
             _ => 0,
         };
         if nanos > 0 {
@@ -9927,8 +10434,12 @@ fn native_lock_support_park_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -
     if ctx.is_interrupted(false) {
         return Ok(None);
     }
-    let nanos = match args.get(1) {
+    // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+    // tag-loss for category-2 longs. Recover via bit-reinterpret.
+    let nanos: i64 = match args.get(1) {
         Some(Value::Long(n)) => *n,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(n)) => *n as i64,
         _ => 0,
     };
     if nanos > 0 {
@@ -9943,8 +10454,12 @@ fn native_lock_support_park_until(ctx: &mut dyn NativeContext, args: &[Value]) -
     if ctx.is_interrupted(false) {
         return Ok(None);
     }
-    let deadline = match args.get(1) {
+    // CLUSTER-A: long argument may arrive as Value::Double due to operand-stack
+    // tag-loss for category-2 longs. Recover via bit-reinterpret.
+    let deadline: i64 = match args.get(1) {
         Some(Value::Long(d)) => *d,
+        Some(Value::Double(x)) => x.to_bits() as i64,
+        Some(Value::Int(x)) => *x as i64,
         _ => 0,
     };
     if deadline > 0 {
@@ -11338,6 +11853,147 @@ pub(crate) fn alloc_concurrent_synthetic(
     }
 }
 
+/// Build a `java.util.HashSet` with a real-layout `java.util.HashMap` inside,
+/// populated with the supplied String keys (each mapped to the canonical
+/// `HashSet.PRESENT` singleton — represented here as the same `Boolean.TRUE`
+/// substitute / null sentinel: JDK code only ever does `containsKey`, never
+/// reads the value).
+///
+/// Falls back to the legacy synthetic-2-field layout (data_array, size) when
+/// the real `HashMap` / `HashMap$Node` field layout cannot be resolved (i.e.
+/// classes not yet loaded). This matches the pattern S111r7 introduced in
+/// `lang_system::native_system_getenv_all` so JDK bytecode for
+/// `HashSet.spliterator()` (which constructs a `HashMap.KeySpliterator` from
+/// the wrapped HashMap and later does `getfield m.table`) reads valid slots
+/// instead of seeing the synthetic `(data_array, size)` placement.
+///
+/// This is a generic collection-layout helper, NOT vendor-specific.
+pub(crate) fn build_real_layout_string_hashset(
+    ctx: &mut dyn NativeContext,
+    keys: &[ObjectRef],
+) -> ObjectRef {
+    use rustjvm_types::ClassId;
+
+    // Resolve real HashMap + HashMap$Node + HashSet field layout.
+    let _ = ctx.ensure_class_initialized("java/util/HashMap");
+    let _ = ctx.ensure_class_initialized("java/util/HashMap$Node");
+    let _ = ctx.ensure_class_initialized("java/util/HashSet");
+    let hashmap_cid = ctx
+        .ensure_class_initialized("java/util/HashMap")
+        .unwrap_or(ClassId::new(0));
+    let node_cid = ctx
+        .ensure_class_initialized("java/util/HashMap$Node")
+        .unwrap_or(ClassId::new(0));
+    let hashset_cid = ctx
+        .ensure_class_initialized("java/util/HashSet")
+        .unwrap_or(ClassId::new(0));
+
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+    let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+    let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+    let n_hash = ctx.resolve_field_index("java/util/HashMap$Node", "hash");
+    let n_key = ctx.resolve_field_index("java/util/HashMap$Node", "key");
+    let n_value = ctx.resolve_field_index("java/util/HashMap$Node", "value");
+    let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
+    let s_map = ctx.resolve_field_index("java/util/HashSet", "map");
+
+    fn jdk_string_hash_from_obj(ctx: &mut dyn NativeContext, k: ObjectRef) -> i32 {
+        // Use String.hashCode equivalent: per-char folded with 31, then JDK
+        // HashMap.hash post-mix `h ^ (h >>> 16)`.
+        let s = ctx.read_string(k).unwrap_or_default();
+        let mut h: i32 = 0;
+        for ch in s.chars() {
+            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        h ^ ((h as u32 >> 16) as i32)
+    }
+
+    if let (
+        Some(f_table),
+        Some(f_size),
+        Some(f_threshold),
+        Some(f_loadfactor),
+        Some(f_entryset),
+        Some(n_hash),
+        Some(n_key),
+        Some(n_value),
+        Some(n_next),
+        Some(s_map),
+    ) = (
+        f_table,
+        f_size,
+        f_threshold,
+        f_loadfactor,
+        f_entryset,
+        n_hash,
+        n_key,
+        n_value,
+        n_next,
+        s_map,
+    ) {
+        // Pick a power-of-two capacity >= size / 0.75 so we never exceed
+        // the threshold during insertion. Default to 16 (matches JDK).
+        let mut cap: usize = 16;
+        while cap < (keys.len() * 4 / 3 + 1).max(16) {
+            cap <<= 1;
+        }
+        let buckets = ctx.new_ref_array(ClassId::new(0), cap);
+
+        let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let node_n_fields = [n_hash, n_key, n_value, n_next]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let map = ctx.alloc_object(hashmap_cid, map_n_fields);
+        ctx.set_field(map, f_table, Value::Object(Some(buckets)));
+        ctx.set_field(map, f_size, Value::Int(keys.len() as i32));
+        ctx.set_field(map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        ctx.set_field(map, f_loadfactor, Value::Float(0.75));
+        ctx.set_field(map, f_entryset, Value::Object(None));
+
+        for &k in keys {
+            let hash = jdk_string_hash_from_obj(ctx, k);
+            let idx = ((cap as u32 - 1) & hash as u32) as usize;
+            let node = ctx.alloc_object(node_cid, node_n_fields);
+            ctx.set_field(node, n_hash, Value::Int(hash));
+            ctx.set_field(node, n_key, Value::Object(Some(k)));
+            // Value: null is fine — JDK HashSet uses the static PRESENT
+            // sentinel, but bytecode that walks the keySet only inspects the
+            // key field, never the value.
+            ctx.set_field(node, n_value, Value::Object(None));
+            let existing = ctx.get_array_element(buckets, idx);
+            ctx.set_field(node, n_next, existing);
+            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+        }
+
+        // Allocate HashSet with the real layout (single field `map`).
+        let set_n_fields = (s_map + 1).max(ctx.class_num_total_fields(hashset_cid));
+        let set = ctx.alloc_object(hashset_cid, set_n_fields);
+        ctx.set_field(set, s_map, Value::Object(Some(map)));
+        return set;
+    }
+
+    // Fallback: legacy synthetic-2-field (data_array, size) layout used by
+    // older callers that don't go through the JDK spliterator/stream path.
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    for (i, &k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(k)));
+    }
+    ctx.set_field(set, 0, Value::Object(Some(arr)));
+    ctx.set_field(set, 1, Value::Int(keys.len() as i32));
+    set
+}
+
 // ---------------------------------------------------------------------------
 // T19.H2: SharedSecrets JavaLangAccess shim
 // ---------------------------------------------------------------------------
@@ -11474,6 +12130,515 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// S111r12 SB3 follow-on: jdk.internal.module.Builder.new* static overrides
+// ---------------------------------------------------------------------------
+//
+// Real-JDK `Builder.newExports` (Builder.java:99) bytecode is:
+//
+//     return JLMA.newExports(ms, pn, targets);
+//
+// where `JLMA = SharedSecrets.getJavaLangModuleAccess()`.  Rustjvm's
+// SharedSecrets bridge (`shared_secrets_bridge.rs`) does not wire up a
+// `JavaLangModuleAccess` singleton (that interface holds 13 methods,
+// most of which require a fully-implemented module-descriptor builder
+// surface that goes far beyond what SB3 boot exercises).  Without a
+// JLMA, the static field is null and the `invokeinterface` NPEs.
+//
+// Spring Boot 3's only consumer of `SystemModuleFinders.ofSystem` →
+// `SystemModules$all.moduleDescriptors` is the `<clinit>` of
+// `PathMatchingResourcePatternResolver` (Spring uses the class loader's
+// boot ModuleLayer to enumerate resource roots).  That walk only needs
+// each `Builder.new*` call to NOT throw; the returned objects flow into
+// `Set.of(...)` and ultimately into `newModuleDescriptor(...)` whose
+// result is also synthetic in our boot path.
+//
+// Strategy: register native overrides for each static factory that
+// allocate a synthetic instance of the matching `ModuleDescriptor$*`
+// inner class and stash the original args under JDK-standard field
+// names (`source`, `targets`, `mods`, `name`, `compiledVersion`,
+// `service`, `providers`).  `set_field_by_name` is slot-resolved so it
+// is robust to either the real-JDK private-field layout or our
+// synthetic minimum-field allocation.
+
+fn module_builder_alloc_with_named_fields(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    fields: &[(&str, Value)],
+) -> ObjectRef {
+    // Allocate enough slots for the named fields plus a safety margin;
+    // `alloc_concurrent_synthetic` widens to the real-JDK field count
+    // when the class is loaded.
+    let obj = alloc_concurrent_synthetic(ctx, class_name, fields.len().max(4));
+    for (name, value) in fields {
+        ctx.set_field_by_name(obj, name, *value);
+    }
+    obj
+}
+
+fn native_module_builder_new_exports_qualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String source, Set<String> targets) -> Exports
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        &[("mods", mods), ("source", source), ("targets", targets)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_exports_unqualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String source) -> Exports
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        &[("mods", mods), ("source", source)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_opens_qualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Opens",
+        &[("mods", mods), ("source", source), ("targets", targets)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_opens_unqualified(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Opens",
+        &[("mods", mods), ("source", source)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_requires_versioned(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String mn, String compiledVersion) -> Requires
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Requires",
+        &[
+            ("mods", mods),
+            ("name", mn),
+            ("compiledVersion", compiled),
+        ],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_requires_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (Set<Modifier>, String mn) -> Requires
+    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Requires",
+        &[("mods", mods), ("name", mn)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_provides(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String service, List<String> providers) -> Provides
+    let service = args.first().copied().unwrap_or(Value::Object(None));
+    let providers = args.get(1).copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Provides",
+        &[("service", service), ("providers", providers)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_new_version(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String v) -> Version
+    let v = args.first().copied().unwrap_or(Value::Object(None));
+    let obj = module_builder_alloc_with_named_fields(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Version",
+        &[("version", v)],
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_module_builder_build(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Instance method: build(int hashCode) -> ModuleDescriptor
+    // args[0] = this (Builder), args[1] = hashCode int
+    // The real impl calls JLMA.newModuleDescriptor(name, version, …) — JLMA
+    // is null in our boot.  Allocate a synthetic ModuleDescriptor and copy
+    // over the readable Builder state into matching named fields.
+    let this = args.first().copied().unwrap_or(Value::Object(None));
+    let md = alloc_concurrent_synthetic(
+        ctx,
+        "java/lang/module/ModuleDescriptor",
+        16,
+    );
+    if let Value::Object(Some(builder)) = this {
+        for f in [
+            "name",
+            "version",
+            "requires",
+            "exports",
+            "opens",
+            "uses",
+            "provides",
+            "packages",
+            "mainClass",
+        ] {
+            let v = ctx.get_field_by_name(builder, f);
+            ctx.set_field_by_name(md, f, v);
+        }
+    }
+    if let Some(Value::Int(h)) = args.get(1) {
+        ctx.set_field_by_name(md, "hashCode", Value::Int(*h));
+    }
+    Ok(Some(Value::Object(Some(md))))
+}
+
+fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
+    let owner = "jdk/internal/module/Builder";
+    // newExports(Set<Modifier>, String, Set<String>) -> Exports (qualified)
+    registry.register(
+        owner,
+        "newExports",
+        "(Ljava/util/Set;Ljava/lang/String;Ljava/util/Set;)Ljava/lang/module/ModuleDescriptor$Exports;",
+        native_module_builder_new_exports_qualified,
+    );
+    // newExports(Set<Modifier>, String) -> Exports (unqualified)
+    registry.register(
+        owner,
+        "newExports",
+        "(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Exports;",
+        native_module_builder_new_exports_unqualified,
+    );
+    // newOpens(Set<Modifier>, String, Set<String>) -> Opens (qualified)
+    registry.register(
+        owner,
+        "newOpens",
+        "(Ljava/util/Set;Ljava/lang/String;Ljava/util/Set;)Ljava/lang/module/ModuleDescriptor$Opens;",
+        native_module_builder_new_opens_qualified,
+    );
+    // newOpens(Set<Modifier>, String) -> Opens (unqualified)
+    registry.register(
+        owner,
+        "newOpens",
+        "(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Opens;",
+        native_module_builder_new_opens_unqualified,
+    );
+    // newRequires(Set<Modifier>, String, String) -> Requires (with version)
+    registry.register(
+        owner,
+        "newRequires",
+        "(Ljava/util/Set;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Requires;",
+        native_module_builder_new_requires_versioned,
+    );
+    // newRequires(Set<Modifier>, String) -> Requires
+    registry.register(
+        owner,
+        "newRequires",
+        "(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Requires;",
+        native_module_builder_new_requires_short,
+    );
+    // newProvides(String, List<String>) -> Provides
+    registry.register(
+        owner,
+        "newProvides",
+        "(Ljava/lang/String;Ljava/util/List;)Ljava/lang/module/ModuleDescriptor$Provides;",
+        native_module_builder_new_provides,
+    );
+    // build(int) -> ModuleDescriptor (instance method, also goes through JLMA)
+    registry.register(
+        owner,
+        "build",
+        "(I)Ljava/lang/module/ModuleDescriptor;",
+        native_module_builder_build,
+    );
+    // The Builder.version(String) bytecode goes through Version.parse —
+    // we override the Builder method to skip parse and stash the raw
+    // string in a synthetic Version object so the static cache field
+    // does not feed downstream NPE paths.  We register against
+    // `Version.parse` directly because Builder.version() doesn't have
+    // a separate factory entry; Builder uses Version.parse().
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
+        native_module_builder_new_version,
+    );
+
+    // S111r12 SB3 follow-on (continued): downstream of `Builder.newExports`
+    // is `Builder.exports(Exports[])` which delegates to
+    // `Set.of(exports)`.  `ImmutableCollections$SetN.probe` calls
+    // `Exports.hashCode()` which dereferences the private `mods`,
+    // `source`, `targets` fields:
+    //
+    //     int hash = modsHashCode(mods);                // NPE on null mods
+    //     hash = hash * 43 + source.hashCode();
+    //     return hash * 43 + targets.hashCode();
+    //
+    // Our synthetic stand-ins may have any of those null (Builder is called
+    // from generated `SystemModules$all.moduleDescriptors` which builds the
+    // Sets first).  Override `hashCode`/`equals` on the four
+    // ModuleDescriptor$* inner classes to identity-based defaults.  The
+    // descriptor walk only needs hashCode to be well-defined and equals
+    // to be reflexive — Set.of's duplicate detection just needs a
+    // consistent hash; identity hashing is consistent because we allocate
+    // a fresh object per `Builder.new*` call anyway.
+    for inner in [
+        "java/lang/module/ModuleDescriptor$Exports",
+        "java/lang/module/ModuleDescriptor$Opens",
+        "java/lang/module/ModuleDescriptor$Requires",
+        "java/lang/module/ModuleDescriptor$Provides",
+        "java/lang/module/ModuleDescriptor$Version",
+    ] {
+        registry.register(inner, "hashCode", "()I", |ctx, args| {
+            // Identity-based hash: stable per object, never NPEs on
+            // null private fields.
+            if let Some(Value::Object(Some(o))) = args.first() {
+                let h = ctx.identity_hash_code(*o);
+                Ok(Some(Value::Int(h)))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        });
+        registry.register(
+            inner,
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            |_ctx, args| {
+                // Reference equality.  Set.of's duplicate detection
+                // works because we allocate a fresh stand-in per call.
+                let a = args.first().copied().unwrap_or(Value::Object(None));
+                let b = args.get(1).copied().unwrap_or(Value::Object(None));
+                let eq = matches!(
+                    (a, b),
+                    (Value::Object(Some(x)), Value::Object(Some(y))) if x == y
+                );
+                Ok(Some(Value::Int(if eq { 1 } else { 0 })))
+            },
+        );
+        registry.register(
+            inner,
+            "compareTo",
+            "(Ljava/lang/Object;)I",
+            |ctx, args| {
+                // Identity-based ordering; Set.of doesn't sort, but
+                // ModuleDescriptor's later TreeSet wrappings might.
+                let a = args.first().copied();
+                let b = args.get(1).copied();
+                let ha = match a {
+                    Some(Value::Object(Some(o))) => ctx.identity_hash_code(o),
+                    _ => 0,
+                };
+                let hb = match b {
+                    Some(Value::Object(Some(o))) => ctx.identity_hash_code(o),
+                    _ => 0,
+                };
+                Ok(Some(Value::Int(ha.cmp(&hb) as i32)))
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // post-banner SB3: PMRPR.<clinit> Stream lambda NPE
+    // -----------------------------------------------------------------
+    //
+    // After the JLMA Builder.* overrides above unblock SystemModuleFinders
+    // construction, PathMatchingResourcePatternResolver.<clinit>:216 still
+    // NPEs inside this Stream pipeline:
+    //
+    //     ModuleFinder.ofSystem().findAll().stream()
+    //         .map(ref -> ref.descriptor().name())     // <-- NPE here
+    //         .collect(Collectors.toSet());
+    //
+    // The synthetic ModuleReference instances handed back by our partial
+    // SystemModuleFinders impl carry a null `descriptor` field — the
+    // real-JDK `ModuleReference.descriptor()` is just `getfield descriptor`
+    // (the field is final, set by the protected constructor through
+    // Objects.requireNonNull). Our synthetics never went through that
+    // constructor, so the field stays null. Then `.name()` NPEs.
+    //
+    // Defensive override: register native impls for both the immediate
+    // dereference (`ModuleReference.descriptor()`) and the inner one
+    // (`ModuleDescriptor.name()`). Each reads its private field and, if
+    // null, lazily allocates / interns a synthetic placeholder so the
+    // Stream pipeline can run to completion. The descriptor placeholder
+    // is cached on the ModuleReference instance itself (so identity is
+    // stable across repeat calls); the name placeholder is cached on
+    // the ModuleDescriptor instance similarly.
+    //
+    // Spring's PMRPR only consumes the resulting Set<String> to seed
+    // a static cache — the actual module names don't influence
+    // resource resolution unless the user passes a `module:` URL. The
+    // generic placeholder name "synthetic" is therefore acceptable
+    // for boot. (Real-JDK module naming is exercised exhaustively in
+    // dedicated module-system tests, not here.)
+
+    // Approach: short-circuit `ModuleFinder.findAll()` to return an
+    // empty Set so the Stream pipeline never iterates and the lambda is
+    // never invoked. PMRPR then ends up with
+    // `systemModuleNames = Collections.emptySet()` which is exactly what
+    // the `inNativeImage` branch already does (line :11-:17 in PMRPR
+    // bytecode). Spring uses this set only to filter `module:` URIs out
+    // of resource scans — empty just means no filtering, which is
+    // semantically a no-op for fat-JAR Spring apps that don't use the
+    // module system.
+    //
+    // We also register fallbacks for `ModuleReference.descriptor()` and
+    // `ModuleDescriptor.name()` for any other code path that exercises
+    // the synthetic ModuleReferences directly (defence-in-depth — these
+    // were the original residual #4 from the JLMA agent's report).
+    registry.register(
+        "java/lang/module/ModuleFinder",
+        "findAll",
+        "()Ljava/util/Set;",
+        |ctx, _args| {
+            // Return an empty HashSet via the existing helper.
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
+    // Concrete impl in case the dispatcher resolves through the receiver
+    // class first.
+    registry.register(
+        "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
+        "findAll",
+        "()Ljava/util/Set;",
+        |ctx, _args| {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
+
+    // ModuleFinder.ofSystem() is a static interface method. If the real
+    // bytecode threads through SystemModuleFinders.ofSystem() and any
+    // step returns null (for instance, our partial Path / Files impls),
+    // the chain `null.findAll()` will NPE before our findAll override
+    // is reached. Override ofSystem() to return a synthetic stub finder
+    // whose findAll() override (registered above) yields an empty Set.
+    registry.register(
+        "java/lang/module/ModuleFinder",
+        "ofSystem",
+        "()Ljava/lang/module/ModuleFinder;",
+        |ctx, _args| {
+            // Try to allocate a real SystemModuleFinder; fall back to
+            // an abstract-base instance which still dispatches into our
+            // findAll() override via the registered base-class native.
+            let finder = alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
+                4,
+            );
+            Ok(Some(Value::Object(Some(finder))))
+        },
+    );
+
+    // Registered on BOTH the abstract base and the concrete impl. The
+    // dispatcher in `interpreter.rs` (line ~11547) walks the parent chain
+    // looking for natives but breaks early if a parent has bytecode for
+    // the method — which `ModuleReference.descriptor()` does (a simple
+    // `getfield`). To force the override to fire, register on the
+    // concrete receiver class `jdk/internal/module/ModuleReferenceImpl`
+    // directly (the dispatcher checks the receiver class FIRST before
+    // walking parents).
+    let descriptor_native: rustjvm_native_api::NativeCallback = |ctx, args| {
+        let this = match args.first().copied() {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        // Fast path: real / previously-populated descriptor.
+        if let Value::Object(Some(d)) = ctx.get_field_by_name(this, "descriptor") {
+            return Ok(Some(Value::Object(Some(d))));
+        }
+        // Lazy allocate a synthetic ModuleDescriptor with a non-null
+        // `name` so the immediate downstream `.name()` call cannot
+        // NPE. Cache it on the ModuleReference instance.
+        let md = alloc_concurrent_synthetic(
+            ctx,
+            "java/lang/module/ModuleDescriptor",
+            16,
+        );
+        let name_str = ctx.create_string("synthetic");
+        ctx.set_field_by_name(md, "name", Value::Object(Some(name_str)));
+        ctx.set_field_by_name(this, "descriptor", Value::Object(Some(md)));
+        Ok(Some(Value::Object(Some(md))))
+    };
+    registry.register(
+        "java/lang/module/ModuleReference",
+        "descriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        descriptor_native,
+    );
+    registry.register(
+        "jdk/internal/module/ModuleReferenceImpl",
+        "descriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        descriptor_native,
+    );
+
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "name",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first().copied() {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+            // Populate on first read so subsequent reads (e.g. Set
+            // duplicate-detection) see a stable identity.
+            let s = ctx.create_string("synthetic");
+            ctx.set_field_by_name(this, "name", Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // T19.H2: MethodHandles.Lookup.<clinit> dependency natives
 // ---------------------------------------------------------------------------
 //
@@ -11501,16 +12666,19 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 //     dumper object (so downstream `dumper.isEnabled()` returns false).
 
 /// Build a synthetic `java.util.HashSet` with the given elements.
+///
+/// S111r7: previously this allocated a 3-field HashSet (bucket array,
+/// size, capacity) which conflicts with the real-JDK HashSet field
+/// layout (single `map:Ljava/util/HashMap;` at offset 0). When real
+/// bytecode for `HashSet.iterator()` then ran `getfield map →
+/// invokevirtual HashMap.keySet()`, the receiver class came back as
+/// bare `java/lang/Object` (the bucket Object[]) and dispatch raised
+/// `NoSuchMethodError Object.keySet()`. The fix delegates to the
+/// native-collections helper that uses the correct 1-field-with-
+/// backing-HashMap layout, matching `<init>()` / 0..3-arg `Set.of`
+/// behaviour and unblocking Spring `getConvertibleTypes()` paths.
 fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, args.len());
-    for (i, v) in args.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
-    }
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    ctx.set_field(set, 1, Value::Int(args.len() as i32));
-    ctx.set_field(set, 2, Value::Int(16));
-    set
+    rustjvm_native_collections::make_hashset_with_elements(ctx, args)
 }
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
@@ -15009,20 +16177,118 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
 // 2-field synthetic (field 0 = String decimal representation, field 1 = Int signum)
 // ===========================================================================
 
-pub(crate) const BI_FIELD_VALUE: usize = 0; // String decimal representation
-pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Int: -1, 0, or 1
+pub(crate) const BI_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
+pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Synthetic-mode: Int signum (-1, 0, or 1)
 
+/// RBIGDEC.1 — Resolve the real-JDK BigInteger field layout if available.
+///
+/// Returns `Some((signum_idx, mag_idx))` when the JDK class is loaded with the
+/// real fields `signum:I` and `mag:[I`.  Returns `None` in synthetic-jdk mode
+/// or before the class has been loaded — callers fall back to the legacy
+/// 2-field synthetic layout (`BI_FIELD_VALUE` / `BI_FIELD_SIGNUM`).
+pub(crate) fn bi_layout(ctx: &dyn NativeContext) -> Option<(usize, usize)> {
+    let s = ctx.resolve_field_index("java/math/BigInteger", "signum")?;
+    let m = ctx.resolve_field_index("java/math/BigInteger", "mag")?;
+    Some((s, m))
+}
+
+/// Read a `BigInteger` instance and return its decimal string representation.
+///
+/// Two layouts are supported:
+///   * Real-JDK layout (slot 0 = `signum:I`, slot 1 = `mag:[I`): we convert
+///     the magnitude array (big-endian, base 2^32) to a decimal string and
+///     prepend `-` if `signum < 0`.
+///   * Synthetic-stub layout (slot 0 = `value:String`): we read the string
+///     directly.
 pub(crate) fn bi_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, BI_FIELD_VALUE) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
-        _ => "0".to_string(),
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let signum = match ctx.get_field(this, sig_i) {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        if signum == 0 {
+            return "0".to_string();
+        }
+        let mag = match ctx.get_field(this, mag_i) {
+            Value::Object(Some(o)) => o,
+            _ => return "0".to_string(),
+        };
+        let len = ctx.array_length(mag);
+        if len == 0 {
+            return "0".to_string();
+        }
+        let mut words: Vec<u32> = Vec::with_capacity(len);
+        for i in 0..len {
+            let w = match ctx.get_array_element(mag, i) {
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+            words.push(w);
+        }
+        let abs = mag_words_to_decimal(&words);
+        if signum < 0 { format!("-{}", abs) } else { abs }
+    } else {
+        match ctx.get_field(this, BI_FIELD_VALUE) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
+            _ => "0".to_string(),
+        }
     }
+}
+
+/// Convert a big-endian base-2^32 magnitude array to a decimal string.
+/// Returns `"0"` for an empty array.  Used by `bi_read` (real-JDK layout).
+fn mag_words_to_decimal(mag: &[u32]) -> String {
+    if mag.is_empty() {
+        return "0".to_string();
+    }
+    let mut words: Vec<u32> = mag.to_vec();
+    let mut digits: Vec<u8> = Vec::new();
+    while !words.iter().all(|&w| w == 0) {
+        let mut rem: u64 = 0;
+        for w in words.iter_mut() {
+            let cur = (rem << 32) | (*w as u64);
+            *w = (cur / 10) as u32;
+            rem = cur % 10;
+        }
+        digits.push(rem as u8);
+    }
+    if digits.is_empty() {
+        return "0".to_string();
+    }
+    digits.iter().rev().map(|&d| (d + b'0') as char).collect()
+}
+
+/// Convert an unsigned decimal string to a big-endian base-2^32 magnitude
+/// vector.  Empty result for `"0"`.  Used by `bi_alloc` (real-JDK layout).
+fn decimal_to_mag_words(decimal: &str) -> Vec<u32> {
+    let s = decimal.trim_start_matches('-');
+    if s == "0" || s.is_empty() {
+        return Vec::new();
+    }
+    // Repeated multiply-and-add over the decimal digits.
+    let mut words: Vec<u32> = Vec::new();
+    for ch in s.chars() {
+        let d = match ch.to_digit(10) {
+            Some(v) => v as u64,
+            None => continue,
+        };
+        // multiply existing magnitude by 10
+        let mut carry: u64 = d;
+        for w in words.iter_mut().rev() {
+            let prod = (*w as u64) * 10 + carry;
+            *w = prod as u32;
+            carry = prod >> 32;
+        }
+        while carry != 0 {
+            words.insert(0, carry as u32);
+            carry >>= 32;
+        }
+    }
+    words
 }
 
 pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
-    let s = ctx.create_string(value);
-    ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
     let signum = if value.starts_with('-') {
         -1
     } else if value == "0" {
@@ -15030,7 +16296,22 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     } else {
         1
     };
-    ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        // Real-JDK layout: write signum + mag[].  This is the canonical
+        // representation that bytecode reads via `getfield`.
+        let mag_words = decimal_to_mag_words(value);
+        let mag_arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, mag_words.len());
+        for (i, w) in mag_words.iter().enumerate() {
+            ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+        }
+        ctx.set_field(obj, sig_i, Value::Int(signum));
+        ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+    } else {
+        // Synthetic-stub fallback.
+        let s = ctx.create_string(value);
+        ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
+        ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+    }
     obj
 }
 
@@ -15312,6 +16593,65 @@ fn bi_bitwise_xor(a: &str, b: &str) -> String {
         .collect();
     let trimmed = result.trim_start_matches('0');
     if trimmed.is_empty() { "0".to_string() } else { bi_from_binary(trimmed) }
+}
+
+/// RBIGDEC.1 — register BigInteger arithmetic + toString overrides for
+/// real-JDK mode. The synthetic-jdk-only `register_biginteger_natives`
+/// registers the full surface; this lean variant covers the methods the
+/// `BdProbe` tests + KC16 boot path actually call, so we don't perturb
+/// real-JDK behaviour for the broader class.
+fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry) {
+    let bi = "java/math/BigInteger";
+    registry.register(
+        bi, "add",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        native_bi_add,
+    );
+    registry.register(
+        bi, "subtract",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        native_bi_subtract,
+    );
+    registry.register(
+        bi, "multiply",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        native_bi_multiply,
+    );
+    registry.register(bi, "negate", "()Ljava/math/BigInteger;", native_bi_negate);
+    registry.register(bi, "signum", "()I", native_bi_signum);
+    registry.register(bi, "toString", "()Ljava/lang/String;", native_bi_to_string);
+    registry.register(bi, "intValue", "()I", native_bi_int_value);
+    registry.register(bi, "longValue", "()J", native_bi_long_value);
+}
+
+/// RBIGDEC.1 — register BigDecimal arithmetic + toString overrides for
+/// real-JDK mode.  Same rationale as `register_biginteger_arithmetic_overrides`.
+fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMethodRegistry) {
+    let bd = "java/math/BigDecimal";
+    registry.register(
+        bd, "add",
+        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+        native_bd_add,
+    );
+    registry.register(
+        bd, "subtract",
+        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+        native_bd_subtract,
+    );
+    registry.register(
+        bd, "multiply",
+        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+        native_bd_multiply,
+    );
+    registry.register(bd, "negate", "()Ljava/math/BigDecimal;", native_bd_negate);
+    registry.register(bd, "signum", "()I", native_bd_signum);
+    registry.register(bd, "scale", "()I", native_bd_scale);
+    registry.register(bd, "precision", "()I", native_bd_precision);
+    registry.register(bd, "toString", "()Ljava/lang/String;", native_bd_to_string);
+    registry.register(bd, "toPlainString", "()Ljava/lang/String;", native_bd_to_string);
+    registry.register(bd, "intValue", "()I", native_bd_int_value);
+    registry.register(bd, "longValue", "()J", native_bd_long_value);
+    registry.register(bd, "doubleValue", "()D", native_bd_double_value);
 }
 
 fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
@@ -15677,17 +17017,35 @@ fn native_bi_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => "0".to_string(),
     };
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(val_str)));
-    let signum = if s.starts_with('-') {
+    bi_write_into(ctx, this, &s);
+    Ok(None)
+}
+
+/// Populate an existing `BigInteger` instance with the value parsed from a
+/// decimal string.  Picks the slot layout (real-JDK signum/mag vs. legacy
+/// synthetic value/signum) automatically.  Used by the `<init>` natives so
+/// `new BigInteger("17")` lands in the right slots regardless of JDK mode.
+fn bi_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str) {
+    let signum = if value.starts_with('-') {
         -1
-    } else if s == "0" {
+    } else if value == "0" {
         0
     } else {
         1
     };
-    ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
-    Ok(None)
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let mag_words = decimal_to_mag_words(value);
+        let mag_arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, mag_words.len());
+        for (i, w) in mag_words.iter().enumerate() {
+            ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+        }
+        ctx.set_field(this, sig_i, Value::Int(signum));
+        ctx.set_field(this, mag_i, Value::Object(Some(mag_arr)));
+    } else {
+        let val_str = ctx.create_string(value);
+        ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(val_str)));
+        ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
+    }
 }
 
 fn native_bi_init_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15715,16 +17073,7 @@ fn native_bi_init_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             val.to_string()
         }
     };
-    let val_str = ctx.create_string(&decimal);
-    ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(val_str)));
-    let signum = if decimal.starts_with('-') {
-        -1
-    } else if decimal == "0" {
-        0
-    } else {
-        1
-    };
-    ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
+    bi_write_into(ctx, this, &decimal);
     Ok(None)
 }
 
@@ -15883,8 +17232,11 @@ fn native_bi_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let v = ctx.get_field(this, BI_FIELD_VALUE);
-    Ok(Some(v))
+    // RBIGDEC.1 — `bi_read` already handles both the real-JDK and synthetic
+    // layouts; allocate a fresh Java string from the decimal representation.
+    let s = bi_read(ctx, this);
+    let java_str = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(java_str))))
 }
 
 fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15898,7 +17250,11 @@ fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let a = bi_read(ctx, this);
     if radix == 10 {
-        return Ok(Some(ctx.get_field(this, BI_FIELD_VALUE)));
+        // RBIGDEC.1 — bi_read returns the decimal already; allocate a fresh
+        // Java string instead of returning the raw slot 0 (which in real-JDK
+        // mode is signum:I, not the value string).
+        let result = ctx.create_string(&a);
+        return Ok(Some(Value::Object(Some(result))));
     }
     let val: i128 = a.parse().unwrap_or(0);
     let s = match radix {
@@ -15956,7 +17312,12 @@ fn native_bi_signum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let signum = match ctx.get_field(this, BI_FIELD_SIGNUM) {
+    // RBIGDEC.1 — read from the real-JDK `signum:I` slot when available.
+    // Falls back to the synthetic-stub slot 1.  We deliberately do not use
+    // `bi_read` + sign-of-string here because that path requires reading
+    // `mag[]` and is overkill for a single-int read.
+    let sig_idx = bi_layout(ctx).map(|(s, _)| s).unwrap_or(BI_FIELD_SIGNUM);
+    let signum = match ctx.get_field(this, sig_idx) {
         Value::Int(s) => s,
         _ => 0,
     };
@@ -16034,20 +17395,67 @@ fn native_bi_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // BigDecimal — 3-field synthetic (value String, scale Int, precision Int)
 // ===========================================================================
 
-const BD_FIELD_VALUE: usize = 0;
-const BD_FIELD_SCALE: usize = 1;
-const BD_FIELD_PRECISION: usize = 2;
+const BD_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
+const BD_FIELD_SCALE: usize = 1; // Synthetic-mode: Int scale
+const BD_FIELD_PRECISION: usize = 2; // Synthetic-mode: Int precision
+
+/// `INFLATED` sentinel from real-JDK `BigDecimal`: when `intCompact` equals
+/// `Long.MIN_VALUE`, the value lives in `intVal` (a `BigInteger`).  Otherwise
+/// the compact long is the unscaled value and `intVal` may be null.
+const BD_INFLATED: i64 = i64::MIN;
+
+/// RBIGDEC.1 — Resolve the real-JDK BigDecimal field layout if available.
+///
+/// Returns the slot indices for `(intVal, scale, precision, intCompact)`
+/// when the JDK class is loaded.  None ⇒ synthetic-stub fallback.
+fn bd_layout(ctx: &dyn NativeContext) -> Option<(usize, usize, usize, usize)> {
+    let iv = ctx.resolve_field_index("java/math/BigDecimal", "intVal")?;
+    let sc = ctx.resolve_field_index("java/math/BigDecimal", "scale")?;
+    let pr = ctx.resolve_field_index("java/math/BigDecimal", "precision")?;
+    let ic = ctx.resolve_field_index("java/math/BigDecimal", "intCompact")?;
+    Some((iv, sc, pr, ic))
+}
 
 fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
-    let s = ctx.create_string(value);
-    ctx.set_field(obj, BD_FIELD_VALUE, Value::Object(Some(s)));
-    ctx.set_field(obj, BD_FIELD_SCALE, Value::Int(scale));
-    ctx.set_field(
-        obj,
-        BD_FIELD_PRECISION,
-        Value::Int(value.replace(['-', '.'], "").len() as i32),
-    );
+    let precision = value.replace(['-', '.'], "").len() as i32;
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        // Real-JDK layout: build the value as the scaled unscaled-integer
+        // representation.  `value` may include a decimal point (e.g.
+        // "1.5", scale=1 → unscaled=15).  Strip the dot and parse.
+        let unscaled_str = value.replace('.', "");
+        // Try a fast i64 path; fall back to inflated BigInteger.
+        let bi_class_id = ctx.class_id_by_name("java/math/BigInteger");
+        let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
+        if int_compact == BD_INFLATED {
+            // Value out of i64 range (or literal `Long.MIN_VALUE`, which we
+            // treat as inflated to keep the sentinel pure).  Allocate an
+            // intVal BigInteger.
+            let bi = bi_alloc(ctx, &unscaled_str);
+            ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
+        } else {
+            // Compact path: leave `intVal` null (or, when non-null, the JDK
+            // expects it to mirror `intCompact`).  Allocate a backing
+            // BigInteger so reflective reads of `intVal` still see a real
+            // object — matches HotSpot's behaviour for `BigDecimal.ONE`
+            // where `intVal != null` even though `intCompact == 1`.
+            if bi_class_id.is_some() {
+                let bi = bi_alloc(ctx, &unscaled_str);
+                ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            } else {
+                ctx.set_field(obj, iv_i, Value::Object(None));
+            }
+            ctx.set_field(obj, ic_i, Value::Long(int_compact));
+        }
+        ctx.set_field(obj, sc_i, Value::Int(scale));
+        ctx.set_field(obj, pr_i, Value::Int(precision));
+    } else {
+        let s = ctx.create_string(value);
+        ctx.set_field(obj, BD_FIELD_VALUE, Value::Object(Some(s)));
+        ctx.set_field(obj, BD_FIELD_SCALE, Value::Int(scale));
+        ctx.set_field(obj, BD_FIELD_PRECISION, Value::Int(precision));
+    }
     obj
 }
 
@@ -16153,9 +17561,77 @@ fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
 }
 
 fn bd_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
+    if let Some((iv_i, sc_i, _pr_i, ic_i)) = bd_layout(ctx) {
+        // Real-JDK layout — prefer the compact long unless inflated.
+        let scale = match ctx.get_field(this, sc_i) {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        let int_compact = match ctx.get_field(this, ic_i) {
+            Value::Long(l) => l,
+            _ => BD_INFLATED,
+        };
+        let unscaled = if int_compact != BD_INFLATED {
+            int_compact.to_string()
+        } else {
+            match ctx.get_field(this, iv_i) {
+                Value::Object(Some(bi)) => bi_read(ctx, bi),
+                _ => "0".to_string(),
+            }
+        };
+        return apply_scale(&unscaled, scale);
+    }
+    // Synthetic-stub fallback — the value is already a decimal string.
     match ctx.get_field(this, BD_FIELD_VALUE) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
         _ => "0".to_string(),
+    }
+}
+
+/// Read the `scale` int from a `BigDecimal`, picking the layout-correct slot.
+fn bd_scale_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let idx = bd_layout(ctx).map(|(_, sc, _, _)| sc).unwrap_or(BD_FIELD_SCALE);
+    match ctx.get_field(this, idx) {
+        Value::Int(s) => s,
+        _ => 0,
+    }
+}
+
+/// Read the `precision` int from a `BigDecimal`, picking the layout slot.
+fn bd_precision_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let idx = bd_layout(ctx).map(|(_, _, pr, _)| pr).unwrap_or(BD_FIELD_PRECISION);
+    match ctx.get_field(this, idx) {
+        Value::Int(p) => p,
+        _ => 0,
+    }
+}
+
+/// Format an unscaled integer string + a scale into the canonical
+/// `BigDecimal.toString` decimal representation (no exponent — used for
+/// arithmetic, not pretty-printing, so we keep it simple and round-trip-able
+/// through `f64::parse`).
+fn apply_scale(unscaled: &str, scale: i32) -> String {
+    if scale == 0 || unscaled == "0" {
+        return unscaled.to_string();
+    }
+    let (neg, abs) = if let Some(stripped) = unscaled.strip_prefix('-') {
+        (true, stripped.to_string())
+    } else {
+        (false, unscaled.to_string())
+    };
+    let sign = if neg { "-" } else { "" };
+    if scale > 0 {
+        let s = scale as usize;
+        if abs.len() > s {
+            let split = abs.len() - s;
+            format!("{}{}.{}", sign, &abs[..split], &abs[split..])
+        } else {
+            let pad = s - abs.len();
+            format!("{}0.{}{}", sign, "0".repeat(pad), abs)
+        }
+    } else {
+        // Negative scale = trailing zeros.
+        format!("{}{}{}", sign, abs, "0".repeat((-scale) as usize))
     }
 }
 
@@ -16169,15 +17645,35 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => "0".to_string(),
     };
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace(['-', '.'], "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, scale);
     Ok(None)
+}
+
+/// Populate an existing `BigDecimal` instance from a decimal string + scale.
+/// Picks the layout (real-JDK intVal/scale/precision/intCompact vs. legacy
+/// synthetic value/scale/precision) automatically.
+fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) {
+    let precision = value.replace(['-', '.'], "").len() as i32;
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        let unscaled_str = value.replace('.', "");
+        let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
+        if int_compact == BD_INFLATED {
+            let bi = bi_alloc(ctx, &unscaled_str);
+            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
+        } else {
+            let bi = bi_alloc(ctx, &unscaled_str);
+            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(this, ic_i, Value::Long(int_compact));
+        }
+        ctx.set_field(this, sc_i, Value::Int(scale));
+        ctx.set_field(this, pr_i, Value::Int(precision));
+    } else {
+        let val_str = ctx.create_string(value);
+        ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
+        ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
+        ctx.set_field(this, BD_FIELD_PRECISION, Value::Int(precision));
+    }
 }
 
 fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16191,14 +17687,7 @@ fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let s = format!("{}", d);
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace(['-', '.'], "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, scale);
     Ok(None)
 }
 
@@ -16212,14 +17701,7 @@ fn native_bd_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => 0,
     };
     let s = v.to_string();
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(0));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace('-', "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, 0);
     Ok(None)
 }
 
@@ -16233,14 +17715,7 @@ fn native_bd_init_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => 0,
     };
     let s = v.to_string();
-    let val_str = ctx.create_string(&s);
-    ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
-    ctx.set_field(this, BD_FIELD_SCALE, Value::Int(0));
-    ctx.set_field(
-        this,
-        BD_FIELD_PRECISION,
-        Value::Int(s.replace('-', "").len() as i32),
-    );
+    bd_write_into(ctx, this, &s, 0);
     Ok(None)
 }
 
@@ -16391,14 +17866,8 @@ fn native_bd_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let a = bd_read(ctx, this);
     let b = bd_read(ctx, other);
-    let a_scale = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
-    let b_scale = match ctx.get_field(other, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
+    let a_scale = bd_scale_of(ctx, this);
+    let b_scale = bd_scale_of(ctx, other);
     Ok(Some(Value::Int(if a == b && a_scale == b_scale {
         1
     } else {
@@ -16411,24 +17880,20 @@ fn native_bd_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, BD_FIELD_VALUE)))
+    // RBIGDEC.1 — `bd_read` reconstructs the decimal from intCompact + scale
+    // in real-JDK mode, so synthesise a fresh Java string.
+    let s = bd_read(ctx, this);
+    let java_str = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(java_str))))
 }
 
 fn native_bd_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() {
-                eprintln!("[bd_int_value] no receiver, args={:?}", args);
-            }
-            return Ok(Some(Value::Int(0)));
-        }
+        _ => return Ok(Some(Value::Int(0))),
     };
     let s = bd_read(ctx, this);
     let v: f64 = s.parse().unwrap_or(0.0);
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() {
-        eprintln!("[bd_int_value] this={:p} field0={:?} parsed={}", this.as_ptr(), ctx.get_field(this, BD_FIELD_VALUE), v);
-    }
     Ok(Some(Value::Int(v as i32)))
 }
 
@@ -16464,11 +17929,7 @@ fn native_bd_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let s = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(s)))
+    Ok(Some(Value::Int(bd_scale_of(ctx, this))))
 }
 
 fn native_bd_precision(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16476,11 +17937,7 @@ fn native_bd_precision(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let p = match ctx.get_field(this, BD_FIELD_PRECISION) {
-        Value::Int(p) => p,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(p)))
+    Ok(Some(Value::Int(bd_precision_of(ctx, this))))
 }
 
 fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16489,10 +17946,7 @@ fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
     let a = bd_read(ctx, this);
-    let scale = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
+    let scale = bd_scale_of(ctx, this);
     let neg = if let Some(stripped) = a.strip_prefix('-') {
         stripped.to_string()
     } else if a == "0" {
@@ -16510,10 +17964,7 @@ fn native_bd_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Object(None))),
     };
     let a = bd_read(ctx, this);
-    let scale = match ctx.get_field(this, BD_FIELD_SCALE) {
-        Value::Int(s) => s,
-        _ => 0,
-    };
+    let scale = bd_scale_of(ctx, this);
     let abs = if let Some(rest) = a.strip_prefix('-') {
         rest.to_string()
     } else {
@@ -18226,10 +19677,39 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let nfields = ctx.object_num_fields(this);
     let full = match ctx.get_field(this, URL_FIELD_FULL) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
+    // Real-JDK URL has 13-field layout where field 5 = authority (often null
+    // for our synthetic file: URLs allocated in Class.getProtectionDomain).
+    // Fall back to reconstructing from field 0=protocol + ":" + field 3=file.
+    let full = if !full.is_empty() {
+        full
+    } else if nfields >= 7 {
+        let protocol = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let file = match ctx.get_field(this, 3) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => match ctx.get_field(this, 6) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
+        };
+        if !protocol.is_empty() && !file.is_empty() {
+            format!("{protocol}:{file}")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!("[DBG_SBLOAD] URL.toURI() nfields={} full={:?}", nfields, full);
+    }
     let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
     url_parse(ctx, uri, &full);
     Ok(Some(Value::Object(Some(uri))))
@@ -19160,6 +20640,262 @@ std::thread_local! {
     static MDC_MAP: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// SLF4J 1.7 static-binder pattern. SLF4J 1.7 wires its API to a logging
+/// backend via three companion classes that the impl JAR (slf4j-log4j12,
+/// logback-classic, slf4j-simple, ...) provides on the classpath:
+///
+///   org.slf4j.impl.StaticLoggerBinder   — supplies ILoggerFactory
+///   org.slf4j.impl.StaticMDCBinder      — supplies MDCAdapter
+///   org.slf4j.impl.StaticMarkerBinder   — supplies IMarkerFactory
+///
+/// Each is loaded from MDC.<clinit> / LoggerFactory.<clinit> via something
+/// like `StaticMDCBinder.getSingleton().getMDCA()`. When the impl JAR
+/// isn't visible to the VM's class loader (Spring Boot fat-jar nested
+/// BOOT-INF/lib/ visibility issue, or the user simply didn't add one),
+/// those <clinit>s blow up with a NoSuchMethodError that surfaces as a
+/// linkage error during JIT dispatch.
+///
+/// The adapter/factory the binders return here is never consulted by the
+/// SLF4J API call sites we model (the MDC / Logger / Marker natives all
+/// short-circuit before delegating) — the binders just have to exist so
+/// that <clinit> can complete.
+///
+/// Registered both from `register_slf4j_natives` (synthetic-jdk path) and
+/// directly from the real-JDK boot in `vm/src/vm/vm_init.rs` so Spring
+/// Boot 2.x fat-jars without an SLF4J impl on the classpath survive
+/// boot. (Spring Boot 3.x ships SLF4J 2.x which uses the
+/// `META-INF/services/org.slf4j.spi.SLF4JServiceProvider` discovery
+/// mechanism instead, so this stub doesn't fire — and is harmless if the
+/// classes happen to be present, because last-writer-wins on the native
+/// registry just leaves the real bytecode dispatch in place.)
+pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/slf4j/impl/StaticMDCBinder",
+        "getSingleton",
+        "()Lorg/slf4j/impl/StaticMDCBinder;",
+        |ctx, _| {
+            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMDCBinder",
+        "getMDCA",
+        "()Lorg/slf4j/spi/MDCAdapter;",
+        |ctx, _| {
+            let a = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0);
+            Ok(Some(Value::Object(Some(a))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMDCBinder",
+        "getMDCAdapterClassStr",
+        "()Ljava/lang/String;",
+        |ctx, _| {
+            let s = ctx.create_string("org.slf4j.helpers.BasicMDCAdapter");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    registry.register(
+        "org/slf4j/impl/StaticLoggerBinder",
+        "getSingleton",
+        "()Lorg/slf4j/impl/StaticLoggerBinder;",
+        |ctx, _| {
+            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticLoggerBinder",
+        "getLoggerFactory",
+        "()Lorg/slf4j/ILoggerFactory;",
+        |ctx, _| {
+            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
+            Ok(Some(Value::Object(Some(f))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticLoggerBinder",
+        "getLoggerFactoryClassStr",
+        "()Ljava/lang/String;",
+        |ctx, _| {
+            let s = ctx.create_string("org.slf4j.helpers.NOPLoggerFactory");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    registry.register(
+        "org/slf4j/impl/StaticMarkerBinder",
+        "getSingleton",
+        "()Lorg/slf4j/impl/StaticMarkerBinder;",
+        |ctx, _| {
+            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMarkerBinder", 1);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMarkerBinder",
+        "getMarkerFactory",
+        "()Lorg/slf4j/IMarkerFactory;",
+        |ctx, _| {
+            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMarkerFactory", 0);
+            Ok(Some(Value::Object(Some(f))))
+        },
+    );
+    registry.register(
+        "org/slf4j/impl/StaticMarkerBinder",
+        "getMarkerFactoryClassStr",
+        "()Ljava/lang/String;",
+        |ctx, _| {
+            let s = ctx.create_string("org.slf4j.helpers.BasicMarkerFactory");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    // BasicMDCAdapter no-op surface — the adapter the binder above returns.
+    // Our MDC stubs implement put/get/... directly so these don't fire on
+    // user paths, but newer SLF4J façades sometimes route through the
+    // adapter; keeping these no-ops avoids surprise NSME later.
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "put",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "get",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "remove",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "clear",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "getCopyOfContextMap",
+        "()Ljava/util/Map;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "org/slf4j/helpers/BasicMDCAdapter",
+        "setContextMap",
+        "(Ljava/util/Map;)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // SB2-NPE: Spring Boot 2.x fat-jars hit
+    // `LogAdapter$Slf4jLog.<init>(Logger)` with a null logger because the
+    // bytecode flow `LoggerFactory.getLogger(name) -> getILoggerFactory()
+    // -> ILoggerFactory.getLogger(name)` lands on the synthetic
+    // ILoggerFactory we returned above, which has no `getLogger` native
+    // and so returns null (default-Object reference) → NPE on
+    // `logger.getName()` at LogAdapter.java:279.
+    //
+    // Mirror the synthetic-jdk `LoggerFactory.getLogger(String)` stub on
+    // the real-JDK path: register `ILoggerFactory.getLogger(String)` to
+    // hand back a synthetic Logger whose `name` field is the requested
+    // string, plus the small surface (`getName`, `is*Enabled`, `trace/
+    // debug/info/warn/error`) that LogAdapter and friends invoke.
+    //
+    // We use BOTH `set_field_by_name("name", ...)` (matches the real
+    // `org.slf4j.helpers.NamedLoggerBase.name` slot when the synthetic
+    // Logger object happens to share that layout) and a slot-0 fallback
+    // (matches our synthetic-jdk `SLF4J_NAME = 0` invariant) so the
+    // accessor below can find the name regardless of which path
+    // allocated the Logger.
+    registry.register(
+        "org/slf4j/ILoggerFactory",
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/slf4j/Logger;",
+        |ctx, args| {
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            // Best-effort dual-write: name-by-name (real layout) +
+            // name-at-slot-0 (synthetic layout).
+            ctx.set_field_by_name(logger, "name", name);
+            ctx.set_field(logger, 0, name);
+            Ok(Some(Value::Object(Some(logger))))
+        },
+    );
+
+    // Logger.getName() — read by-name first, fall back to slot 0. The
+    // synthetic-jdk `register_slf4j_natives` registers a slot-0-reading
+    // version that is replayed AFTER this fn (last-writer-wins is
+    // harmless because both versions return the same value when both
+    // writes happened).
+    registry.register(
+        "org/slf4j/Logger",
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Prefer real-layout `name` field; fall back to synthetic
+            // slot 0; final fallback is empty string so callers like
+            // `Slf4jLog.<init>` never see null.
+            let v = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(s)) => Value::Object(Some(s)),
+                    _ => Value::Object(Some(ctx.create_string(""))),
+                },
+            };
+            Ok(Some(v))
+        },
+    );
+
+    // Level checks — return false so log call sites short-circuit. The
+    // synthetic-jdk path overrides these with level-aware versions,
+    // which is fine because the registration order in
+    // `register_slf4j_natives` is binder-LAST and we only get called
+    // there if no level-aware override has been registered yet.
+    fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(0)))
+    }
+    registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
+
+    // No-op log methods (covers the most common arities that JCL /
+    // commons-logging / direct-SLF4J callers use). The synthetic-jdk
+    // `register_slf4j_natives` overrides several of these with
+    // dispatched-to-stdout versions; that override is harmless because
+    // the binder helper runs last in synthetic mode, but here in
+    // real-JDK mode we want pure no-ops.
+    fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(None)
+    }
+    let lg = "org/slf4j/Logger";
+    for sig in [
+        "(Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;[Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ] {
+        registry.register(lg, "trace", sig, slf4j_noop);
+        registry.register(lg, "debug", sig, slf4j_noop);
+        registry.register(lg, "info", sig, slf4j_noop);
+        registry.register(lg, "warn", sig, slf4j_noop);
+        registry.register(lg, "error", sig, slf4j_noop);
+    }
+}
+
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lf = "org/slf4j/LoggerFactory";
 
@@ -19414,6 +21150,11 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         ctx.set_field(m, 0, name);
         Ok(Some(Value::Object(Some(m))))
     });
+
+    // SLF4J 1.7 static-binder stubs (getSingleton / adapter / factory).
+    // Implementation is shared with the real-JDK boot path — see
+    // `register_slf4j_binder_stubs_pub` for the full rationale.
+    register_slf4j_binder_stubs_pub(registry);
 
     // --- java.util.logging (JUL) — standard JDK logging ---
     let jul_logger = "java/util/logging/Logger";
@@ -22400,6 +24141,10 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(None),
     };
     let msg = args.get(1).cloned().unwrap_or(Value::Object(None));
+    // Mirror to both the named field (real-JDK Throwable layout has
+    // detailMessage at slot 1, after backtrace) and slot 0 (synthetic-stub
+    // layout with unnamed `_f0`). See `lang_misc::write_throwable_detail_message`.
+    ctx.set_field_by_name(this, "detailMessage", msg);
     if ctx.object_num_fields(this) >= 1 {
         ctx.set_field(this, 0, msg);
     }
@@ -22411,6 +24156,11 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Real-JDK layout: detailMessage at slot 1; synthetic stubs put it at 0.
+    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    if matches!(by_name, Value::Object(Some(_))) {
+        return Ok(Some(by_name));
+    }
     if ctx.object_num_fields(this) >= 1 {
         Ok(Some(ctx.get_field(this, 0)))
     } else {
@@ -24320,48 +26070,7 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         c,
         "getClassLoader",
         "()Ljava/lang/ClassLoader;",
-        |ctx, args| {
-            // JVM spec §5.3: bootstrap classes return null, others return the
-            // defining loader. We read the ClassId from the mirror (field 0)
-            // and look up which loader defined it. For mirrors that don't
-            // carry a resolvable class id (synthetic test fixtures, or
-            // application-user classes that haven't been registered with
-            // the class manager yet), we default to the application
-            // class loader — matching HotSpot behaviour for
-            // dynamically-loaded user classes.
-            let mirror = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let class_id = match ctx.get_field(mirror, 0) {
-                Value::Int(v) => rustjvm_types::ClassId::new(v as u32),
-                _ => {
-                    // Synthetic mirror with no stored ClassId — return the
-                    // app loader so `Class.getClassLoader()` is never null
-                    // for a non-bootstrap class. The only path that should
-                    // yield null is the explicit Bootstrap case below.
-                    let cl = crate::classloader::get_or_create_app_loader(ctx);
-                    return Ok(Some(Value::Object(Some(cl))));
-                }
-            };
-            let loader_type = ctx.loader_id_of_class(class_id);
-            match loader_type {
-                0 => {
-                    // Bootstrap loader → null per JVM spec
-                    Ok(Some(Value::Object(None)))
-                }
-                1 => {
-                    // Platform/extension loader — return singleton
-                    let cl = crate::classloader::get_or_create_platform_loader(ctx);
-                    Ok(Some(Value::Object(Some(cl))))
-                }
-                _ => {
-                    // Application or user-defined loader — return singleton
-                    let cl = crate::classloader::get_or_create_app_loader(ctx);
-                    Ok(Some(Value::Object(Some(cl))))
-                }
-            }
-        },
+        lang_class::native_class_get_class_loader,
     );
     registry.register(
         c,

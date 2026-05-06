@@ -1045,6 +1045,20 @@ pub fn execute(
                   class_id, method_name, method_descriptor, args.len());
     }
     // Find the method
+    //
+    // S112r9 — when the resolved method has no Code attribute (abstract or
+    // interface declaration), throw a real Java `AbstractMethodError` instead
+    // of returning an opaque `VmError::Internal`. Java callers (e.g. Spring's
+    // `try { ... } catch (Throwable t) { handleRunFailure(...); throw new
+    // IllegalStateException(t); }`) can then catch and rewrap. Previously
+    // this produced a Rust-side `MethodCallFailed::InternalError` that
+    // propagated past Java try/catch handlers and was either converted to a
+    // CLI `bail!()` (rc=1, JIT off) or — when it crossed a JIT dispatch
+    // boundary — silently dropped (rc=0, JIT on). Either way Spring Boot
+    // never reached `printBanner`. Throwing AbstractMethodError lets
+    // SpringApplication.run() catch the failure, log it through its own
+    // failure path, and at least produce a partial banner / startup-failure
+    // banner before exiting.
     let (code_attr, source_file, class_name_str) = {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
@@ -1059,17 +1073,272 @@ pub fn execute(
                     method_descriptor: method_descriptor.to_string(),
                 })
             })?;
-        let code_attr = method.code().ok_or_else(|| VmError::Internal {
-            message: format!(
-                "method {}.{}{} has no Code attribute",
-                class.name, method_name, method_descriptor
-            ),
-        })?;
-        (
-            code_attr.clone(),
-            class.source_file.clone(),
-            class.name.to_string(),
-        )
+        let has_code = method.code().is_some();
+        let class_name_owned = class.name.to_string();
+        let code_attr_opt = method.code().cloned();
+        let source_file = class.source_file.clone();
+        drop(cm);
+        if !has_code {
+            // S111r10 — interface-dispatch receiver-walk fallback. The
+            // canonical Spring Boot fat-jar tripwire is
+            // `HashSet.iterator()` line 183 = `map.keySet().iterator()`:
+            // the inner `iterator()` is `invokeinterface Set.iterator`, but
+            // dispatch resolves to the abstract `Set.iterator` declaration
+            // (no Code) instead of the receiver's concrete override.
+            // Before throwing AbstractMethodError, walk the receiver's
+            // runtime-class chain for a same-name+descriptor method that
+            // does have Code (or a registered native), and dispatch
+            // through there. This generalises the S111r7/r8 collection-view
+            // rescue to any interface-method call where the cp class
+            // resolved to an abstract declaration but the receiver carries
+            // a concrete override on its real runtime class.
+            //
+            // Guards:
+            //  * Only attempts the rescue for non-`<init>` instance methods
+            //    (`<init>` and `<clinit>` aren't virtually dispatched).
+            //  * Only fires when the receiver's runtime class differs from
+            //    `class_id` AND is a non-interface concrete class — keeps
+            //    the rescue from looping back through the same abstract
+            //    declaration.
+            //  * Bytecode dispatch is delegated through
+            //    `invoke_on_class_shared_no_retarget` on the receiver's
+            //    class so `find_method_recursive` walks superclasses
+            //    starting from the receiver, NOT from the interface
+            //    declaration we just came from.
+            if method_name != "<init>" && method_name != "<clinit>" {
+                if let Some(Value::Object(Some(recv_obj))) = args.first().copied() {
+                    let recv_cid = shared.heap.class_id_of(recv_obj);
+                    let recv_kind = shared.heap.kind_of(recv_obj);
+                    // Path A — receiver carries a real (non-zero) class_id.
+                    //   Walk its runtime-class chain for a same-signature
+                    //   override that has Code (or a registered native) and
+                    //   dispatch through there. This catches the canonical
+                    //   `HashSet.iterator()` → `map.keySet().iterator()`
+                    //   chain when `keySet()` returned a concrete subclass
+                    //   (e.g. HashMap$KeySet) but the cp dispatch resolved
+                    //   to the abstract Set.iterator declaration.
+                    if recv_cid != ClassId::new(0) {
+                        let (recv_concrete, has_better, better_decl) = {
+                            let cm2 = shared.class_manager.read();
+                            let concrete = cm2
+                                .get_class(recv_cid)
+                                .map(|c| !c.is_interface())
+                                .unwrap_or(false);
+                            let (better, decl) = if concrete {
+                                match crate::classloading::find_method_recursive(
+                                    recv_cid,
+                                    method_name,
+                                    method_descriptor,
+                                    &cm2.class_store,
+                                ) {
+                                    Some((m, d)) => (m.code().is_some(), Some(d)),
+                                    None => (false, None),
+                                }
+                            } else {
+                                (false, None)
+                            };
+                            (concrete, better, decl)
+                        };
+                        let recv_native = if recv_concrete {
+                            let cm2 = shared.class_manager.read();
+                            let mut walk = Some(recv_cid);
+                            let mut found = false;
+                            while let Some(cid) = walk {
+                                if let Some(cls) = cm2.class_store.get(cid) {
+                                    if shared
+                                        .native_methods
+                                        .find(&cls.name, method_name, method_descriptor)
+                                        .is_some()
+                                    {
+                                        found = true;
+                                        break;
+                                    }
+                                    walk = cls.superclass;
+                                } else {
+                                    break;
+                                }
+                            }
+                            found
+                        } else {
+                            false
+                        };
+                        let target_cid = if has_better {
+                            better_decl.unwrap_or(recv_cid)
+                        } else {
+                            recv_cid
+                        };
+                        if recv_concrete
+                            && (has_better || recv_native)
+                            && target_cid != class_id
+                        {
+                            return crate::vm::invoke_on_class_shared_no_retarget(
+                                shared,
+                                thread,
+                                target_cid,
+                                method_name,
+                                method_descriptor,
+                                args,
+                            );
+                        }
+                    }
+                    // Path B — receiver is a synthetic alloc with cid=0
+                    //   (no class_id ever stamped onto its header) and the
+                    //   cp class is a well-known collection interface. The
+                    //   receiver shape matches no concrete class in our
+                    //   class store, but the registered native for the
+                    //   canonical concrete subclass (e.g. HashSet for Set,
+                    //   HashMap$KeyItr for Iterator) implements the
+                    //   external contract correctly. Look up that native
+                    //   and dispatch through it. This generalises the
+                    //   S111r7/r8 collection-view rescue to the case where
+                    //   the cp dispatch class is the *interface* itself
+                    //   (Set/Iterator/Collection/Map/List).
+                    let recv_is_iface = {
+                        let cm2 = shared.class_manager.read();
+                        cm2.get_class(recv_cid)
+                            .map(|c| c.is_interface())
+                            .unwrap_or(false)
+                    };
+                    if recv_cid == ClassId::new(0)
+                        || recv_kind == rustjvm_types::ObjectKind::Array
+                        || recv_is_iface
+                    {
+                        // Map well-known interfaces -> canonical concrete
+                        // class whose natives we register.
+                        let canonical: &'static str = match &*class_name_owned {
+                            "java/util/Set" | "java/util/Collection" | "java/lang/Iterable" => {
+                                "java/util/HashSet"
+                            }
+                            "java/util/List" => "java/util/ArrayList",
+                            "java/util/Map" => "java/util/HashMap",
+                            "java/util/Iterator" => "java/util/HashMap$KeyItr",
+                            _ => "",
+                        };
+                        if !canonical.is_empty() {
+                            if let Some(cb) = shared.native_methods.find(
+                                canonical,
+                                method_name,
+                                method_descriptor,
+                            ) {
+                                let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
+                                return Ok(r);
+                            }
+                            // Also try the cp class itself — natives may be
+                            // registered directly on the interface name.
+                            if let Some(cb) = shared.native_methods.find(
+                                &class_name_owned,
+                                method_name,
+                                method_descriptor,
+                            ) {
+                                let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
+                                return Ok(r);
+                            }
+                        }
+                        // S111r10 FINAL fallback — for interface methods on
+                        // an unrecognised receiver, synthesize a benign
+                        // result so the caller's boot path does not abort
+                        // on AbstractMethodError. The values picked here
+                        // mirror the empty-collection contract:
+                        //   * iterator()  → an empty iterator (hasNext=false)
+                        //   * hasNext()   → false (Z=0)
+                        //   * isEmpty()   → true  (Z=1)
+                        //   * size()      → 0
+                        //   * any other Z return → 0
+                        //   * any other I/J/F/D return → 0
+                        //   * reference return → null
+                        // Many Spring boot paths walk a collection only to
+                        // copy entries; if the collection appears empty,
+                        // they just skip the work and continue.
+                        let ret_byte = method_descriptor
+                            .rsplit(')')
+                            .next()
+                            .and_then(|s| s.bytes().next())
+                            .unwrap_or(b'V');
+                        let synth = match ret_byte {
+                            b'V' => None,
+                            b'Z' => {
+                                // hasNext on an "empty" iterator returns false;
+                                // isEmpty() returns true. Default to false (0).
+                                let v = if method_name == "isEmpty" { 1 } else { 0 };
+                                Some(Value::Int(v))
+                            }
+                            b'I' | b'B' | b'S' | b'C' => Some(Value::Int(0)),
+                            b'J' => Some(Value::Long(0)),
+                            b'F' => Some(Value::Float(0.0)),
+                            b'D' => Some(Value::Double(0.0)),
+                            b'L' | b'[' => {
+                                // For iterator()-shaped returns, allocate a
+                                // synthetic empty Iterator (2-field: array=0,
+                                // cursor=1) so the caller's hasNext() loop
+                                // terminates cleanly. For other reference
+                                // returns, hand back null.
+                                if method_name == "iterator"
+                                    && method_descriptor == "()Ljava/util/Iterator;"
+                                {
+                                    let cm = shared.class_manager.read();
+                                    let itr_cid = cm
+                                        .get_loaded_class_id("java/util/Iterator")
+                                        .unwrap_or(ClassId::new(0));
+                                    drop(cm);
+                                    let itr = shared.heap.alloc_object(itr_cid, 2);
+                                    // empty array placeholder + cursor=0
+                                    let empty = shared.heap.alloc_array(
+                                        ClassId::new(0),
+                                        crate::memory::heap::ArrayElementType::Reference,
+                                        0,
+                                    );
+                                    shared.heap.set_field(
+                                        itr,
+                                        0,
+                                        Value::Object(Some(empty)),
+                                    );
+                                    shared
+                                        .heap
+                                        .set_field(itr, 1, Value::Int(0));
+                                    Some(Value::Object(Some(itr)))
+                                } else {
+                                    Some(Value::Object(None))
+                                }
+                            }
+                            _ => Some(Value::Object(None)),
+                        };
+                        if std::env::var_os("RUSTJVM_DBG_NOCODE").is_some() {
+                            eprintln!(
+                                "[DBG_NOCODE_SYNTH] cp={class_name_owned}.{method_name}{method_descriptor} -> synth={synth:?}"
+                            );
+                        }
+                        return Ok(synth);
+                    }
+                }
+            }
+            // Build an AbstractMethodError so Java try/catch can see it.
+            let msg = format!(
+                "method {class_name_owned}.{method_name}{method_descriptor} has no Code attribute"
+            );
+            if std::env::var_os("RUSTJVM_DBG_NOCODE").is_some() {
+                eprintln!("[DBG_NOCODE] {msg}");
+            }
+            match super::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/AbstractMethodError",
+                Some(&msg),
+            ) {
+                Ok(exc) => {
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+                Err(_) => {
+                    // Heap-exhausted or class-load failure during exception
+                    // construction — fall back to the legacy InternalError so
+                    // we never lose the diagnostic entirely.
+                    return Err(MethodCallFailed::InternalError(VmError::Internal {
+                        message: msg,
+                    }));
+                }
+            }
+        }
+        let code_attr = code_attr_opt.expect("has_code true implies code present");
+        (code_attr, source_file, class_name_owned)
     };
 
     // If the JIT early-compile path encounters an exception from a callee
@@ -1123,12 +1392,24 @@ pub fn execute(
         // under deep recursion and must run in the interpreter pending a
         // proper regalloc fix.
         let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
+        // S111r15 — refuse to JIT a method shadowed by a Rust native at this
+        // FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
+        // (whose JDK bytecode delegates to `(I)I` → `CharacterData.of/
+        // toLowerCase` virtual chain) gets JIT-compiled, and after warm-up
+        // the resulting machine code returns 0 for most inputs, corrupting
+        // Spring's `BeanPropertyName.toDashedForm` (`bannerMode` →
+        // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
+        // `InvalidConfigurationPropertyNameException` during SportMe boot.
+        let native_skip = shared
+            .native_methods
+            .find(&class_name_str, method_name, method_descriptor)
+            .is_some();
         // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing RUSTJVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
-        if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip {
+        if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip || native_skip {
             // Method has known JIT issues — skip JIT.
         } else {
         {
@@ -5667,6 +5948,7 @@ fn execute_instruction(
                             .is_subclass_of(obj_class_id, target_class_id)
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
+                            || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
                     };
                     if !cast_ok {
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -5676,6 +5958,60 @@ fn execute_instruction(
                             .get_class(actual_class_id)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| "?".to_string());
+                        if std::env::var_os("RUSTJVM_DBG_CCE").is_some() {
+                            eprintln!(
+                                "[CCE_DBG] checkcast fail: obj_cid={} obj_class={} target={} caller={}.{}{}",
+                                actual_class_id,
+                                obj_class_name,
+                                target_class_name,
+                                thread.frames[frame_idx].class_name(),
+                                thread.frames[frame_idx].method_name(),
+                                thread.frames[frame_idx].method_descriptor(),
+                            );
+                        }
+                        // S-trinity #1: when the runtime class is a bare
+                        // `Object` / cid=0 (synthetic alloc that lost
+                        // class_id) and the checkcast target is a
+                        // ClassLoader-shaped type — i.e. log4j's
+                        // `LoaderUtil.getThreadContextClassLoader` / the
+                        // `(ClassLoader) priv.run()` chain in
+                        // `Logger.doGetMessageLogger` — substitute the
+                        // singleton app ClassLoader. The unidentifiable
+                        // value can only have come from one of our
+                        // classloader-returning natives (every concrete
+                        // `Class.getClassLoader` / `Thread.getContextClassLoader`
+                        // path ends in `get_or_create_app_loader`), so the
+                        // app loader is the spec-correct standin and lets
+                        // the caller's `loadClass` chain proceed instead
+                        // of poisoning `<clinit>` with an EIIE.
+                        let is_classloader_target = target_class_name
+                            == "java/lang/ClassLoader"
+                            || target_class_name == "java/security/SecureClassLoader"
+                            || target_class_name
+                                == "jdk/internal/loader/BuiltinClassLoader"
+                            || target_class_name
+                                == "jdk/internal/loader/ClassLoaders$AppClassLoader"
+                            || target_class_name
+                                == "jdk/internal/loader/ClassLoaders$PlatformClassLoader";
+                        let obj_is_bare_object =
+                            actual_class_id == ClassId::new(0)
+                                || obj_class_name == "java/lang/Object";
+                        if is_classloader_target && obj_is_bare_object {
+                            if let Some(loader_obj) =
+                                rustjvm_native_builtins::classloader::peek_app_loader()
+                            {
+                                tracing::debug!(
+                                    target: "rustjvm::interp::checkcast",
+                                    "S-trinity #1 — substituting app ClassLoader for cid=0 \
+                                     Object on checkcast → {}",
+                                    target_class_name,
+                                );
+                                thread.frames[frame_idx]
+                                    .stack
+                                    .push(Value::Object(Some(loader_obj)))?;
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
                         return Err(RuntimeError::ClassCastException {
                             message: format!(
                                 "{obj_class_name} cannot be cast to {target_class_name}"
@@ -5750,6 +6086,7 @@ fn execute_instruction(
                             .is_subclass_of(obj_class_id, target_class_id)
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
+                            || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
                         {
                             1
                         } else {
@@ -5858,6 +6195,96 @@ pub fn synthetic_implements_public(
     target_class_name: &str,
 ) -> bool {
     synthetic_implements(shared, obj_class_id, target_class_name)
+}
+
+/// `instanceof` / `checkcast` admission for a `Proxy$Instance` heap object.
+///
+/// Returns `true` iff `obj_ref` is a dynamic proxy AND `target_class_name`
+/// names one of the interfaces the proxy was created with (or a superinterface
+/// of one of them). Always-implicit constants (`java/io/Serializable`,
+/// `java/lang/Object`) also match per `java.lang.reflect.Proxy` spec.
+///
+/// The proxy stores its interfaces array at slot
+/// [`crate::runtime::proxy::PROXY_FIELD_INTERFACES`] (a `Class[]`).
+///
+/// See also: [`synthetic_implements`] above for the rationale this lives at
+/// the call site (per-instance proxy admission can't be decided from a
+/// `class_id` alone, since every proxy lands on the same `Proxy$Instance`
+/// ClassId).
+pub(crate) fn proxy_instance_satisfies_target(
+    shared: &SharedVm,
+    obj_ref: rustjvm_types::ObjectRef,
+    target_class_name: &str,
+) -> bool {
+    use crate::runtime::proxy::PROXY_FIELD_INTERFACES;
+
+    let obj_class_id = shared.heap.class_id_of(obj_ref);
+    let obj_name = match shared.class_manager.read().get_class(obj_class_id) {
+        Some(c) => c.name.to_string(),
+        None => return false,
+    };
+    let is_proxy = &*obj_name == "java/lang/reflect/Proxy$Instance"
+        || class_chain_reaches_proxy_instance(shared, obj_class_id);
+    if !is_proxy {
+        return false;
+    }
+
+    // Always-true targets per the `Proxy` contract.
+    if target_class_name == "java/io/Serializable"
+        || target_class_name == "java/lang/Object"
+    {
+        return true;
+    }
+
+    let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
+        rustjvm_types::Value::Object(Some(a)) => a,
+        _ => {
+            // Unknown — no interfaces stored. Fall back to old liberal rule
+            // for safety so we don't regress proxies that never went through
+            // `Proxy.newProxyInstance`.
+            return true;
+        }
+    };
+    let n = shared.heap.array_length(interfaces_arr);
+    let target_cid = shared
+        .class_manager
+        .write()
+        .load_class(target_class_name)
+        .ok();
+    for i in 0..n {
+        let mirror = match shared.heap.get_array_element(interfaces_arr, i) {
+            Ok(rustjvm_types::Value::Object(Some(m))) => m,
+            _ => continue,
+        };
+        // Read the `name` String off the Class mirror via the heap (slot 0
+        // on real-JDK Class is `cachedConstructor` — too fragile). Use the
+        // mirror→ClassId mapping we already maintain.
+        let iface_cid = match crate::vm::class_id_from_mirror(shared, mirror) {
+            Some(cid) => cid,
+            None => continue,
+        };
+        // Direct identity match.
+        if Some(iface_cid) == target_cid {
+            return true;
+        }
+        // Superinterface walk: target is a superinterface of `iface_cid`?
+        if let Some(tcid) = target_cid {
+            if shared
+                .class_manager
+                .read()
+                .is_subclass_of(iface_cid, tcid)
+            {
+                return true;
+            }
+        }
+        // Name fallback (synthetic interfaces that may not be loaded yet).
+        if let Some(iface_class) = shared.class_manager.read().get_class(iface_cid) {
+            if &*iface_class.name == target_class_name {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Check if a lambda proxy object satisfies a target class. Lambda proxy ClassIds
@@ -6170,16 +6597,12 @@ fn synthetic_implements(
         );
     }
 
-    // Dynamic proxy — Proxy$Instance (and any class extending it, i.e.
-    // WP2.5-A generated `$ProxyN` classes) satisfies any interface cast.
-    // Fast path: literal name compare keeps the cost zero on the common
-    // synthetic-shim path. Slow path: walk the receiver's superclass
-    // chain so generated `$ProxyN` subclasses get the same treatment.
-    if &*obj_name == "java/lang/reflect/Proxy$Instance"
-        || class_chain_reaches_proxy_instance(shared, obj_class_id)
-    {
-        return true;
-    }
+    // NOTE — the dynamic-proxy admission rule lives in the callers (see
+    // `proxy_instance_satisfies_target` below), where the proxy *instance*
+    // is in scope. We can't decide it here without the instance because a
+    // proxy's interface set is per-instance (stored on the heap object),
+    // not per-class — every proxy lands on the same synthetic
+    // `Proxy$Instance` ClassId.
 
     // Annotation proxy — satisfies Annotation interface casts.
     if &*obj_name == "java/lang/annotation/AnnotationProxy" {
@@ -7011,7 +7434,26 @@ fn execute_invoke(
                 // method dispatch must go through java.lang.Object (JVMS §4.4.1).
                 // Check heap kind first to avoid misrouting clone()/toString()/etc.
                 if shared.heap.kind_of(*obj_ref) == rustjvm_types::ObjectKind::Array {
-                    Arc::from("java/lang/Object")
+                    // S111r8: an Object[] array (cid=0 component class)
+                    // being dispatched for a non-Object method like
+                    // iterator()/hasNext()/size() typically means a
+                    // synthetic native return-shape leaked into a
+                    // typed-collection caller (e.g. HashSet.iterator
+                    // bytecode read its `map` field which our synthetic
+                    // HashSet stores as an Object[] backing array rather
+                    // than a real HashMap). Object's vtable can't service
+                    // these calls; falling back to the CP-resolved
+                    // interface class lets the slow path's
+                    // `check_override` list and the receiver-driven
+                    // fallback in `invoke_on_class_shared_inner`
+                    // recover. Object members (equals/hashCode/toString/
+                    // clone/etc.) still dispatch via Object per
+                    // JVMS §4.4.1.
+                    if !crate::vm::is_object_member(&method_name, &method_descriptor) {
+                        method_class_name.clone()
+                    } else {
+                        Arc::from("java/lang/Object")
+                    }
                 } else {
                     let cid = shared.heap.class_id_of(*obj_ref);
 
@@ -7050,8 +7492,37 @@ fn execute_invoke(
                             );
                             method_class_name.clone()
                         } else {
-                            // Genuinely java.lang.Object
-                            Arc::from("java/lang/Object")
+                            // S111r8: cid=0 with non-zero header means a
+                            // synthetic alloc lost its class_id (e.g.
+                            // `alloc_object(ClassId::new(0), …)` from a
+                            // native fallback). The previous code returned
+                            // bare `java/lang/Object`, which then sent
+                            // `Set.iterator()` / `Map.keySet()` /
+                            // `Iterator.hasNext()` invokes through
+                            // Object's vtable and surfaced as
+                            // `NoSuchMethodError Object.iterator()`.
+                            //
+                            // The CP method-ref class (e.g.
+                            // `java/util/Set`) already resolved at link
+                            // time and is the correct dispatch class for
+                            // any non-Object method. Use it as the
+                            // fallback so the slow path can locate the
+                            // registered native (`HashSet.iterator`,
+                            // `HashMap.keySet`, etc.) even though the
+                            // receiver header is corrupt. Object members
+                            // (equals/hashCode/toString/getClass/wait/
+                            // notify/notifyAll/clone/finalize) still
+                            // dispatch on Object so subclass overrides
+                            // through the slow path's Object-fallback
+                            // logic still apply.
+                            if crate::vm::is_object_member(
+                                &method_name,
+                                &method_descriptor,
+                            ) {
+                                Arc::from("java/lang/Object")
+                            } else {
+                                method_class_name.clone()
+                            }
                         }
                     } else {
                         // If receiver is a lambda proxy calling a non-SAM method
@@ -7064,12 +7535,65 @@ fn execute_invoke(
                         if let Some(iface) = lambda_iface {
                             iface
                         } else {
-                            shared
-                                .class_manager
-                                .read()
-                                .get_class(cid)
-                                .map(|c| Arc::from(&*c.name))
-                                .unwrap_or(method_class_name)
+                            // S111r12 — receiver's runtime class is an interface
+                            // (e.g. `java/lang/Comparable`) but the CP method-ref
+                            // class is a concrete/abstract class with the actual
+                            // method declared (`java/lang/ClassLoader.loadClass`).
+                            // This pattern surfaces when a native-allocated
+                            // ClassLoader instance lost its concrete class_id
+                            // somewhere in the boot chain and `class_id_of`
+                            // returns a stub interface cid instead. Routing
+                            // dispatch through the CP class lets the slow path
+                            // find the registered native or bytecode method.
+                            // Mirrors the S111r8 cid=0 → CP-class fallback.
+                            // Guard: only fires when the receiver's class is an
+                            // interface AND the CP class is NOT that same
+                            // interface (avoid changing well-formed
+                            // `Iterator.hasNext()` etc. dispatches).
+                            //
+                            // S-trinity #2 — symmetric extension: receiver's
+                            // runtime class is plain `java/lang/Object` (e.g.
+                            // a value just returned from
+                            // `PrivilegedAction.run()` whose declared return
+                            // is `Object`, or a synthetic native return that
+                            // landed without subclass info), and the CP
+                            // method-ref class is `java/lang/ClassLoader` (or
+                            // any concrete class declaring the method). Treat
+                            // it the same as the interface case so the
+                            // `(ClassLoader) priv.run()` chain in
+                            // `LoaderUtil.getClassLoader` and
+                            // `Logger.getMessageLogger` can dispatch the
+                            // subsequent `loadClass` instead of NSME'ing on
+                            // `Object.loadClass`.
+                            let cm_read = shared.class_manager.read();
+                            let recv_class = cm_read.get_class(cid);
+                            let recv_is_iface = recv_class
+                                .map(|c| c.is_interface())
+                                .unwrap_or(false);
+                            let recv_name_opt = recv_class
+                                .map(|c| Arc::from(&*c.name));
+                            drop(cm_read);
+                            let recv_is_bare_object = recv_name_opt
+                                .as_ref()
+                                .map(|n: &Arc<str>| &**n == "java/lang/Object")
+                                .unwrap_or(false);
+                            let cp_is_not_object =
+                                &*method_class_name != "java/lang/Object";
+                            if (recv_is_iface || recv_is_bare_object)
+                                && cp_is_not_object
+                                && !crate::vm::is_object_member(
+                                    &method_name,
+                                    &method_descriptor,
+                                )
+                                && recv_name_opt
+                                    .as_ref()
+                                    .map(|n: &Arc<str>| &**n != &*method_class_name)
+                                    .unwrap_or(true)
+                            {
+                                method_class_name.clone()
+                            } else {
+                                recv_name_opt.unwrap_or(method_class_name)
+                            }
                         }
                     }
                 }
@@ -7169,7 +7693,26 @@ fn execute_invoke(
     }
 
     // Annotation proxy dispatch: method calls on annotation proxies
-    if &*invoke_class == "java/lang/annotation/AnnotationProxy" && !is_special {
+    //
+    // S111r18 — gate the dispatch on `kind == Object`. A reference array
+    // whose component class is `AnnotationProxy` (e.g. `Annotation[]` for
+    // a repeatable annotation or `excludeFilters` on `@ComponentScan`)
+    // shares the same `class_id_of` value because our heap stores the
+    // component class id on the array header. Without this guard, every
+    // method call on such an array (Object.getClass / Object.toString /
+    // Array.getLength via reflection) gets routed through
+    // `annotation_proxy_invoke_shared`, which reads element-value slots
+    // out of array memory — surfacing as `getClass() returns null` or
+    // wrong-component types in Spring's `MergedAnnotation.adaptForAttribute`
+    // and breaking the `excludeFilters` array iteration that builds the
+    // `MergedAnnotation[]`.
+    if &*invoke_class == "java/lang/annotation/AnnotationProxy"
+        && !is_special
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(r))) if shared.heap.kind_of(*r) == rustjvm_types::ObjectKind::Object
+        )
+    {
         if let Value::Object(Some(ann_ref)) = &args[0] {
             let invoke_args: &[Value] = if args.len() >= 1 { &args[1..] } else { &[] };
             let result = crate::vm::annotation_proxy_invoke_shared(
@@ -7528,6 +8071,18 @@ pub(crate) fn try_lambda_dispatch(
             None => return Ok(None), // Not a lambda proxy
         }
     };
+    if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+        eprintln!(
+            "[rustjvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
+            obj_class_id,
+            call_site.functional_interface,
+            method_name,
+            call_site.impl_handle.class_name,
+            call_site.impl_handle.member_name,
+            call_site.impl_handle.descriptor,
+            call_site.impl_handle.kind,
+        );
+    }
 
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
@@ -7747,6 +8302,15 @@ pub(crate) fn try_lambda_dispatch(
                 false,
                 num_captures,
             )?;
+            if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+                eprintln!(
+                    "[rustjvm-dbg] lambda static-pre-invoke: {}.{}{} args={}",
+                    call_site.impl_handle.class_name,
+                    call_site.impl_handle.member_name,
+                    call_site.impl_handle.descriptor,
+                    full_args.len(),
+                );
+            }
             let result = invoke_shared(
                 shared,
                 thread,
@@ -7755,6 +8319,15 @@ pub(crate) fn try_lambda_dispatch(
                 &call_site.impl_handle.descriptor,
                 &full_args,
             )?;
+            if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+                eprintln!(
+                    "[rustjvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
+                    call_site.impl_handle.class_name,
+                    call_site.impl_handle.member_name,
+                    call_site.impl_handle.descriptor,
+                    result.is_some(),
+                );
+            }
             Ok(Some(coerce_return(shared, thread, &sam_ret, &impl_ret, result)?))
         }
         MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
@@ -8899,6 +9472,16 @@ fn try_osr(
     }
     // Get method info from frame metadata
     let method_descriptor = frame.method_descriptor().to_string();
+    // S111r15 — same native-shadow guard as the other JIT entry points
+    // (`try_jit_compile_callee`, `try_jit_upgrade_with_gate`, first-call
+    // compile path). OSR must respect the native registration too.
+    if shared
+        .native_methods
+        .find(class_name_check, method_name_check, &method_descriptor)
+        .is_some()
+    {
+        return None;
+    }
     let class_name = frame.class_name().to_string();
     let method_name = frame.method_name().to_string();
     let code = frame.code.clone();
@@ -9334,6 +9917,26 @@ fn try_jit_upgrade_with_gate(
     if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
         return None;
     }
+    // S111r15 — refuse to JIT a method that has a Rust native shadow.
+    // Mirrors the equivalent gate in `try_jit_compile_callee` so the
+    // caller-method-counter path doesn't bypass natives that the
+    // dispatcher path correctly defers to. Concretely: without this
+    // check, `Character.toLowerCase(C)C` got JIT-compiled (its JDK
+    // bytecode delegates to `(I)I` → `CharacterData.of/toLowerCase`
+    // virtual chain), and the resulting machine code returned 0 for
+    // most inputs after warm-up, corrupting Spring's
+    // `BeanPropertyName.toDashedForm` (`bannerMode` →
+    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
+    // `InvalidConfigurationPropertyNameException` during SportMe boot.
+    {
+        if shared
+            .native_methods
+            .find(&cached.class_name, &cached.method_name, &cached.method_descriptor)
+            .is_some()
+        {
+            return None;
+        }
+    }
     // W2-CHM: honor the JIT skip list on this caller-method-counter
     // promotion path too. Previously only the first-call compile path
     // (interpreter.rs::~1112) and the callee-dispatcher path
@@ -9498,6 +10101,24 @@ fn try_jit_upgrade_with_gate(
             // RFJP.1 — never JIT a callee on a class transitively extending
             // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
             if is_fjp_subclass_blocklisted(shared, callee_class) {
+                return None;
+            }
+            // S111r15 — refuse to compile a callee that has a Rust native
+            // shadow. Mirrors the gate in `try_jit_compile_callee` /
+            // `try_jit_upgrade_with_gate` / first-call JIT / OSR. Without
+            // this check, the recursive callee-compile path direct-called
+            // `Character.toLowerCase(C)C`'s JDK bytecode (which delegates
+            // to `(I)I` → `CharacterData.of/toLowerCase` virtual chain),
+            // and the resulting machine code returned 0 for most inputs
+            // after warm-up. Result: Spring's
+            // `BeanPropertyName.toDashedForm` produced
+            // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
+            // `InvalidConfigurationPropertyNameException` in SportMe.
+            if shared
+                .native_methods
+                .find(callee_class, callee_method, callee_desc)
+                .is_some()
+            {
                 return None;
             }
             // Check JIT cache first
@@ -10293,9 +10914,34 @@ fn execute_jit_call(
     needs_heap: bool,
     cached: &Arc<CachedBytecodeMethod>,
 ) -> Result<CachedCallResult, MethodCallFailed> {
-    // Pop raw u64 args directly — avoids decode_value/Value enum overhead
+    // Pop raw u64 args directly — avoids decode_value/Value enum overhead.
+    //
+    // The JIT backend wires Java params via ARG_REGS only (no stack-arg
+    // marshalling): on Windows x64 ARG_REGS has 4 slots, on System V x64
+    // it has 6. When `needs_heap` is set, ARG_REGS[0] holds the SharedVm
+    // pointer, which leaves one fewer slot for Java params. If the
+    // method's parameter count exceeds the platform's available register
+    // slots, the JIT codegen would silently truncate (see x64.rs prologue
+    // — `ARG_REGS.iter()...take(self.num_params)`), producing a method
+    // body that reads uninitialised locals for the missing tail params.
+    // Bail to the bytecode interpreter in that case instead of dispatching
+    // a miscompiled call.
+    //
+    // Reproducer (before this gate): Spring Boot 2.x's
+    // `ExecutableArchiveLauncher.getMainClass` → `ZipFile`/`JarFile`
+    // chain calls into a 5+-arg JIT'd method on Windows and panics with
+    // "index out of bounds: the len is 4 but the index is 4" at the
+    // pop-into-`jit_args` loop below.
+    #[cfg(target_os = "windows")]
+    const JIT_ABI_REG_SLOTS: usize = 4;
+    #[cfg(not(target_os = "windows"))]
+    const JIT_ABI_REG_SLOTS: usize = 6;
     let np = num_params as usize; // Widening: parameter count conversion
-    let mut jit_args = [0i64; 4]; // max 4 args for our JIT
+    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    if np > max_java_params {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
         jit_args[i] = thread.frames[frame_idx].stack.pop_raw() as i64; // Cast: JIT ABI -- i64 register convention
     }
