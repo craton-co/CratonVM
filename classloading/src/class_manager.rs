@@ -3215,6 +3215,22 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl" =>
             "java/util/concurrent/atomic/AtomicLongFieldUpdater",
 
+        // Block 2C — `org.jboss.logmanager.LogManager` extends
+        // `java.util.logging.LogManager`. The JDK `LogManager.<clinit>`
+        // bytecode does `clz.newInstance()` then `checkcast` to
+        // `java.util.logging.LogManager`; the cast only succeeds when the
+        // synthetic stub's superclass chain reaches the JDK class. Without
+        // this entry, KC16 boot prints
+        //   `WARNING: Failed to load the specified log manager class
+        //    org.jboss.logmanager.LogManager`
+        // and falls back to the default `java.util.logging.LogManager`,
+        // silently dropping every WildFly log line. Pairs with
+        // `native-builtins::logmanager::register_logmanager_natives` which
+        // intercepts the `<init>` so the JBoss ctor's handler-chain wiring
+        // doesn't NPE on our minimal field layout. See WP6.5 / Block 2C.
+        "org/jboss/logmanager/LogManager" => "java/util/logging/LogManager",
+        "java/util/logging/LogManager" => "java/lang/Object",
+
         // Default: everything else extends Object
         _ => "java/lang/Object",
     }

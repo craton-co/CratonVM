@@ -1704,6 +1704,82 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         native_module_classloader_get_resource_as_stream,
     );
+
+    // KC16 boot blocker (Session 100): `org/jboss/modules/log/JDKModuleLogger`'s
+    // `<clinit>` calls `Level.parse("TRACE")` / `parse("DEBUG")` /
+    // `parse("WARN")` to populate the static `TRACE`/`DEBUG`/`WARN`
+    // fields, falling back to `Level.FINEST`/`FINE`/`WARNING` on the
+    // `IllegalArgumentException` thrown for the non-standard names.
+    // Somewhere down that path (Logger / Level / KnownLevel internals
+    // exercised on JDK 25) a `Class.getModule()` chain produces a null
+    // `Module` and a downstream `m.isNamed()` raises
+    // `NullPointerException: Cannot invoke isNamed on null`.  Our B6
+    // policy turns that NPE into a silent swallow of the JDKModuleLogger
+    // class init, after which JBoss Modules' bootstrap proceeds without
+    // a working logger and KC16 limps onward.
+    //
+    // Replace the `<clinit>` with a synthetic native that performs the
+    // expected effect directly: ensure `java/util/logging/Level` is
+    // initialized, then read the JDK's `FINEST`/`FINE`/`WARNING` static
+    // Level instances and write them into JDKModuleLogger.TRACE/DEBUG/WARN.
+    // This bypasses the broken Module path entirely while preserving
+    // the contract that those static fields are non-null Level mirrors.
+    registry.register(
+        "org/jboss/modules/log/JDKModuleLogger",
+        "<clinit>",
+        "()V",
+        native_jdk_module_logger_clinit,
+    );
+}
+
+/// Synthetic `JDKModuleLogger.<clinit>` — populates the three static
+/// `Level` fields without calling `Level.parse`, sidestepping a JDK 25
+/// class-init NPE chain that surfaces under our synthetic Module shim.
+/// See the registration site for the full root-cause writeup.
+fn native_jdk_module_logger_clinit(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Ensure java.util.logging.Level is initialized so its FINEST/FINE/
+    // WARNING static fields are populated.  `ensure_class_initialized`
+    // is a no-op once the class is already in `Initialized` state.
+    let level_cid = match ctx.ensure_class_initialized("java/util/logging/Level") {
+        Ok(cid) => cid,
+        Err(_) => {
+            // Level itself failed to initialize — leave the fields as
+            // their default (null) and return; downstream code that
+            // reads them will get null and emit its own diagnostic.
+            return Ok(None);
+        }
+    };
+    let trace_val = match ctx.static_field_index_by_name(level_cid, "FINEST") {
+        Some(idx) => ctx.get_static_field(level_cid, idx),
+        None => Value::Object(None),
+    };
+    let debug_val = match ctx.static_field_index_by_name(level_cid, "FINE") {
+        Some(idx) => ctx.get_static_field(level_cid, idx),
+        None => Value::Object(None),
+    };
+    let warn_val = match ctx.static_field_index_by_name(level_cid, "WARNING") {
+        Some(idx) => ctx.get_static_field(level_cid, idx),
+        None => Value::Object(None),
+    };
+    ctx.set_static_field_by_name(
+        "org/jboss/modules/log/JDKModuleLogger",
+        "TRACE",
+        trace_val,
+    );
+    ctx.set_static_field_by_name(
+        "org/jboss/modules/log/JDKModuleLogger",
+        "DEBUG",
+        debug_val,
+    );
+    ctx.set_static_field_by_name(
+        "org/jboss/modules/log/JDKModuleLogger",
+        "WARN",
+        warn_val,
+    );
+    Ok(None)
 }
 
 /// `loadModule(ModuleIdentifier)` — extract the dotted name from the

@@ -262,6 +262,7 @@ fn socket_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let id = register_socket(state);
     write_fd(ctx, this, id);
+    eprintln!("[w3a2] plain socketCreate stream={stream} -> id={id}");
     Ok(None)
 }
 
@@ -308,6 +309,7 @@ fn socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    eprintln!("[w3a2] plain socketBind port={port}");
     let ip: std::net::IpAddr = match args.get(1) {
         Some(Value::Object(Some(o))) => read_inet_addr(ctx, *o)
             .unwrap_or(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)),

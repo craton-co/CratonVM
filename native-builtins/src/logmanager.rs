@@ -184,10 +184,107 @@ fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Object
     obj
 }
 
+/// Block 2B — try to allocate a custom subclass instance based on the
+/// `java.util.logging.manager` system property.
+///
+/// Returns `Some(instance)` if:
+///   * the property is set to a non-empty class name,
+///   * the named class is loadable through the unified class loader
+///     (which sees `-c` classpath entries — bypassing the bootstrap-
+///     loader caller-class detection that vanilla
+///     `Class.forName(name)` from inside `j.u.l.LogManager.<clinit>`
+///     stumbles over),
+///   * the class has an accessible no-arg constructor that completes
+///     without throwing.
+///
+/// Returns `None` otherwise so the caller can fall back to the JDK
+/// default `java/util/logging/LogManager` singleton (preserving the
+/// no-`-Djava.util.logging.manager` baseline).
+///
+/// Built-in aliases (`java.util.logging.LogManager`,
+/// `org.jboss.logmanager.LogManager`) short-circuit to `None` so the
+/// existing pre-allocated singletons remain the source of truth — those
+/// singletons already have the synthetic field layout my native helpers
+/// expect, and routing them through `<init>` would re-enter
+/// `getLogManager()` recursively.
+fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let prop = ctx.get_system_property("java.util.logging.manager")?;
+    let dotted = prop.trim();
+    if dotted.is_empty() {
+        return None;
+    }
+    // Built-in aliases use the pre-existing singletons; calling
+    // `<init>` on them through the bytecode path would either re-enter
+    // this function or trip the `native_jboss_init` no-op contract.
+    let internal = dotted.replace('.', "/");
+    if internal == CLS_JUL_LOG_MANAGER || internal == CLS_JBOSS_LOG_MANAGER {
+        return None;
+    }
+
+    // Sanity-check the class name — reject obvious traversal / control
+    // bytes so a hostile property value can't drag the unified loader
+    // into a path it shouldn't probe.
+    if !is_valid_logger_name(&internal) {
+        tracing::warn!(
+            class = %dotted,
+            "java.util.logging.manager: rejecting suspicious class name"
+        );
+        return None;
+    }
+
+    // Step 1: load + init via the unified loader. This is the path that
+    // sees `-c` classpath entries and JBoss-Modules-injected jars; the
+    // vanilla `Class.forName(String)` 1-arg form invoked from inside the
+    // JDK's `LogManager.<clinit>` resolves with the bootstrap loader
+    // (caller-class detection) and so misses `-c apps/...` classes
+    // entirely. Bypassing that path is exactly what the override exists
+    // for.
+    if ctx.ensure_class_initialized(&internal).is_err() {
+        tracing::warn!(
+            class = %dotted,
+            "java.util.logging.manager: class not loadable via unified loader, \
+             falling back to JDK default"
+        );
+        return None;
+    }
+
+    // Step 2: allocate without invoking `<init>` so we control the
+    // ordering — `new_object` reserves a slot, then `invoke(<init>()V)`
+    // runs the user-defined ctor (which may itself call `super()` into
+    // `java.util.logging.LogManager.<init>`, satisfied by the
+    // `native_jboss_init` no-op we register on the parent class).
+    let obj = match ctx.new_object(&internal) {
+        Ok(Some(Value::Object(Some(obj)))) => obj,
+        _ => {
+            tracing::warn!(
+                class = %dotted,
+                "java.util.logging.manager: new_object failed, falling back"
+            );
+            return None;
+        }
+    };
+    if let Err(e) = ctx.invoke(&internal, "<init>", "()V", &[Value::Object(Some(obj))]) {
+        tracing::warn!(
+            class = %dotted,
+            error = ?e,
+            "java.util.logging.manager: <init> threw, falling back"
+        );
+        return None;
+    }
+    Some(obj)
+}
+
 /// Return (or lazily allocate) the process-wide `LogManager` singleton
 /// ObjectRef. Subsequent calls return the same ObjectRef so
 /// pointer-identity comparisons in Java (`if (mgr == other)`) stay
 /// stable.
+///
+/// Block 2B: when called for the JDK-side `java.util.logging.LogManager`
+/// entry-point and `-Djava.util.logging.manager=<X>` is set, the
+/// resolved instance's concrete class is `X` (loaded through the
+/// unified system loader so `-c` paths are visible). Without the
+/// property, the JDK-default class is used as before — see
+/// `try_allocate_property_log_manager` for the loader-bypass rationale.
 fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
     // Fast path: already cached.
     {
@@ -200,15 +297,28 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef 
             }
         }
     }
-    // Slow path: allocate + cache under the same lock to avoid a race
-    // where two threads both pay the allocation cost.
+    // Slow path: try the property-driven subclass first (only relevant
+    // when the JDK's own `getLogManager` is the entry point). For
+    // direct `org.jboss.logmanager.LogManager.getLogManager()` calls
+    // the caller already chose the concrete class, so honour that.
+    let chose_property_class = if class_name == CLS_JUL_LOG_MANAGER {
+        try_allocate_property_log_manager(ctx)
+    } else {
+        None
+    };
+    let obj = match chose_property_class {
+        Some(o) => o,
+        None => allocate_log_manager(ctx, class_name),
+    };
     let mut guard = singleton_cell().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *guard {
         if addr != 0 {
+            // Another thread beat us; drop our allocation on the floor
+            // (we have no external references to it yet) and adopt
+            // theirs.
             return unsafe { object_from_u64(addr) };
         }
     }
-    let obj = allocate_log_manager(ctx, class_name);
     *guard = Some(obj.as_ptr() as u64);
     obj
 }
@@ -1001,5 +1111,101 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(v, Value::Object(None)));
+    }
+
+    // -- Block 2B: -Djava.util.logging.manager honoured by getLogManager --
+
+    #[test]
+    fn block_2b_property_unset_returns_default_class_singleton() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        // Property absent — expected to return the default JDK class.
+        let obj = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected manager ObjectRef, got {:?}", other),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(
+            name, CLS_JUL_LOG_MANAGER,
+            "no property set => default LogManager class"
+        );
+    }
+
+    #[test]
+    fn block_2b_property_set_to_subclass_returns_named_class() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        ctx.set_system_property("java.util.logging.manager", "LmSubclass$MyLm");
+        let obj = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected manager ObjectRef, got {:?}", other),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(
+            name, "LmSubclass$MyLm",
+            "property set => getLogManager returns instance of named class"
+        );
+    }
+
+    #[test]
+    fn block_2b_property_built_in_alias_falls_through_to_singleton() {
+        // Built-in JDK / JBoss class names short-circuit through the
+        // pre-allocated singleton path. This pins the contract that
+        // `try_allocate_property_log_manager` returns `None` for them
+        // (so the existing synthetic field layout is preserved).
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        ctx.set_system_property("java.util.logging.manager", "java.util.logging.LogManager");
+        let obj = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(name, CLS_JUL_LOG_MANAGER);
+        // Singleton identity preserved across calls.
+        let obj2 = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        assert_eq!(obj, obj2);
+    }
+
+    #[test]
+    fn block_2b_property_empty_or_whitespace_returns_default() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        ctx.set_system_property("java.util.logging.manager", "   ");
+        let obj = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(name, CLS_JUL_LOG_MANAGER);
+    }
+
+    #[test]
+    fn block_2b_property_path_traversal_class_name_rejected() {
+        // Hostile property values must not coax the unified loader
+        // into probing arbitrary disk paths via the class-name string.
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        ctx.set_system_property("java.util.logging.manager", "../../../etc/passwd");
+        let obj = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        // Falls through to the default LogManager class on rejection.
+        assert_eq!(name, CLS_JUL_LOG_MANAGER);
     }
 }

@@ -30,7 +30,7 @@ on:
       - 'native-builtins/**'
       - 'classloading/**'
   schedule:
-    # Nightly at 03:17 UTC — off-peak, doesn't collide with other workflows.
+    # Nightly at 03:17 UTC — off-peak, doesn't collide with other .wf.
     - cron: '17 3 * * *'
   workflow_dispatch:
 

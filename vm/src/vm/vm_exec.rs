@@ -1434,7 +1434,60 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 &[Value::Object(Some(thread_obj_for_spawn))],
             );
             if let Err(e) = result {
-                eprintln!("Thread {} terminated with error: {:?}", tid, e);
+                // Wave1-C: dispatch the per-Thread (or default)
+                // UncaughtExceptionHandler before dropping the
+                // exception. Without this, code that relies on
+                // `Thread.setUncaughtExceptionHandler(...)` to observe
+                // worker failures (web servers, async pipelines) sees
+                // the exception silently disappear.
+                //
+                // Spec order (Thread.dispatchUncaughtException):
+                //   1. per-instance handler (set via
+                //      `setUncaughtExceptionHandler`),
+                //   2. ThreadGroup.uncaughtException — we approximate
+                //      by falling through to (3),
+                //   3. default handler (set via static
+                //      `setDefaultUncaughtExceptionHandler`).
+                //
+                // We only invoke the handler when `e` carries a Java
+                // throwable (`ExceptionThrown(exc)`). Internal VM
+                // errors keep the existing eprintln so they remain
+                // visible during diagnostics.
+                if let MethodCallFailed::ExceptionThrown(exc) = e {
+                    let handler = rustjvm_native_builtins::uncaught_handlers::take_uncaught_handler(thread_obj_for_spawn)
+                        .or_else(rustjvm_native_builtins::uncaught_handlers::default_uncaught_handler);
+                    if let Some(h) = handler {
+                        // Best-effort dispatch: invoke the handler's
+                        // `uncaughtException(Thread, Throwable)` via
+                        // virtual dispatch. Any error from the handler
+                        // itself is swallowed — HotSpot does the same
+                        // (a misbehaving handler can't take down the
+                        // VM further than the original exception
+                        // already did).
+                        let recv_cid = shared_arc.heap.class_id_of(h);
+                        let _ = invoke_on_class_shared(
+                            &shared_arc,
+                            &mut jvm_thread,
+                            recv_cid,
+                            "uncaughtException",
+                            "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
+                            &[
+                                Value::Object(Some(h)),
+                                Value::Object(Some(thread_obj_for_spawn)),
+                                Value::Object(Some(exc)),
+                            ],
+                        );
+                    } else {
+                        eprintln!("Thread {} terminated with error: ExceptionThrown(...)", tid);
+                    }
+                } else {
+                    eprintln!("Thread {} terminated with error: {:?}", tid, e);
+                }
+            } else {
+                // Successful return — drop any registered handler so
+                // the side-table doesn't accumulate entries for dead
+                // threads.
+                let _ = rustjvm_native_builtins::uncaught_handlers::take_uncaught_handler(thread_obj_for_spawn);
             }
             if is_virtual {
                 // Release carrier permit on thread exit.
@@ -3532,6 +3585,15 @@ pub fn invoke_or_native(
             if let Some(mut cid) = cm.get_loaded_class_id(effective_class) {
                 while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
                     if let Some(parent) = cm.get_class(parent_id) {
+                        // S107 collection-toString fix: if this parent has its
+                        // own bytecode for the method (e.g.
+                        // AbstractCollection.toString), the bytecode override
+                        // wins over any deeper native ancestor (e.g.
+                        // Object.toString). Stop walking so the bytecode
+                        // dispatch path runs.
+                        if parent.find_method(method_name, descriptor).is_some() {
+                            break;
+                        }
                         if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
                             if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
                                 eprintln!("[invoke_or_native] hierarchy walk hit on parent={}", parent.name);
@@ -5015,7 +5077,18 @@ fn invoke_on_class_shared_inner(
                                 | "equalsIgnoreCase"
                                 | "contains"
                                 | "split"
-                            ));
+                            ))
+                        // Session 100 KC16 boot: org/jboss/modules/log/JDKModuleLogger.<clinit>
+                        // calls Level.parse on non-standard names ("TRACE"/"DEBUG"/"WARN")
+                        // which transitively NPEs through a Class.getModule().isNamed()
+                        // chain in the JDK 25 logging stack under our synthetic Module
+                        // shim.  The native override in jboss_module_loader.rs
+                        // (`native_jdk_module_logger_clinit`) sets the three static
+                        // Level fields directly from JDK Level.FINEST/FINE/WARNING and
+                        // sidesteps the broken JDK path.  Force the override so the
+                        // bytecode <clinit> never runs.
+                        || (class_name == "org/jboss/modules/log/JDKModuleLogger"
+                            && method_name == "<clinit>");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }

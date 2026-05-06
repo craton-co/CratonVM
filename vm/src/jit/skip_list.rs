@@ -390,6 +390,24 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // Tracked by the committed reproducer in
         // `vm/tests/tier1_tests.rs::t1_known_regalloc_miscompile_exc_hierarchy_reproducer`.
         | ("rustjvm/TckLang", "exc_hierarchy")
+        // W2-CHM (Cluster B-CHM, Session 108) — JIT miscompiles
+        // `Integer.valueOf(int)` / `Integer.<init>(int)` such that the
+        // returned `Integer` has `value=0` instead of the requested int
+        // for any caller that crosses both the OSR back-edge threshold
+        // (1000) and the per-callee invocation threshold (2000) within
+        // the same outer-method frame. Reproducer:
+        // `apps/chm_basic/ChmScale` puts/gets 1000 keys into a CHM;
+        // entries `k992..k999` come back as 0 instead of 992..999
+        // because `Integer.valueOf(992..999)` returned the `value=0`
+        // path of the JIT'd allocate-and-init sequence. Pinned by
+        // `vm/tests/wave2_chm.rs::chm_scale_pins_integer_valueof_jit_miscompile`.
+        // Narrow: other `Integer` methods (`intValue` reads field 0;
+        // `parseInt` parses a `String`) stay JIT-eligible because they
+        // do not exercise the allocate-then-putfield sequence.
+        | ("java/lang/Integer", "valueOf")
+        | ("java/lang/Integer", "<init>")
+        | ("java/lang/Long", "valueOf")
+        | ("java/lang/Long", "<init>")
     )
 }
 
@@ -597,6 +615,10 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// NEW-1.2 CI gate: java/lang/* is no longer blanket-banned.
+    /// (W2-CHM narrowed `Integer.valueOf` / `<init>` and `Long.valueOf` /
+    /// `<init>` to targeted bans — see `is_known_miscompile` — so unrelated
+    /// `java/lang/*` methods like `String.indexOf` still demonstrate the
+    /// "no blanket ban" guarantee.)
     #[test]
     fn java_lang_is_jit_eligible_after_new_1_2() {
         assert_eq!(
@@ -605,9 +627,31 @@ mod tests {
             "java/lang/* must be JIT-eligible after NEW-1.2 (instanceof fix)"
         );
         assert_eq!(
-            check("java/lang/Integer", "valueOf", false, true, SkipPolicy::Conservative),
-            None
+            check("java/lang/Integer", "toString", false, true, SkipPolicy::Conservative),
+            None,
+            "Integer.toString stays JIT-eligible — only valueOf/<init> are skip-listed"
         );
+    }
+
+    /// W2-CHM CI gate: `Integer.valueOf` and `Integer.<init>` are skipped
+    /// under the conservative policy because the JIT miscompiles them
+    /// (Integer's value field reads back as 0 when allocated via the
+    /// allocate-then-putfield JIT sequence after the OSR + per-callee
+    /// invocation thresholds are crossed in the same outer frame).
+    /// `Long.valueOf` / `Long.<init>` are skipped by the same logic.
+    #[test]
+    fn integer_long_box_methods_skipped_under_conservative_policy() {
+        for (cls, mn) in [
+            ("java/lang/Integer", "valueOf"),
+            ("java/lang/Integer", "<init>"),
+            ("java/lang/Long", "valueOf"),
+            ("java/lang/Long", "<init>"),
+        ] {
+            assert!(
+                check(cls, mn, false, true, SkipPolicy::Conservative).is_some(),
+                "{cls}.{mn} must be skipped under Conservative policy (W2-CHM)"
+            );
+        }
     }
 
     /// NEW-1.2 CI gate: rustjvm/Tck* is no longer blanket-banned.

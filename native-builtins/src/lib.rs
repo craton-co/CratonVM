@@ -31,6 +31,10 @@ pub mod phases_late;
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
 // the loaded value instead of NPE.
 pub mod properties_sidetable;
+// Wave1-C: per-Thread UncaughtExceptionHandler side-table so
+// `Thread.setUncaughtExceptionHandler` actually has effect when the
+// thread terminates abruptly.
+pub mod uncaught_handlers;
 pub mod charset;
 pub mod panama;
 pub mod panama_libffi;
@@ -181,6 +185,16 @@ pub mod jboss_jdkspecific;
 // singleton + Logger registry (fixes KC26 ClassCastException where
 // LogManager.getLogManager() was returning a Class mirror).
 pub mod logmanager;
+// Block 2C: synthetic JBoss LogManager boot-log sink. Companion to
+// `logmanager.rs` — that one provides addLogger / getLogger /
+// readConfiguration; this one routes Logger.{info,warning,severe,log}
+// through to stderr + the file at `org.jboss.boot.log.file`. Required
+// so KC16 boot lines flow to disk even when the real JBoss-LogManager
+// JAR isn't on the classpath. See `class_manager.rs::jdk_superclass`
+// for the companion class-hierarchy fix that makes the synthetic
+// `org.jboss.logmanager.LogManager` extend `java.util.logging.LogManager`
+// so JDK's `LogManager.<clinit>` checkcast succeeds.
+pub mod jboss_logmanager;
 // T19.H5: AtomicReferenceFieldUpdater / AtomicIntegerFieldUpdater /
 // AtomicLongFieldUpdater `newUpdater` factories — unblock
 // `org.jboss.logmanager.ExtHandler.<clinit>` ClassCastException on
@@ -316,6 +330,7 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
+    eprintln!("[w3a2-lib] register_essential_natives ENTRY");
     let before = registry.len();
 
     // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
@@ -667,6 +682,34 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Wired here in `register_essential_natives` (universal) so the natives
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
+
+    // Wave3 — `java/lang/Module.canUse(Class)`. The real bytecode reads
+    // `this.descriptor` (a real-Module field that does not exist on our
+    // synthetic 2-field Module shape) and dereferences it, producing a
+    // NullPointer deep inside `ServiceLoader.checkCaller(Class, Class)`
+    // during `Console.instantiateConsole()` static-init. The override
+    // returns true (every module is treated as permissively
+    // `uses`-declared); null-receiver returns false; null service-class
+    // throws NPE per spec. Registered universally so both real-JDK and
+    // synthetic-jdk modes are protected — see vm/tests/wave3_console_module.rs.
+    registry.register(
+        "java/lang/Module",
+        "canUse",
+        "(Ljava/lang/Class;)Z",
+        |_ctx, args| {
+            match args.first() {
+                Some(Value::Object(Some(_))) => {}
+                _ => return Ok(Some(Value::Int(0))),
+            }
+            match args.get(1) {
+                Some(Value::Object(Some(_))) => Ok(Some(Value::Int(1))),
+                _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Module.canUse: service class is null".into()),
+                }
+                .into()),
+            }
+        },
+    );
 
     registry.register(
         "java/lang/String", "trim", "()Ljava/lang/String;",
@@ -3926,6 +3969,15 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
 
+    // Block 2C: synthetic JBoss LogManager boot-log sink. Routes
+    // Logger.{info,warning,severe,log} through to stderr + the file at
+    // `org.jboss.boot.log.file` so KC16 server.log gets the WildFly
+    // bootstrap-banner lines even when `jboss-logmanager-2.1.18.Final.jar`
+    // isn't loaded. Block 2A loads the real JAR (when present) and that
+    // path's bytecode-defined `Logger.log` wins over our native — the
+    // synthetic shim only fires when no Java method body exists.
+    jboss_logmanager::register_jboss_logmanager_natives(registry);
+
     // WP2.1: java.lang.reflect full coverage — net-new natives
     // (trySetAccessible, canAccess, getEnclosingClass, Parameter
     // helpers, Executable.getParameters, Method.is{VarArgs,Bridge,
@@ -5937,6 +5989,12 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // --- Phase 72: Preferences, Beans, JNDI, Datagram, HttpServer, ServerSocket extras ---
     register_phase72_natives(registry);
 
+    // Wave1-C: override the noop Thread.setUncaughtExceptionHandler /
+    // getUncaughtExceptionHandler from phase71 with a side-table-backed
+    // implementation so the handler actually fires when a thread
+    // terminates abruptly (consumed by vm_exec.rs::thread_start).
+    crate::uncaught_handlers::register_uncaught_handler_natives(registry);
+
     // --- NEW-15: Virtual threads / Loom (JEP 444 / 491) ---
     // Continuation, ContinuationScope, ForkJoinPool.commonPool.
     crate::phases_late::register_new15_loom(registry);
@@ -6091,6 +6149,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // do not silently win over the proper SPI implementation. Mirrors
     // the unconditional registration in `register_essential_natives`.
     jdbc::register_jdbc_driver_natives(registry);
+
+    // W3-A2 (Wave 3 Task A2): re-register `net_phase_e` AFTER every
+    // phase 50..72 so its real `Socket` / `ServerSocket` natives
+    // (backed by std::net::TcpStream / TcpListener through
+    // `s2_registry`, with ObjectRef-keyed side-tables to bypass
+    // synthetic-vs-real-JDK field-layout collisions) take precedence
+    // over the synthetic stubs registered earlier in
+    // `register_phase53_socket_stubs` and `register_p72_server_socket`.
+    // Without this re-registration, `new ServerSocket(0)` runs a stub
+    // that never binds, so `getLocalPort()` returns 0 and the loopback
+    // round-trip in SocketProbe fails immediately.
+    net_phase_e::register_phase_e_networking(registry);
 
     let after = registry.len();
     tracing::info!(count = after - before, "Registered synthetic overrides");

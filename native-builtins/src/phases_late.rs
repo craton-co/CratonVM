@@ -12452,6 +12452,10 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if can { 1 } else { 0 })))
     });
 
+    // Module.canUse(Class) is registered universally in
+    // `register_essential_natives` (lib.rs) so it is available in BOTH
+    // synthetic-jdk and real-JDK modes. See vm/tests/wave3_console_module.rs.
+
     // Module.addReads(Module) → Module (returns this)
     // Adds a dynamic read edge in the ModuleRegistry.
     r.register(
@@ -34873,238 +34877,30 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
-    // ServerSocket extras — add methods not registered in phase 53
-    let ss = "java/net/ServerSocket";
-    r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let port = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 0,
-        };
-        let backlog = match args.get(2) {
-            Some(Value::Int(i)) => *i,
-            _ => 50,
-        };
-        ctx.set_field(this, 0, Value::Int(port));
-        ctx.set_field(this, 1, Value::Int(backlog));
-        ctx.set_field(this, 2, Value::Int(0));
-        Ok(None)
-    });
-    r.register(ss, "accept", "()Ljava/net/Socket;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let _ = (ctx, this);
-        Ok(None)
-    });
-    r.register(ss, "bind", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(Value::Int(backlog)) = args.get(2) {
-            ctx.set_field(this, 1, Value::Int(*backlog));
-        }
-        Ok(None)
-    });
-    r.register(ss, "isBound", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-    r.register(
-        ss,
-        "getInetAddress",
-        "()Ljava/net/InetAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        ss,
-        "getLocalSocketAddress",
-        "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(ss, "getSoTimeout", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    // ServerSocket setReuseAddress/setReceiveBufferSize: use real socket options
-    // Note: ServerSocket doesn't always have a stream_id, so we track these as fields if needed
-    // For now, these are kept as field-tracking stubs since ServerSocket doesn't expose
-    // the underlying listener to socket2 in the same way as Socket.
-    // Real implementations exist in phases_early.rs for Socket; ServerSocket is less critical.
-    r.register(ss, "implAccept", "(Ljava/net/Socket;)V", |ctx, args| {
-        // Accept a connection on the underlying TcpListener and populate the given
-        // Socket object's stream_id field. This is the JDK-internal hook called by
-        // ServerSocket.accept() to delegate the actual blocking accept.
-        use crate::servlet::{s2_registry, s2_alloc_stream};
-        let this = obj_arg(args, 0)?;
-        let target_socket = match args.get(1) {
-            Some(Value::Object(Some(s))) => *s,
-            _ => return Err(RuntimeError::IOException {
-                message: "implAccept: null socket".into(),
-            }
-            .into()),
-        };
-        let listener_id = ctx.get_field(this, 3).as_int().unwrap_or(-1); // SS_LISTENER_ID
-        if listener_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "ServerSocket not bound".into(),
-            }
-            .into());
-        }
-        // Block-accept via the s2_registry. Take the listener out, accept on it, put it back.
-        let stream = {
-            let mut reg = s2_registry().lock();
-            let listener = reg.listeners.get(&listener_id).ok_or_else(|| {
-                RuntimeError::IOException {
-                    message: "Listener not found".into(),
-                }
-            })?;
-            match listener.accept() {
-                Ok((stream, _addr)) => stream,
-                Err(e) => return Err(RuntimeError::IOException {
-                    message: format!("accept failed: {}", e),
-                }
-                .into()),
-            }
-        };
-        let stream_id = s2_alloc_stream(stream);
-        // Populate the target Socket's fields. Socket layout: host=0, port=1, localPort=2, closed=3, stream_id=4
-        ctx.set_field(target_socket, 3, Value::Int(0)); // not closed
-        ctx.set_field(target_socket, 4, Value::Int(stream_id));
-        Ok(None)
-    });
+    // W3-A2: ServerSocket / Socket public-API methods are owned by
+    // `native-builtins/src/net_phase_e.rs::register_re1_socket /
+    // register_re2_server_socket`, which uses real OS sockets via
+    // `s2_registry` and ObjectRef-keyed side-tables to bypass the
+    // synthetic-vs-real-JDK field-layout collision.  The stubs that
+    // formerly lived here pre-dated phase E and now collide with it
+    // (registry is last-writer-wins).  We retain only the implAccept
+    // bridge below, which phase E does not register.
+    let _ss = "java/net/ServerSocket";
+    // implAccept is unused: net_phase_e overrides `accept()` at the public
+    // API level, so the bytecode that would have called implAccept never
+    // runs.  Removing the stub here also avoids reading `field 3` which
+    // collides with the real-JDK `closed:boolean` field.
 
-    // Socket extras — add methods not registered in phase 53
+    // W3-A2: Socket / ServerSocket public-API natives are owned by
+    // `net_phase_e::register_re1_socket / register_re2_server_socket`.
+    // Stubs that previously stored host/port directly in synthetic field
+    // slots collide with the real-JDK class layout (slot 0 != host on
+    // JDK 25's `Socket`).  Side-tables in net_phase_e make state
+    // layout-independent.  We keep only the secondary Socket extras
+    // below (shutdown, OOB, performance prefs) which net_phase_e doesn't
+    // touch and which are gated on `field 4` only when the side-table-
+    // driven phase E has already populated it.
     let sock = "java/net/Socket";
-    r.register(sock, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        let port = match args.get(2) {
-            Some(Value::Int(i)) => *i,
-            _ => 0,
-        };
-        ctx.set_field(this, 1, Value::Int(port));
-        ctx.set_field(this, 2, Value::Int(0));
-        ctx.set_field(this, 3, Value::Int(0));
-        Ok(None)
-    });
-    // Socket.bind(SocketAddress) — store the local address.
-    // SocketAddress (InetSocketAddress) field layout: 0=host String, 1=port Int.
-    r.register(sock, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(Value::Object(Some(sa))) = args.get(1) {
-            // Store local port in field 2 (localPort)
-            let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-            ctx.set_field(this, 2, Value::Int(port));
-        }
-        Ok(None)
-    });
-    // Socket.connect(SocketAddress) — extract host/port, connect via std::net::TcpStream.
-    r.register(sock, "connect", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let (host, port) = match args.get(1) {
-            Some(Value::Object(Some(sa))) => {
-                let host = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                    _ => "127.0.0.1".into(),
-                };
-                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (host, port)
-            }
-            _ => return Err(RuntimeError::IOException {
-                message: "Socket.connect: null address".into(),
-            }.into()),
-        };
-        // Connect and register in s2_registry
-        use crate::servlet::{s2_registry, s2_alloc_stream};
-        let addr = format!("{}:{}", host, port);
-        match std::net::TcpStream::connect(&addr) {
-            Ok(stream) => {
-                let stream_id = s2_alloc_stream(stream);
-                // Store host, port, stream_id in Socket fields
-                let host_s = ctx.create_string(&host);
-                ctx.set_field(this, 0, Value::Object(Some(host_s)));
-                ctx.set_field(this, 1, Value::Int(port));
-                ctx.set_field(this, 3, Value::Int(0)); // not closed
-                ctx.set_field(this, 4, Value::Int(stream_id));
-                Ok(None)
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("Socket.connect failed: {}", e),
-            }.into()),
-        }
-    });
-    // Socket.connect(SocketAddress, int timeout)
-    r.register(sock, "connect", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let (host, port) = match args.get(1) {
-            Some(Value::Object(Some(sa))) => {
-                let host = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                    _ => "127.0.0.1".into(),
-                };
-                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (host, port)
-            }
-            _ => return Err(RuntimeError::IOException {
-                message: "Socket.connect: null address".into(),
-            }.into()),
-        };
-        let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        use crate::servlet::{s2_registry, s2_alloc_stream};
-        let addr = format!("{}:{}", host, port);
-        let result = if timeout_ms > 0 {
-            // Resolve address and use connect_timeout
-            match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
-                Ok(mut iter) => match iter.next() {
-                    Some(sock_addr) => std::net::TcpStream::connect_timeout(
-                        &sock_addr,
-                        std::time::Duration::from_millis(timeout_ms.max(0) as u64),
-                    ),
-                    None => Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address")),
-                },
-                Err(e) => Err(e),
-            }
-        } else {
-            std::net::TcpStream::connect(&addr)
-        };
-        match result {
-            Ok(stream) => {
-                let stream_id = s2_alloc_stream(stream);
-                let host_s = ctx.create_string(&host);
-                ctx.set_field(this, 0, Value::Object(Some(host_s)));
-                ctx.set_field(this, 1, Value::Int(port));
-                ctx.set_field(this, 3, Value::Int(0));
-                ctx.set_field(this, 4, Value::Int(stream_id));
-                Ok(None)
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("Socket.connect failed: {}", e),
-            }.into()),
-        }
-    });
-    r.register(
-        sock,
-        "getLocalAddress",
-        "()Ljava/net/InetAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        sock,
-        "getLocalSocketAddress",
-        "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        sock,
-        "getRemoteSocketAddress",
-        "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(sock, "isInputShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(sock, "isOutputShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(sock, "isBound", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    });
     // Socket options (setReuseAddress, setSoLinger, set/getReceiveBufferSize,
     // set/getSendBufferSize, getTcpNoDelay, getKeepAlive, getInputStream, getOutputStream)
     // are registered with REAL implementations in phases_early.rs — not re-registered here.

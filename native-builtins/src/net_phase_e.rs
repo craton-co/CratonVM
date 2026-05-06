@@ -65,6 +65,99 @@ const SS_BACKLOG: usize = 1;
 const SS_CLOSED: usize = 2;
 const SS_LISTENER_ID: usize = 3;
 
+// ---------------------------------------------------------------------------
+// W3-A2 side-tables — bypass the synthetic-vs-real-JDK field-layout
+// collision by storing Socket / ServerSocket state in process-wide HashMaps
+// keyed by ObjectRef. Synthetic field slots collide with real-JDK private
+// fields (e.g. real `ServerSocket` slot 0 is `boolean created`, not the int
+// port we write through SS_PORT=0). Side-tables are independent of layout.
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct SockSide {
+    pub host_id: i32,        // unused (we still keep `SOCK_HOST` in field for getInetAddress)
+    pub port: i32,
+    pub local_port: i32,
+    pub closed: i32,
+    pub stream_id: i32,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct SsSide {
+    pub port: i32,
+    pub backlog: i32,
+    pub closed: i32,
+    pub listener_id: i32,
+}
+
+fn sock_side_table() -> &'static Mutex<HashMap<ObjectRef, SockSide>> {
+    static T: OnceLock<Mutex<HashMap<ObjectRef, SockSide>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ss_side_table() -> &'static Mutex<HashMap<ObjectRef, SsSide>> {
+    static T: OnceLock<Mutex<HashMap<ObjectRef, SsSide>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sock_get(this: ObjectRef) -> SockSide {
+    let t = sock_side_table().lock();
+    t.get(&this).copied().unwrap_or(SockSide {
+        host_id: 0,
+        port: 0,
+        local_port: 0,
+        closed: 0,
+        stream_id: -1,
+    })
+}
+
+fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
+    let mut t = sock_side_table().lock();
+    let entry = t.entry(this).or_insert(SockSide {
+        host_id: 0,
+        port: 0,
+        local_port: 0,
+        closed: 0,
+        stream_id: -1,
+    });
+    f(entry);
+}
+
+fn ss_get(this: ObjectRef) -> SsSide {
+    let t = ss_side_table().lock();
+    t.get(&this).copied().unwrap_or(SsSide {
+        port: -1,
+        backlog: 50,
+        closed: 0,
+        listener_id: -1,
+    })
+}
+
+fn ss_set<F: FnOnce(&mut SsSide)>(this: ObjectRef, f: F) {
+    let mut t = ss_side_table().lock();
+    let entry = t.entry(this).or_insert(SsSide {
+        port: -1,
+        backlog: 50,
+        closed: 0,
+        listener_id: -1,
+    });
+    f(entry);
+}
+
+// Map Socket$SocketInputStream / Socket$SocketOutputStream synthetic
+// instance -> owner Socket. The real-JDK inner classes have their own
+// fields (`parent`, `in`/`out`); we cannot use raw slot indices safely.
+fn stream_owner_table() -> &'static Mutex<HashMap<ObjectRef, ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<ObjectRef, ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn stream_owner_set(stream: ObjectRef, owner: ObjectRef) {
+    stream_owner_table().lock().insert(stream, owner);
+}
+fn stream_owner_get(stream: ObjectRef) -> Option<ObjectRef> {
+    stream_owner_table().lock().get(&stream).copied()
+}
+
 const SEL_OPEN: usize = 0;
 
 const HS_ADDRESS: usize = 0;
@@ -241,6 +334,8 @@ fn hostname_string() -> String {
 // ---------------------------------------------------------------------------
 
 pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
+    println!("[w3a2] register_phase_e_networking called STDOUT");
+    eprintln!("[w3a2] register_phase_e_networking called STDERR");
     register_re1_socket(registry);
     register_re2_server_socket(registry);
     register_re3_inet_address(registry);
@@ -279,7 +374,7 @@ fn re1_socket_read_stream(
             "read out of range: off={off} len={ln} cap={cap}"
         )));
     }
-    let stream_id = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+    let stream_id = sock_get(this).stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
@@ -312,7 +407,7 @@ fn re1_socket_write_stream(
         return Ok(None);
     }
     let data = java_byte_array_to_vec(ctx, buf, offset, length)?;
-    let stream_id = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+    let stream_id = sock_get(this).stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
@@ -324,6 +419,9 @@ fn re1_socket_write_stream(
     stream
         .write_all(&data)
         .map_err(|e| ioex(format!("Socket write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| ioex(format!("Socket flush failed: {e}")))?;
     Ok(None)
 }
 
@@ -349,10 +447,12 @@ fn re1_connect_socket(
     let stream_id = s2_alloc_stream(stream);
     let host_str = ctx.create_string(host);
     ctx.set_field(this, SOCK_HOST, Value::Object(Some(host_str)));
-    ctx.set_field(this, SOCK_PORT, Value::Int(port));
-    ctx.set_field(this, SOCK_LOCAL_PORT, Value::Int(local_port));
-    ctx.set_field(this, SOCK_CLOSED, Value::Int(0));
-    ctx.set_field(this, SOCK_STREAM_ID, Value::Int(stream_id));
+    sock_set(this, |s| {
+        s.port = port;
+        s.local_port = local_port;
+        s.closed = 0;
+        s.stream_id = stream_id;
+    });
     Ok(None)
 }
 
@@ -362,10 +462,12 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sock, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, SOCK_HOST, Value::Object(None));
-        ctx.set_field(this, SOCK_PORT, Value::Int(0));
-        ctx.set_field(this, SOCK_LOCAL_PORT, Value::Int(0));
-        ctx.set_field(this, SOCK_CLOSED, Value::Int(0));
-        ctx.set_field(this, SOCK_STREAM_ID, Value::Int(-1));
+        sock_set(this, |s| {
+            s.port = 0;
+            s.local_port = 0;
+            s.closed = 0;
+            s.stream_id = -1;
+        });
         Ok(None)
     });
 
@@ -426,40 +528,40 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(sa))) = args.get(1) {
             let (_, port) = read_inet_socket_address(ctx, *sa)?;
-            ctx.set_field(this, SOCK_LOCAL_PORT, Value::Int(port));
+            sock_set(this, |s| s.local_port = port);
         }
         Ok(None)
     });
 
-    r.register(sock, "isConnected", "()Z", |ctx, args| {
+    r.register(sock, "isConnected", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
-        let closed = ctx.get_field(this, SOCK_CLOSED).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if sid >= 0 && closed == 0 { 1 } else { 0 })))
+        let s = sock_get(this);
+        Ok(Some(Value::Int(if s.stream_id >= 0 && s.closed == 0 { 1 } else { 0 })))
     });
-    r.register(sock, "isClosed", "()Z", |ctx, args| {
+    r.register(sock, "isClosed", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = ctx.get_field(this, SOCK_CLOSED).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if closed != 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if sock_get(this).closed != 0 { 1 } else { 0 })))
     });
 
-    r.register(sock, "close", "()V", |ctx, args| {
+    r.register(sock, "close", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+        let sid = sock_get(this).stream_id;
         if sid >= 0 {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.remove(&sid) {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
-        ctx.set_field(this, SOCK_STREAM_ID, Value::Int(-1));
-        ctx.set_field(this, SOCK_CLOSED, Value::Int(1));
+        sock_set(this, |s| {
+            s.stream_id = -1;
+            s.closed = 1;
+        });
         Ok(None)
     });
 
-    r.register(sock, "shutdownInput", "()V", |ctx, args| {
+    r.register(sock, "shutdownInput", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+        let sid = sock_get(this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
@@ -470,9 +572,9 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(sock, "shutdownOutput", "()V", |ctx, args| {
+    r.register(sock, "shutdownOutput", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+        let sid = sock_get(this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
@@ -484,13 +586,13 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(sock, "setSoTimeout", "(I)V", |ctx, args| {
+    r.register(sock, "setSoTimeout", "(I)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
-        let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+        let sid = sock_get(this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
@@ -503,13 +605,13 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(sock, "getPort", "()I", |ctx, args| {
+    r.register(sock, "getPort", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SOCK_PORT)))
+        Ok(Some(Value::Int(sock_get(this).port)))
     });
-    r.register(sock, "getLocalPort", "()I", |ctx, args| {
+    r.register(sock, "getLocalPort", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SOCK_LOCAL_PORT)))
+        Ok(Some(Value::Int(sock_get(this).local_port)))
     });
     r.register(
         sock,
@@ -535,14 +637,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+            let sid = sock_get(this).stream_id;
             if sid < 0 {
                 return Err(ioex("Socket.getInputStream: not connected"));
             }
             let is = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3);
-            ctx.set_field(is, 0, Value::Object(Some(this)));
-            ctx.set_field(is, 1, Value::Int(sid));
-            ctx.set_field(is, 2, Value::Int(0));
+            // Side-table the stream's owner+sid so we don't depend on field
+            // layout (real `Socket$SocketInputStream` has different fields
+            // than the synthetic shape: `parent:Socket`, `in:InputStream`).
+            stream_owner_set(is, this);
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -552,14 +655,12 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
+            let sid = sock_get(this).stream_id;
             if sid < 0 {
                 return Err(ioex("Socket.getOutputStream: not connected"));
             }
             let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
-            ctx.set_field(os, 0, Value::Object(Some(this)));
-            ctx.set_field(os, 1, Value::Int(sid));
-            ctx.set_field(os, 2, Value::Int(0));
+            stream_owner_set(os, this);
             Ok(Some(Value::Object(Some(os))))
         },
     );
@@ -567,10 +668,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     let sis = "java/net/Socket$SocketInputStream";
     r.register(sis, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => o,
-            _ => return Err(ioex("SocketInputStream has no owner")),
-        };
+        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -578,10 +676,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => o,
-            _ => return Err(ioex("SocketInputStream has no owner")),
-        };
+        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
         match r {
@@ -594,15 +689,17 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
     });
     r.register(sis, "close", "()V", |_ctx, _args| Ok(None));
-    r.register(sis, "available", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(sis, "available", "()I", |_ctx, args| {
+        // Real BufferedReader.readLine asks via available()? No — it calls
+        // read() which blocks. Returning 0 (no peek-ahead) is fine.
+        let _ = args;
+        Ok(Some(Value::Int(0)))
+    });
 
     let sos = "java/net/Socket$SocketOutputStream";
     r.register(sos, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => o,
-            _ => return Err(ioex("SocketOutputStream has no owner")),
-        };
+        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -610,24 +707,23 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(sos, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => o,
-            _ => return Err(ioex("SocketOutputStream has no owner")),
-        };
+        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) & 0xff;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         ctx.set_array_element(one, 0, Value::Int(b as i8 as i32));
         re1_socket_write_stream(ctx, owner, one, 0, 1)
     });
-    r.register(sos, "flush", "()V", |ctx, args| {
+    r.register(sos, "flush", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = ctx.get_field(this, 1).as_int().unwrap_or(-1);
-        if sid >= 0 {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                stream
-                    .flush()
-                    .map_err(|e| ioex(format!("flush failed: {e}")))?;
+        if let Some(owner) = stream_owner_get(this) {
+            let sid = sock_get(owner).stream_id;
+            if sid >= 0 {
+                let mut reg = s2_registry().lock();
+                if let Some(stream) = reg.streams.get_mut(&sid) {
+                    stream
+                        .flush()
+                        .map_err(|e| ioex(format!("flush failed: {e}")))?;
+                }
             }
         }
         Ok(None)
@@ -708,15 +804,17 @@ fn re2_accept_into(
     let stream_id = s2_alloc_stream(stream);
     let host_str = ctx.create_string(&peer_ip);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
-    ctx.set_field(target, SOCK_PORT, Value::Int(peer_port));
-    ctx.set_field(target, SOCK_LOCAL_PORT, Value::Int(local_port));
-    ctx.set_field(target, SOCK_CLOSED, Value::Int(0));
-    ctx.set_field(target, SOCK_STREAM_ID, Value::Int(stream_id));
+    sock_set(target, |s| {
+        s.port = peer_port;
+        s.local_port = local_port;
+        s.closed = 0;
+        s.stream_id = stream_id;
+    });
     Ok(Some(Value::Object(Some(target))))
 }
 
 fn re2_bind_listener(
-    ctx: &mut dyn NativeContext,
+    _ctx: &mut dyn NativeContext,
     this: ObjectRef,
     host: &str,
     port: i32,
@@ -728,29 +826,41 @@ fn re2_bind_listener(
         .map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
     let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(port);
     let listener_id = s2_alloc_listener(listener);
-    ctx.set_field(this, SS_PORT, Value::Int(actual_port));
-    ctx.set_field(this, SS_BACKLOG, Value::Int(backlog.max(0)));
-    ctx.set_field(this, SS_CLOSED, Value::Int(0));
-    ctx.set_field(this, SS_LISTENER_ID, Value::Int(listener_id));
+    ss_set(this, |s| {
+        s.port = actual_port;
+        s.backlog = backlog.max(0);
+        s.closed = 0;
+        s.listener_id = listener_id;
+    });
     Ok(None)
 }
 
 fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     let ss = "java/net/ServerSocket";
 
-    r.register(ss, "<init>", "()V", |ctx, args| {
+    r.register(ss, "<init>", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, SS_PORT, Value::Int(-1));
-        ctx.set_field(this, SS_BACKLOG, Value::Int(50));
-        ctx.set_field(this, SS_CLOSED, Value::Int(0));
-        ctx.set_field(this, SS_LISTENER_ID, Value::Int(-1));
+        ss_set(this, |s| {
+            s.port = -1;
+            s.backlog = 50;
+            s.closed = 0;
+            s.listener_id = -1;
+        });
         Ok(None)
     });
 
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        eprintln!("[w3a2] ServerSocket <init>(I)V port={port}");
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
+    });
+
+    r.register(ss, "getLocalPort", "()I", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let p = ss_get(this).port;
+        eprintln!("[w3a2] ServerSocket.getLocalPort -> {p}");
+        Ok(Some(Value::Int(p)))
     });
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
@@ -768,14 +878,17 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(ia))) => read_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
             _ => "0.0.0.0".to_string(),
         };
-        re2_bind_listener(ctx, this, &host, port, backlog)
+        eprintln!("[w3a2] ServerSocket <init>(IILjava/net/InetAddress;)V port={port} backlog={backlog} host={host}");
+        let r = re2_bind_listener(ctx, this, &host, port, backlog);
+        eprintln!("[w3a2]   ss_get(this).port = {}", ss_get(this).port);
+        r
     });
 
     r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
         let (host, port) = read_inet_socket_address(ctx, sa)?;
-        let backlog = ctx.get_field(this, SS_BACKLOG).as_int().unwrap_or(50);
+        let backlog = ss_get(this).backlog;
         re2_bind_listener(ctx, this, &host, port, backlog)
     });
     r.register(ss, "bind", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
@@ -786,64 +899,63 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         re2_bind_listener(ctx, this, &host, port, backlog)
     });
 
-    r.register(ss, "getLocalPort", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SS_PORT)))
-    });
-
     r.register(ss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = ctx.get_field(this, SS_CLOSED).as_int().unwrap_or(0);
-        if closed != 0 {
+        let s = ss_get(this);
+        if s.closed != 0 {
             return Err(ioex("Socket is closed"));
         }
-        let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        let lid = s.listener_id;
         let timeout_ms = re2_accept_timeout_for(lid);
         let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
         ctx.set_field(sock, SOCK_HOST, Value::Object(None));
-        ctx.set_field(sock, SOCK_PORT, Value::Int(0));
-        ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(0));
-        ctx.set_field(sock, SOCK_CLOSED, Value::Int(0));
-        ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(-1));
+        sock_set(sock, |x| {
+            x.port = 0;
+            x.local_port = 0;
+            x.closed = 0;
+            x.stream_id = -1;
+        });
         re2_accept_into(ctx, lid, sock, timeout_ms)
     });
 
-    r.register(ss, "setSoTimeout", "(I)V", |ctx, args| {
+    r.register(ss, "setSoTimeout", "(I)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
-        let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        let lid = ss_get(this).listener_id;
         re2_set_accept_timeout(lid, ms);
         Ok(None)
     });
-    r.register(ss, "getSoTimeout", "()I", |ctx, args| {
+    r.register(ss, "getSoTimeout", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        let lid = ss_get(this).listener_id;
         Ok(Some(Value::Int(re2_accept_timeout_for(lid))))
     });
 
-    r.register(ss, "close", "()V", |ctx, args| {
+    r.register(ss, "close", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        let lid = ss_get(this).listener_id;
         if lid >= 0 {
             s2_registry().lock().listeners.remove(&lid);
             re2_clear_accept_timeout(lid);
         }
-        ctx.set_field(this, SS_CLOSED, Value::Int(1));
-        ctx.set_field(this, SS_LISTENER_ID, Value::Int(-1));
+        ss_set(this, |s| {
+            s.closed = 1;
+            s.listener_id = -1;
+        });
         Ok(None)
     });
 
-    r.register(ss, "isBound", "()Z", |ctx, args| {
+    r.register(ss, "isBound", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        let lid = ss_get(this).listener_id;
         Ok(Some(Value::Int(if lid >= 0 { 1 } else { 0 })))
     });
-    r.register(ss, "isClosed", "()Z", |ctx, args| {
+    r.register(ss, "isClosed", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SS_CLOSED)))
+        Ok(Some(Value::Int(ss_get(this).closed)))
     });
 
     r.register(
@@ -852,7 +964,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+            let lid = ss_get(this).listener_id;
             if lid < 0 {
                 return Ok(Some(Value::Object(None)));
             }
@@ -1991,10 +2103,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let host_s = ctx.create_string(&host);
             ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_s)));
-            ctx.set_field(sock, SOCK_PORT, Value::Int(port));
-            ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(0));
-            ctx.set_field(sock, SOCK_CLOSED, Value::Int(0));
-            ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(id));
+            sock_set(sock, |s| {
+                s.port = port;
+                s.local_port = 0;
+                s.closed = 0;
+                s.stream_id = id;
+            });
             Ok(Some(Value::Object(Some(sock))))
         },
     );

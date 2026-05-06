@@ -28,7 +28,7 @@ on:
     branches: [main]
     paths:
       - 'bench/**'
-      - '.github/workflows/forcing-function-smoke.yml'
+      - '/forcing-function-smoke.yml'
 
 env:
   CARGO_TERM_COLOR: always

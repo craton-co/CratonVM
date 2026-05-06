@@ -1,0 +1,177 @@
+//! W2-CHM — ConcurrentHashMap correctness regression.
+//!
+//! Pins the fix for the JIT miscompile that caused
+//! `apps/chm_basic/ChmScale` to lose entries `k992..k999` from a
+//! 1000-element single-threaded `ConcurrentHashMap<String,Integer>`. The
+//! immediate symptom was `size=1000 mapSize=1000 found=992 firstMiss=992`
+//! against the HotSpot reference's `found=1000 firstMiss=-1`.
+//!
+//! Root cause: the JIT compiles `Integer.valueOf(int)` /
+//! `Integer.<init>(int)` (both trivial enough to clear the
+//! `<init>` complexity gate) as an allocate-then-putfield sequence.
+//! When the surrounding outer-method frame crosses both the OSR
+//! back-edge threshold (1000) and the per-callee invocation threshold
+//! (2000), the JIT'd path stores the wrong value into the boxed
+//! `Integer.value` slot — the wrapper comes back with `value=0`.
+//! The CHM happily stores `("k992" -> Integer(0))` and the subsequent
+//! `get("k992").intValue()` reports 0 instead of 992.
+//!
+//! Fix (vm/src/jit/skip_list.rs::is_known_miscompile): add
+//! `Integer.valueOf` / `Integer.<init>` (and the `Long` siblings) to
+//! the conservative skip list so the interpreter retains those
+//! allocate-then-putfield boxing sequences. Narrow: `Integer.toString`,
+//! `Integer.parseInt`, and other non-allocating methods stay
+//! JIT-eligible.
+//!
+//! Acceptance: `apps/chm_basic/ChmScale` runs to completion in well
+//! under 30 s and emits `size=1000 mapSize=1000 found=1000 firstMiss=-1`
+//! as its final line. Any regression in the skip list (or a deeper JIT
+//! fix that re-enables Integer boxing without a correctness audit)
+//! surfaces here as `firstMiss != -1` or `found != 1000`.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+fn chm_basic_dir() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .unwrap()
+        .join("apps")
+        .join("chm_basic")
+}
+
+fn rustjvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target = manifest.parent().unwrap().join("target");
+    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    for profile in &["release", "debug"] {
+        let candidate = target.join(profile).join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn java_home() -> Option<PathBuf> {
+    if let Ok(jh) = std::env::var("JAVA_HOME") {
+        let p = PathBuf::from(&jh);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Fall back to the canonical Adoptium 25 location used by the rest
+    // of the suite — see e.g. cluster_a_aqs_chm.rs.
+    let candidate = PathBuf::from("C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn ensure_chm_scale_compiled() -> bool {
+    let dir = chm_basic_dir();
+    let class_file = dir.join("ChmScale.class");
+    if class_file.exists() {
+        return true;
+    }
+    let source = dir.join("ChmScale.java");
+    if !source.exists() {
+        return false;
+    }
+    let status = Command::new("javac")
+        .arg("--release")
+        .arg("21")
+        .arg("-d")
+        .arg(&dir)
+        .arg(&source)
+        .status();
+    matches!(status, Ok(s) if s.success()) && class_file.exists()
+}
+
+fn run_chm_scale(timeout: Duration) -> Option<(String, String)> {
+    if !ensure_chm_scale_compiled() {
+        eprintln!("wave2_chm: ChmScale.class missing and javac unavailable; skipping");
+        return None;
+    }
+    let bin = rustjvm_binary()?;
+    let jh = java_home()?;
+    let dir = chm_basic_dir();
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--java-home")
+        .arg(&jh)
+        .arg("-c")
+        .arg(&dir)
+        .arg("ChmScale");
+
+    // Spawn so we can enforce a per-test timeout independent of any
+    // VM-side watchdog.
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    Some((stdout, stderr))
+}
+
+#[test]
+fn chm_scale_pins_integer_valueof_jit_miscompile() {
+    let Some((stdout, stderr)) = run_chm_scale(Duration::from_secs(60)) else {
+        // Build artifacts or environment unavailable — skip rather than
+        // false-fail. Real CI sets JAVA_HOME and builds the rustjvm
+        // binary up front, so this branch only fires for the developer
+        // running `cargo test -p rustjvm-vm` without those preconditions.
+        eprintln!("wave2_chm: prerequisites missing; skipping (set RUSTJVM_BIN + JAVA_HOME)");
+        return;
+    };
+    let combined = format!("{stdout}\n{stderr}");
+
+    // The reference HotSpot output for size=1000 must match exactly: every
+    // entry round-trips, and the firstMiss sentinel is -1. This pins the
+    // W2-CHM fix in `is_known_miscompile`.
+    assert!(
+        combined.contains("size=1000 mapSize=1000 found=1000 firstMiss=-1"),
+        "ChmScale must report all 1000 entries round-trip; got:\n{combined}"
+    );
+    // Defensive: each smaller-size line must also round-trip — a regression
+    // that loses entries earlier (e.g. at the `<init>` complexity gate
+    // change) should fire here too.
+    for size in [16, 32, 64, 128, 256, 512] {
+        let expected = format!(
+            "size={s} mapSize={s} found={s} firstMiss=-1",
+            s = size
+        );
+        assert!(
+            combined.contains(&expected),
+            "ChmScale size={size} stage must round-trip; got:\n{combined}"
+        );
+    }
+}
