@@ -69,8 +69,8 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactValue, ObjectRef, Value};
 use crate::vm::{
     create_java_string, ensure_class_initialized_shared, get_or_create_class_mirror,
-    get_static_shared, invoke_on_class_shared, invoke_or_native, invoke_shared, set_static_shared,
-    SharedVm,
+    get_static_shared, invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string,
+    set_static_shared, SharedVm,
 };
 
 // ---------------------------------------------------------------------------
@@ -1043,6 +1043,16 @@ pub fn execute(
     if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
         eprintln!("[interpreter::execute] class_id={:?} method={} desc={} args.len={}",
                   class_id, method_name, method_descriptor, args.len());
+    }
+    // RUSTJVM_IAE_TRACE: log args when executing AnnotationScopeMetadataResolver.<init>
+    if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+        let class_name_for_trace = shared.class_manager.read()
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        if class_name_for_trace.contains("AnnotationScopeMetadataResolver") && method_name == "<init>" {
+            eprintln!("[execute] {}.{}{} args={:?}", class_name_for_trace, method_name, method_descriptor, args);
+        }
     }
     // Find the method
     //
@@ -5878,6 +5888,39 @@ fn execute_instruction(
             let exc_value = thread.frames[frame_idx].stack.pop()?;
             match exc_value {
                 Value::Object(Some(obj_ref)) => {
+                    // S111r19+: trace IAE thrown from Java bytecode (ATHROW opcode)
+                    // This catches IAEs that don't go through throw_runtime_error,
+                    // e.g. Spring's Assert.notNull / validateBeanDefinition etc.
+                    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(exc_class_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        if exc_class_name.contains("IllegalArgumentException") {
+                            // Try to read the detail message (field 0 = detailMessage)
+                            let msg = match shared.heap.get_field(obj_ref, 0) {
+                                Value::Object(Some(msg_ref)) => {
+                                    read_java_string(&shared.heap, msg_ref)
+                                        .unwrap_or_else(|| "<non-string>".to_string())
+                                }
+                                Value::Object(None) => "<null message>".to_string(),
+                                _ => "<no message field>".to_string(),
+                            };
+                            eprintln!("IAE-ATHROW class={exc_class_name} message={msg:?}");
+                            for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                                let cn = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(f.class_id)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_default();
+                                eprintln!("IAE-ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                            }
+                        }
+                    }
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
                 }
                 Value::Object(None) => {
@@ -11959,6 +12002,12 @@ fn pop_object_ref_ctx(
             }
         }
         other => {
+            if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+                eprintln!("[pop_object_ref] ERROR: expected object reference, got {other}");
+                // Print a Rust backtrace to identify the calling opcode handler
+                let bt = std::backtrace::Backtrace::capture();
+                eprintln!("[pop_object_ref] Rust backtrace:\n{bt}");
+            }
             Err(VmError::Internal {
                 message: format!("expected object reference, got {other}"),
             }

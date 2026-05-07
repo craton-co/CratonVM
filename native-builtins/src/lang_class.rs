@@ -3074,6 +3074,11 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     let is_init = method_name == "<init>";
     let use_virtual_dispatch = !is_static && !is_private && !is_init;
 
+    let iae_trace = std::env::var_os("RUSTJVM_IAE_TRACE").is_some();
+    if iae_trace {
+        eprintln!("[Method.invoke] about to invoke: class={} method={} desc={} is_static={} use_virtual={}",
+                  class_name, method_name, descriptor, is_static, use_virtual_dispatch);
+    }
     let result = if use_virtual_dispatch {
         // invoke_virtual takes the receiver separately and prepends it.
         // We already pushed receiver as invoke_args[0]; strip it for the
@@ -4828,7 +4833,13 @@ fn create_annotation_proxy(
             ann_class_id_opt = Some(cid);
             let mirror = ctx.get_class_mirror(cid);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
+        } else if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+            eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} — type mirror NOT set (class load failed)",
+                ann.type_descriptor, ann.type_descriptor);
         }
+    } else if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+        eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} — annotation_desc_to_class_name returned None",
+            ann.type_descriptor);
     }
 
     // Collect explicit elements with their declared return-type descriptor
@@ -4969,6 +4980,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // the wrong switch case, surfacing as `IllegalArgumentException`
             // wrapped at `ConfigurationClassParser.parse:181`.  Load the
             // class on demand, mirroring the sibling `Class` arm (C29).
+            let iae_trace = std::env::var("RUSTJVM_IAE_TRACE").is_ok();
             let enum_cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
                 let _ = ctx.load_class(class_name);
                 ctx.class_id_by_name(class_name)
@@ -4976,16 +4988,25 @@ pub(crate) fn annotation_element_to_java_typed(
             if let Some(enum_cid) = enum_cid_opt {
                 let class_mirror = ctx.get_class_mirror(enum_cid);
                 let name_str = ctx.create_string(const_name);
-                if let Ok(Some(val)) = ctx.invoke(
+                let invoke_res = ctx.invoke(
                     "java/lang/Enum",
                     "valueOf",
                     "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
                     &[Value::Object(Some(class_mirror)), Value::Object(Some(name_str))],
-                ) {
+                );
+                if iae_trace {
+                    eprintln!("ANN-ENUM class={class_name} const={const_name} ok={}", invoke_res.as_ref().map(|v| v.is_some()).unwrap_or(false));
+                }
+                if let Ok(Some(val)) = invoke_res {
                     return val;
                 }
+            } else if iae_trace {
+                eprintln!("ANN-ENUM class={class_name} const={const_name} CLASS-NOT-FOUND");
             }
             // Fallback: allocate a synthetic enum instance with the name and ordinal
+            if iae_trace {
+                eprintln!("ANN-ENUM FALLBACK class={class_name} const={const_name} ordinal=0");
+            }
             let obj = alloc_concurrent_synthetic(ctx, class_name, 2);
             let name_str = ctx.create_string(const_name);
             ctx.set_field(obj, 0, Value::Object(Some(name_str)));
@@ -4997,14 +5018,21 @@ pub(crate) fn annotation_element_to_java_typed(
             // (common for annotation defaults that reference sibling classes
             // like picocli's NoOpModelTransformer), load it on demand. A null
             // return here causes downstream NullPointerExceptions (C29).
+            let iae_trace_cls = std::env::var("RUSTJVM_IAE_TRACE").is_ok();
             if let Some(class_name) = annotation_desc_to_class_name(desc) {
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
                     let mirror = ctx.get_class_mirror(cid);
+                    if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok"); }
                     return Value::Object(Some(mirror));
                 }
-                if let Ok(Some(val)) = ctx.load_class(class_name) {
+                let load_res = ctx.load_class(class_name);
+                if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} load-ok={}", load_res.as_ref().map(|v| v.is_some()).unwrap_or(false)); }
+                if let Ok(Some(val)) = load_res {
                     return val;
                 }
+                if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL"); }
+            } else if iae_trace_cls {
+                eprintln!("ANN-CLASS desc={desc} NO-CLASS-NAME");
             }
             Value::Object(None)
         }
@@ -7494,7 +7522,13 @@ pub(crate) fn native_class_get_protection_domain0(
     // as raw byte[] blocks so the reflective surface survives
     // `getCodeSource().getCertificates()` without requiring a full
     // `java.security.cert.Certificate` implementation.
-    let url_str = ctx.create_string(&code_base);
+    //
+    // location must be a real java/net/URL object so that JDK bytecode
+    // (e.g. Spring Boot's Launcher.createArchive) can call .toURI() on it.
+    // Storing a raw String here caused native_url_to_uri's override to miss,
+    // falling through to URI$Parser which rejects paths with special chars.
+    let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+    crate::url_parse(ctx, url_obj, &code_base);
     let cs_cid = ctx
         .ensure_class_initialized("java/security/CodeSource")
         .unwrap_or(rustjvm_types::ClassId::new(0));
@@ -7503,8 +7537,8 @@ pub(crate) fn native_class_get_protection_domain0(
     // Slot-based writes cover the synthetic layout; name-based writes
     // cover the real-JDK-loaded layout. At least one lands on the right
     // slot for each mode.
-    ctx.set_field(cs, 0, Value::Object(Some(url_str)));
-    ctx.set_field_by_name(cs, "location", Value::Object(Some(url_str)));
+    ctx.set_field(cs, 0, Value::Object(Some(url_obj)));
+    ctx.set_field_by_name(cs, "location", Value::Object(Some(url_obj)));
 
     // Attach signer certs as fresh byte[] copies on slot 1.
     let certs = ctx.class_code_source_certs(class_id);

@@ -1174,11 +1174,19 @@ impl SharedVm {
         );
 
         // ---- Tier 3: env/config-derived keys ----
-        // java.home — use config value or JAVA_HOME env var
+        // java.home — use config value, JAVA_HOME env var, or auto-detect
+        // by probing `java` on PATH. Falling back to "." causes JDK code
+        // (e.g. sun.util.calendar.ZoneInfoFile) to look for resources like
+        // `./lib/tzdb.dat` in the CWD and fail with FileNotFoundException,
+        // which then surfaces as an Error during clinit and aborts startup.
         let java_home_val = config
             .java_home
             .clone()
             .or_else(|| std::env::var("JAVA_HOME").ok())
+            .or_else(|| {
+                crate::config::resolve_java_home_public(None)
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| ".".to_string());
         sys_props.insert("java.home".to_string(), java_home_val.clone());
 

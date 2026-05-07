@@ -718,6 +718,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+            eprintln!("[NativeContext::invoke] class={class_name} method={method_name} desc={descriptor}");
+        }
         invoke_shared(
             self.shared,
             self.thread,
@@ -5034,6 +5037,22 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         "getClass" => {
             return Ok(Some(shared.heap.get_field(proxy, 1)));
         }
+        // S111r20 — `getType()` is a `MergedAnnotation` interface method
+        // that returns the annotation's `Class<A>`. When Spring's
+        // `TypeMappedAnnotation.adaptValueForMapOptions` treats an
+        // AnnotationProxy array as `MergedAnnotation[]` (via the lenient
+        // `instanceof [LMergedAnnotation;` check), it calls `asMap(factory,
+        // adaptations)` on each element. Our `annotation_proxy_as_map`
+        // then calls `factory.apply(proxy)`, where the factory lambda is
+        // `mergedAnnotation -> new AnnotationAttributes(mergedAnnotation.getType(), ...)`.
+        // Without this branch, `getType()` falls through to the element
+        // accessor walk, finds no element named "getType", returns null,
+        // and Spring's `AnnotationAttributes.<init>` throws
+        // `IllegalArgumentException: 'annotationType' must not be null`.
+        // Fix: return the same Class mirror as `annotationType()` does.
+        "getType" => {
+            return Ok(Some(shared.heap.get_field(proxy, 1)));
+        }
         _ => {}
     }
 
@@ -5589,6 +5608,20 @@ fn invoke_on_class_shared_inner(
                                 || method_name == "toPath"
                                 || method_name == "getName"
                                 || method_name == "toURI"))
+                        // Spring Boot fat-jar launcher: `Launcher.createArchive`
+                        // calls `URL.toURI()` on a `jar:file:/.../app.jar!/`
+                        // URL. The real-JDK `URL.toURI()` is `new URI(toString())`
+                        // and the JDK URI parser rejects characters like `'`
+                        // (apostrophe) in the path even though RFC 3986 allows
+                        // them as sub-delims — so any JAR whose absolute path
+                        // contains an apostrophe (e.g. `C:\...\Let's Go\...`)
+                        // throws URISyntaxException. Our native `URL.toURI`
+                        // (registered in `register_net_natives`) just calls
+                        // `url_parse` without character validation, matching
+                        // the user-visible expectation that the URL string
+                        // round-trips to a URI.
+                        || (class_name == "java/net/URL"
+                            && method_name == "toURI")
                         // Spring Boot 3.2 fat-jar launcher: JarFileArchive
                         // opens the fat-jar via `new JarFile(File)` and walks
                         // entries via `jarFile.stream() -> JarEntry`. The
@@ -5811,7 +5844,99 @@ fn invoke_on_class_shared_inner(
                                 "java/nio/channels/SelectableChannel"
                                 | "java/nio/channels/spi/AbstractSelectableChannel"
                             )
-                            && matches!(method_name, "register" | "configureBlocking"));
+                            && matches!(method_name, "register" | "configureBlocking"))
+                        // C20 / S111r20: Locale.getDefault() and
+                        // getDefault(Category) have JDK bytecode but that
+                        // bytecode walks the locale-provider adapter chain
+                        // (COMPAT/CLDR/SPI/HOST/FALLBACK ServiceLoader) which
+                        // throws InternalError("should not come down here")
+                        // in CratonVM's partial bootstrap.  The
+                        // locale_bootstrap native overrides bypass the chain
+                        // and return a cached en_US Locale — but they only
+                        // win if we force native dispatch here; otherwise the
+                        // JDK bytecode runs first and fails before reaching
+                        // the override, leaving Locale.getDefault returning
+                        // null and cascading into SimpleDateFormat/Logback NPEs.
+                        || (class_name == "java/util/Locale"
+                            && matches!(
+                                method_name,
+                                "getDefault"
+                                    | "setDefault"
+                                    | "getLanguage"
+                                    | "getCountry"
+                                    | "getScript"
+                                    | "getVariant"
+                                    | "toLanguageTag"
+                                    | "stripExtensions"
+                                    | "getExtension"
+                            ))
+                        // S-SB: Spring ApplicationStartup bootstrap — force native
+                        // dispatch so the no-op singleton is returned even when
+                        // ApplicationStartup.<clinit> was swallowed and DEFAULT is null.
+                        || (class_name
+                            == "org/springframework/context/support/AbstractApplicationContext"
+                            && method_name == "getApplicationStartup")
+                        || ((class_name
+                            == "org/springframework/core/metrics/DefaultApplicationStartup"
+                            || class_name
+                                == "org/springframework/core/metrics/ApplicationStartup")
+                            && method_name == "start")
+                        || ((class_name == "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep"
+                            || class_name == "org/springframework/core/metrics/StartupStep")
+                            && matches!(
+                                method_name,
+                                "tag" | "end" | "getName" | "getId" | "getParentId" | "getTags"
+                            ))
+                        // S-SB: Environment fix — force native on getEnvironment/
+                        // createEnvironment so the synthetic StandardEnvironment
+                        // singleton is returned when the real one failed to init.
+                        || (class_name
+                            == "org/springframework/context/support/AbstractApplicationContext"
+                            && matches!(method_name, "getEnvironment" | "createEnvironment"))
+                        || (matches!(
+                                class_name,
+                                "org/springframework/core/env/StandardEnvironment"
+                                    | "org/springframework/core/env/AbstractEnvironment"
+                                    | "org/springframework/core/env/Environment"
+                                    | "org/springframework/core/env/ConfigurableEnvironment"
+                            )
+                            && matches!(
+                                method_name,
+                                "getProperty"
+                                    | "containsProperty"
+                                    | "getActiveProfiles"
+                                    | "getDefaultProfiles"
+                                    | "acceptsProfiles"
+                                    | "getPropertySources"
+                                    | "resolveRequiredPlaceholders"
+                                    | "resolvePlaceholders"
+                            ))
+                        // S-SB: BeanFactory fix — force native dispatch for
+                        // getBeanFactory() on GenericApplicationContext /
+                        // AbstractApplicationContext so the lazy-init native
+                        // always runs even when the bytecode getter is present.
+                        // Without this, the JDK bytecode runs `getfield beanFactory`
+                        // directly (bypassing the native registry), returns null,
+                        // and `containsBeanDefinition` NPEs immediately after.
+                        || (matches!(
+                                class_name,
+                                "org/springframework/context/support/GenericApplicationContext"
+                                    | "org/springframework/context/support/AbstractApplicationContext"
+                            )
+                            && method_name == "getBeanFactory")
+                        // Force native for containsBeanDefinition / registerBeanDefinition
+                        // on DefaultListableBeanFactory and its interfaces so the no-op
+                        // stubs win when the DLBF is a synthetic allocation.
+                        || (matches!(
+                                class_name,
+                                "org/springframework/beans/factory/support/DefaultListableBeanFactory"
+                                    | "org/springframework/beans/factory/ListableBeanFactory"
+                                    | "org/springframework/beans/factory/config/ConfigurableListableBeanFactory"
+                            )
+                            && matches!(
+                                method_name,
+                                "containsBeanDefinition" | "registerBeanDefinition"
+                            ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }

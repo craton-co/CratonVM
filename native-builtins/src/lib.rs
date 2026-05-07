@@ -80,6 +80,7 @@ pub mod jdk25_concurrency;
 pub mod jdk25_patterns;
 pub mod locale_bootstrap;
 pub mod locale_resources;
+pub mod spring_startup_bootstrap;
 pub mod vector_api;
 pub mod graalvm_compat;
 pub mod generics;
@@ -3462,6 +3463,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // "should not come down here" fallback that blocks Jackson, H2 and
     // anything touching Locale.getDefault() formatting paths.
     locale_bootstrap::register(registry);
+
+    // S-SB: Spring ApplicationStartup bootstrap — ensures
+    // AbstractApplicationContext.getApplicationStartup() never returns null
+    // even when ApplicationStartup.<clinit> was swallowed.
+    spring_startup_bootstrap::register(registry);
 
     // C22: ResourceBundle locale-data overrides — provide synthetic
     // English/US bundles for `sun.text.resources.FormatData` and friends

@@ -1362,6 +1362,55 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 );
             }
         }
+        // S-SB: Spring ApplicationStartup.DEFAULT must be non-null.
+        // When DefaultApplicationStartup.<clinit> fails (it creates a
+        // DefaultStartupStep whose constructor fails in our partial bootstrap),
+        // the DEFAULT field stays null.  Populate it with a synthetic
+        // DefaultApplicationStartup object; the `start()` method is overridden
+        // natively by spring_startup_bootstrap.rs so the object doesn't need
+        // real field layout.
+        "org/springframework/core/metrics/ApplicationStartup" => {
+            let def_startup =
+                "org/springframework/core/metrics/DefaultApplicationStartup";
+            let def_startup_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(def_startup)
+            };
+            if let Some(sid) = def_startup_id {
+                // Check current value first — don't overwrite a good value
+                let current_null = {
+                    let cm = shared.class_manager.read();
+                    if let Some(cls) = cm.get_class(class_id) {
+                        let mut static_idx = 0usize;
+                        let mut is_null = true;
+                        for f in &cls.fields {
+                            if f.is_static() {
+                                if &*f.name == "DEFAULT" {
+                                    let v = super::get_static_shared(
+                                        shared, class_id, static_idx,
+                                    );
+                                    is_null = matches!(v, Value::Object(None));
+                                    break;
+                                }
+                                static_idx += 1;
+                            }
+                        }
+                        is_null
+                    } else {
+                        true
+                    }
+                };
+                if current_null {
+                    if let Some(obj) = shared.heap.try_alloc_object(sid, 8) {
+                        if set_static_by_name("DEFAULT", Value::Object(Some(obj))) {
+                            tracing::warn!(
+                                "Post-clinit fixup: ApplicationStartup.DEFAULT populated"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }

@@ -188,6 +188,30 @@ pub fn throw_runtime_error(
                     }
                 }
             }
+            // S111r20: broad NPE trace for spring context NPE hunt
+            if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+                eprintln!("NPE-TRACE msg={:?}", error);
+                for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                    let cn = shared.class_manager.read()
+                        .get_class(f.class_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    eprintln!("NPE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                }
+            }
+        }
+        // S111r19+: trace IAE origins for ConfigurationClassParser hunt
+        if matches!(&error, RuntimeError::IllegalArgumentException { .. })
+            && std::env::var("RUSTJVM_IAE_TRACE").is_ok()
+        {
+            eprintln!("IAE-TRACE error={error:?}");
+            for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
+                let cn = shared.class_manager.read()
+                    .get_class(f.class_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                eprintln!("IAE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+            }
         }
     }
     let (class_name, message) = match &error {
