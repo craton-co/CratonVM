@@ -670,6 +670,11 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     //   args[2] = loader (ClassLoader, may be null = bootstrap)
     //   args[3] = caller (Class, ignored by us)
     if let Some(Value::Object(Some(loader))) = args.get(2) {
+        let loader_class_name_debug = {
+            let cid = ctx.class_id_of_object(*loader);
+            ctx.class_name_of_id(cid).unwrap_or_default()
+        };
+        eprintln!("[S111-DBG] Class.forName({}) loader={}", dotted_name, loader_class_name_debug);
         let invoke_args = [Value::Object(Some(*loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
             *loader,
@@ -677,10 +682,14 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &invoke_args[1..],
         ) {
-            Ok(Some(mirror)) => return Ok(Some(mirror)),
+            Ok(Some(mirror)) => {
+                eprintln!("[S111-DBG] loadClass({}) succeeded via invoke_virtual", dotted_name);
+                return Ok(Some(mirror));
+            }
             // ClassLoader.loadClass returning null is technically illegal
             // (per spec it must throw CNFE) but defensively translate it.
             Ok(None) => {
+                eprintln!("[S111-DBG] loadClass({}) returned null", dotted_name);
                 return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
@@ -699,12 +708,49 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     rustjvm_types::error::LinkageError::NoSuchMethodError { .. },
                 ),
             )) => {
+                eprintln!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
                 // Fall through to bootstrap-style ensure_class_initialized below.
             }
-            // Propagate other exceptions thrown by the classloader (CNFE,
-            // LinkageError, etc.) without re-wrapping.
-            Err(e) => return Err(e),
+            // S111r20 — Spring Boot 2.x LaunchedURLClassLoader.loadClass
+            // fails in CratonVM because the JDK bytecode for URLClassPath
+            // walks nested-JAR URLs (jar:file:/fat.jar!/BOOT-INF/lib/foo.jar!/)
+            // via JarURLConnection + the Spring Boot custom jar: Handler. These
+            // lower-level primitives are not wired up in CratonVM's real-JDK
+            // mode, so loadClass throws ClassNotFoundException (Java-level) or
+            // fails internally. In both cases, fall through to bootstrap-style
+            // ensure_class_initialized, which uses CratonVM's built-in classpath
+            // scanner (which already extracted the nested JARs from BOOT-INF/lib).
+            //
+            // We do NOT apply this rescue to module-aware class loaders like
+            // org.jboss.modules.ModuleClassLoader — for those, CNFE is the
+            // authoritative answer about module visibility. Detect Spring Boot's
+            // LaunchedURLClassLoader by class name prefix.
+            Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(_)) => {
+                // Check if this is a LaunchedURLClassLoader (Spring Boot 2/3)
+                // or a URLClassLoader subclass that might have the same issues.
+                // For these, bootstrap fallback is safe. For module loaders, propagate.
+                let loader_class_name = loader_class_name_debug.clone();
+                let is_launched_url_cl = loader_class_name.contains("LaunchedURLClassLoader")
+                    || loader_class_name.contains("launch/LaunchedURLClassLoader")
+                    || loader_class_name == "java/net/URLClassLoader";
+                if is_launched_url_cl {
+                    eprintln!("[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback", dotted_name);
+                    // Fall through to ensure_class_initialized below.
+                } else {
+                    // For module-scoped loaders (JBoss Modules, OSGi, etc.)
+                    // the CNFE is authoritative — propagate it.
+                    return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                        class_name: dotted_name,
+                    }.into());
+                }
+            }
+            // Propagate internal VM errors without re-wrapping.
+            Err(e) => {
+                eprintln!("[S111-DBG] loadClass({}) -> InternalError {:?}, propagating", dotted_name, e);
+                return Err(e);
+            }
         }
+        eprintln!("[S111-DBG] falling through to ensure_class_initialized({})", dotted_name);
     }
 
     match ctx.ensure_class_initialized(&internal_name) {

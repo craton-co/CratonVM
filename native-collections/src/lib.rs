@@ -916,13 +916,30 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
     };
+    // S111r26: Size layout detection.
+    // Legacy layout: slot 1 = Int(size).
+    // Real JDK layout: slot 1 = Object(entrySet), slot 2 = Int(size).
     let size = match ctx.get_field(this, MAP_FIELD_SIZE) {
-        Value::Int(s) => s,
-        _ => 0,
+        Value::Int(s) => s,                             // legacy: slot 1 is Int
+        _ => match ctx.get_field(this, 2) {             // JDK: slot 2 is Int(size)
+            Value::Int(s) => s,
+            _ => 0,
+        },
     };
-    let cap = match ctx.get_field(this, MAP_FIELD_CAPACITY) {
-        Value::Int(c) => c,
-        _ => MAP_DEFAULT_CAPACITY as i32,
+    // S111r26: Use bucket array length as the true capacity.  When
+    // make_hashset_with_elements uses the real JDK HashMap field layout
+    // (table=0, entrySet=1, size=2, ...), MAP_FIELD_CAPACITY (slot 2)
+    // holds the element count, not the bucket count.  Reading the array
+    // length of the bucket array always gives the correct value regardless
+    // of which layout was used (legacy 3-field or real JDK).
+    let cap = if let Some(b) = buckets {
+        let arr_len = ctx.array_length(b) as i32;
+        if arr_len > 0 { arr_len } else { MAP_DEFAULT_CAPACITY as i32 }
+    } else {
+        match ctx.get_field(this, MAP_FIELD_CAPACITY) {
+            Value::Int(c) if c > 0 => c,
+            _ => MAP_DEFAULT_CAPACITY as i32,
+        }
     };
     (buckets, size, cap)
 }
@@ -1002,6 +1019,29 @@ fn map_alloc_node(
     node
 }
 
+/// S111r26: Layout-aware node key reader.
+///
+/// The legacy synthetic layout stores: key=0, value=1, hash=2, next=3.
+/// The real JDK HashMap$Node layout stores: hash=0, key=1, value=2, next=3.
+///
+/// Detect which layout is in use by checking slot 0:
+///   - Object → legacy layout (slot 0 = key)
+///   - Int    → JDK layout   (slot 0 = hash, key is at slot 1)
+fn get_node_key(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
+    match ctx.get_field(node, 0) {
+        v @ Value::Object(_) => v,          // legacy: slot 0 is the key
+        _ => ctx.get_field(node, 1),         // JDK:    slot 1 is the key
+    }
+}
+
+/// S111r26: Layout-aware node value reader (see `get_node_key`).
+fn get_node_value(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
+    match ctx.get_field(node, 0) {
+        Value::Object(_) => ctx.get_field(node, NODE_FIELD_VALUE), // legacy: slot 1
+        _ => ctx.get_field(node, 2),                               // JDK: slot 2
+    }
+}
+
 /// Maximum capacity for HashMap buckets (~1 billion).
 const MAP_MAX_CAPACITY: i32 = 1 << 30;
 
@@ -1049,7 +1089,7 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
         for i in 0..(cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
-                let key = ctx.get_field(node, NODE_FIELD_KEY);
+                let key = get_node_key(ctx, node);
                 keys.push(key);
                 node_val = ctx.get_field(node, NODE_FIELD_NEXT);
             }
@@ -1066,7 +1106,7 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
         for i in 0..(cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
-                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                let value = get_node_value(ctx, node);
                 values.push(value);
                 node_val = ctx.get_field(node, NODE_FIELD_NEXT);
             }
@@ -1083,8 +1123,8 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
         for i in 0..(cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
-                let key = ctx.get_field(node, NODE_FIELD_KEY);
-                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                let key = get_node_key(ctx, node);
+                let value = get_node_value(ctx, node);
                 entries.push((key, value));
                 node_val = ctx.get_field(node, NODE_FIELD_NEXT);
             }
@@ -1189,18 +1229,42 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 }
 
 pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // S111r27: Set JDK-compatible HashMap field layout so that JDK bytecode
+    // (which bypasses our registered natives for JDK classes) can correctly
+    // read and write HashMap state.
+    //
+    // JDK 25 HashMap instance field layout:
+    //   slot 0: Node<K,V>[] table        (null initially — JDK resize() creates it)
+    //   slot 1: Set<Entry<K,V>> entrySet (null)
+    //   slot 2: int size                 (0)
+    //   slot 3: int modCount             (0)
+    //   slot 4: int threshold            (0 — set by resize() based on loadFactor)
+    //   slot 5: float loadFactor         (0.75 — JDK DEFAULT_LOAD_FACTOR)
+    //
+    // Previous (legacy) init set slot 2 = 16 (capacity) which JDK treated as
+    // size=16, causing every putVal to trigger resize (threshold=0 since
+    // loadFactor was never set). This broke all getOrDefault/get lookups.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(
-        this,
-        MAP_FIELD_CAPACITY,
-        Value::Int(MAP_DEFAULT_CAPACITY as i32),
-    );
+    // slot 0: table = null (JDK's resize() allocates it on first putVal)
+    ctx.set_field(this, 0, Value::Object(None));
+    // slot 1: entrySet = null
+    ctx.set_field(this, 1, Value::Object(None));
+    // slot 2: size = 0
+    ctx.set_field(this, 2, Value::Int(0));
+    // slot 3: modCount = 0
+    ctx.set_field(this, 3, Value::Int(0));
+    // slot 4: threshold = 0 (JDK resize() sets this to loadFactor * initialCapacity)
+    ctx.set_field(this, 4, Value::Int(0));
+    // slot 5: loadFactor = 0.75 (DEFAULT_LOAD_FACTOR) — critical for threshold computation
+    ctx.set_field(this, 5, Value::Float(0.75_f32));
+
+    // Also maintain legacy layout fields for our own native map operations
+    // (map_state reads from MAP_FIELD_BUCKETS=0, MAP_FIELD_SIZE=1, MAP_FIELD_CAPACITY=2).
+    // Since slot 0 now holds JDK's table (null initially), our map_state's
+    // layout-aware code path handles this: when table=null, size=0, cap=default.
     Ok(None)
 }
 
@@ -1218,10 +1282,18 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         _ => MAP_DEFAULT_CAPACITY,
     };
+    // S111r27: Use JDK-compatible layout (same as native_map_init).
+    // JDK bytecode will call resize() on first putVal if table is null.
+    // Pre-allocating the table here avoids the initial resize overhead.
     let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(this, 0, Value::Object(Some(buckets)));  // table
+    ctx.set_field(this, 1, Value::Object(None));           // entrySet = null
+    ctx.set_field(this, 2, Value::Int(0));                 // size = 0
+    ctx.set_field(this, 3, Value::Int(0));                 // modCount = 0
+    // threshold = loadFactor * cap = 0.75 * cap
+    let threshold = ((cap as f32) * 0.75_f32) as i32;
+    ctx.set_field(this, 4, Value::Int(threshold));         // threshold
+    ctx.set_field(this, 5, Value::Float(0.75_f32));        // loadFactor
     Ok(None)
 }
 
@@ -1317,20 +1389,27 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
 
-    // Walk chain looking for existing key
+    // Walk chain looking for existing key (S111r27: layout-aware)
     while let Value::Object(Some(node)) = node_val {
-        let node_key_field = ctx.get_field(node, NODE_FIELD_KEY);
+        let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             // Looking for a null-key node
             if matches!(node_key_field, Value::Object(None)) {
-                let old_value = ctx.get_field(node, NODE_FIELD_VALUE);
-                ctx.set_field(node, NODE_FIELD_VALUE, value);
+                let old_value = get_node_value(ctx, node);
+                // Update value in-place using the detected layout
+                match ctx.get_field(node, 0) {
+                    Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
+                    _ => ctx.set_field(node, 2, value), // JDK slot 2
+                }
                 return Ok(Some(old_value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
             if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
-                let old_value = ctx.get_field(node, NODE_FIELD_VALUE);
-                ctx.set_field(node, NODE_FIELD_VALUE, value);
+                let old_value = get_node_value(ctx, node);
+                match ctx.get_field(node, 0) {
+                    Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
+                    _ => ctx.set_field(node, 2, value), // JDK slot 2
+                }
                 return Ok(Some(old_value));
             }
         }
@@ -1381,20 +1460,55 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
 
+    // S111r27: Use layout-aware helpers so that JDK-created nodes
+    // (hash=0, key=1, value=2, next=3) are handled correctly alongside
+    // legacy-created nodes (key=0, value=1, hash=2, next=3).
     while let Value::Object(Some(node)) = node_val {
-        let node_key_field = ctx.get_field(node, NODE_FIELD_KEY);
+        let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
-                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                let value = get_node_value(ctx, node);
                 return Ok(Some(value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
             if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
-                let value = ctx.get_field(node, NODE_FIELD_VALUE);
+                // Debug: log when ApplicationContextFactory key is found
+                if let Some(s) = ctx.read_string(key_ref.unwrap()) {
+                    if s.contains("ApplicationContext") {
+                        eprintln!("[MAP-GET-DBG] found key={}", s);
+                    }
+                }
+                let value = get_node_value(ctx, node);
                 return Ok(Some(value));
             }
         }
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+
+    // Debug: log misses for ApplicationContextFactory
+    if let Some(k) = key_ref {
+        if let Some(s) = ctx.read_string(k) {
+            if s.contains("ApplicationContext") {
+                eprintln!("[MAP-GET-DBG] MISS key={} cap={} idx={}", s, cap, idx);
+                // Dump bucket contents for diagnosis
+                let mut n = ctx.get_array_element(buckets, idx);
+                while let Value::Object(Some(nd)) = n {
+                    let nk = get_node_key(ctx, nd);
+                    let nk_str = if let Value::Object(Some(nkr)) = nk {
+                        ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
+                    } else { format!("<non-obj {:?}>", nk) };
+                    eprintln!("[MAP-GET-DBG]   bucket[{}] key={}", idx, nk_str);
+                    n = ctx.get_field(nd, NODE_FIELD_NEXT);
+                }
+                // Also dump slot0..slot3 of node for raw layout inspection
+                let n0 = ctx.get_array_element(buckets, idx);
+                if let Value::Object(Some(nd)) = n0 {
+                    eprintln!("[MAP-GET-DBG]   node slots: s0={:?} s1={:?} s2={:?} s3={:?}",
+                        ctx.get_field(nd, 0), ctx.get_field(nd, 1),
+                        ctx.get_field(nd, 2), ctx.get_field(nd, 3));
+                }
+            }
+        }
     }
 
     Ok(Some(Value::Object(None)))
@@ -1422,9 +1536,9 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let idx = map_bucket_index(hash, cap);
     let head_val = ctx.get_array_element(buckets, idx);
 
-    // Helper closure: check if node matches our key
+    // Helper closure: check if node matches our key (S111r27: layout-aware)
     let node_matches = |ctx: &dyn NativeContext, node: ObjectRef| -> bool {
-        let node_key_field = ctx.get_field(node, NODE_FIELD_KEY);
+        let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             matches!(node_key_field, Value::Object(None))
         } else if let Value::Object(Some(nk)) = node_key_field {
@@ -1440,7 +1554,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
             ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size - 1));
-            let old_value = ctx.get_field(head, NODE_FIELD_VALUE);
+            let old_value = get_node_value(ctx, head);
             return Ok(Some(old_value));
         }
 
@@ -1453,7 +1567,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
                 ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size - 1));
-                let old_value = ctx.get_field(curr, NODE_FIELD_VALUE);
+                let old_value = get_node_value(ctx, curr);
                 return Ok(Some(old_value));
             }
             prev = curr;
@@ -1616,6 +1730,18 @@ fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // S111r27: debug — log ALL calls to detect if this native is bypassed
+    static GODCALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !GODCALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[GOD-DBG] getOrDefault native IS running");
+    }
+    if let Some(Value::Object(Some(k))) = args.get(1) {
+        if let Some(s) = ctx.read_string(*k) {
+            if s.contains("ApplicationContext") || s.contains("ContextFactory") {
+                eprintln!("[GOD-DBG] getOrDefault called key={}", s);
+            }
+        }
+    }
     let result = native_map_get(ctx, args)?;
     match result {
         Some(Value::Object(None)) => {
@@ -2055,10 +2181,14 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     // Collect keys into a snapshot array
     let keys = map_collect_keys(ctx, backing);
+    eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
     let keys_arr = alloc_ref_array(ctx, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(keys_arr, i, *k);
@@ -3376,6 +3506,19 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(Some(Value::Object(None))),
     };
+
+    // Debug: one-shot marker + targeted key log
+    static CIACALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !CIACALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[CIA-DBG] computeIfAbsent native IS running");
+    }
+    if let Value::Object(Some(k)) = key {
+        if let Some(s) = ctx.read_string(k) {
+            if s.contains("ApplicationContextFactory") || s.contains("ApplicationContext") || s.contains("springframework") {
+                eprintln!("[CIA-DBG] computeIfAbsent: key={}", s);
+            }
+        }
+    }
 
     // Check if key already present.
     let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;

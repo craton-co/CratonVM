@@ -365,6 +365,39 @@ pub fn convert_class_not_found(
         MethodCallFailed::InternalError(VmError::Linkage(
             crate::error::LinkageError::NoClassDefFoundError { .. },
         )) => raise_no_class_def_found(shared, thread, class_name),
+        // NoSuchFieldError and NoSuchMethodError are LinkageErrors in Java.
+        // Convert them to throwable Java exceptions so catch(Error) / catch(Throwable)
+        // blocks in user/framework code can handle them instead of crashing the VM.
+        MethodCallFailed::InternalError(VmError::Linkage(
+            crate::error::LinkageError::NoSuchFieldError { class_name: ref cn, ref field_name },
+        )) => {
+            let msg = format!("{}.{}", cn, field_name);
+            match create_exception_object(shared, thread, "java/lang/NoSuchFieldError", Some(&msg)) {
+                Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
+                Err(_) => MethodCallFailed::InternalError(VmError::Linkage(
+                    crate::error::LinkageError::NoSuchFieldError {
+                        class_name: cn.clone(), field_name: field_name.clone(),
+                    },
+                )),
+            }
+        }
+        MethodCallFailed::InternalError(VmError::Linkage(
+            crate::error::LinkageError::NoSuchMethodError {
+                class_name: ref cn, ref method_name, ref method_descriptor,
+            },
+        )) => {
+            let msg = format!("{}.{}{}", cn, method_name, method_descriptor);
+            match create_exception_object(shared, thread, "java/lang/NoSuchMethodError", Some(&msg)) {
+                Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
+                Err(_) => MethodCallFailed::InternalError(VmError::Linkage(
+                    crate::error::LinkageError::NoSuchMethodError {
+                        class_name: cn.clone(),
+                        method_name: method_name.clone(),
+                        method_descriptor: method_descriptor.clone(),
+                    },
+                )),
+            }
+        }
         other => other,
     }
 }

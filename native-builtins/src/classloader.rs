@@ -1384,6 +1384,14 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
 
+    // S111r23-DBG: log spring.factories URL enumeration to diagnose factory loading
+    if resource_name == "META-INF/spring.factories" {
+        eprintln!("[GRES-DBG] getResources(META-INF/spring.factories) -> {} URLs", urls.len());
+        for u in &urls {
+            eprintln!("[GRES-DBG]   url: {}", u);
+        }
+    }
+
     tracing::debug!(
         target: "rustjvm_vm::runtime::resources",
         resource = %resource_name,

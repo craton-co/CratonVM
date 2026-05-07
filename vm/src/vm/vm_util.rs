@@ -504,7 +504,16 @@ fn initialize_class_shared(
                         || class_name_for_jfr.starts_with("org/jboss/")
                         || class_name_for_jfr.starts_with("io/quarkus/")
                         || class_name_for_jfr.starts_with("org/wildfly/")
-                        || class_name_for_jfr.starts_with("io/smallrye/");
+                        || class_name_for_jfr.starts_with("io/smallrye/")
+                        // Spring Boot launcher classes (loader package) — e.g.
+                        // JarFileArchive.<clinit> references PosixFilePermission
+                        // on all platforms including Windows where POSIX perms
+                        // are unavailable. The launcher's <clinit> failure is
+                        // safely ignorable: our native overrides for
+                        // getClassPathArchivesIterator / getMainClass bypass
+                        // the archive-traversal logic entirely.
+                        || class_name_for_jfr.starts_with("org/springframework/boot/loader/")
+                        || class_name_for_jfr.starts_with("com/sun/");
                     is_swallowable_type && is_framework_class
                 } else {
                     matches!(&e,
