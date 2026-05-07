@@ -1,0 +1,583 @@
+[w3a2] register_phase_e_networking called STDERR
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+[S111-DBG] Class.forName(com.digsol.eurekaserver.EurekaServerApplication) loader=org/springframework/boot/loader/LaunchedURLClassLoader
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: com.digsol.eurekaserver.EurekaServerApplication
+[S111-DBG] loadClass(com.digsol.eurekaserver.EurekaServerApplication) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.apache.logging.log4j.spi.ExtendedLogger) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.apache.logging.log4j.spi.ExtendedLogger) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.apache.logging.slf4j.SLF4JProvider) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.apache.logging.slf4j.SLF4JProvider) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.slf4j.spi.LocationAwareLogger) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.slf4j.spi.LocationAwareLogger) succeeded via invoke_virtual
+[CU-DBG] ClassUtils.forName(org.springframework.web.reactive.DispatcherHandler)
+[CU-DBG] ClassUtils.forName(org.springframework.web.reactive.DispatcherHandler) -> ClassNotFoundException
+[CU-DBG] ClassUtils.forName(javax.servlet.Servlet)
+[CU-DBG] ClassUtils.forName(javax.servlet.Servlet) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.web.context.ConfigurableWebApplicationContext)
+[CU-DBG] ClassUtils.forName(org.springframework.web.context.ConfigurableWebApplicationContext) -> found direct
+[GRES-DBG] getResources(META-INF/spring.factories) -> 10 URLs
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] AbstractFileResolvingResource.customizeConnection(UC) intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[SPRING-DBG] AbstractFileResolvingResource.customizeConnection(HUC) intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[GRES-DBG] getResources(META-INF/spring.factories) -> 10 URLs
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[CONN-DBG] URL.openConnection: jar:file:/C:/Users/Victor/YandexDisk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Number) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Number) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Number) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Number) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConditionalConverter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConditionalConverter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Number) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Number) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Character) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Character) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Number) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Number) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Character) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Character) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Character) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Character) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Number) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Number) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Boolean) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Boolean) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Enum) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Enum) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Enum) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Enum) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Integer) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Integer) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Enum) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Enum) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Enum) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Enum) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Integer) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Integer) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Locale) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Locale) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.nio.charset.Charset) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.nio.charset.Charset) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Currency) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Currency) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Properties) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Properties) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Properties) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Properties) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.UUID) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.UUID) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.TimeZone) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.TimeZone) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZoneId) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZoneId) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.TimeZone) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.TimeZone) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[CU-DBG] ClassUtils.forName(javax.money.MonetaryAmount)
+[CU-DBG] ClassUtils.forName(javax.money.MonetaryAmount) -> found direct
+[CU-DBG] ClassUtils.forName(org.joda.time.YearMonth)
+[CU-DBG] ClassUtils.forName(org.joda.time.YearMonth) -> found direct
+[S111-DBG] Class.forName(org.springframework.format.AnnotationFormatterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.AnnotationFormatterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.annotation.NumberFormat) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.annotation.NumberFormat) succeeded via invoke_virtual
+[2m2026-05-07T17:30:15.662738Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(javax.money.CurrencyUnit) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(javax.money.CurrencyUnit) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Printer) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Printer) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Parser) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Parser) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(javax.money.MonetaryAmount) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(javax.money.MonetaryAmount) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.AnnotationFormatterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.AnnotationFormatterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.annotation.NumberFormat) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.annotation.NumberFormat) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Date) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Date) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Date) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Date) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Date) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Date) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Date) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Date) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDate) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDate) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDate) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDate) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDate) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDate) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.ZonedDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.ZonedDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDate) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDate) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Printer) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Printer) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.temporal.TemporalAccessor) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.temporal.TemporalAccessor) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Period) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Period) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Duration) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Duration) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Year) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Year) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.Month) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.Month) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.YearMonth) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.YearMonth) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.MonthDay) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.MonthDay) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.AnnotationFormatterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.AnnotationFormatterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.annotation.DateTimeFormat) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.annotation.DateTimeFormat) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalDate) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalDate) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateMidnight) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateMidnight) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.MutableDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.MutableDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.Instant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.Instant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Date) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Date) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.DateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.DateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Date) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Date) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.ReadableInstant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.ReadableInstant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.util.Calendar) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.util.Calendar) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.ReadableInstant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.ReadableInstant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Long) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Long) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.ReadableInstant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.ReadableInstant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalDate) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalDate) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.LocalTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.LocalTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Printer) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Printer) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.ReadablePartial) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.ReadablePartial) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Printer) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Printer) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.ReadableInstant) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.ReadableInstant) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.Period) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.Period) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.Duration) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.Duration) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.YearMonth) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.YearMonth) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.joda.time.MonthDay) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.joda.time.MonthDay) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.AnnotationFormatterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.AnnotationFormatterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.annotation.DateTimeFormat) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.annotation.DateTimeFormat) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.net.InetAddress) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.net.InetAddress) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.format.Formatter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.format.Formatter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.time.OffsetDateTime) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.time.OffsetDateTime) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.io.File) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.io.File) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.Converter) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.Converter) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.io.InputStreamSource) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.io.InputStreamSource) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.boot.convert.LenientObjectToEnumConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.boot.convert.LenientObjectToEnumConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.String) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.String) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.core.convert.converter.ConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.core.convert.converter.ConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Enum) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Enum) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.springframework.boot.convert.LenientObjectToEnumConverterFactory) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.springframework.boot.convert.LenientObjectToEnumConverterFactory) succeeded via invoke_virtual
+[S111-DBG] Class.forName(java.lang.Boolean) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(java.lang.Boolean) succeeded via invoke_virtual
+[CU-DBG] ClassUtils.forName(org.eclipse.core.runtime.FileLocator)
+[CU-DBG] ClassUtils.forName(org.eclipse.core.runtime.FileLocator) -> ClassNotFoundException
+[CU-DBG] ClassUtils.forName(javax.inject.Provider)
+[CU-DBG] ClassUtils.forName(javax.inject.Provider) -> found direct
+[CU-DBG] ClassUtils.forName(kotlin.Metadata)
+[CU-DBG] ClassUtils.forName(kotlin.Metadata) -> ClassNotFoundException
+[CU-DBG] ClassUtils.forName(kotlin.reflect.full.KClasses)
+[CU-DBG] ClassUtils.forName(kotlin.reflect.full.KClasses) -> ClassNotFoundException
+Exception in thread "main" java/lang/reflect/InvocationTargetException
+	at org/springframework/boot/loader/MainMethodRunner.run(MainMethodRunner.java:49)
+	at java/lang/reflect/InvocationTargetException.<init>(InvocationTargetException.java:68)
+	at java/lang/ReflectiveOperationException.<init>(ReflectiveOperationException.java:90)
+	at java/lang/Exception.<init>(Exception.java:103)
+	at java/lang/Throwable.<init>(Throwable.java:336)
+	at java/lang/Throwable.fillInStackTrace(Throwable.java:825)
+Caused by: java/lang/IllegalStateException: Unable create a default ApplicationContext instance, you may need a custom ApplicationContextFactory
+	at org/springframework/boot/loader/MainMethodRunner.run(MainMethodRunner.java:49)
+	at com/digsol/eurekaserver/EurekaServerApplication.main(EurekaServerApplication.java:12)
+	at org/springframework/boot/SpringApplication.run(SpringApplication.java:304)
+	at org/springframework/boot/DefaultApplicationContextFactory.create(DefaultApplicationContextFactory.java:52)
+	at java/lang/IllegalStateException.<init>(IllegalStateException.java:74)
+	at java/lang/RuntimeException.<init>(RuntimeException.java:81)
+	at java/lang/Exception.<init>(Exception.java:85)
+	at java/lang/Throwable.<init>(Throwable.java:309)
+	at java/lang/Throwable.fillInStackTrace(Throwable.java:825)
+Caused by: java/lang/IllegalArgumentException

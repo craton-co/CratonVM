@@ -79,24 +79,34 @@ fn drain_input_stream(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
 ) -> Option<Vec<u8>> {
-    // The InputStream allocated by `Class.getResourceAsStream` is a
-    // ByteArrayInputStream with `buf` (byte[]), `pos` (int), `count` (int)
-    // fields populated.  Read directly to avoid going through the JDK's
-    // bytecode which is fragile in our env.  Fall back to the
-    // `read([B,I,I)I` virtual call if the by-name lookup fails.
-    let buf = match ctx.get_field_by_name(stream, "buf") {
+    // The InputStream allocated by `Class.getResourceAsStream` and
+    // `URL.openStream` is a ByteArrayInputStream with `buf` (byte[]),
+    // `pos` (int), `count` (int) fields populated.  Read directly to
+    // avoid going through the JDK's bytecode which is fragile in our env.
+    //
+    // Strategy 1: by-name field lookup (works when the JDK class is loaded
+    //   and field names resolve to the correct index).
+    // Strategy 2: by-index fallback (indices 0=buf, 1=pos, 3=count) —
+    //   the standard JDK ByteArrayInputStream layout; covers synthetic
+    //   objects allocated with alloc_concurrent_synthetic where by-name
+    //   may not work.
+    // Strategy 3: invoke_virtual read([BII)I loop — works for any real
+    //   InputStream implementation.
+
+    // --- Strategy 1: by-name ---
+    let buf_by_name = match ctx.get_field_by_name(stream, "buf") {
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
     };
-    let count = match ctx.get_field_by_name(stream, "count") {
+    let count_by_name = match ctx.get_field_by_name(stream, "count") {
         Value::Int(n) => Some(n as usize),
         _ => None,
     };
-    let pos = match ctx.get_field_by_name(stream, "pos") {
+    let pos_by_name = match ctx.get_field_by_name(stream, "pos") {
         Value::Int(n) => Some(n as usize),
         _ => None,
     };
-    if let (Some(arr), Some(c), Some(p)) = (buf, count, pos) {
+    if let (Some(arr), Some(c), Some(p)) = (buf_by_name, count_by_name, pos_by_name) {
         if c <= MAX_LOAD_BYTES && p <= c {
             let len = c.saturating_sub(p);
             let mut out = Vec::with_capacity(len);
@@ -108,10 +118,81 @@ fn drain_input_stream(
                     out.push(b as u8);
                 }
             }
+            eprintln!("[DRAIN-DBG] drain_input_stream: by-name read {} bytes", out.len());
             return Some(out);
         }
     }
-    None
+
+    // --- Strategy 2: by-index (standard ByteArrayInputStream layout) ---
+    // buf=0, pos=1, mark=2, count=3 — the JDK ByteArrayInputStream
+    // instance field order (no instance fields in InputStream parent).
+    let buf_by_idx = match ctx.get_field(stream, 0) {
+        Value::Object(Some(arr)) => Some(arr),
+        _ => None,
+    };
+    let count_by_idx = match ctx.get_field(stream, 3) {
+        Value::Int(n) => Some(n as usize),
+        _ => None,
+    };
+    let pos_by_idx = match ctx.get_field(stream, 1) {
+        Value::Int(n) => Some(n as usize),
+        _ => None,
+    };
+    if let (Some(arr), Some(c), Some(p)) = (buf_by_idx, count_by_idx, pos_by_idx) {
+        if c > 0 && c <= MAX_LOAD_BYTES && p <= c {
+            let len = c.saturating_sub(p);
+            let mut out = Vec::with_capacity(len);
+            for i in p..c {
+                if out.len() >= MAX_LOAD_BYTES {
+                    return None;
+                }
+                if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                    out.push(b as u8);
+                }
+            }
+            eprintln!("[DRAIN-DBG] drain_input_stream: by-index read {} bytes", out.len());
+            return Some(out);
+        }
+    }
+
+    // --- Strategy 3: invoke_virtual read([BII)I loop ---
+    // Handles any real InputStream implementation.
+    let chunk_size = 8192usize;
+    let chunk_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, chunk_size);
+    let mut out = Vec::new();
+    loop {
+        let n = match ctx.invoke_virtual(
+            stream,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(chunk_arr)),
+                Value::Int(0),
+                Value::Int(chunk_size as i32),
+            ],
+        ) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => break,
+        };
+        if n <= 0 {
+            break;
+        }
+        for i in 0..n as usize {
+            if let Value::Int(b) = ctx.get_array_element(chunk_arr, i) {
+                out.push(b as u8);
+            }
+        }
+        if out.len() > MAX_LOAD_BYTES {
+            return None;
+        }
+    }
+    if !out.is_empty() {
+        eprintln!("[DRAIN-DBG] drain_input_stream: invoke_virtual read {} bytes", out.len());
+        Some(out)
+    } else {
+        eprintln!("[DRAIN-DBG] drain_input_stream: all strategies failed");
+        None
+    }
 }
 
 /// Parse a Java-style `.properties` file's bytes.  Implements the JLS
@@ -341,9 +422,16 @@ fn native_properties_load(
     if bytes.len() > MAX_LOAD_BYTES {
         return Ok(None);
     }
-    for (k, v) in parse_properties(&bytes) {
-        put_kv(this, &k, &v);
+    let parsed = parse_properties(&bytes);
+    eprintln!("[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes", parsed.len(), bytes.len());
+    for (k, v) in &parsed {
+        if k.contains("ApplicationContext") || k.contains("ContextFactory") {
+            let preview_len = v.len().min(80);
+            eprintln!("[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}", k, v.len(), &v[..preview_len]);
+        }
+        put_kv(this, k, v);
     }
+    eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(this), this);
     Ok(None)
 }
 
@@ -757,6 +845,13 @@ fn native_properties_entry_set(
         }
     };
     let snapshot = snapshot_kv(this);
+    eprintln!("[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}", snapshot.len(), this);
+    if snapshot.is_empty() {
+        eprintln!("[PROPS-DBG] WARNING: entrySet() called on empty side-table obj {:?}", this);
+    }
+    for (k, _v) in snapshot.iter().take(5) {
+        eprintln!("[PROPS-DBG]   entry key={}", k);
+    }
     let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
     for (k, v) in &snapshot {
         let entry = crate::alloc_concurrent_synthetic(

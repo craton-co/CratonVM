@@ -428,12 +428,282 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
     register_re2_server_socket(registry);
     register_re3_inet_address(registry);
     register_re4_url_http(registry);
+    register_uri_natives(registry);
     register_re5_http_client(registry);
     register_re6_ssl_context(registry);
     register_re7_datagram_socket(registry);
     register_re8_network_interface(registry);
     register_re9_nio_selector(registry);
     register_re10_http_server(registry);
+}
+
+// ===========================================================================
+// java.net.URI natives
+//
+// CratonVM's class loading sometimes cannot find java/net/URI methods from
+// the real JDK bytecode (they appear as "no such method" linkage errors).
+// We register our own implementations that parse the raw URI string stored
+// at field 6 of our synthetic URI objects (scheme=0, host=1, port=2,
+// path=3, query=4, fragment=5, raw=6).
+// ===========================================================================
+
+/// Read the raw URI string from a synthetic URI object.
+/// Tries field 6 (raw) first; falls back to field 0 (scheme/raw in
+/// some callers that store the full string there).
+fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
+    match ctx.get_field(uri, 6) {
+        Value::Object(Some(s)) => {
+            if let Some(r) = ctx.read_string(s) {
+                if !r.is_empty() { return r; }
+            }
+        }
+        _ => {}
+    }
+    // Fallback: field 0
+    match ctx.get_field(uri, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn register_uri_natives(r: &mut NativeMethodRegistry) {
+    let uri = "java/net/URI";
+
+    // toString() → raw string
+    r.register(uri, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = uri_raw_string(ctx, this);
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+
+    // getScheme() → scheme prefix before ':'
+    r.register(uri, "getScheme", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Fast path: scheme field (0) if it was set during construction.
+        if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+            if let Some(v) = ctx.read_string(s) {
+                if !v.is_empty() && !v.contains(':') {
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                }
+            }
+        }
+        // Parse from raw string.
+        let raw = uri_raw_string(ctx, this);
+        let scheme = raw.find(':').map(|i| raw[..i].to_string()).unwrap_or_default();
+        if scheme.is_empty() {
+            Ok(Some(Value::Object(None)))
+        } else {
+            Ok(Some(Value::Object(Some(ctx.create_string(&scheme)))))
+        }
+    });
+
+    // getSchemeSpecificPart() → everything after 'scheme:' (decoded)
+    r.register(uri, "getSchemeSpecificPart", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let ssp = if let Some(i) = raw.find(':') {
+            raw[i + 1..].to_string()
+        } else {
+            raw.clone()
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+    });
+
+    // getRawSchemeSpecificPart() → same (we don't encode/decode)
+    r.register(uri, "getRawSchemeSpecificPart", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let ssp = if let Some(i) = raw.find(':') {
+            raw[i + 1..].to_string()
+        } else {
+            raw.clone()
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+    });
+
+    // getPath() → path field (3) if set, else parse from raw
+    r.register(uri, "getPath", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+            if let Some(v) = ctx.read_string(s) {
+                if !v.is_empty() {
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                }
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        // For hierarchical URIs: after scheme + "://" + authority, path starts.
+        // Simplified: return everything after scheme:
+        let path = if let Some(i) = raw.find(':') {
+            let ssp = &raw[i + 1..];
+            // Strip leading "//" + authority for hierarchical URIs.
+            if ssp.starts_with("//") {
+                let rest = &ssp[2..];
+                let slash = rest.find('/').unwrap_or(rest.len());
+                rest[slash..].split('?').next().unwrap_or("").to_string()
+            } else {
+                ssp.split('?').next().unwrap_or("").to_string()
+            }
+        } else {
+            raw.clone()
+        };
+        if path.is_empty() {
+            Ok(Some(Value::Object(None)))
+        } else {
+            Ok(Some(Value::Object(Some(ctx.create_string(&path)))))
+        }
+    });
+
+    // getRawPath() → same as getPath (no encoding distinction here)
+    r.register(uri, "getRawPath", "()Ljava/lang/String;", |ctx, args| {
+        // Delegate to getPath logic.
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let path = if let Some(i) = raw.find(':') {
+            let ssp = &raw[i + 1..];
+            if ssp.starts_with("//") {
+                let rest = &ssp[2..];
+                let slash = rest.find('/').unwrap_or(rest.len());
+                rest[slash..].split('?').next().unwrap_or("").to_string()
+            } else {
+                ssp.split('?').next().unwrap_or("").to_string()
+            }
+        } else {
+            raw.clone()
+        };
+        if path.is_empty() {
+            Ok(Some(Value::Object(None)))
+        } else {
+            Ok(Some(Value::Object(Some(ctx.create_string(&path)))))
+        }
+    });
+
+    // getHost() → host field (1) or parsed from raw
+    r.register(uri, "getHost", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
+            if let Some(v) = ctx.read_string(s) {
+                if !v.is_empty() {
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                }
+            }
+        }
+        Ok(Some(Value::Object(None)))
+    });
+
+    // getPort() → port field (2)
+    r.register(uri, "getPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 2)))
+    });
+
+    // getQuery() → query field (4)
+    r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 4)))
+    });
+
+    // getFragment() → fragment field (5)
+    r.register(uri, "getFragment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 5)))
+    });
+
+    // isAbsolute() → true if scheme is non-null
+    r.register(uri, "isAbsolute", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let is_abs = raw.contains(':');
+        Ok(Some(Value::Int(if is_abs { 1 } else { 0 })))
+    });
+
+    // isOpaque() → true if scheme-specific-part doesn't start with '/'
+    r.register(uri, "isOpaque", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let is_opaque = if let Some(i) = raw.find(':') {
+            !raw[i + 1..].starts_with('/')
+        } else {
+            false
+        };
+        Ok(Some(Value::Int(if is_opaque { 1 } else { 0 })))
+    });
+
+    // toURL() → synthetic URL from raw string
+    r.register(uri, "toURL", "()Ljava/net/URL;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        if raw.is_empty() {
+            return Ok(Some(Value::Object(None)));
+        }
+        // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
+        let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+        let proto = raw.find(':').map(|i| &raw[..i]).unwrap_or("");
+        let file = if proto.is_empty() { &raw[..] } else { &raw[proto.len() + 1..] };
+        let full_s = ctx.create_string(&raw);
+        let proto_s = ctx.create_string(proto);
+        let file_s = ctx.create_string(file);
+        let host_s = ctx.create_string("");
+        ctx.set_field(url, 0, Value::Object(Some(proto_s)));
+        ctx.set_field(url, 1, Value::Object(Some(host_s)));
+        ctx.set_field(url, 2, Value::Int(-1));
+        ctx.set_field(url, 3, Value::Object(Some(file_s)));
+        ctx.set_field(url, 5, Value::Object(Some(full_s)));
+        ctx.set_field(url, 6, Value::Object(Some(file_s)));
+        Ok(Some(Value::Object(Some(url))))
+    });
+
+    // compareTo(URI) → 0 (always equal — caller uses this for identity checks)
+    r.register(uri, "compareTo", "(Ljava/net/URI;)I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+
+    // equals(Object) → reference equality
+    r.register(uri, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let a = uri_raw_string(ctx, this);
+        let b = uri_raw_string(ctx, other);
+        Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
+    });
+
+    // hashCode() → hash of raw string
+    r.register(uri, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let h = raw.bytes().fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
+        Ok(Some(Value::Int(h)))
+    });
+
+    // normalize() → this (no normalization for now)
+    r.register(uri, "normalize", "()Ljava/net/URI;", |_ctx, args| {
+        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    });
+
+    // resolve(URI) → just return the argument
+    r.register(uri, "resolve", "(Ljava/net/URI;)Ljava/net/URI;", |_ctx, args| {
+        Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+    });
+
+    // create(String) — static factory
+    r.register(uri, "create", "(Ljava/lang/String;)Ljava/net/URI;", |ctx, args| {
+        let s_obj = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let s = ctx.read_string(s_obj).unwrap_or_default();
+        let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
+        let raw_s = ctx.create_string(&s);
+        ctx.set_field(uri_obj, 6, Value::Object(Some(raw_s)));
+        if let Some(colon) = s.find(':') {
+            let scheme = ctx.create_string(&s[..colon]);
+            ctx.set_field(uri_obj, 0, Value::Object(Some(scheme)));
+        }
+        Ok(Some(Value::Object(Some(uri_obj))))
+    });
 }
 
 // ===========================================================================
@@ -1694,6 +1964,69 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register(url, "toString", "()Ljava/lang/String;", url_to_string);
     r.register(url, "toExternalForm", "()Ljava/lang/String;", url_to_string);
 
+    // URL.toURI() — JDK 21+ URLClassPath calls url.toURI() when setting up
+    // the classpath for LaunchedURLClassLoader. The method is absent from
+    // CratonVM's synthetic URL type, so we provide it here. Strategy:
+    //   1. Get the full URL string via our toString native.
+    //   2. Allocate a real java/net/URI and run its (String) constructor so
+    //      getScheme/getPath/toString all return correct answers via JDK bytecode.
+    //   3. If the real constructor fails (e.g. URISyntaxException from a
+    //      jar:file:…!/… URL), fall back to a 7-field synthetic URI whose
+    //      raw-string field is set so our uri_string helper can reconstruct
+    //      the string, and whose scheme field holds the scheme prefix.
+    r.register(url, "toURI", "()Ljava/net/URI;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Obtain the full URL string.
+        let url_str_obj = match ctx.invoke(
+            "java/net/URL",
+            "toString",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(this))],
+        ) {
+            Ok(Some(Value::Object(Some(s)))) => s,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let url_str = ctx.read_string(url_str_obj).unwrap_or_default();
+
+        // Try to create a real URI via URI(String) constructor.
+        let real_uri = (|| -> Option<ObjectRef> {
+            let uri_obj = match ctx.new_object("java/net/URI") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return None,
+            };
+            ctx.invoke(
+                "java/net/URI",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(uri_obj)), Value::Object(Some(url_str_obj))],
+            ).ok()?;
+            Some(uri_obj)
+        })();
+
+        if let Some(uri) = real_uri {
+            return Ok(Some(Value::Object(Some(uri))));
+        }
+
+        // Fallback: synthetic URI. Layout per http2.rs:
+        //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
+        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
+        let raw_s = ctx.create_string(&url_str);
+        ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
+        // Parse scheme.
+        if let Some(colon) = url_str.find(':') {
+            let scheme = &url_str[..colon];
+            let scheme_s = ctx.create_string(scheme);
+            ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
+            // For file: URIs, the path is everything after "file:".
+            if scheme == "file" {
+                let path = &url_str[colon + 1..];
+                let path_s = ctx.create_string(path);
+                ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+            }
+        }
+        Ok(Some(Value::Object(Some(uri))))
+    });
+
     // S111r18: URL.getDefaultPort() — JDK 25 reads `handler.getDefaultPort()`
     // (URL.java:1015) which NPEs because synthetic URLs (alloc_url, real-JDK
     // URL ctors) never populate the `handler` field. Per-protocol defaults
@@ -1739,29 +2072,72 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             return Err(ioex("URL.openStream: empty URL"));
         }
 
+        // S111r23-DBG: log spring.factories URL openStream calls
+        let is_sf = url_str.contains("spring.factories");
+        if is_sf {
+            eprintln!("[OSTR-DBG] URL.openStream: {}", url_str);
+        }
+
         // Resolve the URL to raw bytes. Handles file:, jar:file:!/, and
         // classpath: schemes locally; http(s): goes through the HTTP client.
         let bytes: Vec<u8> = if let Some(rest) = url_str.strip_prefix("jar:file:") {
-            // jar:file:/path/to.jar!/entry
+            // jar:file:/path/to.jar!/entry  (single-level)
+            // jar:file:/fat.jar!/BOOT-INF/lib/inner.jar!/entry  (double-nested)
+            //   — Spring Boot 2.x fat JARs store nested JARs as BOOT-INF/lib/*.jar;
+            //     ClassLoader.getResources() produces double-nested URLs. We must
+            //     read the outer JAR, extract the inner JAR bytes, then look up
+            //     the entry in the inner archive.
             let rest = rest.trim_start_matches('/');
-            let (jar_path, entry) = match rest.find("!/") {
+            let (outer_jar, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => return Err(ioex(format!("URL.openStream: malformed jar URL: {url_str}"))),
             };
-            // Also accept backslash-less paths on Windows.
-            let jar_bytes = std::fs::read(jar_path)
-                .map_err(|e| ioex(format!("URL.openStream: read jar {jar_path}: {e}")))?;
-            let cursor = std::io::Cursor::new(jar_bytes);
-            let mut zip = zip::ZipArchive::new(cursor)
-                .map_err(|e| ioex(format!("URL.openStream: open jar {jar_path}: {e}")))?;
-            let mut entry_file = zip
-                .by_name(entry)
-                .map_err(|e| ioex(format!("URL.openStream: entry {entry} in {jar_path}: {e}")))?;
-            use std::io::Read;
-            let mut buf = Vec::with_capacity(entry_file.size() as usize);
-            entry_file
-                .read_to_end(&mut buf)
-                .map_err(|e| ioex(format!("URL.openStream: read entry {entry}: {e}")))?;
+            // Check if the inner_path itself is a nested jar entry (double !/):
+            // e.g. "BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories"
+            let buf = if let Some(second_sep) = inner_path.find("!/") {
+                let nested_jar_entry = &inner_path[..second_sep];
+                let resource_entry = &inner_path[second_sep + 2..];
+                use std::io::Read;
+                let outer_bytes = std::fs::read(outer_jar)
+                    .map_err(|e| ioex(format!("URL.openStream: read outer jar {outer_jar}: {e}")))?;
+                let cursor = std::io::Cursor::new(outer_bytes);
+                let mut outer_zip = zip::ZipArchive::new(cursor)
+                    .map_err(|e| ioex(format!("URL.openStream: open outer jar {outer_jar}: {e}")))?;
+                let mut nested_jar_file = outer_zip
+                    .by_name(nested_jar_entry)
+                    .map_err(|e| ioex(format!("URL.openStream: nested jar {nested_jar_entry} in {outer_jar}: {e}")))?;
+                let mut nested_jar_bytes = Vec::with_capacity(nested_jar_file.size() as usize);
+                nested_jar_file
+                    .read_to_end(&mut nested_jar_bytes)
+                    .map_err(|e| ioex(format!("URL.openStream: read nested jar {nested_jar_entry}: {e}")))?;
+                let inner_cursor = std::io::Cursor::new(nested_jar_bytes);
+                let mut inner_zip = zip::ZipArchive::new(inner_cursor)
+                    .map_err(|e| ioex(format!("URL.openStream: open inner jar {nested_jar_entry}: {e}")))?;
+                let mut entry_file = inner_zip
+                    .by_name(resource_entry)
+                    .map_err(|e| ioex(format!("URL.openStream: entry {resource_entry} in {nested_jar_entry}: {e}")))?;
+                let mut buf = Vec::with_capacity(entry_file.size() as usize);
+                entry_file
+                    .read_to_end(&mut buf)
+                    .map_err(|e| ioex(format!("URL.openStream: read entry {resource_entry}: {e}")))?;
+                buf
+            } else {
+                // Single-level: jar:file:/path/to.jar!/entry
+                use std::io::Read;
+                let jar_bytes = std::fs::read(outer_jar)
+                    .map_err(|e| ioex(format!("URL.openStream: read jar {outer_jar}: {e}")))?;
+                let cursor = std::io::Cursor::new(jar_bytes);
+                let mut zip = zip::ZipArchive::new(cursor)
+                    .map_err(|e| ioex(format!("URL.openStream: open jar {outer_jar}: {e}")))?;
+                let mut entry_file = zip
+                    .by_name(inner_path)
+                    .map_err(|e| ioex(format!("URL.openStream: entry {inner_path} in {outer_jar}: {e}")))?;
+                let mut buf = Vec::with_capacity(entry_file.size() as usize);
+                entry_file
+                    .read_to_end(&mut buf)
+                    .map_err(|e| ioex(format!("URL.openStream: read entry {inner_path}: {e}")))?;
+                buf
+            };
             buf
         } else if let Some(rest) = url_str.strip_prefix("file:") {
             let path = rest.trim_start_matches('/');
@@ -1781,6 +2157,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             return Err(ioex(format!("URL.openStream: unsupported scheme: {url_str}")));
         };
 
+        if is_sf {
+            eprintln!("[OSTR-DBG] URL.openStream bytes={}", bytes.len());
+        }
         let body = new_java_byte_array(ctx, &bytes);
         let len = ctx.array_length(body) as i32;
         let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
@@ -1826,6 +2205,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/net/URLConnection;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // S111r23-DBG: log openConnection calls for spring.factories
+            {
+                let s0 = read_field_string_or(ctx, this, 5, "");
+                let s1 = if s0.is_empty() { read_field_string_or(ctx, this, 0, "") } else { s0.clone() };
+                if s1.contains("spring.factories") {
+                    eprintln!("[CONN-DBG] URL.openConnection: {}", s1);
+                }
+            }
             let conn = alloc_concurrent_synthetic(ctx, "java/net/HttpURLConnection", 16);
             // Field HUC_URL holds the originating URL so `huc_url_string`
             // and `getInputStream` can recover its external form.
@@ -1860,17 +2247,79 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getInputStream",
         "()Ljava/io/InputStream;",
         |ctx, args| {
+            eprintln!("[UCN-ENTRY] URLConnection.getInputStream ENTERED");
             let this = obj_arg(args, 0)?;
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
-                _ => return Err(ioex("URLConnection.getInputStream: no URL")),
+                _ => {
+                    eprintln!("[UCN-DBG] URLConnection.getInputStream: no HUC_URL in field 0 — trying openStream via args");
+                    return Err(ioex("URLConnection.getInputStream: no URL"));
+                }
             };
+            let url_str = read_field_string_or(ctx, url_obj, 5, "");
+            let url_str2 = if url_str.is_empty() { read_field_string_or(ctx, url_obj, 0, "") } else { url_str };
+            eprintln!("[UCN-DBG] URLConnection.getInputStream: {}", url_str2);
             ctx.invoke_virtual(
                 url_obj,
                 "openStream",
                 "()Ljava/io/InputStream;",
                 &[],
             )
+        },
+    );
+
+    // -----------------------------------------------------------------------
+    // S111r25 — UrlResource.getInputStream() override.
+    //
+    // Spring's UrlResource.getInputStream() uses the pattern:
+    //   URLConnection con = this.url.openConnection();
+    //   customizeConnection(con);
+    //   try { return con.getInputStream(); }
+    //   catch (IOException ex) { ... disconnect ... throw; }
+    //
+    // The final `con.getInputStream()` call dispatches as
+    // `invokevirtual java/net/URLConnection.getInputStream()` on our
+    // synthetic `java/net/HttpURLConnection` object.  In real-JDK mode,
+    // the VM finds the JDK's URLConnection bytecode (which throws
+    // `UnknownServiceException extends IOException`) in preference to our
+    // native registration, because the declaring class (`URLConnection`)
+    // has a JDK class file present.  The IOException is caught by
+    // UrlResource's handler (offset 18), disconnect() is called, and the
+    // exception re-propagates to loadSpringFactories which skips the URL —
+    // leaving the factory map empty and causing DefaultApplicationContextFactory
+    // to fail with IllegalArgumentException.
+    //
+    // Fix: intercept `UrlResource.getInputStream()` directly and delegate
+    // straight to URL.openStream(), completely skipping openConnection /
+    // customizeConnection / URLConnection.getInputStream.  This is
+    // semantically equivalent but entirely inside our VM infrastructure.
+    // -----------------------------------------------------------------------
+    r.register(
+        "org/springframework/core/io/UrlResource",
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            eprintln!("[URLRES-DBG] UrlResource.getInputStream intercepted");
+            // Obtain the URL via UrlResource.getURL() — the public accessor
+            // that simply returns the private `url` field.  Using a Java
+            // call lets us avoid hard-coding the field index (which depends
+            // on the number of fields in the AbstractResource/AbstractFile
+            // ResolvingResource superclasses).
+            let url_val = ctx.invoke_virtual(
+                this,
+                "getURL",
+                "()Ljava/net/URL;",
+                &[],
+            )?;
+            let url_obj = match url_val {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Err(ioex("UrlResource.getInputStream: getURL() returned null")),
+            };
+            // Delegate directly to URL.openStream() — our native handles
+            // jar:file: double-nested URLs correctly.
+            eprintln!("[URLRES-DBG] UrlResource.getInputStream -> openStream");
+            ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[])
         },
     );
 
@@ -1887,6 +2336,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     });
     r.register(huc, "getInputStream", "()Ljava/io/InputStream;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // S111r22 — For non-HTTP/HTTPS URLs (jar:file:, file:, classpath:, jrt:),
+        // huc_perform would try to make a real HTTP request which fails. Instead,
+        // delegate to URL.openStream() via the stored HUC_URL. This enables
+        // SpringFactoriesLoader to read META-INF/spring.factories from nested JARs
+        // when it goes through url.openConnection().getInputStream().
+        let url_str = huc_url_string(ctx, this);
+        eprintln!("[HUC-DBG] HttpURLConnection.getInputStream url={}", url_str);
+        if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
+            // Non-HTTP: delegate to URL.openStream() on the stored URL object.
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("HttpURLConnection.getInputStream: no URL for non-http")),
+            };
+            return ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[]);
+        }
         huc_perform(ctx, this)?;
         let body = match ctx.get_field(this, HUC_BODY) {
             Value::Object(Some(a)) => a,
@@ -1978,6 +2442,67 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, HUC_DO_OUTPUT, Value::Int(v));
         Ok(None)
     });
+
+    // -----------------------------------------------------------------------
+    // S111r24 — Spring Boot / Spring Framework compatibility natives.
+    //
+    // `UrlResource.getInputStream()` (Spring 5.x / 6.x) calls
+    //   openConnection() → customizeConnection(con) → con.getInputStream()
+    // where `customizeConnection` is defined on AbstractFileResolvingResource:
+    //
+    //   protected void customizeConnection(URLConnection con) {
+    //       ResourceUtils.useCachesIfNecessary(con);  // ← getClass().getSimpleName()
+    //       if (con instanceof HttpURLConnection) {
+    //           customizeConnection((HttpURLConnection) con);
+    //       }
+    //   }
+    //
+    // `ResourceUtils.useCachesIfNecessary` calls
+    //   con.getClass().getSimpleName().startsWith("JNLP")
+    // then con.setUseCaches(false).  The `setUseCaches` is already a no-op
+    // native on URLConnection; however any hiccup in the getSimpleName chain
+    // (e.g. the Class mirror for our synthetic HttpURLConnection having a null
+    // name slot) would throw an exception NOT covered by UrlResource's IOException
+    // handler (offset 10 is outside the [13,17) try block), silently aborting
+    // the getInputStream() call and leaving loadSpringFactories with no entries.
+    //
+    // Fix: intercept `ResourceUtils.useCachesIfNecessary` and both overloads of
+    // `AbstractFileResolvingResource.customizeConnection` as native no-ops.
+    // This lets execution fall straight through to con.getInputStream().
+    // -----------------------------------------------------------------------
+
+    // ResourceUtils.useCachesIfNecessary — no-op; skips getSimpleName() call
+    r.register(
+        "org/springframework/util/ResourceUtils",
+        "useCachesIfNecessary",
+        "(Ljava/net/URLConnection;)V",
+        |_ctx, _args| {
+            eprintln!("[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)");
+            Ok(None)
+        },
+    );
+
+    // AbstractFileResolvingResource.customizeConnection(URLConnection) — no-op
+    r.register(
+        "org/springframework/core/io/AbstractFileResolvingResource",
+        "customizeConnection",
+        "(Ljava/net/URLConnection;)V",
+        |_ctx, _args| {
+            eprintln!("[SPRING-DBG] AbstractFileResolvingResource.customizeConnection(UC) intercepted (no-op)");
+            Ok(None)
+        },
+    );
+
+    // AbstractFileResolvingResource.customizeConnection(HttpURLConnection) — no-op
+    r.register(
+        "org/springframework/core/io/AbstractFileResolvingResource",
+        "customizeConnection",
+        "(Ljava/net/HttpURLConnection;)V",
+        |_ctx, _args| {
+            eprintln!("[SPRING-DBG] AbstractFileResolvingResource.customizeConnection(HUC) intercepted (no-op)");
+            Ok(None)
+        },
+    );
 }
 
 // ===========================================================================

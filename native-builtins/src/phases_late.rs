@@ -10735,7 +10735,52 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "org/springframework/boot/loader/WarLauncher",
         "org/springframework/boot/loader/PropertiesLauncher",
     ];
+    let launcher_base = "org/springframework/boot/loader/Launcher";
+    // createArchive() on the abstract base — allocates a dummy
+    // JarFileArchive-shaped object without running its constructor (and thus
+    // without triggering JarFileArchive.<clinit> which accesses
+    // PosixFilePermission.OWNER_READ — unavailable on Windows).
+    // Our getClassPathArchivesIterator native re-derives the fat-jar path
+    // from find_class_source_path so it never reads `this.archive`.
+    r.register(
+        launcher_base,
+        "createArchive",
+        "()Lorg/springframework/boot/loader/archive/Archive;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Build a minimal 2-field synthetic archive so downstream
+            // getClassPathIndex / getUrl / isNestedArchive calls that are NOT
+            // already overridden get a non-null receiver instead of NPE-ing.
+            let archive = alloc_concurrent_synthetic(
+                ctx,
+                "org/springframework/boot/loader/archive/JarFileArchive",
+                4,
+            );
+            // Write back into the launcher's `archive` field so bytecode
+            // that does GETFIELD archive still gets a non-null value.
+            ctx.set_field_by_name(this, "archive", Value::Object(Some(archive)));
+            Ok(Some(Value::Object(Some(archive))))
+        },
+    );
+
     for cls in eal_classes {
+        // Also register createArchive on each concrete launcher class so the
+        // check_override path (which walks the class itself first) finds it.
+        r.register(
+            cls,
+            "createArchive",
+            "()Lorg/springframework/boot/loader/archive/Archive;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let archive = alloc_concurrent_synthetic(
+                    ctx,
+                    "org/springframework/boot/loader/archive/JarFileArchive",
+                    4,
+                );
+                ctx.set_field_by_name(this, "archive", Value::Object(Some(archive)));
+                Ok(Some(Value::Object(Some(archive))))
+            },
+        );
         r.register(
             cls,
             "getMainClass",
@@ -10765,6 +10810,14 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "getClassPathArchivesIterator",
             "()Ljava/util/Iterator;",
             sb2_launcher_get_class_path_archives_iterator,
+        );
+        // getClassPathIndex(Archive) — returns null so no layered-JAR
+        // classpath index is loaded (correct for non-layered Spring Boot 2 JARs).
+        r.register(
+            cls,
+            "getClassPathIndex",
+            "(Lorg/springframework/boot/loader/archive/Archive;)Lorg/springframework/boot/loader/ClassPathIndexFile;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
         );
     }
 
@@ -10812,6 +10865,261 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/URL;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+
+    // SB2 LaunchedURLClassLoader.loadClass(String, boolean) — the real
+    // URLClassLoader bytecode for findClass walks URL entries via
+    // JarURLConnection using the Spring Boot custom jar: Handler. The Handler
+    // opens double-nested JAR URLs (jar:file:/fat.jar!/BOOT-INF/lib/dep.jar!/)
+    // which we don't support in CratonVM's real-JDK mode. Instead, delegate
+    // directly to CratonVM's built-in classpath scanner (ensure_class_initialized),
+    // which already extracted all nested JARs from BOOT-INF/lib at startup.
+    //
+    // This native is registered on BOTH the SB2 and SB3 launcher class names
+    // and for both the one-arg and two-arg overloads.
+    r.register(luc, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", |ctx, args| {
+        let name_obj = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Err(RuntimeError::NullPointerException {
+                message: Some("LaunchedURLClassLoader.loadClass: null name".to_string()),
+            }.into()),
+        };
+        let dotted = ctx.read_string(name_obj).unwrap_or_default();
+        eprintln!("[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: {}", dotted);
+        let internal = dotted.replace('.', "/");
+        match ctx.ensure_class_initialized(&internal) {
+            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+        }
+    });
+    r.register(luc, "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", |ctx, args| {
+        let name_obj = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Err(RuntimeError::NullPointerException {
+                message: Some("LaunchedURLClassLoader.loadClass(Z): null name".to_string()),
+            }.into()),
+        };
+        let dotted = ctx.read_string(name_obj).unwrap_or_default();
+        eprintln!("[LUC-DBG] LaunchedURLClassLoader.loadClass(2) called: {}", dotted);
+        let internal = dotted.replace('.', "/");
+        match ctx.ensure_class_initialized(&internal) {
+            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+        }
+    });
+    // Also register for the SB3 repackaged launcher
+    let luc3 = "org/springframework/boot/loader/launch/LaunchedClassLoader";
+    r.register(luc3, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", |ctx, args| {
+        let name_obj = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Err(RuntimeError::NullPointerException {
+                message: Some("LaunchedClassLoader.loadClass: null name".to_string()),
+            }.into()),
+        };
+        let dotted = ctx.read_string(name_obj).unwrap_or_default();
+        let internal = dotted.replace('.', "/");
+        match ctx.ensure_class_initialized(&internal) {
+            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+        }
+    });
+    r.register(luc3, "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", |ctx, args| {
+        let name_obj = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Err(RuntimeError::NullPointerException {
+                message: Some("LaunchedClassLoader.loadClass(Z): null name".to_string()),
+            }.into()),
+        };
+        let dotted = ctx.read_string(name_obj).unwrap_or_default();
+        let internal = dotted.replace('.', "/");
+        match ctx.ensure_class_initialized(&internal) {
+            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+        }
+    });
+
+    // ---------------------------------------------------------------------------
+    // S111r21 — Spring's ClassUtils.forName(String, ClassLoader) native override.
+    //
+    // ClassUtils.forName is the entry point for all Spring factory class loading
+    // (SpringFactoriesLoader.instantiateFactory calls it for every factory class).
+    // The factory names in spring.factories use dotted canonical notation:
+    //   "org.springframework.boot.web.servlet.context
+    //      .AnnotationConfigServletWebServerApplicationContext.Factory"
+    // (the inner class separator is `.`, not `$`).
+    //
+    // ClassUtils.forName calls Class.forName(name, false, classLoader) which
+    // dispatches to our native_class_for_name. That in turn calls
+    // invoke_virtual(classLoader, "loadClass", ...) which succeeds for the
+    // outer class attempt but fails with InternalError(ClassNotFoundException)
+    // for the ".Factory" suffix (because bytecode uses "$Factory"). This
+    // InternalError is NOT caught by ClassUtils.forName's catch(ClassNotFoundException)
+    // handler — it propagates up, bypassing the inner-class retry logic.
+    //
+    // By registering a native for ClassUtils.forName directly, we:
+    //  1. Handle primitives and array types (Java primitive names, [] notation)
+    //  2. Try direct binary name via ensure_class_initialized
+    //  3. Try inner-class substitution (replace last `.` with `$`) if step 2 fails
+    //  4. Throw ClassNotFoundException if both fail
+    //
+    // This is safe for all callers: ensure_class_initialized is the same loader
+    // CratonVM uses for everything in BOOT-INF/lib/. The classLoader arg is
+    // deliberately ignored (we use CratonVM's unified classpath scanner).
+    // ---------------------------------------------------------------------------
+    let cu = "org/springframework/util/ClassUtils";
+    r.register(cu, "forName", "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
+        spring_class_utils_for_name_impl);
+    // Some Spring Boot 3 / Spring Framework 6 code paths use a 1-arg overload.
+    r.register(cu, "forName", "(Ljava/lang/String;)Ljava/lang/Class;",
+        spring_class_utils_for_name_impl);
+
+    // S111r27 — intercept DefaultApplicationContextFactory.create to diagnose
+    // what exception is thrown and provide a direct bypass if needed.
+    let dacf = "org/springframework/boot/DefaultApplicationContextFactory";
+    r.register(dacf, "create",
+        "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/context/ConfigurableApplicationContext;",
+        spring_default_app_ctx_factory_create);
+}
+
+/// S111r21 — native implementation of Spring's ClassUtils.forName(String, ClassLoader).
+///
+/// ClassUtils.forName is the entry point for all Spring factory class loading.
+/// Factory names in spring.factories use dotted canonical notation:
+///   "org.springframework.boot.web.servlet.context
+///      .AnnotationConfigServletWebServerApplicationContext.Factory"
+/// (where `.Factory` is the inner class — bytecode name uses `$Factory`).
+///
+/// The standard Java path through Class.forName → LaunchedURLClassLoader.loadClass
+/// returns ClassNotFoundException as an InternalError from CratonVM's native layer;
+/// this internal error bypasses ClassUtils.forName's `catch(ClassNotFoundException)`
+/// handler, so the inner-class retry never runs.
+///
+/// By overriding ClassUtils.forName with this native we:
+///  1. Try the direct binary name via ensure_class_initialized (fast path)
+///  2. Try inner-class substitution (replace last '.' with '$') if step 1 fails
+///  3. Throw ClassNotFoundException if both fail (propagated as Java-level CNFE)
+fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Err(RuntimeError::NullPointerException {
+            message: Some("ClassUtils.forName: null name".to_string()),
+        }.into()),
+    };
+    let dotted = ctx.read_string(name_obj).unwrap_or_default();
+    eprintln!("[CU-DBG] ClassUtils.forName({})", dotted);
+
+    // Handle primitive language names (Spring converts these to wrapper classes)
+    let prim_class_id: Option<&str> = match dotted.as_str() {
+        "boolean" => Some("java/lang/Boolean"),
+        "byte"    => Some("java/lang/Byte"),
+        "char"    => Some("java/lang/Character"),
+        "short"   => Some("java/lang/Short"),
+        "int"     => Some("java/lang/Integer"),
+        "long"    => Some("java/lang/Long"),
+        "float"   => Some("java/lang/Float"),
+        "double"  => Some("java/lang/Double"),
+        "void"    => Some("java/lang/Void"),
+        _ => None,
+    };
+    if let Some(prim) = prim_class_id {
+        if let Ok(cid) = ctx.ensure_class_initialized(prim) {
+            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+        }
+    }
+
+    // Handle array types: "String[]" → "[Ljava/lang/String;"
+    if dotted.ends_with("[]") {
+        let element = &dotted[..dotted.len() - 2];
+        let element_internal = element.replace('.', "/");
+        let array_desc = format!("[L{element_internal};");
+        if let Ok(cid) = ctx.ensure_class_initialized(&array_desc) {
+            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+        }
+    }
+
+    // Regular class name: try direct binary name first (a.b.Foo → a/b/Foo)
+    let internal = dotted.replace('.', "/");
+    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
+        eprintln!("[CU-DBG] ClassUtils.forName({}) -> found direct", dotted);
+        return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+    }
+
+    // Inner-class retry: replace last '/' with '$'
+    // "a/b/Outer/Inner" → "a/b/Outer$Inner"
+    if let Some(last_slash) = internal.rfind('/') {
+        let inner = format!("{}${}", &internal[..last_slash], &internal[last_slash + 1..]);
+        if let Ok(cid) = ctx.ensure_class_initialized(&inner) {
+            eprintln!("[CU-DBG] ClassUtils.forName({}) -> found as inner class {}", dotted, inner);
+            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+        }
+    }
+
+    eprintln!("[CU-DBG] ClassUtils.forName({}) -> ClassNotFoundException", dotted);
+    Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into())
+}
+
+// S111r27: Interceptor for DefaultApplicationContextFactory.create.
+// When factories can't be loaded correctly (e.g. HashMap layout mismatch or
+// ConcurrentReferenceHashMap cache miss), this native provides a direct bypass:
+// it creates AnnotationConfigServletWebServerApplicationContext directly for
+// SERVLET type applications.
+fn spring_default_app_ctx_factory_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    eprintln!("[DACF-DBG] DefaultApplicationContextFactory.create called");
+
+    // args[1] = WebApplicationType enum instance
+    let web_type_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let is_servlet = match web_type_val {
+        Value::Object(Some(wt)) => {
+            // WebApplicationType enum - read the name from field 0 (the enum name)
+            // or from the ordinal. The name "SERVLET" is what we're looking for.
+            let name_from_field = match ctx.get_field(wt, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            eprintln!("[DACF-DBG] WebApplicationType field[0]={}", name_from_field);
+            // Also check read_string on the enum itself
+            let enum_str = ctx.read_string(wt).unwrap_or_default();
+            eprintln!("[DACF-DBG] WebApplicationType read_string={}", enum_str);
+            name_from_field.contains("SERVLET") || enum_str.contains("SERVLET")
+        }
+        _ => false,
+    };
+
+    eprintln!("[DACF-DBG] is_servlet={}", is_servlet);
+
+    // Attempt to create the right context class
+    let ctx_class = if is_servlet {
+        "org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext"
+    } else {
+        // For NONE type fall back to AnnotationConfigApplicationContext
+        "org/springframework/context/annotation/AnnotationConfigApplicationContext"
+    };
+
+    // Step 1: allocate the object (new_object does NOT run constructor)
+    let obj_val = match ctx.new_object(ctx_class) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("[DACF-DBG] new_object returned None");
+            return Ok(Some(Value::Object(None)));
+        }
+        Err(e) => {
+            eprintln!("[DACF-DBG] new_object failed: {:?}", e);
+            return Err(e);
+        }
+    };
+
+    // Step 2: run the no-arg constructor explicitly via invoke_special
+    // invoke_special args[0] = this
+    eprintln!("[DACF-DBG] allocated {:?}, running constructor...", obj_val);
+    match ctx.invoke_special(ctx_class, "<init>", "()V", &[obj_val]) {
+        Ok(_) => {
+            eprintln!("[DACF-DBG] constructor OK, returning context");
+            Ok(Some(obj_val))
+        }
+        Err(e) => {
+            eprintln!("[DACF-DBG] constructor failed: {:?}", e);
+            Err(e)
+        }
+    }
 }
 
 // =============================================================================
@@ -38953,5 +39261,93 @@ mod t10_manifest_input_stream_tests {
         );
 
         let _ = std::fs::remove_file(&jar_path);
+    }
+}
+
+// =============================================================================
+// Spring Framework ApplicationStartup / StartupStep no-op natives
+//
+// Spring Boot 2.x / Spring Framework 5.3.x: `AbstractApplicationContext`
+// has a field `applicationStartup = ApplicationStartup.DEFAULT`. The DEFAULT
+// constant is set by the interface's clinit (`new DefaultApplicationStartup()`).
+// When `DefaultApplicationStartup` can't be loaded from nested JARs (because
+// the classloader isn't fully wired yet), the interface clinit fails and
+// DEFAULT stays null. This causes an NPE at
+//   `AnnotationConfigApplicationContext.<init>` line 68:
+//   `this.getApplicationStartup().start("spring.context.annotated-bean-reader.create")`
+//
+// Fix: provide native overrides for `getApplicationStartup()` and the
+// `ApplicationStartup.start(String)` / `StartupStep` methods so they
+// return cheap synthetic no-op objects instead of requiring the real classes.
+// =============================================================================
+
+/// Register no-op natives for Spring's ApplicationStartup / StartupStep.
+/// The StartupStep synthetic object uses 1 field (slot 0 = parent StartupStep ref, unused).
+pub fn register_spring_application_startup_natives(r: &mut NativeMethodRegistry) {
+    let abs_ctx = "org/springframework/context/support/AbstractApplicationContext";
+    let app_startup = "org/springframework/core/metrics/ApplicationStartup";
+    let startup_step = "org/springframework/core/metrics/StartupStep";
+    let default_startup = "org/springframework/core/metrics/DefaultApplicationStartup";
+    let default_step = "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep";
+
+    // AbstractApplicationContext.getApplicationStartup() — always return a
+    // synthetic no-op ApplicationStartup so downstream .start(...) never NPEs.
+    r.register(
+        abs_ctx,
+        "getApplicationStartup",
+        "()Lorg/springframework/core/metrics/ApplicationStartup;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "org/springframework/core/metrics/DefaultApplicationStartup", 1);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // ApplicationStartup.start(String) → no-op StartupStep
+    for cls in &[app_startup, default_startup] {
+        r.register(
+            cls,
+            "start",
+            "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
+            |ctx, _args| {
+                let step = alloc_concurrent_synthetic(ctx, "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep", 1);
+                Ok(Some(Value::Object(Some(step))))
+            },
+        );
+    }
+
+    // StartupStep.tag(String, String) → return this (chaining)
+    for cls in &[startup_step, default_step] {
+        r.register(
+            cls,
+            "tag",
+            "(Ljava/lang/String;Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
+        // StartupStep.tag(String, Supplier) → return this (chaining)
+        r.register(
+            cls,
+            "tag",
+            "(Ljava/lang/String;Ljava/util/function/Supplier;)Lorg/springframework/core/metrics/StartupStep;",
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
+        // StartupStep.end() → void
+        r.register(cls, "end", "()V", |_ctx, _args| Ok(None));
+        // StartupStep.getName() → empty string
+        r.register(cls, "getName", "()Ljava/lang/String;", |ctx, _args| {
+            Ok(Some(Value::Object(Some(ctx.create_string("")))))
+        });
+        // StartupStep.getTags() → empty Iterable
+        r.register(
+            cls,
+            "getTags",
+            "()Ljava/lang/Iterable;",
+            |ctx, _args| {
+                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                ctx.set_field(list, 0, Value::Object(Some(arr)));
+                ctx.set_field(list, 1, Value::Int(0));
+                Ok(Some(Value::Object(Some(list))))
+            },
+        );
     }
 }

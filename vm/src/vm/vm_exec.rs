@@ -5034,6 +5034,17 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         "getClass" => {
             return Ok(Some(shared.heap.get_field(proxy, 1)));
         }
+        // S111r20 — `getType()` is a `MergedAnnotation` interface method.
+        // Spring's `TypeMappedAnnotation.adaptValueForMapOptions` treats
+        // AnnotationProxy arrays as `MergedAnnotation[]` and calls
+        // `asMap(factory, adaptations)` on each element. The factory lambda
+        // is `mergedAnnotation -> new AnnotationAttributes(mergedAnnotation.getType(), ...)`.
+        // Without this branch, `getType()` falls through, finds no element
+        // named "getType", returns null, and AnnotationAttributes throws
+        // `IllegalArgumentException: 'annotationType' must not be null`.
+        "getType" => {
+            return Ok(Some(shared.heap.get_field(proxy, 1)));
+        }
         _ => {}
     }
 
@@ -5631,7 +5642,8 @@ fn invoke_on_class_shared_inner(
                         // parent-walk in `try_stackless_invoke` would
                         // otherwise short-circuit on EAL's own bytecode.
                         || (matches!(class_name,
-                                "org/springframework/boot/loader/ExecutableArchiveLauncher"
+                                "org/springframework/boot/loader/Launcher"
+                                | "org/springframework/boot/loader/ExecutableArchiveLauncher"
                                 | "org/springframework/boot/loader/JarLauncher"
                                 | "org/springframework/boot/loader/WarLauncher"
                                 | "org/springframework/boot/loader/PropertiesLauncher"
@@ -5643,7 +5655,18 @@ fn invoke_on_class_shared_inner(
                                 | "isPostProcessingClassPathArchives"
                                 | "getClassPathArchives"
                                 | "getClassPathArchivesIterator"
+                                | "createArchive"
+                                | "getClassPathIndex"
                             ))
+                        // SB2 LaunchedURLClassLoader.loadClass — the real
+                        // URLClassLoader bytecode walks double-nested JAR URLs
+                        // which CratonVM's real-JDK mode does not support.
+                        // Force the native that delegates to ensure_class_initialized.
+                        || (matches!(class_name,
+                                "org/springframework/boot/loader/LaunchedURLClassLoader"
+                                | "org/springframework/boot/loader/launch/LaunchedClassLoader"
+                            )
+                            && method_name == "loadClass")
                         // SB2 launcher's `getClassPathArchivesIterator()`
                         // returns an `ArrayList$Itr`. The downstream
                         // `Launcher.createClassLoader(Iterator)` calls
@@ -5811,7 +5834,32 @@ fn invoke_on_class_shared_inner(
                                 "java/nio/channels/SelectableChannel"
                                 | "java/nio/channels/spi/AbstractSelectableChannel"
                             )
-                            && matches!(method_name, "register" | "configureBlocking"));
+                            && matches!(method_name, "register" | "configureBlocking"))
+                        // Spring Framework AbstractApplicationContext.getApplicationStartup() —
+                        // the real JDK bytecode reads `this.applicationStartup` which may be
+                        // null when ApplicationStartup.DEFAULT fails to initialize (nested-JAR
+                        // classloading). Force the native that returns a no-op synthetic object.
+                        || (matches!(
+                                class_name,
+                                "org/springframework/context/support/AbstractApplicationContext"
+                                | "org/springframework/context/support/GenericApplicationContext"
+                                | "org/springframework/context/annotation/AnnotationConfigApplicationContext"
+                                | "org/springframework/web/context/support/GenericWebApplicationContext"
+                                | "org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext"
+                                | "org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext"
+                            )
+                            && method_name == "getApplicationStartup")
+                        // Spring Framework StartupStep methods — ApplicationStartup.start(String)
+                        // and StartupStep.tag/end. The real bytecode requires DefaultApplicationStartup
+                        // which may not be loadable from nested JARs.
+                        || (matches!(
+                                class_name,
+                                "org/springframework/core/metrics/ApplicationStartup"
+                                | "org/springframework/core/metrics/DefaultApplicationStartup"
+                                | "org/springframework/core/metrics/StartupStep"
+                                | "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep"
+                            )
+                            && matches!(method_name, "start" | "tag" | "end" | "getName" | "getTags"));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }

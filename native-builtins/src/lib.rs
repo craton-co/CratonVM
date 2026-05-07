@@ -553,6 +553,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
                 if let Some(Value::Object(Some(msg))) = args.get(1) {
                     ctx.set_field(this, 0, Value::Object(Some(*msg)));
+                    // S111r27 diag: log first few IAE/ISE constructions with messages
+                    if let Some(m) = ctx.read_string(*msg) {
+                        if m.len() > 2 {
+                            eprintln!("[EXINIT-DBG] Exception<init>(msg): {}", &m[..m.len().min(200)]);
+                        }
+                    }
                 }
                 Ok(None)
             },
@@ -6605,6 +6611,13 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase 17.2: GraalVM Native Image Compatibility ---
     graalvm_compat::register_graalvm_compat_natives(registry);
+
+    // --- Spring Framework ApplicationStartup / StartupStep no-op stubs ---
+    // Required for Spring Boot 2.x/3.x apps: AbstractApplicationContext.getApplicationStartup()
+    // must return non-null when ApplicationStartup.DEFAULT cannot be initialized (nested JAR
+    // classloading not yet complete). Without this, AnnotationConfigApplicationContext.<init>
+    // NPEs at the first `this.getApplicationStartup().start(...)` call.
+    phases_late::register_spring_application_startup_natives(registry);
 
     // --- Phase 19.2: Real Crypto Primitives ---
     #[cfg(feature = "legacy-synthetic-crypto")]

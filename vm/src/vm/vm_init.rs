@@ -869,6 +869,16 @@ impl SharedVm {
                 // <clinit> completes; the existing MDC / Logger natives
                 // already cover the actual API surface.
                 rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
+                // Spring Boot 2.x / Spring Framework 5.3.x: AbstractApplicationContext
+                // has a field `applicationStartup = ApplicationStartup.DEFAULT`. If
+                // ApplicationStartup.<clinit> fails (DefaultApplicationStartup can't be
+                // instantiated from nested JARs before the context classloader is set),
+                // the field stays null and AnnotationConfigApplicationContext.<init> NPEs at:
+                //   this.getApplicationStartup().start("spring.context.annotated-bean-reader.create")
+                // Force the native override so getApplicationStartup() always returns a
+                // cheap no-op synthetic object. Paired with the check_override allow-list
+                // entry for AbstractApplicationContext in vm_exec.rs.
+                rustjvm_native_builtins::phases_late::register_spring_application_startup_natives(&mut native_methods);
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
         }
@@ -1018,6 +1028,9 @@ impl SharedVm {
             // branch above for the rationale (Spring Boot 2.x fat-jar
             // <clinit> survival).
             rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
+            // Spring Framework ApplicationStartup / StartupStep no-op stubs.
+            // See companion call in the synthetic-jdk branch above for the rationale.
+            rustjvm_native_builtins::phases_late::register_spring_application_startup_natives(&mut native_methods);
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support
