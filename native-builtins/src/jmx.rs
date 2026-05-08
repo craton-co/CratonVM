@@ -39,7 +39,7 @@ fn uptime_ms() -> u64 {
 // Public registration entry-point
 // ---------------------------------------------------------------------------
 
-pub(crate) fn register_jmx_natives(r: &mut NativeMethodRegistry) {
+pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_management_factory(r);
     register_runtime_mxbean(r);
     register_memory_mxbean(r);
@@ -1248,6 +1248,47 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         "getThreadInfo",
         "(J)Ljava/lang/management/ThreadInfo;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    // Surefire ForkedBooter.generateThreadDump: getThreadInfo([J, I) returns
+    // a per-id ThreadInfo array. Returning an empty array (rather than null)
+    // lets the for-loop in generateThreadDump iterate zero times and finish
+    // cleanly instead of NPE'ing on `arraylength` of null. The array form is
+    // also used by JBoss/Quarkus diagnostics for stack-dump generation.
+    r.register(
+        cls,
+        "getThreadInfo",
+        "([JI)[Ljava/lang/management/ThreadInfo;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        cls,
+        "getThreadInfo",
+        "([J)[Ljava/lang/management/ThreadInfo;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        cls,
+        "getThreadInfo",
+        "([JZZ)[Ljava/lang/management/ThreadInfo;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        cls,
+        "getThreadInfo",
+        "([JZZI)[Ljava/lang/management/ThreadInfo;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
     );
     r.register(
         cls,

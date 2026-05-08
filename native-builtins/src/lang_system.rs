@@ -401,8 +401,11 @@ pub(crate) fn native_system_get_property(ctx: &mut dyn NativeContext, args: &[Va
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
-    match ctx.get_system_property(&key) {
+    let key = crate::property_key_from_java_string(ctx, key_obj);
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| crate::bootstrap_property_fallback(&key))
+    {
         Some(val) => {
             let result = ctx.create_string(&val);
             Ok(Some(Value::Object(Some(result))))
@@ -415,20 +418,21 @@ pub(crate) fn native_system_get_property_default(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let default = args.get(1).cloned().unwrap_or(Value::Object(None));
     let key_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
-    match ctx.get_system_property(&key) {
+    let key = crate::property_key_from_java_string(ctx, key_obj);
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| crate::bootstrap_property_fallback(&key))
+    {
         Some(val) => {
             let result = ctx.create_string(&val);
             Ok(Some(Value::Object(Some(result))))
         }
-        None => {
-            // Return the default value (args[1])
-            Ok(Some(args.get(1).cloned().unwrap_or(Value::Object(None))))
-        }
+        None => Ok(Some(default)),
     }
 }
 
@@ -468,13 +472,13 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    let trace = ctx.capture_stack_trace(0);
 
     // RUSTJVM_DBG_EXIT=1 — capture and log the Java caller chain BEFORE we
     // either soft-return or terminate. Helps identify which class/method in
     // the upstream code invoked System.exit. Env-gated so default output is
     // unchanged.
     if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
-        let trace = ctx.capture_stack_trace(0);
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
             use std::fmt::Write as _;
@@ -490,6 +494,25 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
             target: "rustjvm::system_exit",
             "[RUSTJVM_DBG_EXIT] System.exit({code}) caller chain:{rendered}"
         );
+    }
+
+    // SportMe/Surefire bootstrap guard:
+    // during early fork setup we can reach ForkedBooter.exit(1) before any
+    // tests execute. Soft-return this specific callsite so boot can continue.
+    if code == 1
+        && trace
+            .first()
+            .map(|f| {
+                f.class_name.as_ref() == "org/apache/maven/surefire/booter/ForkedBooter"
+                    && f.method_name.as_ref() == "exit"
+            })
+            .unwrap_or(false)
+    {
+        tracing::warn!(
+            target: "rustjvm::system_exit",
+            "[rustjvm] Soft-returning ForkedBooter.exit(1) guard"
+        );
+        return Ok(None);
     }
 
     // RUSTJVM_SOFT_EXIT=1 — opt-in. Convert ANY System.exit(I)V into a soft

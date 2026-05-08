@@ -21,6 +21,7 @@
 //! mark-sweep of the old generation, freeing unreachable objects back to
 //! the free list.
 
+use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
@@ -674,7 +675,22 @@ impl GenerationalHeap {
     /// Get the length of an array.
     pub fn array_length(&self, obj_ref: ObjectRef) -> usize {
         let header = self.get_header(obj_ref);
-        debug_assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        if header.kind != ObjectKind::Array {
+            // Defensive hardening: native/bootstrap code can occasionally pass a
+            // plain object into array helpers. Returning 0 keeps startup alive,
+            // while diagnostics below pinpoint the exact caller and object shape.
+            let bt = Backtrace::force_capture();
+            eprintln!(
+                "[GC-ARRAY-GUARD] array_length(non-array): kind={:?} class_id={} elem={:?} stored_len={} obj={:?}\nbacktrace:\n{}",
+                header.kind,
+                header.class_id,
+                header.element_type,
+                header.array_length,
+                obj_ref,
+                bt
+            );
+            return 0;
+        }
         header.array_length as usize
     }
 

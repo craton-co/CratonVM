@@ -5580,10 +5580,10 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             Ok(Some(Value::Int(1)))
         },
     );
-    r.register(ses, "schedule", "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |_ctx, _args| Ok(Some(Value::Object(None))));
-    r.register(ses, "schedule", "(Ljava/util/concurrent/Callable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |_ctx, _args| Ok(Some(Value::Object(None))));
-    r.register(ses, "scheduleAtFixedRate", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |_ctx, _args| Ok(Some(Value::Object(None))));
-    r.register(ses, "scheduleWithFixedDelay", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // Do not register no-op schedule* here — `register_p63_scheduled_executor`
+    // (register_essential_natives, phase 63) provides delay-aware scheduling.
+    // These stubs used to overwrite p63 and return null / block real Surefire
+    // fork shutdown sequencing.
     r.register(ses, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))

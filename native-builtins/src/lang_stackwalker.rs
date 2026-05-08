@@ -30,11 +30,26 @@
 //! fields) and return a sentinel anchor / count compatible with the
 //! real `AbstractStackWalker.Decoder` ring-buffer protocol.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry, StackTraceEntry};
 use rustjvm_types::Value;
 use rustjvm_types::error::MethodCallResult;
 
 use crate::alloc_concurrent_synthetic;
+
+/// Decode a `long` JVM argument that may reach natives as `Value::Long` or,
+/// due to interpreter tagging quirks, as `Value::Double` holding the same
+/// 8-byte pattern (e.g. small integer anchors appear as denormal `f64`
+/// values). Treating only `Long` left `anchor=0` on every
+/// `fetchStackFrames` call so `StackWalker` streams never advanced past the
+/// first batch (Spring Boot `deduceMainApplicationClass` → null main class).
+fn value_as_i64_bits(v: Option<&Value>) -> i64 {
+    match v {
+        Some(Value::Long(l)) => *l,
+        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Double(d)) => i64::from_ne_bytes(d.to_ne_bytes()),
+        _ => 0,
+    }
+}
 
 /// StackFrameInfo synthetic layout, mirroring the JDK private class
 /// (`jdk.internal.vm.StackFrameInfo` / `java.lang.StackFrameInfo`).
@@ -87,43 +102,63 @@ fn populate_sfi(
         .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
         .unwrap_or(Value::Object(None));
 
-    let try_set = |ctx: &mut dyn NativeContext, owner: &str, fname: &str, val: Value| {
-        if let Some(idx) = ctx.resolve_field_index(owner, fname) {
-            ctx.set_field(sf, idx, val);
-            true
-        } else {
-            false
-        }
-    };
-    // ClassFrameInfo.classOrMemberName <- Class mirror (real-JDK
-    // declaringClass() unwraps via JLIA which handles Class instances).
-    let mut filled_classmem = try_set(ctx, "java/lang/ClassFrameInfo", "classOrMemberName", class_mirror);
-    if !filled_classmem {
-        filled_classmem = try_set(ctx, "java/lang/StackFrameInfo", "classOrMemberName", class_mirror);
-    }
-    // StackFrameInfo.name <- method name (avoid expandStackFrameInfo path).
-    let filled_name = try_set(ctx, "java/lang/StackFrameInfo", "name", Value::Object(Some(meth_str)));
-    // StackFrameInfo.bci <- byte code index.
-    try_set(ctx, "java/lang/StackFrameInfo", "bci", Value::Int(entry.byte_code_index));
+    // Real `java.lang.StackFrameInfo` layout (`ClassFrameInfo` prefix):
+    //   (0) classOrMemberName, (1) flags, (2) name, (3) type, (4) bci,
+    //   (5) contScope, (6) ste, …
+    //
+    // Do **not** reuse the old 6-field `StackWalker$StackFrame` indices here:
+    // SF_FILENAME was written to slot 2, which is JDK `name`, so
+    // `getMethodName()` (wired to `name`) returned null, Spring's
+    // `deduceMainApplicationClass` never saw `"main"`, and
+    // `StartupInfoLogger` NPE'd on `sourceClass.getPackage()`.
+    ctx.set_field_by_name(sf, "classOrMemberName", class_mirror);
+    ctx.set_field_by_name(sf, "flags", Value::Int(0));
+    ctx.set_field_by_name(sf, "name", Value::Object(Some(meth_str)));
+    ctx.set_field_by_name(sf, "bci", Value::Int(entry.byte_code_index));
 
-    // Always also write our own legacy 6-slot synthetic layout. Our
-    // native getter overrides (`getClassName`, `getMethodName`,
-    // `getDeclaringClass`, etc.) read from these fixed slots, so even
-    // when the real-JDK class is loaded our overrides keep working as
-    // long as we register them with the same dispatch precedence.
-    if !filled_classmem || !filled_name {
-        ctx.set_field(sf, SF_CLASSNAME, Value::Object(Some(cls_str)));
-        ctx.set_field(sf, SF_METHODNAME, Value::Object(Some(meth_str)));
-        ctx.set_field(sf, SF_FILENAME, file_str);
-        ctx.set_field(sf, SF_LINENUMBER, Value::Int(entry.line_number));
-        ctx.set_field(sf, SF_BCI, Value::Int(entry.byte_code_index));
-        ctx.set_field(sf, SF_DECL_INTERNAL, Value::Object(Some(decl_internal)));
-    } else {
-        // Suppress unused-variable warnings on the synthetic-mode
-        // fallback values when real-JDK layout was hit.
-        let _ = (cls_str, file_str, decl_internal);
-    }
+    // Pre-cache `ste` so real JDK `toStackTraceElement()` / `getFileName()` /
+    // `getLineNumber()` paths see a populated element without running
+    // `StackTraceElement.of`.
+    let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
+    ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
+    ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
+    ctx.set_field(ste, 2, file_str);
+    ctx.set_field(ste, 3, Value::Int(entry.line_number));
+    ctx.set_field_by_name(sf, "ste", Value::Object(Some(ste)));
+
+    // `declaring_class_native` fast-path reads `SF_DECL_INTERNAL` — on the
+    // real class this aliases `contScope` (slot 5); we stash the '/'-form
+    // internal name there for class mirror lookup.
+    ctx.set_field(sf, SF_DECL_INTERNAL, Value::Object(Some(decl_internal)));
     sf
+}
+
+fn stack_walk_skip_internals(class_name: &str, method_name: &str) -> bool {
+    class_name == "java/lang/StackWalker"
+        || class_name.starts_with("java/lang/StackWalker$")
+        || class_name == "java/lang/StackStreamFactory"
+        || class_name.starts_with("java/lang/StackStreamFactory$")
+        || (class_name == "java/lang/Thread" && method_name == "getStackTrace")
+        || class_name.starts_with("jdk/internal/reflect/")
+        || class_name == "java/lang/reflect/Method"
+        || class_name.starts_with("java/lang/invoke/MethodHandle")
+        || class_name.starts_with("sun/reflect/")
+}
+
+/// `capture_stack_trace` order is outer→inner; StackWalker streams are
+/// inner→outer with VM-internal walker frames stripped from the inner end.
+/// `fetchStackFrames` reuses the same ordering with `anchor` as an index into
+/// this vector (not into the raw reversed physical trace).
+fn ordered_stack_walk_frames(trace: &[StackTraceEntry]) -> Vec<StackTraceEntry> {
+    let mut iter = trace.iter().rev().peekable();
+    while let Some(e) = iter.peek() {
+        if stack_walk_skip_internals(&e.class_name, &e.method_name) {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    iter.cloned().collect()
 }
 
 /// `AbstractStackWalker.callStackWalk(long mode, int skip, int batch,
@@ -180,61 +215,41 @@ pub(crate) fn native_call_stack_walk(
     };
 
     let trace = ctx.capture_stack_trace(0);
+    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+        eprintln!(
+            "[SW-DBG] callStackWalk capture len={} skip={} batch={}",
+            trace.len(),
+            skip,
+            batch
+        );
+        for (i, e) in trace.iter().enumerate() {
+            eprintln!("  [{}] {}.{}", i, e.class_name, e.method_name);
+        }
+    }
     let buf_len = ctx.array_length(frame_buffer);
     let slack = buf_len.saturating_sub(start_index);
     let capacity = if batch == 0 { slack } else { slack.min(batch) };
 
-    // `capture_stack_trace` produces frames in outermost → innermost order
-    // (oldest frame first, current frame last). The JDK StackWalker
-    // contract is the opposite: the stream begins with the *caller* of
-    // `walk()` and proceeds down toward `main`. So we walk the trace in
-    // reverse, then skip walker / reflection internals so the user-visible
-    // first frame is the one that called `StackWalker.walk(...)`.
-    fn is_walker_internal(name: &str, method: &str) -> bool {
-        name == "java/lang/StackWalker"
-            || name.starts_with("java/lang/StackWalker$")
-            || name == "java/lang/StackStreamFactory"
-            || name.starts_with("java/lang/StackStreamFactory$")
-            || (name == "java/lang/Thread" && method == "getStackTrace")
-            || name.starts_with("jdk/internal/reflect/")
-            || name == "java/lang/reflect/Method"
-            || name.starts_with("java/lang/invoke/MethodHandle")
-            || name.starts_with("sun/reflect/")
+    let ordered = ordered_stack_walk_frames(&trace);
+    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+        eprintln!("[SW-DBG] ordered len={}", ordered.len());
+        for (i, e) in ordered.iter().enumerate() {
+            eprintln!("  ord[{}] {}.{}", i, e.class_name, e.method_name);
+        }
     }
-
     let mut written = 0usize;
-    // Count how many trace entries we walked over (skipped internals +
-    // user-requested `skip` + the entries we materialized). The anchor we
-    // return encodes this cursor so a follow-up `fetchStackFrames` can
-    // resume from the right place.
-    let mut consumed = 0usize;
-    let mut iter = trace.iter().rev().peekable();
-    while let Some(e) = iter.peek() {
-        if is_walker_internal(&e.class_name, &e.method_name) {
-            iter.next();
-            consumed += 1;
-        } else {
-            break;
-        }
-    }
-    for _ in 0..skip {
-        if iter.next().is_some() {
-            consumed += 1;
-        }
-    }
-    for entry in iter {
-        if written >= capacity {
-            break;
-        }
-        let sfi = populate_sfi(ctx, entry);
+    let mut pos = skip.min(ordered.len());
+    while written < capacity && pos < ordered.len() {
+        let sfi = populate_sfi(ctx, &ordered[pos]);
         ctx.set_array_element(
             frame_buffer,
             start_index + written,
             Value::Object(Some(sfi)),
         );
+        pos += 1;
         written += 1;
-        consumed += 1;
     }
+    let consumed = pos;
 
     // Real-JDK contract: `callStackWalk` is supposed to invoke
     // `this.doStackWalk(anchor, skip, batch, startIndex, endIndex)` and
@@ -250,6 +265,12 @@ pub(crate) fn native_call_stack_walk(
     // the SpringApplication banner never fires.
     let end_index = (start_index + written) as i32;
     let _ = mode_long;
+    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+        eprintln!(
+            "[SW-DBG] callStackWalk consumed={} written={} end_index={}",
+            consumed, written, end_index
+        );
+    }
     if let Some(this_ref) = this {
         // Pass `endIndex = startIndex + written` so the FrameBuffer's
         // (origin, fence) range exactly covers the frames we populated.
@@ -298,23 +319,29 @@ pub(crate) fn native_fetch_stack_frames(
     let mut anchor: i64 = 0;
     let mut start_index: i32 = 0;
     let mut frame_buffer = None;
-    // Try JDK 25 layout: this(0), mode:int(1), anchor:long(2-3), numFrames:int(4),
-    // batchSize:int(5), startIndex:int(6), frames(7).
-    if let Some(Value::Long(a)) = args.get(2) {
-        anchor = *a;
+    // JDK 25: (this, int mode, long anchor, int lastBatchFrameCount,
+    //          int batchSize, int startIndex, T[] frames) — observed as
+    //          `args.len() == 7` with `anchor` sometimes tagged as `Double`.
+    if args.len() >= 8 {
+        anchor = value_as_i64_bits(args.get(2));
         if let Some(Value::Int(s)) = args.get(6) {
             start_index = *s;
         }
         if let Some(Value::Object(Some(f))) = args.get(7) {
             frame_buffer = Some(*f);
         }
-    }
-    // Legacy layout: this(0), mode:long(1-2), anchor:long(3-4), batch(5),
-    // startIndex(6), frames(7).
-    if frame_buffer.is_none() {
-        if let Some(Value::Long(a)) = args.get(3) {
-            anchor = *a;
+    } else if args.len() >= 7 {
+        anchor = value_as_i64_bits(args.get(2));
+        if let Some(Value::Int(s)) = args.get(5) {
+            start_index = *s;
         }
+        if let Some(Value::Object(Some(f))) = args.get(6) {
+            frame_buffer = Some(*f);
+        }
+    }
+    // Legacy layout: (this, long mode, long anchor, int batch, int startIndex, frames)
+    if frame_buffer.is_none() {
+        anchor = value_as_i64_bits(args.get(3));
         if let Some(Value::Int(s)) = args.get(5) {
             start_index = *s;
         }
@@ -327,14 +354,31 @@ pub(crate) fn native_fetch_stack_frames(
         None => return Ok(Some(Value::Int(0))),
     };
 
+    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+        eprintln!(
+            "[SW-DBG] fetchStackFrames parsed anchor={} start_index={}",
+            anchor, start_index
+        );
+    }
+
     let cursor = anchor.max(0) as usize;
     let trace = ctx.capture_stack_trace(0);
+    let ordered = ordered_stack_walk_frames(&trace);
+    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+        eprintln!(
+            "[SW-DBG] fetchStackFrames anchor={} start_index={} ordered_len={} trace_len={}",
+            cursor,
+            start_index,
+            ordered.len(),
+            trace.len()
+        );
+    }
     let buf_len = ctx.array_length(buffer);
     let start = start_index.max(0) as usize;
     let slack = buf_len.saturating_sub(start);
     let mut written = 0usize;
     let mut new_cursor = cursor;
-    let entries: Vec<_> = trace.iter().rev().skip(cursor).collect();
+    let entries: Vec<_> = ordered.iter().skip(cursor).collect();
     for entry in entries {
         if written >= slack {
             break;
@@ -454,14 +498,18 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         native_fetch_stack_frames,
     );
 
-    // StackFrameInfo (shares layout with StackWalker$StackFrame).
-    // Register the same 6 accessors so reflective access works.
+    // StackFrameInfo — native overrides run before bytecode (see
+    // `try_stackless_invoke` / `invoke_or_native`).  Read real JDK fields
+    // (`name`, `bci`, `flags`) and the eagerly-filled `ste` mirror.
     let sfi = "java/lang/StackFrameInfo";
     registry.register(sfi, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
+            return Ok(Some(ctx.get_field(ste, 0)));
+        }
         Ok(Some(ctx.get_field(this, SF_CLASSNAME)))
     });
     registry.register(sfi, "getMethodName", "()Ljava/lang/String;", |ctx, args| {
@@ -469,6 +517,10 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        let by_name = ctx.get_field_by_name(this, "name");
+        if matches!(by_name, Value::Object(Some(_))) {
+            return Ok(Some(by_name));
+        }
         Ok(Some(ctx.get_field(this, SF_METHODNAME)))
     });
     registry.register(sfi, "getFileName", "()Ljava/lang/String;", |ctx, args| {
@@ -476,6 +528,9 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
+            return Ok(Some(ctx.get_field(ste, 2)));
+        }
         Ok(Some(ctx.get_field(this, SF_FILENAME)))
     });
     registry.register(sfi, "getLineNumber", "()I", |ctx, args| {
@@ -483,6 +538,16 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(-1))),
         };
+        let flags = match ctx.get_field_by_name(this, "flags") {
+            Value::Int(f) => f,
+            _ => 0,
+        };
+        if (flags & 0x100) != 0 {
+            return Ok(Some(Value::Int(-2)));
+        }
+        if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
+            return Ok(Some(ctx.get_field(ste, 3)));
+        }
         Ok(Some(ctx.get_field(this, SF_LINENUMBER)))
     });
     registry.register(sfi, "getByteCodeIndex", "()I", |ctx, args| {
@@ -490,7 +555,17 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        Ok(Some(ctx.get_field(this, SF_BCI)))
+        let flags = match ctx.get_field_by_name(this, "flags") {
+            Value::Int(f) => f,
+            _ => 0,
+        };
+        if (flags & 0x100) != 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
+        match ctx.get_field_by_name(this, "bci") {
+            Value::Int(bci) => Ok(Some(Value::Int(bci))),
+            _ => Ok(Some(ctx.get_field(this, SF_BCI))),
+        }
     });
     registry.register(
         sfi,
@@ -520,11 +595,12 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ln = match ctx.get_field(this, SF_LINENUMBER) {
-            Value::Int(v) => v,
-            _ => -1,
+        let flags = match ctx.get_field_by_name(this, "flags") {
+            Value::Int(f) => f,
+            _ => 0,
         };
-        Ok(Some(Value::Int(if ln == -2 { 1 } else { 0 })))
+        // java.lang.reflect.Modifier.NATIVE
+        Ok(Some(Value::Int(if (flags & 0x100) != 0 { 1 } else { 0 })))
     });
     registry.register(
         sfi,
@@ -535,6 +611,9 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
+                return Ok(Some(Value::Object(Some(ste))));
+            }
             let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
             ctx.set_field(ste, 0, ctx.get_field(this, SF_CLASSNAME));
             ctx.set_field(ste, 1, ctx.get_field(this, SF_METHODNAME));
@@ -570,6 +649,14 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
             if !internal.is_empty() {
+                if std::env::var_os("RUSTJVM_DEBUG_SFI").is_some()
+                    && internal.contains("InsuranceProjectApplication")
+                {
+                    eprintln!(
+                        "[SFI-DBG] declaringClass internal={internal:?} class_id={:?}",
+                        ctx.class_id_by_name(&internal)
+                    );
+                }
                 if let Some(cid) = ctx.class_id_by_name(&internal) {
                     return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
                 }

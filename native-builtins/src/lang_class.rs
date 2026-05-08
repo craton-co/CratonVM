@@ -396,15 +396,32 @@ pub(crate) fn mirror_class_id(
     None
 }
 
-/// Helper: read the class name from a Class mirror.  In the real-JDK
-/// layout `name` is always at slot 1 (first instance field of Class after
-/// `cachedConstructor`).  Our legacy synthetic layout also stored name at
-/// slot 1, so the lookup is uniform.
+/// Helper: read the **internal** class name from a Class mirror (`pkg/Cls`,
+/// `[I`, etc.).
+///
+/// Prefer the VM reverse-map (`class_id_from_mirror` → [`NativeContext::class_name_of_id`])
+/// for real `java.lang.Class` instances — JDK 25 may store something other
+/// than the internal name at slot 1, which broke `getPackage` and reflective
+/// constructor matching for Spring Boot.
+///
+/// When the mirror is **not** in the reverse map (legacy/unit-test mirrors
+/// that encode `ClassId` only as `int` field 0 and put the internal name in
+/// slot 1), trust slot 1 first; only if it is missing do we fall back to
+/// [`mirror_class_id`] + `class_name_of_id`.
 pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: rustjvm_types::ObjectRef) -> Option<String> {
-    match ctx.get_field(mirror, 1) {
+    if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+        return ctx.class_name_of_id(cid);
+    }
+    let slot1 = match ctx.get_field(mirror, 1) {
         Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
         _ => None,
+    };
+    if let Some(ref s) = slot1 {
+        if !s.is_empty() {
+            return slot1;
+        }
     }
+    mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
 }
 
 pub(crate) fn native_class_is_record(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4214,6 +4231,11 @@ pub(crate) fn native_class_get_declared_constructors(
             .into())
         }
     };
+    // JDK `Class.getDeclaredConstructors0(boolean publicOnly)` — when true,
+    // returns only ACC_PUBLIC <init> (used by `Class.getConstructors()`).
+    // When this native is invoked from the synthetic `getDeclaredConstructors()`
+    // wrapper (args.len()==1), publicOnly is false.
+    let public_only = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
@@ -4223,9 +4245,13 @@ pub(crate) fn native_class_get_declared_constructors(
     };
 
     let methods = ctx.declared_methods(class_id);
-    // Filter to only <init> methods
-    let constructors: Vec<&MethodMetadata> =
-        methods.iter().filter(|m| m.name == "<init>").collect();
+    let constructors: Vec<&MethodMetadata> = methods
+        .iter()
+        .filter(|m| {
+            m.name == "<init>"
+                && (!public_only || (m.access_flags & 0x0001) != 0)
+        })
+        .collect();
 
     let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), constructors.len());
     for (i, meta) in constructors.iter().enumerate() {
@@ -7556,25 +7582,68 @@ pub(crate) fn native_class_get_protection_domain0(
         None => return Ok(Some(Value::Object(None))),
     };
 
-    let code_base = ctx.class_code_base(class_id).unwrap_or_default();
-    // Bootstrap / jimage classes: real JDK returns null here; our synthetic
-    // `class:<internal-name>` URIs are likewise non-addressable code sources
-    // that should surface as null PD so policy code treats them as trusted.
+    let mut code_base = ctx.class_code_base(class_id).unwrap_or_default();
+    // `Class.code_source` can be missing on some mirror edges; Spring Boot's
+    // `Launcher.createArchive` needs a real `file:` URL. Mirror
+    // `Class.getProtectionDomain` (lib.rs): fall back to the first
+    // `java.class.path` entry (the executable JAR for `java -jar`).
+    if code_base.is_empty() || code_base.starts_with("class:") {
+        code_base = ctx
+            .get_system_property("java.class.path")
+            .and_then(|cp| {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                cp.split(sep)
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+    }
     if code_base.is_empty() || code_base.starts_with("class:") {
         return Ok(Some(Value::Object(None)));
     }
+
+    // Nested JAR `code_source` is `jar:file:/outer.jar!/inner.jar`. Spring's
+    // `Archive.create(File)` requires the outer filesystem path only.
+    let code_base = if let Some(rest) = code_base.strip_prefix("jar:file:") {
+        let outer = rest.split('!').next().unwrap_or(rest);
+        let outer = outer.trim_start_matches('/');
+        format!("file:/{}", outer)
+    } else {
+        code_base
+    };
+
+    // HotSpot-style path inside the `file:` URL (always `/C:/…` on Windows).
+    let raw_path = code_base
+        .strip_prefix("file:")
+        .map(str::to_string)
+        .unwrap_or_else(|| code_base.clone());
+    let fwd = raw_path.replace('\\', "/");
+    let path = if fwd.len() >= 2 && fwd.as_bytes()[1] == b':' {
+        format!("/{fwd}")
+    } else {
+        fwd
+    };
 
     // Build CodeSource(url=location, certs=[]) — signer certs are attached
     // as raw byte[] blocks so the reflective surface survives
     // `getCodeSource().getCertificates()` without requiring a full
     // `java.security.cert.Certificate` implementation.
     //
-    // location must be a real java/net/URL object so that JDK bytecode
-    // (e.g. Spring Boot's Launcher.createArchive) can call .toURI() on it.
-    // Storing a raw String here caused native_url_to_uri's override to miss,
-    // falling through to URI$Parser which rejects paths with special chars.
+    // `java.net.URL` uses a 13-field JDK layout where slot 5 is `authority`.
+    // Do **not** call `url_parse` here: our 6-field `URL_FIELD_FULL` index
+    // collides with `authority`, corrupting `URL.toString()` / `toURI()` for
+    // Spring Boot's launcher.
     let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
-    crate::url_parse(ctx, url_obj, &code_base);
+    let path_obj = ctx.create_string(&path);
+    let proto_obj = ctx.create_string("file");
+    let host_obj = ctx.create_string("");
+    ctx.set_field(url_obj, 0, Value::Object(Some(proto_obj)));
+    ctx.set_field(url_obj, 1, Value::Object(Some(host_obj)));
+    ctx.set_field(url_obj, 2, Value::Int(-1));
+    ctx.set_field(url_obj, 3, Value::Object(Some(path_obj)));
+    ctx.set_field(url_obj, 5, Value::Object(None));
+    ctx.set_field(url_obj, 6, Value::Object(Some(path_obj)));
     let cs_cid = ctx
         .ensure_class_initialized("java/security/CodeSource")
         .unwrap_or(rustjvm_types::ClassId::new(0));

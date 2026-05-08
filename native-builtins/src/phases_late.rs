@@ -6282,6 +6282,25 @@ fn raf_read_fully(ctx: &mut dyn NativeContext, fd_id: i32, buf: &mut [u8]) -> Re
 
 /// Read the path string from a File object (field 0).
 fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    // Prefer the real-JDK `getPath()` implementation when Available (correct
+    // `prefixLength` + internal path for `java.io.File` loaded from modules).
+    if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
+        "java/io/File",
+        "getPath",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(this))],
+    ) {
+        let r = ctx.read_string(s).unwrap_or_default();
+        if !r.is_empty() {
+            return file_normalise_path(&r);
+        }
+    }
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
+        let r = ctx.read_string(s).unwrap_or_default();
+        if !r.is_empty() {
+            return file_normalise_path(&r);
+        }
+    }
     let raw = match ctx.get_field(this, 0) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -10649,6 +10668,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     );
     r.register(
         attr,
+        "getValue",
+        "(Ljava/util/jar/Attributes$Name;)Ljava/lang/String;",
+        p59_attributes_get_value_name,
+    );
+    r.register(
+        attr,
         "putValue",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         p59_attributes_put_value,
@@ -11053,6 +11078,10 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
         }
     }
 
+    if dotted == "jakarta.faces.context.FacesContext" {
+        eprintln!("[CU-DBG] ClassUtils.forName({}) -> not found (null fallback)", dotted);
+        return Ok(Some(Value::Object(None)));
+    }
     eprintln!("[CU-DBG] ClassUtils.forName({}) -> ClassNotFoundException", dotted);
     Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into())
 }
@@ -12005,6 +12034,30 @@ fn p59_attributes_get_value(
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
+    Ok(Some(p59_attrs_lookup(ctx, this, &key)))
+}
+
+/// Synthetic `java.util.jar.Attributes.getValue(Attributes.Name)`: resolve the
+/// internal Name token to its backing String key and then reuse the same
+/// case-insensitive lookup used by the String overload.
+fn p59_attributes_get_value_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // JDK Attributes$Name stores the normalized key in field 0 (`name`).
+    // Some call sites may hand us a synthetic object with only that slot set.
+    let key = match ctx.get_field(name_obj, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if key.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
     Ok(Some(p59_attrs_lookup(ctx, this, &key)))
 }
 
@@ -15151,30 +15204,109 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         cl,
         "getResource",
         "(Ljava/lang/String;)Ljava/net/URL;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None))) // resource not found
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            let resource_name = name.trim_start_matches('/');
+            let urls = ctx.find_all_resource_urls(resource_name);
+            let url_str = if let Some(first) = urls.first() {
+                first.clone()
+            } else if ctx.find_resource(resource_name).is_some() {
+                format!("classpath:{name}")
+            } else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+            let full = ctx.create_string(&url_str);
+            ctx.set_field(url_obj, 0, Value::Object(Some(full)));
+            ctx.set_field(url_obj, 5, Value::Object(Some(full)));
+            Ok(Some(Value::Object(Some(url_obj))))
         },
     );
     r.register(
         cl,
         "getResources",
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
-        |ctx, _args| {
-            let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
-            Ok(Some(Value::Object(Some(e))))
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    let e =
+                        alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+                    return Ok(Some(Value::Object(Some(e))));
+                }
+            };
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            let resource_name = name.trim_start_matches('/');
+            let mut urls = ctx.find_all_resource_urls(resource_name);
+            if urls.is_empty() && ctx.find_resource(resource_name).is_some() {
+                urls.push(format!("classpath:{name}"));
+            }
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+            for (i, u) in urls.iter().enumerate() {
+                let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+                let full = ctx.create_string(u);
+                ctx.set_field(url_obj, 0, Value::Object(Some(full)));
+                ctx.set_field(url_obj, 5, Value::Object(Some(full)));
+                ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+            }
+            let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            ctx.set_field(enm, 0, Value::Object(Some(arr)));
+            ctx.set_field(enm, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(enm))))
         },
     );
     r.register(
         cl,
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            let resource_name = name.trim_start_matches('/');
+            if crate::lang_class::t19_h10_validate_resource_name_pub(resource_name).is_none() {
+                return Ok(Some(Value::Object(None)));
+            }
+            match ctx.find_resource(resource_name) {
+                None => Ok(Some(Value::Object(None))),
+                Some(bytes) => Ok(Some(Value::Object(Some(
+                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes),
+                )))),
+            }
+        },
     );
     r.register(
         cl,
         "findResource",
         "(Ljava/lang/String;)Ljava/net/URL;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            // Mirror getResource semantics for callers that invoke the protected method directly.
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            let resource_name = name.trim_start_matches('/');
+            let urls = ctx.find_all_resource_urls(resource_name);
+            let url_str = if let Some(first) = urls.first() {
+                first.clone()
+            } else if ctx.find_resource(resource_name).is_some() {
+                format!("classpath:{name}")
+            } else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+            let full = ctx.create_string(&url_str);
+            ctx.set_field(url_obj, 0, Value::Object(Some(full)));
+            ctx.set_field(url_obj, 5, Value::Object(Some(full)));
+            Ok(Some(Value::Object(Some(url_obj))))
+        },
     );
     r.register(
         cl,
@@ -18041,6 +18173,66 @@ fn scheduled_convert_to_millis(ctx: &mut dyn NativeContext, value: i64, unit_arg
 }
 
 pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
+    fn stpe_ensure_work_queue(ctx: &mut dyn NativeContext, this: ObjectRef) {
+        let has_queue = matches!(ctx.get_field_by_name(this, "workQueue"), Value::Object(Some(_)));
+        if has_queue {
+            return;
+        }
+        // Real JDK STPE expects a non-null workQueue before delayedExecute().
+        // Prefer DelayedWorkQueue; fall back to PriorityBlockingQueue.
+        let queue = match ctx.new_object("java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue") {
+            Ok(Some(Value::Object(Some(q)))) => {
+                let _ = ctx.invoke_special(
+                    "java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue",
+                    "<init>",
+                    "()V",
+                    &[Value::Object(Some(q))],
+                );
+                Some(q)
+            }
+            _ => match ctx.new_object("java/util/concurrent/PriorityBlockingQueue") {
+                Ok(Some(Value::Object(Some(q)))) => {
+                    let _ = ctx.invoke_special(
+                        "java/util/concurrent/PriorityBlockingQueue",
+                        "<init>",
+                        "()V",
+                        &[Value::Object(Some(q))],
+                    );
+                    Some(q)
+                }
+                _ => None,
+            },
+        };
+        if let Some(q) = queue {
+            ctx.set_field_by_name(this, "workQueue", Value::Object(Some(q)));
+        }
+    }
+    fn stpe_init_common(ctx: &mut dyn NativeContext, this: ObjectRef, cores: i32) {
+        let cores = cores.max(1);
+        ctx.set_field(this, 0, Value::Int(cores));
+        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field_by_name(this, "corePoolSize", Value::Int(cores));
+        ctx.set_field_by_name(this, "maximumPoolSize", Value::Int(cores.max(1)));
+        ctx.set_field_by_name(this, "largestPoolSize", Value::Int(cores.max(1)));
+        ctx.set_field_by_name(this, "poolSize", Value::Int(cores.max(1)));
+        stpe_ensure_work_queue(ctx, this);
+    }
+    fn stpe_new_executor(ctx: &mut dyn NativeContext, cores: i32) -> Option<ObjectRef> {
+        let cores = cores.max(1);
+        let obj = match ctx.new_object("java/util/concurrent/ScheduledThreadPoolExecutor") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let _ = ctx.invoke_special(
+            "java/util/concurrent/ScheduledThreadPoolExecutor",
+            "<init>",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(cores)],
+        );
+        stpe_init_common(ctx, obj, cores);
+        Some(obj)
+    }
+
     let stpe = "java/util/concurrent/ScheduledThreadPoolExecutor";
     r.register(stpe, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -18048,10 +18240,23 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        ctx.set_field(this, 0, Value::Int(cores));
-        ctx.set_field(this, 1, Value::Int(0));
+        stpe_init_common(ctx, this, cores);
         Ok(None)
     });
+    r.register(
+        stpe,
+        "<init>",
+        "(ILjava/util/concurrent/ThreadFactory;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cores = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            stpe_init_common(ctx, this, cores);
+            Ok(None)
+        },
+    );
     // WP4.5 — registry-driven scheduling. The pump in
     // `crate::scheduled_pump` invokes `runnable.run()` from the next
     // `Thread.sleep` / `awaitTermination` so periodic tasks observe the
@@ -18256,13 +18461,8 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let obj = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
-                2,
-            );
-            ctx.set_field(obj, 0, Value::Int(cores));
-            ctx.set_field(obj, 1, Value::Int(0));
+            let obj = stpe_new_executor(ctx, cores)
+                .unwrap_or_else(|| alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledThreadPoolExecutor", 2));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -18271,13 +18471,8 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         "newSingleThreadScheduledExecutor",
         "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
-                2,
-            );
-            ctx.set_field(obj, 0, Value::Int(1));
-            ctx.set_field(obj, 1, Value::Int(0));
+            let obj = stpe_new_executor(ctx, 1)
+                .unwrap_or_else(|| alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledThreadPoolExecutor", 2));
             Ok(Some(Value::Object(Some(obj))))
         },
     );

@@ -44,6 +44,8 @@ pub mod pipe;
 pub mod datagram;
 // WP3.8 — WatchService backed by `notify` (inotify / ReadDirectoryChangesW / FSEvents).
 pub mod watch;
+// WP1.12 — ProcessBuilder / Process / ProcessHandleImpl subprocess bridge.
+pub mod process;
 
 #[cfg(test)]
 mod test_support;
@@ -2705,6 +2707,9 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// Register all I/O native methods.
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
+    // WP1.12 — real subprocess + ProcessHandleImpl (must override JDK natives)
+    process::register_process_natives(registry);
+
     // --- sun.nio.ch.FileDispatcherImpl / FileChannelImpl / NativeThread / IOUtil ---
     // Real-JDK-mode NIO natives. Must be registered before any JDK
     // bytecode that touches sun.nio.ch runs, because these natives

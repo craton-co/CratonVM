@@ -477,6 +477,11 @@ pub struct NativeContextImpl<'a> {
     pub thread: &'a mut JvmThread,
 }
 
+#[inline]
+fn normalize_system_property_key(key: &str) -> &str {
+    key.trim_matches(|c: char| c.is_ascii_control() || c == '\0')
+}
+
 impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
@@ -913,6 +918,36 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn array_length(&self, obj: ObjectRef) -> usize {
+        let kind = self.shared.heap.kind_of(obj);
+        if kind != ObjectKind::Array {
+            let class_id = self.shared.heap.class_id_of(obj);
+            let class_name = self
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let top = self
+                .thread
+                .frames
+                .last()
+                .map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor()))
+                .unwrap_or_else(|| "<no-frame>".to_string());
+            eprintln!(
+                "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={}",
+                class_name, kind, top
+            );
+            for (i, f) in self.thread.frames.iter().enumerate().rev().take(8) {
+                eprintln!(
+                    "[ARRAY-LEN-GUARD]   stack[{i}] {}.{}{}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor()
+                );
+            }
+            return 0;
+        }
         self.shared.heap.array_length(obj)
     }
 
@@ -941,7 +976,33 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
-        super::read_java_string(&self.shared.heap, obj)
+        if let Some(s) = super::read_java_string(&self.shared.heap, obj) {
+            return Some(s);
+        }
+        let class_id = self.shared.heap.class_id_of(obj);
+        let cm = self.shared.class_manager.read();
+        if cm
+            .get_class(class_id)
+            .map(|c| &*c.name != "java/lang/String")
+            .unwrap_or(true)
+        {
+            drop(cm);
+            return None;
+        }
+        let vidx = resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?;
+        let cidx = resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store);
+        drop(cm);
+        let value_array = match self.shared.heap.get_field(obj, vidx) {
+            Value::Object(Some(a)) => a,
+            _ => return None,
+        };
+        let coder = cidx
+            .map(|idx| match self.shared.heap.get_field(obj, idx) {
+                Value::Int(c) => c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        super::vm_object::decode_java_string_value_array(&self.shared.heap, value_array, coder)
     }
 
     fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
@@ -961,7 +1022,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn get_system_property(&self, key: &str) -> Option<String> {
-        self.shared.system_properties.read().get(key).cloned()
+        let normalized = normalize_system_property_key(key);
+        self.shared.system_properties.read().get(normalized).cloned()
     }
 
     fn list_system_properties(&self) -> Vec<(String, String)> {
@@ -974,10 +1036,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
+        let normalized = normalize_system_property_key(key).to_string();
         self.shared
             .system_properties
             .write()
-            .insert(key.to_string(), value.to_string())
+            .insert(normalized, value.to_string())
     }
 
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
@@ -5505,6 +5568,7 @@ fn invoke_on_class_shared_inner(
                                 | "setProperty"
                                 | "put"
                                 | "containsKey"
+                                | "stringPropertyNames"
                             ))
                         // S111r7: HashMap / LinkedHashMap / Hashtable /
                         // ConcurrentHashMap and HashSet view-method
@@ -5564,6 +5628,46 @@ fn invoke_on_class_shared_inner(
                                 // our stream pipeline already consumes.
                                 | "spliterator"
                             ))
+                        // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
+                        // getThreadMXBean() — the real-JDK code path delegates
+                        // through `getPlatformMXBean(Class)` + PlatformComponent
+                        // SPI which we don't wire up. Without this override the
+                        // booter's `isDebugging()` and `dumpHelp()` paths throw
+                        // `IllegalArgumentException: ... is not a platform
+                        // management interface` and the fork dies before tests
+                        // start. Force the synthetic-bean natives in `jmx.rs`
+                        // to win.
+                        || (class_name == "java/lang/management/ManagementFactory"
+                            && matches!(
+                                method_name,
+                                "getRuntimeMXBean"
+                                | "getThreadMXBean"
+                                | "getMemoryMXBean"
+                                | "getClassLoadingMXBean"
+                                | "getOperatingSystemMXBean"
+                                | "getCompilationMXBean"
+                                | "getGarbageCollectorMXBeans"
+                                | "getPlatformMBeanServer"
+                            ))
+                        // Surefire bootstrap: force PropertiesWrapper fallbacks
+                        // to win over bytecode. The raw bytecode methods call
+                        // Integer.parseInt(Map.get(...)) directly; when the
+                        // map entry is absent this throws
+                        // NumberFormatException("Cannot parse null string")
+                        // and aborts the fork before tests start.
+                        || (class_name == "org/apache/maven/surefire/booter/PropertiesWrapper"
+                            && matches!(
+                                method_name,
+                                "getProperty"
+                                | "getIntProperty"
+                                | "getBooleanProperty"
+                                | "getLongProperty"
+                            ))
+                        // Surefire fork bootstrap: bypass ServiceLoader-based
+                        // decoder-factory discovery, which can return null in
+                        // partial-bootstrap states and NPE on connect().
+                        || (class_name == "org/apache/maven/surefire/booter/ForkedBooter"
+                            && method_name == "lookupDecoderFactory")
                         // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a
                         // static HashMap) which `Provider.<clinit>` would
@@ -6097,6 +6201,35 @@ fn invoke_on_class_shared_inner(
                     eprintln!(
                         "[NSME_DBG] dispatch_class={class_name} method={method_name}{descriptor} receiver={recv_dbg} caller={caller_dbg}"
                     );
+                }
+                // Compatibility fallback: a few real-world call sites have shown
+                // descriptor canonicalization drift (same signature but object
+                // return type with/without trailing ';'). Before surfacing
+                // NSME, retry native dispatch with the alternate descriptor.
+                let alt_descriptor = if descriptor.ends_with(';') {
+                    descriptor.trim_end_matches(';').to_string()
+                } else {
+                    format!("{descriptor};")
+                };
+                if alt_descriptor != descriptor {
+                    if let Some(cb) =
+                        shared
+                            .native_methods
+                            .find(&class_name, method_name, &alt_descriptor)
+                    {
+                        return safe_native_call(shared, thread, cb, args);
+                    }
+                }
+                // Surefire bootstrap compatibility: older framework bytecode
+                // expects `Thread.getThreadGroup()` very early, before our
+                // synthetic ThreadGroup model is fully wired. Returning null
+                // matches HotSpot's "no group yet" behavior for bootstrap
+                // helper threads and avoids hard-failing the fork startup.
+                if class_name == "java/lang/Thread"
+                    && method_name == "getThreadGroup"
+                    && descriptor == "()Ljava/lang/ThreadGroup;"
+                {
+                    return Ok(Some(Value::Object(None)));
                 }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),

@@ -902,6 +902,31 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
     ];
 
     for cls in throwable_classes.iter() {
+        // Constructor overloads for synthetic Throwable-family stubs.
+        // Some bootstrap paths instantiate subclasses directly (for example
+        // InternalError and NoSuchMethodError wrappers). Register all common
+        // ctor descriptors here so both synthetic and real-JDK flows can
+        // initialize message/cause consistently.
+        r.register(cls, "<init>", "()V", crate::native_noop_with_this);
+        r.register(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;)V",
+            native_exc_init_message,
+        );
+        r.register(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+            native_exc_init_message_cause,
+        );
+        r.register(
+            cls,
+            "<init>",
+            "(Ljava/lang/Throwable;)V",
+            native_exc_init_cause,
+        );
+
         // getMessage()Ljava/lang/String; — read slot 0 (detailMessage).
         r.register(
             cls,

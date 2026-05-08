@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Available garbage collector algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,10 +563,14 @@ pub fn resolve_java_home_public(explicit: Option<&str>) -> Option<PathBuf> {
 ///
 /// Resolution order:
 ///   1. Explicit value passed via `--java-home` CLI flag
-///   2. `JAVA_HOME` environment variable
-///   3. Locate `java` on PATH, then walk up to find the JDK root
+///   2. `RUSTJVM_JAVA_HOME` environment variable (real JDK when `JAVA_HOME`
+///      is a rustjvm shim directory)
+///   3. `JAVA_HOME` environment variable
+///   4. Locate `java` on PATH, then walk up to find the JDK root
 ///      (handles both `$JDK/bin/java` and symlink wrappers like
-///       `C:\Program Files\Common Files\Oracle\Java\javapath\java.exe`)
+///       `C:\Program Files\Common Files\Oracle\Java\javapath\java.exe`).
+///      Skips this step when the first `java` on PATH is the current
+///      executable (rustjvm masquerading as `java.exe`).
 ///
 /// Returns `None` if no valid JDK installation can be found.
 fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
@@ -582,7 +586,16 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    // 2. JAVA_HOME env var
+    // 2. RUSTJVM_JAVA_HOME — used when JAVA_HOME points at a rustjvm shim
+    // tree (Maven, Gradle) but boot modules must come from a real JDK.
+    if let Ok(val) = std::env::var("RUSTJVM_JAVA_HOME") {
+        let p = PathBuf::from(val.trim());
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+
+    // 3. JAVA_HOME env var
     if let Ok(val) = std::env::var("JAVA_HOME") {
         let p = PathBuf::from(&val);
         if p.is_dir() {
@@ -590,7 +603,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
         }
     }
 
-    // 3. Detect from `java` on PATH
+    // 4. Detect from `java` on PATH
     detect_java_home_from_path()
 }
 
@@ -604,7 +617,33 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
 ///   - JDK ≤24: `-XshowSettings:property`  (singular)
 ///   - JDK 25+: `-XshowSettings:properties` (plural)
 ///   - Fallback: `-XshowSettings:all`
+fn first_java_executable_on_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = Path::new(&dir).join(exe);
+        if candidate.is_file() {
+            return std::fs::canonicalize(&candidate)
+                .ok()
+                .or_else(|| Some(candidate));
+        }
+    }
+    None
+}
+
 fn detect_java_home_from_path() -> Option<PathBuf> {
+    // If the first `java` on PATH is this process (e.g. rustjvm installed as
+    // `java.exe` for Maven Surefire), probing it would recurse or yield a
+    // bogus java.home — skip and force explicit JAVA_HOME / RUSTJVM_JAVA_HOME.
+    if let (Ok(this), Some(first)) = (
+        std::env::current_exe().and_then(|p| std::fs::canonicalize(p)),
+        first_java_executable_on_path(),
+    ) {
+        if this == first {
+            return None;
+        }
+    }
+
     // Try the flag variants in order of specificity
     let flag_variants = [
         "-XshowSettings:properties",  // JDK 25+

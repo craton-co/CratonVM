@@ -63,6 +63,22 @@ const MAX_LOAD_BYTES: usize = 16 * 1024 * 1024;
 /// abuse without rejecting realistic inputs.
 const MAX_KV_LEN: usize = 64 * 1024;
 
+#[inline]
+fn props_stderr_diag() -> bool {
+    matches!(
+        std::env::var("RUSTJVM_DIAG_PROPERTIES").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+macro_rules! props_diag_eprintln {
+    ($($t:tt)*) => {
+        if props_stderr_diag() {
+            eprintln!($($t)*);
+        }
+    };
+}
+
 fn table() -> &'static Mutex<FxHashMap<usize, FxHashMap<String, String>>> {
     static T: OnceLock<Mutex<FxHashMap<usize, FxHashMap<String, String>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(FxHashMap::default()))
@@ -118,7 +134,7 @@ fn drain_input_stream(
                     out.push(b as u8);
                 }
             }
-            eprintln!("[DRAIN-DBG] drain_input_stream: by-name read {} bytes", out.len());
+            props_diag_eprintln!("[DRAIN-DBG] drain_input_stream: by-name read {} bytes", out.len());
             return Some(out);
         }
     }
@@ -150,7 +166,7 @@ fn drain_input_stream(
                     out.push(b as u8);
                 }
             }
-            eprintln!("[DRAIN-DBG] drain_input_stream: by-index read {} bytes", out.len());
+            props_diag_eprintln!("[DRAIN-DBG] drain_input_stream: by-index read {} bytes", out.len());
             return Some(out);
         }
     }
@@ -172,7 +188,14 @@ fn drain_input_stream(
             ],
         ) {
             Ok(Some(Value::Int(n))) => n,
-            _ => break,
+            Ok(other) => {
+                props_diag_eprintln!(
+                    "[DRAIN-DBG] drain_input_stream: read returned non-int {:?}",
+                    other
+                );
+                return None;
+            }
+            Err(_) => return None,
         };
         if n <= 0 {
             break;
@@ -186,13 +209,13 @@ fn drain_input_stream(
             return None;
         }
     }
-    if !out.is_empty() {
-        eprintln!("[DRAIN-DBG] drain_input_stream: invoke_virtual read {} bytes", out.len());
-        Some(out)
-    } else {
-        eprintln!("[DRAIN-DBG] drain_input_stream: all strategies failed");
-        None
-    }
+    // Empty stream / immediate EOF is valid — `Properties.load` must still
+    // complete (Surefire booter uses an optional props stream).
+    props_diag_eprintln!(
+        "[DRAIN-DBG] drain_input_stream: invoke_virtual read path, {} bytes",
+        out.len()
+    );
+    Some(out)
 }
 
 /// Parse a Java-style `.properties` file's bytes.  Implements the JLS
@@ -380,6 +403,42 @@ fn get_kv(obj: ObjectRef, key: &str) -> Option<String> {
     table().lock().get(&key_for(obj))?.get(key).cloned()
 }
 
+/// Cross-module read access for callers that receive a `Properties` object
+/// behind an erased `Map` type (e.g. surefire `PropertiesWrapper`).
+pub(crate) fn get_property_from_sidetable(obj: ObjectRef, key: &str) -> Option<String> {
+    get_kv(obj, key)
+}
+
+/// Public re-export of `put_kv` so other modules (e.g. the surefire
+/// `SystemPropertyManager.loadProperties` native in `lib.rs`) can store
+/// key/value pairs in the side-table keyed by an arbitrary object
+/// reference.  Used to back `PropertiesWrapper` lookups when the
+/// real-JDK CHM round-trip does not populate the wrapper's internal
+/// `properties` field correctly under our interpreter.
+pub fn store_property_in_sidetable(obj: ObjectRef, key: &str, value: &str) {
+    put_kv(obj, key, value);
+}
+
+/// Public snapshot of side-table entries for a given object, used by
+/// surefire `setAsSystemProperties` etc. to iterate entries without
+/// going through the inner Map field.
+pub fn snapshot_sidetable(obj: ObjectRef) -> Vec<(String, String)> {
+    snapshot_kv(obj)
+}
+
+/// Public re-export of `drain_input_stream` for use from `lib.rs`.
+pub fn drain_input_stream_pub(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+) -> Option<Vec<u8>> {
+    drain_input_stream(ctx, stream)
+}
+
+/// Public re-export of `parse_properties` for use from `lib.rs`.
+pub fn parse_properties_pub(bytes: &[u8]) -> Vec<(String, String)> {
+    parse_properties(bytes)
+}
+
 /// Snapshot the side-table entries for a Properties object.  Returns
 /// an empty vector if the object isn't tracked.  Used by `keySet`,
 /// `entrySet`, `values`, `keys`, `elements` natives so the iteration
@@ -398,6 +457,63 @@ fn count_kv(obj: ObjectRef) -> usize {
         .get(&key_for(obj))
         .map(|m| m.len())
         .unwrap_or(0)
+}
+
+/// After native `load` fills the side-table, mirror each (k,v) into the
+/// JDK `Properties` backing store.  Since JDK 17+, entries live in a
+/// `ConcurrentHashMap` field `map`; `stringPropertyNames()` (used by
+/// Surefire `SystemPropertyManager.loadProperties`) enumerates via
+/// `entrySet()` on that map — not the legacy Hashtable table.  If `map`
+/// is absent (very old layout), fall back to `Hashtable.put` (invokespecial).
+fn mirror_loaded_entries_to_properties_backend(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    parsed: &[(String, String)],
+) {
+    let chm = match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => m,
+        Value::Object(None) | _ => {
+            let Some(m) = (match ctx.new_object("java/util/concurrent/ConcurrentHashMap") {
+                Ok(Some(Value::Object(Some(o)))) => Some(o),
+                _ => None,
+            }) else {
+                for (k, v) in parsed {
+                    let k_obj = ctx.create_string(k);
+                    let v_obj = ctx.create_string(v);
+                    let _ = ctx.invoke_special(
+                        "java/util/Hashtable",
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[
+                            Value::Object(Some(this)),
+                            Value::Object(Some(k_obj)),
+                            Value::Object(Some(v_obj)),
+                        ],
+                    );
+                }
+                return;
+            };
+            let _ = ctx.invoke(
+                "java/util/concurrent/ConcurrentHashMap",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(m))],
+            );
+            ctx.set_field_by_name(this, "map", Value::Object(Some(m)));
+            m
+        }
+    };
+
+    for (k, v) in parsed {
+        let k_obj = ctx.create_string(k);
+        let v_obj = ctx.create_string(v);
+        let _ = ctx.invoke_virtual(
+            chm,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_obj)), Value::Object(Some(v_obj))],
+        );
+    }
 }
 
 /// Native `Properties.load(InputStream)` — drains the stream, parses
@@ -423,15 +539,22 @@ fn native_properties_load(
         return Ok(None);
     }
     let parsed = parse_properties(&bytes);
-    eprintln!("[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes", parsed.len(), bytes.len());
+    eprintln!(
+        "[PROPS-LOAD] obj={:?} stream_bytes={} parsed_entries={}",
+        this,
+        bytes.len(),
+        parsed.len()
+    );
+    props_diag_eprintln!("[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes", parsed.len(), bytes.len());
     for (k, v) in &parsed {
         if k.contains("ApplicationContext") || k.contains("ContextFactory") {
             let preview_len = v.len().min(80);
-            eprintln!("[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}", k, v.len(), &v[..preview_len]);
+            props_diag_eprintln!("[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}", k, v.len(), &v[..preview_len]);
         }
         put_kv(this, k, v);
     }
-    eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(this), this);
+    mirror_loaded_entries_to_properties_backend(ctx, this, &parsed);
+    props_diag_eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(this), this);
     Ok(None)
 }
 
@@ -539,9 +662,11 @@ fn native_properties_load_reader(
     if bytes.len() > MAX_LOAD_BYTES {
         return Ok(None);
     }
-    for (k, v) in parse_properties(&bytes) {
-        put_kv(this, &k, &v);
+    let parsed = parse_properties(&bytes);
+    for (k, v) in &parsed {
+        put_kv(this, k, v);
     }
+    mirror_loaded_entries_to_properties_backend(ctx, this, &parsed);
     Ok(None)
 }
 
@@ -568,11 +693,24 @@ fn native_properties_get_property_1(
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
+    let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(this, &key) {
+        eprintln!(
+            "[PROPS-GET] this={:?} key={:?} -> sidetable hit ({} bytes)",
+            this,
+            key,
+            v.len()
+        );
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
-    match ctx.get_system_property(&key) {
+    eprintln!(
+        "[PROPS-GET] this={:?} key={:?} -> sidetable MISS, falling back to system",
+        this, key
+    );
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| super::bootstrap_property_fallback(&key))
+    {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),
     }
@@ -594,11 +732,14 @@ fn native_properties_get_property_2(
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(default)),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
+    let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(this, &key) {
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
-    match ctx.get_system_property(&key) {
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| super::bootstrap_property_fallback(&key))
+    {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(default)),
     }
@@ -715,11 +856,14 @@ fn native_properties_get(
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
+    let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(this, &key) {
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
-    match ctx.get_system_property(&key) {
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| super::bootstrap_property_fallback(&key))
+    {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),
     }
@@ -769,7 +913,14 @@ fn build_key_set(
         let s = ctx.create_string(k);
         elems.push(Value::Object(Some(s)));
     }
-    rustjvm_native_collections::make_hashset_with_elements(ctx, &elems)
+    let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
+    eprintln!(
+        "[KEYSET-DBG] build_key_set this={:?} keys={} set={:?}",
+        this,
+        snapshot.len(),
+        set
+    );
+    set
 }
 
 /// Build a synthetic `ArrayList<String>` populated with the side-table
@@ -789,6 +940,28 @@ fn build_value_list(
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(snapshot.len() as i32));
     list
+}
+
+/// Native `Properties.stringPropertyNames()Ljava/util/Set;` — Surefire
+/// `SystemPropertyManager.loadProperties` copies loaded entries into a
+/// `ConcurrentHashMap` via `p.stringPropertyNames()` then `p.getProperty(key)`.
+/// JDK bytecode walks `entrySet()` on the internal CHM `map` field, but our
+/// `Properties.<init>` native skips populating that CHM, so the bytecode
+/// would yield an empty set even when `Properties.load` succeeded. Return
+/// the side-table keys directly so the fork sees the loaded properties.
+fn native_properties_string_property_names(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let set = build_key_set(ctx, this);
+    Ok(Some(Value::Object(Some(set))))
 }
 
 /// Native `Properties.keySet()Ljava/util/Set;` — returns a synthetic
@@ -845,12 +1018,12 @@ fn native_properties_entry_set(
         }
     };
     let snapshot = snapshot_kv(this);
-    eprintln!("[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}", snapshot.len(), this);
+    props_diag_eprintln!("[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}", snapshot.len(), this);
     if snapshot.is_empty() {
-        eprintln!("[PROPS-DBG] WARNING: entrySet() called on empty side-table obj {:?}", this);
+        props_diag_eprintln!("[PROPS-DBG] WARNING: entrySet() called on empty side-table obj {:?}", this);
     }
     for (k, _v) in snapshot.iter().take(5) {
-        eprintln!("[PROPS-DBG]   entry key={}", k);
+        props_diag_eprintln!("[PROPS-DBG]   entry key={}", k);
     }
     let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
     for (k, v) in &snapshot {
@@ -1060,6 +1233,12 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "keySet",
         "()Ljava/util/Set;",
         native_properties_key_set,
+    );
+    registry.register(
+        "java/util/Properties",
+        "stringPropertyNames",
+        "()Ljava/util/Set;",
+        native_properties_string_property_names,
     );
     registry.register(
         "java/util/Properties",

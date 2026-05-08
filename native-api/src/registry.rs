@@ -1335,7 +1335,53 @@ impl NativeMethodRegistry {
         descriptor: &str,
     ) -> Option<NativeCallback> {
         let key = native_method_hash(class_name, method_name, descriptor);
-        self.methods.get(&key).copied()
+        if let Some(cb) = self.methods.get(&key).copied() {
+            return Some(cb);
+        }
+
+        // Compatibility lookup path for descriptor drift observed in
+        // real-world app boots:
+        // - accidental control/whitespace suffix/prefix in descriptors
+        // - object return descriptors missing trailing ';'
+        // We keep this as a miss-only fallback to preserve the fast path.
+        let mut variants: Vec<String> = Vec::with_capacity(4);
+
+        let trimmed = descriptor.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
+        if trimmed != descriptor {
+            variants.push(trimmed.to_string());
+        }
+
+        let no_newlines = trimmed.replace(['\r', '\n'], "");
+        if no_newlines != descriptor && !variants.iter().any(|v| v == &no_newlines) {
+            variants.push(no_newlines.clone());
+        }
+
+        for base in [trimmed, no_newlines.as_str()] {
+            if let Some(rparen) = base.rfind(')') {
+                let (args_part, ret_part) = base.split_at(rparen + 1);
+                if ret_part.starts_with('L') {
+                    if !ret_part.ends_with(';') {
+                        let fixed = format!("{args_part}{ret_part};");
+                        if fixed != descriptor && !variants.iter().any(|v| v == &fixed) {
+                            variants.push(fixed);
+                        }
+                    } else if let Some(stripped) = ret_part.strip_suffix(';') {
+                        let fixed = format!("{args_part}{stripped}");
+                        if fixed != descriptor && !variants.iter().any(|v| v == &fixed) {
+                            variants.push(fixed);
+                        }
+                    }
+                }
+            }
+        }
+
+        for candidate in variants {
+            let k = native_method_hash(class_name, method_name, &candidate);
+            if let Some(cb) = self.methods.get(&k).copied() {
+                return Some(cb);
+            }
+        }
+        None
     }
 
     /// NEW-14: copy every native method currently registered under

@@ -422,8 +422,6 @@ fn hostname_string() -> String {
 // ---------------------------------------------------------------------------
 
 pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
-    println!("[w3a2] register_phase_e_networking called STDOUT");
-    eprintln!("[w3a2] register_phase_e_networking called STDERR");
     register_re1_socket(registry);
     register_re2_server_socket(registry);
     register_re3_inet_address(registry);
@@ -448,20 +446,32 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 /// Read the raw URI string from a synthetic URI object.
-/// Tries field 6 (raw) first; falls back to field 0 (scheme/raw in
-/// some callers that store the full string there).
+/// Tries field 6 (alternate "raw" slot used by some JDK-shaped synthetics),
+/// then field 5 (`URL_FIELD_FULL` from `url_parse` / `native_url_to_uri`),
+/// then field 0 only when it looks like a complete URI (contains `:` after
+/// the scheme), so we don't mistake a bare `"file"` scheme token for the
+/// full `file:/C:/...` string.
 fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
-    match ctx.get_field(uri, 6) {
-        Value::Object(Some(s)) => {
-            if let Some(r) = ctx.read_string(s) {
-                if !r.is_empty() { return r; }
+    for &idx in &[6usize, 5usize] {
+        match ctx.get_field(uri, idx) {
+            Value::Object(Some(s)) => {
+                if let Some(r) = ctx.read_string(s) {
+                    if !r.is_empty() {
+                        return r;
+                    }
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
-    // Fallback: field 0
     match ctx.get_field(uri, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        Value::Object(Some(s)) => {
+            let v = ctx.read_string(s).unwrap_or_default();
+            if v.contains(":/") || v.contains(":\\") {
+                return v;
+            }
+            String::new()
+        }
         _ => String::new(),
     }
 }
@@ -1988,26 +1998,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         };
         let url_str = ctx.read_string(url_str_obj).unwrap_or_default();
 
-        // Try to create a real URI via URI(String) constructor.
-        let real_uri = (|| -> Option<ObjectRef> {
-            let uri_obj = match ctx.new_object("java/net/URI") {
-                Ok(Some(Value::Object(Some(o)))) => o,
-                _ => return None,
-            };
-            ctx.invoke(
-                "java/net/URI",
-                "<init>",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(uri_obj)), Value::Object(Some(url_str_obj))],
-            ).ok()?;
-            Some(uri_obj)
-        })();
-
-        if let Some(uri) = real_uri {
-            return Ok(Some(Value::Object(Some(uri))));
-        }
-
-        // Fallback: synthetic URI. Layout per http2.rs:
+        // Always build a synthetic URI. Returning a real-JDK URI here leaves
+        // our `URI.getSchemeSpecificPart()` override without access to the raw
+        // string (layout differs), which can degrade to empty SSP and break
+        // Spring Boot's `new File(url.toURI().getSchemeSpecificPart())` path.
+        // Layout per http2.rs:
         //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         let raw_s = ctx.create_string(&url_str);
@@ -2480,6 +2475,122 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             eprintln!("[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)");
             Ok(None)
         },
+    );
+
+    // S111r24 — Some loader paths can hand a null URL into
+    // ResourceUtils.isFileURL/isJarURL during fallback probing. HotSpot-side
+    // Spring code expects "not file/jar" in this case; without a guard we
+    // NPE on `url.getProtocol()` and abort startup.
+    r.register(
+        "org/springframework/util/ResourceUtils",
+        "isFileURL",
+        "(Ljava/net/URL;)Z",
+        |ctx, args| {
+            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+                eprintln!("[DBG_SBLOAD] ResourceUtils.isFileURL native override");
+            }
+            let url = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let proto = match ctx.invoke_virtual(url, "getProtocol", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let is_file = proto == "file" || proto == "vfsfile" || proto == "vfs";
+            Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
+        },
+    );
+    r.register(
+        "org/springframework/util/ResourceUtils",
+        "isJarURL",
+        "(Ljava/net/URL;)Z",
+        |ctx, args| {
+            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+                eprintln!("[DBG_SBLOAD] ResourceUtils.isJarURL native override");
+            }
+            let url = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let proto = match ctx.invoke_virtual(url, "getProtocol", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let is_jar = matches!(
+                proto.as_str(),
+                "jar" | "war" | "zip" | "vfszip" | "wsjar"
+            );
+            Ok(Some(Value::Int(if is_jar { 1 } else { 0 })))
+        },
+    );
+
+    // S111r25 — Banner lookup is best-effort; unresolved classpath URLs can
+    // trip `new UrlResource(null)` on some fallback paths. Returning null
+    // from both banner resolvers keeps boot moving (Spring then uses no
+    // custom banner or the default fallback).
+    r.register(
+        "org/springframework/boot/SpringApplicationBannerPrinter",
+        "getTextBanner",
+        "(Lorg/springframework/core/env/Environment;)Lorg/springframework/boot/Banner;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        "org/springframework/boot/SpringApplicationBannerPrinter",
+        "getImageBanner",
+        "(Lorg/springframework/core/env/Environment;)Lorg/springframework/boot/Banner;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // S111r27 — Keep optional integrations truly optional. Spring computes
+    // several static "xxxPresent" flags via ClassUtils.isPresent(...); when
+    // these flip true under partial emulation, later probes may dive into
+    // missing subsystems (JSF/Groovy) and destabilize bootstrap.
+    r.register(
+        "org/springframework/util/ClassUtils",
+        "isPresent",
+        "(Ljava/lang/String;Ljava/lang/ClassLoader;)Z",
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if name == "jakarta.faces.context.FacesContext" || name.starts_with("groovy.") {
+                return Ok(Some(Value::Int(0)));
+            }
+            let internal = name.replace('.', "/");
+            let present = ctx.ensure_class_initialized(&internal).is_ok();
+            Ok(Some(Value::Int(if present { 1 } else { 0 })))
+        },
+    );
+
+    // S111r26 — JSF integration is optional; when the Faces API is absent,
+    // Spring's FacesDependencyRegistrar probe should effectively no-op.
+    // In our current runtime, that probe can escalate into hard failure via
+    // NoClassDefFoundError on jakarta.faces.*. Short-circuit it.
+    r.register(
+        "org/springframework/web/context/support/WebApplicationContextUtils$FacesDependencyRegistrar",
+        "registerFacesDependencies",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "org/springframework/web/context/support/WebApplicationContextUtils",
+        "registerWebApplicationScopes",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "org/springframework/web/context/support/WebApplicationContextUtils",
+        "registerWebApplicationScopes",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;Ljakarta/servlet/ServletContext;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext",
+        "registerWebApplicationScopes",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        |_ctx, _args| Ok(None),
     );
 
     // AbstractFileResolvingResource.customizeConnection(URLConnection) — no-op

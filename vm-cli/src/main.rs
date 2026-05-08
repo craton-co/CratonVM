@@ -303,6 +303,43 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Rewrite common HotSpot launcher spellings so clap can parse them.
+///
+/// Surefire / tooling often invokes `java -classpath …` and `java -jar …`.
+/// Our clap schema uses `--classpath` / `--jar`; bare `-classpath` used to be
+/// misparsed as `-c` with value `lasspath`, breaking Maven test runs.
+fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
+    if args.is_empty() {
+        return args;
+    }
+    let mut out = vec![args[0].clone()];
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-jar" && i + 1 < args.len() {
+            out.push("--jar".into());
+            out.push(args[i + 1].clone());
+            i += 2;
+        } else if (a == "-classpath" || a == "-cp") && i + 1 < args.len() {
+            out.push("--classpath".into());
+            out.push(args[i + 1].clone());
+            i += 2;
+        } else if let Some(rest) = a.strip_prefix("-classpath=") {
+            out.push("--classpath".into());
+            out.push(rest.to_string());
+            i += 1;
+        } else if let Some(rest) = a.strip_prefix("-cp=") {
+            out.push("--classpath".into());
+            out.push(rest.to_string());
+            i += 1;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Pre-process raw command-line arguments to extract `-Dkey=value` system
 /// property flags (Java-style) before handing the rest to clap.  Returns
 /// `(filtered_args, system_properties)`.
@@ -387,7 +424,7 @@ fn run() -> Result<()> {
         .init();
 
     // Extract -Dkey=value system properties before clap parsing
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<String> = normalize_java_launcher_argv(std::env::args().collect());
     let (filtered_args, system_properties) = extract_system_properties(raw_args);
     // T6 CLI compat: strip HotSpot-style flags before clap so their
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
@@ -459,11 +496,13 @@ fn run() -> Result<()> {
     } else {
         // Class name mode
         let cn = args.class_name.as_ref().unwrap().replace('.', "/");
-        let cp = args
-            .classpath
-            .as_ref()
-            .map(|cp| VmConfig::parse_classpath(cp))
-            .unwrap_or_default();
+        let cp = if let Some(cp) = args.classpath.as_ref() {
+            VmConfig::parse_classpath(cp)
+        } else if let Ok(env_cp) = std::env::var("CLASSPATH") {
+            VmConfig::parse_classpath(&env_cp)
+        } else {
+            Vec::new()
+        };
         let cp = expand_aggregate_jars(cp);
         (cn, cp)
     };
@@ -1569,6 +1608,35 @@ mod tests {
         let raw = vec!["rustjvm".to_string(), "-Dpath=a=b".to_string()];
         let (_, props) = extract_system_properties(raw);
         assert_eq!(props, vec![("path".to_string(), "a=b".to_string())]);
+    }
+
+    #[test]
+    fn normalize_classpath_and_jar_for_clap() {
+        let raw = vec![
+            "rustjvm".to_string(),
+            "-classpath".to_string(),
+            "a;b".to_string(),
+            "-cp=c:d".to_string(),
+            "-jar".to_string(),
+            "app.jar".to_string(),
+            "arg1".to_string(),
+        ];
+        assert_eq!(
+            normalize_java_launcher_argv(raw),
+            vec![
+                "rustjvm",
+                "--classpath",
+                "a;b",
+                "--classpath",
+                "c:d",
+                "--jar",
+                "app.jar",
+                "arg1",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
     }
 
     // -----------------------------------------------------------------------
