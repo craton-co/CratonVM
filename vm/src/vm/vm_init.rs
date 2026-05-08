@@ -749,7 +749,96 @@ impl SharedVm {
                 // register_builtins — synthetic overrides assume synthetic field
                 // layouts and corrupt real JDK objects.
                 register_essential_natives(&mut native_methods);
+                native_methods.register(
+                    "java/util/concurrent/ScheduledThreadPoolExecutor",
+                    "<init>",
+                    "(ILjava/util/concurrent/ThreadFactory;)V",
+                    |ctx, args| {
+                        let this = match args.first() {
+                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(None),
+                        };
+                        let cores = match args.get(1) {
+                            Some(rustjvm_types::Value::Int(v)) => *v,
+                            _ => 1,
+                        };
+                        ctx.set_field(this, 0, rustjvm_types::Value::Int(cores));
+                        ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                        Ok(None)
+                    },
+                );
+                native_methods.register(
+                    "java/util/concurrent/CopyOnWriteArrayList",
+                    "addIfAbsent",
+                    "(Ljava/lang/Object;)Z",
+                    |ctx, args| {
+                        let this = match args.first() {
+                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        };
+                        let elem = args
+                            .get(1)
+                            .copied()
+                            .unwrap_or(rustjvm_types::Value::Object(None));
+                        ctx.monitor_enter(this);
+                        let size = match ctx.get_field(this, 1) {
+                            rustjvm_types::Value::Int(n) => n.max(0) as usize,
+                            _ => 0,
+                        };
+                        let old_arr = match ctx.get_field(this, 0) {
+                            rustjvm_types::Value::Object(Some(a)) => a,
+                            _ => {
+                                let a = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                                ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(a)));
+                                a
+                            }
+                        };
+                        for i in 0..size {
+                            if ctx.get_array_element(old_arr, i) == elem {
+                                ctx.monitor_exit(this);
+                                return Ok(Some(rustjvm_types::Value::Int(0)));
+                            }
+                        }
+                        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+                        for i in 0..size {
+                            ctx.set_array_element(new_arr, i, ctx.get_array_element(old_arr, i));
+                        }
+                        ctx.set_array_element(new_arr, size, elem);
+                        ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(new_arr)));
+                        ctx.set_field(this, 1, rustjvm_types::Value::Int((size + 1) as i32));
+                        ctx.monitor_exit(this);
+                        Ok(Some(rustjvm_types::Value::Int(1)))
+                    },
+                );
+                native_methods.register(
+                    "java/util/concurrent/atomic/AtomicBoolean",
+                    "<init>",
+                    "(Z)V",
+                    |ctx, args| {
+                        let this = match args.first() {
+                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(None),
+                        };
+                        let v = match args.get(1) {
+                            Some(rustjvm_types::Value::Int(n)) if *n != 0 => 1,
+                            _ => 0,
+                        };
+                        ctx.set_field(this, 0, rustjvm_types::Value::Int(v));
+                        Ok(None)
+                    },
+                );
                 register_io_natives(&mut native_methods);
+                // Mixed real-JDK mode still routes many collection call sites
+                // through synthetic wrappers; register collection natives so
+                // ArrayList/Iterator/Map operations don't fail linkage.
+                register_collections_natives(&mut native_methods);
+                // Re-register the side-table-backed Properties natives AFTER
+                // `register_collections_natives` (see real-JDK arm below for
+                // rationale) — Surefire's BooterDeserializer needs the
+                // side-table round-trip to retrieve forkNumber et al.
+                rustjvm_native_builtins::properties_sidetable::register_properties_sidetable(
+                    &mut native_methods,
+                );
                 // T12: Register JDK 25 Unsafe natives (addressSize0, fences, etc.)
                 rustjvm_native_builtins::unsafe_jdk25::register_t12_unsafe_natives(&mut native_methods);
                 // T14: Register System bootstrap natives (SystemProps$Raw, FileDescriptor, etc.)
@@ -840,6 +929,17 @@ impl SharedVm {
                 // UnsatisfiedLinkError. Lives outside register_jmx_natives
                 // (which is synthetic-only) so the real-JDK path picks it up.
                 rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+                // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
+                // friends. The real-JDK bytecode delegates to
+                // `getPlatformMXBean(Class)` which throws "X is not a platform
+                // management interface" because the PlatformMBeanProvider SPI
+                // is not wired up. Register the synthetic-bean shortcut natives
+                // so the public factory methods short-circuit to
+                // alloc_runtime_mxbean / alloc_thread_mxbean / etc., letting
+                // ForkedBooter.isDebugging() / dumpHelp() succeed and the
+                // forked test JVM continue past constructor.
+                #[cfg(feature = "experimental-jmx")]
+                rustjvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
                 // RKC16N.11: pre-register the rest of the sun.management.*
                 // native surface so future Keycloak-boot iterations don't
                 // trip on missing-native errors as JMM init walks deeper.
@@ -885,7 +985,99 @@ impl SharedVm {
         #[cfg(not(feature = "synthetic-jdk"))]
         {
             register_essential_natives(&mut native_methods);
+            native_methods.register(
+                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "<init>",
+                "(ILjava/util/concurrent/ThreadFactory;)V",
+                |ctx, args| {
+                    let this = match args.first() {
+                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(None),
+                    };
+                    let cores = match args.get(1) {
+                        Some(rustjvm_types::Value::Int(v)) => *v,
+                        _ => 1,
+                    };
+                    ctx.set_field(this, 0, rustjvm_types::Value::Int(cores));
+                    ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                    Ok(None)
+                },
+            );
+            native_methods.register(
+                "java/util/concurrent/CopyOnWriteArrayList",
+                "addIfAbsent",
+                "(Ljava/lang/Object;)Z",
+                |ctx, args| {
+                    let this = match args.first() {
+                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    };
+                    let elem = args
+                        .get(1)
+                        .copied()
+                        .unwrap_or(rustjvm_types::Value::Object(None));
+                    ctx.monitor_enter(this);
+                    let size = match ctx.get_field(this, 1) {
+                        rustjvm_types::Value::Int(n) => n.max(0) as usize,
+                        _ => 0,
+                    };
+                    let old_arr = match ctx.get_field(this, 0) {
+                        rustjvm_types::Value::Object(Some(a)) => a,
+                        _ => {
+                            let a = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                            ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(a)));
+                            a
+                        }
+                    };
+                    for i in 0..size {
+                        if ctx.get_array_element(old_arr, i) == elem {
+                            ctx.monitor_exit(this);
+                            return Ok(Some(rustjvm_types::Value::Int(0)));
+                        }
+                    }
+                    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+                    for i in 0..size {
+                        ctx.set_array_element(new_arr, i, ctx.get_array_element(old_arr, i));
+                    }
+                    ctx.set_array_element(new_arr, size, elem);
+                    ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(new_arr)));
+                    ctx.set_field(this, 1, rustjvm_types::Value::Int((size + 1) as i32));
+                    ctx.monitor_exit(this);
+                    Ok(Some(rustjvm_types::Value::Int(1)))
+                },
+            );
+            native_methods.register(
+                "java/util/concurrent/atomic/AtomicBoolean",
+                "<init>",
+                "(Z)V",
+                |ctx, args| {
+                    let this = match args.first() {
+                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(None),
+                    };
+                    let v = match args.get(1) {
+                        Some(rustjvm_types::Value::Int(n)) if *n != 0 => 1,
+                        _ => 0,
+                    };
+                    ctx.set_field(this, 0, rustjvm_types::Value::Int(v));
+                    Ok(None)
+                },
+            );
             register_io_natives(&mut native_methods);
+            register_collections_natives(&mut native_methods);
+            // Re-register the side-table-backed Properties natives AFTER
+            // `register_collections_natives` because that earlier call
+            // re-registers `Properties.load`, `getProperty`, `setProperty`,
+            // `put`, `get`, `stringPropertyNames` etc. with the legacy
+            // HashMap-layout natives, overwriting the side-table-backed
+            // implementations from `register_essential_natives`.  The
+            // side-table is required for Surefire's
+            // `SystemPropertyManager.loadProperties(InputStream)` round-trip
+            // (load → stringPropertyNames → getProperty) so the forked JVM
+            // sees `forkNumber`, `reportsDirectory`, `shutdown`, etc.
+            rustjvm_native_builtins::properties_sidetable::register_properties_sidetable(
+                &mut native_methods,
+            );
             rustjvm_native_builtins::unsafe_jdk25::register_t12_unsafe_natives(&mut native_methods);
             rustjvm_native_builtins::system_bootstrap::register_t14_system_bootstrap(&mut native_methods);
             // C4: BootLoader natives (see comment at first registration site above).
@@ -1011,6 +1203,14 @@ impl SharedVm {
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+            // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
+            // friends. See companion call in the `feature = "synthetic-jdk"`
+            // branch above for the rationale (real-JDK bytecode delegates
+            // to `getPlatformMXBean(Class)` which fails with
+            // `IllegalArgumentException: ... is not a platform management
+            // interface`, killing the forked test JVM constructor).
+            #[cfg(feature = "experimental-jmx")]
+            rustjvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
             // RKC16N.11: rest of the sun.management.* native surface.
             // See companion calls in the `feature = "synthetic-jdk"`
             // branch above for the full rationale.
@@ -1187,19 +1387,12 @@ impl SharedVm {
         );
 
         // ---- Tier 3: env/config-derived keys ----
-        // java.home — use config value, JAVA_HOME env var, or auto-detect
-        // by probing `java` on PATH. Falling back to "." causes JDK code
-        // (e.g. sun.util.calendar.ZoneInfoFile) to look for resources like
-        // `./lib/tzdb.dat` in the CWD and fail with FileNotFoundException,
-        // which then surfaces as an Error during clinit and aborts startup.
-        let java_home_val = config
-            .java_home
-            .clone()
-            .or_else(|| std::env::var("JAVA_HOME").ok())
-            .or_else(|| {
-                crate::config::resolve_java_home_public(None)
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
+        // java.home — same resolution order as boot classpath discovery
+        // (`resolve_java_home_public`): explicit config, RUSTJVM_JAVA_HOME,
+        // JAVA_HOME, then PATH. Avoid reading JAVA_HOME alone here — that
+        // skipped RUSTJVM_JAVA_HOME and could disagree with boot discovery.
+        let java_home_val = crate::config::resolve_java_home_public(config.java_home.as_deref())
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
         sys_props.insert("java.home".to_string(), java_home_val.clone());
 

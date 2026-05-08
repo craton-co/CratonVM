@@ -25,6 +25,7 @@ static PLATFORM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 /// it back.
 pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     let cl = "java/lang/ClassLoader";
+    let ucl = "java/net/URLClassLoader";
 
     // ClassLoader.<init>()V — default constructor (parent = system class loader)
     r.register(cl, "<init>", "()V", |ctx, args| {
@@ -149,6 +150,37 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         "registerAsParallelCapable",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
+    // URLClassLoader ctors — Spring Boot launcher allocates
+    // `LaunchedURLClassLoader` via these signatures early in boot.
+    r.register(ucl, "<init>", "([Ljava/net/URL;)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let parent = get_or_create_system_cl(ctx);
+        ctx.set_field_by_name(this, "parent", Value::Object(parent));
+        // Best-effort: stash URL array into known field name when present.
+        let urls = args.get(1).copied().unwrap_or(Value::Object(None));
+        ctx.set_field_by_name(this, "ucp", urls);
+        Ok(None)
+    });
+    r.register(
+        ucl,
+        "<init>",
+        "([Ljava/net/URL;Ljava/lang/ClassLoader;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let parent = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "parent", parent);
+            let urls = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "ucp", urls);
+            Ok(None)
+        },
     );
 
     // S111r9 — SecureClassLoader.<clinit> override.

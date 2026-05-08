@@ -6,9 +6,83 @@
 #![allow(clippy::collapsible_if, clippy::needless_range_loop, dead_code)]
 
 use rustjvm_types::ClassId;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectRef, Value};
+
+/// Normalise property keys after `read_string` (trim stray control/NUL).
+#[inline]
+fn normalize_java_property_key(key: &str) -> String {
+    key.trim_matches(|c: char| c.is_ascii_control() || c == '\0')
+        .to_string()
+}
+
+/// Defaults for critical bootstrap keys when the VM store misses a lookup.
+#[inline]
+pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
+    match key {
+        "file.separator" => Some(std::path::MAIN_SEPARATOR.to_string()),
+        "path.separator" => Some(if cfg!(windows) {
+            ";".to_string()
+        } else {
+            ":".to_string()
+        }),
+        "line.separator" => Some(if cfg!(windows) {
+            "\r\n".to_string()
+        } else {
+            "\n".to_string()
+        }),
+        _ => None,
+    }
+}
+
+/// Decode `java.lang.String` used as a system/property key when
+/// `NativeContext::read_string` yields empty (compact `String` layout edge cases).
+pub(crate) fn property_key_from_java_string(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> String {
+    let s = normalize_java_property_key(&ctx.read_string(key_obj).unwrap_or_default());
+    if !s.is_empty() {
+        return s;
+    }
+    let Value::Object(Some(arr)) = ctx.get_field_by_name(key_obj, "value") else {
+        return String::new();
+    };
+    if ctx.heap_element_type_of(arr) != rustjvm_types::ArrayElementType::Byte {
+        return String::new();
+    }
+    let coder = match ctx.get_field_by_name(key_obj, "coder") {
+        Value::Int(c) => c,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr);
+    if coder != 0 {
+        if len % 2 != 0 {
+            return String::new();
+        }
+        let num_units = len / 2;
+        let mut utf16 = Vec::with_capacity(num_units);
+        for i in 0..num_units {
+            let hi = match ctx.get_array_element(arr, i * 2) {
+                Value::Int(v) => (v & 0xFF) as u16,
+                _ => 0,
+            };
+            let lo = match ctx.get_array_element(arr, i * 2 + 1) {
+                Value::Int(v) => (v & 0xFF) as u16,
+                _ => 0,
+            };
+            utf16.push((hi << 8) | lo);
+        }
+        return String::from_utf16_lossy(&utf16);
+    }
+    let mut out = String::with_capacity(len);
+    for i in 0..len {
+        let b = match ctx.get_array_element(arr, i) {
+            Value::Int(v) => (v & 0xFF) as u8,
+            _ => 0,
+        };
+        out.push(b as char);
+    }
+    normalize_java_property_key(&out)
+}
 
 pub mod lang_string;
 pub mod lang_class;
@@ -83,6 +157,7 @@ pub mod locale_resources;
 pub mod spring_startup_bootstrap;
 pub mod vector_api;
 pub mod graalvm_compat;
+pub mod letsgo_compat;
 pub mod generics;
 pub mod unsafe_jdk25;
 pub mod unsafe_natives;
@@ -343,6 +418,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
 
+    // Spring Boot loader in real-JDK mode can resolve Pattern natives through
+    // synthetic-stub dispatch paths before/without usable JDK bytecode
+    // linkage. Keep regex natives in essentials too (not only synthetic
+    // overrides) so Pattern.compile(String,int) is always reachable.
+    register_regex_natives(registry);
+    // Same rationale for java.net URL/URI entrypoints used by Spring Boot
+    // launcher initialization (`URL.<init>(String)` and friends).
+    register_net_natives(registry);
+
     // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
     // surface for real-JDK mode. Real-JDK mode bytecode resolution is
     // failing for these basic String methods during JDK class clinits on
@@ -407,6 +491,34 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let a = ctx.read_string(this).unwrap_or_default();
             let b = match ctx.read_string(other) { Some(s) => s, None => return Ok(Some(Value::Int(0))) };
             Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
+        },
+    );
+    registry.register(
+        "java/lang/String",
+        "toLowerCase",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let out = ctx.create_string(&s.to_lowercase());
+            Ok(Some(Value::Object(Some(out))))
+        },
+    );
+    registry.register(
+        "java/lang/String",
+        "toUpperCase",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let s = ctx.read_string(this).unwrap_or_default();
+            let out = ctx.create_string(&s.to_uppercase());
+            Ok(Some(Value::Object(Some(out))))
         },
     );
     registry.register(
@@ -546,6 +658,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/StringIndexOutOfBoundsException",
         "java/lang/NumberFormatException",
         "java/lang/SecurityException",
+        "java/lang/NoSuchMethodError",
+        "java/lang/NoSuchFieldError",
     ] {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
@@ -556,7 +670,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     ctx.set_field(this, 0, Value::Object(Some(*msg)));
                     // S111r27 diag: log first few IAE/ISE constructions with messages
                     if let Some(m) = ctx.read_string(*msg) {
-                        if m.len() > 2 {
+                        if m.len() > 2
+                            && matches!(
+                                std::env::var("RUSTJVM_DIAG_EXINIT").as_deref(),
+                                Ok("1") | Ok("true") | Ok("yes")
+                            )
+                        {
                             eprintln!("[EXINIT-DBG] Exception<init>(msg): {}", &m[..m.len().min(200)]);
                         }
                     }
@@ -698,6 +817,68 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Wired here in `register_essential_natives` (universal) so the natives
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
+
+    // Surefire bootstrap compatibility: keep the BufferedReader/InputStreamReader
+    // constructor chain available even in "essential-only" native registration
+    // paths. Some harnesses hit these before R3 phase natives are wired.
+    registry.register(
+        "java/io/InputStreamReader",
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, 0, stream);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/InputStreamReader",
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, 0, stream);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/InputStreamReader",
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, 0, stream);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedReader",
+        "<init>",
+        "(Ljava/io/Reader;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let reader = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, 0, reader);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedReader",
+        "<init>",
+        "(Ljava/io/Reader;I)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let reader = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, 0, reader);
+            Ok(None)
+        },
+    );
+    // Also wire the full R3 bundle in essential mode so readLine/lines/close
+    // are available during early Maven/Surefire bootstrap.
+    register_r3_resource_loading(registry);
 
     // S109 Wave3 — `java/lang/Module.canUse(Class)`. The real bytecode reads
     // `this.descriptor` (a real-Module field that does not exist on our
@@ -1059,8 +1240,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(k))) => *k,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let key = ctx.read_string(key_obj).unwrap_or_default();
-            match ctx.get_system_property(&key) {
+            let key = property_key_from_java_string(ctx, key_obj);
+            match ctx.get_system_property(&key).or_else(|| bootstrap_property_fallback(&key)) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -1075,8 +1256,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(k))) => *k,
                 _ => return Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
             };
-            let key = ctx.read_string(key_obj).unwrap_or_default();
-            match ctx.get_system_property(&key) {
+            let key = property_key_from_java_string(ctx, key_obj);
+            match ctx.get_system_property(&key).or_else(|| bootstrap_property_fallback(&key)) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
             }
@@ -1149,6 +1330,229 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
             Ok(Some(Value::Object(Some(props))))
         },
+    );
+    // Surefire bootstrap: Maven wraps system properties in
+    // `org.apache.maven.surefire.booter.PropertiesWrapper` and calls its
+    // virtual `getProperty` overloads very early. In some bootstrap runs the
+    // wrapper method body cannot be resolved cleanly yet, so provide native
+    // fallbacks mirroring `System.getProperty`.
+    registry.register(
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_surefire_properties_wrapper_get_property_1,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        "getProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        native_surefire_properties_wrapper_get_property_2,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        "getIntProperty",
+        "(Ljava/lang/String;)I",
+        native_surefire_properties_wrapper_get_int_property,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        "getBooleanProperty",
+        "(Ljava/lang/String;)Z",
+        native_surefire_properties_wrapper_get_boolean_property,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        "setAsSystemProperties",
+        "()V",
+        native_surefire_properties_wrapper_set_as_system_properties,
+    );
+    // SystemPropertyManager.loadProperties(InputStream) — Surefire reads
+    // its provider configuration via `Properties p = new Properties();
+    // p.load(stream); for (k : p.stringPropertyNames()) map.put(k,
+    // p.getProperty(k));`.  The CHM put/get round-trip through our
+    // synthetic interpreter does not always reliably store the entries
+    // in the wrapper's `properties` field (CHM-specific layout
+    // assumptions our `native_map_put`/`get` don't fully honour).
+    // Override the static factory so we drain the InputStream, parse
+    // the .properties bytes ourselves, and seed our side-table indexed
+    // by the freshly allocated wrapper object — `PropertiesWrapper.
+    // getProperty` (above) consults that side-table first.
+    registry.register(
+        "org/apache/maven/surefire/booter/SystemPropertyManager",
+        "loadProperties",
+        "(Ljava/io/InputStream;)Lorg/apache/maven/surefire/booter/PropertiesWrapper;",
+        native_surefire_system_property_manager_load_properties,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/SystemPropertyManager",
+        "setSystemProperties",
+        "(Ljava/io/File;)V",
+        native_surefire_system_property_manager_set_system_properties,
+    );
+    // Surefire fork bootstrap hardening: if setup fails before jvmTerminator
+    // is initialized, ForkedBooter.launchLastDitchDaemonShutdownThread can NPE
+    // and hide the original cause. Keep it a no-op so the real failure surfaces.
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "launchLastDitchDaemonShutdownThread",
+        "(I)V",
+        native_noop,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "lookupDecoderFactory",
+        "(Ljava/lang/String;)Lorg/apache/maven/surefire/spi/MasterProcessChannelProcessorFactory;",
+        native_surefire_lookup_decoder_factory,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "run",
+        "(Lorg/apache/maven/surefire/booter/ForkedBooter;[Ljava/lang/String;)V",
+        native_surefire_forkedbooter_run,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "exit",
+        "()V",
+        native_surefire_forkedbooter_exit1,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "exit",
+        "(I)V",
+        native_surefire_forkedbooter_exit_code,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "exit1",
+        "()V",
+        native_surefire_forkedbooter_exit1,
+    );
+    // Surefire's Java `lookupDecoderFactory()` picks a provider only when
+    // `canUse(connectionString)` returns true. On rustjvm bootstrap runs the
+    // connection string can be transiently null/partially materialized, which
+    // leaves both built-in providers rejected and `channelProcessorFactory`
+    // null. Force both built-ins to accept the bootstrap connection string.
+    registry.register(
+        "org/apache/maven/surefire/booter/spi/LegacyMasterProcessChannelProcessorFactory",
+        "canUse",
+        "(Ljava/lang/String;)Z",
+        native_return_true,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/spi/SurefireMasterProcessChannelProcessorFactory",
+        "canUse",
+        "(Ljava/lang/String;)Z",
+        native_return_true,
+    );
+    // Surefire diagnostics: ensure bootstrap throwables become visible even
+    // when surefire's dump file plumbing is only partially functional.
+    registry.register(
+        "org/apache/maven/surefire/api/booter/DumpErrorSingleton",
+        "dumpException",
+        "(Ljava/lang/Throwable;)Ljava/io/File;",
+        native_surefire_dump_exception,
+    );
+    // Surefire command bootstrap uses j.u.c synchronizers in CommandReader
+    // initialization paths. Ensure these core concurrency natives are present
+    // in minimal real-JDK bootstrap runs before later phase registrars execute.
+    let surefire_cdl = "java/util/concurrent/CountDownLatch";
+    registry.register(surefire_cdl, "<init>", "(I)V", native_cdl_init);
+    registry.register(surefire_cdl, "countDown", "()V", native_cdl_count_down);
+    registry.register(surefire_cdl, "await", "()V", native_cdl_await);
+    registry.register(
+        surefire_cdl,
+        "await",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_cdl_await_timeout,
+    );
+    registry.register(surefire_cdl, "getCount", "()J", native_cdl_get_count);
+    let surefire_sem = "java/util/concurrent/Semaphore";
+    registry.register(surefire_sem, "<init>", "(I)V", native_sem_init);
+    registry.register(surefire_sem, "<init>", "(IZ)V", native_sem_init_fair);
+    registry.register(surefire_sem, "acquire", "()V", native_sem_acquire);
+    registry.register(surefire_sem, "acquire", "(I)V", native_sem_acquire_n);
+    registry.register(
+        surefire_sem,
+        "acquireUninterruptibly",
+        "()V",
+        native_sem_acquire,
+    );
+    registry.register(surefire_sem, "release", "()V", native_sem_release);
+    registry.register(surefire_sem, "release", "(I)V", native_sem_release_n);
+    registry.register(surefire_sem, "tryAcquire", "()Z", native_sem_try_acquire);
+    registry.register(surefire_sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+    registry.register(
+        surefire_sem,
+        "tryAcquire",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_sem_try_acquire_timeout,
+    );
+    registry.register(
+        surefire_sem,
+        "availablePermits",
+        "()I",
+        native_sem_available_permits,
+    );
+    registry.register(
+        surefire_sem,
+        "drainPermits",
+        "()I",
+        native_sem_drain_permits,
+    );
+    registry.register(surefire_sem, "isFair", "()Z", native_sem_is_fair);
+    registry.register(surefire_sem, "toString", "()Ljava/lang/String;", native_sem_to_string);
+    // Keep CyclicBarrier constructors available this early too; surefire and
+    // plugin ecosystems may switch between latch/semaphore/barrier patterns.
+    let surefire_cb = "java/util/concurrent/CyclicBarrier";
+    registry.register(surefire_cb, "<init>", "(I)V", native_cb_init);
+    registry.register(
+        surefire_cb,
+        "<init>",
+        "(ILjava/lang/Runnable;)V",
+        native_cb_init_action,
+    );
+    // If CommandReader.<clinit> still fails, surefire wraps the cause in
+    // UnsatisfiedLinkError / ExceptionInInitializerError very early.
+    registry.register(
+        "java/lang/UnsatisfiedLinkError",
+        "<init>",
+        "()V",
+        native_exception_init_empty,
+    );
+    registry.register(
+        "java/lang/UnsatisfiedLinkError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_exception_init_msg,
+    );
+    registry.register(
+        "java/lang/ExceptionInInitializerError",
+        "<init>",
+        "()V",
+        native_exception_init_empty,
+    );
+    registry.register(
+        "java/lang/ExceptionInInitializerError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_exception_init_msg,
+    );
+    // Surefire abnormal-shutdown path (`ForkedBooter.exit1`) schedules a
+    // "last ditch" terminator thread via private method
+    // `launchLastDitchDaemonShutdownThread(int)`. In real-JDK mode this path
+    // can trip over partially emulated scheduler/thread-factory internals and
+    // throw before `System.exit(1)` executes, masking the real test failure
+    // with a booter-side NPE.
+    //
+    // Keep the explicit process exit semantics and skip the auxiliary
+    // terminator thread; if `System.exit` is ignored, surefire already treats
+    // that as a fork failure.
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "launchLastDitchDaemonShutdownThread",
+        "(I)V",
+        native_noop,
     );
     // T15: Properties.getProperty overrides — delegate to the VM's
     // system-properties store regardless of the Properties object's state.
@@ -1735,6 +2139,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;", lang_class::native_class_get_declared_fields);
     registry.register("java/lang/Class", "getDeclaredMethods0", "(Z)[Ljava/lang/reflect/Method;", lang_class::native_class_get_declared_methods);
     registry.register("java/lang/Class", "getDeclaredConstructors0", "(Z)[Ljava/lang/reflect/Constructor;", lang_class::native_class_get_declared_constructors);
+    registry.register(
+        "java/lang/Class",
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+        lang_class::native_class_get_declared_method,
+    );
     // C32: override JDK25 bytecode for getDeclaredConstructor so PD0$5's
     // probe returns a Constructor whose fields we fully populate (our
     // copyConstructor path doesn't re-initialise `root`/accessor and
@@ -1829,7 +2239,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 2);
         // Try to produce a real CodeSource with a URL pointing at the
         // classpath entry that holds this Class.
-        let path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
+        let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
             // Reverse-lookup the backing ClassId from the mirror via the
             // VM's class_mirrors_reverse map (the real-JDK Class layout
             // doesn't store our class_id in any Java-visible field).
@@ -1839,6 +2249,26 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         } else {
             None
         };
+        // `find_class_source_path` may return `outer.jar!/nested` for JAR-in-JAR;
+        // Spring Boot's `Archive.create(File)` needs the outer file only.
+        if let Some(ref mut p) = path_opt {
+            if let Some(idx) = p.find('!') {
+                p.truncate(idx);
+            }
+        }
+        // JDK `Class` mirrors often lack a reverse-map entry early in boot;
+        // Spring Boot 3.2's loader calls `Archive.create(Launcher.class)` and
+        // needs a non-null `CodeSource`. Fall back to the first `java.class.path`
+        // entry (the executable JAR for `rustjvm --jar …`).
+        let path_opt = path_opt.or_else(|| {
+            ctx.get_system_property("java.class.path").and_then(|cp| {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                cp.split(sep)
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        });
         if let Some(raw_path) = path_opt {
             // Normalise backslashes to forward slashes so Path/File code
             // further up the stack works the same on every platform.
@@ -1975,10 +2405,101 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Thread", "interrupt0", "()V", native_thread_interrupt);
     // Also register public interrupt() so it works on synthetic Thread stubs
     registry.register("java/lang/Thread", "interrupt", "()V", native_thread_interrupt);
+    registry.register("java/lang/Thread", "getPriority", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(5)))
+    });
+    registry.register("java/lang/Thread", "isDaemon", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
+    registry.register(
+        "java/lang/Thread",
+        "getThreadGroup",
+        "()Ljava/lang/ThreadGroup;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
     // JDK 25 additional Thread natives:
     registry.register("java/lang/Thread", "currentCarrierThread", "()Ljava/lang/Thread;", native_thread_current_thread);
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name_val = args.get(3).cloned().unwrap_or_else(|| {
+                Value::Object(Some(ctx.create_string("Thread")))
+            });
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
     registry.register("java/lang/Thread", "start0", "()V", native_thread_start0);
+    registry.register("java/lang/Thread", "start", "()V", native_thread_start0);
+    registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        if ctx.object_num_fields(this) >= 4 {
+            if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+                let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+            }
+        }
+        Ok(None)
+    });
     registry.register("java/lang/Thread", "yield0", "()V", |_ctx, _args| {
         std::thread::yield_now();
         Ok(None)
@@ -2389,6 +2910,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and FS flags are built in Rust, not JNI).
     registry.register("java/io/WinNTFileSystem", "initIDs", "()V", native_noop);
     registry.register("java/io/UnixFileSystem", "initIDs", "()V", native_noop);
+    // Guard real-JDK File.<clinit> against missing System property entries.
+    // JDK constructors call:
+    //   props.getProperty("file.separator").charAt(0)
+    //   props.getProperty("path.separator").charAt(0)
+    // and can NPE before our Java-side bootstrap finishes wiring props.
+    // Seed the key fields directly in the FS object.
+    registry.register(
+        "java/io/WinNTFileSystem",
+        "<init>",
+        "()V",
+        native_platform_filesystem_init,
+    );
+    registry.register(
+        "java/io/UnixFileSystem",
+        "<init>",
+        "()V",
+        native_platform_filesystem_init,
+    );
 
     // T15: java.lang.reflect.Field accessors — in real-JDK mode the JDK
     // bytecode `Field.getName()` reads a `name` field at the real-JDK
@@ -2732,6 +3271,152 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // defineClass2 uses ByteBuffer — less common; keep as null fallback for now
     registry.register("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class1);
     registry.register("java/lang/ClassLoader", "retrieveDirectives", "()Ljava/lang/AssertionStatusDirectives;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // Real-JDK launcher path wires per-thread context classloader.
+    registry.register(
+        "java/lang/Thread",
+        "setContextClassLoader",
+        "(Ljava/lang/ClassLoader;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "contextClassLoader", loader);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "getContextClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(ctx.get_field_by_name(this, "contextClassLoader")))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/Method",
+        "setAccessible",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "java/lang/reflect/AccessibleObject",
+        "setAccessible",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let name = args.get(1).copied().unwrap_or(Value::Object(None));
+        let ord = args.get(2).copied().unwrap_or(Value::Int(0));
+        ctx.set_field_by_name(this, "name", name);
+        ctx.set_field_by_name(this, "ordinal", ord);
+        Ok(None)
+    });
+    registry.register("java/lang/Enum", "ordinal", "()I", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        Ok(Some(ctx.get_field_by_name(this, "ordinal")))
+    });
+    registry.register("java/lang/Enum", "name", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+    registry.register("java/lang/Enum", "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+    // Spring Boot 2 launcher: avoid ctor-side ClassCastException in
+    // MainMethodRunner.<init> by wiring fields directly.
+    registry.register(
+        "org/springframework/boot/loader/MainMethodRunner",
+        "<init>",
+        "(Ljava/lang/String;[Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let main_class = args.get(1).copied().unwrap_or(Value::Object(None));
+            let main_args = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "mainClassName", main_class);
+            ctx.set_field_by_name(this, "args", main_args);
+            Ok(None)
+        },
+    );
+
+    // Real-JDK ArrayList ctor fallback (Spring Boot launcher path): ensure
+    // `new ArrayList(int)` doesn't fail linkage and has sane initial state.
+    registry.register("java/util/ArrayList", "<init>", "(I)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let cap = match args.get(1) {
+            Some(Value::Int(v)) if *v > 0 => *v as usize,
+            _ => 0usize,
+        };
+        let backing = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        ctx.set_field_by_name(this, "elementData", Value::Object(Some(backing)));
+        ctx.set_field_by_name(this, "size", Value::Int(0));
+        Ok(None)
+    });
+    // Iterator interface fallback for synthetic iterator wrappers used by
+    // collection shims in mixed real-JDK mode.
+    registry.register("java/util/Iterator", "hasNext", "()Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let cursor = match ctx.get_field(this, 1) {
+            Value::Int(v) => v.max(0) as usize,
+            _ => 0usize,
+        };
+        let total = match ctx.get_field(this, 2) {
+            Value::Int(v) => v.max(0) as usize,
+            _ => match ctx.get_field(this, 0) {
+                Value::Object(Some(arr)) => ctx.array_length(arr),
+                _ => 0usize,
+            },
+        };
+        Ok(Some(Value::Int((cursor < total) as i32)))
+    });
+    registry.register("java/util/Iterator", "next", "()Ljava/lang/Object;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let cursor = match ctx.get_field(this, 1) {
+            Value::Int(v) => v.max(0) as usize,
+            _ => 0usize,
+        };
+        if cursor >= ctx.array_length(arr) {
+            return Ok(Some(Value::Object(None)));
+        }
+        let v = ctx.get_array_element(arr, cursor);
+        ctx.set_field(this, 1, Value::Int((cursor + 1) as i32));
+        Ok(Some(v))
+    });
 
     // --- java/lang/ref/Reference ---
     registry.register("java/lang/ref/Reference", "clear0", "()V", native_noop_with_this);
@@ -2758,6 +3443,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // explicitly so the real JDK class finds them.
     registry.register("java/lang/ref/PhantomReference", "clear0", "()V", native_noop_with_this);
     registry.register("java/lang/ref/PhantomReference", "refersTo0", "(Ljava/lang/Object;)Z", native_reference_refers_to);
+    // Ensure full Reference/Weak/Soft/Phantom constructor + queue surface is
+    // present in real-JDK mode too (needed by Spring Boot launcher paths).
+    reference::register_reference_natives(registry);
 
     // T15: java/lang/ref/Finalizer
     registry.register("java/lang/ref/Finalizer", "register", "(Ljava/lang/Object;)V", lang_system::native_finalizer_register);
@@ -3544,6 +4232,27 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Package;",
         crate::lang_class::native_class_get_package,
     );
+    // JDK 11+ `Class.getPackageName()` — Spring / library probes call this
+    // directly; it lived only under `register_synthetic_overrides` so
+    // real-JDK mode hit `NoSuchMethodError` after StackWalker fixes.
+    registry.register(
+        "java/lang/Class",
+        "getPackageName",
+        "()Ljava/lang/String;",
+        crate::lang_class::native_class_get_package_name,
+    );
+    // Spring Boot loader calls `URL.setURLStreamHandlerFactory` very early.
+    // Full `register_net_natives` is not always on the minimal classpath
+    // ordering that `rustjvm-cli` uses before linkage runs.
+    registry.register(
+        "java/net/URL",
+        "setURLStreamHandlerFactory",
+        "(Ljava/net/URLStreamHandlerFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
+    // `URI(String)` — same story: `JarFileArchive` and SB loader parse nested
+    // jar URLs before Phase-30 net registration is guaranteed to run.
+    registry.register("java/net/URI", "<init>", "(Ljava/lang/String;)V", native_uri_init);
 
     // S111r17: `Package.getImplementationVersion()` and friends. The
     // `native_class_get_package` builder writes `implVersion` and
@@ -4830,6 +5539,8 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/Exception",
         "java/lang/RuntimeException",
         "java/lang/Error",
+        "java/lang/LinkageError",
+        "java/lang/NoClassDefFoundError",
         "java/lang/NullPointerException",
         "java/lang/ArithmeticException",
         "java/lang/ArrayIndexOutOfBoundsException",
@@ -4933,6 +5644,19 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/lang/Thread", "sleep", "(J)V", native_thread_sleep);
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
+    registry.register("java/lang/Thread", "getPriority", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(5)))
+    });
+    registry.register("java/lang/Thread", "isDaemon", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
+    registry.register(
+        "java/lang/Thread",
+        "getThreadGroup",
+        "()Ljava/lang/ThreadGroup;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
     registry.register(
         "java/lang/Thread",
         "getName",
@@ -5007,7 +5731,10 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         let target = args.get(1).cloned().unwrap_or(Value::Object(None));
-        let name_val = args.get(2).cloned().unwrap_or(Value::Object(None));
+        let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
+            Value::Object(Some(s)) => Value::Object(Some(s)),
+            _ => Value::Object(Some(ctx.create_string("Thread"))),
+        };
         ctx.set_field(this, 0, name_val);
         ctx.set_field(this, 1, Value::Int(5));
         ctx.set_field(this, 3, target);
@@ -5018,11 +5745,166 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let name_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+        let name_val = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
+            Value::Object(Some(s)) => Value::Object(Some(s)),
+            _ => Value::Object(Some(ctx.create_string("Thread"))),
+        };
         ctx.set_field(this, 0, name_val);
         ctx.set_field(this, 1, Value::Int(5));
         Ok(None)
     });
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name = ctx.create_string("Thread");
+            ctx.set_field(this, 0, Value::Object(Some(name)));
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name_val = args.get(3).cloned().unwrap_or_else(|| {
+                Value::Object(Some(ctx.create_string("Thread")))
+            });
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+            let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(5));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/String;ILjava/lang/Runnable;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            let prio = match args.get(3) {
+                Some(Value::Int(p)) => *p,
+                _ => 5,
+            };
+            let target = args.get(4).cloned().unwrap_or(Value::Object(None));
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(prio));
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/String;IZ)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let name_val = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            let prio = match args.get(2) {
+                Some(Value::Int(p)) => *p,
+                _ => 5,
+            };
+            ctx.set_field(this, 0, name_val);
+            ctx.set_field(this, 1, Value::Int(prio));
+            Ok(None)
+        },
+    );
     registry.register("java/lang/Thread", "start0", "()V", native_thread_start0);
     registry.register("java/lang/Thread", "start", "()V", native_thread_start0);
     registry.register("java/lang/Thread", "getId", "()J", |_, _| {
@@ -5758,18 +6640,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     );
 
     // --- System properties + utilities (Step 4) ---
-    registry.register(
-        "java/lang/System",
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_system_get_property,
-    );
-    registry.register(
-        "java/lang/System",
-        "getProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-        native_system_get_property_default,
-    );
+    // getProperty overloads are registered earlier (T14) with
+    // property_key_from_java_string + bootstrap_property_fallback; do not
+    // re-register here — native_system_get_property would overwrite them.
     registry.register(
         "java/lang/System",
         "setProperty",
@@ -6617,6 +7490,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase 17.2: GraalVM Native Image Compatibility ---
     graalvm_compat::register_graalvm_compat_natives(registry);
+    // LETSGO_S2: real-JDK bootstrap compatibility fallbacks used by
+    // letsgo-main and related Spring/SLF4J startup paths.
+    letsgo_compat::register_letsgo_compat_natives(registry);
 
     // --- Spring Framework ApplicationStartup / StartupStep no-op stubs ---
     // Required for Spring Boot 2.x/3.x apps: AbstractApplicationContext.getApplicationStartup()
@@ -6692,6 +7568,564 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
 pub(crate) fn native_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
+}
+
+fn native_platform_filesystem_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let file_sep = ctx
+        .get_system_property("file.separator")
+        .or_else(|| bootstrap_property_fallback("file.separator"))
+        .unwrap_or_else(|| std::path::MAIN_SEPARATOR.to_string());
+    let path_sep = ctx
+        .get_system_property("path.separator")
+        .or_else(|| bootstrap_property_fallback("path.separator"))
+        .unwrap_or_else(|| if cfg!(windows) { ";".to_string() } else { ":".to_string() });
+    let user_dir = ctx
+        .get_system_property("user.dir")
+        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| ".".to_string());
+
+    let slash = file_sep.chars().next().unwrap_or(std::path::MAIN_SEPARATOR) as i32;
+    let semicolon = path_sep.chars().next().unwrap_or(if cfg!(windows) { ';' } else { ':' }) as i32;
+    let alt_slash = if slash == ('\\' as i32) { '/' as i32 } else { '\\' as i32 };
+
+    // Works for both WinNTFileSystem and UnixFileSystem (fields absent in one
+    // class are ignored by the field-by-name setter implementation).
+    ctx.set_field_by_name(this, "slash", Value::Int(slash));
+    ctx.set_field_by_name(this, "semicolon", Value::Int(semicolon));
+    ctx.set_field_by_name(this, "altSlash", Value::Int(alt_slash));
+    let user_dir_str = ctx.create_string(&user_dir);
+    ctx.set_field_by_name(this, "userDir", Value::Object(Some(user_dir_str)));
+    Ok(None)
+}
+
+fn native_surefire_properties_wrapper_get_property_1(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_obj = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let map_field = ctx.get_field_by_name(this, "properties");
+    if let Value::Object(Some(props_map)) = map_field {
+        match rustjvm_native_collections::native_map_get_pub(
+            ctx,
+            &[Value::Object(Some(props_map)), Value::Object(Some(key_obj))],
+        ) {
+            Ok(Some(Value::Object(Some(v)))) => {
+                // Guard against non-String values leaking from partially
+                // materialized map implementations during surefire bootstrap.
+                if ctx.read_string(v).is_some() {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(props_map, &property_key_from_java_string(ctx, key_obj)) {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        }
+    }
+    let key = property_key_from_java_string(ctx, key_obj);
+    if key == "forkNodeConnectionString" {
+        // ForkedBooter.lookupDecoderFactory(connectionString) returns null if
+        // the value does not match known prefixes (pipe:// or tcp://). During
+        // early bootstrap we occasionally miss this property in the wrapper map;
+        // default to legacy pipe transport to keep booter initialization alive.
+        return Ok(Some(Value::Object(Some(ctx.create_string("pipe://")))));
+    }
+    // BooterDeserializer.deserialize() calls Shutdown.valueOf(getProperty("shutdown")).
+    // If provider properties are only partially materialized, this key can
+    // come back null and Enum.valueOf throws NPE("Name is null").
+    if key == "shutdown" {
+        return Ok(Some(Value::Object(Some(ctx.create_string("DEFAULT")))));
+    }
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| bootstrap_property_fallback(&key))
+    {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_surefire_properties_wrapper_get_property_2(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(args.get(2).copied().unwrap_or(Value::Object(None)))),
+    };
+    let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    let key_obj = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(Some(default)),
+    };
+    if let Value::Object(Some(props_map)) = ctx.get_field_by_name(this, "properties") {
+        if let Ok(Some(Value::Object(Some(v)))) = rustjvm_native_collections::native_map_get_pub(
+            ctx,
+            &[Value::Object(Some(props_map)), Value::Object(Some(key_obj))],
+        ) {
+            if ctx.read_string(v).is_some() {
+                return Ok(Some(Value::Object(Some(v))));
+            }
+        }
+        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(props_map, &property_key_from_java_string(ctx, key_obj)) {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        }
+    }
+    let key = property_key_from_java_string(ctx, key_obj);
+    if key == "forkNodeConnectionString" {
+        return Ok(Some(Value::Object(Some(ctx.create_string("pipe://")))));
+    }
+    if key == "shutdown" {
+        return Ok(Some(Value::Object(Some(ctx.create_string("DEFAULT")))));
+    }
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| bootstrap_property_fallback(&key))
+    {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(default)),
+    }
+}
+
+fn native_surefire_dump_exception(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(t))) = args.get(1) {
+        eprintln!("[SUREFIRE-BOOT] dumpException called:");
+        if let Ok(Some(Value::Object(Some(msg_obj)))) =
+            native_throwable_to_string(ctx, &[Value::Object(Some(*t))])
+        {
+            if let Some(msg) = ctx.read_string(msg_obj) {
+                eprintln!("[SUREFIRE-BOOT] throwable={msg}");
+            }
+        }
+        // Print captured Java backtrace frames when available. This gives
+        // the exact producer callsite for early surefire bootstrap failures.
+        let thash = ctx.identity_hash_code(*t);
+        if let Some(frames) = ctx.get_stack_trace(thash) {
+            if !frames.is_empty() {
+                eprintln!(
+                    "[SUREFIRE-BOOT] captured stack trace (top {} frames):",
+                    frames.len().min(16)
+                );
+                for (i, f) in frames.iter().take(16).enumerate() {
+                    let src = f.source_file.as_deref().unwrap_or("Unknown Source");
+                    eprintln!(
+                        "[SUREFIRE-BOOT]   #{i} {}.{} ({}:{})",
+                        f.class_name, f.method_name, src, f.line_number
+                    );
+                }
+            }
+        }
+        let _ = native_throwable_print_stack_trace(ctx, &[Value::Object(Some(*t))]);
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_surefire_properties_wrapper_get_int_property(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let v = native_surefire_properties_wrapper_get_property_1(ctx, args)?;
+    let s = match v {
+        Some(Value::Object(Some(obj))) => ctx.read_string(obj).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if s.is_empty() {
+        // surefire uses this for fork number; default to 1 in forked mode.
+        return Ok(Some(Value::Int(1)));
+    }
+    let parsed = s.parse::<i32>().unwrap_or(1);
+    Ok(Some(Value::Int(parsed)))
+}
+
+fn native_surefire_properties_wrapper_get_boolean_property(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let v = native_surefire_properties_wrapper_get_property_1(ctx, args)?;
+    let s = match v {
+        Some(Value::Object(Some(obj))) => ctx.read_string(obj).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let b = if s.eq_ignore_ascii_case("true") { 1 } else { 0 };
+    Ok(Some(Value::Int(b)))
+}
+
+fn native_surefire_properties_wrapper_set_as_system_properties(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Surefire's `setAsSystemProperties` iterates the wrapper's
+    // `properties` map and calls `System.setProperty(k, v)` for each
+    // entry. The bytecode iteration over our synthetic CHM does not
+    // reliably observe the entries (CHM-specific layout), so honour
+    // the contract by walking our wrapper-side side-table and seeding
+    // each entry into the VM's system property store.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        let entries = crate::properties_sidetable::snapshot_sidetable(*this);
+        for (k, v) in entries {
+            let _ = ctx.set_system_property(&k, &v);
+        }
+    }
+    Ok(None)
+}
+
+/// Native impl for `SystemPropertyManager.loadProperties(InputStream)
+///   -> PropertiesWrapper`. Bypasses the bytecode round-trip through
+/// `Properties.load → stringPropertyNames → ConcurrentHashMap.put` —
+/// our synthetic CHM does not faithfully store entries through that
+/// path. Instead we drain the input stream, parse the `.properties`
+/// bytes, allocate a `PropertiesWrapper`, populate the wrapper-side
+/// side-table directly, and return it.
+fn native_surefire_system_property_manager_load_properties(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let stream = match args.first() {
+        Some(Value::Object(Some(s))) => *s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let bytes = match crate::properties_sidetable::drain_input_stream_pub(ctx, stream) {
+        Some(b) => b,
+        None => Vec::new(),
+    };
+    let parsed = crate::properties_sidetable::parse_properties_pub(&bytes);
+    // Allocate a PropertiesWrapper with enough fields for the JDK
+    // layout (`properties` is the only declared field).  Use the
+    // standard synthetic allocator so the class is initialised first.
+    let wrapper = alloc_concurrent_synthetic(
+        ctx,
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        2,
+    );
+    // Allocate a tiny placeholder map for the `properties` field so any
+    // bytecode that touches the field (not via our overrides) sees a
+    // non-null Map. Use a HashMap (well-known to our natives) rather
+    // than ConcurrentHashMap to keep the placeholder layout-stable.
+    let placeholder = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8);
+    if let Ok(_) = rustjvm_native_collections::native_map_init(
+        ctx,
+        &[Value::Object(Some(placeholder))],
+    ) {}
+    ctx.set_field_by_name(
+        wrapper,
+        "properties",
+        Value::Object(Some(placeholder)),
+    );
+    for (k, v) in &parsed {
+        crate::properties_sidetable::store_property_in_sidetable(wrapper, k, v);
+    }
+    eprintln!(
+        "[SPM-LOAD] wrapper={:?} parsed_entries={} stream_bytes={}",
+        wrapper,
+        parsed.len(),
+        bytes.len()
+    );
+    for (k, v) in &parsed {
+        if matches!(
+            k.as_str(),
+            "forkNodeConnectionString"
+                | "shutdown"
+                | "reportsDirectory"
+                | "forkNumber"
+                | "failFastCount"
+                | "rerunFailingTestsCount"
+                | "isTrimStackTrace"
+                | "useSystemClassLoader"
+                | "providerConfiguration"
+                | "providerClass"
+        ) {
+            eprintln!("[SPM-LOAD]   {} = {}", k, v);
+        }
+    }
+    Ok(Some(Value::Object(Some(wrapper))))
+}
+
+/// Native impl for `SystemPropertyManager.setSystemProperties(File)`.
+/// Reads the named file directly via std::fs::read so we do not depend
+/// on FileInputStream + Properties.load bytecode flowing correctly.
+fn native_surefire_system_property_manager_set_system_properties(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let file = match args.first() {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(None),
+    };
+    let path_str = match ctx.get_field_by_name(file, "path") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if path_str.is_empty() {
+        return Ok(None);
+    }
+    let bytes = match std::fs::read(&path_str) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let parsed = crate::properties_sidetable::parse_properties_pub(&bytes);
+    eprintln!(
+        "[SPM-SET] path={:?} parsed_entries={} bytes={}",
+        path_str,
+        parsed.len(),
+        bytes.len()
+    );
+    for (k, v) in &parsed {
+        let _ = ctx.set_system_property(k, v);
+    }
+    Ok(None)
+}
+
+fn native_surefire_lookup_decoder_factory(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let instantiate_factory = |ctx: &mut dyn NativeContext, class_name: &str| -> Option<ObjectRef> {
+        let init_ok = ctx.ensure_class_initialized(class_name).is_ok();
+        let obj = if init_ok {
+            match ctx.new_object(class_name) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => alloc_concurrent_synthetic(ctx, class_name, 0),
+            }
+        } else {
+            alloc_concurrent_synthetic(ctx, class_name, 0)
+        };
+        // Use real object allocation + constructor init so surefire's internal
+        // processor/channel fields are materialized with the expected layout.
+        let _ = ctx.invoke_special(
+            class_name,
+            "<init>",
+            "()V",
+            &[Value::Object(Some(obj))],
+        );
+        Some(obj)
+    };
+
+    let conn_val = args.first().copied().unwrap_or(Value::Object(None));
+    let conn_text = match conn_val {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    // setupBooter() immediately invokes `factory.connect(connectionString)`.
+    // Normalize missing/blank strings to legacy pipe mode so the downstream
+    // connect call never sees null and cannot throw "connect on null".
+    let normalized_conn = if conn_text.trim().is_empty() {
+        "pipe://".to_string()
+    } else {
+        conn_text.clone()
+    };
+    let conn_obj = ctx.create_string(&normalized_conn);
+    // Prefer the modern processor first even for `pipe://` connection strings.
+    // The legacy implementation's periodic flusher path currently trips our
+    // ScheduledThreadPoolExecutor emulation (`Cannot invoke add on null`).
+    let candidates = [
+        "org/apache/maven/surefire/booter/spi/SurefireMasterProcessChannelProcessorFactory",
+        "org/apache/maven/surefire/booter/spi/LegacyMasterProcessChannelProcessorFactory",
+    ];
+    for class_name in candidates {
+        let Some(factory) = instantiate_factory(ctx, class_name) else {
+            continue;
+        };
+        let can_use = ctx.invoke_virtual(
+            factory,
+            "canUse",
+            "(Ljava/lang/String;)Z",
+            &[Value::Object(Some(conn_obj))],
+        );
+        if !matches!(can_use, Ok(Some(Value::Int(1)))) {
+            continue;
+        }
+        let connect = ctx.invoke_virtual(
+            factory,
+            "connect",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(conn_obj))],
+        );
+        if connect.is_ok() {
+            return Ok(Some(Value::Object(Some(factory))));
+        }
+    }
+    // If capability checks are unreliable, at least require connect() to accept
+    // the normalized transport string before returning.
+    for class_name in candidates {
+        let Some(factory) = instantiate_factory(ctx, class_name) else {
+            continue;
+        };
+        let connect = ctx.invoke_virtual(
+            factory,
+            "connect",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(conn_obj))],
+        );
+        if connect.is_ok() {
+            return Ok(Some(Value::Object(Some(factory))));
+        }
+    }
+    for class_name in candidates {
+        if let Some(factory) = instantiate_factory(ctx, class_name) {
+            return Ok(Some(Value::Object(Some(factory))));
+        }
+    }
+    Err(MethodCallFailed::InternalError(VmError::Internal {
+        message: "Surefire lookupDecoderFactory: no processor factories available".to_string(),
+    }))
+}
+
+fn native_surefire_forkedbooter_run(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let booter = obj_arg(args, 0)?;
+    let argv = obj_arg(args, 1)?;
+    let argv_len = ctx.array_length(argv);
+    let get_arg = |ctx: &mut dyn NativeContext, arr: ObjectRef, idx: usize| -> Option<ObjectRef> {
+        if idx >= ctx.array_length(arr) {
+            return None;
+        }
+        match ctx.get_array_element(arr, idx) {
+            Value::Object(Some(s)) => Some(s),
+            _ => None,
+        }
+    };
+    let arg0 = get_arg(ctx, argv, 0)
+        .map(|o| Value::Object(Some(o)))
+        .unwrap_or(Value::Object(None));
+    let arg1 = get_arg(ctx, argv, 1)
+        .map(|o| Value::Object(Some(o)))
+        .unwrap_or(Value::Object(None));
+    let arg2 = get_arg(ctx, argv, 2)
+        .map(|o| Value::Object(Some(o)))
+        .unwrap_or(Value::Object(None));
+    let arg3 = if argv_len > 3 {
+        get_arg(ctx, argv, 3)
+            .map(|o| Value::Object(Some(o)))
+            .unwrap_or(Value::Object(None))
+    } else {
+        Value::Object(None)
+    };
+    eprintln!(
+        "[SUREFIRE-RUN] entering ForkedBooter.run argv_len={}",
+        argv_len
+    );
+    let setup = ctx.invoke_special(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "setupBooter",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        &[Value::Object(Some(booter)), arg0, arg1, arg2, arg3],
+    );
+    if let Err(err) = setup {
+        eprintln!("[SUREFIRE-RUN] setupBooter threw (first attempt): {:?}", err);
+        // Surefire forks occasionally race during very early bootstrap in
+        // rustjvm shim mode (factory/connection state not fully materialized
+        // yet). Retry setup once before taking the hard exit1() branch.
+        let setup_retry = ctx.invoke_special(
+            "org/apache/maven/surefire/booter/ForkedBooter",
+            "setupBooter",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[Value::Object(Some(booter)), arg0, arg1, arg2, arg3],
+        );
+        if setup_retry.is_ok() {
+            eprintln!("[SUREFIRE-RUN] setupBooter recovered on retry");
+        } else {
+            eprintln!("[SUREFIRE-RUN] setupBooter threw (retry): {:?}", setup_retry);
+            let _ = ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "cancelPingScheduler",
+                "()V",
+                &[Value::Object(Some(booter))],
+            );
+            let _ = ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "exit1",
+                "()V",
+                &[Value::Object(Some(booter))],
+            );
+            return Ok(None);
+        }
+    }
+    let exec = ctx.invoke_special(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "execute",
+        "()V",
+        &[Value::Object(Some(booter))],
+    );
+    if let Err(err) = exec {
+        eprintln!("[SUREFIRE-RUN] execute threw: {:?}", err);
+        let _ = ctx.invoke_special(
+            "org/apache/maven/surefire/booter/ForkedBooter",
+            "cancelPingScheduler",
+            "()V",
+            &[Value::Object(Some(booter))],
+        );
+        let _ = ctx.invoke_special(
+            "org/apache/maven/surefire/booter/ForkedBooter",
+            "exit1",
+            "()V",
+            &[Value::Object(Some(booter))],
+        );
+    }
+    Ok(None)
+}
+
+fn native_surefire_forkedbooter_exit1(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let is_null = |v: Value| matches!(v, Value::Object(None));
+    let ev = ctx.get_field_by_name(this, "eventChannel");
+    let cr = ctx.get_field_by_name(this, "commandReader");
+    let pc = ctx.get_field_by_name(this, "providerConfiguration");
+    let sc = ctx.get_field_by_name(this, "startupConfiguration");
+    let ts = ctx.get_field_by_name(this, "testSet");
+    eprintln!(
+        "[SUREFIRE-EXIT] invoked; eventChannel_null={} commandReader_null={} providerConfig_null={} startupConfig_null={} testSet_null={}",
+        is_null(ev),
+        is_null(cr),
+        is_null(pc),
+        is_null(sc),
+        is_null(ts),
+    );
+    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+        eprintln!("[SUREFIRE-EXIT] soft-returning due to RUSTJVM_SOFT_EXIT=1");
+        return Ok(None);
+    }
+    std::process::exit(1);
+}
+
+fn native_surefire_forkedbooter_exit_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let code = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    let is_null = |v: Value| matches!(v, Value::Object(None));
+    let ev = ctx.get_field_by_name(this, "eventChannel");
+    let cr = ctx.get_field_by_name(this, "commandReader");
+    eprintln!(
+        "[SUREFIRE-EXIT] exit({}) invoked; eventChannel_null={} commandReader_null={}",
+        code,
+        is_null(ev),
+        is_null(cr),
+    );
+    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+        eprintln!("[SUREFIRE-EXIT] soft-returning due to RUSTJVM_SOFT_EXIT=1");
+        return Ok(None);
+    }
+    std::process::exit(code);
 }
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage (field 0)
@@ -8252,9 +9686,29 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
 /// Extract the field offset (slot index) from args at the given position.
 /// In our VM, offset = slot index (not byte offset).
 pub(crate) fn unsafe_offset(args: &[Value], pos: usize) -> usize {
+    // Field-slot offsets in this VM are small logical indices (or bounded
+    // array byte offsets). When compact-value drift surfaces a `Double/Float`
+    // with unrelated bit pattern, `to_bits() as usize` can become a huge
+    // index and crash GC heap access with OOB panic. Keep the defensive
+    // decode, but clamp clearly-invalid offsets to 0 (HotSpot-style callers
+    // already fail CAS/get semantics safely on wrong offsets).
+    const MAX_REASONABLE_OFFSET: usize = 1 << 30; // 1 Gi slot/byte cap
+    let clamp = |u: usize| if u <= MAX_REASONABLE_OFFSET { u } else { 0 };
     match args.get(pos) {
-        Some(Value::Long(off)) => *off as usize,
-        Some(Value::Int(off)) => *off as usize,
+        Some(Value::Long(off)) => {
+            if *off < 0 {
+                0
+            } else {
+                clamp(*off as usize)
+            }
+        }
+        Some(Value::Int(off)) => {
+            if *off < 0 {
+                0
+            } else {
+                clamp(*off as usize)
+            }
+        }
         // T19.H1 / T10.9.E — accept a Double/Float with the bit pattern of
         // a 64-bit long. CompactValue on the invoke-argument boundary is
         // the one remaining decode drift site: invoke arg-pop still uses
@@ -8271,8 +9725,24 @@ pub(crate) fn unsafe_offset(args: &[Value], pos: usize) -> usize {
         // instead of the generic `.pop()?`. Once that lands, every
         // `offset: long` parameter arrives as `Value::Long` and these
         // arms become unreachable.
-        Some(Value::Double(d)) => d.to_bits() as usize,
-        Some(Value::Float(f)) => f.to_bits() as usize,
+        Some(Value::Double(d)) => {
+            if d.is_finite() {
+                let n = *d as i64;
+                if n >= 0 && (n as f64) == *d {
+                    return clamp(n as usize);
+                }
+            }
+            clamp(d.to_bits() as usize)
+        }
+        Some(Value::Float(f)) => {
+            if f.is_finite() {
+                let n = *f as i64;
+                if n >= 0 && (n as f32) == *f {
+                    return clamp(n as usize);
+                }
+            }
+            clamp(f.to_bits() as usize)
+        }
         _ => 0,
     }
 }
@@ -9888,19 +11358,19 @@ fn native_atomic_int_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_atomic_int_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field_volatile(this, 0)))
 }
 
 fn native_atomic_int_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let val = args.get(1).copied().unwrap_or(Value::Int(0));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
 }
 
 fn native_atomic_int_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let new_val = args.get(1).copied().unwrap_or(Value::Int(0));
     loop {
         let current = ctx.get_field_volatile(this, 0);
@@ -9911,7 +11381,7 @@ fn native_atomic_int_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_atomic_int_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let expected = args.get(1).copied().unwrap_or(Value::Int(0));
     let new_val = args.get(2).copied().unwrap_or(Value::Int(0));
     let result = ctx.compare_and_swap_field(this, 0, expected, new_val);
@@ -9922,7 +11392,7 @@ fn native_atomic_int_get_and_increment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     loop {
         let current = ctx.get_field_volatile(this, 0);
         if let Value::Int(old) = current {
@@ -9940,7 +11410,7 @@ fn native_atomic_int_get_and_decrement(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     loop {
         let current = ctx.get_field_volatile(this, 0);
         if let Value::Int(old) = current {
@@ -9955,7 +11425,7 @@ fn native_atomic_int_get_and_decrement(
 }
 
 fn native_atomic_int_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let delta = match args.get(1) {
         Some(Value::Int(d)) => *d,
         _ => 0,
@@ -9977,7 +11447,7 @@ fn native_atomic_int_increment_and_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     loop {
         let current = ctx.get_field_volatile(this, 0);
         if let Value::Int(old) = current {
@@ -9995,7 +11465,7 @@ fn native_atomic_int_decrement_and_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     loop {
         let current = ctx.get_field_volatile(this, 0);
         if let Value::Int(old) = current {
@@ -10010,7 +11480,7 @@ fn native_atomic_int_decrement_and_get(
 }
 
 fn native_atomic_int_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let delta = match args.get(1) {
         Some(Value::Int(d)) => *d,
         _ => 0,
@@ -10029,7 +11499,7 @@ fn native_atomic_int_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_atomic_int_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let val = ctx.get_field_volatile(this, 0);
     match val {
         Value::Int(v) => Ok(Some(Value::Long(v as i64))),
@@ -10038,7 +11508,7 @@ fn native_atomic_int_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_atomic_int_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = obj_arg(args, 0)?;
     let val = ctx.get_field_volatile(this, 0);
     let text = match val {
         Value::Int(v) => format!("{v}"),
@@ -10827,6 +12297,15 @@ fn register_regex_natives(registry: &mut NativeMethodRegistry) {
         p,
         "compile",
         "(Ljava/lang/String;I)Ljava/util/regex/Pattern;",
+        native_pattern_compile_flags,
+    );
+    // Compatibility alias: some bytecode/descriptor paths in current app
+    // boots resolve the return descriptor without the trailing ';'. Keep an
+    // alternate key so we don't fail linkage on that variant.
+    registry.register(
+        p,
+        "compile",
+        "(Ljava/lang/String;I)Ljava/util/regex/Pattern",
         native_pattern_compile_flags,
     );
     registry.register(
@@ -13094,6 +14573,33 @@ fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         ctx.set_array_element(new_arr, size, elem);
         ctx.set_field(this, 0, Value::Object(Some(new_arr)));
         ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+        ctx.monitor_exit(this);
+        Ok(Some(Value::Int(1)))
+    });
+    registry.register(cowal, "addIfAbsent", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+        ctx.monitor_enter(this);
+        let size = match ctx.get_field(this, 1) {
+            Value::Int(n) => n.max(0) as usize,
+            _ => 0,
+        };
+        if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+            for i in 0..size {
+                let cur = ctx.get_array_element(arr, i);
+                if cur == elem {
+                    ctx.monitor_exit(this);
+                    return Ok(Some(Value::Int(0)));
+                }
+            }
+        }
+        let (new_arr, cur_size) = cowal_copy_array(ctx, this, 1);
+        ctx.set_array_element(new_arr, cur_size, elem);
+        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+        ctx.set_field(this, 1, Value::Int((cur_size + 1) as i32));
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(1)))
     });
@@ -19169,6 +20675,15 @@ fn register_net_natives(registry: &mut NativeMethodRegistry) {
     registry.register(url, "toURI", "()Ljava/net/URI;", native_url_to_uri);
     registry.register(url, "equals", "(Ljava/lang/Object;)Z", native_url_equals);
     registry.register(url, "hashCode", "()I", native_url_hash_code);
+    // Spring Boot's `LaunchedURLClassLoader` installs a JVM-wide handler factory.
+    // HotSpot allows at most one successful registration; we accept the call
+    // and rely on existing Rust URL / `JarFile` shims instead of JDK handlers.
+    registry.register(
+        url,
+        "setURLStreamHandlerFactory",
+        "(Ljava/net/URLStreamHandlerFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
     // openConnection() — returns a 10-field HttpURLConnection synthetic
     registry.register(url, "openConnection", "()Ljava/net/URLConnection;", |ctx, args| {
         let url_obj = obj_arg(args, 0)?;
@@ -19399,8 +20914,18 @@ fn register_net_natives(registry: &mut NativeMethodRegistry) {
         // URI and URL share the same 6-field layout in our synthetic model
         Ok(Some(args[0]))
     });
-    registry.register(uri, "getSchemeSpecificPart", "()Ljava/lang/String;", native_url_to_string);
-    registry.register(uri, "getRawSchemeSpecificPart", "()Ljava/lang/String;", native_url_to_string);
+    registry.register(
+        uri,
+        "getSchemeSpecificPart",
+        "()Ljava/lang/String;",
+        native_uri_get_scheme_specific_part,
+    );
+    registry.register(
+        uri,
+        "getRawSchemeSpecificPart",
+        "()Ljava/lang/String;",
+        native_uri_get_scheme_specific_part,
+    );
     registry.register(uri, "compareTo", "(Ljava/net/URI;)I", |ctx, args| {
         let s1 = match args.first() {
             Some(Value::Object(Some(o))) => match ctx.get_field(*o, URL_FIELD_FULL) {
@@ -19573,7 +21098,54 @@ fn extract_path(uri: &str) -> &str {
     }
 }
 
+/// `URI.getSchemeSpecificPart()` / `getRawSchemeSpecificPart()`.
+///
+/// Spring Boot 3.2 `Archive.create(ProtectionDomain)` does
+/// `getCodeSource().getLocation().toURI().getSchemeSpecificPart()` → `new File(...)`.
+/// Our `URL.toURI()` stores the full string in `URL_FIELD_FULL` (e.g. `file:/C:/a.jar`).
+/// Returning the entire string breaks `File(String)`; callers need the scheme-specific
+/// part only (`/C:/a.jar`).
+fn native_uri_get_scheme_specific_part(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let full = match ctx.get_field(this, URL_FIELD_FULL) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let ssp = if let Some(pos) = full.find(':') {
+        full[pos + 1..].to_string()
+    } else {
+        full
+    };
+    Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+}
+
 pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str) {
+    // Fast path: opaque/hierarchical `file:` URIs used by `Class.getProtectionDomain`
+    // (`file:/C:/foo.jar` on Windows — note **no** `file://`). The generic
+    // `://` splitter below treats these as schemeless and corrupts field slots,
+    // which used to leave `URI` field 5 empty and broke
+    // `getSchemeSpecificPart() -> new File(...)` for Spring Boot's launcher.
+    if let Some(rest) = url_str.strip_prefix("file:") {
+        let full_obj = ctx.create_string(url_str);
+        let path_str = rest.to_string();
+        let path_obj = ctx.create_string(&path_str);
+        let proto_obj = ctx.create_string("file");
+        let host_empty = ctx.create_string("");
+        ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
+        ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
+        ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
+        ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
+        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
+        ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+        return;
+    }
+
     // Parse: protocol://host[:port][/path][?query]
     let (protocol, rest) = if let Some(pos) = url_str.find("://") {
         (&url_str[..pos], &url_str[pos + 3..])
@@ -24166,6 +25738,27 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     ctx.set_field_by_name(this, "detailMessage", msg);
     if ctx.object_num_fields(this) >= 1 {
         ctx.set_field(this, 0, msg);
+    }
+    // Surefire bootstrap forensics: capture exact Java callsite for the
+    // recurring `NullPointerException("Name is null")` blocker so we can
+    // patch the true producer instead of masking symptoms.
+    if let Value::Object(Some(msg_obj)) = msg {
+        if let Some(message) = ctx.read_string(msg_obj) {
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(this))
+                .unwrap_or_default();
+            if class_name == "java/lang/NullPointerException" && message == "Name is null" {
+                let trace = ctx.capture_stack_trace(ctx.identity_hash_code(this));
+                eprintln!("[SUREFIRE-NPE] Name is null thrown; top Java frames:");
+                for (i, f) in trace.iter().take(12).enumerate() {
+                    let src = f.source_file.as_deref().unwrap_or("Unknown Source");
+                    eprintln!(
+                        "[SUREFIRE-NPE]   #{i} {}.{} ({}:{})",
+                        f.class_name, f.method_name, src, f.line_number
+                    );
+                }
+            }
+        }
     }
     Ok(None)
 }

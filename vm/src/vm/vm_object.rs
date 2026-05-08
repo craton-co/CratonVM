@@ -153,6 +153,54 @@ pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
     str_obj
 }
 
+/// Decode the JDK `String.value` array payload (compact `byte[]` or legacy `char[]`).
+pub fn decode_java_string_value_array(
+    heap: &VmHeap,
+    value_array: ObjectRef,
+    coder: i32,
+) -> Option<String> {
+    if heap.kind_of(value_array) != crate::memory::heap::ObjectKind::Array {
+        return None;
+    }
+    let elem_type = heap.array_element_type(value_array)?;
+    match elem_type {
+        ArrayElementType::Char => {
+            let utf16 = heap.read_char_array_bulk(value_array);
+            Some(String::from_utf16_lossy(&utf16))
+        }
+        ArrayElementType::Byte => {
+            let len = heap.array_length(value_array);
+            if coder == CODER_LATIN1 {
+                let mut s = String::with_capacity(len);
+                for i in 0..len {
+                    let b = match heap.get_array_element(value_array, i) {
+                        Ok(Value::Int(v)) => (v & 0xFF) as u8,
+                        _ => 0,
+                    };
+                    s.push(b as char);
+                }
+                Some(s)
+            } else {
+                let num_units = len / 2;
+                let mut utf16 = Vec::with_capacity(num_units);
+                for i in 0..num_units {
+                    let hi = match heap.get_array_element(value_array, i * 2) {
+                        Ok(Value::Int(v)) => (v & 0xFF) as u16,
+                        _ => 0,
+                    };
+                    let lo = match heap.get_array_element(value_array, i * 2 + 1) {
+                        Ok(Value::Int(v)) => (v & 0xFF) as u16,
+                        _ => 0,
+                    };
+                    utf16.push((hi << 8) | lo);
+                }
+                Some(String::from_utf16_lossy(&utf16))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Read a Java String object back to a Rust `String`.
 ///
 /// Supports both compact string layout (JDK 9+: byte[] + coder) and legacy
@@ -178,47 +226,16 @@ fn read_java_string_inner(heap: &VmHeap, obj_ref: ObjectRef, _compact_override: 
 
     // Detect the array element type to determine which layout is in use.
     let elem_type = heap.array_element_type(value_array);
+    let coder = match elem_type {
+        Some(ArrayElementType::Byte) => match heap.get_field(obj_ref, 1) {
+            Value::Int(c) => c,
+            _ => CODER_LATIN1,
+        },
+        _ => CODER_LATIN1,
+    };
     match elem_type {
-        Some(ArrayElementType::Char) => {
-            // Legacy layout: char[] value — bulk read UTF-16
-            let utf16 = heap.read_char_array_bulk(value_array);
-            Some(String::from_utf16_lossy(&utf16))
-        }
-        Some(ArrayElementType::Byte) => {
-            // Compact string layout: byte[] value — check coder field
-            let coder = match heap.get_field(obj_ref, 1) {
-                Value::Int(c) => c,
-                _ => CODER_LATIN1,
-            };
-            let len = heap.array_length(value_array);
-            if coder == CODER_LATIN1 {
-                // LATIN1: each byte is a Unicode code point (0..255)
-                let mut s = String::with_capacity(len);
-                for i in 0..len {
-                    let b = match heap.get_array_element(value_array, i) {
-                        Ok(Value::Int(v)) => (v & 0xFF) as u8,
-                        _ => 0,
-                    };
-                    s.push(b as char);
-                }
-                Some(s)
-            } else {
-                // UTF16: pairs of bytes → UTF-16 code units (big-endian)
-                let num_units = len / 2;
-                let mut utf16 = Vec::with_capacity(num_units);
-                for i in 0..num_units {
-                    let hi = match heap.get_array_element(value_array, i * 2) {
-                        Ok(Value::Int(v)) => (v & 0xFF) as u16,
-                        _ => 0,
-                    };
-                    let lo = match heap.get_array_element(value_array, i * 2 + 1) {
-                        Ok(Value::Int(v)) => (v & 0xFF) as u16,
-                        _ => 0,
-                    };
-                    utf16.push((hi << 8) | lo);
-                }
-                Some(String::from_utf16_lossy(&utf16))
-            }
+        Some(ArrayElementType::Char) | Some(ArrayElementType::Byte) => {
+            decode_java_string_value_array(heap, value_array, coder)
         }
         _ => {
             // Field 0 is an array but it's neither a char[] nor a byte[].

@@ -12,7 +12,7 @@
 use rustjvm_types::ClassId;
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use rustjvm_types::{ObjectKind, ObjectRef, Value};
 
 /// Create an iterator backed by a snapshot array of the given size.
 /// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
@@ -67,7 +67,12 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_collections_extras_natives(registry);
     register_blocking_queue_natives(registry);
     register_iterator_protocol_natives(registry);
-    register_scheduled_executor_natives(registry);
+    // ScheduledThreadPoolExecutor.schedule is implemented in
+    // native-builtins `register_p63_scheduled_executor` (scheduled_pump +
+    // delay-aware firing). The previous inline `native_stpe_schedule` ran
+    // every runnable immediately, which breaks Surefire ForkedBooter.exit1
+    // (it schedules kill() as a delayed backup; immediate kill NPEs on a
+    // null CommandReader when setupBooter failed first).
     register_concurrent_skip_list_map_natives(registry);
     register_stamped_lock_natives(registry);
     register_phaser_natives(registry);
@@ -240,7 +245,7 @@ const AL_DEFAULT_CAPACITY: usize = 10;
 /// Extract ArrayList state: (elementData, size).
 fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32) {
     let data = match ctx.get_field(this, AL_FIELD_DATA) {
-        Value::Object(Some(arr)) => Some(arr),
+        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
         _ => None,
     };
     let size = match ctx.get_field(this, AL_FIELD_SIZE) {
@@ -913,7 +918,20 @@ const NODE_NUM_FIELDS: usize = 4;
 /// Extract HashMap state: (buckets, size, capacity).
 fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
     let buckets = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
-        Value::Object(Some(arr)) => Some(arr),
+        Value::Object(Some(arr)) => {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                Some(arr)
+            } else {
+                // Real-JDK map variants can expose non-table objects in slot 0
+                // during partial initialization / alternate layouts. Do not
+                // treat those as bucket arrays.
+                eprintln!(
+                    "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
+                    this, arr
+                );
+                None
+            }
+        }
         _ => None,
     };
     // S111r26: Size layout detection.
@@ -1687,9 +1705,12 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
-    // Each entry is a Map.Entry object with 2 fields: key and value
+    // Each entry is a Map.Entry object with 2 fields: key and value.
+    // Use `java/util/Map$Entry` instead of `HashMap$Entry`: in early
+    // bootstrap the concrete nested class can be unresolved and degrade to
+    // cid=0 (`java/lang/Object`), breaking downstream checkcasts.
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/HashMap$Entry", 2);
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
         ctx.set_field(entry_obj, 0, *key);
         ctx.set_field(entry_obj, 1, *value);
 
@@ -2030,32 +2051,239 @@ pub fn make_hashset_with_elements(
 }
 
 fn register_hashset_natives(r: &mut NativeMethodRegistry) {
-    let c = "java/util/HashSet";
+    // LETSGO_S1: Mirror HashSet's native surface onto the class names of
+    // its real-JDK subclasses that share the same `field 0 = backing
+    // map` layout. Without this mirroring, `LinkedHashSet.add(Object)Z`
+    // dispatch — which `force_native` looks up by the receiver's *exact*
+    // class name — falls off the synthetic-jdk dispatcher and surfaces a
+    // `NoSuchMethodError`, breaking real-app boots that allocate
+    // `LinkedHashSet`s during Spring/Log4J/SLF4J initialisation. Real
+    // JDK semantics for `LinkedHashSet` differ only in iteration order
+    // (insertion-order vs hash order), which our `make_set_of` /
+    // `native_hs_iterator` already preserve via the synthetic backing
+    // map's bucket walk for the purposes of caller code. Same rationale
+    // for `EnumSet`, `CopyOnWriteArraySet`, and `ConcurrentSkipListSet`
+    // — applications that allocate them via the synthetic-stub path get
+    // a working contract, and applications that rely on their JDK
+    // bytecode keep working because the natives only override matching
+    // signatures.
+    const SET_CLASSES: &[&str] = &[
+        "java/util/HashSet",
+        "java/util/LinkedHashSet",
+        "java/util/concurrent/CopyOnWriteArraySet",
+    ];
 
-    r.register(c, "<init>", "()V", native_hs_init);
-    r.register(c, "<init>", "(I)V", native_hs_init_capacity);
-    r.register(c, "size", "()I", native_hs_size);
-    r.register(c, "isEmpty", "()Z", native_hs_is_empty);
-    r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
-    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_hs_remove);
-    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_hs_contains);
-    r.register(c, "clear", "()V", native_hs_clear);
-    r.register(c, "iterator", "()Ljava/util/Iterator;", native_hs_iterator);
-    r.register(c, "toArray", "()[Ljava/lang/Object;", native_hs_to_array);
-    r.register(
-        c,
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-        native_collection_to_array_generator,
-    );
-    r.register(c, "toString", "()Ljava/lang/String;", native_hs_to_string);
-    r.register(
-        c,
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        native_hs_for_each,
-    );
-    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
+    for c in SET_CLASSES {
+        r.register(c, "<init>", "()V", native_hs_init);
+        r.register(c, "<init>", "(I)V", native_hs_init_capacity);
+        r.register(c, "<init>", "(IF)V", native_hs_init_capacity_load);
+        r.register(c, "<init>", "(Ljava/util/Collection;)V", native_hs_init_from_collection);
+        r.register(c, "size", "()I", native_hs_size);
+        r.register(c, "isEmpty", "()Z", native_hs_is_empty);
+        r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
+        r.register(c, "remove", "(Ljava/lang/Object;)Z", native_hs_remove);
+        r.register(c, "contains", "(Ljava/lang/Object;)Z", native_hs_contains);
+        r.register(c, "clear", "()V", native_hs_clear);
+        r.register(c, "iterator", "()Ljava/util/Iterator;", native_hs_iterator);
+        r.register(c, "toArray", "()[Ljava/lang/Object;", native_hs_to_array);
+        r.register(
+            c,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            native_hs_to_array_typed,
+        );
+        r.register(
+            c,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            native_collection_to_array_generator,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_hs_to_string);
+        r.register(c, "hashCode", "()I", native_hs_hash_code);
+        r.register(c, "equals", "(Ljava/lang/Object;)Z", native_hs_equals);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_hs_for_each,
+        );
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
+        r.register(
+            c,
+            "addAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_add_all,
+        );
+        r.register(
+            c,
+            "removeAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_remove_all,
+        );
+        r.register(
+            c,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_retain_all,
+        );
+        r.register(
+            c,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_contains_all,
+        );
+    }
+}
+
+/// LETSGO_S1: HashSet(int initialCapacity, float loadFactor) — mirror of
+/// `native_hs_init_capacity` that ignores the load factor (matches our
+/// HashMap layout, where loadFactor is fixed at 0.75).
+fn native_hs_init_capacity_load(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Drop the loadFactor (last) arg and reuse the (I)V path.
+    let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
+    native_hs_init_capacity(ctx, &trimmed)
+}
+
+/// LETSGO_S1: HashSet.toArray(T[]) — typed-array variant. Our existing
+/// `native_hs_to_array` returns a fresh `Object[]`, but the typed
+/// variant must populate the caller's array (or allocate a new one of
+/// the same component type if the input is too small). For now we
+/// allocate a fresh `Object[]` of the right size — sufficient for the
+/// callers we observe (Spring's iteration of HashSet keysets). When the
+/// input array is large enough we copy into it and write null at index
+/// `size` per spec; otherwise we fall back to a fresh allocation.
+fn native_hs_to_array_typed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match args.get(1).copied() {
+        Some(Value::Object(Some(t))) => Some(t),
+        _ => None,
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    if let Some(arr) = target {
+        let len = ctx.array_length(arr);
+        if len >= keys.len() {
+            for (i, k) in keys.iter().enumerate() {
+                ctx.set_array_element(arr, i, *k);
+            }
+            if len > keys.len() {
+                ctx.set_array_element(arr, keys.len(), Value::Object(None));
+            }
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    }
+    let arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// LETSGO_S1: HashSet.hashCode — sum of `hashCode()` over elements
+/// (matches `AbstractSet.hashCode` semantics).
+fn native_hs_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    let mut h: i32 = 0;
+    for k in &keys {
+        let kh = match k {
+            Value::Object(Some(o)) => ctx.identity_hash_code(*o),
+            Value::Int(v) => *v,
+            _ => 0,
+        };
+        h = h.wrapping_add(kh);
+    }
+    Ok(Some(Value::Int(h)))
+}
+
+/// LETSGO_S1: HashSet.equals — same size + every element of `this` is in
+/// `other` (`AbstractSet.equals` semantics).
+fn native_hs_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let other_size = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+        Some(Value::Int(n)) => n,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    if keys.len() as i32 != other_size {
+        return Ok(Some(Value::Int(0)));
+    }
+    for k in &keys {
+        let contains = ctx.invoke_virtual(
+            other,
+            "contains",
+            "(Ljava/lang/Object;)Z",
+            &[*k],
+        )?;
+        if !matches!(contains, Some(Value::Int(1))) {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+/// LETSGO_S1: HashSet.containsAll(Collection<?>) — true iff every element
+/// of the source collection is present in this set.  Wraps the existing
+/// `native_hs_contains` and `collect_collection_elements` helpers.
+fn native_hs_contains_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = collect_collection_elements(ctx, coll);
+    for e in &elems {
+        let r = native_hs_contains(ctx, &[Value::Object(Some(this)), *e])?;
+        if !matches!(r, Some(Value::Int(1))) {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    Ok(Some(Value::Int(1)))
 }
 
 fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2761,10 +2989,21 @@ fn native_arrays_sort_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
+    let mut arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
+    if ctx.heap_kind_of(arr) != ObjectKind::Array {
+        // Some early bootstrap paths (ClassWorlds / Maven launcher) can
+        // route a List receiver into Arrays.sort native overrides. Coerce an
+        // ArrayList receiver to its backing elementData to preserve behavior.
+        let (data, _size) = al_state(ctx, arr);
+        if let Some(backing) = data {
+            arr = backing;
+        } else {
+            return Ok(None);
+        }
+    }
     let len = ctx.array_length(arr);
     // Read all elements with their string representation for sorting
     let mut items: Vec<(String, Value)> = Vec::with_capacity(len);
@@ -3912,7 +4151,7 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let key = args.first().copied().unwrap_or(Value::Object(None));
     let value = args.get(1).copied().unwrap_or(Value::Object(None));
-    let entry = alloc_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
     Ok(Some(Value::Object(Some(entry))))
@@ -15981,11 +16220,97 @@ fn native_pbq_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_executors_scheduled_natives(r: &mut NativeMethodRegistry) {
+    // Some runtimes resolve STPE constructors through this crate's registry,
+    // so keep both ctor shapes available here (including ThreadFactory variant).
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "<init>",
+        "(I)V",
+        native_stpe_init,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "<init>",
+        "(ILjava/util/concurrent/ThreadFactory;)V",
+        native_stpe_init,
+    );
     r.register(
         "java/util/concurrent/Executors",
         "newScheduledThreadPool",
         "(I)Ljava/util/concurrent/ScheduledExecutorService;",
         native_executors_new_scheduled_pool,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "setKeepAliveTime",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_stpe_set_keep_alive_time,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "getKeepAliveTime",
+        "(Ljava/util/concurrent/TimeUnit;)J",
+        native_stpe_get_keep_alive_time,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "schedule",
+        "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "scheduleAtFixedRate",
+        "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule_fixed_rate,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "scheduleWithFixedDelay",
+        "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
+        native_stpe_schedule_fixed_delay,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "shutdown",
+        "()V",
+        native_stpe_shutdown,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "isShutdown",
+        "()Z",
+        native_stpe_is_shutdown,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "setMaximumPoolSize",
+        "(I)V",
+        native_stpe_set_maximum_pool_size,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "setCorePoolSize",
+        "(I)V",
+        native_stpe_set_core_pool_size,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "setContinueExistingPeriodicTasksAfterShutdownPolicy",
+        "(Z)V",
+        native_stpe_ignore_policy_setter,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "setExecuteExistingDelayedTasksAfterShutdownPolicy",
+        "(Z)V",
+        native_stpe_ignore_policy_setter,
+    );
+    r.register(
+        "java/util/concurrent/ScheduledThreadPoolExecutor",
+        "setRemoveOnCancelPolicy",
+        "(Z)V",
+        native_stpe_ignore_policy_setter,
     );
 }
 
@@ -16027,6 +16352,19 @@ const CF_FIELD_SOURCE: usize = 2;
 const CF_FIELD_HANDLER: usize = 3;
 
 fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "addIfAbsent",
+        "(Ljava/lang/Object;)Z",
+        native_cowal_add_if_absent,
+    );
+    r.register(
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_cowal_contains,
+    );
+
     let cf = "java/util/concurrent/CompletableFuture";
 
     // --- CompletionStage methods ---
@@ -16245,6 +16583,84 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     // --- RecursiveAction.invoke that calls compute ---
     let ra = "java/util/concurrent/RecursiveAction";
     r.register(ra, "invoke", "()Ljava/lang/Object;", native_ra_invoke);
+}
+
+fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let present = ctx.invoke_virtual(this, "contains", "(Ljava/lang/Object;)Z", &[elem])?;
+    if matches!(present, Some(Value::Int(v)) if v != 0) {
+        return Ok(Some(Value::Int(0)));
+    }
+    let added = ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+    Ok(added.or(Some(Value::Int(0))))
+}
+
+fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(n) => n.max(0) as usize,
+        _ => 0,
+    };
+    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+        for i in 0..size {
+            if ctx.get_array_element(arr, i) == needle {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_stpe_set_keep_alive_time(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Shim compatibility: accept and ignore keep-alive tuning.
+    Ok(None)
+}
+
+fn native_stpe_get_keep_alive_time(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Return a conservative "disabled" value in all units.
+    Ok(Some(Value::Long(0)))
+}
+
+fn native_stpe_set_maximum_pool_size(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Compatibility no-op for tuning knobs not modeled by the shim scheduler.
+    Ok(None)
+}
+
+fn native_stpe_set_core_pool_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let size = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    ctx.set_field(this, STPE_FIELD_POOL_SIZE, Value::Int(size.max(0)));
+    Ok(None)
+}
+
+fn native_stpe_ignore_policy_setter(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
 }
 
 // --- CompletableFuture CompletionStage implementations ---

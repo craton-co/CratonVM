@@ -187,6 +187,16 @@ pub fn throw_runtime_error(
                         eprintln!("C29-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                     }
                 }
+                if m.contains("Name is null") {
+                    eprintln!("SUREFIRE-NPE-TRACE msg={m}");
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                        let cn = shared.class_manager.read()
+                            .get_class(f.class_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        eprintln!("SUREFIRE-NPE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                    }
+                }
             }
             // S111r20: broad NPE trace for spring context NPE hunt
             if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {

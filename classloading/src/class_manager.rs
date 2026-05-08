@@ -14,9 +14,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use rustjvm_reader::attribute::Attribute;
-use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
+use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
 use rustjvm_reader::class_file_version::ClassFileVersion;
 use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use rustjvm_reader::method::ClassFileMethod;
 use tracing::debug;
 
 use crate::class::{
@@ -714,7 +715,7 @@ impl ClassManager {
             superclass: None,
             interfaces: vec![],
             fields: vec![],
-            methods: vec![],
+            methods: synthetic_stub_ctor_methods(name),
             first_field_index: 0,
             num_total_fields: num_fields,
             bootstrap_methods: vec![],
@@ -915,8 +916,6 @@ impl ClassManager {
             "java/util/concurrent/atomic/AtomicReference",
             "java/util/concurrent/locks/ReentrantLock",
             "java/util/concurrent/locks/ReentrantReadWriteLock",
-            "java/util/concurrent/CountDownLatch",
-            "java/util/concurrent/Semaphore",
             "java/util/concurrent/CompletableFuture",
             "java/util/concurrent/CyclicBarrier",
             "java/util/concurrent/ForkJoinPool",
@@ -2711,13 +2710,39 @@ impl ClassManager {
     ///
     /// Returns `None` if the class hasn't been loaded by any loader.
     pub fn find_class_by_name(&self, name: &str) -> Option<ClassId> {
-        for loader_id in &[
-            ClassLoaderId::Bootstrap,
-            ClassLoaderId::Extension,
-            ClassLoaderId::Application,
-        ] {
-            if let Some(&id) = self.loaded_classes.get(&(*loader_id, name.to_string())) {
-                // Hidden classes (JEP 371) are not discoverable by name.
+        let slash = if name.contains('.') && !name.contains('/') {
+            name.replace('.', "/")
+        } else {
+            name.to_string()
+        };
+        let dot = slash.replace('/', ".");
+        let keys = if slash == dot {
+            vec![slash]
+        } else {
+            vec![slash, dot]
+        };
+
+        for key in &keys {
+            for loader_id in &[
+                ClassLoaderId::Bootstrap,
+                ClassLoaderId::Extension,
+                ClassLoaderId::Application,
+            ] {
+                if let Some(&id) = self.loaded_classes.get(&(*loader_id, key.clone())) {
+                    if let Some(class) = self.get_class(id) {
+                        if class.hidden {
+                            continue;
+                        }
+                    }
+                    return Some(id);
+                }
+            }
+        }
+        for key in &keys {
+            for ((_loader_id, class_name), &id) in self.loaded_classes.iter() {
+                if class_name.as_str() != key.as_str() {
+                    continue;
+                }
                 if let Some(class) = self.get_class(id) {
                     if class.hidden {
                         continue;
@@ -2827,8 +2852,40 @@ impl ClassManager {
             "jdk/internal/loader/ClassLoaders$AppClassLoader"
                 | "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
         );
+        // LETSGO_S1: Curated list of well-known JDK interfaces whose names
+        // aren't matched by the `$` / `*able` / heuristic. Without this,
+        // synthetic stubs for `java.util.{Set, Map, List, Collection,
+        // Queue, Deque, Iterator, Map$Entry, ...}` end up as concrete
+        // classes and `instanceof` walks via the `interfaces` edge fail
+        // when no concrete bytecode `Set`/`Map`/etc. was loaded ahead of
+        // the dependent class. (LinkedHashSet → HashSet → AbstractSet
+        // chain is fine without this, but Spring boot's `Set.class`
+        // reflection probes still need it.)
+        let is_known_jdk_interface = matches!(
+            name,
+            "java/util/Collection"
+                | "java/util/Set"
+                | "java/util/SortedSet"
+                | "java/util/NavigableSet"
+                | "java/util/List"
+                | "java/util/Map"
+                | "java/util/SortedMap"
+                | "java/util/NavigableMap"
+                | "java/util/Queue"
+                | "java/util/Deque"
+                | "java/util/Iterator"
+                | "java/util/ListIterator"
+                | "java/util/Enumeration"
+                | "java/util/Spliterator"
+                | "java/util/RandomAccess"
+                | "java/util/concurrent/ConcurrentMap"
+                | "java/util/concurrent/BlockingQueue"
+                | "java/util/concurrent/BlockingDeque"
+                | "java/util/concurrent/TransferQueue"
+        );
         let access_flags = if (name.contains("$") && !is_concrete_dollar_class)
             || name.ends_with("able")
+            || is_known_jdk_interface
         {
             // Likely an interface (Serializable, Comparable, Iterable, etc.)
             ClassAccessFlags::PUBLIC | ClassAccessFlags::INTERFACE | ClassAccessFlags::ABSTRACT
@@ -2848,7 +2905,7 @@ impl ClassManager {
             superclass: superclass_id,
             interfaces: vec![], // populated after registration to avoid cycles
             fields,
-            methods: vec![],
+            methods: synthetic_stub_ctor_methods(name),
             first_field_index: parent_fields,
             num_total_fields: parent_fields + num_instance,
             bootstrap_methods: vec![],
@@ -2872,6 +2929,12 @@ impl ClassManager {
             class = %class.name,
             id = %id,
             superclass = ?superclass_id,
+            methods = class.methods.len(),
+            method_sigs = ?class
+                .methods
+                .iter()
+                .map(|m| format!("{}{}", m.name, m.descriptor))
+                .collect::<Vec<_>>(),
             "Synthetic stub class created",
         );
 
@@ -3381,6 +3444,62 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/net/URLClassLoader" => "java/security/SecureClassLoader",
         "java/lang/ClassLoader" => "java/lang/Object",
 
+        // ---- LETSGO_S1: java.util collections compatibility layer ----
+        //
+        // Real JDK declares an `Abstract*` skeletal hierarchy under every
+        // concrete collection. Without this chain, synthetic-stub
+        // dispatch resolves `LinkedHashSet.add(Object)Z` as
+        // `LinkedHashSet.<class chain only Object>.add` and surfaces a
+        // `NoSuchMethodError` (failure mode observed during letsgo-main
+        // boot). Wiring the chain lets `find_method_recursive` and the
+        // native-dispatch fallback walk parents until they locate the
+        // method/native registered on the closest concrete ancestor
+        // (e.g. `HashSet`).
+        //
+        // ONLY edges where the parent contributes zero (or matching)
+        // synthetic fields are listed here so we don't perturb existing
+        // field-slot layouts that natives depend on. In particular,
+        // `LinkedHashMap`, `Properties`, and `Stack` keep their direct
+        // `Object` parent because their `synthetic_stub_fields` already
+        // count fields the candidate parent would also declare.
+        //
+        // Abstract bases (no synthetic fields):
+        "java/util/AbstractCollection" => "java/lang/Object",
+        "java/util/AbstractList" => "java/util/AbstractCollection",
+        "java/util/AbstractSet" => "java/util/AbstractCollection",
+        "java/util/AbstractMap" => "java/lang/Object",
+        "java/util/AbstractQueue" => "java/util/AbstractCollection",
+        "java/util/AbstractSequentialList" => "java/util/AbstractList",
+        "java/util/Dictionary" => "java/lang/Object",
+
+        // Concrete Set hierarchy:
+        "java/util/HashSet" => "java/util/AbstractSet",
+        "java/util/LinkedHashSet" => "java/util/HashSet",
+        "java/util/TreeSet" => "java/util/AbstractSet",
+        "java/util/EnumSet" => "java/util/AbstractSet",
+        "java/util/concurrent/CopyOnWriteArraySet" => "java/util/AbstractSet",
+        "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
+
+        // Concrete List/Queue hierarchy:
+        "java/util/ArrayList" => "java/util/AbstractList",
+        "java/util/LinkedList" => "java/util/AbstractSequentialList",
+        "java/util/Vector" => "java/util/AbstractList",
+        "java/util/ArrayDeque" => "java/util/AbstractCollection",
+        "java/util/PriorityQueue" => "java/util/AbstractQueue",
+        "java/util/concurrent/CopyOnWriteArrayList" => "java/util/AbstractList",
+        "java/util/concurrent/ConcurrentLinkedQueue" => "java/util/AbstractQueue",
+        "java/util/concurrent/ConcurrentLinkedDeque" => "java/util/AbstractCollection",
+
+        // Concrete Map hierarchy:
+        "java/util/HashMap" => "java/util/AbstractMap",
+        "java/util/TreeMap" => "java/util/AbstractMap",
+        "java/util/IdentityHashMap" => "java/util/AbstractMap",
+        "java/util/WeakHashMap" => "java/util/AbstractMap",
+        "java/util/EnumMap" => "java/util/AbstractMap",
+        "java/util/concurrent/ConcurrentHashMap" => "java/util/AbstractMap",
+        "java/util/concurrent/ConcurrentSkipListMap" => "java/util/AbstractMap",
+        "java/util/Hashtable" => "java/util/Dictionary",
+
         // Default: everything else extends Object
         _ => "java/lang/Object",
     }
@@ -3412,18 +3531,72 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/io/Serializable",
             "java/lang/Comparable",
         ],
-        "java/util/ArrayList" | "java/util/LinkedList" | "java/util/Vector" => &[
+        "java/util/ArrayList" | "java/util/LinkedList" | "java/util/Vector"
+        | "java/util/concurrent/CopyOnWriteArrayList" => &[
             "java/util/List",
             "java/util/Collection",
             "java/lang/Iterable",
             "java/io/Serializable",
         ],
-        "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/TreeMap" => &[
+        "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/TreeMap"
+        | "java/util/IdentityHashMap" | "java/util/WeakHashMap"
+        | "java/util/EnumMap"
+        | "java/util/concurrent/ConcurrentHashMap"
+        | "java/util/concurrent/ConcurrentSkipListMap" => &[
             "java/util/Map",
             "java/io/Serializable",
         ],
-        "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet" => &[
+        "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet"
+        | "java/util/EnumSet"
+        | "java/util/concurrent/CopyOnWriteArraySet"
+        | "java/util/concurrent/ConcurrentSkipListSet" => &[
             "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        // LETSGO_S1: Skeletal abstract bases — declare the same root
+        // interfaces as their concrete subclasses so `instanceof` checks
+        // travelling through the abstract base land on the right answer.
+        "java/util/AbstractCollection" => &[
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        "java/util/AbstractList" | "java/util/AbstractSequentialList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        "java/util/AbstractSet" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        "java/util/AbstractMap" => &["java/util/Map"],
+        "java/util/AbstractQueue" => &[
+            "java/util/Queue",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        "java/util/Hashtable" | "java/util/Properties" => &[
+            "java/util/Map",
+            "java/io/Serializable",
+            "java/lang/Cloneable",
+        ],
+        "java/util/Dictionary" => &[],
+        "java/util/ArrayDeque" => &[
+            "java/util/Deque",
+            "java/util/Queue",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        "java/util/PriorityQueue" => &[
+            "java/util/Queue",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        "java/util/Stack" => &[
+            "java/util/List",
             "java/util/Collection",
             "java/lang/Iterable",
             "java/io/Serializable",
@@ -3752,6 +3925,56 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/text/MessageFormat" => instance_fields(1),
         // Thread = 5 fields (name=0, priority=1, tid=2, target/runnable=3, virtualFlag=4)
         "java/lang/Thread" => instance_fields(5),
+        "java/lang/Thread$State" => vec![
+            ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc("NEW"),
+                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc("RUNNABLE"),
+                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc("BLOCKED"),
+                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc("WAITING"),
+                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc("TIMED_WAITING"),
+                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc("TERMINATED"),
+                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                attributes: vec![],
+            },
+        ],
         // Atomic types: 1 field (value=0)
         "java/util/concurrent/atomic/AtomicInteger"
         | "java/util/concurrent/atomic/AtomicLong"
@@ -4963,6 +5186,168 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
     }
 }
 
+fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
+    let mut out = Vec::new();
+    let mk_ctor = |descriptor: &str| ClassFileMethod {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+        name: rustjvm_types::intern_arc("<init>"),
+        descriptor: rustjvm_types::intern_arc(descriptor),
+        attributes: vec![],
+    };
+    let is_throwable_like =
+        name == "java/lang/Throwable" || name.ends_with("Exception") || name.ends_with("Error");
+    if is_throwable_like {
+        out.extend([
+            mk_ctor("()V"),
+            mk_ctor("(Ljava/lang/String;)V"),
+            mk_ctor("(Ljava/lang/Throwable;)V"),
+            mk_ctor("(Ljava/lang/String;Ljava/lang/Throwable;)V"),
+        ]);
+    }
+    if name == "java/io/InputStreamReader" {
+        out.extend([
+            mk_ctor("(Ljava/io/InputStream;)V"),
+            mk_ctor("(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V"),
+            mk_ctor("(Ljava/io/InputStream;Ljava/lang/String;)V"),
+        ]);
+    }
+    if name == "java/io/BufferedReader" {
+        out.extend([
+            mk_ctor("(Ljava/io/Reader;)V"),
+            mk_ctor("(Ljava/io/Reader;I)V"),
+        ]);
+    }
+    if name == "java/lang/Thread" {
+        for desc in [
+            "()V",
+            "(Ljava/lang/Runnable;)V",
+            "(Ljava/lang/Runnable;Ljava/lang/String;)V",
+            "(Ljava/lang/String;)V",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        ] {
+            out.push(ClassFileMethod {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+                name: rustjvm_types::intern_arc("<init>"),
+                descriptor: rustjvm_types::intern_arc(desc),
+                attributes: vec![],
+            });
+        }
+        for (method, desc) in [
+            ("start0", "()V"),
+            ("start", "()V"),
+            ("run", "()V"),
+            ("join", "()V"),
+            ("join", "(J)V"),
+            ("join", "(JI)V"),
+        ] {
+            out.push(ClassFileMethod {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+                name: rustjvm_types::intern_arc(method),
+                descriptor: rustjvm_types::intern_arc(desc),
+                attributes: vec![],
+            });
+        }
+        out.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc("getThreadGroup"),
+            descriptor: rustjvm_types::intern_arc("()Ljava/lang/ThreadGroup;"),
+            attributes: vec![],
+        });
+        out.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc("getPriority"),
+            descriptor: rustjvm_types::intern_arc("()I"),
+            attributes: vec![],
+        });
+        out.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc("isDaemon"),
+            descriptor: rustjvm_types::intern_arc("()Z"),
+            attributes: vec![],
+        });
+        out.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc("setDaemon"),
+            descriptor: rustjvm_types::intern_arc("(Z)V"),
+            attributes: vec![],
+        });
+    }
+    if name == "java/util/concurrent/CountDownLatch" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc(method),
+            descriptor: rustjvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("<init>", "(I)V"),
+            mk("countDown", "()V"),
+            mk("await", "()V"),
+            mk("await", "(JLjava/util/concurrent/TimeUnit;)Z"),
+            mk("getCount", "()J"),
+            mk("toString", "()Ljava/lang/String;"),
+        ]);
+    }
+    if name == "java/util/concurrent/Semaphore" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc(method),
+            descriptor: rustjvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("<init>", "(I)V"),
+            mk("<init>", "(IZ)V"),
+            mk("acquire", "()V"),
+            mk("acquire", "(I)V"),
+            mk("acquireUninterruptibly", "()V"),
+            mk("release", "()V"),
+            mk("release", "(I)V"),
+            mk("tryAcquire", "()Z"),
+            mk("tryAcquire", "(I)Z"),
+            mk("tryAcquire", "(JLjava/util/concurrent/TimeUnit;)Z"),
+            mk("availablePermits", "()I"),
+            mk("drainPermits", "()I"),
+            mk("isFair", "()Z"),
+            mk("toString", "()Ljava/lang/String;"),
+        ]);
+    }
+    if name == "java/util/concurrent/atomic/AtomicBoolean" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc(method),
+            descriptor: rustjvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([mk("<init>", "()V"), mk("<init>", "(Z)V")]);
+    }
+    if name == "java/util/concurrent/ScheduledThreadPoolExecutor" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc(method),
+            descriptor: rustjvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("<init>", "(I)V"),
+            mk("<init>", "(ILjava/util/concurrent/ThreadFactory;)V"),
+        ]);
+    }
+    if name == "java/util/concurrent/CopyOnWriteArrayList" {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc(method),
+            descriptor: rustjvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("contains", "(Ljava/lang/Object;)Z"),
+            mk("addIfAbsent", "(Ljava/lang/Object;)Z"),
+        ]);
+    }
+    out
+}
+
 impl std::fmt::Debug for ClassManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClassManager")
@@ -5324,6 +5709,18 @@ mod tests {
         assert_eq!(cls.record_components.len(), 2);
         assert_eq!(cls.record_components[0].name, "x");
         assert_eq!(cls.record_components[1].descriptor, "I");
+    }
+
+    #[test]
+    fn synthetic_thread_stub_declares_get_thread_group() {
+        let methods = synthetic_stub_ctor_methods("java/lang/Thread");
+        assert!(
+            methods.iter().any(|m| {
+                &*m.name == "getThreadGroup"
+                    && &*m.descriptor == "()Ljava/lang/ThreadGroup;"
+            }),
+            "synthetic Thread stub should declare getThreadGroup()"
+        );
     }
 
     #[test]

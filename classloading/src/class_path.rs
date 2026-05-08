@@ -177,6 +177,49 @@ pub struct ManifestInfo {
 }
 
 impl ManifestInfo {
+    fn decode_manifest_classpath_entry(entry: &str, jar_dir: &Path) -> PathBuf {
+        let raw = entry.trim();
+        // JAR manifests may carry file URLs (e.g. surefire booter jars emit
+        // `file:/C:/...` entries). Treat those as absolute paths instead of
+        // joining them to the launcher jar directory.
+        let from_file_uri = |rest: &str| -> PathBuf {
+            let mut path = rest.replace('%', "%");
+            path = path.replace("%20", " ");
+            path = path.replace("%5B", "[");
+            path = path.replace("%5D", "]");
+            path = path.replace("%7B", "{");
+            path = path.replace("%7D", "}");
+            let mut out = path;
+            if let Some(stripped) = out.strip_prefix("///") {
+                out = stripped.to_string();
+            } else if let Some(stripped) = out.strip_prefix("//") {
+                // file://<host>/... . For local drive paths this is typically
+                // file:///C:/...; for malformed host forms preserve the slash.
+                out = stripped.to_string();
+            } else if let Some(stripped) = out.strip_prefix('/') {
+                // file:/C:/... (single slash before drive letter) -> C:/...
+                if stripped.as_bytes().get(1) == Some(&b':') {
+                    out = stripped.to_string();
+                }
+            }
+            PathBuf::from(out)
+        };
+
+        if let Some(rest) = raw.strip_prefix("file:") {
+            return from_file_uri(rest);
+        }
+
+        let p = Path::new(raw);
+        if p.is_absolute() {
+            return p.to_path_buf();
+        }
+        if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+            // Windows drive-absolute path like C:/foo or C:\foo.
+            return PathBuf::from(raw);
+        }
+        jar_dir.join(raw)
+    }
+
     /// Parse a `MANIFEST.MF` file's bytes.
     pub fn parse(data: &[u8]) -> Self {
         let text = String::from_utf8_lossy(data);
@@ -196,13 +239,17 @@ impl ManifestInfo {
             if let Some((key, value)) = line.split_once(':') {
                 let key = key.trim();
                 let value = value.trim();
-                // Cap each attribute to 8 KiB to keep a malicious manifest
-                // (large nameplate, suspicious magic strings) from blowing
-                // out memory.  Real attributes max out at a few hundred
-                // bytes; the few that legitimately hold a base64 blob
-                // (signing certs) sit on per-entry sections, which we do
-                // not parse.
-                if value.len() > 8 * 1024 {
+                // Cap most attributes to 8 KiB to keep a malicious manifest
+                // from blowing out memory, but allow a larger window for
+                // Class-Path: build tools (Surefire booter JARs in
+                // particular) routinely emit 10s of KB when test classpaths
+                // include many dependencies.
+                let max_len = if key == "Class-Path" {
+                    256 * 1024
+                } else {
+                    8 * 1024
+                };
+                if value.len() > max_len {
                     continue;
                 }
                 info.attributes.insert(key.to_string(), value.to_string());
@@ -229,7 +276,11 @@ impl ManifestInfo {
         match &self.class_path {
             Some(cp) => cp
                 .split_whitespace()
-                .map(|entry| jar_dir.join(entry).to_string_lossy().into_owned())
+                .map(|entry| {
+                    Self::decode_manifest_classpath_entry(entry, jar_dir)
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect(),
             None => Vec::new(),
         }
@@ -2534,6 +2585,38 @@ mod tests {
         let data = b"Multi-Release: TRUE\n";
         let info = ManifestInfo::parse(data);
         assert!(info.multi_release);
+    }
+
+    #[test]
+    fn manifest_classpath_not_dropped_when_large() {
+        let mut entries = Vec::new();
+        for i in 0..1200 {
+            entries.push(format!("file:/C:/repo/lib/dep{i}.jar"));
+        }
+        let cp = entries.join(" ");
+        let raw = format!("Manifest-Version: 1.0\nClass-Path: {cp}\n");
+        let info = ManifestInfo::parse(raw.as_bytes());
+        assert!(info.class_path.is_some(), "large Class-Path must be preserved");
+    }
+
+    #[test]
+    fn manifest_classpath_file_uri_windows_drive() {
+        let data = b"Class-Path: file:/C:/Users/Victor/.m2/repository/x/y.jar\n";
+        let info = ManifestInfo::parse(data);
+        let cp = info.resolve_class_path(Path::new("C:/tmp/booter.jar"));
+        assert_eq!(cp.len(), 1);
+        let norm = cp[0].replace('\\', "/");
+        assert_eq!(norm, "C:/Users/Victor/.m2/repository/x/y.jar");
+    }
+
+    #[test]
+    fn manifest_classpath_relative_entries_still_resolve_against_jar_dir() {
+        let data = b"Class-Path: lib/a.jar ../shared/b.jar\n";
+        let info = ManifestInfo::parse(data);
+        let cp = info.resolve_class_path(Path::new("C:/tmp/boot/booter.jar"));
+        assert_eq!(cp.len(), 2);
+        assert!(cp[0].replace('\\', "/").ends_with("/tmp/boot/lib/a.jar"));
+        assert!(cp[1].replace('\\', "/").ends_with("/tmp/boot/../shared/b.jar"));
     }
 
     // -- Multi-release JAR tests --

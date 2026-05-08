@@ -45,6 +45,21 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
+fn ipc_dbg_enabled() -> bool {
+    std::env::var("RUSTJVM_SUREFIRE_IPC_DBG")
+        .map(|v| {
+            let t = v.trim();
+            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
+fn ipc_dbg(msg: impl AsRef<str>) {
+    if ipc_dbg_enabled() {
+        eprintln!("[IPC-DBG] {}", msg.as_ref());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry of real OS sockets — keyed by integer id stashed in the synthetic
 // SocketChannelImpl / ServerSocketChannelImpl Java object.
@@ -576,6 +591,7 @@ fn sc_connect_inner(
 ) -> Result<bool, MethodCallFailed> {
     let (host, port) = decode_socket_address(ctx, sa)?;
     let target = format!("{host}:{port}");
+    ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
 
     if allow_block {
         let stream = TcpStream::connect(&target).map_err(|e| map_err(&target, e))?;
@@ -598,10 +614,37 @@ fn sc_connect_inner(
             ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
             ctx.set_field(this, F_REMOTE_PORT, Value::Int(port as i32));
         }
+        ipc_dbg(format!("connect success(blocking) id={id} local_port={local_port}"));
         return Ok(true);
     }
 
-    // Non-blocking path: spawn a worker thread that performs the connect.
+    // Non-blocking path fast-path: for localhost IPC (e.g., Surefire
+    // master-fork channel), a short synchronous dial is more robust than
+    // deferring connect completion to a background thread.
+    let immediate = match target.parse::<SocketAddr>() {
+        Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_millis(750)),
+        Err(_) => TcpStream::connect(&target),
+    };
+    if let Ok(stream) = immediate {
+        let _ = stream.set_nonblocking(true);
+        let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+        let id = tcp_register(TcpHandle::Stream(stream));
+        tcp_blocking_state().write().insert(id, false);
+        if ctx.object_num_fields(this) >= N_FIELDS {
+            ctx.set_field(this, F_REG_ID, Value::Int(id));
+            ctx.set_field(this, F_CONNECTED, Value::Int(1));
+            ctx.set_field(this, F_LOCAL_PORT, Value::Int(local_port));
+            let host_str = ctx.create_string(&host);
+            ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
+            ctx.set_field(this, F_REMOTE_PORT, Value::Int(port as i32));
+        }
+        ipc_dbg(format!(
+            "connect success(nonblocking-fastpath) id={id} local_port={local_port}"
+        ));
+        return Ok(true);
+    }
+
+    // Fallback: spawn a worker thread that performs the connect.
     let progress = ConnectInProgress {
         result: parking_lot::Mutex::new(None),
         done: std::sync::atomic::AtomicBool::new(false),
@@ -623,6 +666,7 @@ fn sc_connect_inner(
             *prog.result.lock() = Some(res);
             prog.done
                 .store(true, std::sync::atomic::Ordering::Release);
+            ipc_dbg(format!("connect worker completed id={id_clone}"));
         }
     });
 
@@ -632,6 +676,7 @@ fn sc_connect_inner(
         ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
         ctx.set_field(this, F_REMOTE_PORT, Value::Int(port as i32));
     }
+    ipc_dbg(format!("connect pending id={id}"));
     Ok(false)
 }
 

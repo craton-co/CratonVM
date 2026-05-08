@@ -216,6 +216,20 @@ fn native_vm_properties(
     if let Some(cp) = ctx.get_system_property("java.class.path") {
         props.push(("java.class.path", cp));
     }
+    // Core separators can be queried very early by java.io bootstrap code
+    // (e.g. WinNTFileSystem.<clinit>), so keep them present in vmProperties.
+    if let Some(v) = ctx.get_system_property("file.separator") {
+        props.push(("file.separator", v));
+    }
+    if let Some(v) = ctx.get_system_property("path.separator") {
+        props.push(("path.separator", v));
+    }
+    if let Some(v) = ctx.get_system_property("line.separator") {
+        props.push(("line.separator", v));
+    }
+    if let Some(v) = ctx.get_system_property("user.dir") {
+        props.push(("user.dir", v));
+    }
     if let Some(java_home) = ctx.get_system_property("java.home") {
         // java.library.path — needed for System.loadLibrary
         #[cfg(windows)]

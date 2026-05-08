@@ -172,6 +172,18 @@ fn discover_providers(
 
     providers.sort();
     providers.dedup();
+    if matches!(
+        std::env::var("RUSTJVM_DIAG_SERVICELOADER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) {
+        eprintln!(
+            "[SL-DBG] ServiceLoader.iterator service={} descriptors={} providers={} ({:?})",
+            service_name,
+            descriptors.len(),
+            providers.len(),
+            providers
+        );
+    }
     Ok(providers)
 }
 
@@ -225,20 +237,44 @@ fn native_sl_iterator(
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
 
+    let diag = matches!(
+        std::env::var("RUSTJVM_DIAG_SERVICELOADER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+    if diag {
+        eprintln!("[SL-DBG] iterator() entering loop with {} providers", providers.len());
+    }
     for fqn in providers {
+        if diag {
+            eprintln!("[SL-DBG]   instantiate provider={fqn}");
+        }
         let name = ctx.create_string(&fqn);
-        let class = ctx
-            .invoke(
-                "java/lang/Class",
-                "forName",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[Value::Object(Some(name))],
-            )
-            .ok()
-            .and_then(|v| v);
-        let class = match class {
+        let class_res = ctx.invoke(
+            "java/lang/Class",
+            "forName",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name))],
+        );
+        let class_opt = match &class_res {
+            Ok(v) => *v,
+            Err(e) => {
+                if diag {
+                    eprintln!("[SL-DBG]   forName({fqn}) raised: {e:?}");
+                }
+                None
+            }
+        };
+        let class = match class_opt {
             Some(Value::Object(Some(c))) => c,
-            _ => continue,
+            other => {
+                if diag {
+                    eprintln!(
+                        "[SL-DBG]   skip (forName returned {:?}): {fqn}",
+                        other
+                    );
+                }
+                continue;
+            }
         };
         // newInstance via Class.getDeclaredConstructor() + Constructor.newInstance().
         let empty_types = ctx.new_ref_array(
@@ -257,7 +293,12 @@ fn native_sl_iterator(
             .and_then(|v| v);
         let ctor = match ctor {
             Some(Value::Object(Some(c))) => c,
-            _ => continue,
+            _ => {
+                if diag {
+                    eprintln!("[SL-DBG]   skip (no zero-arg ctor): {fqn}");
+                }
+                continue;
+            }
         };
         // setAccessible(true)
         let _ = ctx.invoke(
@@ -282,7 +323,12 @@ fn native_sl_iterator(
             .and_then(|v| v);
         let inst = match inst {
             Some(Value::Object(Some(o))) => o,
-            _ => continue,
+            _ => {
+                if diag {
+                    eprintln!("[SL-DBG]   skip (newInstance returned null): {fqn}");
+                }
+                continue;
+            }
         };
         ctx.invoke(
             al_cls,
@@ -292,6 +338,16 @@ fn native_sl_iterator(
         )?;
     }
 
+    if diag {
+        let size = ctx
+            .invoke(al_cls, "size", "()I", &[Value::Object(Some(list))])
+            .ok()
+            .and_then(|v| v);
+        eprintln!(
+            "[SL-DBG] iterator() final list size={:?}",
+            size
+        );
+    }
     let it = ctx.invoke(
         al_cls,
         "iterator",

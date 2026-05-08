@@ -721,6 +721,14 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 
     // ProcessHandleImpl family — ProcessHandle.current() / Process.pid()
     // ultimately reach these.
+    // OpenJDK <clinit> calls initNative(); without it, UnsatisfiedLinkError leaves
+    // internal stubs null and Spring Boot / logging fails on ProcessHandle.current().
+    registry.register(
+        "java/lang/ProcessHandleImpl",
+        "initNative",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register(
         "java/lang/ProcessHandleImpl",
         "getCurrentPid0",
