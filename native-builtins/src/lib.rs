@@ -9953,6 +9953,124 @@ fn static_obj_store() -> &'static std::sync::Mutex<std::collections::HashMap<usi
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+// =====================================================================
+// CAS-livelock fix — synthetic-offset side store for Unsafe.{CAS,get,put}.
+//
+// Background: `Unsafe.objectFieldOffset(C.class, "name")` is called by JDK
+// internals such as `java.lang.Class$Atomic.{cas,get}ReflectionData`,
+// `jdk.internal.module.ServicesCatalog.getServicesCatalog` and
+// `jdk.internal.loader.AbstractClassLoaderValue.putIfAbsent`.  These all
+// follow the same pattern: cache a field offset once at <clinit> time, then
+// drive a `compareAndSetReference` (or `compareAndSetInt`) loop for lazy
+// initialisation.
+//
+// If our `objectFieldOffset1` cannot resolve the (Class, fieldName) pair —
+// for example when the field is declared on `java.lang.Class` itself but our
+// declared-fields list for `java/lang/Class` does not include the synthetic
+// `reflectionData` / `annotationData` / `annotationType` slots — it used to
+// return `0`.  The caller's CAS loop then reads slot 0 of the receiver
+// (which is the classId Int slot for a Class mirror, or the object header
+// for a generic object).  Because that slot's value never matches the
+// `expected` reference the lazy-init guard is comparing against, the CAS
+// loop never makes progress and the thread livelocks — observable as the
+// 60-second watchdog dump on Spring Boot startup and WildFly bootstrap.
+//
+// Fix: instead of returning `0`, mint a unique non-zero synthetic offset
+// in the range `[SYNTHETIC_OFFSET_BASE, SYNTHETIC_OFFSET_BASE + 2^28)` and
+// route Unsafe load/CAS/store on that offset through a side-channel
+// `(ObjectRef, offset) -> Value` store.  The store is per-object so two
+// Class mirrors don't alias each other's lazy state.  The synthetic
+// offset is well below `MAX_REASONABLE_OFFSET = 1 << 30` so the existing
+// `unsafe_offset` clamp doesn't strip it back to 0.
+// =====================================================================
+
+pub(crate) const SYNTHETIC_OFFSET_BASE: usize = 0x2000_0000;
+pub(crate) const SYNTHETIC_OFFSET_END: usize = 0x3FFF_FFFF;
+
+#[inline]
+pub(crate) fn is_synthetic_offset(off: usize) -> bool {
+    (SYNTHETIC_OFFSET_BASE..=SYNTHETIC_OFFSET_END).contains(&off)
+}
+
+/// Map a `(class_name, field_name)` pair to a stable non-zero synthetic
+/// offset.  Stable across calls so the JDK's "cache offset at <clinit>,
+/// reuse forever" pattern stays consistent.
+fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static T: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), usize>>> =
+        std::sync::OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(SYNTHETIC_OFFSET_BASE);
+    let lock = T.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (class_name.to_string(), field_name.to_string());
+    if let Some(off) = map.get(&key) {
+        return *off;
+    }
+    let off = NEXT.fetch_add(1, Ordering::Relaxed);
+    debug_assert!(off < SYNTHETIC_OFFSET_END);
+    map.insert(key, off);
+    off
+}
+
+/// Per-object side store for fields stored at a synthetic offset.  Keyed
+/// by `(ObjectRef-as-usize, offset)` so each receiver has its own slot and
+/// CAS sees a consistent value across the load and the compare-and-store.
+fn synthetic_field_store()
+    -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Value>>
+{
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), Value>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[inline]
+fn obj_key(obj: rustjvm_types::ObjectRef) -> usize {
+    // We only use the address as a hash-map key; never dereferenced here.
+    obj.as_ptr() as usize
+}
+
+pub(crate) fn synthetic_get(obj: rustjvm_types::ObjectRef, offset: usize) -> Value {
+    let map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(obj_key(obj), offset))
+        .copied()
+        .unwrap_or(Value::Object(None))
+}
+
+pub(crate) fn synthetic_put(obj: rustjvm_types::ObjectRef, offset: usize, val: Value) {
+    let mut map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert((obj_key(obj), offset), val);
+}
+
+/// CAS on the synthetic per-object slot.  Returns true on success.  The
+/// expected/new pair may be Object, Int or Long; the comparison is by the
+/// raw bit pattern (Object identity for refs, value for primitives).
+pub(crate) fn synthetic_cas(
+    obj: rustjvm_types::ObjectRef,
+    offset: usize,
+    expected: Value,
+    new_val: Value,
+) -> bool {
+    let mut map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    let cur = map
+        .get(&(obj_key(obj), offset))
+        .copied()
+        .unwrap_or(Value::Object(None));
+    let eq = match (cur, expected) {
+        (Value::Object(a), Value::Object(b)) => a == b,
+        (Value::Object(None), Value::Int(0)) | (Value::Int(0), Value::Object(None)) => true,
+        (Value::Object(None), Value::Long(0)) | (Value::Long(0), Value::Object(None)) => true,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Long(a), Value::Long(b)) => a == b,
+        _ => false,
+    };
+    if eq {
+        map.insert((obj_key(obj), offset), new_val);
+    }
+    eq
+}
+
 fn native_unsafe_object_field_offset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10122,6 +10240,10 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
             return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
         }
     };
+    if is_synthetic_offset(offset) {
+        let ok = synthetic_cas(obj, offset, expected, new_val);
+        return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         // Route through the locked CAS path so concurrent threads can't
         // interleave inside the load+compare+store. See the matching note
@@ -10151,6 +10273,10 @@ fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
         }
     };
+    if is_synthetic_offset(offset) {
+        let ok = synthetic_cas(obj, offset, expected, new_val);
+        return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         // Route through the locked CAS path. See `native_unsafe_cas_object`.
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
@@ -10239,6 +10365,14 @@ fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
         }
     };
+    // Synthetic-offset CAS — routed via per-object side store so lazy-init
+    // guards on JDK-internal fields (Class.reflectionData, ServicesCatalog,
+    // AbstractClassLoaderValue) don't livelock when the field's real heap
+    // slot is unknown to our layout.  See `synthetic_offset_for` above.
+    if is_synthetic_offset(offset) {
+        let ok = synthetic_cas(obj, offset, expected, new_val);
+        return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+    }
     // ConcurrentHashMap.casTabAt passes byte offsets into an Object[] array,
     // not field slot indices. The shared-VM `compare_and_swap_field` path
     // dispatches on `kind_of(obj) == Array` internally AND grabs the per-
@@ -10266,6 +10400,12 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(obj, offset) {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(0),
+        }));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
@@ -10285,6 +10425,10 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10306,6 +10450,13 @@ fn native_unsafe_get_long_volatile(
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(obj, offset) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(0),
+        }));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
@@ -10328,6 +10479,10 @@ fn native_unsafe_put_long_volatile(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10349,6 +10504,9 @@ fn native_unsafe_get_object_volatile(
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(recover_object_arg(synthetic_get(obj, offset))));
+    }
     let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
@@ -10375,6 +10533,10 @@ fn native_unsafe_put_object_volatile(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10393,6 +10555,9 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(recover_object_arg(synthetic_get(obj, offset))));
+    }
     let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
@@ -10414,6 +10579,10 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -11165,10 +11334,19 @@ fn native_unsafe_object_field_offset1(
             }
         }
     }
-    // Fall through — `0` is the canonical HotSpot "no such field" sentinel
-    // but it happens to be a valid slot index, so the CAS path masks
-    // lookup failure as a livelock. Surface the miss loudly so any new
-    // regression stands out in stderr.
+    // Lookup failed.  Returning `0` here used to alias slot 0 of the
+    // receiver and livelock the caller's CAS loop (see WildFly's
+    // `Class$Atomic.casReflectionData` and the Spring Boot
+    // `AbstractClassLoaderValue.putIfAbsent` watchdog hangs).  Mint a
+    // unique non-zero synthetic offset instead — the Unsafe.{CAS,get,put}
+    // natives detect the synthetic range and route through a per-object
+    // side store (`synthetic_field_store`) that yields self-consistent
+    // load/CAS/store semantics.  This unblocks lazy-init guards whose
+    // backing field happens to live on a class our layout doesn't
+    // expose (typically `java.lang.Class`'s synthetic
+    // `reflectionData` / `annotationData` / `annotationType` slots, or
+    // ConcurrentHashMap's `table` reference when the populator failed
+    // to wire the rj_slot metadata).
     let cname = match args.get(1) {
         Some(Value::Object(Some(obj))) => {
             if let Value::Int(cid) = ctx.get_field(*obj, 0) {
@@ -11180,11 +11358,12 @@ fn native_unsafe_object_field_offset1(
         }
         _ => String::new(),
     };
+    let synthetic = synthetic_offset_for(&cname, &field_name);
     tracing::warn!(
         target: "rustjvm::unsafe",
-        "objectFieldOffset1: field {field_name:?} not found on class {cname:?} — returning 0 (caller's CAS will likely livelock)"
+        "objectFieldOffset1: field {field_name:?} not found on class {cname:?} — minting synthetic offset {synthetic:#x} (CAS routed via side store)"
     );
-    Ok(Some(Value::Long(0)))
+    Ok(Some(Value::Long(synthetic as i64)))
 }
 
 /// Unsafe.compareAndExchangeInt — atomically sets field to update if current == expected,
