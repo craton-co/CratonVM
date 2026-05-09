@@ -2080,29 +2080,29 @@ pub(crate) fn native_string_split_impl(
     let s = ctx.read_string(this).unwrap_or_default();
     let delim = ctx.read_string(delim_obj).unwrap_or_default();
 
-    let parts: Vec<&str> = if delim.is_empty() {
+    let parts: Vec<String> = if delim.is_empty() {
         // Empty delimiter: split each character (like Java regex "")
-        s.split("").filter(|p| !p.is_empty()).collect()
+        s.split("").filter(|p| !p.is_empty()).map(|p| p.to_string()).collect()
     } else if let Ok(re) = compile_java_regex(&delim, 0) {
         if limit > 0 {
-            re.splitn(&s, limit as usize).collect()
+            re.splitn(&s, limit as usize)
         } else {
-            re.split(&s).collect()
+            re.split(&s)
         }
     } else if limit > 0 {
-        s.splitn(limit as usize, delim.as_str()).collect()
+        s.splitn(limit as usize, delim.as_str()).map(|p| p.to_string()).collect()
     } else {
-        s.split(delim.as_str()).collect()
+        s.split(delim.as_str()).map(|p| p.to_string()).collect()
     };
 
     // When limit == 0 (default for String.split(regex)), remove trailing empty strings
-    let parts: Vec<&str> = if limit == 0 {
-        let mut v: Vec<&str> = parts;
-        while v.last() == Some(&"") {
+    let parts: Vec<String> = if limit == 0 {
+        let mut v = parts;
+        while v.last().map(|s| s.is_empty()).unwrap_or(false) {
             v.pop();
         }
         if v.is_empty() {
-            vec![""]
+            vec![String::new()]
         } else {
             v
         }
@@ -2161,7 +2161,7 @@ pub(crate) fn native_string_replace_all(ctx: &mut dyn NativeContext, args: &[Val
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_all(&s, replacement.as_str()).into_owned()
+        re.replace_all(&s, replacement.as_str())
     } else {
         s.replace(&pattern, &replacement)
     };
@@ -2183,7 +2183,7 @@ pub(crate) fn native_string_replace_first(ctx: &mut dyn NativeContext, args: &[V
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace(&s, replacement.as_str()).into_owned()
+        re.replace_first(&s, replacement.as_str())
     } else {
         s.replacen(&pattern, &replacement, 1)
     };
@@ -2202,7 +2202,13 @@ pub(crate) fn native_string_matches(ctx: &mut dyn NativeContext, args: &[Value])
     let s = ctx.read_string(this).unwrap_or_default();
     let matched = if let Ok(re) = compile_java_regex(&pattern, 0) {
         let anchored = format!("^(?:{})$", re.as_str());
-        regex::Regex::new(&anchored).is_ok_and(|full_re| full_re.is_match(&s))
+        match regex::Regex::new(&anchored) {
+            Ok(full) => full.is_match(&s),
+            Err(_) => match fancy_regex::Regex::new(&anchored) {
+                Ok(full) => full.is_match(&s).unwrap_or(false),
+                Err(_) => re.is_match(&s),
+            },
+        }
     } else {
         s == pattern
     };

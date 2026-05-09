@@ -4638,7 +4638,10 @@ fn execute_instruction(
             // Reference array store — needs write barrier for generational GC
             let value = thread.frames[frame_idx].stack.pop()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             // SATB barrier: log old array element before overwriting
             // Widening: index conversion
             if let Ok(old_elem) = shared.heap.get_array_element(array_ref, index as usize) {
@@ -4659,7 +4662,10 @@ fn execute_instruction(
         | Instruction::Sastore => {
             let value = thread.frames[frame_idx].stack.pop()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
@@ -4673,7 +4679,10 @@ fn execute_instruction(
         Instruction::Lastore => {
             let v = thread.frames[frame_idx].stack.pop_long()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Long(v))
@@ -4682,7 +4691,10 @@ fn execute_instruction(
         Instruction::Dastore => {
             let d = thread.frames[frame_idx].stack.pop_double()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -5818,10 +5830,24 @@ fn execute_instruction(
             let current_class_name = shared.class_manager.read()
                 .get_class(class_id)
                 .map(|c| c.name.to_string()).unwrap_or_default();
-            let arr_ref = pop_object_ref_ctx(
+            let mname = thread.frames[frame_idx].method_name().to_string();
+            let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
+            // S111r14 diag: print full Java stack trace on arraylength failure
+            let arr_ref = match pop_object_ref_ctx(
                 &mut thread.frames[frame_idx].stack,
-                Some(format!("arraylength null (in {current_class_name} pc={pc})")),
-            )?;
+                Some(format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})")),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+                        eprintln!("[ARRAYLEN-DIAG] failure in {current_class_name}.{mname}{mdesc} pc={pc}");
+                        for (i, f) in thread.frames.iter().enumerate().rev() {
+                            eprintln!("  frame[{i}]: {}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             let len = shared.heap.array_length(arr_ref);
             thread.frames[frame_idx]
                 .stack
@@ -6144,7 +6170,10 @@ fn execute_instruction(
 
         // -- Monitor --
         Instruction::Monitorenter => {
-            let obj_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let obj_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("monitorenter in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             let mon_start = std::time::Instant::now();
             shared.monitors.enter(obj_ref, thread.thread_id);
             let mon_dur = mon_start.elapsed();
@@ -6166,7 +6195,10 @@ fn execute_instruction(
             }
         }
         Instruction::Monitorexit => {
-            let obj_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let obj_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("monitorexit in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared.monitors.exit(obj_ref, thread.thread_id)?;
         }
 
@@ -11828,6 +11860,12 @@ fn populate_virtual_invoke_cache(
             | "forEach" | "replaceAll" | "getOrDefault"
             | "putMapEntries" | "putAll"
             | "keySet" | "values" | "entrySet"
+            // S111r14: see vm_exec.rs — logback LoggerContext.<init>
+            // hits HashMap.put → putVal → arraylength on Int(16).
+            | "put" | "get" | "remove"
+            | "containsKey" | "containsValue"
+            | "size" | "isEmpty" | "clear"
+            | "<init>"
         );
         if force {
             if let Some(callback) =
@@ -12058,13 +12096,13 @@ fn pop_object_ref_ctx(
         }
         other => {
             if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
-                eprintln!("[pop_object_ref] ERROR: expected object reference, got {other}");
+                eprintln!("[pop_object_ref] ERROR: expected object reference, got {other} ctx={context:?}");
                 // Print a Rust backtrace to identify the calling opcode handler
                 let bt = std::backtrace::Backtrace::capture();
                 eprintln!("[pop_object_ref] Rust backtrace:\n{bt}");
             }
             Err(VmError::Internal {
-                message: format!("expected object reference, got {other}"),
+                message: format!("expected object reference, got {other} ctx={context:?}"),
             }
             .into())
         }

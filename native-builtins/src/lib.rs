@@ -12338,20 +12338,241 @@ const JAVA_REGEX_DOTALL: i32 = 32;
 const JAVA_REGEX_UNICODE_CASE: i32 = 64;
 const JAVA_REGEX_UNICODE_CHARACTER_CLASS: i32 = 256;
 
-/// Convert a Java regex pattern string + flags into a Rust `regex::Regex`.
-/// Returns the compiled Regex or a PatternSyntaxException error.
+/// Wrapper that abstracts over the two regex engines we use to evaluate Java
+/// patterns: the fast `regex` crate (DFA, no backtracking, no lookaround) and
+/// `fancy-regex` (NFA + backtracking, supports lookaround/backrefs). We try
+/// `regex` first and fall back to `fancy-regex` only when `regex` rejects the
+/// pattern — most real-world Java regexes compile fine on the simpler engine.
+///
+/// Lookaround appears in real workloads: log4j2's
+/// `PropertySource$Util.PREFIX_PATTERN` is
+/// `(^log4j2?[-._/]?|^org\.apache\.logging\.log4j\.)|(?=AsyncLogger(Config)?\.)`
+/// — the trailing `(?=...)` is a positive lookahead the `regex` crate refuses
+/// with `look-around, including look-ahead and look-behind, is not supported`.
+/// Without `fancy-regex` the resulting `IllegalArgumentException` escapes
+/// `<clinit>` and aborts WildFly boot.
+pub(crate) enum JavaRegex {
+    Std(regex::Regex),
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+/// A successful match, with byte offsets into the haystack. We materialise the
+/// matched text as `String` so callers (which often need to bridge into the
+/// Java heap) don't have to keep the haystack borrow alive.
+pub(crate) struct JavaMatch {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+/// Capture groups for a single match — index 0 is the whole match. Group N may
+/// be `None` if the optional alternative didn't participate in the match.
+pub(crate) struct JavaCaptures {
+    pub groups: Vec<Option<JavaMatch>>,
+    pub named: std::collections::HashMap<String, usize>,
+}
+
+impl JavaCaptures {
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+    pub fn get(&self, idx: usize) -> Option<&JavaMatch> {
+        self.groups.get(idx).and_then(|o| o.as_ref())
+    }
+    pub fn name(&self, name: &str) -> Option<&JavaMatch> {
+        self.named.get(name).and_then(|&i| self.get(i))
+    }
+}
+
+impl JavaRegex {
+    pub fn as_str(&self) -> &str {
+        match self {
+            JavaRegex::Std(r) => r.as_str(),
+            JavaRegex::Fancy(r) => r.as_str(),
+        }
+    }
+
+    pub fn is_match(&self, text: &str) -> bool {
+        match self {
+            JavaRegex::Std(r) => r.is_match(text),
+            JavaRegex::Fancy(r) => r.is_match(text).unwrap_or(false),
+        }
+    }
+
+    pub fn find(&self, text: &str) -> Option<JavaMatch> {
+        match self {
+            JavaRegex::Std(r) => r.find(text).map(|m| JavaMatch {
+                start: m.start(),
+                end: m.end(),
+                text: m.as_str().to_string(),
+            }),
+            JavaRegex::Fancy(r) => r.find(text).ok().flatten().map(|m| JavaMatch {
+                start: m.start(),
+                end: m.end(),
+                text: m.as_str().to_string(),
+            }),
+        }
+    }
+
+    pub fn captures(&self, text: &str) -> Option<JavaCaptures> {
+        match self {
+            JavaRegex::Std(r) => {
+                let caps = r.captures(text)?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+            JavaRegex::Fancy(r) => {
+                let caps = r.captures(text).ok().flatten()?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+        }
+    }
+
+    pub fn captures_len(&self) -> usize {
+        match self {
+            JavaRegex::Std(r) => r.captures_len(),
+            JavaRegex::Fancy(r) => r.captures_len(),
+        }
+    }
+
+    /// Split, dropping empty trailing pieces is the caller's responsibility.
+    pub fn split(&self, text: &str) -> Vec<String> {
+        match self {
+            JavaRegex::Std(r) => r.split(text).map(|s| s.to_string()).collect(),
+            JavaRegex::Fancy(r) => fancy_split_all(r, text),
+        }
+    }
+
+    pub fn splitn(&self, text: &str, limit: usize) -> Vec<String> {
+        match self {
+            JavaRegex::Std(r) => r.splitn(text, limit).map(|s| s.to_string()).collect(),
+            JavaRegex::Fancy(r) => fancy_splitn(r, text, limit),
+        }
+    }
+
+    /// Replace all non-overlapping matches. `replacement` follows Java/regex
+    /// `$N` group-reference semantics (delegated to the underlying engine).
+    pub fn replace_all(&self, text: &str, replacement: &str) -> String {
+        match self {
+            JavaRegex::Std(r) => r.replace_all(text, replacement).into_owned(),
+            JavaRegex::Fancy(r) => r.replace_all(text, replacement).into_owned(),
+        }
+    }
+
+    /// Replace only the first match.
+    pub fn replace_first(&self, text: &str, replacement: &str) -> String {
+        match self {
+            JavaRegex::Std(r) => r.replace(text, replacement).into_owned(),
+            JavaRegex::Fancy(r) => r.replace(text, replacement).into_owned(),
+        }
+    }
+}
+
+/// Split a string on every match of a fancy-regex Regex. Mirrors the semantics
+/// of `regex::Regex::split`: yields the text between matches, possibly
+/// including empty leading/trailing pieces. We advance manually to handle
+/// zero-width matches correctly (advance by one char to avoid infinite loops).
+fn fancy_split_all(r: &fancy_regex::Regex, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    while pos <= text.len() {
+        match r.find_from_pos(text, pos) {
+            Ok(Some(m)) => {
+                out.push(text[last..m.start()].to_string());
+                if m.end() == m.start() {
+                    // Zero-width match: advance one char to avoid looping.
+                    let mut step = pos + 1;
+                    while step < text.len() && !text.is_char_boundary(step) {
+                        step += 1;
+                    }
+                    last = m.end();
+                    pos = step.max(m.end());
+                } else {
+                    last = m.end();
+                    pos = m.end();
+                }
+            }
+            _ => break,
+        }
+    }
+    out.push(text[last..].to_string());
+    out
+}
+
+fn fancy_splitn(r: &fancy_regex::Regex, text: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return fancy_split_all(r, text);
+    }
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    while out.len() + 1 < limit && pos <= text.len() {
+        match r.find_from_pos(text, pos) {
+            Ok(Some(m)) => {
+                out.push(text[last..m.start()].to_string());
+                if m.end() == m.start() {
+                    let mut step = pos + 1;
+                    while step < text.len() && !text.is_char_boundary(step) {
+                        step += 1;
+                    }
+                    last = m.end();
+                    pos = step.max(m.end());
+                } else {
+                    last = m.end();
+                    pos = m.end();
+                }
+            }
+            _ => break,
+        }
+    }
+    out.push(text[last..].to_string());
+    out
+}
+
+/// Convert a Java regex pattern string + flags into a `JavaRegex` engine
+/// wrapper. Returns the compiled engine or a PatternSyntaxException error.
 pub(crate) fn compile_java_regex(
     pattern: &str,
     flags: i32,
-) -> Result<regex::Regex, rustjvm_types::error::RuntimeError> {
-    // LITERAL flag: treat pattern as a literal string (no regex metacharacters)
+) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
+    // LITERAL flag: treat pattern as a literal string (no regex metacharacters).
     if flags & JAVA_REGEX_LITERAL != 0 {
         let escaped = regex::escape(pattern);
-        return regex::Regex::new(&escaped).map_err(|e| {
-            rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return regex::Regex::new(&escaped)
+            .map(JavaRegex::Std)
+            .map_err(|e| rustjvm_types::error::RuntimeError::IllegalArgumentException {
                 message: format!("PatternSyntaxException: {e}"),
-            }
-        });
+            });
     }
 
     // Build the Rust regex pattern with flag prefixes
@@ -12375,9 +12596,17 @@ pub(crate) fn compile_java_regex(
 
     let translated = translate_java_regex(pattern);
     let full = format!("{prefix}{translated}");
-    regex::Regex::new(&full).map_err(|e| rustjvm_types::error::RuntimeError::IllegalArgumentException {
-        message: format!("PatternSyntaxException: {e}"),
-    })
+    // Fast path: try the `regex` crate first.
+    if let Ok(r) = regex::Regex::new(&full) {
+        return Ok(JavaRegex::Std(r));
+    }
+    // Fallback: `fancy-regex` for lookaround/backrefs/etc.
+    match fancy_regex::Regex::new(&full) {
+        Ok(r) => Ok(JavaRegex::Fancy(Box::new(r))),
+        Err(e) => Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("PatternSyntaxException: {e}"),
+        }),
+    }
 }
 
 /// Translate Java regex constructs that aren't directly supported by the Rust
@@ -12494,7 +12723,7 @@ fn utf8_char_len(b: u8) -> usize {
 pub(crate) fn read_pattern_regex(
     ctx: &mut dyn NativeContext,
     pattern_obj: rustjvm_types::ObjectRef,
-) -> Result<regex::Regex, rustjvm_types::error::RuntimeError> {
+) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
     let source = match ctx.get_field(pattern_obj, PAT_FIELD_SOURCE) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -12762,12 +12991,14 @@ fn native_pattern_matches_static(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let re = compile_java_regex(&pattern_str, 0)?;
     let anchored = format!("^(?:{})$", re.as_str());
-    let full_re = regex::Regex::new(&anchored).unwrap_or(re);
-    Ok(Some(Value::Int(if full_re.is_match(&input_str) {
-        1
-    } else {
-        0
-    })))
+    let matched = match regex::Regex::new(&anchored) {
+        Ok(full) => full.is_match(&input_str),
+        Err(_) => match fancy_regex::Regex::new(&anchored) {
+            Ok(full) => full.is_match(&input_str).unwrap_or(false),
+            Err(_) => re.is_match(&input_str),
+        },
+    };
+    Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
 
 fn native_pattern_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12815,19 +13046,19 @@ fn native_pattern_split_impl(
     };
     let re = read_pattern_regex(ctx, this)?;
 
-    let parts: Vec<&str> = if limit > 0 {
-        re.splitn(&input_str, limit as usize).collect()
+    let parts: Vec<String> = if limit > 0 {
+        re.splitn(&input_str, limit as usize)
     } else {
-        re.split(&input_str).collect()
+        re.split(&input_str)
     };
 
-    let parts: Vec<&str> = if limit == 0 {
+    let parts: Vec<String> = if limit == 0 {
         let mut v = parts;
-        while v.last() == Some(&"") {
+        while v.last().map(|s| s.is_empty()).unwrap_or(false) {
             v.pop();
         }
         if v.is_empty() {
-            vec![""]
+            vec![String::new()]
         } else {
             v
         }
@@ -12889,8 +13120,8 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 
     if let Some(m) = re.find(&input[offset..]) {
-        let abs_start = offset + m.start();
-        let abs_end = offset + m.end();
+        let abs_start = offset + m.start;
+        let abs_end = offset + m.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
         ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
@@ -12915,11 +13146,17 @@ fn native_matcher_matches(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let re = read_pattern_regex(ctx, pat_obj)?;
     // Full match: anchor with ^ and $
     let anchored = format!("^(?:{})$", re.as_str());
-    let full_re = regex::Regex::new(&anchored).unwrap_or(re);
+    let full_re = match regex::Regex::new(&anchored) {
+        Ok(r) => JavaRegex::Std(r),
+        Err(_) => match fancy_regex::Regex::new(&anchored) {
+            Ok(r) => JavaRegex::Fancy(Box::new(r)),
+            Err(_) => re,
+        },
+    };
     if full_re.is_match(&input) {
         if let Some(m) = full_re.find(&input) {
-            ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(m.start() as i32));
-            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end() as i32));
+            ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(m.start as i32));
+            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end as i32));
         }
         Ok(Some(Value::Int(1)))
     } else {
@@ -12986,8 +13223,7 @@ fn native_matcher_group_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // Search from the last match start to find capture groups
     if let Some(caps) = re.captures(&input[start..]) {
         if let Some(g) = caps.get(idx) {
-            let text = g.as_str();
-            return Ok(Some(Value::Object(Some(ctx.create_string(text)))));
+            return Ok(Some(Value::Object(Some(ctx.create_string(&g.text)))));
         }
     }
     Ok(Some(Value::Object(None)))
@@ -13043,7 +13279,7 @@ fn native_matcher_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace(&input, replacement.as_str());
+    let result = re.replace_first(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -13087,10 +13323,14 @@ fn native_matcher_looking_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let re = read_pattern_regex(ctx, pat_obj)?;
     // lookingAt: match at the beginning of the input
     let anchored = format!("^(?:{})", re.as_str());
-    if let Ok(start_re) = regex::Regex::new(&anchored) {
+    let start_re = match regex::Regex::new(&anchored) {
+        Ok(r) => Some(JavaRegex::Std(r)),
+        Err(_) => fancy_regex::Regex::new(&anchored).ok().map(|r| JavaRegex::Fancy(Box::new(r))),
+    };
+    if let Some(start_re) = start_re {
         if let Some(m) = start_re.find(&input) {
             ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(0));
-            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end() as i32));
+            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end as i32));
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -13195,7 +13435,7 @@ fn native_matcher_group_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     if let Some(caps) = re.captures(&input[match_start..]) {
         if let Some(m) = caps.name(&name) {
-            let result = ctx.create_string(m.as_str());
+            let result = ctx.create_string(&m.text);
             return Ok(Some(Value::Object(Some(result))));
         }
     }
@@ -13271,7 +13511,7 @@ fn native_matcher_append_replacement(ctx: &mut dyn NativeContext, args: &[Value]
     let search_start = match_start as usize;
     let groups: Vec<Option<String>> = if let Some(caps) = re.captures(&input[search_start..]) {
         (0..caps.len())
-            .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
+            .map(|i| caps.get(i).map(|m| m.text.clone()))
             .collect()
     } else {
         Vec::new()

@@ -14520,7 +14520,7 @@ fn register_scanner_find_within_horizon(r: &mut NativeMethodRegistry) {
 fn scanner_find_within_horizon_impl(
     ctx: &mut dyn NativeContext,
     this: rustjvm_types::ObjectRef,
-    regex: regex::Regex,
+    regex: crate::JavaRegex,
     horizon: i32,
 ) -> MethodCallResult {
     if horizon < 0 {
@@ -14561,10 +14561,9 @@ fn scanner_find_within_horizon_impl(
     let hay = &source[pos..window_end];
     match regex.find(hay) {
         Some(m) => {
-            let matched = m.as_str().to_string();
-            let new_pos = pos + m.end();
+            let new_pos = pos + m.end;
             ctx.set_field(this, SC_FIELD_POS, Value::Int(new_pos as i32));
-            Ok(Some(Value::Object(Some(ctx.create_string(&matched)))))
+            Ok(Some(Value::Object(Some(ctx.create_string(&m.text)))))
         }
         None => Ok(Some(Value::Object(None))),
     }

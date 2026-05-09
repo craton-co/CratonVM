@@ -5687,6 +5687,36 @@ fn invoke_on_class_shared_inner(
                                 | "forEach"
                                 | "replaceAll"
                                 | "getOrDefault"
+                                // S111r14: logback `LoggerContext.<init>` →
+                                // `HashMap.put(...)` whose JDK bytecode calls
+                                // `putVal` which does
+                                //   `getfield table` + `arraylength`.
+                                // Slot 2 in our synthetic layout holds
+                                // `Int(16)` (DEFAULT_INITIAL_CAPACITY) and
+                                // surfaces as
+                                //   `expected object reference, got int(16)`
+                                // (in java/util/HashMap.putVal pc=13).
+                                // Same family as the existing
+                                // computeIfAbsent/merge overrides — force the
+                                // side-table-backed `put` / `get` / `remove`
+                                // natives in `native-collections` to win.
+                                | "put"
+                                | "get"
+                                | "remove"
+                                | "containsKey"
+                                | "containsValue"
+                                | "size"
+                                | "isEmpty"
+                                | "clear"
+                                | "putAll"
+                                // S111r14: copy-constructor `<init>(Ljava/util/Map;)V`
+                                // — DateTimeFormatter.<clinit> hits this via
+                                // `new LinkedHashMap<>(map)`. Override only
+                                // fires if a native is registered for the
+                                // exact (class, method, descriptor) triple,
+                                // so non-Map `<init>` signatures still run
+                                // bytecode unless explicitly registered.
+                                | "<init>"
                             ))
                         || (matches!(
                                 class_name,

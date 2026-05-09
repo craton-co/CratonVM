@@ -1278,6 +1278,7 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_map_init);
     r.register(c, "<init>", "(I)V", native_map_init_capacity);
+    r.register(c, "<init>", "(Ljava/util/Map;)V", native_map_init_from_map);
     r.register(c, "size", "()I", native_map_size);
     r.register(c, "isEmpty", "()Z", native_map_is_empty);
     r.register(
@@ -8686,6 +8687,7 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register(c, "<init>", "()V", native_lhm_init);
     registry.register(c, "<init>", "(I)V", native_lhm_init_capacity);
+    registry.register(c, "<init>", "(Ljava/util/Map;)V", native_lhm_init_from_map);
     registry.register(c, "size", "()I", native_lhm_size);
     registry.register(c, "isEmpty", "()Z", native_lhm_is_empty);
     registry.register(
@@ -8772,6 +8774,20 @@ fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => MAP_DEFAULT_CAPACITY,
     };
     lhm_init_with_cap(ctx, this, cap);
+    Ok(None)
+}
+
+// S111r14: LinkedHashMap copy-constructor — see `native_map_init_from_map`
+// for the rationale. DateTimeFormatterBuilder.appendText reaches us via
+// `new LinkedHashMap<>(map)`.
+fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    lhm_init_with_cap(ctx, this, MAP_DEFAULT_CAPACITY);
+    let src = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_map_put_all(ctx, &[Value::Object(Some(this)), src])?;
     Ok(None)
 }
 
