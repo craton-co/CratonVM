@@ -1402,7 +1402,26 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, this, 0);
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(MAP_DEFAULT_CAPACITY as i32));
+    // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
+    // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
+    // `MAP_FIELD_CAPACITY` (absolute slot 2) is dangerous when the JDK class
+    // layout puts `table` at the same slot — JDK bytecode (e.g. `HashMap.resize()`)
+    // then runs `arraylength` on `Int(16)` and aborts with
+    //   `internal error: expected object reference, got int(16)`.
+    // The fix: never let the JDK `table` slot hold an Int. Write the bucket
+    // array to the JDK `table` slot when resolvable, and skip the legacy
+    // capacity Int write if it would clobber `table`. `map_state` already
+    // prefers the bucket array's length over `MAP_FIELD_CAPACITY`, so dropping
+    // the Int write is safe.
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(slot) = table_slot {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Object(Some(buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(MAP_DEFAULT_CAPACITY as i32));
+    }
 
     // Best-effort JDK-named field population for bytecode readers. `size`
     // was already mirrored by `set_map_size`; the rest are best-effort.
@@ -1436,7 +1455,19 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, this, 0);
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    // S111r29: see `native_map_init` for rationale. Mirror the bucket array
+    // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
+    // (or null), never an Int. Skip the legacy Int-capacity write when it
+    // would land on the same slot as JDK `table`.
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(slot) = table_slot {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Object(Some(buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    }
 
     // Best-effort JDK-named field population for bytecode readers.
     // `size` is mirrored by `set_map_size`.

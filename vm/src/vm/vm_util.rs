@@ -589,6 +589,25 @@ fn initialize_class_shared(
                             "non-critical-exception",
                             &format!("class={} exc={}", class_name_for_jfr, exc_detail),
                         );
+                        // Diagnostic: dump captured stack trace for the
+                        // swallowed clinit exception so we can pinpoint where
+                        // bare-NPEs originate during boot.
+                        if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
+                            let h = shared.heap.identity_hash_code(*exc_ref);
+                            if let Some(frames) = thread.throwable_stacks.get(&h) {
+                                for (i, f) in frames.iter().enumerate().take(20) {
+                                    tracing::warn!(
+                                        "  [SWALLOW-TRACE {}] at {}.{} ({}:{}) bci={}",
+                                        i,
+                                        f.class_name,
+                                        f.method_name,
+                                        f.source_file.as_deref().unwrap_or("?"),
+                                        f.line_number,
+                                        f.byte_code_index,
+                                    );
+                                }
+                            }
+                        }
                     }
                     finalize_init(shared, class_id, ClassState::Initialized);
 
@@ -640,6 +659,25 @@ fn initialize_class_shared(
                                     message = %cause_msg,
                                     "<clinit> failed вЂ” wrapping in ExceptionInInitializerError"
                                 );
+                                // Diagnostic: dump captured stack trace from
+                                // throwable_stacks so we can pinpoint where
+                                // bare-NPEs originate during boot.
+                                let h = shared.heap.identity_hash_code(*exc_ref);
+                                if let Some(frames) = thread.throwable_stacks.get(&h) {
+                                    for (i, f) in frames.iter().enumerate().take(20) {
+                                        tracing::warn!(
+                                            "  [CLINIT-TRACE {}] at {}.{} ({}:{}) bci={}",
+                                            i,
+                                            f.class_name,
+                                            f.method_name,
+                                            f.source_file.as_deref().unwrap_or("?"),
+                                            f.line_number,
+                                            f.byte_code_index,
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!("  [CLINIT-TRACE] no captured frames for hash={}", h);
+                                }
                             }
                             match crate::runtime::exceptions::create_exception_object(
                                 shared,
