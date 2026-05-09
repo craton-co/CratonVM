@@ -6,7 +6,7 @@ use rustjvm_vm::vm::{create_java_string, Vm};
 use rustjvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
-/// RustJVM — A Java Virtual Machine implemented in Rust.
+/// RustJVM Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
 ///
@@ -159,11 +159,11 @@ struct Args {
     #[arg(long = "Xlog", value_name = "SPEC")]
     xlog: Option<String>,
 
-    /// T19.H1 — if set, spawn a watchdog thread that, after `SECONDS`,
+    /// T19.H1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ if set, spawn a watchdog thread that, after `SECONDS`,
     /// signals every interpreter thread to dump its frame chain to
     /// stderr and then calls `std::process::abort()`. Used to
     /// diagnose silent-hang bootstraps (Keycloak, WildFly, Quarkus).
-    /// The flag is honoured on a best-effort basis — threads stuck
+    /// The flag is honoured on a best-effort basis Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ threads stuck
     /// inside Rust native code will not dump (the watchdog still
     /// aborts with a reduced-information banner in that case).
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
@@ -222,7 +222,7 @@ fn validate_class_name(name: &str) -> Result<()> {
 /// Some libraries ship as a single "all-in-one" fat JAR (e.g.
 /// `netty-all.jar`, `groovy-all.jar`) or, alternatively, as a set of split
 /// modules that live next to it (e.g. `netty-common.jar`, `netty-buffer.jar`,
-/// …).  When a user passes a classpath entry that points at the aggregate JAR
+/// Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦).  When a user passes a classpath entry that points at the aggregate JAR
 /// but the repository only contains the split distribution, the classloader
 /// silently drops the entry and the program fails with a puzzling
 /// `NoClassDefFoundError`.
@@ -286,7 +286,7 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
             }
         }
         if substitutes.is_empty() {
-            // Nothing to substitute — preserve original entry so downstream
+            // Nothing to substitute Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ preserve original entry so downstream
             // logging surfaces the missing file.
             out.push(entry);
             continue;
@@ -305,7 +305,7 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
 
 /// Rewrite common HotSpot launcher spellings so clap can parse them.
 ///
-/// Surefire / tooling often invokes `java -classpath …` and `java -jar …`.
+/// Surefire / tooling often invokes `java -classpath Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦` and `java -jar Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦`.
 /// Our clap schema uses `--classpath` / `--jar`; bare `-classpath` used to be
 /// misparsed as `-c` with value `lasspath`, breaking Maven test runs.
 fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
@@ -314,8 +314,20 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
     }
     let mut out = vec![args[0].clone()];
     let mut i = 1usize;
+    let mut past_separator = false;
     while i < args.len() {
         let a = args[i].as_str();
+        if past_separator {
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            past_separator = true;
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
         if a == "-jar" && i + 1 < args.len() {
             out.push("--jar".into());
             out.push(args[i + 1].clone());
@@ -346,12 +358,32 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
 fn extract_system_properties(raw: Vec<String>) -> (Vec<String>, Vec<(String, String)>) {
     let mut filtered = Vec::with_capacity(raw.len());
     let mut props = Vec::new();
+    let mut past_separator = false;
     for arg in raw {
+        // Anything after `--` is a program argument and must be preserved
+        // verbatim, including bare `-Dfoo=bar` tokens that the Java program
+        // (e.g. jboss-modules) wants to consume itself.
+        if past_separator {
+            filtered.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            // Mark the separator boundary so subsequent `-D...` tokens are
+            // preserved as program arguments. We still emit the `--` to
+            // clap so it knows where program args begin (otherwise tokens
+            // like `-mp` would be rejected as unknown short flags). The
+            // `--` itself is stripped out of the program-args vector
+            // after clap parsing, before the String[] is built for
+            // Java's main().
+            past_separator = true;
+            filtered.push(arg);
+            continue;
+        }
         if let Some(kv) = arg.strip_prefix("-D") {
             if let Some((k, v)) = kv.split_once('=') {
                 props.push((k.to_string(), v.to_string()));
             } else {
-                // `-Dkey` with no value → set to empty string (matches java behaviour)
+                // `-Dkey` with no value -> set to empty string (matches java behaviour)
                 props.push((kv.to_string(), String::new()));
             }
         } else {
@@ -374,7 +406,7 @@ struct HotspotFlags {
     heap_dump_on_oom: Option<bool>,
     /// `-XX:HeapDumpPath=<path>` companion.
     heap_dump_path: Option<String>,
-    /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` — the
+    /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the
     /// entire token (including prefix) is preserved so the existing
     /// `AgentRegistry::parse_agent_option` can consume it verbatim.
     agent_options: Vec<String>,
@@ -389,7 +421,18 @@ struct HotspotFlags {
 fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     let mut filtered = Vec::with_capacity(raw.len());
     let mut out = HotspotFlags::default();
+    let mut past_separator = false;
     for arg in raw {
+        // Tokens after `--` are program arguments Р Р†Р вЂљРІР‚Сњ pass through unchanged.
+        if past_separator {
+            filtered.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            past_separator = true;
+            filtered.push(arg);
+            continue;
+        }
         match arg.as_str() {
             // Boolean toggles: -XX:+Foo / -XX:-Foo
             "-XX:+HeapDumpOnOutOfMemoryError" => out.heap_dump_on_oom = Some(true),
@@ -430,6 +473,18 @@ fn run() -> Result<()> {
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
+
+    // Strip a literal `--` separator that clap parked in the trailing
+    // positional list. We pass `--` through to clap so it knows where
+    // program args begin (so tokens like `-mp` aren't mis-parsed as
+    // short flags), but the Java program must not see `--` itself in
+    // its String[] args. Without this, jboss-modules' Main.main reads
+    // args[0] == "--" instead of "-mp" and fails inside getServiceName
+    // with NullPointerException.
+    if args.class_name.as_deref() == Some("--") {
+        args.class_name = None;
+    }
+    args.args.retain(|a| a != "--");
 
     // Validate: exactly one of class_name or --jar must be provided
     if args.class_name.is_none() && args.jar.is_none() {
@@ -645,7 +700,7 @@ fn run() -> Result<()> {
         config = config.with_xlog_spec(xlog_spec.clone());
     }
 
-    // T6.1.2 — `-XX:+HeapDumpOnOutOfMemoryError` / `-XX:HeapDumpPath=...`.
+    // T6.1.2 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ `-XX:+HeapDumpOnOutOfMemoryError` / `-XX:HeapDumpPath=...`.
     // The interpreter's OOM path already honors these config fields (see
     // `maybe_dump_heap_on_oom` in `vm/src/runtime/interpreter.rs`); we
     // only need to thread the CLI values through.
@@ -656,7 +711,7 @@ fn run() -> Result<()> {
         config.heap_dump_path = Some(path);
     }
 
-    // T6.3.3 — `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
+    // T6.3.3 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
     // are stashed here and handed to the JVMTI `AgentRegistry` at VM
     // startup; registering them in a dedicated config field lets the
     // startup path load them in the canonical Agent_OnLoad order.
@@ -677,7 +732,7 @@ fn run() -> Result<()> {
                         // Per the `java.lang.instrument` package spec, a
                         // misconfigured agent should fail loudly enough
                         // that the operator notices, but the VM should
-                        // still try to run the application — match the
+                        // still try to run the application Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ match the
                         // HotSpot warn-and-continue behaviour.
                         eprintln!("Warning: ignoring {opt}: {e}");
                     }
@@ -699,18 +754,18 @@ fn run() -> Result<()> {
     // Create VM and execute main method
     let mut vm = Vm::new(config);
 
-    // T19.H1 — optional watchdog that dumps every interpreter thread's
+    // T19.H1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ optional watchdog that dumps every interpreter thread's
     // frame chain and aborts the process if the main method hasn't
     // completed within the configured deadline. Triggered by the
     // `--stack-dump-on-timeout=SECONDS` CLI flag.
     //
-    // I1 — make hangs visible by default.
+    // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ make hangs visible by default.
     //
     // When neither `--stack-dump-on-timeout` is supplied nor the
     // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG` env var is set, install a
     // conservative 45-second default. This guarantees a hung VM emits
     // **something** to stderr before the surrounding harness kills the
-    // process — the previous default of "no watchdog" produced empty
+    // process Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the previous default of "no watchdog" produced empty
     // stderr + Windows TerminateProcess rc=-1 from the bench runners,
     // which made hangs (e.g. CGLIB's `String.indexOf` looping inside
     // `TypeUtils.parseSignature`) visually indistinguishable from a
@@ -722,7 +777,7 @@ fn run() -> Result<()> {
     // every existing probe runner's 60s `TIMEOUT_SEC`. Long-running
     // services (Keycloak, Quarkus, WildFly) should pass an explicit
     // `--stack-dump-on-timeout=N` (with N suitably large) or set
-    // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` — the same way they pass
+    // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the same way they pass
     // explicit `-Xmx` instead of relying on heap defaults.
     let effective_watchdog = match args.stack_dump_on_timeout {
         Some(s) if s > 0 => Some(s),
@@ -744,7 +799,7 @@ fn run() -> Result<()> {
     };
     if let Some(secs) = effective_watchdog {
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
-        // RKC16N.5 — capture the audit-dump paths into the watchdog
+        // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
         // census. Without this, the only flush path is the
         // clean-shutdown branch at the end of `main()`, and every
@@ -789,7 +844,7 @@ fn run() -> Result<()> {
                      aborting process ==="
                 );
 
-                // RKC16N.5 — flush the missing-natives audit BEFORE
+                // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE
                 // `process::abort()` so a hung or watchdog-killed run
                 // still produces the diagnostic JSON. Errors are
                 // logged but never unwrap; abort still happens.
@@ -848,7 +903,7 @@ fn run() -> Result<()> {
         .collect();
 
     // Resolve the String[] class id for the args array.
-    // ClassId(0) is java/lang/Object — the base reference array element type.
+    // ClassId(0) is java/lang/Object Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the base reference array element type.
     let string_array_class_id = rustjvm_vm::ClassId::new(0);
     let args_array = vm.shared.heap.alloc_array(
         string_array_class_id,
@@ -870,7 +925,7 @@ fn run() -> Result<()> {
         match vm.invoke("java/lang/System", "initPhase1", "()V", &[]) {
             Ok(_) => {
                 tracing::info!("System.initPhase1() completed");
-                // WP1.3: initPhase1 just finished — advance to level 2.
+                // WP1.3: initPhase1 just finished Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ advance to level 2.
                 vm.shared.set_init_level(2);
             }
             Err(e) => {
@@ -897,7 +952,7 @@ fn run() -> Result<()> {
                 vm.shared.resolution_cache.write().clear();
                 // WP1.3: even though initPhase1 threw mid-flight, the
                 // early system-properties / stream installation ran
-                // before the failure — enough for callers gated on
+                // before the failure Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ enough for callers gated on
                 // level 2 (e.g. `java.class.path` availability) to
                 // proceed.  Bump anyway so downstream `initLevel()`
                 // observers don't stall at 1.
@@ -912,13 +967,13 @@ fn run() -> Result<()> {
         // subsystems we don't implement), but many callers key on
         // `initLevel() >= 3` to decide whether
         // `ClassLoader.getSystemClassLoader()` may read the `scl`
-        // field directly.  We leave the level at 2 here — bumping
+        // field directly.  We leave the level at 2 here Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ bumping
         // past it would send those callers down a null-deref path.
         // The CLI bumps to 4 below, just before `main()`, once the
         // initPhase2 gate no longer matters.
     }
 
-    // WP1.3: right before `main()` starts, advance to level 4 —
+    // WP1.3: right before `main()` starts, advance to level 4 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ
     // HotSpot's "VM fully initialized" state.  This is the signal
     // that `ClassLoader.getSystemClassLoader()` may return `scl` if
     // it is populated (in rustjvm it usually isn't, so callers fall
@@ -930,7 +985,7 @@ fn run() -> Result<()> {
     vm.shared.set_init_level(3);
     vm.shared.set_init_level(4);
 
-    // WP2.4-C — run every `-javaagent:` agent's `premain(String,
+    // WP2.4-C Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ run every `-javaagent:` agent's `premain(String,
     // Instrumentation)` hook BEFORE the application's `main`. Per the
     // `java.lang.instrument` package spec, agent failures are warnings
     // (logged inside the dispatcher) unless the agent throws a fatal
@@ -972,7 +1027,7 @@ fn run() -> Result<()> {
     // missing-natives audit log to the user-specified JSON path. We
     // do this unconditionally (regardless of Ok/Err) so a crashing
     // program still produces a census file. Any I/O error surfaces
-    // as a warning — the primary invocation result takes precedence.
+    // as a warning Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the primary invocation result takes precedence.
     if let Some(path) = &args.dump_missing_natives {
         match vm.shared.dump_missing_natives_json(path) {
             Ok(()) => {
@@ -1031,7 +1086,7 @@ fn run() -> Result<()> {
         }
     }
 
-    // T19.K1 — wait for non-daemon threads before exiting.
+    // T19.K1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ wait for non-daemon threads before exiting.
     //
     // Per the JVM specification, the VM keeps running until every
     // non-daemon thread has terminated. Daemon threads (GC workers,
@@ -1048,7 +1103,7 @@ fn run() -> Result<()> {
     // We only wait when `main()` returned cleanly (`Ok`). On
     // exception we propagate to the existing error-printing path
     // which calls `bail!()` and lets the process exit with non-zero
-    // status — same as HotSpot's "Exception in thread \"main\"".
+    // status Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ same as HotSpot's "Exception in thread \"main\"".
     // Waiting for daemons or worker threads after a fatal error
     // would just delay the stack trace.
     //
@@ -1057,16 +1112,16 @@ fn run() -> Result<()> {
     // and bounding the wait would surprise users. CI runs that need
     // to bound execution can use the existing
     // `--stack-dump-on-timeout` watchdog which `abort()`s the
-    // process from a separate thread — this loop will be
+    // process from a separate thread Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this loop will be
     // interrupted by the watchdog's `process::abort()` call.
     if matches!(result, Ok(_)) {
-        // T19.K1 — diagnostic only when the wait is actually
+        // T19.K1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ diagnostic only when the wait is actually
         // observable (i.e. there ARE non-daemon threads). HelloWorld
         // and any program that doesn't `Thread.start()` a user
         // thread skips this message and exits silently. Long-running
         // apps (Quarkus, Keycloak, embedded Jetty) print one line so
         // the user can tell the wait is what's holding the process
-        // alive — useful when a CI run mysteriously sits at "main
+        // alive Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ useful when a CI run mysteriously sits at "main
         // returned" forever.
         let pending = vm
             .shared
@@ -1107,14 +1162,14 @@ fn run() -> Result<()> {
             // current rustjvm, `Throwable.fillInStackTrace` (see
             // `native-builtins/src/lang_misc.rs`) only stashes frames into the
             // per-thread `JvmThread::throwable_stacks` map keyed by identity
-            // hash — it does NOT populate the heap-side `stackTrace` /
+            // hash Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ it does NOT populate the heap-side `stackTrace` /
             // `backtrace` field. The Java code only writes that field lazily
             // when something calls `Throwable.getStackTrace()`. For unhandled
             // exceptions that escape `main()`, that has typically never
             // happened, so the renderer below will usually find a null array
             // and emit no `\tat ...` lines. Promoting the synthetic capture
             // to populate the heap field (or wiring this CLI to read from
-            // `throwable_stacks` directly) is roadmap item T2.2.18 — see
+            // `throwable_stacks` directly) is roadmap item T2.2.18 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see
             // `docs/roadmap-100.md` line 471.
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
@@ -1126,7 +1181,7 @@ fn run() -> Result<()> {
                     .unwrap_or_else(|| "unknown".to_string());
                 // Find fields by name so we work regardless of layout.
                 // Also probe `target` (used by InvocationTargetException
-                // in lieu of Throwable.cause — see its `getCause()` override)
+                // in lieu of Throwable.cause Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see its `getCause()` override)
                 // so that `Caused by:` chains still walk through the wrapper.
                 let (msg_idx, cause_idx, stack_idx, target_idx) = {
                     let cm = vm.shared.class_manager.read();
@@ -1259,11 +1314,11 @@ fn run() -> Result<()> {
                 }
 
                 // Fallback: when `Throwable.stackTrace[]` was never populated
-                // (the array is null or empty — the typical case for an
+                // (the array is null or empty Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the typical case for an
                 // exception that escapes `main()` without anyone calling
                 // `getStackTrace()`), pull frames from the per-thread
                 // `JvmThread::throwable_stacks` map keyed by identity hash
-                // — that's where `Throwable.fillInStackTrace` actually
+                // Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ that's where `Throwable.fillInStackTrace` actually
                 // stashes the captured frames in this VM. See
                 // `vm/src/vm/vm_init.rs::Vm::throwable_stack_for`.
                 if !emitted_frames {
@@ -1285,7 +1340,7 @@ fn run() -> Result<()> {
                 // Follow cause. Throwable.cause is the canonical chain link,
                 // but InvocationTargetException stores the wrapped exception
                 // in its own `target` field and its `getCause()` override
-                // returns that — so the heap-level `cause` is null/self while
+                // returns that Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ so the heap-level `cause` is null/self while
                 // the real cause lives in `target`. Probe both.
                 let next_cause = {
                     let mut next = None;
@@ -1317,13 +1372,13 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    // I1 — Visibility-first panic hook.
+    // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ Visibility-first panic hook.
     //
     // The previous T14 hook silenced **every** Rust panic by routing it to
     // `tracing::debug!`. That worked for the well-known initPhase1
     // bootstrap-path panics (unaligned-pointer reads, transient null
     // dereferences) which the outer `safe_native_call` already logs once
-    // via a user-facing warning — but it also silenced *real* panics that
+    // via a user-facing warning Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ but it also silenced *real* panics that
     // escaped a `catch_unwind`. Because the tracing subscriber installed
     // by `run()` filters at WARN+, debug-level panic notices were never
     // written to stderr, and any genuine VM crash showed up in the logs
@@ -1335,13 +1390,13 @@ fn main() {
     // `--stack-dump-on-timeout`), and the failure was indistinguishable
     // from a successful run that produced no output.
     //
-    // The new hook routes everything to `stderr` directly — the only sink
+    // The new hook routes everything to `stderr` directly Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the only sink
     // that is guaranteed to survive every other failure mode (tracing
     // subscriber not initialized, WARN-level filter, panic firing from a
     // worker thread before `run()` builds the subscriber). For
     // bootstrap-path panics that are still expected to be quiet, the
     // outer `safe_native_call` continues to swallow them via its own
-    // `catch_unwind` — the hook fires *before* `catch_unwind` catches
+    // `catch_unwind` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the hook fires *before* `catch_unwind` catches
     // the unwind, but only the recovery path knows the panic was caught,
     // so we always emit at hook time. The cost is a couple of extra
     // stderr lines on the (rare) bootstrap-panic path; the gain is that
@@ -1402,7 +1457,7 @@ fn main() {
         } else {
             let _ = writeln!(stderr, "thread '{thread_name}' panicked:\n{msg}");
         }
-        // Backtrace only when explicitly requested — matches the stock
+        // Backtrace only when explicitly requested Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ matches the stock
         // Rust hook semantics so users opting out of backtrace still see
         // the panic message but no overhead.
         let bt = std::backtrace::Backtrace::capture();
@@ -1604,7 +1659,7 @@ mod tests {
 
     #[test]
     fn extract_d_value_with_equals() {
-        // -Dkey=val=ue  →  key = "val=ue"
+        // -Dkey=val=ue  Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ  key = "val=ue"
         let raw = vec!["rustjvm".to_string(), "-Dpath=a=b".to_string()];
         let (_, props) = extract_system_properties(raw);
         assert_eq!(props, vec![("path".to_string(), "a=b".to_string())]);

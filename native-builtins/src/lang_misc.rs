@@ -8,24 +8,26 @@ use crate::obj_arg;
 
 /// Helper: write Throwable.detailMessage on a Throwable subclass.
 ///
-/// In real-JDK Throwable, detailMessage is at slot 1 (after backtrace at
-/// slot 0). In our synthetic-stub layout, it's at slot 0 (the stubs use
-/// unnamed `_f0`, `_f1`). Use `set_field_by_name` to honour the real-JDK
-/// layout when present, then mirror to slot 0 so synthetic-stub code paths
-/// (which read slot 0 directly) still observe the message.
+/// Real-JDK Throwable layout: slot 0 = `backtrace` (an internal Object
+/// reference), slot 1 = `detailMessage`, slot 2 = `cause`. Resolve by
+/// name so we always hit `detailMessage` regardless of declared subclass
+/// fields. The previous implementation also mirrored to slot 0 to support
+/// a now-removed synthetic-stub layout — that mirror clobbered
+/// Throwable.backtrace with a String reference and corrupted any
+/// downstream consumer that read backtrace as an Object[].
 fn write_throwable_detail_message(ctx: &mut dyn NativeContext, this: ObjectRef, msg: Value) {
     ctx.set_field_by_name(this, "detailMessage", msg);
-    ctx.set_field(this, 0, msg);
 }
 
 /// Helper: write Throwable.cause on a Throwable subclass.
 ///
-/// Mirrors `write_throwable_detail_message`: by-name first (real-JDK slot
-/// is `cause` at slot 2 after backtrace+detailMessage), then slot 1 to
-/// keep the synthetic-stub layout in sync.
+/// Real-JDK Throwable layout: `cause` is at slot 2. Resolve by name. The
+/// previous implementation also mirrored to slot 1 (the synthetic-stub
+/// cause slot), but slot 1 in the real-JDK layout is `detailMessage` —
+/// the mirror clobbered the message field whenever both helpers ran
+/// (e.g. via `<init>(String, Throwable)`).
 fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
     ctx.set_field_by_name(this, "cause", cause);
-    ctx.set_field(this, 1, cause);
 }
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
@@ -245,14 +247,15 @@ pub(crate) fn native_throwable_get_cause(ctx: &mut dyn NativeContext, args: &[Va
         }
         return Ok(Some(by_name_target));
     }
-    // Synthetic-stub fallback: layout has no named `cause` but reserves
-    // slot 1 for the cause reference.
-    let slot1 = ctx.get_field(this, 1);
-    match slot1 {
-        Value::Object(Some(obj)) if obj == this => Ok(Some(Value::Object(None))),
-        Value::Object(obj_opt) => Ok(Some(Value::Object(obj_opt))),
-        _ => Ok(Some(Value::Object(None))),
-    }
+    // Real-JDK only: when neither `cause` nor `target` named fields hold a
+    // value, the cause is genuinely null. The previous synthetic-stub
+    // fallback that read `slot 1` was wrong here — slot 1 of a real-JDK
+    // Throwable layout is `detailMessage` (a String), so the fallback
+    // returned the message text as the cause and Spring Boot's
+    // `getExitCodeFromExitCodeGeneratorException` recursion then dispatched
+    // `Throwable.getCause()` on a String, surfacing as
+    // `NoSuchMethodError: java/lang/String.getCause()Ljava/lang/Throwable;`.
+    Ok(Some(Value::Object(None)))
 }
 
 /// initCause(Throwable) — set the cause field, return this.

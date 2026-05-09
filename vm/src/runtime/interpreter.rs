@@ -11797,6 +11797,61 @@ fn populate_virtual_invoke_cache(
         return;
     }
 
+    // S111r13: For real-JDK Map functional methods (computeIfAbsent / compute
+    // / merge / putIfAbsent / forEach / replaceAll / getOrDefault / replace /
+    // putMapEntries — internal helper invoked from putAll / Map.copyOf), the
+    // bytecode reads `getfield table` followed by `arraylength`.  Our
+    // synthetic HashMap layout stores the `Int(capacity)` in slot 2 instead
+    // of an array, surfacing as
+    //   `expected object reference, got int(N)`.
+    // Mirror the force-native override list at vm_exec.rs:invoke_on_class_shared_inner.
+    // This branch fires when find_method_recursive resolved to non-native
+    // bytecode declared on HashMap (or a sibling), but a Rust native exists
+    // for the (declaring_class, method, descriptor) triple — caching the
+    // bytecode would re-introduce the layout mismatch on every dispatch
+    // through this call-site.
+    {
+        let declaring_name = store
+            .get(declaring_id)
+            .map(|c| &*c.name)
+            .unwrap_or("");
+        let force = matches!(
+            declaring_name,
+            "java/util/HashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/Hashtable"
+            | "java/util/concurrent/ConcurrentHashMap"
+        ) && matches!(
+            &*method_name,
+            "computeIfAbsent" | "compute" | "computeIfPresent"
+            | "merge" | "putIfAbsent" | "replace"
+            | "forEach" | "replaceAll" | "getOrDefault"
+            | "putMapEntries" | "putAll"
+            | "keySet" | "values" | "entrySet"
+        );
+        if force {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(declaring_name, &method_name, &descriptor)
+            {
+                let gate = RedefineGate::snapshot(
+                    cm.class_redefine_generation_handle(declaring_id),
+                );
+                drop(cm);
+                let target = CachedInvokeTarget::VirtualNative {
+                    receiver_class_id,
+                    callback,
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+                return;
+            }
+        }
+    }
+
     let Some(code_attr) = method.code() else {
         return;
     };

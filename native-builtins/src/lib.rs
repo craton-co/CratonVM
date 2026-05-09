@@ -2133,6 +2133,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "getSimpleBinaryName0", "()Ljava/lang/String;", lang_class::native_class_get_simple_binary_name);
     registry.register("java/lang/Class", "getEnclosingMethod0", "()[Ljava/lang/Object;", lang_class::native_class_get_enclosing_method);
     registry.register("java/lang/Class", "getGenericSignature0", "()Ljava/lang/String;", lang_class::native_class_get_generic_signature);
+    // GENS-1 (real-JDK): override Class.getGenericInterfaces() and
+    // getGenericSuperclass() with our native implementations. The JDK's
+    // own bytecode for these methods drives the SignatureParser →
+    // Reifier pipeline (sun.reflect.generics.*), and on classes such as
+    // `ArrayList` the parsed `path` list contains a null entry that
+    // causes `Reifier.visitClassTypeSignature` to NPE on
+    // `new StringBuilder(sc.getName())`. The crash surfaces as
+    // "Cannot invoke getName on null" during Spring Boot's
+    // `ApplicationConversionService.<clinit>` (and is reproducible with a
+    // 5-line program that just touches `ArrayList.class.getGenericInterfaces()`).
+    // Our natives parse the Signature attribute via
+    // `rustjvm_reader::signature` and build the synthetic
+    // `ParameterizedType` / `Class` mirror tree directly, side-stepping
+    // the broken JDK parse path entirely. The matching `check_override`
+    // entry in `vm_exec.rs` lets these natives take precedence over the
+    // non-`ACC_NATIVE` JDK bytecode.
+    registry.register("java/lang/Class", "getGenericInterfaces", "()[Ljava/lang/reflect/Type;", lang_class::native_class_get_generic_interfaces);
+    registry.register("java/lang/Class", "getGenericSuperclass", "()Ljava/lang/reflect/Type;", lang_class::native_class_get_generic_superclass);
     registry.register("java/lang/Class", "getRawAnnotations", "()[B", lang_class::native_class_get_raw_annotations);
     registry.register("java/lang/Class", "getRawTypeAnnotations", "()[B", lang_class::native_class_get_raw_type_annotations);
     registry.register("java/lang/Class", "getConstantPool", "()Ljdk/internal/reflect/ConstantPool;", lang_class::native_class_get_constant_pool);
@@ -4096,6 +4114,43 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let urls = args.get(1).copied().unwrap_or(Value::Object(None));
         ucp_init_2(ctx, &[this, urls, Value::Object(None)])
     }
+    // SB3 (URLClassPath fix): Spring Boot's launcher creates a URLClassPath
+    // instance whose `<init>` never runs through any of our dispatch paths
+    // (likely via fat-jar reflective allocation / sun.misc.Unsafe path),
+    // so the instance fields `path`, `loaders`, `lmap`, `unopenedUrls`
+    // remain at their default `null` value. The next call into
+    // `findResources(String)` reads `loaders` (or `path`) and NPEs.
+    //
+    // Defensively populate any missing instance fields on every entry to
+    // `findResources` and `getResource` (and the inner-class Enumeration's
+    // `getLoader(int)`) so the bytecode method body can continue to run
+    // safely.  Fields are populated by name (no slot-index guessing) so
+    // any future shape drift is benign.
+    fn ucp_ensure_field(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        field: &str,
+        init_class: &str,
+    ) -> MethodCallResult {
+        if let Value::Object(Some(_)) = ctx.get_field_by_name(this, field) {
+            return Ok(None);
+        }
+        let new_obj = match ctx.new_object(init_class)? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(init_class, "<init>", "()V", &[Value::Object(Some(new_obj))])?;
+        ctx.set_field_by_name(this, field, Value::Object(Some(new_obj)));
+        Ok(None)
+    }
+    fn ucp_lazy_init_fields(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+        ucp_ensure_field(ctx, this, "path", "java/util/ArrayList")?;
+        ucp_ensure_field(ctx, this, "loaders", "java/util/ArrayList")?;
+        ucp_ensure_field(ctx, this, "lmap", "java/util/HashMap")?;
+        ucp_ensure_field(ctx, this, "unopenedUrls", "java/util/ArrayDeque")?;
+        Ok(())
+    }
+
     registry.register(
         "jdk/internal/loader/URLClassPath",
         "<init>",
@@ -4107,6 +4162,64 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "<init>",
         "([Ljava/net/URL;)V",
         ucp_init_1,
+    );
+
+    // SB3 (URLClassPath fix continued): override `getLoader(I)` and
+    // `findResources(String)` to be NPE-tolerant. When the URLClassPath
+    // instance has its `loaders`/`path`/`lmap`/`unopenedUrls` fields
+    // unset (because the bytecode `<init>` never executed for this
+    // instance — Spring Boot's launcher allocates URLClassPath objects
+    // through a path our dispatcher doesn't see), the bytecode for
+    // `getLoader(int)` reads `loaders` and NPEs on `loaders.size()`.
+    // Lazily populate the fields here, then return null (== no loader at
+    // this index, equivalent to past-end-of-collection).
+    fn ucp_get_loader_int(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        ucp_lazy_init_fields(ctx, this)?;
+        // After ensuring fields, replicate the JDK semantics: return null
+        // when there's no loader for the requested index. Our lazy-init
+        // produces empty collections, so every index is past-end, which
+        // matches the "no more URLs to open" exit path.
+        Ok(Some(Value::Object(None)))
+    }
+    fn ucp_find_resources(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => {
+                // Return an empty Enumeration — synthetic Enumeration$Impl
+                // with size=0.
+                let enm = ctx.new_object("java/util/Enumeration$Impl")?
+                    .and_then(|v| if let Value::Object(Some(o)) = v { Some(o) } else { None });
+                return Ok(enm.map(|o| Value::Object(Some(o))));
+            }
+        };
+        ucp_lazy_init_fields(ctx, this)?;
+        // Empty enumeration is correct after lazy-init (no loaders, no
+        // resources). Caller (CompoundEnumeration) will move on to the
+        // next URLClassPath in the chain.
+        let enm = ctx.new_object("java/util/Enumeration$Impl")?;
+        Ok(enm)
+    }
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "getLoader",
+        "(I)Ljdk/internal/loader/URLClassPath$Loader;",
+        ucp_get_loader_int,
+    );
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "findResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        ucp_find_resources,
     );
 
     // --- java.io.ObjectStreamClass native bindings (real-JDK mode) ---
@@ -12260,10 +12373,121 @@ pub(crate) fn compile_java_regex(
     let _ = JAVA_REGEX_UNICODE_CASE;
     let _ = JAVA_REGEX_UNICODE_CHARACTER_CLASS;
 
-    let full = format!("{prefix}{pattern}");
+    let translated = translate_java_regex(pattern);
+    let full = format!("{prefix}{translated}");
     regex::Regex::new(&full).map_err(|e| rustjvm_types::error::RuntimeError::IllegalArgumentException {
         message: format!("PatternSyntaxException: {e}"),
     })
+}
+
+/// Translate Java regex constructs that aren't directly supported by the Rust
+/// regex crate into equivalents the crate understands.
+///
+/// Currently handles:
+/// - `\p{InBlockName}` / `\P{InBlockName}` (Java Unicode-block prefix) →
+///   `\p{BlockName}` / `\P{BlockName}` (Rust accepts Unicode block names
+///   directly without the `In` prefix). Encountered in log4j2's
+///   `StatusLogger$PropertiesUtilsDouble.normalizePropertyName` which uses
+///   `\P{InBasic_Latin}` to scrub non-ASCII characters from property names —
+///   without this translation the regex compile fails with
+///   `Unicode property not found`, surfacing as an `IllegalArgumentException`
+///   that escapes `StatusLogger$Config.<clinit>` and aborts WildFly boot.
+/// - `\p{IsScriptName}` / `\P{IsScriptName}` (Java Unicode-script prefix) →
+///   `\p{ScriptName}` / `\P{ScriptName}` (same accepted-without-prefix shape).
+fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: if the pattern doesn't contain `\p{In` or `\p{Is` (or the
+    // capital-P negated forms), there's nothing to rewrite.
+    if !(pattern.contains("\\p{In") || pattern.contains("\\P{In")
+        || pattern.contains("\\p{Is") || pattern.contains("\\P{Is"))
+    {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
+        // All matched bytes are ASCII so byte indexing is safe.
+        if i + 5 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+            && bytes[i + 3] == b'I'
+            && (bytes[i + 4] == b'n' || bytes[i + 4] == b's')
+        {
+            if let Some(close_off) = pattern[i + 5..].find('}') {
+                let name = &pattern[i + 5..i + 5 + close_off];
+                let negated = bytes[i + 1] == b'P';
+                let prefix = bytes[i + 4]; // b'n' (block) or b's' (script)
+                if let Some(range_class) = map_java_unicode_block(name, prefix == b'n') {
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(range_class);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(range_class);
+                        out.push(']');
+                    }
+                } else {
+                    // Fall back: drop the In/Is prefix and let Rust regex try
+                    // (works for some script names even with Is prefix).
+                    out.push('\\');
+                    out.push(bytes[i + 1] as char);
+                    out.push('{');
+                    out.push_str(name);
+                    out.push('}');
+                }
+                i = i + 5 + close_off + 1;
+                continue;
+            }
+        }
+        // Copy one full UTF-8 character.
+        let ch_len = utf8_char_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        out.push_str(&pattern[i..end]);
+        i = end;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
+/// to a Rust regex character-class body covering the same code points. The
+/// Rust regex crate doesn't expose Unicode blocks natively, so we substitute
+/// equivalent code-point ranges for the common ones encountered in real-world
+/// JDK / library code. Returns `None` for unknown blocks so the caller can
+/// fall back to a less specific translation.
+fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
+    if !is_block {
+        // Script names ("Is" prefix) — Rust regex supports `\p{Latin}` etc.
+        // already; let the caller re-emit without the prefix.
+        return None;
+    }
+    // Block ranges from the Unicode Standard. Add more as needed.
+    match name {
+        "Basic_Latin" | "BasicLatin" => Some(r"\x00-\x7F"),
+        "Latin-1_Supplement" | "Latin1Supplement" => Some(r"\u{0080}-\u{00FF}"),
+        "Latin_Extended-A" | "LatinExtendedA" => Some(r"\u{0100}-\u{017F}"),
+        "Latin_Extended-B" | "LatinExtendedB" => Some(r"\u{0180}-\u{024F}"),
+        "IPA_Extensions" | "IPAExtensions" => Some(r"\u{0250}-\u{02AF}"),
+        "Greek" | "Greek_and_Coptic" => Some(r"\u{0370}-\u{03FF}"),
+        "Cyrillic" => Some(r"\u{0400}-\u{04FF}"),
+        "General_Punctuation" | "GeneralPunctuation" => Some(r"\u{2000}-\u{206F}"),
+        "CJK_Unified_Ideographs" | "CJKUnifiedIdeographs" => Some(r"\u{4E00}-\u{9FFF}"),
+        "Hiragana" => Some(r"\u{3040}-\u{309F}"),
+        "Katakana" => Some(r"\u{30A0}-\u{30FF}"),
+        "Hangul_Syllables" | "HangulSyllables" => Some(r"\u{AC00}-\u{D7AF}"),
+        _ => None,
+    }
+}
+
+#[inline]
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 { 1 }
+    else if b < 0xC0 { 1 } // continuation byte (shouldn't happen at boundary)
+    else if b < 0xE0 { 2 }
+    else if b < 0xF0 { 3 }
+    else { 4 }
 }
 
 /// Read the pattern source string + flags from a Pattern object and compile.
@@ -14873,7 +15097,18 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- LinkedBlockingQueue: 3-field (data=0 array, size=1 int, capacity=2 int) ---
+    // --- LinkedBlockingQueue / ArrayBlockingQueue: synthetic 3-field overrides ---
+    //
+    // These overrides assume slot 0 = element array, slot 1 = size, slot 2 =
+    // capacity / head — the synthetic-jdk layout.  Real JDK 25 LBQ has fields
+    // head/last/count/putLock/takeLock/notEmpty/notFull/capacity, and its
+    // <init> is responsible for instantiating putLock and takeLock.  When we
+    // shadowed `<init>` in real-JDK mode, putLock/takeLock stayed null, so
+    // real bytecode (e.g. drainTo line 706 -> `takeLock.lock()`) NPEd.
+    // Gate the entire block behind synthetic-jdk so real-JDK boot lets the
+    // real constructor and real methods run.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
     registry.register(lbq, "<init>", "()V", |ctx, args| {
         let this = match args.first() {
@@ -15466,9 +15701,11 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(size)))
     });
+    } // end of #[cfg(feature = "synthetic-jdk")] block for LBQ/ABQ
 }
 
 // LinkedBlockingQueue: add element at tail, grow array if needed
+#[cfg(feature = "synthetic-jdk")]
 fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
     let size = match ctx.get_field(this, 1) { Value::Int(n) => n as usize, _ => 0 };
     let arr = match ctx.get_field(this, 0) {
@@ -15489,6 +15726,7 @@ fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Valu
 }
 
 // LinkedBlockingQueue: remove and return head element, shift remaining
+#[cfg(feature = "synthetic-jdk")]
 fn m18_lbq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let size = match ctx.get_field(this, 1) { Value::Int(n) => n as usize, _ => return Value::Object(None) };
     if size == 0 { return Value::Object(None); }
@@ -15504,6 +15742,7 @@ fn m18_lbq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
 }
 
 // ArrayBlockingQueue: remove and return head element from circular buffer
+#[cfg(feature = "synthetic-jdk")]
 fn m18_abq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => return Value::Object(None) };
     if size == 0 { return Value::Object(None); }
@@ -15764,7 +16003,12 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
     });
 
     // --- LinkedTransferQueue ---
-    // Backed by same array structure as LinkedBlockingQueue: 0=array, 1=size, 2=capacity
+    // Backed by same array structure as LinkedBlockingQueue: 0=array, 1=size, 2=capacity.
+    // Real JDK 25 LTQ has a totally different layout (head/tail Node refs etc.) so the
+    // synthetic <init> would leave real fields null and break later real bytecode.
+    // Gate behind synthetic-jdk so real-JDK boot uses the real constructor.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     let ltq = "java/util/concurrent/LinkedTransferQueue";
     registry.register(ltq, "<init>", "()V", |ctx, args| {
         let this = match args.first() {
@@ -15966,6 +16210,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
         let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => 0 };
         Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
     });
+    } // end of #[cfg(feature = "synthetic-jdk")] block for LinkedTransferQueue
 
     // --- Flow.Publisher / Flow.Subscriber / Flow.Subscription ---
     // These are interfaces in Java; register minimal natives for the reactive-streams bridge.

@@ -22,6 +22,13 @@ pub fn register_letsgo_compat_natives(registry: &mut NativeMethodRegistry) {
     register_wrapper_value_of(registry);
     register_wrapper_unbox(registry);
     register_security_fallbacks(registry);
+    // `drainTo` synthetic overrides assume slot 0=array, 1=size — that's the
+    // synthetic-jdk LBQ/ABQ layout.  On real JDK 25 LBQ those slots are
+    // head/last (Node refs), so the synthetic native silently misreads.  More
+    // importantly, registering this override is paired with synthetic LBQ
+    // <init> overrides elsewhere (m18, native-collections) that leave real
+    // putLock/takeLock null.  Gate so real-JDK bytecode (which works) runs.
+    #[cfg(feature = "synthetic-jdk")]
     register_blocking_queue_drain_to(registry);
     register_atomic_compat(registry);
 }
@@ -558,6 +565,7 @@ fn register_security_fallbacks(r: &mut NativeMethodRegistry) {
 
 /// `BlockingQueue.drainTo(Collection, int)` overload — required by SLF4J's
 /// `LoggerFactory.replayEvents` and by Spring's `TaskExecutor` pools.
+#[cfg(feature = "synthetic-jdk")]
 fn register_blocking_queue_drain_to(r: &mut NativeMethodRegistry) {
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
     r.register(lbq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_lbq_bounded);
@@ -570,6 +578,7 @@ fn register_blocking_queue_drain_to(r: &mut NativeMethodRegistry) {
     r.register(bq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_iface_bounded);
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn drain_to_lbq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -606,6 +615,7 @@ fn drain_to_lbq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(n)))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn drain_to_abq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -642,6 +652,7 @@ fn drain_to_abq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(n)))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn drain_to_iface_unbounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -655,6 +666,7 @@ fn drain_to_iface_unbounded(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(r.or(Some(Value::Int(0))))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn drain_to_iface_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,

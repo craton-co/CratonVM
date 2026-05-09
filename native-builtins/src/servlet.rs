@@ -201,6 +201,12 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
 
     // -------------------------------------------------------------------------
     // java.io.BufferedReader.readLine() → String
+    //
+    // The underlying InputStream is a synthetic ByteArrayInputStream with
+    // layout: field 0 = byte[] buf, field 1 = pos, field 2 = mark, field 3 = count.
+    // We read bytes from `pos..count` until we hit a line terminator
+    // (`\n`, `\r`, or `\r\n`), advance `pos` past it, and return the line
+    // as a UTF-8 String. Returns null at EOF.
     // -------------------------------------------------------------------------
     r.register(
         "java/io/BufferedReader",
@@ -212,21 +218,49 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                 Some(s) => s,
                 None => return Ok(Some(Value::Object(None))),
             };
-            let lines_arr = match ctx.get_field(is, 0) {
+            let buf_arr = match ctx.get_field(is, 0) {
                 Value::Object(Some(arr)) => arr,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let pos = match ctx.get_field(is, 1) {
-                Value::Int(i) => i,
+            let mut pos = match ctx.get_field(is, 1) {
+                Value::Int(i) => i as usize,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let len = ctx.array_length(lines_arr) as i32;
-            if pos >= len {
+            let count = match ctx.get_field(is, 3) {
+                Value::Int(i) => i as usize,
+                _ => ctx.array_length(buf_arr),
+            };
+            if pos >= count {
+                // EOF — readLine returns null
                 return Ok(Some(Value::Object(None)));
             }
-            let line = ctx.get_array_element(lines_arr, pos as usize);
-            ctx.set_field(is, 1, Value::Int(pos + 1));
-            Ok(Some(line))
+            let mut bytes: Vec<u8> = Vec::new();
+            while pos < count {
+                let b = match ctx.get_array_element(buf_arr, pos) {
+                    Value::Int(v) => (v as i8) as u8,
+                    _ => break,
+                };
+                pos += 1;
+                if b == b'\n' {
+                    break;
+                }
+                if b == b'\r' {
+                    // Consume optional following \n (CRLF stays atomic)
+                    if pos < count {
+                        if let Value::Int(v) = ctx.get_array_element(buf_arr, pos) {
+                            if (v as i8) as u8 == b'\n' {
+                                pos += 1;
+                            }
+                        }
+                    }
+                    break;
+                }
+                bytes.push(b);
+            }
+            ctx.set_field(is, 1, Value::Int(pos as i32));
+            let line = String::from_utf8_lossy(&bytes).into_owned();
+            let s = ctx.create_string(&line);
+            Ok(Some(Value::Object(Some(s))))
         },
     );
 

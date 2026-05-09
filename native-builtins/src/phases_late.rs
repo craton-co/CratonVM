@@ -30043,12 +30043,25 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
 
     // StreamSupport
     let ss = "java/util/stream/StreamSupport";
+    eprintln!("[STREAM-SUPPORT-DBG] registering StreamSupport.stream");
     r.register(
         ss,
         "stream",
         "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;",
         |ctx, args| {
-            // Convert spliterator to stream (1-field synthetic with backing array)
+            eprintln!("[STREAM-SUPPORT-DBG] StreamSupport.stream native fired");
+            // Convert spliterator to stream (1-field synthetic with backing array).
+            //
+            // Two cases:
+            //  * Synthetic spliterator (built by our `Collection.spliterator`,
+            //    `Spliterators.spliterator`, etc.): field 0 is already the
+            //    backing Object[] — just snapshot it.
+            //  * Real-JDK Spliterator subclass (e.g. log4j's
+            //    `ServiceLoaderUtil$ServiceLoaderSpliterator`, whose field 0
+            //    is an `Iterator`, not an array). We can't read its private
+            //    layout; drain it via `forEachRemaining(Consumer)` into a
+            //    collector consumer whose `accept` natively appends to a
+            //    growing Object[].
             let spliterator = match args.first() {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
@@ -30058,9 +30071,14 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(stream))));
                 }
             };
-            let arr = match ctx.get_field(spliterator, 0) {
-                Value::Object(Some(a)) => a,
-                _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+            let field0 = ctx.get_field(spliterator, 0);
+            let arr = match field0 {
+                Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+                _ => {
+                    // Real Spliterator subclass — drain via a collecting
+                    // consumer.
+                    drain_spliterator(ctx, spliterator)?
+                }
             };
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -30100,6 +30118,86 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(stream))))
         },
     );
+
+    // Collector consumer used by `drain_spliterator`. Layout:
+    //   field 0: Object[] storage (capacity == array_length)
+    //   field 1: Int — current logical length
+    // `accept(Object)V` appends, growing the storage on demand.
+    r.register(
+        "rustjvm/internal/StreamCollector",
+        "accept",
+        "(Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            let mut len = match ctx.get_field(this, 1) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            let storage = match ctx.get_field(this, 0) {
+                Value::Object(Some(a)) => a,
+                _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16),
+            };
+            let cap = ctx.array_length(storage);
+            let storage = if len >= cap {
+                let new_cap = (cap * 2).max(16);
+                let bigger = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+                for i in 0..len {
+                    let v = ctx.get_array_element(storage, i);
+                    ctx.set_array_element(bigger, i, v);
+                }
+                ctx.set_field(this, 0, Value::Object(Some(bigger)));
+                bigger
+            } else {
+                storage
+            };
+            ctx.set_array_element(storage, len, elem);
+            len += 1;
+            ctx.set_field(this, 1, Value::Int(len as i32));
+            Ok(None)
+        },
+    );
+}
+
+/// Drain a (possibly real-JDK) Spliterator into a freshly-allocated
+/// Object[] by repeatedly invoking `tryAdvance(Consumer)` with a synthetic
+/// collector consumer. Used when `StreamSupport.stream` is handed a
+/// Spliterator whose field-0 layout we don't control (e.g. log4j's
+/// `ServiceLoaderUtil$ServiceLoaderSpliterator`).
+fn drain_spliterator(
+    ctx: &mut dyn NativeContext,
+    spliterator: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Allocate the collector consumer.
+    let collector = alloc_concurrent_synthetic(ctx, "rustjvm/internal/StreamCollector", 2);
+    let initial = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+    ctx.set_field(collector, 0, Value::Object(Some(initial)));
+    ctx.set_field(collector, 1, Value::Int(0));
+
+    // Drive the spliterator. Try forEachRemaining first (one virtual call),
+    // fall back to tryAdvance loop if forEachRemaining isn't usable.
+    let _ = ctx.invoke_virtual(
+        spliterator,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        &[Value::Object(Some(spliterator)), Value::Object(Some(collector))],
+    );
+
+    // Snapshot to an exactly-sized array.
+    let len = match ctx.get_field(collector, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let storage = match ctx.get_field(collector, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)),
+    };
+    let out = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+    for i in 0..len {
+        let v = ctx.get_array_element(storage, i);
+        ctx.set_array_element(out, i, v);
+    }
+    Ok(out)
 }
 
 // =============================================================================

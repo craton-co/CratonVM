@@ -5416,6 +5416,41 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // GENS-1: Class.getGenericInterfaces / getGenericSuperclass
+                        // — the real-JDK bytecode goes through ClassRepository →
+                        // SignatureParser → Reifier. The Reifier path NPEs in
+                        // `Reifier.visitClassTypeSignature` (line 110:
+                        // `new StringBuilder(sc.getName())`) on `ArrayList`'s
+                        // `Ljava/util/AbstractList<TE;>;Ljava/util/List<TE;>;...`
+                        // signature: an iter.next() on the parsed path returns
+                        // null, surfacing as
+                        //   "Cannot invoke getName on null"
+                        // during Spring Boot's `ApplicationConversionService.<clinit>`
+                        // (and our minimal CR repro on `ArrayList.class`). Our
+                        // native `getGenericInterfaces` parses the Signature
+                        // attribute via `rustjvm_reader::signature` and builds
+                        // synthetic `ParameterizedType` mirrors directly, so
+                        // force the override and bypass the broken JDK path.
+                        // GENS-1: Class.getGenericInterfaces / getGenericSuperclass
+                        // — the real-JDK bytecode goes through ClassRepository →
+                        // SignatureParser → Reifier. The Reifier path NPEs in
+                        // `Reifier.visitClassTypeSignature` (`new StringBuilder(
+                        // sc.getName())`) on `ArrayList`'s class signature: an
+                        // `iter.next()` on the parsed path returns null, surfacing
+                        // as "Cannot invoke getName on null" during Spring Boot's
+                        // `ApplicationConversionService.<clinit>` (and the
+                        // minimal `CR` repro on `ArrayList.class`). Our native
+                        // parses the Signature attribute via
+                        // `rustjvm_reader::signature` directly and builds
+                        // `ParameterizedType` mirrors, so force the override and
+                        // bypass the broken JDK parse path. Registered
+                        // unconditionally below in
+                        // `register_essential_natives` (this `check_override`
+                        // entry is the gate that lets a registered native take
+                        // precedence over a non-`ACC_NATIVE` JDK Java method).
+                        || (class_name == "java/lang/Class"
+                            && (method_name == "getGenericInterfaces"
+                                || method_name == "getGenericSuperclass"))
                         // B3: ClassLoader.getResources / getSystemResources
                         // have real-JDK bytecode but that bytecode walks
                         // URLClassPath (which NPEs during <clinit>). Force
@@ -5423,6 +5458,31 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // SB3 (URLClassPath): the real-JDK bytecode for
+                        // `URLClassPath.<init>([Ljava/net/URL;...)V` writes
+                        // the `loaders`/`lmap`/`closed` instance fields in
+                        // the inline initializer prelude *before* the
+                        // `aload_1; arraylength` on `urls` — but Spring Boot
+                        // Loader's `LaunchedURLClassLoader(URL[], ClassLoader)`
+                        // hands us a partially-constructed URL[] (some slots
+                        // are `null`) that later calls (e.g. `URL.<init>` of
+                        // a nested-jar URL) NPE on. The JDK's
+                        // `URLClassPath$1.next` then descends into
+                        // `getLoader(int)`, which reads `loaders.size()` —
+                        // null because the constructor never finished its
+                        // `path = new ArrayList<>(urls.length)` step. Our
+                        // `ucp_init_*` natives in `native-builtins/src/lib.rs`
+                        // tolerate null/partial URL[]s and populate every
+                        // field via `set_field_by_name` (no slot guessing).
+                        // Force the override so the bytecode never runs.
+                        || (class_name == "jdk/internal/loader/URLClassPath"
+                            && ((method_name == "<init>"
+                                && (descriptor == "([Ljava/net/URL;Ljava/net/URLStreamHandlerFactory;)V"
+                                    || descriptor == "([Ljava/net/URL;)V"))
+                                || (method_name == "getLoader"
+                                    && descriptor == "(I)Ljdk/internal/loader/URLClassPath$Loader;")
+                                || (method_name == "findResources"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/util/Enumeration;")))
                         // RKC16N.12: System.loadLibrary / Runtime.loadLibrary0
                         // — the real JDK bytecode walks down through
                         // ClassLoader.loadLibrary which throws
@@ -5602,6 +5662,31 @@ fn invoke_on_class_shared_inner(
                             && matches!(
                                 method_name,
                                 "keySet" | "values" | "entrySet"
+                                // S111r13: HashMap.computeIfAbsent / compute /
+                                // computeIfPresent / merge / putIfAbsent / replace
+                                // / forEach / replaceAll / getOrDefault — the
+                                // real-JDK bytecode for these reads
+                                // `getfield table` and then `arraylength`,
+                                // which on our synthetic HashMap layout (slot
+                                // 2 holds capacity as `Int(16/32/...)`)
+                                // surfaces as
+                                //   `expected object reference, got int(N)`
+                                // and aborts. logback's LoggerContext ctor
+                                // hits this through
+                                // `LogbackMDCAdapter.<clinit>` and friends.
+                                // Same family as the existing keySet/values/
+                                // entrySet and HashSet.spliterator overrides.
+                                // Force the side-table-backed natives in
+                                // `native-collections` to win.
+                                | "computeIfAbsent"
+                                | "compute"
+                                | "computeIfPresent"
+                                | "merge"
+                                | "putIfAbsent"
+                                | "replace"
+                                | "forEach"
+                                | "replaceAll"
+                                | "getOrDefault"
                             ))
                         || (matches!(
                                 class_name,
