@@ -105,6 +105,7 @@ pub mod phases_late;
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
 // the loaded value instead of NPE.
 pub mod properties_sidetable;
+pub mod classloader_value_sidetable;
 pub mod charset;
 pub mod panama;
 pub mod panama_libffi;
@@ -1581,6 +1582,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `properties_sidetable.rs` to keep the registration here lean.
     crate::properties_sidetable::register_properties_sidetable(registry);
 
+    // Spring Boot apps (eureka-server, letsgo-main, sportme) hang in
+    // `jdk/internal/loader/AbstractClassLoaderValue.putIfAbsent` (pc=29):
+    // the method drives `ConcurrentHashMap.putIfAbsent` whose internal CAS
+    // loop livelocks under our Unsafe field-offset emulation.  Bypass the
+    // CHM path entirely with a side-table keyed by (ClassLoader, this).
+    // See `classloader_value_sidetable.rs`.
+    crate::classloader_value_sidetable::register_classloader_value_sidetable(registry);
+
     // S111r11 SB3: `jdk.internal.module.ModuleBootstrap.<clinit>` calls
     // `getAndRemoveProperty(key) = (String) System.getProperties().remove(key)`
     // for `jdk.module.path`, `jdk.module.upgrade.path`, `jdk.module.main.class`,
@@ -2004,6 +2013,31 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // --- java.lang.Class (native methods) ---
     registry.register("java/lang/Class", "registerNatives", "()V", native_noop);
     registry.register("java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;", native_class_get_primitive_class);
+
+    // WildFly livelock fix — override the three `java.lang.Class$Atomic`
+    // CAS helpers so they bypass the broken Unsafe.objectFieldOffset
+    // lookup for Class.{reflectionData,annotationType,annotationData}
+    // and operate on a Rust-side per-mirror table instead. Without
+    // these overrides, `Class.privateGetDeclaredFields` livelocks on
+    // bootstrap (observed under WildFlySecurityManager.<clinit>).
+    registry.register(
+        "java/lang/Class$Atomic",
+        "casReflectionData",
+        "(Ljava/lang/Class;Ljava/lang/ref/SoftReference;Ljava/lang/ref/SoftReference;)Z",
+        native_class_atomic_cas_reflection_data,
+    );
+    registry.register(
+        "java/lang/Class$Atomic",
+        "casAnnotationType",
+        "(Ljava/lang/Class;Lsun/reflect/annotation/AnnotationType;Lsun/reflect/annotation/AnnotationType;)Z",
+        native_class_atomic_cas_annotation_type,
+    );
+    registry.register(
+        "java/lang/Class$Atomic",
+        "casAnnotationData",
+        "(Ljava/lang/Class;Ljava/lang/Class$AnnotationData;Ljava/lang/Class$AnnotationData;)Z",
+        native_class_atomic_cas_annotation_data,
+    );
 
     // T14/T15: Override Class.getResourceAsStream / getResource so that
     // real-JDK bytecode doesn't depend on the full Module subsystem during
@@ -10069,6 +10103,76 @@ pub(crate) fn synthetic_cas(
         map.insert((obj_key(obj), offset), new_val);
     }
     eq
+}
+
+// =====================================================================
+// Class$Atomic CAS overrides — sidestep broken Unsafe path for the JDK's
+// internal lazy-init guards on Class.{reflectionData,annotationType,
+// annotationData}. These are static helpers in `java.lang.Class$Atomic`
+// that drive a `U.compareAndSetReference(c, FIELD_OFFSET, exp, new)`
+// loop. Our java.lang.Class mirror does not expose those synthetic
+// fields, so the offset cache resolves to a slot that never CAS-matches
+// and we livelock (observed in WildFlySecurityManager.<clinit>). Bypass
+// Unsafe entirely: store the per-Class-mirror state in a Rust-side
+// table keyed by mirror pointer.
+// =====================================================================
+
+fn class_atomic_side_store()
+    -> &'static std::sync::Mutex<std::collections::HashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>
+{
+    // Key: (Class mirror ptr, slot tag). Tag distinguishes the three
+    // slots (reflectionData=0, annotationType=1, annotationData=2).
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[inline]
+fn class_atomic_cas_impl(args: &[Value], slot_tag: u8) -> MethodCallResult {
+    // Static method: args[0]=Class mirror, args[1]=expected, args[2]=new.
+    let class_ref = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let expected = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let new_val = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let key = (class_ref.as_ptr() as usize, slot_tag);
+    let mut map = class_atomic_side_store().lock().unwrap_or_else(|e| e.into_inner());
+    let cur = map.get(&key).copied().unwrap_or(None);
+    if cur == expected {
+        map.insert(key, new_val);
+        Ok(Some(Value::Int(1)))
+    } else {
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+fn native_class_atomic_cas_reflection_data(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_atomic_cas_impl(args, 0)
+}
+
+fn native_class_atomic_cas_annotation_type(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_atomic_cas_impl(args, 1)
+}
+
+fn native_class_atomic_cas_annotation_data(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_atomic_cas_impl(args, 2)
 }
 
 fn native_unsafe_object_field_offset(

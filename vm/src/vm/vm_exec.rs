@@ -6078,7 +6078,34 @@ fn invoke_on_class_shared_inner(
                                 | "org/springframework/core/metrics/StartupStep"
                                 | "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep"
                             )
-                            && matches!(method_name, "start" | "tag" | "end" | "getName" | "getTags"));
+                            && matches!(method_name, "start" | "tag" | "end" | "getName" | "getTags"))
+                        // Spring Boot eureka-server / letsgo-main / sportme hang in
+                        // `jdk/internal/loader/AbstractClassLoaderValue.putIfAbsent`
+                        // (pc=29) because the JDK's bytecode drives
+                        // `ConcurrentHashMap.putIfAbsent` whose internal CAS loop
+                        // livelocks under our Unsafe field-offset emulation. Force
+                        // the side-table-backed natives registered in
+                        // `classloader_value_sidetable.rs` so the bytecode never
+                        // reaches the CHM path.
+                        || (class_name == "jdk/internal/loader/AbstractClassLoaderValue"
+                            && matches!(
+                                method_name,
+                                "get" | "putIfAbsent" | "remove" | "computeIfAbsent"
+                            ))
+                        // WildFly bootstrap livelock fix —
+                        // `java.lang.Class$Atomic.cas{ReflectionData,
+                        // AnnotationType,AnnotationData}` cache an
+                        // Unsafe field offset for synthetic Class
+                        // mirror slots that our layout doesn't
+                        // expose, so the CAS loop livelocks. Force
+                        // our side-table natives to win.
+                        || (class_name == "java/lang/Class$Atomic"
+                            && matches!(
+                                method_name,
+                                "casReflectionData"
+                                | "casAnnotationType"
+                                | "casAnnotationData"
+                            ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
