@@ -2039,6 +2039,45 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_class_atomic_cas_annotation_data,
     );
 
+    // T20.RD (WildFly/SportMe Class$ReflectionData livelock fix) —
+    // The cas-side-store fix above (`casReflectionData`) keeps CAS
+    // progress consistent, but it is INVISIBLE to the direct
+    // `getfield Class.reflectionData` performed by `Class.reflectionData()`
+    // and `Class.newReflectionData()` (slot 11 on the mirror, populated
+    // by `make_class_mirror` to `null`). After the first CAS succeeds
+    // the side store holds a SoftReference, but the heap slot stays
+    // null; the second call therefore re-enters `newReflectionData()`
+    // whose `while(true)` loop CASes with `expected=null` against a
+    // side-store value of `Some(prevSoftRef)`, the comparison fails
+    // forever, and `re-read this.reflectionData` returns null again
+    // → livelock at `Class$ReflectionData.<init>` / `newReflectionData`
+    // pc=0..9 (60s watchdog dump on WildFly bootstrap and SportMe).
+    //
+    // Cleanest fix: replace `Class.newReflectionData(SoftReference, int)`
+    // with a native that allocates the `Class$ReflectionData`, sets its
+    // `redefinedCount`, wraps it in a fresh `SoftReference`, writes the
+    // SoftReference into slot 11 of the receiver mirror AND into the
+    // cas side store so both the direct getfield and any future
+    // `casReflectionData` see the same value. Also register the
+    // `Class$ReflectionData.<init>(I)V` constructor as a no-op-ish
+    // native that just assigns `redefinedCount` (the JDK constructor
+    // body is `this.redefinedCount = redefinedCount;`) — required so
+    // that any caller that allocates a ReflectionData directly (the
+    // bytecode at `newReflectionData` pc=5) does not run through
+    // class-init / JIT paths that may themselves be hung.
+    registry.register(
+        "java/lang/Class$ReflectionData",
+        "<init>",
+        "(I)V",
+        native_class_reflection_data_init,
+    );
+    registry.register(
+        "java/lang/Class",
+        "newReflectionData",
+        "(Ljava/lang/ref/SoftReference;I)Ljava/lang/Class$ReflectionData;",
+        native_class_new_reflection_data,
+    );
+
     // T14/T15: Override Class.getResourceAsStream / getResource so that
     // real-JDK bytecode doesn't depend on the full Module subsystem during
     // bootstrap.  The real JDK's versions call getModule().isNamed() first,
@@ -10155,10 +10194,124 @@ fn class_atomic_cas_impl(args: &[Value], slot_tag: u8) -> MethodCallResult {
 }
 
 fn native_class_atomic_cas_reflection_data(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    class_atomic_cas_impl(args, 0)
+    // Same as `class_atomic_cas_impl` but ALSO mirrors the new value
+    // into slot 11 (`Class.reflectionData`) of the receiver class
+    // mirror, so the direct `getfield this.reflectionData` performed
+    // by `Class.reflectionData()` and `Class.newReflectionData()` sees
+    // the value stored by the CAS. Without this mirror-write the cas
+    // succeeds once, then `newReflectionData()`'s `while(true)` loop
+    // livelocks forever (T20.RD on WildFly / SportMe bootstrap).
+    let result = class_atomic_cas_impl(args, 0)?;
+    if let Some(Value::Int(1)) = result {
+        if let (Some(Value::Object(Some(class_mirror))), Some(Value::Object(new_soft_ref))) =
+            (args.first(), args.get(2))
+        {
+            ctx.set_field(*class_mirror, 11, Value::Object(*new_soft_ref));
+        }
+    }
+    Ok(result)
+}
+
+/// T20.RD: native body of `java/lang/Class$ReflectionData.<init>(I)V`.
+///
+/// The JDK source is `this.redefinedCount = redefinedCount;` plus the
+/// implicit super-constructor call. Implementing this as a native
+/// (instead of running the bytecode body) bypasses any class-init /
+/// JIT path that may itself be blocked on reflection during early
+/// WildFly bootstrap.
+fn native_class_reflection_data_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let count = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if let Some(idx) =
+        ctx.resolve_field_index("java/lang/Class$ReflectionData", "redefinedCount")
+    {
+        ctx.set_field(this, idx, Value::Int(count));
+    } else {
+        // Fall back to set-by-name; if the field can't be resolved,
+        // leave the slot at default (0). The reflection-data cache
+        // logic only checks for equality against the receiver's
+        // classRedefinedCount (also 0 in our VM).
+        ctx.set_field_by_name(this, "redefinedCount", Value::Int(count));
+    }
+    Ok(None)
+}
+
+/// T20.RD: native body of `java/lang/Class.newReflectionData(SoftReference, int)`.
+///
+/// Allocates a fresh `Class$ReflectionData`, runs our `<init>(I)V`
+/// native to set `redefinedCount`, wraps it in a `SoftReference`,
+/// writes the SoftReference into slot 11 (reflectionData) of the
+/// receiver class mirror, AND mirrors it into the cas side store so
+/// any subsequent `casReflectionData` observes the same value. The
+/// JDK's `while(true)` CAS loop is replaced by a single allocation —
+/// safe because we hold no contention against any other thread on
+/// this slot (the side store and the heap slot are written together).
+fn native_class_new_reflection_data(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let count = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+
+    // 1. Allocate a fresh `Class$ReflectionData`.
+    let rd = match ctx.new_object("java/lang/Class$ReflectionData")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // 2. Initialise `redefinedCount` directly (the <init> native does
+    //    this; calling it through `invoke` would also work but keep
+    //    this path self-contained to avoid recursive native dispatch).
+    if let Some(idx) =
+        ctx.resolve_field_index("java/lang/Class$ReflectionData", "redefinedCount")
+    {
+        ctx.set_field(rd, idx, Value::Int(count));
+    } else {
+        ctx.set_field_by_name(rd, "redefinedCount", Value::Int(count));
+    }
+
+    // 3. Wrap in a SoftReference. We use `new_object` + bytecode
+    //    `<init>(Object)V`. SoftReference's referent is stored in the
+    //    Reference superclass field `referent`.
+    let soft_ref = match ctx.new_object("java/lang/ref/SoftReference")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(Some(rd)))),
+    };
+    // SoftReference's `<init>(Object)V` calls Reference's <init>(Object,ReferenceQueue)
+    // with a null queue. Set the referent field directly — works regardless of
+    // whether SoftReference's constructor runs (avoids reentrant reflection
+    // during bootstrap).
+    ctx.set_field_by_name(soft_ref, "referent", Value::Object(Some(rd)));
+
+    // 4. Write the SoftReference into mirror slot 11 (reflectionData).
+    ctx.set_field(this, 11, Value::Object(Some(soft_ref)));
+
+    // 5. Mirror into the cas side store so future casReflectionData
+    //    calls observe the current value.
+    {
+        let key = (this.as_ptr() as usize, 0u8);
+        let mut map = class_atomic_side_store().lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(key, Some(soft_ref));
+    }
+
+    Ok(Some(Value::Object(Some(rd))))
 }
 
 fn native_class_atomic_cas_annotation_type(

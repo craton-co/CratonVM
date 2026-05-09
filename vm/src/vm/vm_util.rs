@@ -494,6 +494,13 @@ fn initialize_class_shared(
                         | "java/lang/AbstractMethodError"
                         | "java/lang/IncompatibleClassChangeError"
                         | "java/lang/UnsatisfiedLinkError"
+                        // Bare `java/lang/Error` (no specific subclass) — used
+                        // by some optional-classpath probes (e.g. logback's
+                        // ContextSelectorStaticBinder.<clinit> when the
+                        // logback config is absent or partially parseable in
+                        // CratonVM real-JDK mode). Treated as recoverable
+                        // for the same framework allowlist below.
+                        | "java/lang/Error"
                     );
                     // Only swallow for JDK/framework classes, not for arbitrary app classes.
                     // This prevents masking real errors in user code.
@@ -513,6 +520,24 @@ fn initialize_class_shared(
                         // getClassPathArchivesIterator / getMainClass bypass
                         // the archive-traversal logic entirely.
                         || class_name_for_jfr.starts_with("org/springframework/boot/loader/")
+                        // SLF4J/logback impl classes whose <clinit> wires up an
+                        // entire logging backend (logback Joran XML config,
+                        // ContextSelectorStaticBinder, status printer, etc.)
+                        // that touches many partial-real-JDK paths. The
+                        // CratonVM `register_slf4j_binder_stubs_pub` natives
+                        // (vm_init.rs) already provide synthetic singletons
+                        // for `getSingleton()` / `getLoggerFactory()` / the
+                        // MDC and Marker binders, so a failed real <clinit>
+                        // is harmless: SLF4J's `LoggerFactory.bind()` only
+                        // calls `StaticLoggerBinder.getSingleton()`, which
+                        // routes through our native and never reads the
+                        // half-initialized `SINGLETON` static. Without this,
+                        // Spring Boot fat-jars bundling logback fail with a
+                        // NoClassDefFoundError at the linkage of the
+                        // getSingleton invokestatic, even though the class
+                        // is correctly extracted from BOOT-INF/lib.
+                        || class_name_for_jfr.starts_with("org/slf4j/impl/")
+                        || class_name_for_jfr.starts_with("ch/qos/logback/")
                         || class_name_for_jfr.starts_with("com/sun/");
                     is_swallowable_type && is_framework_class
                 } else {

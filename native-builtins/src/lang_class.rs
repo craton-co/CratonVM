@@ -785,10 +785,23 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
         }
-        Err(_) => Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: dotted_name,
-        }
-        .into()),
+        Err(e) => {
+            if let rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
+                let exc_cid = ctx.class_id_of_object(*exc_ref);
+                let exc_class = ctx.class_name_of_id(exc_cid).unwrap_or_default();
+                let msg = match ctx.get_field(*exc_ref, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                eprintln!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
+            } else {
+                eprintln!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
+            }
+            Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: dotted_name,
+            }
+            .into())
+        },
     }
 }
 
