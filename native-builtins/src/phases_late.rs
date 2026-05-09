@@ -30176,11 +30176,17 @@ fn drain_spliterator(
 
     // Drive the spliterator. Try forEachRemaining first (one virtual call),
     // fall back to tryAdvance loop if forEachRemaining isn't usable.
+    // NOTE: `invoke_virtual` prepends the receiver itself — `args` must NOT
+    // include it. The previous version double-passed the receiver, producing
+    // a malformed 3-arg call for a 2-arg method, which silently dropped the
+    // collector and left the output array empty (the symptom that surfaced
+    // as the FORE-DBG trace and as `Stream.forEach` returning zero elements
+    // during WildFly's log4j init).
     let _ = ctx.invoke_virtual(
         spliterator,
         "forEachRemaining",
         "(Ljava/util/function/Consumer;)V",
-        &[Value::Object(Some(spliterator)), Value::Object(Some(collector))],
+        &[Value::Object(Some(collector))],
     );
 
     // Snapshot to an exactly-sized array.

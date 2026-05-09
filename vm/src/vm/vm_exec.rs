@@ -6155,15 +6155,67 @@ fn invoke_on_class_shared_inner(
 
                 // Check interfaces for default methods (e.g. Function$AndThen
                 // implements Function, so Function.andThen should be found).
+                //
+                // SPLITERATOR-FALLTHROUGH: When the receiver is a real-JDK
+                // subclass implementing an interface for which we have BOTH
+                // a registered native (e.g. `java/util/Spliterator.tryAdvance`
+                // registered for our synthetic Spliterator instances) AND the
+                // interface declares a default method (or any super-interface
+                // does), we MUST prefer the JDK default-method bytecode over
+                // our native: the native operates on synthetic field layouts
+                // (field 0 = backing array, field 1 = cursor) and silently
+                // returns false/0 when invoked on a real-JDK subclass like
+                // `ServiceLoaderUtil$ServiceLoaderSpliterator` whose field 0
+                // is an Iterator. This regressed log4j's
+                // `PropertySource$Util.<clinit>` (Stream.forEach over a
+                // ServiceLoader-driven Spliterator returned 0 elements,
+                // surfacing as IAE during WildFly boot).
                 {
                     let cm2 = shared.class_manager.read();
                     if let Some(class) = cm2.class_store.get(class_id) {
-                        let iface_names: Vec<String> = class
-                            .interfaces
-                            .iter()
-                            .filter_map(|&iid| cm2.class_store.get(iid).map(|c| c.name.to_string()))
-                            .collect();
+                        // Collect transitive interfaces (BFS over super-ifaces)
+                        // so we find default methods declared on a parent
+                        // interface even if the receiver implements only a
+                        // sub-interface.
+                        let mut iface_queue: Vec<ClassId> = class.interfaces.iter().copied().collect();
+                        let mut visited_ifaces: std::collections::HashSet<ClassId> = std::collections::HashSet::new();
+                        let mut iface_names: Vec<String> = Vec::new();
+                        let mut i = 0;
+                        while i < iface_queue.len() {
+                            let iid = iface_queue[i];
+                            i += 1;
+                            if !visited_ifaces.insert(iid) {
+                                continue;
+                            }
+                            if let Some(iface) = cm2.class_store.get(iid) {
+                                iface_names.push(iface.name.to_string());
+                                iface_queue.extend_from_slice(&iface.interfaces);
+                            }
+                        }
+                        // First pass: prefer a non-abstract default method on
+                        // any (super-)interface — running the JDK bytecode is
+                        // always safer than dispatching to a native shaped for
+                        // synthetic receivers.
+                        let mut default_iface: Option<ClassId> = None;
+                        for &iid in visited_ifaces.iter() {
+                            if let Some(iface) = cm2.class_store.get(iid) {
+                                if let Some(m) = iface.find_method(method_name, descriptor) {
+                                    if !m.is_abstract() {
+                                        default_iface = Some(iid);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(iid) = default_iface {
+                            drop(cm2);
+                            return invoke_on_class_shared(
+                                shared, thread, iid, method_name, descriptor, args,
+                            );
+                        }
                         drop(cm2);
+                        // Second pass: fall back to a native registered on
+                        // any interface name (legacy behavior).
                         for iface_name in &iface_names {
                             if let Some(callback) =
                                 shared.native_methods.find(iface_name, method_name, descriptor)

@@ -1126,7 +1126,24 @@ fn map_bucket_index(hash: i32, capacity: i32) -> usize {
     ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
 }
 
-/// Allocate a HashMap$Node entry.
+/// Allocate a HashMap$Node entry using the legacy synthetic layout
+/// (slot 0 = key, slot 1 = value, slot 2 = hash, slot 3 = next).
+///
+/// We deliberately allocate with `ClassId::new(0)` instead of binding the
+/// node to the real-JDK `java/util/HashMap$Node` class. The JDK declares
+/// fields in order `hash:I, key:Object, value:Object, next:HashMap$Node`,
+/// so binding to the real class causes descriptor-aware field coercion
+/// (see `coerce_field_value_by_descriptor`) to interpret slot 0 as `int`
+/// and rewrite our `Object(key)` write as `Int(<pointer-bits>)`. The
+/// downstream `get_node_key` layout-sniff then sees an `Int` in slot 0,
+/// concludes the node uses the JDK layout, and reads slot 1 as the key —
+/// but slot 1 was set to the sentinel `Int(1)` (for HashSet-backed maps),
+/// surfacing as `Iterator.next()` returning `Int(1)` and a downstream
+/// `checkcast Map.Entry` against an `Int`.
+///
+/// Matches `native_map_put`'s direct `alloc_object(ClassId::new(0), ...)`
+/// at the insert path; reads via `get_node_key`/`get_node_value` keep
+/// their layout-sniff for nodes produced by either site.
 fn map_alloc_node(
     ctx: &mut dyn NativeContext,
     key: ObjectRef,
@@ -1134,7 +1151,7 @@ fn map_alloc_node(
     hash: i32,
     next: Option<ObjectRef>,
 ) -> ObjectRef {
-    let node = alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS);
+    let node = ctx.alloc_object(rustjvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
     ctx.set_field(node, NODE_FIELD_VALUE, value);
     ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
@@ -15196,8 +15213,19 @@ fn native_spliterator_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Synthetic-spliterator fast path: field 0 is a backing Object[]. If it
+    // isn't, this native is being invoked on a real-JDK Spliterator subclass
+    // whose field-0 is something else (e.g. an Iterator inside
+    // `ServiceLoaderUtil$ServiceLoaderSpliterator`). Returning Int(0) here
+    // would silently terminate the caller's stream — instead, signal "no
+    // synthetic state" by returning Int(0) only AFTER trying the JDK default
+    // method on the receiver class. The dispatcher in `invoke_on_class_shared_inner`
+    // now prefers default-method bytecode over this native when the receiver
+    // is a non-synthetic class, so reaching here typically means the
+    // receiver IS our synthetic shape; the array guard protects against
+    // edge cases where dispatch routes the wrong way.
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
         _ => return Ok(Some(Value::Int(0))),
     };
     let cursor = match ctx.get_field(this, 1) {
@@ -15239,14 +15267,14 @@ fn native_spliterator_for_each_remaining(
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
         _ => {
-            let cid = ctx.class_id_of_object(this);
-            let cn = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
-            eprintln!("[FORE-DBG] forEachRemaining fallback class={}", cn);
-            let mut iters = 0;
+            // Non-synthetic Spliterator subclass — drive its own tryAdvance
+            // (which now correctly dispatches to the JDK default-method
+            // bytecode for real-JDK subclasses, thanks to the
+            // SPLITERATOR-FALLTHROUGH change in `invoke_on_class_shared_inner`).
+            let mut iters: u64 = 0;
             loop {
                 iters += 1;
-                if iters > 1_000_000 {
-                    eprintln!("[FORE-DBG] runaway");
+                if iters > 10_000_000 {
                     break;
                 }
                 let r = ctx.invoke_virtual(
@@ -15255,7 +15283,6 @@ fn native_spliterator_for_each_remaining(
                     "(Ljava/util/function/Consumer;)Z",
                     &[Value::Object(Some(consumer))],
                 )?;
-                eprintln!("[FORE-DBG] tryAdvance returned {:?} (iter {})", r, iters);
                 match r {
                     Some(Value::Int(1)) => continue,
                     _ => break,
