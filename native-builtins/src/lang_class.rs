@@ -5023,8 +5023,31 @@ pub(crate) fn annotation_element_to_java_typed(
     use rustjvm_native_api::AnnotationElementValue;
     match val {
         AnnotationElementValue::Int(v) => {
-            let obj = crate::alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
-            ctx.set_field(obj, 0, Value::Int(*v));
+            // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
+            // boolean/byte/char/short/int (the `.class` AnnotationDefault
+            // attribute encodes Z/B/C/S/I tags as int constants in the CP).
+            // When the caller knows the annotation method's return-type
+            // descriptor we must box into the matching wrapper, else
+            // Spring's `TypeMappedAnnotation.adapt` rejects e.g.
+            // `proxyBeanMethods` (declared `boolean`) when given an Integer
+            // (`should be compatible with java.lang.Boolean but a
+            // java.lang.Integer value was returned`), causing
+            // `ConfigurationClassParser.processImports` to silently drop the
+            // `@Import(AutoConfigurationImportSelector.class)` directive on
+            // `@SpringBootApplication` and ultimately surfacing as
+            // `MissingWebServerFactoryBeanException`.
+            let (wrapper, value) = match return_type_desc {
+                Some("Z") => (
+                    "java/lang/Boolean",
+                    Value::Int(if *v != 0 { 1 } else { 0 }),
+                ),
+                Some("B") => ("java/lang/Byte", Value::Int(*v as i8 as i32)),
+                Some("C") => ("java/lang/Character", Value::Int(*v & 0xFFFF)),
+                Some("S") => ("java/lang/Short", Value::Int(*v as i16 as i32)),
+                _ => ("java/lang/Integer", Value::Int(*v)),
+            };
+            let obj = crate::alloc_concurrent_synthetic(ctx, wrapper, 1);
+            ctx.set_field(obj, 0, value);
             Value::Object(Some(obj))
         }
         AnnotationElementValue::Long(v) => {
@@ -5227,8 +5250,15 @@ pub(crate) fn annotation_element_to_java_typed(
                 })
                 .unwrap_or(rustjvm_types::ClassId::new(0));
             let arr = ctx.new_ref_array(comp_cid, elems.len());
+            // Round 18: derive the per-element return-type descriptor from
+            // the array descriptor (strip leading `[`) so primitive elements
+            // box into the correct wrapper (Z/B/C/S → Boolean/Byte/Char/Short
+            // instead of always Integer).
+            let elem_desc: Option<String> = return_type_desc
+                .and_then(|rd| rd.strip_prefix('['))
+                .map(|s| s.to_string());
             for (i, elem) in elems.iter().enumerate() {
-                let v = annotation_element_to_java(ctx, elem);
+                let v = annotation_element_to_java_typed(ctx, elem, elem_desc.as_deref());
                 ctx.set_array_element(arr, i, v);
             }
             Value::Object(Some(arr))
