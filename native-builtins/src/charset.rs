@@ -600,6 +600,38 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)[B",
         native_string_get_bytes_named,
     );
+    // Round 24 — `String.getBytes()` (no-arg, default charset). The JDK
+    // bytecode for this method calls `Charset.defaultCharset()` and then
+    // dispatches via `String.encode(Charset, byte coder, byte[] value)`.
+    // That path goes through `CharsetEncoder.encode(CharBuffer, ByteBuffer, Z)`
+    // with a real-JDK HeapCharBuffer/HeapByteBuffer whose field layout
+    // does not match our synthetic 5-field Buffer overlay used by the
+    // encoder native — so the encode loop reads zero chars and returns
+    // an empty byte array. Keycloak / WildFly's
+    // `ProcessEnvironment.obtainProcessUUID` then writes a 0-byte
+    // process.uuid file and the subsequent `Files.readAllBytes` returns
+    // empty / triggers the IOException-Cannot-find-file cascade.
+    //
+    // Override with a direct UTF-8 encode (matches the platform default
+    // charset we report from `Charset.defaultCharset`).
+    registry.register(
+        s,
+        "getBytes",
+        "()[B",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let text = ctx.read_string(this).unwrap_or_default();
+            let bytes = text.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
 }
 
 /// `CharsetEncoder.encode(CharBuffer) -> ByteBuffer` — uses the

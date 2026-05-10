@@ -5205,6 +5205,105 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             },
         );
     }
+
+    // Round 24 — Files.write(Path, Iterable<? extends CharSequence>, OpenOption...)
+    // and the (..., Charset, ...) overload. Used by JBoss
+    // ProcessEnvironment.obtainProcessUUID to write standalone/data/process.uuid.
+    // Also Files.write(Path, byte[], OpenOption...) — needed in real-JDK mode
+    // where register_p71_files_bridge is not invoked. Without these, the JDK
+    // bytecode falls through to FileSystemProvider.newOutputStream which we
+    // do not implement and throws "Не удается найти указанный файл" (errno 2).
+    let files_cls = "java/nio/file/Files";
+    r.register(
+        files_cls,
+        "write",
+        "(Ljava/nio/file/Path;[B[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let arr = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, path_obj);
+            let len = ctx.array_length(arr);
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| match ctx.get_array_element(arr, i) {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                })
+                .collect();
+            match std::fs::write(&p, &bytes) {
+                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                Err(e) => Err(RuntimeError::IllegalStateException {
+                    message: format!("IOException: {}", e),
+                }
+                .into()),
+            }
+        },
+    );
+    fn write_iterable_impl(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> rustjvm_types::error::MethodCallResult {
+        let path_obj = obj_arg(args, 0)?;
+        let iterable = obj_arg(args, 1)?;
+        let p = p57_read_path(ctx, path_obj);
+        let it_val = ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])
+            .ok().flatten();
+        let it = match it_val {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Err(RuntimeError::IllegalStateException {
+                message: "Files.write(Iterable): null iterator".to_string(),
+            }.into()),
+        };
+        let mut out = String::new();
+        loop {
+            let has = ctx.invoke_virtual(it, "hasNext", "()Z", &[]).ok().flatten();
+            match has {
+                Some(Value::Int(1)) => {}
+                _ => break,
+            }
+            let nxt = ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
+                .ok().flatten();
+            let elem = match nxt {
+                Some(Value::Object(Some(o))) => o,
+                _ => break,
+            };
+            // CharSequence: try read_string first (Strings), fall back to toString().
+            let s = ctx.read_string(elem).unwrap_or_else(|| {
+                let s_val = ctx.invoke_virtual(elem, "toString", "()Ljava/lang/String;", &[])
+                    .ok().flatten();
+                match s_val {
+                    Some(Value::Object(Some(so))) => ctx.read_string(so).unwrap_or_default(),
+                    _ => String::new(),
+                }
+            });
+            out.push_str(&s);
+            out.push('\n');
+        }
+        match std::fs::write(&p, out.as_bytes()) {
+            Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+            Err(e) => Err(RuntimeError::IllegalStateException {
+                message: format!("IOException: {}", e),
+            }
+            .into()),
+        }
+    }
+    r.register(
+        files_cls,
+        "write",
+        "(Ljava/nio/file/Path;Ljava/lang/Iterable;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        write_iterable_impl,
+    );
+    r.register(
+        files_cls,
+        "write",
+        "(Ljava/nio/file/Path;Ljava/lang/Iterable;Ljava/nio/charset/Charset;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            // Charset arg at slot 2 ignored — we always emit UTF-8, matching
+            // the platform default we report from `Charset.defaultCharset`.
+            // Forward the (path, iterable, options) shape by reordering.
+            let trimmed: Vec<Value> = vec![args[0], args[1], args.get(3).copied().unwrap_or(Value::Object(None))];
+            write_iterable_impl(ctx, &trimmed)
+        },
+    );
 }
 
 fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
