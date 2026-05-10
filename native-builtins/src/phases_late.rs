@@ -13042,6 +13042,28 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(pkg_obj))))
         },
     );
+
+    // Package.getPackages() — static. Real-JDK bytecode delegates to
+    // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`,
+    // which in turn calls `packages().toArray(...)` with `packages()` returning
+    // a Stream over the `packages` ConcurrentHashMap. In our boot, that path
+    // routes back through bytecode which (in JDK 25) leaks a Stream object
+    // where a `Package[]` is required (observed: `ReferencePipeline$Head`
+    // returned from `ClassLoader.getPackages()[Ljava/lang/Package;`,
+    // triggering NPE on arraylength in callers like
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` during WildFly boot).
+    // Override with an empty `Package[]` — JBoss-modules only uses this for a
+    // sanity scan and tolerates an empty result. Mirrors the existing
+    // `ClassLoader.getDefinedPackages()` empty-array override.
+    r.register(
+        pkg,
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        |ctx, _args| {
+            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
 }
 
 // =============================================================================

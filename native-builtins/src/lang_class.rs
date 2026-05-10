@@ -6786,6 +6786,29 @@ pub fn i2_register_classloader_package_natives(
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
     );
+    // `ClassLoader.getPackages()` — real JDK bytecode is
+    // `return packages().toArray(Package[]::new)`. In our boot the stream
+    // pipeline leaks a `ReferencePipeline$Head` into the caller's local
+    // typed as `Package[]`, NPE-ing on arraylength inside
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
+    // Override with empty array (same shape as `getDefinedPackages`).
+    r.register(
+        cl,
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        i2_classloader_get_defined_packages,
+    );
+    // `Package.getPackages()` is static and delegates to
+    // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`.
+    // Override here as well so direct callers (the WildFly boot path) get an
+    // empty array even if the static delegation pulls a different ClassLoader
+    // mirror.
+    r.register(
+        "java/lang/Package",
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        i2_classloader_get_defined_packages,
+    );
     r.register(
         cl,
         "getNamedPackage",

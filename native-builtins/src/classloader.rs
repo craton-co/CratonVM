@@ -2402,6 +2402,14 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     r.register(cl, "getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;", cl_get_resource_as_stream);
     r.register(cl, "getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;", cl_get_defined_package);
     r.register(cl, "getDefinedPackages", "()[Ljava/lang/Package;", cl_get_defined_packages);
+    // `ClassLoader.getPackages()` — real JDK bytecode is
+    // `return packages().toArray(Package[]::new)` with a stream pipeline that
+    // (in our boot) leaks a `ReferencePipeline$Head` into the caller's local
+    // typed as `Package[]`, causing NPE on arraylength in
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
+    // Override with an empty array — matches the empty `getDefinedPackages`
+    // override and is sufficient for jboss-modules' sanity scan.
+    r.register(cl, "getPackages", "()[Ljava/lang/Package;", cl_get_defined_packages);
     r.register(cl, "setDefaultAssertionStatus", "(Z)V", cl_set_default_assertion_status);
     r.register(cl, "registerAsParallelCapable", "()Z", cl_register_as_parallel_capable);
     r.register(cl, "isRegisteredAsParallelCapable", "()Z", cl_is_registered_as_parallel_capable);
