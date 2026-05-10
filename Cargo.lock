@@ -1753,6 +1753,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rustjvm-native-api",
  "rustjvm-vm",
  "tracing",
  "tracing-subscriber",

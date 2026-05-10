@@ -885,6 +885,10 @@ fn run() -> Result<()> {
                          thread; FYI only) ---\n{bt}\n--- end native \
                          backtrace ---"
                     );
+                    // KC-watchdog-native: dump the native-call ring
+                    // buffer. The last entry with `STILL-IN-NATIVE`
+                    // marks the hang site.
+                    rustjvm_native_api::native_ring::dump_to_stderr();
                 }
 
                 // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE

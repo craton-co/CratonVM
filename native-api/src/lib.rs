@@ -7,6 +7,7 @@ pub mod charset;
 pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
+pub mod native_ring;
 pub mod registry;
 
 pub use registry::{

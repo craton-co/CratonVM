@@ -8343,7 +8343,10 @@ pub(crate) fn try_lambda_dispatch(
         for desc in &descriptors {
             if let Some(callback) = shared.native_methods.find(iface, method_name, desc) {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                let result = callback(&mut ctx, &full_args)?;
+                let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+                let result = callback(&mut ctx, &full_args);
+                rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                let result = result?;
                 return Ok(Some(result));
             }
         }
@@ -9267,7 +9270,10 @@ fn execute_invokestatic_cached(
             }
             args.reverse();
             let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-            let result = callback(&mut ctx, &args)?;
+            let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+            let cb_result = callback(&mut ctx, &args);
+            rustjvm_native_api::native_ring::record_exit(_ring_idx);
+            let result = cb_result?;
             if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native invokestatic return values.
                 push_invoke_return_value(
@@ -11595,7 +11601,10 @@ fn execute_invokevirtual_cached(
                     }
                     args.reverse();
                     let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                    let result = callback(&mut ctx, &args)?;
+                    let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+                    let cb_result = callback(&mut ctx, &args);
+                    rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                    let result = cb_result?;
                     if let Some(value) = result {
                         // T18.K4 — tag-exact push for J/D native virtual return values.
                         push_invoke_return_value(
@@ -11671,7 +11680,10 @@ fn execute_invokevirtual_cached(
             }
             args.reverse();
             let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-            let result = callback(&mut ctx, &args)?;
+            let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+            let cb_result = callback(&mut ctx, &args);
+            rustjvm_native_api::native_ring::record_exit(_ring_idx);
+            let result = cb_result?;
             if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native virtual fallback return values.
                 push_invoke_return_value(

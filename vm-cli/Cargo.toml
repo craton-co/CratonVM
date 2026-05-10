@@ -20,6 +20,7 @@ synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]
 
 [dependencies]
 rustjvm-vm = { path = "../vm" }
+rustjvm-native-api = { path = "../native-api" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
