@@ -2586,6 +2586,14 @@ impl SharedVm {
     pub fn request_stack_dump(&self) {
         self.stack_dump_requested
             .store(true, std::sync::atomic::Ordering::Release);
+        // KC16-watchdog: also wake every thread parked in Object.wait().
+        // The interpreter top-of-loop poll only fires when the thread is
+        // actively dispatching bytecode — a thread blocked in
+        // `parking_lot::Condvar::wait_for` (Monitor::wait) never reaches
+        // it. Signalling the global wait flag lets each waiter's 5ms
+        // poll exit the condvar and re-check its state, where the
+        // standard top-of-loop ack path then fires.
+        crate::threading::monitor::signal_stack_dump_to_waiters();
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -2661,6 +2669,80 @@ impl SharedVm {
         self.stack_dump_ack_count
             .load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+// KC16-watchdog: thread-local snapshot of the current thread's frame chain,
+// populated right before the thread parks in `Object.wait()`. The static
+// `WAIT_SITE_DUMP` callback (installed in `Vm::new`) reads this thread-
+// local to emit a stack dump from inside the wait loop, where the
+// `JvmThread` is not directly accessible.
+thread_local! {
+    static WAIT_SITE_SNAPSHOT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Build a frame-chain snapshot string for the given thread and stash it
+/// in the thread-local so a wait-site dump can emit it later. Cleared on
+/// wait return.
+pub fn set_wait_site_snapshot(thread: &JvmThread) {
+    let mut buf = String::new();
+    let tid = thread.thread_id.0;
+    let name = &thread.name;
+    let fc = thread.frames.len();
+    buf.push_str(&format!(
+        "--- T19.H1 stack dump (wait-site): tid={tid} name={name:?} frames={fc} ---\n"
+    ));
+    for (depth, frame) in thread.frames.iter().enumerate() {
+        let class_name = truncate_ascii(frame.class_name(), 240);
+        let method_name = truncate_ascii(frame.method_name(), 240);
+        let desc = truncate_ascii(frame.method_descriptor(), 240);
+        let source = frame
+            .source_file()
+            .map(|s| truncate_ascii(s, 240))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        buf.push_str(&format!(
+            "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
+            pc = frame.pc,
+            last = frame.last_instr_pc,
+        ));
+    }
+    buf.push_str(&format!("--- T19.H1 end dump tid={tid} (wait-site) ---\n"));
+    WAIT_SITE_SNAPSHOT.with(|c| *c.borrow_mut() = Some(buf));
+}
+
+pub fn clear_wait_site_snapshot() {
+    WAIT_SITE_SNAPSHOT.with(|c| *c.borrow_mut() = None);
+}
+
+/// Called by the Monitor wait loop (via the OnceLock callback installed in
+/// `Vm::new`) when the stack-dump watchdog flag is observed. Reads the
+/// thread-local snapshot captured by `monitor_wait` on entry and writes
+/// it to stderr, then increments the watchdog ack counter.
+pub fn dump_wait_site_thread_local(shared: &SharedVm) {
+    use std::io::Write;
+    let snapshot = WAIT_SITE_SNAPSHOT.with(|c| c.borrow().clone());
+    if let Some(buf) = snapshot {
+        let stderr = std::io::stderr();
+        let mut handle = stderr.lock();
+        let _ = handle.write_all(buf.as_bytes());
+        let _ = handle.flush();
+        shared
+            .stack_dump_ack_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    } else {
+        tracing::warn!(
+            target: "kc16_watchdog",
+            "wait-site dump fired but no snapshot was captured"
+        );
+    }
+}
+
+impl SharedVm {
+    /// Placeholder split-impl — see the inherent impl above. The split is
+    /// purely so the thread-local helpers above can sit between two impl
+    /// blocks without losing rustfmt readability.
+    #[doc(hidden)]
+    fn __kc16_split_marker(&self) {}
 
     /// Get or create a synthetic lock object for static synchronized methods.
     ///
@@ -2902,6 +2984,29 @@ impl Vm {
         // Store a weak self-reference so native methods can clone the Arc
         // for spawning new threads.
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
+
+        // KC16-watchdog: install the wait-site frame dumper so a thread
+        // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit
+        // its frame chain when the stack-dump watchdog fires. Without
+        // this, the watchdog reports "0 threads dumped — main in native"
+        // because the parked thread never reaches the interpreter's
+        // top-of-loop poll.
+        //
+        // The closure reads the per-thread "wait-site frame snapshot"
+        // thread-local that `monitor_wait` populates on entry (see
+        // `vm_exec::monitor_wait`). The Monitor itself runs on the same
+        // OS thread as the wait caller, so the thread-local is visible
+        // even though we routed the wait through `parking_lot::Condvar`.
+        // We also increment the watchdog ack counter so the watchdog's
+        // "0 threads dumped" banner no longer fires for this case.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_site_dump(move |_tid| {
+                if let Some(s) = weak.upgrade() {
+                    crate::vm::vm_init::dump_wait_site_thread_local(&s);
+                }
+            });
+        }
 
         // Register the main thread (id 0) in the thread registry.
         let main_thread = JvmThread::new(ThreadId(0), "main");

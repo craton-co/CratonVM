@@ -1265,6 +1265,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
+        // KC16-watchdog: stash a snapshot of the current frame chain in a
+        // thread-local so the watchdog's wait-site dump callback can emit
+        // it if the stack-dump flag fires while we are parked in
+        // `wait_condvar.wait_for`. See `vm_init::dump_wait_site_thread_local`.
+        crate::vm::vm_init::set_wait_site_snapshot(&*self.thread);
         let wait_start = std::time::Instant::now();
         let was_interrupted = self.shared.monitors.wait(
             obj,
@@ -1272,6 +1277,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             timeout_ms,
             Some(&self.thread.interrupted),
         )?;
+        crate::vm::vm_init::clear_wait_site_snapshot();
         let wait_dur = wait_start.elapsed();
         // Check if GC happened while we were blocked
         self.check_post_block_gc();
