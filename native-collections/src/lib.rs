@@ -1068,7 +1068,7 @@ fn try_set_jdk_map_field(
 }
 
 /// Compute hash for a key.
-fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
+fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
     // Try to read as string for better distribution
     if let Some(s) = ctx.read_string(key) {
         let mut h: i32 = 0;
@@ -1076,8 +1076,9 @@ fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
             h = h.wrapping_mul(31).wrapping_add(ch as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
-        h ^ (h >> 16)
-    } else if let Some(prim) = unbox_wrapper(ctx, key) {
+        return h ^ (h >> 16);
+    }
+    if let Some(prim) = unbox_wrapper(ctx, key) {
         // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
         let h = match prim {
             Value::Int(v) => v,
@@ -1089,15 +1090,23 @@ fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
             }
             _ => ctx.identity_hash_code(key),
         };
-        h ^ (h >> 16)
-    } else {
-        let h = ctx.identity_hash_code(key);
-        h ^ (h >> 16)
+        return h ^ (h >> 16);
     }
+    // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
+    // MUST call their `hashCode()` so HashMap honours the equals/hashCode
+    // contract — otherwise `HashMap.get(equalKey) == null` for non-identical
+    // but equal keys (Spring's `AnnotationTypeMapping.aliasedBy` keyed by
+    // `java.lang.reflect.Method` is the canonical victim, surfacing as the
+    // `@AliasFor ... is not meta-present` chain on Spring Boot startup).
+    let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => ctx.identity_hash_code(key),
+    };
+    h ^ (h >> 16)
 }
 
 /// Check if two keys are equal.
-fn map_keys_equal(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
         return true;
     }
@@ -1117,7 +1126,18 @@ fn map_keys_equal(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
             _ => false,
         };
     }
-    false
+    // S111r-bug-fix (peaceful-sammet): fall back to the user-defined
+    // `equals(Object)` so HashMap honours the equals/hashCode contract for
+    // arbitrary key types. See `map_hash_key` for the matching contract
+    // commentary and the Spring `AnnotationTypeMapping.aliasedBy` symptom.
+    let res = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))]);
+    if std::env::var("RUSTJVM_HM_TRACE").is_ok() {
+        eprintln!("[HM-EQ] invoke_virtual(equals) -> {:?}", res);
+    }
+    match res {
+        Ok(Some(Value::Int(v))) => v != 0,
+        _ => false,
+    }
 }
 
 /// Get the bucket index for a given hash and capacity.
@@ -1717,7 +1737,12 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let head_val = ctx.get_array_element(buckets, idx);
 
     // Helper closure: check if node matches our key (S111r27: layout-aware)
-    let node_matches = |ctx: &dyn NativeContext, node: ObjectRef| -> bool {
+    fn node_matches_inner(
+        ctx: &mut dyn NativeContext,
+        node: ObjectRef,
+        is_null_key: bool,
+        key_ref: Option<ObjectRef>,
+    ) -> bool {
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             matches!(node_key_field, Value::Object(None))
@@ -1726,11 +1751,11 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         } else {
             false
         }
-    };
+    }
 
     // Check if the head node is the target
     if let Value::Object(Some(head)) = head_val {
-        if node_matches(ctx, head) {
+        if node_matches_inner(ctx, head, is_null_key, key_ref) {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
             set_map_size(ctx, this, size - 1);
@@ -1743,7 +1768,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
 
         while let Value::Object(Some(curr)) = curr_val {
-            if node_matches(ctx, curr) {
+            if node_matches_inner(ctx, curr, is_null_key, key_ref) {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
                 set_map_size(ctx, this, size - 1);
@@ -8687,7 +8712,7 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
 }
 
-fn lhm_find_node(ctx: &dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
+fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
     let (buckets, _, cap) = lhm_state(ctx, this);
     let buckets = buckets?;
     let (hash, is_null) = match key {
@@ -12668,7 +12693,7 @@ const CHM_DEFAULT_SEGMENTS: usize = 16;
 const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
 
 /// Compute hash for a key value (reuses map_hash_key for object keys).
-fn chm_key_hash(ctx: &dyn NativeContext, key: &Value) -> i32 {
+fn chm_key_hash(ctx: &mut dyn NativeContext, key: &Value) -> i32 {
     match key {
         Value::Object(Some(k)) => map_hash_key(ctx, *k),
         _ => 0,

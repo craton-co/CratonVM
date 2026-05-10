@@ -13248,6 +13248,11 @@ fn register_regex_natives(registry: &mut NativeMethodRegistry) {
 
     // Matcher
     registry.register(m, "find", "()Z", native_matcher_find);
+    // log4j2 PropertySource$Util.tokenize calls Matcher.find(int start) — the
+    // overload that resets the search position to a specific index. Without a
+    // native, the JVM falls through to real-JDK Matcher.find(int) which
+    // dereferences the unset `text` field on our synthetic Matcher.
+    registry.register(m, "find", "(I)Z", native_matcher_find_at);
     registry.register(m, "matches", "()Z", native_matcher_matches);
     registry.register(m, "group", "()Ljava/lang/String;", native_matcher_group);
     registry.register(
@@ -13548,6 +13553,46 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Int(o) => o.max(0) as usize,
         _ => 0,
     };
+
+    if offset > input.len() {
+        ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
+        ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
+        return Ok(Some(Value::Int(0)));
+    }
+
+    if let Some(m) = re.find(&input[offset..]) {
+        let abs_start = offset + m.start;
+        let abs_end = offset + m.end;
+        ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
+        ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
+        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
+        Ok(Some(Value::Int(1)))
+    } else {
+        ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
+        ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+/// `Matcher.find(int start)` — reset the search position to `start` and look
+/// for the next match.  Mirrors `native_matcher_find` but ignores the stored
+/// MAT_FIELD_OFFSET in favour of the explicit argument.
+fn native_matcher_find_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let start = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let input = matcher_read_input(ctx, this);
+    let pat_obj = match matcher_get_pattern(ctx, this) {
+        Some(p) => p,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let re = read_pattern_regex(ctx, pat_obj)?;
+    let offset = (start.max(0) as usize).min(input.len());
 
     if offset > input.len() {
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));

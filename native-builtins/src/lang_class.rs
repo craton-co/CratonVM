@@ -5267,6 +5267,13 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
         }
     };
     let annotations = ctx.class_annotations(class_id);
+    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") || cn.contains("SpringBootConfiguration") {
+            eprintln!("[GDA] {} -> {} annotations", cn, annotations.len());
+            for a in &annotations { eprintln!("    {}", a.type_descriptor); }
+        }
+    }
     let arr = build_annotation_array(ctx, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -5714,6 +5721,18 @@ pub(crate) fn native_method_get_annotations(ctx: &mut dyn NativeContext, args: &
         }
     };
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
+    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") {
+            eprintln!("[MGA] {}.{}{} -> {} method-anns", cn, method_name, method_desc, annotations.len());
+            for a in &annotations {
+                eprintln!("    {} elements={}", a.type_descriptor, a.elements.len());
+                for (en, ev) in &a.elements {
+                    eprintln!("      {} -> {:?}", en, ev);
+                }
+            }
+        }
+    }
     let arr = build_annotation_array(ctx, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -5773,6 +5792,18 @@ pub(crate) fn native_method_get_annotation(ctx: &mut dyn NativeContext, args: &[
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
+    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        if cn.contains("SpringBootApplication") {
+            eprintln!("[GMA] {}.{}{} target={} -> {} method-anns", cn, method_name, method_desc, target_desc, annotations.len());
+            for a in &annotations {
+                eprintln!("    {} elements={}", a.type_descriptor, a.elements.len());
+                for (en, ev) in &a.elements {
+                    eprintln!("      {} -> {:?}", en, ev);
+                }
+            }
+        }
+    }
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
             let proxy = create_annotation_proxy(ctx, ann);
