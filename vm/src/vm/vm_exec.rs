@@ -5643,6 +5643,32 @@ fn invoke_on_class_shared_inner(
                         // natives (in `properties_sidetable.rs`) to win
                         // over the real JDK bytecode so `load` populates
                         // and `getProperty` retrieves the parsed values.
+                        // UUID-OVERRIDE: java.util.UUID {<init>, randomUUID,
+                        // fromString, toString, getMostSignificantBits,
+                        // getLeastSignificantBits, equals, hashCode, version}
+                        // — the real JDK 25 UUID.toString() bytecode uses
+                        // jdk/internal/util/ByteArrayLittleEndian.setLong/setInt
+                        // and JavaLangAccess.uncheckedNewStringNoRepl, which we
+                        // don't implement, producing an empty string. That
+                        // empty string then fails UUID.fromString in
+                        // ProcessEnvironment.obtainProcessUUID during Keycloak
+                        // boot ("Invalid UUID string"). Force our native
+                        // overrides in `register_uuid_natives` (which read/
+                        // write `mostSigBits`/`leastSigBits` by name and emit
+                        // canonical 8-4-4-4-12 hex).
+                        || (class_name == "java/util/UUID"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "randomUUID"
+                                | "fromString"
+                                | "toString"
+                                | "getMostSignificantBits"
+                                | "getLeastSignificantBits"
+                                | "equals"
+                                | "hashCode"
+                                | "version"
+                            ))
                         || (class_name == "java/util/Properties"
                             && matches!(
                                 method_name,

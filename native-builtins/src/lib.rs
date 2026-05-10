@@ -4893,6 +4893,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // in `vm/src/vm/vm_exec.rs`.
     crate::phases_late::register_p69_cleaner(registry);
 
+    // UUID-OVERRIDE: java.util.UUID natives. Real JDK 25 `UUID.toString()`
+    // bytecode uses `jdk/internal/util/ByteArrayLittleEndian.{setLong,setInt}`
+    // + `JavaLangAccess.uncheckedNewStringNoRepl` which we don't implement,
+    // producing an empty string. That empty string fails `UUID.fromString`
+    // in `ProcessEnvironment.obtainProcessUUID` ("Invalid UUID string")
+    // during Keycloak 16 boot. Wire our native overrides (canonical
+    // 8-4-4-4-12 hex via `format!`) into the essential-natives registry so
+    // they're present in real-JDK mode (previously they were only
+    // registered inside `register_synthetic_overrides`).
+    register_uuid_natives(registry);
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }
@@ -9196,14 +9207,45 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
 const UUID_FIELD_MSB: usize = 0;
 const UUID_FIELD_LSB: usize = 1;
 
+fn uuid_set_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef, v: i64) {
+    ctx.set_field_by_name(obj, "mostSigBits", Value::Long(v));
+    // Best-effort fallback for synthetic-jdk layout where the natives use indices 0/1.
+    ctx.set_field(obj, UUID_FIELD_MSB, Value::Long(v));
+}
+
+fn uuid_set_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef, v: i64) {
+    ctx.set_field_by_name(obj, "leastSigBits", Value::Long(v));
+    ctx.set_field(obj, UUID_FIELD_LSB, Value::Long(v));
+}
+
+fn uuid_get_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(obj, "mostSigBits") {
+        if v != 0 { return v; }
+    }
+    match ctx.get_field(obj, UUID_FIELD_MSB) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(obj, "leastSigBits") {
+        if v != 0 { return v; }
+    }
+    match ctx.get_field(obj, UUID_FIELD_LSB) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
 fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> rustjvm_types::ObjectRef {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
         Err(_) => rustjvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(class_id, 2);
-    ctx.set_field(obj, UUID_FIELD_MSB, Value::Long(msb));
-    ctx.set_field(obj, UUID_FIELD_LSB, Value::Long(lsb));
+    uuid_set_msb(ctx, obj, msb);
+    uuid_set_lsb(ctx, obj, lsb);
     obj
 }
 
@@ -9220,8 +9262,8 @@ fn native_uuid_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, UUID_FIELD_MSB, Value::Long(msb));
-    ctx.set_field(this, UUID_FIELD_LSB, Value::Long(lsb));
+    uuid_set_msb(ctx, this, msb);
+    uuid_set_lsb(ctx, this, lsb);
     Ok(None)
 }
 
@@ -9273,14 +9315,8 @@ fn native_uuid_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let msb = match ctx.get_field(this, UUID_FIELD_MSB) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
-    let lsb = match ctx.get_field(this, UUID_FIELD_LSB) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
+    let msb = uuid_get_msb(ctx, this) as u64;
+    let lsb = uuid_get_lsb(ctx, this) as u64;
     let s = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         (msb >> 32) & 0xFFFFFFFF,
@@ -9298,7 +9334,7 @@ fn native_uuid_get_msb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(ctx.get_field(this, UUID_FIELD_MSB)))
+    Ok(Some(Value::Long(uuid_get_msb(ctx, this))))
 }
 
 fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9306,7 +9342,7 @@ fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(ctx.get_field(this, UUID_FIELD_LSB)))
+    Ok(Some(Value::Long(uuid_get_lsb(ctx, this))))
 }
 
 fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9318,11 +9354,8 @@ fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let this_msb = ctx.get_field(this, UUID_FIELD_MSB);
-    let this_lsb = ctx.get_field(this, UUID_FIELD_LSB);
-    let other_msb = ctx.get_field(other, UUID_FIELD_MSB);
-    let other_lsb = ctx.get_field(other, UUID_FIELD_LSB);
-    let eq = this_msb == other_msb && this_lsb == other_lsb;
+    let eq = uuid_get_msb(ctx, this) == uuid_get_msb(ctx, other)
+        && uuid_get_lsb(ctx, this) == uuid_get_lsb(ctx, other);
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 
@@ -9331,14 +9364,8 @@ fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let msb = match ctx.get_field(this, UUID_FIELD_MSB) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    let lsb = match ctx.get_field(this, UUID_FIELD_LSB) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
+    let msb = uuid_get_msb(ctx, this);
+    let lsb = uuid_get_lsb(ctx, this);
     let hilo = msb ^ lsb;
     let hash = ((hilo >> 32) ^ hilo) as i32;
     Ok(Some(Value::Int(hash)))
@@ -9349,10 +9376,7 @@ fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let msb = match ctx.get_field(this, UUID_FIELD_MSB) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
+    let msb = uuid_get_msb(ctx, this);
     let version = ((msb >> 12) & 0xF) as i32;
     Ok(Some(Value::Int(version)))
 }
