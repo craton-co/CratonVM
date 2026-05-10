@@ -305,7 +305,93 @@ pub(crate) fn native_throwable_to_string(ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-/// printStackTrace() — print class name + message to output
+/// Build "ClassName: message" or just "ClassName" for a throwable, reading
+/// the real-JDK `detailMessage` field by name with a slot-0 fallback for
+/// synthetic stubs.
+fn throwable_header_line(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
+    let class_id = ctx.class_id_of_object(t);
+    let class_name = ctx
+        .class_name_of_id(class_id)
+        .unwrap_or_else(|| "java/lang/Throwable".to_string())
+        .replace('/', ".");
+    let by_name = ctx.get_field_by_name(t, "detailMessage");
+    let detail = match by_name {
+        Value::Object(Some(_)) => by_name,
+        _ => ctx.get_field(t, 0),
+    };
+    match detail {
+        Value::Object(Some(sr)) => match ctx.read_string(sr) {
+            Some(m) => format!("{class_name}: {m}"),
+            None => class_name,
+        },
+        _ => class_name,
+    }
+}
+
+/// Read the cause field, returning None if missing or self-referential
+/// (the JDK `cause = this` "uninitialized" sentinel).
+fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRef> {
+    let by_name = ctx.get_field_by_name(t, "cause");
+    if let Value::Object(Some(c)) = by_name {
+        if c == t { return None; }
+        return Some(c);
+    }
+    None
+}
+
+/// Format the captured stack-trace frames for `t` as "\tat C.m(F:L)" lines.
+fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String> {
+    let hash = ctx.identity_hash_code(t);
+    let frames: Vec<(String, String, Option<String>, i32)> = ctx
+        .get_stack_trace(hash)
+        .map(|tr| {
+            tr.iter()
+                .map(|e| {
+                    (
+                        e.class_name.replace('/', "."),
+                        e.method_name.to_string(),
+                        e.source_file.as_ref().map(|f| f.to_string()),
+                        e.line_number,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    frames
+        .into_iter()
+        .map(|(cls, meth, file, line)| {
+            let loc = match (file.as_deref(), line) {
+                (Some(f), n) if n > 0 => format!("{f}:{n}"),
+                (Some(f), _) => f.to_string(),
+                (None, n) if n > 0 => format!("Unknown Source:{n}"),
+                _ => "Unknown Source".to_string(),
+            };
+            format!("\tat {cls}.{meth}({loc})")
+        })
+        .collect()
+}
+
+/// Emit a single line: record it for in-VM consumers and write it to the
+/// host process's stderr fd (2) so `printStackTrace` actually shows up
+/// when the JVM runs an embedded program. The record_printed_line call
+/// keeps existing tests that scan `thread.printed_lines` working.
+fn emit_stack_line(ctx: &mut dyn NativeContext, line: String) {
+    ctx.record_printed_line(line.clone());
+    let sep = ctx
+        .get_system_property("line.separator")
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n".to_string() } else { "\n".to_string() });
+    let _ = ctx.fd_table().write_string(2, &line);
+    let _ = ctx.fd_table().write_string(2, &sep);
+}
+
+/// printStackTrace() / printStackTrace(PrintStream) / printStackTrace(PrintWriter).
+///
+/// Walks the full cause chain (with a cycle guard) and prints each
+/// throwable's "ClassName: message" header followed by its captured
+/// stack frames as "\tat ..." lines. Output goes both to the recorded-
+/// line buffer (so tests scanning `thread.printed_lines` keep working)
+/// and to the host process's stderr fd so users actually see the trace
+/// when WildFly / Keycloak / etc. dump exceptions during boot.
 pub(crate) fn native_throwable_print_stack_trace(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -315,51 +401,31 @@ pub(crate) fn native_throwable_print_stack_trace(
         _ => return Ok(None),
     };
 
-    // Get the class name
-    let class_id = ctx.class_id_of_object(this);
-    let class_name = ctx
-        .class_name_of_id(class_id)
-        .unwrap_or_else(|| "java/lang/Throwable".to_string())
-        .replace('/', ".");
+    // Header for the top-level throwable.
+    let header = throwable_header_line(ctx, this);
+    emit_stack_line(ctx, header);
+    for f in throwable_frame_lines(ctx, this) {
+        emit_stack_line(ctx, f);
+    }
 
-    // Get the message (field 0)
-    let detail = ctx.get_field(this, 0);
-    let header = match detail {
-        Value::Object(Some(str_ref)) => {
-            if let Some(msg) = ctx.read_string(str_ref) {
-                format!("{class_name}: {msg}")
-            } else {
-                class_name
-            }
+    // Walk the cause chain with a cycle guard. Limit depth defensively
+    // to avoid pathological loops if `cause` was somehow self-referential
+    // through a non-equality identity.
+    let mut seen: Vec<ObjectRef> = vec![this];
+    let mut current = throwable_cause(ctx, this);
+    let mut depth = 0;
+    while let Some(c) = current {
+        depth += 1;
+        if depth > 32 || seen.iter().any(|s| *s == c) {
+            break;
         }
-        _ => class_name,
-    };
-
-    ctx.record_printed_line(header);
-
-    // Print cause chain
-    let cause = ctx.get_field(this, 1);
-    if let Value::Object(Some(cause_ref)) = cause {
-        // Avoid self-referential cause
-        if !std::ptr::eq(cause_ref.as_ptr(), this.as_ptr()) {
-            let cause_class_id = ctx.class_id_of_object(cause_ref);
-            let cause_class_name = ctx
-                .class_name_of_id(cause_class_id)
-                .unwrap_or_else(|| "?".to_string())
-                .replace('/', ".");
-            let cause_detail = ctx.get_field(cause_ref, 0);
-            let cause_line = match cause_detail {
-                Value::Object(Some(sr)) => {
-                    if let Some(m) = ctx.read_string(sr) {
-                        format!("Caused by: {cause_class_name}: {m}")
-                    } else {
-                        format!("Caused by: {cause_class_name}")
-                    }
-                }
-                _ => format!("Caused by: {cause_class_name}"),
-            };
-            ctx.record_printed_line(cause_line);
+        seen.push(c);
+        let inner = throwable_header_line(ctx, c);
+        emit_stack_line(ctx, format!("Caused by: {inner}"));
+        for f in throwable_frame_lines(ctx, c) {
+            emit_stack_line(ctx, f);
         }
+        current = throwable_cause(ctx, c);
     }
 
     Ok(None)
