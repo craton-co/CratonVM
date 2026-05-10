@@ -792,7 +792,14 @@ fn run() -> Result<()> {
                     std::env::var("RUSTJVM_DEFAULT_WATCHDOG_SEC")
                         .ok()
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(45),
+                        // Bumped from 45 → 120: WildFly bootstrap was making
+                        // forward progress through clinit cascade (64 distinct
+                        // stack snapshots dumped in the 3s grace window) but
+                        // 45s was insufficient for Module/AS/SimpleAttributeDef
+                        // chain on cold-cache JDK. 120s matches typical CI
+                        // budget for boot tests while still catching real
+                        // hangs.
+                        .unwrap_or(120),
                 )
             }
         }
@@ -843,6 +850,42 @@ fn run() -> Result<()> {
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
                 );
+
+                // KC-watchdog-native: when zero Java threads ack'd a dump,
+                // every interpreter thread is parked in native (Rust) code
+                // — the most common cause being a JNI / native-method loop
+                // or a deadlock on a Rust mutex inside the runtime. The
+                // Java-frame dump produces nothing actionable, so fall
+                // back to:
+                //   1. The watchdog thread's own native backtrace (cheap
+                //      and tells you WHERE in the runtime the watchdog
+                //      is reached from — usually right after the sleep,
+                //      which is uninteresting, but confirms the watchdog
+                //      thread didn't itself deadlock).
+                //   2. The PID + a hint to attach an external debugger
+                //      (cdb / WinDbg / `rust-lldb -p <pid>`) for full
+                //      thread coverage. We can't safely walk other
+                //      threads' native stacks from a portable Rust
+                //      thread without OS-specific facilities (Windows
+                //      `MiniDumpWriteDump`, Linux `ptrace`, etc.).
+                if total_acks == 0 {
+                    let pid = std::process::id();
+                    eprintln!(
+                        "=== T19.H1 watchdog: no Java threads responded \
+                         — main thread is in native (Rust) code. \
+                         pid={pid}. Attach a native debugger before the \
+                         3s post-dump grace ends to capture the hang \
+                         site (Windows: `cdb -p {pid}` then `~* k`; \
+                         Linux: `gdb -p {pid}` then `thread apply all bt`). \
+                         ==="
+                    );
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!(
+                        "--- T19.H1 watchdog native backtrace (watchdog \
+                         thread; FYI only) ---\n{bt}\n--- end native \
+                         backtrace ---"
+                    );
+                }
 
                 // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE
                 // `process::abort()` so a hung or watchdog-killed run
