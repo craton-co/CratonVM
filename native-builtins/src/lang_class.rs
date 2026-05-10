@@ -658,6 +658,65 @@ pub(crate) fn native_class_get_resource(
     }
 }
 
+/// RKC16r23 — detect jboss-logging's i18n localized-logger fallback names.
+///
+/// jboss-logging generates classes named `<base>_$logger` and walks the
+/// `Class.forName` chain `_$logger_<lang>_<country>` → `_$logger_<lang>` →
+/// `_$logger` (then a parallel `_$bundle` chain). Only the base names ship
+/// in app jars; the locale-suffixed variants always CNFE.
+///
+/// Returns true if `name` ends with `_$logger_<token>` or
+/// `_$logger_<token>_<token>` (or the `_$bundle_` equivalents) where
+/// every locale token is two-or-three ASCII lowercase letters
+/// (`<lang>`) or two ASCII uppercase letters (`<country>`).
+fn i18n_logger_locale_suffix(name: &str) -> bool {
+    let marker_logger = "_$logger_";
+    let marker_bundle = "_$bundle_";
+    let suffix = if let Some(idx) = name.rfind(marker_logger) {
+        &name[idx + marker_logger.len()..]
+    } else if let Some(idx) = name.rfind(marker_bundle) {
+        &name[idx + marker_bundle.len()..]
+    } else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return false;
+    }
+    let mut parts = suffix.split('_');
+    let lang = parts.next().unwrap_or("");
+    let is_lang = (2..=3).contains(&lang.len())
+        && lang.chars().all(|c| c.is_ascii_lowercase());
+    if !is_lang {
+        return false;
+    }
+    match parts.next() {
+        None => true, // `_$logger_<lang>`
+        Some(country) => {
+            // `_$logger_<lang>_<country>` (no further parts; variant possible
+            // but rare — accept country=2 upper or 2-3 alphanum).
+            let ok = country.len() == 2
+                && country.chars().all(|c| c.is_ascii_uppercase());
+            ok && parts.next().is_none()
+        }
+    }
+}
+
+/// RKC16r23 — gate the verbose `Class.forName` diagnostic prints behind an
+/// env var so they don't pollute boot logs in normal runs. Set
+/// `RUSTJVM_S111_DBG=1` to re-enable.
+fn s111_dbg_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RUSTJVM_S111_DBG").is_ok())
+}
+
+macro_rules! s111_dbg {
+    ($($arg:tt)*) => {
+        if crate::lang_class::s111_dbg_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -670,6 +729,38 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     };
     let dotted_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal_name = dotted_name.replace('.', "/");
+
+    // RKC16r23 — jboss-logging i18n localized-logger lookup short-circuit.
+    //
+    // jboss-logging's `Messages.getBundle` / `LoggerProviders.doGetMessageLogger`
+    // walks a fallback chain of `<FQCN>_$logger_<lang>_<country>`,
+    // `<FQCN>_$logger_<lang>`, `<FQCN>_$logger` for every i18n logger lookup.
+    // The first two almost never exist (no app ships per-locale generated
+    // classes); they're spec'd to throw CNFE so the chain tries the next.
+    //
+    // Inside CratonVM, each `loadClass` round-trip for a missing class is
+    // expensive: ModuleClassLoader's `loadClass` walks the dependency graph,
+    // tries every resource-root JAR, fails, throws CNFE. For Keycloak this
+    // happens on every WARN/ERROR log call — turning what should be a no-op
+    // cached negative into a tight loop of class-loader walks that visibly
+    // dominates boot time.
+    //
+    // Real OpenJDK has the same CNFE cost in principle but jboss-logging's
+    // own `Messages` infrastructure caches the resolved bundle Class per
+    // `Class<?>` key, so the chain only walks once per bundle interface. In
+    // our run the cache lookup isn't hitting (likely the `Messages` static
+    // field is being re-clinit'd or the WeakReference clears) — and rather
+    // than reverse-engineer jboss-logging's internals, we short-circuit the
+    // negative answer at the VM boundary: any name matching the
+    // `<...>_$logger_<lang>(_<country>)?` suffix where the suffix's
+    // language and (optional) country tokens look like locale codes
+    // returns CNFE immediately without calling out to loader.loadClass.
+    if i18n_logger_locale_suffix(&dotted_name) {
+        return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+            class_name: dotted_name,
+        }
+        .into());
+    }
 
     // RKC16N.12 — when `Class.forName` is invoked with an explicit non-null
     // classloader, route through `loader.loadClass(name)` so module-scoped
@@ -691,7 +782,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             let cid = ctx.class_id_of_object(*loader);
             ctx.class_name_of_id(cid).unwrap_or_default()
         };
-        eprintln!("[S111-DBG] Class.forName({}) loader={}", dotted_name, loader_class_name_debug);
+        s111_dbg!("[S111-DBG] Class.forName({}) loader={}", dotted_name, loader_class_name_debug);
         let invoke_args = [Value::Object(Some(*loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
             *loader,
@@ -700,13 +791,13 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             &invoke_args[1..],
         ) {
             Ok(Some(mirror)) => {
-                eprintln!("[S111-DBG] loadClass({}) succeeded via invoke_virtual", dotted_name);
+                s111_dbg!("[S111-DBG] loadClass({}) succeeded via invoke_virtual", dotted_name);
                 return Ok(Some(mirror));
             }
             // ClassLoader.loadClass returning null is technically illegal
             // (per spec it must throw CNFE) but defensively translate it.
             Ok(None) => {
-                eprintln!("[S111-DBG] loadClass({}) returned null", dotted_name);
+                s111_dbg!("[S111-DBG] loadClass({}) returned null", dotted_name);
                 return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
@@ -725,7 +816,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     rustjvm_types::error::LinkageError::NoSuchMethodError { .. },
                 ),
             )) => {
-                eprintln!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
+                s111_dbg!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
                 // Fall through to bootstrap-style ensure_class_initialized below.
             }
             // S111r20 — Spring Boot 2.x LaunchedURLClassLoader.loadClass
@@ -751,7 +842,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     || loader_class_name.contains("launch/LaunchedURLClassLoader")
                     || loader_class_name == "java/net/URLClassLoader";
                 if is_launched_url_cl {
-                    eprintln!("[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback", dotted_name);
+                    s111_dbg!("[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback", dotted_name);
                     // Fall through to ensure_class_initialized below.
                 } else {
                     // For module-scoped loaders (JBoss Modules, OSGi, etc.)
@@ -763,11 +854,11 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             }
             // Propagate internal VM errors without re-wrapping.
             Err(e) => {
-                eprintln!("[S111-DBG] loadClass({}) -> InternalError {:?}, propagating", dotted_name, e);
+                s111_dbg!("[S111-DBG] loadClass({}) -> InternalError {:?}, propagating", dotted_name, e);
                 return Err(e);
             }
         }
-        eprintln!("[S111-DBG] falling through to ensure_class_initialized({})", dotted_name);
+        s111_dbg!("[S111-DBG] falling through to ensure_class_initialized({})", dotted_name);
     }
 
     match ctx.ensure_class_initialized(&internal_name) {
@@ -793,9 +884,9 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 };
-                eprintln!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
+                s111_dbg!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
             } else {
-                eprintln!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
+                s111_dbg!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
             }
             Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,
