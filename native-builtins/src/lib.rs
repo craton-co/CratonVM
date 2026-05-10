@@ -2514,6 +2514,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
     // JDK 25 additional Thread natives:
     registry.register("java/lang/Thread", "currentCarrierThread", "()Ljava/lang/Thread;", native_thread_current_thread);
+    // Thread.<init> overrides: synthetic-JDK only. In real-JDK mode the
+    // Thread class has many more fields and a FieldHolder layout — writing
+    // raw slots 0..3 there corrupts the object. We detect by num_fields:
+    // synthetic Thread has at most ~6 slots; real-JDK Thread has 20+.
+    fn is_synthetic_thread_layout(num_fields: usize) -> bool { num_fields <= 8 }
     registry.register(
         "java/lang/Thread",
         "<init>",
@@ -2523,6 +2528,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                // Real-JDK Thread: let the Java constructor run (this native
+                // shouldn't intercept). Return MethodCallFailed::NotImplemented
+                // would be ideal, but we don't have that wired; instead we
+                // do nothing — the JDK constructor body still executed
+                // before this native was dispatched only if the native
+                // wasn't bound. Since we ARE bound, we have to manually
+                // delegate. Fall back to calling the field-resolution path.
+                let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+                let name_val = args.get(3).cloned().unwrap_or_else(|| {
+                    Value::Object(Some(ctx.create_string("Thread")))
+                });
+                ctx.set_field_by_name(this, "name", name_val);
+                ctx.set_field_by_name(this, "priority", Value::Int(5));
+                ctx.set_field_by_name(this, "group", group);
+                ctx.set_field_by_name(this, "target", target);
+                return Ok(None);
+            }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = args.get(3).cloned().unwrap_or_else(|| {
@@ -2544,6 +2568,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+                let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                    Value::Object(Some(s)) => Value::Object(Some(s)),
+                    _ => Value::Object(Some(ctx.create_string("Thread"))),
+                };
+                ctx.set_field_by_name(this, "name", name_val);
+                ctx.set_field_by_name(this, "priority", Value::Int(5));
+                ctx.set_field_by_name(this, "group", group);
+                ctx.set_field_by_name(this, "target", target);
+                return Ok(None);
+            }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
@@ -2566,6 +2603,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+                let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                    Value::Object(Some(s)) => Value::Object(Some(s)),
+                    _ => Value::Object(Some(ctx.create_string("Thread"))),
+                };
+                ctx.set_field_by_name(this, "name", name_val);
+                ctx.set_field_by_name(this, "priority", Value::Int(5));
+                ctx.set_field_by_name(this, "group", group);
+                ctx.set_field_by_name(this, "target", target);
+                return Ok(None);
+            }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
@@ -2580,14 +2630,50 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.register("java/lang/Thread", "start0", "()V", native_thread_start0);
-    registry.register("java/lang/Thread", "start", "()V", native_thread_start0);
+    // Thread.start: in real-JDK mode the JDK's Java implementation must
+    // run (it sets thread state, checks already-started, and calls start0).
+    // Only intercept for synthetic-JDK Thread where there is no Java body
+    // worth executing.
+    registry.register("java/lang/Thread", "start", "()V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            // Real-JDK Thread: spawn directly. The JDK's Thread.start()
+            // does threadStatus checks then calls start0() native, but
+            // since we've registered an override on "start" we bypass
+            // that here. Just spawn via the same native.
+            return native_thread_start0(ctx, args);
+        }
+        native_thread_start0(ctx, args)
+    });
+    // Thread.run: synthetic-JDK reads slot 3 = target. Real-JDK Thread.run
+    // reads `holder.task` from FieldHolder. For real-JDK we resolve the
+    // `target` field by name so we invoke the user's Runnable correctly.
     registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if ctx.object_num_fields(this) >= 4 {
-            if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+        let num_fields = ctx.object_num_fields(this);
+        if is_synthetic_thread_layout(num_fields) {
+            if num_fields >= 4 {
+                if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+                    let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                }
+            }
+        } else {
+            // Real-JDK: target is stored on this Thread (resolved by name).
+            // Could be on `holder` (FieldHolder.task) or directly on Thread
+            // depending on JDK version. Try both.
+            let mut target_val = ctx.get_field_by_name(this, "target");
+            if matches!(target_val, Value::Object(None)) {
+                if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
+                    target_val = ctx.get_field_by_name(holder, "task");
+                }
+            }
+            if let Value::Object(Some(target)) = target_val {
                 let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
             }
         }

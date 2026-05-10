@@ -1087,18 +1087,20 @@ fn native_exec_execute(
         _ => "default".to_string(),
     };
     let pool = get_or_create_pool(&name);
-    // Non-blocking submit of a no-op bookkeeping task; the caller's
-    // real `run()` method will be invoked synchronously by the
-    // interpreter if it's a known built-in Runnable, or deferred to
-    // the full cross-thread dispatcher once it's wired up.
-    let _ = runnable;
-    let res = pool.submit(|| {});
-    match res {
-        Ok(_) => Ok(None),
-        Err(msg) => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::IllegalStateException { message: msg },
-        ))),
+    // Submit a bookkeeping marker so pool stats reflect activity.
+    let _ = pool.submit(|| {});
+    // Execute the user's Runnable synchronously on the calling thread.
+    // The cross-thread dispatch path isn't wired through the interpreter
+    // yet (would require running the runnable on a fresh JvmThread with
+    // its own call stack and root snapshot), but synchronous execution
+    // unblocks WildFly / Keycloak boot which queues a single bootstrap
+    // task to EQE and then `AsyncFutureTask.get()`s on its completion.
+    // Running on the calling thread means the bootstrap task completes
+    // BEFORE `get()` is reached, so the wait returns immediately.
+    if let Value::Object(Some(r)) = runnable {
+        let _ = ctx.invoke_virtual(r, "run", "()V", &[]);
     }
+    Ok(None)
 }
 
 /// Register all WildFly Core kernel natives with the method registry.

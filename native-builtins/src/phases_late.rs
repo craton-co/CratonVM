@@ -11119,10 +11119,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
 
     // S111r27 — intercept DefaultApplicationContextFactory.create to diagnose
     // what exception is thrown and provide a direct bypass if needed.
-    let dacf = "org/springframework/boot/DefaultApplicationContextFactory";
-    r.register(dacf, "create",
-        "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/context/ConfigurableApplicationContext;",
-        spring_default_app_ctx_factory_create);
+    //
+    // DISABLED: the shim allocated a context with NO primary configuration source
+    // registered, so SpringApplication.prepareContext -> load(...) never received
+    // EurekaServerApplication.class as a @Configuration bean def. In real Spring
+    // Boot, DefaultApplicationContextFactory.create just instantiates the context
+    // and the caller does the load. Running the real bytecode is correct now that
+    // HashMap / LinkedHashMap / MergedAnnotation / ClassLoader prerequisites are
+    // fixed.
+    let _ = spring_default_app_ctx_factory_create;
+    // let dacf = "org/springframework/boot/DefaultApplicationContextFactory";
+    // r.register(dacf, "create",
+    //     "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/context/ConfigurableApplicationContext;",
+    //     spring_default_app_ctx_factory_create);
 }
 
 /// S111r21 — native implementation of Spring's ClassUtils.forName(String, ClassLoader).
