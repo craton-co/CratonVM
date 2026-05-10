@@ -11286,16 +11286,22 @@ fn execute_invokevirtual_vtable_fast(
                     // own bytecode for the method, the bytecode override wins
                     // over any deeper native ancestor (e.g. Object.toString).
                     // Stop walking so the vtable bytecode path runs.
-                    if parent.find_method(&method_name, &method_descriptor).is_some() {
-                        break;
-                    }
-                    if shared
+                    //
+                    // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                    // the parent has BOTH bytecode AND a Rust native, the
+                    // native wins. See `populate_virtual_invoke_cache` for
+                    // the LinkedHashMap-overlay rationale.
+                    let has_bytecode = parent.find_method(&method_name, &method_descriptor).is_some();
+                    let has_native = shared
                         .native_methods
                         .find(&parent.name, &method_name, &method_descriptor)
-                        .is_some()
-                    {
+                        .is_some();
+                    if has_native {
                         drop(cm);
                         return Ok(CachedCallResult::CacheMiss);
+                    }
+                    if has_bytecode {
+                        break;
                     }
                 }
                 cid = parent_id;
@@ -11765,10 +11771,37 @@ fn populate_virtual_invoke_cache(
                 // the bytecode override wins over any deeper native ancestor
                 // (e.g. Object.toString). Stop walking so the bytecode dispatch
                 // path runs (via find_method_recursive below).
+                //
+                // Round 19 (peaceful-sammet) — IMPORTANT exception: if the
+                // parent has BOTH its own bytecode AND a Rust native registered
+                // for this method, the native wins. Our LinkedHashMap natives
+                // store state in an external overlay (not real fields), so
+                // executing JDK bytecode for inherited callers like
+                // `AnnotationAttributes` (which extends `LinkedHashMap`) walks
+                // empty real fields and returns empty `entrySet()` /
+                // `keySet()`, breaking Spring's
+                // `MetadataReader.getAnnotationAttributes("...Import", true)`
+                // for `@EnableAutoConfiguration` and surfacing as
+                // `MissingWebServerFactoryBean` on Spring Boot startup.
+                let parent_name = parent.name.to_string();
                 if parent.find_method(&method_name, &descriptor).is_some() {
+                    if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
+                        let gate = RedefineGate::snapshot(
+                            cm.class_redefine_generation_handle(receiver_class_id),
+                        );
+                        drop(cm);
+                        let target = CachedInvokeTarget::VirtualNative {
+                            receiver_class_id,
+                            callback,
+                            num_params: num_params as u16,
+                            gate,
+                        };
+                        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+                        thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+                        return;
+                    }
                     break;
                 }
-                let parent_name = parent.name.to_string();
                 if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
                     let gate = RedefineGate::snapshot(
                         cm.class_redefine_generation_handle(receiver_class_id),

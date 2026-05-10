@@ -3650,7 +3650,17 @@ pub fn invoke_or_native(
                         // wins over any deeper native ancestor (e.g.
                         // Object.toString). Stop walking so the bytecode
                         // dispatch path runs.
+                        //
+                        // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                        // the parent has BOTH bytecode AND a Rust native, the
+                        // native wins. See `populate_virtual_invoke_cache` for
+                        // the full LinkedHashMap-overlay rationale.
                         if parent.find_method(method_name, descriptor).is_some() {
+                            if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
+                                drop(cm);
+                                return safe_native_call(shared, thread, callback, args)
+                                    .map(|v| coerce_native_return(v, descriptor));
+                            }
                             break;
                         }
                         if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
