@@ -1297,6 +1297,31 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/ImmutableCollections$MapN", "probe")
         | ("java/util/ImmutableCollections$SetN", "contains")
         | ("java/util/ImmutableCollections$SetN", "probe")
+        // SPB.5 (Insurance-backend, Spring Boot 3.2.0) — JIT_DISPATCH trace
+        // shows the segfault occurs inside the JIT-compiled
+        // `Objects.hash(Object[])` / `Arrays.hashCode(Object[])` /
+        // `ArraysSupport.hashCode(Object[],int,int,int)` chain. The first
+        // call returns correctly (1625377124), then on the 5th invocation
+        // the run STATUS_ACCESS_VIOLATIONs without a matching
+        // `JIT_DISPATCH_RET`. The `[Ljava/lang/Object;III)I` overload of
+        // `ArraysSupport.hashCode` is a virtual-dispatch hot loop: it
+        // iterates the input Object[] and for each element calls
+        // `Objects.hashCode(o)` -> `Object.hashCode()`, which is the
+        // canonical pattern that miscompiles under the per-callee
+        // threshold (W2-CHM / RBC.1 archetype, but applied to a virtual
+        // dispatch site instead of an allocate-then-putfield). With
+        // `RUSTJVM_DISABLE_JIT=1` the bootstrap advances ~16 lines further
+        // and surfaces a clean Java-level
+        // `MissingWebServerFactoryBeanException` — proof the segfault is
+        // JIT-only. Skip-list the entire `Objects.hash` / `Arrays.hashCode`
+        // / `ArraysSupport.hashCode` cluster (Spring uses these heavily in
+        // `ConfigurationPropertyName.hashCode` and its bind-path keys).
+        // Other ArraysSupport intrinsic dispatchers (vectorizedHashCode is
+        // a native, not a Java method) are unaffected.
+        | ("jdk/internal/util/ArraysSupport", "hashCode")
+        | ("java/util/Arrays", "hashCode")
+        | ("java/util/Objects", "hash")
+        | ("java/util/Objects", "hashCode")
     )
 }
 

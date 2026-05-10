@@ -223,6 +223,30 @@ pub fn throw_runtime_error(
                     }
                 }
             }
+            // R15 (WildFly): trace NPE origins inside log4j SimpleLoggerContext
+            // / PropertiesUtil chain so we can pinpoint which native /
+            // bytecode op produces the bare-NPE that bubbles up as the
+            // ExceptionInInitializerError that crashes WildFly boot.
+            {
+                let in_log4j_init = thread.frames.iter().any(|f| {
+                    let cn = shared.class_manager.read()
+                        .get_class(f.class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    cn.starts_with("org/apache/logging/log4j/")
+                        || cn.starts_with("org/jboss/logging/")
+                });
+                if in_log4j_init {
+                    eprintln!("[WF-NPE-TRACE] msg={:?}", error);
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
+                        let cn = shared.class_manager.read()
+                            .get_class(f.class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!("[WF-NPE-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                    }
+                }
+            }
             // S111r20: broad NPE trace for spring context NPE hunt
             if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
                 eprintln!("NPE-TRACE msg={:?}", error);

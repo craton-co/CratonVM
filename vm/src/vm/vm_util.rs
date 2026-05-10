@@ -426,6 +426,19 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "java/math/BigInteger") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // R15 (WildFly): some real-JDK / WildFly classes complete
+                // <clinit> normally yet leave a critical static field null
+                // because the metafactory-driven Stream/IntFunction lambda
+                // chain that should have populated it produced an empty
+                // result.  org/jboss/modules/Module.systemPaths is the case
+                // that crashes WildFly boot at
+                // ConcurrentClassLoader.getResources -> arraylength null.
+                // Run the fixup so it can backfill the field with an empty
+                // String[].  Idempotent: every arm checks for null before
+                // writing.
+                if matches!(&*class_name_for_jfr, "org/jboss/modules/Module") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1128,6 +1141,59 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     };
 
     match class_name {
+        "org/jboss/modules/Module" => {
+            // R15 (WildFly): The static fields `systemPaths` and
+            // `systemPackages` are populated in `<clinit>` via a
+            // `Stream.toArray(String[]::new)` chain. In our VM that pipeline
+            // sometimes leaves the static slot null (the lambda metafactory
+            // for `IntFunction<String[]>` does not always produce a real
+            // typed array — investigation pending). Result: every call to
+            // `ConcurrentClassLoader.getResources` (and other system-path
+            // checks) NPEs at the leading `arraylength` instruction with
+            // `systemPaths == null`. The downstream effect is that log4j's
+            // `PropertyFilePropertySource.loadPropertiesFile` throws an NPE
+            // mid-`SimpleLoggerContext.<init>`, propagating up as
+            // ExceptionInInitializerError -> ServerLogger.<clinit> ->
+            // SystemExiter -> System.exit(1). Backfill empty arrays so the
+            // system-path scan loop in getResources/findClass produces zero
+            // hits and falls through to `findResources` / `loadClass`.
+            // This matches the production behavior on a JDK where the
+            // `jboss.modules.system.pkgs` system property is unset (the
+            // common case): both arrays end up empty.
+            let read_static = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, idx,
+                            ));
+                        }
+                        idx += 1;
+                    }
+                }
+                None
+            };
+            for fname in ["systemPaths", "systemPackages"] {
+                let cur = read_static(fname);
+                let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+                if needs_fix {
+                    let arr = shared.heap.alloc_array(
+                        ClassId::new(0),
+                        ArrayElementType::Reference,
+                        0,
+                    );
+                    if set_static_by_name(fname, Value::Object(Some(arr))) {
+                        tracing::warn!(
+                            "Post-clinit fixup: org/jboss/modules/Module.{} backfilled with empty String[]",
+                            fname
+                        );
+                    }
+                }
+            }
+        }
         "java/util/logging/LogManager" => {
             // LogManager.manager must be non-null for getLogManager()
             if let Some(mgr) = shared.heap.try_alloc_object(class_id, 4) {

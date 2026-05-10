@@ -776,10 +776,13 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Create ArrayList$Itr: field 0 = list, field 1 = cursor
-    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", AL_ITR_NUM_FIELDS);
-    ctx.set_field(itr, AL_ITR_FIELD_LIST, Value::Object(Some(this)));
-    ctx.set_field(itr, AL_ITR_FIELD_CURSOR, Value::Int(0));
+    // Create ArrayList$Itr. Real-JDK has fields: cursor, lastRet,
+    // expectedModCount, this$0. Use field-name resolution so we write to
+    // the right slots regardless of layout.
+    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+    ctx.set_field(itr, list_slot, Value::Object(Some(this)));
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -2683,6 +2686,25 @@ const AL_ITR_FIELD_LIST: usize = 0;
 const AL_ITR_FIELD_CURSOR: usize = 1;
 const AL_ITR_NUM_FIELDS: usize = 2;
 
+/// Resolve ArrayList$Itr field slots: returns (cursor_slot, list_slot, n_fields).
+/// Real-JDK layout: cursor (slot 0), lastRet (slot 1), expectedModCount (slot 2),
+/// this$0 (slot 3 — the enclosing ArrayList). Falls back to synthetic
+/// (list=0, cursor=1) when the real class isn't available.
+#[inline]
+fn al_itr_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
+    let cursor = ctx.resolve_field_index("java/util/ArrayList$Itr", "cursor");
+    let list = ctx.resolve_field_index("java/util/ArrayList$Itr", "this$0");
+    match (cursor, list) {
+        (Some(c), Some(l)) => {
+            let n = std::cmp::max(c, l) + 1;
+            // Account for lastRet/expectedModCount slots between cursor and this$0.
+            let n = std::cmp::max(n, 4);
+            (c, l, n)
+        }
+        _ => (AL_ITR_FIELD_CURSOR, AL_ITR_FIELD_LIST, AL_ITR_NUM_FIELDS),
+    }
+}
+
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
@@ -2723,14 +2745,12 @@ fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] native_al_itr_has_next called");
-    }
-    let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
+    let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
+    let cursor = match ctx.get_field(this, cursor_slot) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let list = match ctx.get_field(this, AL_ITR_FIELD_LIST) {
+    let list = match ctx.get_field(this, list_slot) {
         Value::Object(Some(l)) => l,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -2743,11 +2763,12 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
+    let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
+    let cursor = match ctx.get_field(this, cursor_slot) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let list = match ctx.get_field(this, AL_ITR_FIELD_LIST) {
+    let list = match ctx.get_field(this, list_slot) {
         Value::Object(Some(l)) => l,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -2760,7 +2781,7 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         None => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(data, cursor as usize);
-    ctx.set_field(this, AL_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
     Ok(Some(val))
 }
 
@@ -5235,6 +5256,12 @@ const COLLECTOR_TAG_GROUPING_BY_SUPPLIER: i32 = 10;
 /// T2.3.19 — `Collectors.partitioningBy(Predicate,Collector)` with
 /// downstream collector applied to each partition.
 const COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM: i32 = 11;
+/// `Collectors.toMap(keyFn, valFn, mergeFn)` — ARG1=keyFn, ARG2=valFn,
+/// ARG3=BinaryOperator merge function applied on duplicate keys.
+const COLLECTOR_TAG_TO_MAP_MERGE: i32 = 12;
+/// `Collectors.collectingAndThen(downstream, finisher)` — ARG1=downstream
+/// Collector, ARG2=finisher Function applied to the downstream result.
+const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/stream/Collectors";
@@ -5268,6 +5295,30 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "toMap",
         "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
         native_collectors_to_map,
+    );
+    r.register(
+        c,
+        "toMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;",
+        native_collectors_to_map_merge,
+    );
+    r.register(
+        c,
+        "toUnmodifiableMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+        native_collectors_to_map,
+    );
+    r.register(
+        c,
+        "toUnmodifiableMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;",
+        native_collectors_to_map_merge,
+    );
+    r.register(
+        c,
+        "collectingAndThen",
+        "(Ljava/util/stream/Collector;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+        native_collectors_collecting_and_then,
     );
     r.register(
         c,
@@ -5343,6 +5394,32 @@ fn native_collectors_to_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
     ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map_merge(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_MERGE);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_collecting_and_then(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_COLLECTING_AND_THEN);
+    let downstream = args.first().copied().unwrap_or(Value::Object(None));
+    let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, downstream);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, finisher);
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -5497,6 +5574,99 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 pairs.push((k, v));
             }
             make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_TO_MAP_MERGE => {
+            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                Value::Object(Some(r)) => Some(r),
+                _ => None,
+            };
+            // Walk elements, merging duplicate keys via the BinaryOperator.
+            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                let k = ctx
+                    .invoke_virtual(
+                        key_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let v = ctx
+                    .invoke_virtual(
+                        val_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let mut idx = None;
+                for (i, (ek, _)) in pairs.iter().enumerate() {
+                    if values_equal(ctx, ek, &k) {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = idx {
+                    let existing = pairs[i].1;
+                    let merged = if let Some(mf) = merge_fn {
+                        ctx.invoke_virtual(
+                            mf,
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[existing, v],
+                        )?
+                        .unwrap_or(Value::Object(None))
+                    } else {
+                        v
+                    };
+                    pairs[i].1 = merged;
+                } else {
+                    pairs.push((k, v));
+                }
+            }
+            make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_COLLECTING_AND_THEN => {
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+            let finisher = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Re-build a stream over the same elements and recursively collect
+            // through the downstream Collector, then apply finisher.apply().
+            let inner_stream =
+                alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+            let arr = alloc_ref_array(ctx, elements.len());
+            for (i, v) in elements.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(
+                inner_stream,
+                STREAM_FIELD_ELEMENTS,
+                Value::Object(Some(arr)),
+            );
+            let downstream_result = native_stream_collect(
+                ctx,
+                &[Value::Object(Some(inner_stream)), downstream],
+            )?
+            .unwrap_or(Value::Object(None));
+            let finished = ctx
+                .invoke_virtual(
+                    finisher,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[downstream_result],
+                )?
+                .unwrap_or(Value::Object(None));
+            Ok(Some(finished))
         }
         COLLECTOR_TAG_GROUPING_BY => {
             let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
