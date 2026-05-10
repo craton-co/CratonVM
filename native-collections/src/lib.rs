@@ -10394,15 +10394,57 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
-    // Try ArrayList layout first (field 0 = Object[], field 1 = Int size)
+    // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
+    // field-index resolver so we honour the real-JDK layout
+    // (`modCount`/`elementData`/`size` slots from AbstractList/ArrayList) —
+    // not just the synthetic (0=data, 1=size) layout. Without this,
+    // `HashSet.addAll(arrayList)` silently sees zero elements when running
+    // against the real JDK, which is the canonical victim for Spring's
+    // `AnnotationTypeMapping.processAliases` populating `claimedAliases`
+    // and surfaces as the `@AliasFor ... is not meta-present` chain.
+    {
+        let (data_slot, size_slot, _) = al_slots(ctx);
+        let f_data = ctx.get_field(coll, data_slot);
+        let f_size = ctx.get_field(coll, size_slot);
+        if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                let len = ctx.array_length(arr);
+                if size >= 0 && len >= size as usize {
+                    let mut elems = Vec::with_capacity(size as usize);
+                    for i in 0..(size as usize) {
+                        elems.push(ctx.get_array_element(arr, i));
+                    }
+                    return elems;
+                }
+            }
+        }
+    }
+    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size)
     let f0 = ctx.get_field(coll, 0);
     let f1 = ctx.get_field(coll, 1);
     if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
-        // Check if field 0 is an array (ArrayList/Vector/Stack pattern)
-        let len = ctx.array_length(arr);
-        if len >= size as usize {
-            let mut elems = Vec::with_capacity(size as usize);
-            for i in 0..(size as usize) {
+        if ctx.heap_kind_of(arr) == ObjectKind::Array {
+            let len = ctx.array_length(arr);
+            if size >= 0 && len >= size as usize {
+                let mut elems = Vec::with_capacity(size as usize);
+                for i in 0..(size as usize) {
+                    elems.push(ctx.get_array_element(arr, i));
+                }
+                return elems;
+            }
+        }
+    }
+    // S111r-bug-fix: Arrays$ArrayList — single field `a` (Object[]), no size.
+    // `Arrays.asList(...)` is heavily used in JDK callers (and Spring uses
+    // it indirectly through `Collections.singletonList` / similar wrappers)
+    // and has a different layout than `java.util.ArrayList`.
+    if let Value::Object(Some(arr)) = f0 {
+        if ctx.heap_kind_of(arr) == ObjectKind::Array {
+            let len = ctx.array_length(arr);
+            // Heuristic: if this object has at most a couple of fields and
+            // field 0 is a ref-array, treat it as an array-backed wrapper.
+            let mut elems = Vec::with_capacity(len);
+            for i in 0..len {
                 elems.push(ctx.get_array_element(arr, i));
             }
             return elems;

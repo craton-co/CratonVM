@@ -631,6 +631,17 @@ fn initialize_class_shared(
                                         f.byte_code_index,
                                     );
                                 }
+                            } else {
+                                let cm = shared.class_manager.read();
+                                for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
+                                    let cn = cm.get_class(f.class_id)
+                                        .map(|c| c.name.to_string())
+                                        .unwrap_or_default();
+                                    tracing::warn!(
+                                        "  [SWALLOW-LIVE {}] class={} {}.{} pc={}",
+                                        i, class_name_for_jfr, cn, f.method_name(), f.pc,
+                                    );
+                                }
                             }
                         }
                     }
@@ -701,7 +712,83 @@ fn initialize_class_shared(
                                         );
                                     }
                                 } else {
-                                    tracing::warn!("  [CLINIT-TRACE] no captured frames for hash={}", h);
+                                    tracing::warn!("  [CLINIT-TRACE] no captured frames for hash={} — falling back to live thread.frames", h);
+                                    // Fallback: live frames captured at the moment
+                                    // we observe propagation. Even though some
+                                    // frames have already been popped via athrow
+                                    // unwinding, the deepest remaining frame is
+                                    // typically the <clinit> we are about to
+                                    // wrap, plus all surviving callers. This
+                                    // beats no info at all.
+                                    let cm = shared.class_manager.read();
+                                    for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                                        let cn = cm.get_class(f.class_id)
+                                            .map(|c| c.name.to_string())
+                                            .unwrap_or_default();
+                                        tracing::warn!(
+                                            "  [CLINIT-LIVE {}] at {}.{} pc={}",
+                                            i, cn, f.method_name(), f.pc,
+                                        );
+                                    }
+                                }
+                                // Walk the cause chain — many JDK/log4j
+                                // wrappers re-throw RuntimeException over a
+                                // deeper NPE/IAE. Print up to 4 levels.
+                                {
+                                    let cm = shared.class_manager.read();
+                                    // Resolve Throwable.cause field index by name
+                                    let cause_idx_of = |obj: crate::types::ObjectRef| -> Option<usize> {
+                                        let mut walk = Some(shared.heap.class_id_of(obj));
+                                        while let Some(k) = walk {
+                                            if let Some(cls) = cm.get_class(k) {
+                                                let mut inst = 0usize;
+                                                for f in &cls.fields {
+                                                    if !f.is_static() {
+                                                        if &*f.name == "cause" {
+                                                            return Some(cls.first_field_index + inst);
+                                                        }
+                                                        inst += 1;
+                                                    }
+                                                }
+                                                walk = cls.superclass;
+                                            } else { break; }
+                                        }
+                                        None
+                                    };
+                                    let mut cur = *exc_ref;
+                                    for depth in 0..4 {
+                                        let Some(ci) = cause_idx_of(cur) else { break; };
+                                        let cause_val = shared.heap.get_field(cur, ci);
+                                        let cause_obj = match cause_val {
+                                            Value::Object(Some(o)) if o != cur => o,
+                                            _ => break,
+                                        };
+                                        let cause_cid = shared.heap.class_id_of(cause_obj);
+                                        let cause_name = cm.get_class(cause_cid)
+                                            .map(|c| c.name.to_string()).unwrap_or_default();
+                                        let cause_msg = match shared.heap.get_field(cause_obj, 0) {
+                                            Value::Object(Some(s)) =>
+                                                crate::vm::vm_object::read_java_string(&shared.heap, s)
+                                                    .unwrap_or_default(),
+                                            _ => String::new(),
+                                        };
+                                        tracing::warn!(
+                                            "  [CLINIT-CAUSE depth={}] {}: {}",
+                                            depth, cause_name, cause_msg,
+                                        );
+                                        let ch = shared.heap.identity_hash_code(cause_obj);
+                                        if let Some(frames) = thread.throwable_stacks.get(&ch) {
+                                            for (i, f) in frames.iter().enumerate().take(15) {
+                                                tracing::warn!(
+                                                    "    [CAUSE-TRACE {}] at {}.{} ({}:{}) bci={}",
+                                                    i, f.class_name, f.method_name,
+                                                    f.source_file.as_deref().unwrap_or("?"),
+                                                    f.line_number, f.byte_code_index,
+                                                );
+                                            }
+                                        }
+                                        cur = cause_obj;
+                                    }
                                 }
                             }
                             match crate::runtime::exceptions::create_exception_object(

@@ -4824,6 +4824,61 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // ParameterFormatter-fix: real-JDK mode bypass for ZoneId.systemDefault.
+    //
+    // In real-JDK mode the JDK bytecode for ZoneId.systemDefault() walks
+    // TimeZone.getDefault() → ZoneInfo.getTimeZone(...) → triggers
+    // sun/util/calendar/ZoneInfoFile.<clinit>, which fails to load
+    // ${java.home}/lib/tzdb.dat in CratonVM (DataInputStream/binary
+    // parsing path is incomplete) and is silently swallowed as
+    // java/lang/Error.  After the swallow, ZoneInfoFile is marked
+    // Initialized but its `zones` map is empty, so all subsequent
+    // TimeZone lookups return null and ZoneId.systemDefault() returns
+    // null.  Downstream, log4j's
+    // ParameterFormatter.<clinit> calls
+    //   DateTimeFormatter.ofPattern(...).withZone(ZoneId.systemDefault())
+    // and `withZone(null)` immediately NPEs, blowing up the entire
+    // log4j logging stack and stalling WildFly bootstrap.
+    //
+    // Until the underlying tzdb.dat read is fixed, intercept the call
+    // and return a synthetic UTC ZoneId object.  The returned value
+    // satisfies `withZone(non-null)` so log4j initialises cleanly.
+    // DST semantics are wrong, but log timestamps default to UTC,
+    // which is acceptable for boot diagnostics.
+    registry.register(
+        "java/time/ZoneId",
+        "systemDefault",
+        "()Ljava/time/ZoneId;",
+        |ctx, _args| {
+            // Allocate a synthetic instance of ZoneOffset (a concrete
+            // ZoneId subclass with a single int totalSeconds field).
+            // Using the abstract ZoneId class directly may break
+            // instanceof checks downstream; ZoneOffset.UTC is the
+            // canonical way to get a non-null ZoneId without touching
+            // ZoneInfoFile.
+            let cid = match ctx.ensure_class_initialized("java/time/ZoneOffset") {
+                Ok(id) => id,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            // ZoneOffset has fields: totalSeconds(I), id(String).
+            // Allocate enough slots — we conservatively use 8 to
+            // tolerate JDK-version field drift, then set totalSeconds=0
+            // and id="Z" via slot 0/1.  The JDK uses the id field for
+            // toString(); 0-init for the rest is safe since ZoneOffset
+            // does not consult any other fields in withZone() path.
+            let obj = ctx.alloc_object(cid, 8);
+            // Best-effort field set — failures are non-fatal because
+            // the JVM has already had the constructor skipped.  Any
+            // downstream getter that requires a fully-initialised
+            // ZoneOffset would have failed via the ZoneInfoFile path
+            // anyway.
+            let s = ctx.create_string("Z");
+            ctx.set_field(obj, 0, Value::Int(0));
+            ctx.set_field(obj, 1, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }
