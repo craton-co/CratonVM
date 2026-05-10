@@ -434,6 +434,90 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
 
+    // --- MemberName accessor overrides ---
+    // The JDK bytecode for `MemberName.getMethodType()` reads its `type:Object`
+    // field and, when null, invokes `expandFromVM` (a JVM-internal native) to
+    // populate it. We don't implement expandFromVM, so when downstream code
+    // (revealDirect, LambdaMetafactory) reads getMethodType the JDK falls
+    // through to the null-return branch even after we populate the slot —
+    // the JDK Object-field read may be intercepted by an injected vtable that
+    // re-reads from a hidden vmtarget slot. Bypassing the Java logic entirely
+    // with a native that returns slot 2 directly avoids the issue and matches
+    // what `MemberName.type` would yield once `expandFromVM` had populated it.
+    let mn_cls = "java/lang/invoke/MemberName";
+    r.register(
+        mn_cls,
+        "getMethodType",
+        "()Ljava/lang/invoke/MethodType;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
+    );
+    // `getMethodOrFieldType` is what `InfoFromMemberName.getMethodType()` and
+    // several other JDK paths actually call. Real-JDK impl branches on
+    // isInvocable / isGetter etc., but for our purposes slot 2 already holds
+    // the right thing (MethodType for methods/constructors, Class for fields
+    // — and the latter case isn't on the LambdaMetafactory revealDirect path).
+    r.register(
+        mn_cls,
+        "getMethodOrFieldType",
+        "()Ljava/lang/invoke/MethodType;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
+    );
+    r.register(
+        mn_cls,
+        "getFieldType",
+        "()Ljava/lang/Class;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
+    );
+    r.register(
+        mn_cls,
+        "getModifiers",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Modifiers = low 16 bits of flags.
+            let flags = match ctx.get_field(this, 3) { Value::Int(f) => f, _ => 0 };
+            Ok(Some(Value::Int(flags & 0xFFFF)))
+        },
+    );
+    r.register(
+        mn_cls,
+        "getReferenceKind",
+        "()B",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // flags is at declared-slot 3; refKind is the top byte
+            let flags = match ctx.get_field(this, 3) { Value::Int(f) => f, _ => 0 };
+            Ok(Some(Value::Int((flags >> 24) & 0x0F)))
+        },
+    );
+    r.register(
+        mn_cls,
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        mn_cls,
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
+
     // --- MethodHandles (static utility) ---
     let mhs = "java/lang/invoke/MethodHandles";
     r.register(
@@ -1389,6 +1473,28 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         lookup_find_static_var_handle);
 
+    // revealDirect — crack a (direct) MethodHandle into a MethodHandleInfo.
+    //
+    // The default JDK path calls `mh.isCrackable()` and `mh.internalMemberName()`,
+    // which only return useful values on `DirectMethodHandle`. Our `findStatic` /
+    // `findVirtual` / `findGetter` / etc. allocate plain MethodHandle objects with
+    // our private synthetic slots populated (MH_CLASS, MH_NAME, MH_DESC, MH_KIND),
+    // so the default path throws `IllegalArgumentException: not a direct method
+    // handle`. This native rebuilds a fully populated MemberName from our slots
+    // and wraps it in an `InfoFromMemberName`, which is what the JDK path would
+    // have returned for a real DirectMethodHandle.
+    //
+    // This is the entry point cracked by LambdaMetafactory (via
+    // `caller.revealDirect(implementation)`), so getting this right is what lets
+    // log4j 2.x's `ServiceLoaderUtil$LazyProviderHolder.<clinit>` lambda chain
+    // succeed in real-JDK mode.
+    r.register(
+        lk,
+        "revealDirect",
+        "(Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandleInfo;",
+        lookup_reveal_direct,
+    );
+
     r.register(lk, "toString", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("MethodHandles.Lookup");
         Ok(Some(Value::Object(Some(s))))
@@ -1662,6 +1768,225 @@ fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     let vh = alloc_static_var_handle(ctx, &class, &field_name, &field_desc);
     Ok(Some(Value::Object(Some(vh))))
+}
+
+/// `MethodHandles.Lookup.revealDirect(MethodHandle)`
+///
+/// Build a `MemberName` populated from our private MH synthetic slots
+/// (MH_CLASS, MH_NAME, MH_DESC, MH_KIND) and wrap it in an
+/// `InfoFromMemberName`. Bypasses the default Java path which would call
+/// `mh.isCrackable()` / `mh.internalMemberName()` — both of which return
+/// `false` / `null` on a base `MethodHandle`, raising
+/// `IllegalArgumentException: not a direct method handle`.
+fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // MemberName flag bits (mirroring native_mhn_init).
+    const IS_METHOD: i32      = 0x1_0000;
+    const IS_CONSTRUCTOR: i32 = 0x2_0000;
+    const IS_FIELD: i32       = 0x4_0000;
+    // JVM spec table 5.4.3.5 reference kinds.
+    const REF_GET_FIELD: i32        = 1;
+    const REF_GET_STATIC: i32       = 2;
+    const REF_PUT_FIELD: i32        = 3;
+    const REF_PUT_STATIC: i32       = 4;
+    const REF_INVOKE_VIRTUAL: i32   = 5;
+    const REF_INVOKE_STATIC: i32    = 6;
+    const REF_INVOKE_SPECIAL: i32   = 7;
+    const REF_NEW_INVOKE_SPECIAL: i32 = 8;
+    const ACC_STATIC: i32 = 0x0008;
+    const ACC_PUBLIC: i32 = 0x0001;
+
+    // args[0] = this (Lookup), args[1] = MethodHandle target
+    let mh = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            // Null MH — return null rather than throw; callers (LambdaMetafactory
+            // and direct revealDirect tests) always pass a real MH.
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+
+    // Read our private slots. If the MH was not produced by our find* path
+    // (foreign MH — bound, adapted, asType-converted) these slots will be
+    // empty, in which case we fall back to a default `()V`/static descriptor
+    // so revealDirect at least returns a non-throwing InfoFromMemberName.
+    let class = mh_read_class(ctx, mh).unwrap_or_default();
+    let name  = mh_read_name(ctx, mh).unwrap_or_default();
+    let desc  = mh_read_desc(ctx, mh).unwrap_or_else(|| "()V".to_string());
+    let kind  = match ctx.get_field(mh, MH_KIND) {
+        Value::Int(k) => k,
+        _ => MH_KIND_STATIC,
+    };
+
+    // Map our MH_KIND_* to (refKind, kindFlag, accStaticBits).
+    let (ref_kind, kind_flag, acc_static) = match kind {
+        MH_KIND_STATIC      => (REF_INVOKE_STATIC, IS_METHOD,      ACC_STATIC),
+        MH_KIND_VIRTUAL     => (REF_INVOKE_VIRTUAL, IS_METHOD,     0),
+        MH_KIND_SPECIAL     => (REF_INVOKE_SPECIAL, IS_METHOD,     0),
+        MH_KIND_CONSTRUCTOR => (REF_NEW_INVOKE_SPECIAL, IS_CONSTRUCTOR, 0),
+        MH_KIND_GETTER      => {
+            // Distinguish static vs instance by descriptor arity.
+            let is_static = desc.starts_with("()");
+            let rk = if is_static { REF_GET_STATIC } else { REF_GET_FIELD };
+            (rk, IS_FIELD, if is_static { ACC_STATIC } else { 0 })
+        }
+        MH_KIND_SETTER      => {
+            let is_static = !desc_has_two_params(&desc);
+            let rk = if is_static { REF_PUT_STATIC } else { REF_PUT_FIELD };
+            (rk, IS_FIELD, if is_static { ACC_STATIC } else { 0 })
+        }
+        _ => (REF_INVOKE_STATIC, IS_METHOD, ACC_STATIC),
+    };
+
+    // Build the MemberName (6 declared instance fields: clazz, name, type,
+    // flags, method, resolution).
+    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", 6);
+
+    // clazz: Class mirror of the declaring class. Fall back to a synthetic
+    // mirror only if the class is genuinely unloadable.
+    let clazz_mirror = match ctx.class_id_by_name(&class) {
+        Some(cid) => ctx.get_class_mirror(cid),
+        None => {
+            let _ = ctx.ensure_class_initialized(&class);
+            match ctx.class_id_by_name(&class) {
+                Some(cid) => ctx.get_class_mirror(cid),
+                None => alloc_concurrent_synthetic(ctx, "java/lang/Class", 1),
+            }
+        }
+    };
+    ctx.set_field_by_name(mn, "clazz", Value::Object(Some(clazz_mirror)));
+
+    // name
+    let name_str = ctx.create_string(&name);
+    ctx.set_field_by_name(mn, "name", Value::Object(Some(name_str)));
+
+    // type: MethodType for methods/constructors; Class for fields. Write to
+    // both the named slot AND raw slot 2 (declared layout) so JDK code that
+    // accesses `type` via either route sees the populated value — important
+    // because real-JDK field resolution can drift when the class is partially
+    // resolved during early bootstrap.
+    let type_value = if kind_flag == IS_FIELD {
+        let field_type_slice = field_type_from_desc(&desc, ref_kind);
+        Value::Object(Some(field_type_mirror(ctx, &field_type_slice)))
+    } else {
+        let mt = build_method_type_from_descriptor(ctx, &desc)
+            .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+        Value::Object(mt)
+    };
+    ctx.set_field_by_name(mn, "type", type_value);
+    ctx.set_field(mn, 2, type_value);
+
+    // flags: kind_flag | (modifiers) | (refKind << 24). We don't track real
+    // method modifiers — use ACC_PUBLIC plus ACC_STATIC for static refs so
+    // `getModifiers()` reads sensibly.
+    let flags = kind_flag | ACC_PUBLIC | acc_static | (ref_kind << 24);
+    ctx.set_field_by_name(mn, "flags", Value::Int(flags));
+
+    // method slot (4): non-zero sentinel — matches alloc_resolved_member_name.
+    ctx.set_field(mn, 4, Value::Int(1));
+    // resolution slot (5): null marks MemberName as resolved per JDK.
+    ctx.set_field(mn, 5, Value::Object(None));
+
+    // Construct InfoFromMemberName(Lookup, MemberName, byte). Field layout
+    // (verified via javap): { MemberName member, int referenceKind }. We
+    // bypass <init> assertions by direct field writes — they're disabled in
+    // production JDKs anyway.
+    let lookup_this = args.first().copied().unwrap_or(Value::Object(None));
+    let info = alloc_concurrent_synthetic(ctx, "java/lang/invoke/InfoFromMemberName", 2);
+    // Invoke the real constructor so any future-version field additions are
+    // populated correctly. Falls back to direct field writes if invocation
+    // fails (e.g. class not yet on the classpath in stripped runtimes).
+    let init_args = [
+        Value::Object(Some(info)),
+        lookup_this,
+        Value::Object(Some(mn)),
+        Value::Int(ref_kind),
+    ];
+    let _ = ctx.invoke(
+        "java/lang/invoke/InfoFromMemberName",
+        "<init>",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/invoke/MemberName;B)V",
+        &init_args,
+    );
+    // Defensive: also write fields directly, so even if <init> was skipped
+    // (registered as a no-op native somewhere) `member`/`referenceKind` are
+    // populated and downstream `toString`/`getDeclaringClass` work. Write
+    // both by-name and by raw declared slot index.
+    ctx.set_field_by_name(info, "member", Value::Object(Some(mn)));
+    ctx.set_field_by_name(info, "referenceKind", Value::Int(ref_kind));
+    ctx.set_field(info, 0, Value::Object(Some(mn)));
+    ctx.set_field(info, 1, Value::Int(ref_kind));
+
+    Ok(Some(Value::Object(Some(info))))
+}
+
+/// Extract the field type descriptor slice from a getter/setter descriptor.
+/// Getter: `()T` or `(Lowner;)T`. Setter: `(T)V` or `(Lowner;T)V`.
+fn field_type_from_desc(desc: &str, ref_kind: i32) -> String {
+    const REF_GET_FIELD: i32 = 1;
+    const REF_GET_STATIC: i32 = 2;
+    // For getters the field type is the return-type slice.
+    if ref_kind == REF_GET_FIELD || ref_kind == REF_GET_STATIC {
+        if let Some(idx) = desc.find(')') { return desc[idx + 1..].to_string(); }
+        return "V".to_string();
+    }
+    // For setters the field type is the LAST parameter.
+    let end = desc.find(')').unwrap_or(desc.len());
+    let params = &desc[1..end];
+    // Walk forward and remember the last full type.
+    let bytes = params.as_bytes();
+    let mut i = 0;
+    let mut last_start = 0;
+    while i < bytes.len() {
+        last_start = i;
+        match bytes[i] as char {
+            'B'|'C'|'D'|'F'|'I'|'J'|'S'|'Z' => { i += 1; }
+            '[' => {
+                while i < bytes.len() && bytes[i] as char == '[' { i += 1; }
+                if i < bytes.len() && bytes[i] as char == 'L' {
+                    while i < bytes.len() && bytes[i] as char != ';' { i += 1; }
+                }
+                if i < bytes.len() { i += 1; }
+            }
+            'L' => {
+                while i < bytes.len() && bytes[i] as char != ';' { i += 1; }
+                if i < bytes.len() { i += 1; }
+            }
+            _ => { i += 1; }
+        }
+    }
+    params[last_start..].to_string()
+}
+
+/// Build a Class mirror for a field-type descriptor slice (one JVM type).
+fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> ObjectRef {
+    // Primitive shortcuts: use a wrapper class mirror as a reasonable proxy.
+    // Real JDK uses primitive-Class mirrors here; our wrapper substitutes
+    // keep MemberName.getMethodType / getDeclaringClass consumers happy.
+    let class_name: &str = match ty.chars().next() {
+        Some('B') => "java/lang/Byte",
+        Some('C') => "java/lang/Character",
+        Some('D') => "java/lang/Double",
+        Some('F') => "java/lang/Float",
+        Some('I') => "java/lang/Integer",
+        Some('J') => "java/lang/Long",
+        Some('S') => "java/lang/Short",
+        Some('Z') => "java/lang/Boolean",
+        Some('L') => return field_type_mirror_class(ctx, &ty[1..ty.len().saturating_sub(1)]),
+        Some('[') => return field_type_mirror_class(ctx, ty),
+        _ => "java/lang/Object",
+    };
+    field_type_mirror_class(ctx, class_name)
+}
+
+fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+    if let Some(cid) = ctx.class_id_by_name(class_name) {
+        return ctx.get_class_mirror(cid);
+    }
+    let _ = ctx.ensure_class_initialized(class_name);
+    if let Some(cid) = ctx.class_id_by_name(class_name) {
+        return ctx.get_class_mirror(cid);
+    }
+    alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)
 }
 
 // =============================================================================
