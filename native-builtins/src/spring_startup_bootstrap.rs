@@ -576,28 +576,34 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         );
     }
 
-    // DefaultListableBeanFactory stubs — used when the DLBF is a synthetic
-    // allocation and its bytecode cannot run.
-    registry.register(
-        DLBF,
-        "containsBeanDefinition",
-        "(Ljava/lang/String;)Z",
-        dlbf_contains_bean_definition,
-    );
-    // Also cover the BeanFactory / ListableBeanFactory interface descriptor.
-    for bf_class in &[
-        DLBF,
+    // DefaultListableBeanFactory stubs — used ONLY when the DLBF is a
+    // synthetic allocation (i.e. the bytecode <init> failed and we built a
+    // fallback object in `get_or_create_bean_factory`).  Registering these
+    // on the concrete `DefaultListableBeanFactory` class would unconditionally
+    // override the real bytecode for every receiver — silently discarding
+    // every bean-definition registration, including the user's
+    // @SpringBootApplication primary source via
+    // `AnnotatedBeanDefinitionReader.doRegisterBean`.  That was the root
+    // cause of `MissingWebServerFactoryBeanException` on Spring Boot apps:
+    // no beans got registered, so `ConfigurationClassPostProcessor` never
+    // ran and `@EnableAutoConfiguration` never fired.
+    //
+    // The interfaces below have no concrete bytecode of their own, so an
+    // override here only fires when virtual dispatch lands on a synthetic
+    // object whose runtime class is the interface stub itself.  For real
+    // DLBF instances, the bytecode walks `beanDefinitionMap` correctly.
+    for bf_iface in &[
         "org/springframework/beans/factory/ListableBeanFactory",
         "org/springframework/beans/factory/config/ConfigurableListableBeanFactory",
     ] {
         registry.register(
-            bf_class,
+            bf_iface,
             "containsBeanDefinition",
             "(Ljava/lang/String;)Z",
             dlbf_contains_bean_definition,
         );
         registry.register(
-            bf_class,
+            bf_iface,
             "registerBeanDefinition",
             "(Ljava/lang/String;Lorg/springframework/beans/factory/config/BeanDefinition;)V",
             dlbf_register_bean_definition,
