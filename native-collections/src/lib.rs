@@ -8124,6 +8124,38 @@ fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 // LinkedList = 3-field synthetic (field 0 = head Node, field 1 = tail Node, field 2 = Int size)
 // Node = 3-field synthetic (field 0 = prev Node, field 1 = next Node, field 2 = element value)
+//
+// As with LinkedHashMap, the synthetic slot indices alias real-JDK declared
+// fields once the real `java.util.LinkedList` class is loaded (real-JDK has
+// `size`, `first`, `last` after AbstractList's `modCount`). Storing state in
+// a per-object overlay map sidesteps the layout collision without altering
+// HashMap allocation/resolution. The instance node fields (`LL_NODE_*`) are
+// kept slot-based because `LinkedList$Node` is purely synthetic in our VM
+// (we never load the real class, since Node is private/inner and bytecode
+// doesn't `getfield` it directly).
+fn ll_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>>> =
+        std::sync::OnceLock::new();
+    OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+fn ll_get(this: ObjectRef, name: &'static str) -> Value {
+    ll_overlay()
+        .lock()
+        .unwrap()
+        .get(&(this.as_ptr() as usize))
+        .and_then(|m| m.get(name))
+        .copied()
+        .unwrap_or(Value::Object(None))
+}
+fn ll_set(this: ObjectRef, name: &'static str, v: Value) {
+    ll_overlay()
+        .lock()
+        .unwrap()
+        .entry(this.as_ptr() as usize)
+        .or_default()
+        .insert(name, v);
+}
+
 const LL_FIELD_HEAD: usize = 0;
 const LL_FIELD_TAIL: usize = 1;
 const LL_FIELD_SIZE: usize = 2;
@@ -8140,7 +8172,7 @@ fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
 }
 
 fn ll_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, LL_FIELD_SIZE) {
+    match ll_get(this, "size") {
         Value::Int(n) => n,
         _ => 0,
     }
@@ -8189,39 +8221,39 @@ fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(0));
+    ll_set(this, "head", Value::Object(None));
+    ll_set(this, "tail", Value::Object(None));
+    ll_set(this, "size", Value::Int(0));
     Ok(None)
 }
 
 fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(tail)) = ctx.get_field(this, LL_FIELD_TAIL) {
+    if let Value::Object(Some(tail)) = ll_get(this, "tail") {
         ctx.set_field(tail, LL_NODE_NEXT, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_PREV, Value::Object(Some(tail)));
-        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     } else {
         // Empty list
-        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
-        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 fn ll_link_first(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(head)) = ctx.get_field(this, LL_FIELD_HEAD) {
+    if let Value::Object(Some(head)) = ll_get(this, "head") {
         ctx.set_field(head, LL_NODE_PREV, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(head)));
-        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
     } else {
-        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
-        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 fn native_ll_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8262,7 +8294,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
     }
     if index < size / 2 {
         // Traverse from head
-        let mut cur = match ctx.get_field(this, LL_FIELD_HEAD) {
+        let mut cur = match ll_get(this, "head") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -8275,7 +8307,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
         Some(cur)
     } else {
         // Traverse from tail
-        let mut cur = match ctx.get_field(this, LL_FIELD_TAIL) {
+        let mut cur = match ll_get(this, "tail") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -8314,7 +8346,7 @@ fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
-    match ctx.get_field(this, LL_FIELD_HEAD) {
+    match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -8333,7 +8365,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    match ctx.get_field(this, LL_FIELD_TAIL) {
+    match ll_get(this, "tail") {
         Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, LL_NODE_ELEM))),
         _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -8343,7 +8375,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let head = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let head = match ll_get(this, "head") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -8353,19 +8385,19 @@ fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match next {
         Value::Object(Some(next_node)) => {
             ctx.set_field(next_node, LL_NODE_PREV, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(next_node)));
+            ll_set(this, "head", Value::Object(Some(next_node)));
         }
         _ => {
-            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+            ll_set(this, "head", Value::Object(None));
+            ll_set(this, "tail", Value::Object(None));
         }
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size - 1));
+    ll_set(this, "size", Value::Int(size - 1));
     element
 }
 
 fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let tail = match ctx.get_field(this, LL_FIELD_TAIL) {
+    let tail = match ll_get(this, "tail") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -8375,14 +8407,14 @@ fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match prev {
         Value::Object(Some(prev_node)) => {
             ctx.set_field(prev_node, LL_NODE_NEXT, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(prev_node)));
+            ll_set(this, "tail", Value::Object(Some(prev_node)));
         }
         _ => {
-            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+            ll_set(this, "head", Value::Object(None));
+            ll_set(this, "tail", Value::Object(None));
         }
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size - 1));
+    ll_set(this, "size", Value::Int(size - 1));
     element
 }
 
@@ -8450,7 +8482,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -8472,9 +8504,9 @@ fn native_ll_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(0));
+    ll_set(this, "head", Value::Object(None));
+    ll_set(this, "tail", Value::Object(None));
+    ll_set(this, "size", Value::Int(0));
     Ok(None)
 }
 
@@ -8483,7 +8515,7 @@ fn native_ll_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    match ctx.get_field(this, LL_FIELD_HEAD) {
+    match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Ok(Some(Value::Object(None))),
     }
@@ -8510,7 +8542,7 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let size = ll_size(ctx, this) as usize;
     let arr = alloc_ref_array(ctx, size);
-    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -8537,7 +8569,7 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this) as usize;
     let mut parts = Vec::with_capacity(size);
-    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -8560,7 +8592,7 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let head = ctx.get_field(this, LL_FIELD_HEAD);
+    let head = ll_get(this, "head");
     let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 2);
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
@@ -8615,6 +8647,63 @@ const LHM_FIELD_CAPACITY: usize = 2;
 const LHM_FIELD_HEAD: usize = 3;
 const LHM_FIELD_TAIL: usize = 4;
 
+// Real-JDK LinkedHashMap inherits from HashMap, which has many declared fields
+// (`table`, `entrySet`, `size`, `modCount`, `threshold`, `loadFactor`) plus
+// AbstractMap (`keySet`, `values`) and LinkedHashMap's own (`head`, `tail`,
+// `accessOrder`, `putMode`). The synthetic 5-slot layout (buckets, size,
+// capacity, head, tail at indices 0..4) only matches a stub; against the real
+// JDK the indices line up with completely different fields, so writes to the
+// `LHM_FIELD_SIZE=1` slot land in `AbstractMap.values` (a Collection ref) and
+// reads of size find Object(None), producing `LinkedHashMap.size()==0` even
+// after multiple puts. (Fortunately the `buckets` slot also gets aliased to a
+// reference field, so the chain itself stays consistent for get/put — only
+// `size()` / `isEmpty()` / iteration short-circuit.)
+//
+// Spring 5.0's `LinkedMultiValueMap.addAll` calls
+// `targetMap.computeIfAbsent(key, lambda)` on a `LinkedHashMap` and then walks
+// `targetMap.entrySet()`; with the synthetic offsets, both the size-based
+// short-circuit in `Map.computeIfAbsent` and the iterator's emptiness check
+// see `size==0`, so the cache map ends up empty and `loadFactoryNames` returns
+// 0 — precisely the SportMe `ServletWebServerFactory` missing-bean failure.
+//
+// These helpers route to a side-table when the synthetic slot indices would
+// alias real-JDK declared fields. Storing LinkedHashMap state externally,
+// keyed by ObjectRef, sidesteps the layout-mismatch problem entirely without
+// touching the (other-agent-owned) HashMap allocation/resolution logic.
+//
+// We try a slot-based read/write first via the legacy `LHM_FIELD_*` indices,
+// because (a) prior callers and the JIT may have populated those slots in
+// stub-only configurations, and (b) it costs only one map lookup. When the
+// stored value clearly isn't the synthetic value we expected (e.g. `size`
+// reads back as Object(None) because slot 1 aliases AbstractMap.values), we
+// fall through to the side-table.
+//
+// IMPORTANT: this is a per-object overlay; iteration helpers continue to walk
+// the synthetic linked-list pointers, which now live in the side-table too.
+use std::sync::Mutex;
+use std::collections::HashMap as StdHashMap;
+fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<String, Value>>>> =
+        std::sync::OnceLock::new();
+    OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+fn lhm_overlay_key(this: ObjectRef) -> usize {
+    this.as_ptr() as usize
+}
+fn lhm_get(_ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
+    let m = lhm_overlay().lock().unwrap();
+    m.get(&lhm_overlay_key(this))
+        .and_then(|inner| inner.get(name))
+        .copied()
+        .unwrap_or(Value::Object(None))
+}
+fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
+    let mut m = lhm_overlay().lock().unwrap();
+    m.entry(lhm_overlay_key(this))
+        .or_default()
+        .insert(name.to_string(), v);
+}
+
 const LHM_NODE_KEY: usize = 0;
 const LHM_NODE_VALUE: usize = 1;
 const LHM_NODE_HASH: usize = 2;
@@ -8624,17 +8713,23 @@ const LHM_NODE_AFTER: usize = 5;
 const LHM_NODE_NUM_FIELDS: usize = 6;
 
 fn lhm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
-    let buckets = match ctx.get_field(this, LHM_FIELD_BUCKETS) {
+    let buckets = match lhm_get(ctx, this, "table", LHM_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
     };
-    let size = match ctx.get_field(this, LHM_FIELD_SIZE) {
+    let size = match lhm_get(ctx, this, "size", LHM_FIELD_SIZE) {
         Value::Int(s) => s,
         _ => 0,
     };
-    let cap = match ctx.get_field(this, LHM_FIELD_CAPACITY) {
-        Value::Int(c) => c,
-        _ => MAP_DEFAULT_CAPACITY as i32,
+    // Real-JDK HashMap has no explicit `capacity` field — derive from the
+    // bucket array length when present. Falls back to the synthetic slot if
+    // we couldn't get a buckets array (e.g. uninitialised stub).
+    let cap = match buckets {
+        Some(arr) => ctx.array_length(arr) as i32,
+        None => match lhm_get(ctx, this, "__capacity", LHM_FIELD_CAPACITY) {
+            Value::Int(c) => c,
+            _ => MAP_DEFAULT_CAPACITY as i32,
+        },
     };
     (buckets, size, cap)
 }
@@ -8651,15 +8746,15 @@ fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i
 }
 
 fn lhm_link_tail(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
-    let tail = ctx.get_field(this, LHM_FIELD_TAIL);
+    let tail = lhm_get(ctx, this, "tail", LHM_FIELD_TAIL);
     if let Value::Object(Some(t)) = tail {
         ctx.set_field(t, LHM_NODE_AFTER, Value::Object(Some(node)));
         ctx.set_field(node, LHM_NODE_BEFORE, Value::Object(Some(t)));
     } else {
         // Empty list — node becomes head
-        ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(Some(node)));
+        lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(Some(node)));
     }
-    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(Some(node)));
+    lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(Some(node)));
 }
 
 fn lhm_unlink(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
@@ -8670,13 +8765,13 @@ fn lhm_unlink(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
     if let Value::Object(Some(b)) = before {
         ctx.set_field(b, LHM_NODE_AFTER, after);
     } else {
-        ctx.set_field(this, LHM_FIELD_HEAD, after);
+        lhm_set(ctx, this, "head", LHM_FIELD_HEAD, after);
     }
     // Fix after's before
     if let Value::Object(Some(a)) = after {
         ctx.set_field(a, LHM_NODE_BEFORE, before);
     } else {
-        ctx.set_field(this, LHM_FIELD_TAIL, before);
+        lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, before);
     }
 }
 
@@ -8686,7 +8781,7 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let new_buckets = alloc_ref_array(ctx, new_cap);
 
     // Walk insertion-order list and rehash
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let hash = match ctx.get_field(node, LHM_NODE_HASH) {
             Value::Int(h) => h,
@@ -8707,9 +8802,9 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
 
-    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size));
-    ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
+    lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size));
+    lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
 }
 
 fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
@@ -8800,15 +8895,61 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
         native_lhm_for_each,
     );
     registry.register(c, "putAll", "(Ljava/util/Map;)V", native_lhm_put_all);
+
+    // computeIfAbsent on LinkedHashMap must route through the LHM put/get
+    // natives (which use the overlay-backed slots), NOT through the HashMap
+    // versions inherited via dispatch — otherwise the put no-ops because
+    // HashMap's slot indices alias different real-JDK fields on a LHM object.
+    registry.register(
+        c,
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+        native_lhm_compute_if_absent,
+    );
+}
+
+fn native_lhm_compute_if_absent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let function = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // If the key is already present, return the existing value unchanged.
+    let existing = native_lhm_get(ctx, &[Value::Object(Some(this)), key])?;
+    if let Some(Value::Object(Some(_))) = existing {
+        return Ok(existing);
+    }
+
+    // Otherwise call function.apply(key) and store the (non-null) result.
+    let result = ctx.invoke_virtual(
+        function,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key],
+    )?;
+    let new_val = result.unwrap_or(Value::Object(None));
+    if let Value::Object(None) = new_val {
+        return Ok(Some(Value::Object(None)));
+    }
+    native_lhm_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
 }
 
 fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(cap as i32));
-    ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(None));
+    lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(0));
+    lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(cap as i32));
+    lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(None));
+    lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(None));
 }
 
 fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8912,7 +9053,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Link at tail of insertion-order list
     lhm_link_tail(ctx, this, new_node);
 
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size + 1));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size + 1));
     Ok(Some(Value::Object(None)))
 }
 
@@ -8976,7 +9117,7 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             // Unlink from insertion-order list
             lhm_unlink(ctx, this, node);
 
-            ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size - 1));
+            lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size - 1));
             return Ok(Some(old_value));
         }
 
@@ -9007,7 +9148,7 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let val = ctx.get_field(node, LHM_NODE_VALUE);
         if values_equal(ctx, &val, &target) {
@@ -9025,16 +9166,16 @@ fn native_lhm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (_, _, cap) = lhm_state(ctx, this);
     let new_buckets = alloc_ref_array(ctx, cap as usize);
-    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(None));
+    lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(0));
+    lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(None));
+    lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(None));
     Ok(None)
 }
 
 fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut keys = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         keys.push(ctx.get_field(node, LHM_NODE_KEY));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
@@ -9044,7 +9185,7 @@ fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 fn lhm_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut vals = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         vals.push(ctx.get_field(node, LHM_NODE_VALUE));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
@@ -9076,7 +9217,7 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let mut entries = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
@@ -9095,7 +9236,7 @@ fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(Some(ctx.create_string("{}"))))),
     };
     let mut parts = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
@@ -9145,7 +9286,7 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);

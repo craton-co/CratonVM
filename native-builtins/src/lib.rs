@@ -2503,12 +2503,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
-    registry.register(
-        "java/lang/Thread",
-        "getThreadGroup",
-        "()Ljava/lang/ThreadGroup;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // NOTE: do NOT register a `getThreadGroup` shim that returns null.
+    // In real-JDK mode the Thread class has a Java implementation
+    // (`return holder.group`) and shadowing it with a null-returning
+    // native breaks `new Thread(...)`: the constructor calls
+    // `parent.getThreadGroup()` and then `g.getMaxPriority()`, which
+    // NPEs when `g` is null. The fallback in `vm_exec.rs::invoke_*`
+    // already returns null when the method is genuinely missing
+    // (e.g. synthetic-JDK / pre-bootstrap call sites).
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
     // JDK 25 additional Thread natives:
     registry.register("java/lang/Thread", "currentCarrierThread", "()Ljava/lang/Thread;", native_thread_current_thread);
@@ -5892,12 +5894,14 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
-    registry.register(
-        "java/lang/Thread",
-        "getThreadGroup",
-        "()Ljava/lang/ThreadGroup;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // NOTE: do NOT register a `getThreadGroup` shim that returns null.
+    // In real-JDK mode the Thread class has a Java implementation
+    // (`return holder.group`) and shadowing it with a null-returning
+    // native breaks `new Thread(...)`: the constructor calls
+    // `parent.getThreadGroup()` and then `g.getMaxPriority()`, which
+    // NPEs when `g` is null. The fallback in `vm_exec.rs::invoke_*`
+    // already returns null when the method is genuinely missing
+    // (e.g. synthetic-JDK / pre-bootstrap call sites).
     registry.register(
         "java/lang/Thread",
         "getName",
@@ -10997,15 +11001,16 @@ fn native_unsafe_allocate_instance(
     // args[0] = Unsafe this, args[1] = Class mirror
     // Read class name from mirror, allocate without calling <init>
     if let Some(Value::Object(Some(class_obj))) = args.get(1) {
-        let class_id_val = ctx.get_field(*class_obj, 0);
-        if let Value::Int(cid) = class_id_val {
-            if cid >= 0 {
-                if let Some(name) =
-                    ctx.class_name_of_id(rustjvm_types::ClassId::new(cid as u32))
-                {
-                    if let Some(obj) = ctx.allocate_instance(&name) {
-                        return Ok(Some(Value::Object(Some(obj))));
-                    }
+        let cid_opt = ctx
+            .class_id_from_mirror(*class_obj)
+            .or_else(|| match ctx.get_field(*class_obj, 0) {
+                Value::Int(cid) if cid >= 0 => Some(rustjvm_types::ClassId::new(cid as u32)),
+                _ => None,
+            });
+        if let Some(class_id) = cid_opt {
+            if let Some(name) = ctx.class_name_of_id(class_id) {
+                if let Some(obj) = ctx.allocate_instance(&name) {
+                    return Ok(Some(Value::Object(Some(obj))));
                 }
             }
         }
@@ -11601,10 +11606,18 @@ fn native_unsafe_object_field_offset1(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Class mirror field 0 = classId (Int). Look up the class and find the field.
-    let class_id_val = ctx.get_field(class_mirror, 0);
-    if let Value::Int(cid) = class_id_val {
-        let class_id = rustjvm_types::ClassId::new(cid as u32);
+    // Resolve the Class mirror's ClassId. Real-JDK Class layout doesn't
+    // have classId in slot 0 (slot 0 is `cachedConstructor` or similar
+    // ObjectRef), so we go through the reverse-map registered when the
+    // mirror is allocated. The synthetic-jdk path keeps slot 0 = Int(cid)
+    // and is handled by the fallback below.
+    let resolved_cid: Option<rustjvm_types::ClassId> = ctx
+        .class_id_from_mirror(class_mirror)
+        .or_else(|| match ctx.get_field(class_mirror, 0) {
+            Value::Int(cid) => Some(rustjvm_types::ClassId::new(cid as u32)),
+            _ => None,
+        });
+    if let Some(class_id) = resolved_cid {
         // T19.H1 — `declared_fields` only lists fields declared by
         // `class_id` itself, not inherited ones. HotSpot resolves
         // `Unsafe.objectFieldOffset(C.class, "name")` by walking the
@@ -11659,17 +11672,9 @@ fn native_unsafe_object_field_offset1(
     // `reflectionData` / `annotationData` / `annotationType` slots, or
     // ConcurrentHashMap's `table` reference when the populator failed
     // to wire the rj_slot metadata).
-    let cname = match args.get(1) {
-        Some(Value::Object(Some(obj))) => {
-            if let Value::Int(cid) = ctx.get_field(*obj, 0) {
-                ctx.class_name_of_id(rustjvm_types::ClassId::new(cid as u32))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            }
-        }
-        _ => String::new(),
-    };
+    let cname = resolved_cid
+        .and_then(|cid| ctx.class_name_of_id(cid))
+        .unwrap_or_default();
     let synthetic = synthetic_offset_for(&cname, &field_name);
     tracing::warn!(
         target: "rustjvm::unsafe",

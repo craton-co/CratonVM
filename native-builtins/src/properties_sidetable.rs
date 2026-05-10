@@ -1025,7 +1025,29 @@ fn native_properties_entry_set(
     for (k, _v) in snapshot.iter().take(5) {
         props_diag_eprintln!("[PROPS-DBG]   entry key={}", k);
     }
-    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
+    // Build a real-JDK HashSet by allocating it via new_object + <init>
+    // and populating via HashSet.add(Object). This routes through real
+    // HashMap.put bytecode, ensuring the bucket array (`table`) is populated
+    // in a way that real-JDK HashSet/Map iterators can walk. Going through
+    // `make_hashset_with_elements`'s raw-field path produced a HashMap whose
+    // `size` field reported correctly but whose `table` did not align with
+    // what the real-JDK iterator expected, so iteration silently yielded 0
+    // entries — breaking Spring's SpringFactoriesLoader (which iterates
+    // properties.entrySet() to build the EnableAutoConfiguration list).
+    let set = match ctx.new_object("java/util/HashSet") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            // Fallback: synthetic empty HashSet via collections helper.
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let _ = ctx.invoke(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
     for (k, v) in &snapshot {
         let entry = crate::alloc_concurrent_synthetic(
             ctx,
@@ -1034,11 +1056,17 @@ fn native_properties_entry_set(
         );
         let ks = ctx.create_string(k);
         let vs = ctx.create_string(v);
-        ctx.set_field(entry, 0, Value::Object(Some(ks)));
-        ctx.set_field(entry, 1, Value::Object(Some(vs)));
-        elems.push(Value::Object(Some(entry)));
+        // Use field-by-name to handle any inherited-field offset (real-JDK
+        // SimpleImmutableEntry has only `key` and `value`, but be safe).
+        ctx.set_field_by_name(entry, "key", Value::Object(Some(ks)));
+        ctx.set_field_by_name(entry, "value", Value::Object(Some(vs)));
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(entry))],
+        );
     }
-    let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
     Ok(Some(Value::Object(Some(set))))
 }
 
