@@ -1986,7 +1986,23 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let entries = map_collect_entries(ctx, other);
+    // S111r24-fix: Source may be a LinkedHashMap whose entries live in the
+    // Rust-side `lhm_overlay`. Walk its insertion-order list first; only
+    // fall back to HashMap bucket scanning when there is no LHM head
+    // pointer registered for `other`.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    let lhm_head = lhm_get(ctx, other, "head", LHM_FIELD_HEAD);
+    if let Value::Object(Some(_)) = lhm_head {
+        let mut cur = lhm_head;
+        while let Value::Object(Some(node)) = cur {
+            let key = ctx.get_field(node, LHM_NODE_KEY);
+            let val = ctx.get_field(node, LHM_NODE_VALUE);
+            entries.push((key, val));
+            cur = ctx.get_field(node, LHM_NODE_AFTER);
+        }
+    } else {
+        entries = map_collect_entries(ctx, other);
+    }
     for (key, value) in entries {
         if let Value::Object(Some(k)) = key {
             // Call put on this map
@@ -7267,8 +7283,24 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     set_map_size(ctx, this, 0);
     ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
-    // Copy entries from source
-    let entries = map_collect_entries(ctx, source);
+    // Copy entries from source.
+    // S111r24-fix: When source is a LinkedHashMap, its entries live in the
+    // Rust-side `lhm_overlay`, not in HashMap-style buckets. Walk the LHM
+    // insertion-order list first, falling back to HashMap bucket scanning
+    // for plain HashMaps / CHMs / etc.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    let lhm_head = lhm_get(ctx, source, "head", LHM_FIELD_HEAD);
+    if let Value::Object(Some(_)) = lhm_head {
+        let mut cur = lhm_head;
+        while let Value::Object(Some(node)) = cur {
+            let key = ctx.get_field(node, LHM_NODE_KEY);
+            let val = ctx.get_field(node, LHM_NODE_VALUE);
+            entries.push((key, val));
+            cur = ctx.get_field(node, LHM_NODE_AFTER);
+        }
+    } else {
+        entries = map_collect_entries(ctx, source);
+    }
     for (key, value) in entries {
         native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
     }
@@ -9159,7 +9191,14 @@ fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     lhm_init_with_cap(ctx, this, MAP_DEFAULT_CAPACITY);
     let src = args.get(1).copied().unwrap_or(Value::Object(None));
-    native_map_put_all(ctx, &[Value::Object(Some(this)), src])?;
+    // S111r24-fix: Route through `native_lhm_put_all` so insertion-order
+    // linkage (head/tail) is established for each copied entry. Calling
+    // `native_map_put_all` would invoke `native_map_put` which writes
+    // directly into HashMap-style bucket nodes without `lhm_link_tail`,
+    // leaving the LHM's insertion-order list empty and the entries
+    // invisible to `entrySet()`/`putAll(...)` consumers like Spring's
+    // `AnnotationAttributes(Map)` copy constructor.
+    native_lhm_put_all(ctx, &[Value::Object(Some(this)), src])?;
     Ok(None)
 }
 
@@ -9486,10 +9525,17 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
 
-    // Collect entries from source map (walk either LHM insertion list or HashMap buckets)
+    // Collect entries from source map (walk either LHM insertion list or HashMap buckets).
+    // S111r24-fix: LHM keeps `head`/`tail`/`table` in the Rust-side overlay
+    // (`lhm_overlay`), NOT in Java field slots. Use `lhm_get` to retrieve
+    // them; `ctx.get_field(source, LHM_FIELD_HEAD)` always returns
+    // `Object(None)` for a real LHM allocated by our natives, which made
+    // `putAll` and `new LHM<>(map)` silently produce an empty map. This
+    // broke any downstream code that relied on copy-constructing a
+    // LinkedHashMap from another LinkedHashMap, e.g. Spring's
+    // `AnnotationAttributes(Map<String,Object>)`.
     let mut entries = Vec::new();
-    // Try LHM head first (5-field object)
-    let head = ctx.get_field(source, LHM_FIELD_HEAD);
+    let head = lhm_get(ctx, source, "head", LHM_FIELD_HEAD);
     if let Value::Object(Some(_)) = head {
         let mut cur = head;
         while let Value::Object(Some(node)) = cur {
@@ -9499,7 +9545,8 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             cur = ctx.get_field(node, LHM_NODE_AFTER);
         }
     } else {
-        // Fall back to HashMap bucket scan
+        // Fall back to HashMap bucket scan when source isn't an LHM (e.g.
+        // a plain HashMap, ConcurrentHashMap, etc.).
         let (buckets, _, cap) = map_state(ctx, source);
         if let Some(b) = buckets {
             for i in 0..(cap as usize) {
@@ -9511,6 +9558,10 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     nv = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
+        } else {
+            // Last resort: route through map_collect_entries which has
+            // additional logic for TreeMap / ConcurrentHashMap / Properties.
+            entries.extend(map_collect_entries(ctx, source));
         }
     }
 

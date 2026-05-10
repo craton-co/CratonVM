@@ -540,6 +540,267 @@ fn native_enumeration_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(elem))
 }
 
+// ---------------------------------------------------------------------------
+// KC16: org.jboss.logmanager.Logger attachment side-table
+// ---------------------------------------------------------------------------
+//
+// Real-JDK `org.jboss.logmanager.Logger.getAttachment(AttachmentKey)` reads
+// `this.loggerNode` and forwards to `LoggerNode.getAttachment`. When the
+// `LogManager` failed to install (the JDK warning "Failed to load the
+// specified log manager class org.jboss.logmanager.LogManager" fires during
+// boot), `LogContext.getLogger("")` returns a Logger whose `loggerNode` field
+// is null. The bytecode then NPEs at pc=8.
+//
+// Override the four attachment methods on `org/jboss/logmanager/Logger` with
+// natives that stash attachments in a process-wide side table keyed by
+// `(receiver-ObjectRef-addr, AttachmentKey-ObjectRef-addr)`. The JBoss
+// `JBossLogManagerFacade.getLoggerRepository` PrivilegedAction is happy with
+// any non-NPE behavior — it null-checks the result of getAttachment and
+// allocates a fresh Hierarchy/RootLogger when null. `attachIfAbsent` semantics
+// (return previous value, null if newly attached) are honored so the facade's
+// race-free initialisation path matches the JDK contract.
+
+type AttachKey = (u64, u64);
+fn attachments() -> &'static Mutex<HashMap<AttachKey, u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<AttachKey, u64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn obj_addr(v: &Value) -> u64 {
+    if let Value::Object(Some(o)) = v {
+        o.as_ptr() as u64
+    } else {
+        0
+    }
+}
+
+fn native_jboss_logger_get_attachment(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = args.first().map(obj_addr).unwrap_or(0);
+    let key = args.get(1).map(obj_addr).unwrap_or(0);
+    if this == 0 || key == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&addr) = map.get(&(this, key)) {
+        if addr != 0 {
+            // SAFETY: addresses produced by attach/attachIfAbsent are
+            // ObjectRefs alive for the lifetime of the process (JBoss
+            // facade attachments are static-singletons).
+            return Ok(Some(Value::Object(Some(unsafe { object_from_u64(addr) }))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_jboss_logger_attach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = args.first().map(obj_addr).unwrap_or(0);
+    let key = args.get(1).map(obj_addr).unwrap_or(0);
+    let value = args.get(2).map(obj_addr).unwrap_or(0);
+    if this == 0 || key == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    let prev = map.insert((this, key), value);
+    Ok(Some(match prev {
+        Some(addr) if addr != 0 => Value::Object(Some(unsafe { object_from_u64(addr) })),
+        _ => Value::Object(None),
+    }))
+}
+
+fn native_jboss_logger_attach_if_absent(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = args.first().map(obj_addr).unwrap_or(0);
+    let key = args.get(1).map(obj_addr).unwrap_or(0);
+    let value = args.get(2).map(obj_addr).unwrap_or(0);
+    if this == 0 || key == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&addr) = map.get(&(this, key)) {
+        if addr != 0 {
+            return Ok(Some(Value::Object(Some(unsafe { object_from_u64(addr) }))));
+        }
+    }
+    map.insert((this, key), value);
+    // Per JDK contract, attachIfAbsent returns null when newly attached.
+    Ok(Some(Value::Object(None)))
+}
+
+/// Process-wide synthetic `org.jboss.logmanager.LogContext` singleton.
+/// Returned by `Logger.getLogContext()` and `LogContext.getLogContext()`
+/// natives. The real class has many fields; we only need a non-null
+/// receiver so JBoss bytecode that walks the parent chain
+/// (`JBossLogManagerFacade.updateParents`) can call methods on it
+/// without NPE. All overridden methods on this class return null/empty.
+fn jboss_log_context_singleton() -> &'static Mutex<Option<u64>> {
+    static INSTANCE: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(None))
+}
+
+fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
+    {
+        let g = jboss_log_context_singleton().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(addr) = *g {
+            if addr != 0 {
+                return unsafe { object_from_u64(addr) };
+            }
+        }
+    }
+    // Synthetic with zero fields — none are read by our overrides.
+    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LogContext", 1);
+    let mut g = jboss_log_context_singleton().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(addr) = *g {
+        if addr != 0 {
+            return unsafe { object_from_u64(addr) };
+        }
+    }
+    *g = Some(obj.as_ptr() as u64);
+    obj
+}
+
+fn native_jboss_logger_get_log_context(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)))))
+}
+
+fn native_jboss_log_context_get_log_context(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)))))
+}
+
+fn native_jboss_log_context_get_logger_if_exists(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Returning null is contractually fine — callers null-check before
+    // dereferencing (see JBossLogManagerFacade.getLoggers / updateParents).
+    Ok(Some(Value::Object(None)))
+}
+
+/// Process-wide registry of synthetic `org/jboss/logmanager/Logger`
+/// instances keyed by name. Distinct from `logger_registry()` (which
+/// holds `java/util/logging/Logger` mirrors) so the JBoss-side overrides
+/// for `getAttachment` etc. dispatch on receivers whose concrete class
+/// is `org/jboss/logmanager/Logger`.
+fn jboss_logger_registry() -> &'static Mutex<HashMap<String, u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    if !is_valid_logger_name(name) {
+        let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+        let name_obj = ctx.create_string("");
+        ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
+        return obj;
+    }
+    {
+        let reg = jboss_logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&addr) = reg.get(name) {
+            if addr != 0 {
+                return unsafe { object_from_u64(addr) };
+            }
+        }
+    }
+    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+    let name_obj = ctx.create_string(name);
+    ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
+    ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
+    ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
+    let mut reg = jboss_logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&addr) = reg.get(name) {
+        if addr != 0 {
+            return unsafe { object_from_u64(addr) };
+        }
+    }
+    reg.insert(name.to_string(), obj.as_ptr() as u64);
+    obj
+}
+
+fn native_jboss_log_context_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Mirror `LogManager.getLogger(String)` semantics — return a stable
+    // synthetic JBoss Logger keyed by name. Used by JBoss
+    // `JBossLogManagerFacade.getJBossLogger(LogContext, name)`. The
+    // concrete class is `org/jboss/logmanager/Logger` so subsequent
+    // calls to `getAttachment` etc. resolve to our native overrides
+    // registered on that class name.
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let logger = get_or_create_jboss_logger(ctx, &name);
+    Ok(Some(Value::Object(Some(logger))))
+}
+
+fn native_jboss_log_context_get_level_for_name(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_jboss_log_context_check_access(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+fn native_jboss_logger_get_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Returning null is spec-legal ("inherit from parent"). Both the
+    // JDK Logger.isLoggable contract and the JBoss
+    // JBossLevelMapping.getPriorityFor(null) chain handle null safely.
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_jboss_logger_get_parent(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Returning null breaks the parent walk on first hop (the JBoss
+    // facade only uses it through Logger.getEffectiveLevel chains;
+    // returning the root would loop). The PrivilegedAction in
+    // JBossLogManagerFacade$2.run treats this as "no parent".
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_jboss_logger_set_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // No-op — level filtering happens in the process-wide tracing
+    // subscriber, not the JBoss logger node graph.
+    Ok(None)
+}
+
+fn native_jboss_logger_is_loggable(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Match JDK default: every level is loggable. Filtering is owned
+    // by the tracing subscriber.
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_jboss_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Read slot 0 (name string). When unset, return empty string so
+    // Category.getName() never returns null (the apache log4j
+    // updateParents bytecode does `name.length()` immediately).
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+    };
+    if let Value::Object(Some(name_str)) = ctx.get_field(this, LOGGER_FIELD_NAME) {
+        return Ok(Some(Value::Object(Some(name_str))));
+    }
+    Ok(Some(Value::Object(Some(ctx.create_string("")))))
+}
+
+fn native_jboss_logger_get_use_parent_handlers(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_jboss_logger_get_effective_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Return INFO_INT (800) — the JBoss LoggerNode default before any
+    // setLevel call. Callers compare against `Level.intValue()`; INFO
+    // means INFO+ levels are enabled, FINE/FINER/FINEST are not. This
+    // matches the conservative default that boot expects.
+    Ok(Some(Value::Int(800)))
+}
+
+fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = args.first().map(obj_addr).unwrap_or(0);
+    let key = args.get(1).map(obj_addr).unwrap_or(0);
+    if this == 0 || key == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    let prev = map.remove(&(this, key));
+    Ok(Some(match prev {
+        Some(addr) if addr != 0 => Value::Object(Some(unsafe { object_from_u64(addr) })),
+        _ => Value::Object(None),
+    }))
+}
+
 fn native_get_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // We never load configuration files (see `native_read_configuration_*`),
     // so every `getProperty(key)` returns null. The JDK default
@@ -690,6 +951,132 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "checkAccess",
         "()V",
         |_ctx, _args| Ok(None),
+    );
+
+    // ---------------- KC16: org.jboss.logmanager.Logger attachment overrides ----------------
+    // Override real-JDK `org/jboss/logmanager/Logger.getAttachment` /
+    // `attach` / `attachIfAbsent` / `detach` with side-table-backed
+    // natives. The bytecode bodies in jboss-logmanager-2.1.18.Final.jar
+    // dereference `this.loggerNode` which is null when the JDK warns
+    // "Failed to load the specified log manager class
+    // org.jboss.logmanager.LogManager" and falls back to a plain
+    // `Logger`. See `vm_exec.rs` `check_override` for the dispatch
+    // override that selects these natives over the real bytecode.
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getAttachment",
+        "(Lorg/jboss/logmanager/Logger$AttachmentKey;)Ljava/lang/Object;",
+        native_jboss_logger_get_attachment,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "attach",
+        "(Lorg/jboss/logmanager/Logger$AttachmentKey;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_jboss_logger_attach,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "attachIfAbsent",
+        "(Lorg/jboss/logmanager/Logger$AttachmentKey;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_jboss_logger_attach_if_absent,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "detach",
+        "(Lorg/jboss/logmanager/Logger$AttachmentKey;)Ljava/lang/Object;",
+        native_jboss_logger_detach,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getLevel",
+        "()Ljava/util/logging/Level;",
+        native_jboss_logger_get_level,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getParent",
+        "()Lorg/jboss/logmanager/Logger;",
+        native_jboss_logger_get_parent,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "setLevel",
+        "(Ljava/util/logging/Level;)V",
+        native_jboss_logger_set_level,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "isLoggable",
+        "(Ljava/util/logging/Level;)Z",
+        native_jboss_logger_is_loggable,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getLogContext",
+        "()Lorg/jboss/logmanager/LogContext;",
+        native_jboss_logger_get_log_context,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getEffectiveLevel",
+        "()I",
+        native_jboss_logger_get_effective_level,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getName",
+        "()Ljava/lang/String;",
+        native_jboss_logger_get_name,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getUseParentHandlers",
+        "()Z",
+        native_jboss_logger_get_use_parent_handlers,
+    );
+
+    // ---------------- KC16: org.jboss.logmanager.LogContext overrides ----------------
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "getLogContext",
+        "()Lorg/jboss/logmanager/LogContext;",
+        native_jboss_log_context_get_log_context,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "getSystemLogContext",
+        "()Lorg/jboss/logmanager/LogContext;",
+        native_jboss_log_context_get_log_context,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/jboss/logmanager/Logger;",
+        native_jboss_log_context_get_logger,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "getLoggerIfExists",
+        "(Ljava/lang/String;)Lorg/jboss/logmanager/Logger;",
+        native_jboss_log_context_get_logger_if_exists,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "getLevelForName",
+        "(Ljava/lang/String;)Ljava/util/logging/Level;",
+        native_jboss_log_context_get_level_for_name,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "checkAccess",
+        "(Lorg/jboss/logmanager/LogContext;)V",
+        native_jboss_log_context_check_access,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "checkSecurityAccess",
+        "()V",
+        native_jboss_log_context_check_access,
     );
 
     // ---------------- Enumeration<String> wrapper ----------------

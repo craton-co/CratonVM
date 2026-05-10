@@ -6105,6 +6105,47 @@ fn invoke_on_class_shared_inner(
                                 "casReflectionData"
                                 | "casAnnotationType"
                                 | "casAnnotationData"
+                            ))
+                        // KC16 ServerLogger NPE fix — real-JDK
+                        // `org/jboss/logmanager/Logger.getAttachment`
+                        // bytecode dereferences `this.loggerNode` which
+                        // is null because `LogContext.getLogger()` returned
+                        // a Logger built outside the LoggerNode graph
+                        // (the JDK reports "Failed to load the specified
+                        // log manager class org.jboss.logmanager.LogManager"
+                        // and falls back). Force our null-safe natives
+                        // (getAttachment returns null per spec contract;
+                        // attach/attachIfAbsent stash in a side-table;
+                        // detach removes). Without this the JBoss
+                        // log4j facade NPEs in the PrivilegedAction at
+                        // JBossLogManagerFacade$2.run pc=29, leading to
+                        // ServerLogger.<clinit> System.exit(1).
+                        || (class_name == "org/jboss/logmanager/Logger"
+                            && matches!(
+                                method_name,
+                                "getAttachment"
+                                | "attach"
+                                | "attachIfAbsent"
+                                | "detach"
+                                | "getLevel"
+                                | "getParent"
+                                | "setLevel"
+                                | "isLoggable"
+                                | "getLogContext"
+                                | "getEffectiveLevel"
+                                | "getName"
+                                | "getUseParentHandlers"
+                            ))
+                        || (class_name == "org/jboss/logmanager/LogContext"
+                            && matches!(
+                                method_name,
+                                "getLogContext"
+                                | "getSystemLogContext"
+                                | "getLogger"
+                                | "getLoggerIfExists"
+                                | "getLevelForName"
+                                | "checkAccess"
+                                | "checkSecurityAccess"
                             ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
