@@ -4904,6 +4904,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // registered inside `register_synthetic_overrides`).
     register_uuid_natives(registry);
 
+    // --- WP4.8 / NEW-15 Loom natives (real-JDK mode) ---
+    // `jdk/internal/vm/ContinuationSupport.isSupported0()Z` must return false
+    // so `Continuation.<clinit>` does not throw UnsatisfiedLinkError during
+    // JBoss server bootstrap (`EnhancedQueueExecutor`/`JBossExecutors` <clinit>).
+    // Previously this was only registered via `register_synthetic_overrides`
+    // (line 7662 in the synthetic-only branch); move it here so real-JDK mode
+    // (Keycloak 16 boot) gets the native too.
+    crate::phases_late::register_new15_loom(registry);
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }
