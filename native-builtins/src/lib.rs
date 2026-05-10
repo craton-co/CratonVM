@@ -4881,6 +4881,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // CleanerFactory.<clinit> NPE fix — real-JDK
+    // `Cleaner.create(...)` bytecode allocates an `InnocuousThread`
+    // and calls `t.setPriority(...)` which dereferences a null
+    // `holder:FieldHolder` field, killing `CleanerFactory.<clinit>`
+    // (and thereby blocking WildFly's boot via the silent-swallowed
+    // exception in `Bootstrap.bootstrap`). Wire our synthetic
+    // `Cleaner.create / register / clean` natives so the bytecode
+    // never reaches the InnocuousThread path. Paired with the
+    // `check_override` allow-list entry for `java/lang/ref/Cleaner`
+    // in `vm/src/vm/vm_exec.rs`.
+    crate::phases_late::register_p69_cleaner(registry);
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }

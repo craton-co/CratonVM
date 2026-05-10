@@ -753,6 +753,54 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "(JZ)Z",
         native_proc_handle_destroy_process0,
     );
+    // Real JDK 25 signature: destroy0(pid, startTime, forcibly) -> boolean.
+    registry.register(
+        "java/lang/ProcessHandleImpl",
+        "destroy0",
+        "(JJZ)Z",
+        |_ctx, args| {
+            let handle = match args.first() {
+                Some(Value::Long(h)) => *h,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let force = matches!(args.get(2), Some(Value::Int(1)));
+            let ok = destroy_handle(handle, force);
+            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        },
+    );
+    // parent0(pid, startTime) -> long. We don't track parent relationships;
+    // returning -1 is the documented "unknown" value.
+    registry.register(
+        "java/lang/ProcessHandleImpl",
+        "parent0",
+        "(JJ)J",
+        |_ctx, _args| Ok(Some(Value::Long(-1))),
+    );
+    // getProcessPids0(pid, pids[], ppids[], starttimes[]) -> int (count).
+    // We don't enumerate child processes; return 0 (no children found).
+    registry.register(
+        "java/lang/ProcessHandleImpl",
+        "getProcessPids0",
+        "(J[J[J[J)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // ProcessHandleImpl$Info: initIDs() is a JNI fieldID cache init — no-op for us.
+    // info0(pid) fills in command/user/arguments/startTime/totalTime fields. Without
+    // OS-level introspection we leave the fields at their constructor defaults (null/-1),
+    // which the JDK code path handles gracefully (info() returns a partially-empty Info).
+    registry.register(
+        "java/lang/ProcessHandleImpl$Info",
+        "initIDs",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "java/lang/ProcessHandleImpl$Info",
+        "info0",
+        "(J)V",
+        |_ctx, _args| Ok(None),
+    );
 
     // Process methods on our synthetic Process — override the stubs
     // from phases_late::register_phase57_process with real fd-aware

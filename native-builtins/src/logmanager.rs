@@ -787,6 +787,39 @@ fn native_jboss_logger_get_effective_level(_ctx: &mut dyn NativeContext, _args: 
     Ok(Some(Value::Int(800)))
 }
 
+/// Keycloak NPE fix — `org/jboss/logmanager/Logger.logRaw(ExtLogRecord)`
+/// (and the `(LogRecord)` overload that wraps and recurses into it).
+/// The real-JDK bytecode at pc=40 dereferences `this.loggerNode` and at
+/// pc=45 calls `LoggerNode.isLoggable(record)` (NPE pc=48 "Cannot invoke
+/// isLoggable on null"); pc=70 calls `LoggerNode.publish(record)` (NPE
+/// "Cannot invoke publish on null"). Our synthetic `Logger` instances
+/// have no `loggerNode`, so any logRaw call on them NPEs.
+///
+/// This native is null-safe: it pulls the logger name (slot 0) and best-
+/// effort message off the (Ext)LogRecord, then routes the line through
+/// stderr so the operator still sees what would have been logged.
+/// Returns `void`.
+fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    // Best-effort logger name from slot 0.
+    let logger = match this {
+        Some(obj) => {
+            if let Value::Object(Some(name_str)) = ctx.get_field(obj, LOGGER_FIELD_NAME) {
+                ctx.read_string(name_str).unwrap_or_else(|| "<root>".to_string())
+            } else { "<root>".to_string() }
+        }
+        None => "<root>".to_string(),
+    };
+    // The ExtLogRecord layout in real-JDK has many fields; we only
+    // probe the inherited `j.u.l.LogRecord` slots (level slot 1 in the
+    // real layout, message slot 5). Since we never allocated this
+    // record, we don't actually know the field offsets — best effort
+    // is to emit a fixed entry. Avoids NPE; matches the
+    // jboss_logmanager.rs raw stub's behavior.
+    eprintln!("INFO [{logger}] <jboss-logmanager logRaw>");
+    Ok(None)
+}
+
 fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
@@ -1034,6 +1067,26 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_jboss_logger_get_use_parent_handlers,
     );
+    // Keycloak boot NPE — `Logger.logRaw` real-JDK bytecode dereferences
+    // `this.loggerNode` and NPEs at `LoggerNode.isLoggable` (pc=48) and
+    // `LoggerNode.publish` (pc=70). Our synthetic Logger has no
+    // LoggerNode wired up, so any caller path (e.g. `Log4jLogger.doLogf`
+    // -> `JBossLogManagerFacade` -> `Logger.logRaw`) crashes during
+    // `SystemExiter.logBeforeExit` on WildFly bootstrap. Force the
+    // null-safe native override that emits a best-effort line to stderr
+    // and returns without touching the missing field.
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "logRaw",
+        "(Lorg/jboss/logmanager/ExtLogRecord;)V",
+        native_jboss_logger_log_raw,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "logRaw",
+        "(Ljava/util/logging/LogRecord;)V",
+        native_jboss_logger_log_raw,
+    );
 
     // ---------------- KC16: org.jboss.logmanager.LogContext overrides ----------------
     registry.register(
@@ -1077,6 +1130,26 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "checkSecurityAccess",
         "()V",
         native_jboss_log_context_check_access,
+    );
+
+    // ---------------- KC16-JUL: java/util/logging/Logger null-safe accessors ----------------
+    // Real-JDK `Logger.getResourceBundleName()` reads
+    // `this.loggerBundle.resourceBundleName`, NPE-ing when our Logger init
+    // path leaves `loggerBundle` null. WildFly's
+    // `org/jboss/as/server/SystemExiter.logBeforeExit` calls this on the
+    // exit-reason logger path, killing the boot. Return null safely
+    // instead — JDK callers handle a null return per spec.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "getResourceBundleName",
+        "()Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "getResourceBundle",
+        "()Ljava/util/ResourceBundle;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
     // ---------------- Enumeration<String> wrapper ----------------

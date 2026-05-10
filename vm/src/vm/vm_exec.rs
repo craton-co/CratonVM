@@ -5461,6 +5461,19 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/Class"
                             && (method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
+                        // KC16-JUL: java.util.logging.Logger.getResourceBundleName /
+                        // getResourceBundle — the real JDK bytecode reads the
+                        // private `loggerBundle` field which our Logger init
+                        // path never populates. Reads through the bytecode NPE
+                        // with "Cannot read field 'resourceBundleName' because
+                        // the object is null" inside
+                        // `org/jboss/as/server/SystemExiter.logBeforeExit`
+                        // when WildFly is reporting an exit reason. Force our
+                        // null-tolerant natives (registered in
+                        // `logmanager.rs`) to win over the bytecode.
+                        || (class_name == "java/util/logging/Logger"
+                            && (method_name == "getResourceBundleName"
+                                || method_name == "getResourceBundle"))
                         // B3: ClassLoader.getResources / getSystemResources
                         // have real-JDK bytecode but that bytecode walks
                         // URLClassPath (which NPEs during <clinit>). Force
@@ -5925,6 +5938,24 @@ fn invoke_on_class_shared_inner(
                                 | "java/util/LinkedHashSet"
                             )
                             && method_name == "toArray")
+                        // CleanerFactory.<clinit> NPE fix — real-JDK
+                        // `java.lang.ref.Cleaner.create()` bytecode allocates
+                        // a `CleanerImpl`, then calls `CleanerImpl.start(cleaner,
+                        // tf)` which builds an `InnocuousThread` and calls
+                        // `t.setPriority(...)`. Our Thread `<init>` natives do
+                        // not populate the `holder:FieldHolder` field, so
+                        // `Thread.priority(int)` (called from `setPriority`)
+                        // dereferences `holder.group` and NPEs. The NPE bubbles
+                        // through `CleanerFactory.<clinit>` (silently
+                        // swallowed) leaving the static `cleaner` field null,
+                        // which blocks WildFly boot. Force our synthetic
+                        // `Cleaner.create` / `register` natives to win so the
+                        // bytecode never reaches the InnocuousThread path.
+                        || (class_name == "java/lang/ref/Cleaner"
+                            && matches!(
+                                method_name,
+                                "create" | "register"
+                            ))
                         // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
                         // bytecode resolution is failing for these basic methods
                         // during JDK class clinits like
@@ -6145,6 +6176,15 @@ fn invoke_on_class_shared_inner(
                                 | "getEffectiveLevel"
                                 | "getName"
                                 | "getUseParentHandlers"
+                                // Keycloak boot NPE — `Logger.logRaw` bytecode
+                                // dereferences `this.loggerNode` (NPE at pc=48
+                                // calling `LoggerNode.isLoggable` and at pc=70
+                                // calling `LoggerNode.publish`). Our synthetic
+                                // Logger has no LoggerNode wired up, so force
+                                // the null-safe native override that emits the
+                                // record via the existing JBoss-LM boot-log
+                                // sink without touching `loggerNode`.
+                                | "logRaw"
                             ))
                         || (class_name == "org/jboss/logmanager/LogContext"
                             && matches!(

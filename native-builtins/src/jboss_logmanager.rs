@@ -353,6 +353,17 @@ pub fn register_jboss_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Lorg/jboss/logmanager/ExtLogRecord;)V",
         native_jboss_logger_log_unchecked,
     );
+    // Keycloak `Log4jLogger.doLogf` -> `Logger.logRaw(LogRecord)` overload.
+    // The real bytecode wraps the LogRecord into an ExtLogRecord then
+    // recurses into `logRaw(ExtLogRecord)`, which NPEs on `loggerNode`.
+    // Intercept the LogRecord overload too and emit a best-effort line
+    // directly without ever touching the missing LoggerNode field.
+    registry.register(
+        CLS_JBOSS_LOGGER,
+        "logRaw",
+        "(Ljava/util/logging/LogRecord;)V",
+        native_jboss_logger_log_unchecked,
+    );
 }
 
 /// Test-only: drop the cached file handle so a re-test against a
