@@ -2621,13 +2621,18 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
-            eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
+            // (Quieted: previously eprintln. Enable via RUSTJVM_HS_ITR_DBG.)
+            if std::env::var("RUSTJVM_HS_ITR_DBG").is_ok() {
+                eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
+            }
             return Ok(Some(Value::Object(None)));
         }
     };
     // Collect keys into a snapshot array
     let keys = map_collect_keys(ctx, backing);
-    eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
+    if std::env::var("RUSTJVM_HS_ITR_DBG").is_ok() {
+        eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
+    }
     let keys_arr = alloc_ref_array(ctx, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(keys_arr, i, *k);

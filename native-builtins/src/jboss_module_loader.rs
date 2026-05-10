@@ -1396,6 +1396,78 @@ pub(crate) fn native_module_classloader_get_resource(
     Ok(Some(Value::Object(Some(url))))
 }
 
+/// `ModuleClassLoader.findResources(String) -> Enumeration<URL>` and
+/// `ModuleClassLoader.findResources(String, boolean) -> Enumeration<URL>`.
+///
+/// JBoss's bytecode at `findResources(String, boolean)` is just
+/// `getfield module; invokevirtual Module.getResources(String)`. When the
+/// `module` field is null (which happens for the synthetic ModuleClassLoader
+/// instances log4j's PropertyFilePropertySource ends up using via
+/// `LoaderUtil.findUrlResources`), that invokevirtual NPEs and aborts WildFly
+/// boot. This native short-circuits to a resource-closure walk identical to
+/// `getResource`, returning an empty Enumeration when the module shape is
+/// missing.
+pub(crate) fn native_module_classloader_find_resources(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return build_empty_enumeration(ctx),
+    };
+    // The String name is at args[1]; an optional boolean (export flag) may
+    // follow, which we ignore.
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return build_empty_enumeration(ctx),
+    };
+    let name = ctx.read_string(name_obj).unwrap_or_default();
+    let trimmed = name.trim_start_matches('/').to_string();
+
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(module_name) = module_name_of_mcl(ctx, this) {
+        let (_modules, roots) = module_visibility_closure(&module_name);
+        register_resource_roots(ctx, &roots);
+        if let Some(hit_root) = find_entry_in_roots(&roots, &trimmed) {
+            let url_string = if hit_root.ends_with(".jar") {
+                let path = hit_root.replace('\\', "/");
+                format!("jar:file:/{path}!/{trimmed}")
+            } else {
+                let path = hit_root.replace('\\', "/");
+                format!("file:/{path}/{trimmed}")
+            };
+            urls.push(url_string);
+        }
+    }
+    // Fall back to the system loader for `java.*` / boot resources so log4j's
+    // property-file probe finds the same set the bootstrap loader sees.
+    if urls.is_empty() {
+        let system_urls = ctx.find_all_resource_urls(&trimmed);
+        urls.extend(system_urls);
+    }
+
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    for (i, u) in urls.iter().enumerate() {
+        let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+        let full_str = ctx.create_string(u);
+        ctx.set_field(url_obj, 0, Value::Object(Some(full_str)));
+        ctx.set_field(url_obj, 5, Value::Object(Some(full_str)));
+        ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+    }
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    ctx.set_field(enm, 0, Value::Object(Some(arr)));
+    ctx.set_field(enm, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(enm))))
+}
+
+fn build_empty_enumeration(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    ctx.set_field(enm, 0, Value::Object(Some(arr)));
+    ctx.set_field(enm, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(enm))))
+}
+
 /// `ModuleClassLoader.getResourceAsStream(String) -> InputStream`.
 pub(crate) fn native_module_classloader_get_resource_as_stream(
     ctx: &mut dyn NativeContext,
@@ -1703,6 +1775,31 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         native_module_classloader_get_resource_as_stream,
+    );
+    // findResources: JBoss's bytecode dereferences `module` and calls
+    // `Module.getResources`. With our synthetic ModuleClassLoader instances
+    // the `module` field can be null (log4j's LoaderUtil routes through
+    // unrelated CL instances), which NPEs WildFly boot during
+    // `org.apache.logging.log4j.util.PropertyFilePropertySource.<init>`.
+    // Override with a native that walks the closure directly and returns
+    // an empty Enumeration when the module shape is missing.
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "findResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        native_module_classloader_find_resources,
+    );
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "findResources",
+        "(Ljava/lang/String;Z)Ljava/util/Enumeration;",
+        native_module_classloader_find_resources,
+    );
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "getResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        native_module_classloader_find_resources,
     );
 
     // KC16 boot blocker (Session 100): `org/jboss/modules/log/JDKModuleLogger`'s

@@ -695,17 +695,17 @@ fn native_properties_get_property_1(
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(this, &key) {
-        eprintln!(
-            "[PROPS-GET] this={:?} key={:?} -> sidetable hit ({} bytes)",
-            this,
-            key,
-            v.len()
+        tracing::debug!(
+            target: "rustjvm_vm::props_sidetable",
+            ?this, key = %key, bytes = v.len(),
+            "PROPS-GET sidetable hit"
         );
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
-    eprintln!(
-        "[PROPS-GET] this={:?} key={:?} -> sidetable MISS, falling back to system",
-        this, key
+    tracing::debug!(
+        target: "rustjvm_vm::props_sidetable",
+        ?this, key = %key,
+        "PROPS-GET sidetable MISS, falling back to system"
     );
     match ctx
         .get_system_property(&key)

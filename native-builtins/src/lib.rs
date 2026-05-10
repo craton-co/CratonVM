@@ -24275,7 +24275,7 @@ const LOC_FIELD_LANG: usize = 0;
 const LOC_FIELD_COUNTRY: usize = 1;
 const LOC_FIELD_VARIANT: usize = 2;
 
-fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
+pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
     let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
     let l = ctx.create_string(lang);
     let c = ctx.create_string(country);
