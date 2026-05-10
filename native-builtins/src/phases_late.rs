@@ -4104,33 +4104,54 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
     });
 
+    fn read_all_lines_impl(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> rustjvm_types::error::MethodCallResult {
+        let path_obj = obj_arg(args, 0)?;
+        let p = p57_read_path(ctx, path_obj);
+        match std::fs::read_to_string(&p) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                // Resolve real-JDK ArrayList layout: elementData / size slots
+                // can be at (1,2) when AbstractList.modCount occupies slot 0.
+                // Fall back to synthetic (0,1) layout when the class isn't
+                // available via the resolver.
+                let data_slot = ctx
+                    .resolve_field_index("java/util/ArrayList", "elementData")
+                    .unwrap_or(0);
+                let size_slot = ctx
+                    .resolve_field_index("java/util/ArrayList", "size")
+                    .unwrap_or(1);
+                let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+                use rustjvm_types::ArrayElementType;
+                let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
+                for (i, line) in lines.iter().enumerate() {
+                    let s = ctx.create_string(line);
+                    ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                }
+                ctx.set_field(list, data_slot, Value::Object(Some(arr)));
+                ctx.set_field(list, size_slot, Value::Int(lines.len() as i32));
+                Ok(Some(Value::Object(Some(list))))
+            }
+            Err(e) => Err(RuntimeError::IllegalStateException {
+                message: format!("IOException: {}", e),
+            }
+            .into()),
+        }
+    }
     r.register(
         files,
         "readAllLines",
         "(Ljava/nio/file/Path;)Ljava/util/List;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            match std::fs::read_to_string(&p) {
-                Ok(content) => {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                    use rustjvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
-                    for (i, line) in lines.iter().enumerate() {
-                        let s = ctx.create_string(line);
-                        ctx.set_array_element(arr, i, Value::Object(Some(s)));
-                    }
-                    ctx.set_field(list, 0, Value::Object(Some(arr)));
-                    ctx.set_field(list, 1, Value::Int(lines.len() as i32));
-                    Ok(Some(Value::Object(Some(list))))
-                }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
-            }
-        },
+        read_all_lines_impl,
+    );
+    r.register(
+        files,
+        "readAllLines",
+        "(Ljava/nio/file/Path;Ljava/nio/charset/Charset;)Ljava/util/List;",
+        read_all_lines_impl,
     );
 
     r.register(
