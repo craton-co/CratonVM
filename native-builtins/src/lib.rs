@@ -18958,6 +18958,157 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+
+    // Round 58: CharBuffer abstract-method overrides for real-JDK mode.
+    // Our `CharsetDecoder.decode(ByteBuffer)` native (see charset.rs)
+    // returns a synthetic `java/nio/CharBuffer` instance whose layout is
+    // (array=0 char[], pos=1, limit=2, capacity=3, mark=4) — matching
+    // the synthetic-mode CB_FIELD_* in phases_late.rs. Real-JDK
+    // `CharBuffer.get()C` is abstract (declared on the abstract class,
+    // overridden in concrete subclasses HeapCharBuffer/StringCharBuffer/
+    // …). Without a native here, an invokevirtual on the synthetic
+    // CharBuffer instance resolves to the abstract declaration and
+    // throws AbstractMethodError ("no Code attribute") — observed at
+    // `org/apache/tomcat/util/buf/CharsetUtil.isAsciiSuperset:48` during
+    // Spring Boot Tomcat startup for demo/eureka/insurance apps.
+    //
+    // The dispatch path in `invoke_on_class_shared_inner` already
+    // promotes any abstract method to a native override if one is
+    // registered (the `check_override = method.is_abstract() || …`
+    // gate), so registering these is sufficient. The natives below
+    // mirror the field layout used by `alloc_char_buffer` in
+    // charset.rs (BUF_FIELD_ARRAY=0, BUF_FIELD_POS=1, BUF_FIELD_LIMIT=2).
+    {
+        let cb = "java/nio/CharBuffer";
+
+        // Read (hb, position, limit, offset) honouring the real-JDK
+        // field names first and falling back to the synthetic indexed
+        // layout (array=0, pos=1, limit=2). Returns (char[] arr, pos,
+        // lim, offset).
+        fn cb_state(
+            ctx: &dyn rustjvm_native_api::NativeContext,
+            this: ObjectRef,
+        ) -> Option<(ObjectRef, i32, i32, i32)> {
+            let arr = match ctx.get_field_by_name(this, "hb") {
+                Value::Object(Some(a)) => Some(a),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(a)) => Some(a),
+                    _ => None,
+                },
+            }?;
+            let pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 1) { Value::Int(v) => v, _ => 0 },
+            };
+            let lim = match ctx.get_field_by_name(this, "limit") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 2) { Value::Int(v) => v, _ => 0 },
+            };
+            let off = match ctx.get_field_by_name(this, "offset") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            Some((arr, pos, lim, off))
+        }
+
+        fn cb_set_pos(ctx: &dyn rustjvm_native_api::NativeContext, this: ObjectRef, new_pos: i32) {
+            ctx.set_field_by_name(this, "position", Value::Int(new_pos));
+            ctx.set_field(this, 1, Value::Int(new_pos));
+        }
+
+        // get()C — advance pos, return char at pos.
+        registry.register(cb, "get", "()C", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.get() on null".into()),
+                }.into()),
+            };
+            let (arr, pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            if pos >= lim {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "BufferUnderflowException".into(),
+                }.into());
+            }
+            let ch = ctx.get_array_element(arr, (pos + off) as usize);
+            cb_set_pos(ctx, this, pos + 1);
+            Ok(Some(ch))
+        });
+        // get(I)C — absolute get.
+        registry.register(cb, "get", "(I)C", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.get(I) on null".into()),
+                }.into()),
+            };
+            let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            let (arr, _pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            if idx < 0 || idx >= lim {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("index: {idx}"),
+                }.into());
+            }
+            Ok(Some(ctx.get_array_element(arr, (idx + off) as usize)))
+        });
+        // put(C)Ljava/nio/CharBuffer; — relative put.
+        registry.register(cb, "put", "(C)Ljava/nio/CharBuffer;", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.put(C) on null".into()),
+                }.into()),
+            };
+            let ch = args.get(1).copied().unwrap_or(Value::Int(0));
+            let (arr, pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            if pos >= lim {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "BufferOverflowException".into(),
+                }.into());
+            }
+            ctx.set_array_element(arr, (pos + off) as usize, ch);
+            cb_set_pos(ctx, this, pos + 1);
+            Ok(Some(Value::Object(Some(this))))
+        });
+        // charAt(I)C — for CharSequence interop.
+        registry.register(cb, "charAt", "(I)C", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.charAt(I) on null".into()),
+                }.into()),
+            };
+            let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            let (arr, pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            let real = pos + idx;
+            if idx < 0 || real >= lim {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("charAt index: {idx}"),
+                }.into());
+            }
+            Ok(Some(ctx.get_array_element(arr, (real + off) as usize)))
+        });
+    }
 }
 
 /// Public wrapper so vm_init.rs can register charset natives in real-JDK mode.

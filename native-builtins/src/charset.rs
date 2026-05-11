@@ -167,6 +167,18 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
 }
 
 /// Allocate a fresh CharBuffer containing `chars`.
+///
+/// Round 58 — write the (hb, position, limit, capacity, mark) tuple via
+/// `set_field_by_name` so the layout matches real-JDK CharBuffer's actual
+/// field names (Buffer.mark/position/limit/capacity + CharBuffer.hb).
+/// The previous indexed-slot writes (0..=4) collided with real-JDK
+/// Buffer's int-field block when `alloc_concurrent_synthetic` widened
+/// the field count from 5 to the loaded class's real total, surfacing
+/// later as "CharBuffer has no backing array" inside Tomcat's
+/// `CharsetUtil.isAsciiSuperset`. We still also write the indexed
+/// fallback slots so any caller assuming the synthetic 5-field overlay
+/// (e.g. older `register_p62_char_buffer` natives compiled only in
+/// synthetic mode) continues to see consistent state.
 pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> ObjectRef {
     let cap = chars.len();
     let obj = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", BUF_NUM_FIELDS);
@@ -174,6 +186,14 @@ pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> O
     for (i, &c) in chars.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(c as i32));
     }
+    // Real-JDK field names (Buffer + CharBuffer):
+    ctx.set_field_by_name(obj, "hb", Value::Object(Some(arr)));
+    ctx.set_field_by_name(obj, "offset", Value::Int(0));
+    ctx.set_field_by_name(obj, "position", Value::Int(0));
+    ctx.set_field_by_name(obj, "limit", Value::Int(cap as i32));
+    ctx.set_field_by_name(obj, "capacity", Value::Int(cap as i32));
+    ctx.set_field_by_name(obj, "mark", Value::Int(-1));
+    // Indexed fallback for synthetic-mode consumers.
     ctx.set_field(obj, BUF_FIELD_ARRAY, Value::Object(Some(arr)));
     ctx.set_field(obj, BUF_FIELD_POS, Value::Int(0));
     ctx.set_field(obj, BUF_FIELD_LIMIT, Value::Int(cap as i32));
@@ -447,13 +467,41 @@ fn native_charset_decode_bytebuf(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[]))))),
     };
-    let (barr, bpos, blim) = match buf_state(ctx, bb) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[]))))),
-    };
-    let bytes = read_byte_array(ctx, barr, bpos as usize, (blim - bpos).max(0) as usize);
+    // Round 58 — tolerate real-JDK ByteBuffer layouts. Our synthetic
+    // ByteBuffer uses (array=0, pos=1, limit=2, cap=3, mark=4) but real-JDK
+    // `HeapByteBuffer` stores `hb` at a different slot. Scan field slots
+    // 0..=8 for the first byte[] reference; if found, use its full length
+    // when our normal (pos, limit) read returns an empty range. This lets
+    // Tomcat's `CharsetUtil.isAsciiSuperset` loop (which feeds a 1-byte
+    // ByteBuffer into `decode` per iteration) work even though the
+    // ByteBuffer came from real-JDK bytecode rather than our `allocate`
+    // native.
+    let mut bytes: Vec<u8> = Vec::new();
+    if let Some((barr, bpos, blim)) = buf_state(ctx, bb) {
+        let want = (blim - bpos).max(0) as usize;
+        if want > 0 {
+            bytes = read_byte_array(ctx, barr, bpos as usize, want);
+            set_pos(ctx, bb, blim);
+        }
+    }
+    if bytes.is_empty() {
+        // Layout fallback: probe slots 0..=8 for the first byte[] field.
+        for slot in 0..=8 {
+            if let Value::Object(Some(arr)) = ctx.get_field(bb, slot) {
+                let len = ctx.array_length(arr);
+                if len > 0 {
+                    // Heuristic: cap at 256 to avoid pulling a huge backing
+                    // array. The Tomcat probe path uses 1-byte buffers; any
+                    // larger consumer should be routed through our synthetic
+                    // allocate path which preserves pos/limit.
+                    let n = len.min(256);
+                    bytes = read_byte_array(ctx, arr, 0, n);
+                    break;
+                }
+            }
+        }
+    }
     let chars = decode_with_charset(ctx, this, &bytes);
-    set_pos(ctx, bb, blim);
     Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &chars)))))
 }
 
