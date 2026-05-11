@@ -5668,6 +5668,21 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // declared methods + superclasses to produce real `PropertyDescriptor`s
     // backed by `java.lang.reflect.Method` mirrors.
     crate::phases_late::register_p72_beans(registry);
+
+    // BaseStream / Stream / IntStream / LongStream / DoubleStream
+    // `sequential() / parallel() / unordered() / isParallel() / onClose()`
+    // are default methods on the `java.util.stream.BaseStream` interface in
+    // the real JDK. Real-JDK code (e.g. Spring Boot 4.0.6 auto-config) calls
+    // `stream.sequential()` and our `invokeinterface` dispatch surfaces a
+    // `NoSuchMethodError java/util/stream/Stream.sequential()Ljava/util/stream/BaseStream;`
+    // because find_method_recursive treats the BaseStream declaration as
+    // abstract (it IS abstract in the bytecode — concrete subclasses like
+    // AbstractPipeline override it) and skips it. The full
+    // synthetic-jdk-only `register_stream_overrides` registration was
+    // unreachable in real-JDK builds; pull it into essentials so the
+    // identity/return-this no-ops are available without the JIT/interpreter
+    // having to resolve the override on the receiver's pipeline class.
+    crate::streams::register_stream_overrides(registry);
 }
 
 #[cfg(feature = "synthetic-jdk")]

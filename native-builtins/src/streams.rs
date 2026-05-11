@@ -41,6 +41,68 @@ fn flow_subscription_demand() -> &'static Mutex<HashMap<u64, i64>> {
 /// Register Stream-terminal / Flow.Subscriber overrides.
 pub(crate) fn register_stream_overrides(registry: &mut NativeMethodRegistry) {
     register_flow_subscription_overrides(registry);
+    register_basestream_mode_overrides(registry);
+}
+
+/// `BaseStream.sequential() / parallel() / unordered() / isParallel() / onClose(Runnable)`
+/// are default methods on the `java.util.stream.BaseStream` interface. Real-JDK code
+/// (e.g. Spring Boot's auto-configuration) calls `stream.sequential()` and our
+/// invokeinterface dispatch can't resolve default methods through superinterfaces
+/// reliably, surfacing as `NoSuchMethodError`. Register no-op implementations on
+/// every Stream sub-interface that is actually used at the call sites.
+///
+/// `sequential()` / `parallel()` / `unordered()` simply return `this` (the runtime
+/// always operates in sequential mode for now). `isParallel()` returns false.
+/// `onClose(Runnable)` returns `this` (we don't track close handlers).
+fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
+    // Each stream type declares the return type of sequential/parallel/unordered
+    // as its own interface, *not* BaseStream. The descriptor recorded in the
+    // bytecode is what `invokeinterface` looks up, so we register all the
+    // declared-on-the-call-site variants.
+    let classes: &[(&str, &str)] = &[
+        ("java/util/stream/BaseStream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/Stream", "Ljava/util/stream/Stream;"),
+        ("java/util/stream/Stream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/IntStream", "Ljava/util/stream/IntStream;"),
+        ("java/util/stream/IntStream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/LongStream", "Ljava/util/stream/LongStream;"),
+        ("java/util/stream/LongStream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/DoubleStream", "Ljava/util/stream/DoubleStream;"),
+        ("java/util/stream/DoubleStream", "Ljava/util/stream/BaseStream;"),
+    ];
+
+    for (cls, ret) in classes {
+        let sig_return_self = format!("(){}", ret);
+        registry.register(cls, "sequential", &sig_return_self, native_stream_return_this);
+        registry.register(cls, "parallel", &sig_return_self, native_stream_return_this);
+        registry.register(cls, "unordered", &sig_return_self, native_stream_return_this);
+
+        let sig_onclose = format!("(Ljava/lang/Runnable;){}", ret);
+        registry.register(cls, "onClose", &sig_onclose, native_stream_return_this);
+    }
+
+    // isParallel returns boolean — always false in our sequential-only runtime.
+    for cls in &[
+        "java/util/stream/BaseStream",
+        "java/util/stream/Stream",
+        "java/util/stream/IntStream",
+        "java/util/stream/LongStream",
+        "java/util/stream/DoubleStream",
+    ] {
+        registry.register(cls, "isParallel", "()Z", native_stream_return_false);
+    }
+}
+
+/// Native helper: return `this` (the first argument). Used by
+/// `sequential() / parallel() / unordered() / onClose()` which are all
+/// identity / no-op transformations in our sequential-only stream runtime.
+fn native_stream_return_this(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(args.first().copied())
+}
+
+/// Native helper: return boolean false. Used by `isParallel()`.
+fn native_stream_return_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
 }
 
 /// Override the no-op `Flow.Subscription.request(long)` with a real
@@ -123,6 +185,28 @@ mod tests {
         assert!(r
             .find("java/util/concurrent/Flow$Subscription", "cancel", "()V")
             .is_some());
+    }
+
+    #[test]
+    fn register_stream_overrides_installs_basestream_mode_methods() {
+        let mut r = NativeMethodRegistry::new();
+        register_stream_overrides(&mut r);
+        // BaseStream-declared signatures
+        assert!(r.find(
+            "java/util/stream/BaseStream", "sequential",
+            "()Ljava/util/stream/BaseStream;").is_some());
+        // Stream-narrowed return type (covariant override seen on call sites)
+        assert!(r.find(
+            "java/util/stream/Stream", "sequential",
+            "()Ljava/util/stream/BaseStream;").is_some());
+        assert!(r.find(
+            "java/util/stream/Stream", "sequential",
+            "()Ljava/util/stream/Stream;").is_some());
+        assert!(r.find(
+            "java/util/stream/Stream", "isParallel", "()Z").is_some());
+        assert!(r.find(
+            "java/util/stream/IntStream", "parallel",
+            "()Ljava/util/stream/IntStream;").is_some());
     }
 
     #[test]
