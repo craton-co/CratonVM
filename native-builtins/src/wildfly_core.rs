@@ -1055,6 +1055,32 @@ fn native_exec_builder_build(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `EnhancedQueueExecutor$Builder.setKeepAliveTime(Duration)` — no-op shim.
+///
+/// The real setter calls `Assert.checkNotNullParam` and then checks
+/// `duration.compareTo(Duration.ZERO) > 0`, throwing `JBTHR00109` otherwise.
+/// In CratonVM the `Builder` instance fields are sometimes left at their
+/// default (e.g. when initialized via reflection paths that bypass `<init>`),
+/// so this validation fires spuriously. The pool's keep-alive policy isn't
+/// observed on the Rust side (workers live for the executor's lifetime), so
+/// dropping the value is safe — return `this` to keep the builder chain.
+fn native_exec_builder_set_keep_alive_duration(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `EnhancedQueueExecutor$Builder.setKeepAliveTime(long, TimeUnit)` — no-op.
+fn native_exec_builder_set_keep_alive_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Object(Some(this))))
+}
+
 fn native_exec_execute(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1247,6 +1273,24 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         "build",
         "()Lorg/jboss/threads/EnhancedQueueExecutor;",
         native_exec_builder_build,
+    );
+    // Bypass `Builder.setKeepAliveTime` validation — WildFly 39's bootstrap
+    // path constructs Builder defaults that under CratonVM end up with a
+    // `null` (or non-positive) `keepAliveTime` Duration, which the real
+    // setter rejects with `JBTHR00109`. We don't actually use the
+    // keep-alive value (the pool is driven from our Rust-side
+    // `EnhancedQueueExecutor`), so swallow the arg and return `this`.
+    r.register(
+        "org/jboss/threads/EnhancedQueueExecutor$Builder",
+        "setKeepAliveTime",
+        "(Ljava/time/Duration;)Lorg/jboss/threads/EnhancedQueueExecutor$Builder;",
+        native_exec_builder_set_keep_alive_duration,
+    );
+    r.register(
+        "org/jboss/threads/EnhancedQueueExecutor$Builder",
+        "setKeepAliveTime",
+        "(JLjava/util/concurrent/TimeUnit;)Lorg/jboss/threads/EnhancedQueueExecutor$Builder;",
+        native_exec_builder_set_keep_alive_long,
     );
     r.register(
         "org/jboss/threads/EnhancedQueueExecutor",
