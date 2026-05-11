@@ -4404,24 +4404,7 @@ pub(crate) fn annotation_proxy_invoke_shared(
     // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
     // (`@Filter` attribute is null).
     if method_name == "asMap" {
-        if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
-            let desc_obj = shared.heap.get_field(proxy, 0);
-            let desc = if let Value::Object(Some(o)) = desc_obj { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { String::new() };
-            // Print call stack
-            eprintln!("ASMAP-CALL desc={desc}");
-            for (i, f) in thread.frames.iter().enumerate().rev().take(6) {
-                let cn = shared.class_manager.read().get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
-                eprintln!("  ASMAP-FRAME[{i}] {}.{}", cn, f.method_name());
-            }
-        }
         return annotation_proxy_as_map(shared, thread, proxy, args);
-    }
-    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
-        let desc_obj = shared.heap.get_field(proxy, 0);
-        let desc = if let Value::Object(Some(o)) = desc_obj { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { String::new() };
-        if desc.contains("ComponentScan$Filter") || desc.contains("ComponentScan;") {
-            eprintln!("PROXY-CALL desc={desc} method={method_name}");
-        }
     }
     annotation_proxy_dispatch_impl(shared, proxy, method_name, args)
 }
@@ -4476,9 +4459,6 @@ fn annotation_proxy_as_map(
         match res {
             Some(Value::Object(Some(m))) => m,
             _ => {
-                if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
-                    eprintln!("ASMAP-FACTORY-FALLBACK factory_apply_returned_null");
-                }
                 let cid = shared
                     .load_class_concurrent(
                         "org/springframework/core/annotation/AnnotationAttributes",
@@ -4518,11 +4498,6 @@ fn annotation_proxy_as_map(
         _ => return Ok(Some(Value::Object(Some(dest_map)))),
     };
     let n = shared.heap.array_length(names_arr);
-    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
-        let cid = shared.heap.class_id_of(dest_map);
-        let cn = shared.class_manager.read().get_class(cid).map(|c| c.name.to_string()).unwrap_or_default();
-        eprintln!("ASMAP-LOOP n={n} dest_map_cid={:?} class={cn}", cid);
-    }
     for i in 0..n {
         let name_val = match shared.heap.get_array_element(names_arr, i) {
             Ok(v) => v,
@@ -4533,11 +4508,6 @@ fn annotation_proxy_as_map(
             Err(_) => continue,
         };
         let adapted = adapt_annotation_value_for_map(shared, thread, elem_val, args)?;
-        if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
-            let nstr = if let Value::Object(Some(o)) = name_val { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { "<no-name>".to_string() };
-            let val_kind = match adapted { Value::Object(None) => "null".to_string(), Value::Object(Some(o)) => format!("obj-cid={:?}", shared.heap.class_id_of(o)), _ => format!("{:?}", adapted) };
-            eprintln!("ASMAP-PUT i={i} name={nstr} val={val_kind}");
-        }
         // Apply CLASS_TO_STRING: replace Class / Class[] with String / String[].
         let adapted = if class_to_string {
             convert_class_values_to_strings(shared, adapted)
@@ -5639,6 +5609,25 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/Class"
                             && (method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
+                        // SPB.10 / Spring `BeanWrapperImpl`: the real-JDK
+                        // `java.beans.Introspector.getBeanInfo` walks
+                        // `com.sun.beans.introspect.*` reflection — that
+                        // path is on the JIT skip-list (Round 34: SPB.9d)
+                        // and the interpreter walk produces an empty
+                        // `BeanInfo` for ordinary POJOs (`pds.length == 0`),
+                        // which surfaces as
+                        //   `NotWritablePropertyException: Bean property 'X'
+                        //    is not writable or has an invalid setter method`
+                        // on Spring's `ConfigurationClassPostProcessor`
+                        // (the `metadataReaderFactory` setter is real but
+                        // invisible). Force our native (registered above
+                        // as `introspector_get_bean_info`) to win — it
+                        // walks the class + superclasses via
+                        // `ctx.declared_methods` and builds real
+                        // `java.lang.reflect.Method` mirrors for the
+                        // discovered getter/setter pairs.
+                        || (class_name == "java/beans/Introspector"
+                            && method_name == "getBeanInfo")
                         // KC16-JUL: java.util.logging.Logger.getResourceBundleName /
                         // getResourceBundle — the real JDK bytecode reads the
                         // private `loggerBundle` field which our Logger init

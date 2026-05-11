@@ -974,14 +974,11 @@ const NODE_NUM_FIELDS: usize = 4;
 
 /// Extract HashMap state: (buckets, size, capacity).
 fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
-    let buckets = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
+    let buckets_slot0 = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => {
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
                 Some(arr)
             } else {
-                // Real-JDK map variants can expose non-table objects in slot 0
-                // during partial initialization / alternate layouts. Do not
-                // treat those as bucket arrays.
                 eprintln!(
                     "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
                     this, arr
@@ -991,6 +988,20 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         }
         _ => None,
     };
+    // For JDK-constructed maps (e.g. AnnotationAttributes via Spring's
+    // `new AnnotationAttributes(annotationType, false)`), the absolute
+    // slot 0 is NOT necessarily the `table` field. Fall back to the
+    // JDK-resolved `table` slot when slot 0 doesn't yield a bucket array.
+    let buckets = buckets_slot0.or_else(|| {
+        let slot = ctx.resolve_field_index("java/util/HashMap", "table")?;
+        if slot == MAP_FIELD_BUCKETS || slot >= ctx.object_num_fields(this) {
+            return None;
+        }
+        match ctx.get_field(this, slot) {
+            Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
+            _ => None,
+        }
+    });
     // S111r28: Read size from the JDK-resolved `size` field by name when the
     // class metadata is available. The synthetic absolute-slot-1 fallback
     // only fires for raw `alloc_object(ClassId::new(0), ...)` allocations
@@ -1241,7 +1252,22 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
 
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
     set_map_size(ctx, this, size);
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+    // Mirror the bucket array to the JDK-resolved `table` slot when present
+    // (and different from slot 0). This is critical for AnnotationAttributes
+    // and other JDK-constructed maps where slot 0 may not be the `table`
+    // field — without this mirror, subsequent reads via `map_state` (which
+    // reads slot 0) would see the new buckets, but any JDK-bytecode path
+    // that reads `table` directly would see null. Also keeps the two
+    // storage locations in sync.
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(slot) = table_slot {
+        if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Object(Some(new_buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+    }
 }
 
 /// Collect all keys from a HashMap into a Vec.
@@ -1577,16 +1603,31 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
 
-    // Check for resize first
-    let (_, size, cap) = map_state(ctx, this);
-    if size + 1 > (cap * 3) / 4 {
+    // Check for resize first. Also initialize table when buckets is None
+    // (e.g. AnnotationAttributes constructed via JDK bytecode constructor —
+    // LinkedHashMap.<init>() leaves `table` null until first put, but our
+    // synthetic put native previously returned a silent no-op when buckets
+    // were None, dropping `type` from `@ComponentScan.Filter` AnnotationAttributes
+    // and surfacing as `IllegalArgumentException: Attribute 'type' not found`
+    // deep in Spring's bean factory).
+    let (initial_buckets, size, cap) = map_state(ctx, this);
+    if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
+        if std::env::var("RUSTJVM_IAE_TRACE").is_ok() && initial_buckets.is_none() {
+            let cn = ctx.class_name_of_id(ctx.class_id_of_object(this)).unwrap_or_default();
+            eprintln!("[MAP-PUT-INIT-RESIZE] this={:?} class={cn} size={size} cap={cap}", this);
+        }
         map_resize(ctx, this);
     }
 
     let (buckets, size, cap) = map_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+                eprintln!("[MAP-PUT-NO-BUCKETS-AFTER-RESIZE] this={:?}", this);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
 
     let idx = map_bucket_index(hash, cap);

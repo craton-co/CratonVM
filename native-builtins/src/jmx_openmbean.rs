@@ -486,7 +486,7 @@ fn native_introspector_get_methods(
 /// Allocate a `java.lang.reflect.Method` mirror with the JDK-25 field
 /// layout used by `lang_class::native_method_get_*` accessors:
 /// `clazz`, `name`, `parameterTypes`, `returnType`, `modifiers`.
-fn build_method_mirror(
+pub(crate) fn build_method_mirror(
     ctx: &mut dyn NativeContext,
     declaring_class_mirror: ObjectRef,
     name: &str,
@@ -586,6 +586,21 @@ fn read_one_descriptor(bytes: &[u8], start: usize) -> Option<(String, usize)> {
 
 /// Convert a single descriptor token (e.g. `"I"`, `"Ljava/lang/String;"`,
 /// `"[I"`) to the corresponding `java.lang.Class` mirror.
+/// Public re-export wrapper for `parse_method_descriptor` so callers in
+/// other modules (notably the `java.beans.Introspector` native) can reuse
+/// the descriptor parser without duplicating it.
+pub(crate) fn parse_method_descriptor_pub(d: &str) -> (Vec<String>, String) {
+    parse_method_descriptor(d)
+}
+
+/// Public re-export wrapper for `type_descriptor_to_class_mirror`.
+pub(crate) fn type_descriptor_to_class_mirror_pub(
+    ctx: &mut dyn NativeContext,
+    desc: &str,
+) -> ObjectRef {
+    type_descriptor_to_class_mirror(ctx, desc)
+}
+
 fn type_descriptor_to_class_mirror(
     ctx: &mut dyn NativeContext,
     desc: &str,

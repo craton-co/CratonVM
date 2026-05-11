@@ -34844,93 +34844,182 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // PropertyDescriptor = 4-field (name=0, readMethodName=1, writeMethodName=2, propertyTypeDesc=3)
+    // PropertyDescriptor = 4-field
+    //   field 0: name (String)
+    //   field 1: readMethod (java.lang.reflect.Method or null)
+    //   field 2: writeMethod (java.lang.reflect.Method or null)
+    //   field 3: propertyType (java.lang.Class or null)
+    //
+    // Spring's BeanWrapperImpl checks `pd.getWriteMethod() != null` to decide
+    // whether a property is writable. Returning null here surfaces as
+    // `NotWritablePropertyException` even when the bean has a real setter, so
+    // we materialise real `java.lang.reflect.Method` mirrors below in
+    // `introspector_get_bean_info` and just hand them back here.
     let pd = "java/beans/PropertyDescriptor";
     r.register(pd, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(pd, "getReadMethod", "()Ljava/lang/reflect/Method;", |_ctx, _args| {
-        // Return null — caller should use the name string from field 1
-        Ok(Some(Value::Object(None)))
+    r.register(pd, "getReadMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(pd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(pd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 2)))
     });
-    r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 3)))
     });
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.
 /// BeanInfo = 2-field synthetic (propertyDescriptors=0 PD[], beanDescriptor=1)
-/// PropertyDescriptor = 4-field (name=0, readMethod=1 String, writeMethod=2 String, propertyType=3 String)
+/// PropertyDescriptor = 4-field (name=0, readMethod=1 Method, writeMethod=2 Method, propertyType=3 Class)
+///
+/// Walks the target class plus its superclasses so that inherited setters
+/// (e.g. `ConfigurationClassPostProcessor.setMetadataReaderFactory`, declared
+/// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
+/// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let class_id = ctx.class_id_of_object(class_mirror);
-    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    if class_name.is_empty() {
-        return Ok(Some(Value::Object(None)));
-    }
+    // The argument is a `Class` *mirror*, so `class_id_of_object` returns
+    // `java/lang/Class` itself. We need the represented class — use
+    // `mirror_class_id`, which consults the VM's mirror→ClassId table.
+    let class_id = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
+        Some(c) => c,
+        None => {
+            // Empty BeanInfo is safer than null (matches JDK behaviour for
+            // classes with no introspectable bean properties).
+            let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 2);
+            ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
+            return Ok(Some(Value::Object(Some(bean_info))));
+        }
+    };
 
-    let methods = ctx.declared_methods(class_id);
+    // Discover properties from getters/setters across the class + superclasses.
+    // Stored as (name, getter_method_mirror, setter_method_mirror, propertyType_mirror).
+    let mut properties: Vec<(String, Option<ObjectRef>, Option<ObjectRef>, Option<ObjectRef>)> =
+        Vec::new();
 
-    // Discover properties from getters/setters
-    let mut properties: Vec<(String, Option<String>, Option<String>, String)> = Vec::new(); // (name, getter, setter, type_desc)
+    let mut current = Some(class_id);
+    let mut seen_method_keys: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    while let Some(cid) = current {
+        // Resolve the mirror for this declaring class so the Method mirror
+        // points at the class that actually declares the method.
+        let declaring_mirror = ctx.get_class_mirror(cid);
 
-    for method in &methods {
-        let name = &method.name;
-        let desc = &method.descriptor;
+        let methods = ctx.declared_methods(cid);
+        for method in &methods {
+            let name = &method.name;
+            let desc = &method.descriptor;
+            // Dedupe across inheritance: subclass override wins.
+            let key = (name.clone(), desc.clone());
+            if !seen_method_keys.insert(key) {
+                continue;
+            }
 
-        // getter: getXxx() -> T or isXxx() -> boolean
-        if (name.starts_with("get") && name.len() > 3 && desc.starts_with("()"))
-            || (name.starts_with("is") && name.len() > 2 && desc == "()Z")
-        {
-            let prop_start = if name.starts_with("get") { 3 } else { 2 };
-            let prop_name = decapitalize(&name[prop_start..]);
-            let ret_type = desc.split(')').nth(1).unwrap_or("Ljava/lang/Object;").to_string();
+            // getter: getXxx() -> T (T != void) or isXxx() -> boolean.
+            let is_get = name.starts_with("get") && name.len() > 3 && desc.starts_with("()")
+                && !desc.ends_with(")V");
+            let is_is = name.starts_with("is") && name.len() > 2 && desc == "()Z";
+            if is_get || is_is {
+                let prop_start = if is_get { 3 } else { 2 };
+                let prop_name = decapitalize(&name[prop_start..]);
+                let ret_desc = desc.split(')').nth(1).unwrap_or("Ljava/lang/Object;").to_string();
+                let ret_mirror =
+                    crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &ret_desc);
+                let mm = crate::jmx_openmbean::build_method_mirror(
+                    ctx,
+                    declaring_mirror,
+                    name,
+                    desc,
+                    method.access_flags,
+                );
+                if let Some(existing) =
+                    properties.iter_mut().find(|(n, _, _, _)| *n == prop_name)
+                {
+                    if existing.1.is_none() {
+                        existing.1 = Some(mm);
+                    }
+                    if existing.3.is_none() {
+                        existing.3 = Some(ret_mirror);
+                    }
+                } else {
+                    properties.push((prop_name, Some(mm), None, Some(ret_mirror)));
+                }
+            }
 
-            if let Some(existing) = properties.iter_mut().find(|(n, _, _, _)| *n == prop_name) {
-                existing.1 = Some(name.clone());
-            } else {
-                properties.push((prop_name, Some(name.clone()), None, ret_type));
+            // setter: setXxx(T) -> void with exactly one parameter.
+            if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
+                // Validate it's a single-parameter setter and extract that
+                // parameter's descriptor token.
+                let (params, _ret) =
+                    crate::jmx_openmbean::parse_method_descriptor_pub(desc);
+                if params.len() != 1 {
+                    continue;
+                }
+                let prop_name = decapitalize(&name[3..]);
+                let param_mirror =
+                    crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &params[0]);
+                let mm = crate::jmx_openmbean::build_method_mirror(
+                    ctx,
+                    declaring_mirror,
+                    name,
+                    desc,
+                    method.access_flags,
+                );
+                if let Some(existing) =
+                    properties.iter_mut().find(|(n, _, _, _)| *n == prop_name)
+                {
+                    if existing.2.is_none() {
+                        existing.2 = Some(mm);
+                    }
+                    if existing.3.is_none() {
+                        existing.3 = Some(param_mirror);
+                    }
+                } else {
+                    properties.push((prop_name, None, Some(mm), Some(param_mirror)));
+                }
             }
         }
-
-        // setter: setXxx(T) -> void
-        if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
-            let prop_name = decapitalize(&name[3..]);
-            // Extract parameter type from descriptor like "(Ljava/lang/String;)V" -> "Ljava/lang/String;"
-            let param_type = desc.trim_start_matches('(').split(')').next().unwrap_or("").to_string();
-
-            if let Some(existing) = properties.iter_mut().find(|(n, _, _, _)| *n == prop_name) {
-                existing.2 = Some(name.clone());
-            } else {
-                properties.push((prop_name, None, Some(name.clone()), param_type));
-            }
-        }
+        current = ctx.superclass_of(cid);
     }
 
-    // Build PropertyDescriptor array
+    // Always include the synthetic "class" property (java.beans includes it
+    // because every Object has `getClass()`). Spring's reflection caches key
+    // off PD presence, so omitting it can mislead callers.
+    if !properties.iter().any(|(n, _, _, _)| n == "class") {
+        let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
+            Ok(cid) => ctx.get_class_mirror(cid),
+            Err(_) => class_mirror,
+        };
+        let getter = crate::jmx_openmbean::build_method_mirror(
+            ctx,
+            class_mirror,
+            "getClass",
+            "()Ljava/lang/Class;",
+            0x0001, /* ACC_PUBLIC */
+        );
+        properties.push(("class".to_string(), Some(getter), None, Some(class_class_mirror)));
+    }
+
+    // Build PropertyDescriptor array.
     let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), properties.len());
-    for (i, (prop_name, getter, setter, type_desc)) in properties.iter().enumerate() {
+    for (i, (prop_name, getter, setter, type_mirror)) in properties.iter().enumerate() {
         let pd = alloc_concurrent_synthetic(ctx, "java/beans/PropertyDescriptor", 4);
         let name_str = ctx.create_string(prop_name);
         ctx.set_field(pd, 0, Value::Object(Some(name_str)));
-        if let Some(g) = getter {
-            let gs = ctx.create_string(g);
-            ctx.set_field(pd, 1, Value::Object(Some(gs)));
-        }
-        if let Some(s) = setter {
-            let ss = ctx.create_string(s);
-            ctx.set_field(pd, 2, Value::Object(Some(ss)));
-        }
-        let ts = ctx.create_string(type_desc);
-        ctx.set_field(pd, 3, Value::Object(Some(ts)));
+        ctx.set_field(pd, 1, Value::Object(*getter));
+        ctx.set_field(pd, 2, Value::Object(*setter));
+        ctx.set_field(pd, 3, Value::Object(*type_mirror));
         ctx.set_array_element(pd_arr, i, Value::Object(Some(pd)));
     }
 

@@ -5089,15 +5089,6 @@ fn create_annotation_proxy(
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     ctx.set_field(proxy, ANN_PROXY_ELEM_VALUES, Value::Object(Some(values_arr)));
-    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() && ann.type_descriptor.contains("ComponentScanZZZZ$Filter") {
-        let names_dbg: Vec<String> = all_elements.iter().map(|(n,_,_)| n.clone()).collect();
-        eprintln!("ANN-PROXY-FILTER desc={} ann_cid_loaded={} explicit={} total_elems={} names={:?}",
-            ann.type_descriptor,
-            ann_class_id_opt.is_some(),
-            ann.elements.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>().join(","),
-            all_elements.len(),
-            names_dbg);
-    }
     proxy
 }
 

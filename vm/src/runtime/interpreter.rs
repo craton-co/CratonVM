@@ -5961,38 +5961,6 @@ fn execute_instruction(
                                 _ => "<no message field>".to_string(),
                             };
                             eprintln!("IAE-ATHROW class={exc_class_name} message={msg:?}");
-                            // Dump local 0 (the AA receiver) of the assertAttributePresence frame
-                            if &*exc_class_name == "java/lang/IllegalArgumentException" {
-                                for f in thread.frames.iter().rev() {
-                                    let cn = shared.class_manager.read().get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
-                                    if cn == "org/springframework/core/annotation/AnnotationAttributes" && f.method_name() == "assertAttributePresence" {
-                                        if let Value::Object(Some(aa)) = f.get_local(0) {
-                                            // AnnotationAttributes extends LinkedHashMap. Inspect its size via the keySet
-                                            let aa_cid = shared.heap.class_id_of(aa);
-                                            let aa_cn = shared.class_manager.read().get_class(aa_cid).map(|c| c.name.to_string()).unwrap_or_default();
-                                            eprintln!("IAE-AA-DUMP receiver_cid={:?} class={aa_cn}", aa_cid);
-                                            // displayName field
-                                            // Field offsets: 0=annotationType, 1=displayName, 2=validated (maybe diff)
-                                            for slot in 0..6 {
-                                                let v = shared.heap.get_field(aa, slot);
-                                                let s = match v {
-                                                    Value::Object(Some(o)) => {
-                                                        let kid = shared.heap.class_id_of(o);
-                                                        let kcn = shared.class_manager.read().get_class(kid).map(|c| c.name.to_string()).unwrap_or_default();
-                                                        if kcn == "java/lang/String" {
-                                                            format!("String:{:?}", crate::vm::read_java_string(&shared.heap, o).unwrap_or_default())
-                                                        } else { format!("obj:{kcn}") }
-                                                    },
-                                                    Value::Object(None) => "null".to_string(),
-                                                    _ => format!("{:?}", v),
-                                                };
-                                                eprintln!("  AA-SLOT[{slot}] = {s}");
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
                             for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                                 let cn = shared
                                     .class_manager
