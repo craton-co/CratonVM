@@ -6469,7 +6469,12 @@ pub(crate) fn native_class_get_component_type(
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            if std::env::var("RUSTJVM_DBG_COMPONENT_TYPE").is_ok() {
+                eprintln!("[CT-DBG] getComponentType receiver=null");
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     // Array classes have names like "[I", "[Ljava/lang/String;"
@@ -6498,6 +6503,13 @@ pub(crate) fn native_class_get_component_type(
                 if let Ok(cid) = ctx.ensure_class_initialized(comp_name) {
                     return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
                 }
+                // SB3.2 — when the component class can't be loaded
+                // (e.g. nested array `[[L...;`, or absent class), still
+                // return a non-null Class mirror so callers that assume
+                // `array.componentType() != null` (Spring's
+                // `ConstructorResolver.resolveAutowiredArgument` does
+                // `Array.newInstance(type.componentType(), 0)`) do not NPE.
+                return Ok(Some(Value::Object(Some(synthetic_class_mirror(ctx, comp_name)))));
             }
         }
     }

@@ -7797,6 +7797,9 @@ fn execute_invoke(
                     // (m.getClassLoader() NPEs). Fix lives in
                     // `native-builtins/src/lib.rs` as a native override that
                     // treats null module as `isSystem=true`.
+                    if std::env::var("RUSTJVM_DBG_NPE_INVOKE").is_ok() {
+                        eprintln!("[NPE-DBG] invokevirtual null receiver: {}.{}", method_class_name, method_name);
+                    }
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
