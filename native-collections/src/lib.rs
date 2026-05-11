@@ -1792,43 +1792,11 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
             if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
-                // Debug: log when ApplicationContextFactory key is found
-                if let Some(s) = ctx.read_string(key_ref.unwrap()) {
-                    if s.contains("ApplicationContext") {
-                        eprintln!("[MAP-GET-DBG] found key={}", s);
-                    }
-                }
                 let value = get_node_value(ctx, node);
                 return Ok(Some(value));
             }
         }
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
-    }
-
-    // Debug: log misses for ApplicationContextFactory
-    if let Some(k) = key_ref {
-        if let Some(s) = ctx.read_string(k) {
-            if s.contains("ApplicationContext") {
-                eprintln!("[MAP-GET-DBG] MISS key={} cap={} idx={}", s, cap, idx);
-                // Dump bucket contents for diagnosis
-                let mut n = ctx.get_array_element(buckets, idx);
-                while let Value::Object(Some(nd)) = n {
-                    let nk = get_node_key(ctx, nd);
-                    let nk_str = if let Value::Object(Some(nkr)) = nk {
-                        ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
-                    } else { format!("<non-obj {:?}>", nk) };
-                    eprintln!("[MAP-GET-DBG]   bucket[{}] key={}", idx, nk_str);
-                    n = ctx.get_field(nd, NODE_FIELD_NEXT);
-                }
-                // Also dump slot0..slot3 of node for raw layout inspection
-                let n0 = ctx.get_array_element(buckets, idx);
-                if let Value::Object(Some(nd)) = n0 {
-                    eprintln!("[MAP-GET-DBG]   node slots: s0={:?} s1={:?} s2={:?} s3={:?}",
-                        ctx.get_field(nd, 0), ctx.get_field(nd, 1),
-                        ctx.get_field(nd, 2), ctx.get_field(nd, 3));
-                }
-            }
-        }
     }
 
     Ok(Some(Value::Object(None)))
@@ -2059,18 +2027,6 @@ fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // S111r27: debug — log ALL calls to detect if this native is bypassed
-    static GODCALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !GODCALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[GOD-DBG] getOrDefault native IS running");
-    }
-    if let Some(Value::Object(Some(k))) = args.get(1) {
-        if let Some(s) = ctx.read_string(*k) {
-            if s.contains("ApplicationContext") || s.contains("ContextFactory") {
-                eprintln!("[GOD-DBG] getOrDefault called key={}", s);
-            }
-        }
-    }
     let result = native_map_get(ctx, args)?;
     match result {
         Some(Value::Object(None)) => {
@@ -4117,19 +4073,6 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(Some(Value::Object(None))),
     };
-
-    // Debug: one-shot marker + targeted key log
-    static CIACALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !CIACALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[CIA-DBG] computeIfAbsent native IS running");
-    }
-    if let Value::Object(Some(k)) = key {
-        if let Some(s) = ctx.read_string(k) {
-            if s.contains("ApplicationContextFactory") || s.contains("ApplicationContext") || s.contains("springframework") {
-                eprintln!("[CIA-DBG] computeIfAbsent: key={}", s);
-            }
-        }
-    }
 
     // Check if key already present.
     let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;

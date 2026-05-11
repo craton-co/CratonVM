@@ -6195,9 +6195,12 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/AssertionError",
         "java/lang/MatchException",
     ] {
-        // No-arg exception constructor — message defaults to null;
-        // the instance has no fields to initialize. (NEW-6)
-        registry.register(exc_class, "<init>", "()V", native_noop_with_this);
+        // No-arg exception constructor — message defaults to null, but
+        // `cause` must be initialized to the self-sentinel (`this`) so a
+        // later `initCause()` call succeeds. JDK declares
+        // `private Throwable cause = this;` and our `<init>` shadows the
+        // bytecode that mirrors that initializer.
+        registry.register(exc_class, "<init>", "()V", native_exc_init_noargs);
         registry.register(
             exc_class,
             "<init>",

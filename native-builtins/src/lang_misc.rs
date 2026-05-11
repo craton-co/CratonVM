@@ -31,9 +31,22 @@ fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Va
 }
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
+///
+/// JDK semantics: `Throwable.cause` is declared `private Throwable cause = this;`
+/// — a self-reference sentinel meaning "no cause set yet". A later
+/// `initCause(c)` checks `cause != this` and throws `IllegalStateException`
+/// ("Can't overwrite cause") otherwise. Because we shadow the JDK
+/// `Throwable.<init>` with this native, we must mirror the field
+/// initializer ourselves; without it, the sentinel stays null and the
+/// real-JDK `initCause` bytecode (which still runs because we don't
+/// shadow it on every dispatch path) treats the field as already-set.
 pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let (Some(Value::Object(Some(this))), Some(msg)) = (args.first(), args.get(1)) {
-        write_throwable_detail_message(ctx, *this, *msg);
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Some(msg) = args.get(1) {
+            write_throwable_detail_message(ctx, *this, *msg);
+        }
+        // Initialize cause to self-sentinel so a later initCause() succeeds.
+        write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
     }
     Ok(None)
 }
@@ -55,6 +68,15 @@ pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &
 pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(cause)) = (args.first(), args.get(1)) {
         write_throwable_cause(ctx, *this, *cause);
+    }
+    Ok(None)
+}
+
+/// Exception <init>()V — no message, no cause. Mirrors the JDK
+/// `cause = this` sentinel so later `initCause()` calls succeed.
+pub(crate) fn native_exc_init_noargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
     }
     Ok(None)
 }

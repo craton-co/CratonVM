@@ -11057,7 +11057,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             }.into()),
         };
         let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        eprintln!("[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: {}", dotted);
         let internal = dotted.replace('.', "/");
         match ctx.ensure_class_initialized(&internal) {
             Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
@@ -11072,7 +11071,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             }.into()),
         };
         let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        eprintln!("[LUC-DBG] LaunchedURLClassLoader.loadClass(2) called: {}", dotted);
         let internal = dotted.replace('.', "/");
         match ctx.ensure_class_initialized(&internal) {
             Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
@@ -11187,7 +11185,6 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
         }.into()),
     };
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
-    eprintln!("[CU-DBG] ClassUtils.forName({})", dotted);
 
     // Handle primitive language names (Spring converts these to wrapper classes)
     let prim_class_id: Option<&str> = match dotted.as_str() {
@@ -11221,7 +11218,6 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
     // Regular class name: try direct binary name first (a.b.Foo → a/b/Foo)
     let internal = dotted.replace('.', "/");
     if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        eprintln!("[CU-DBG] ClassUtils.forName({}) -> found direct", dotted);
         return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
     }
 
@@ -11230,16 +11226,13 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
     if let Some(last_slash) = internal.rfind('/') {
         let inner = format!("{}${}", &internal[..last_slash], &internal[last_slash + 1..]);
         if let Ok(cid) = ctx.ensure_class_initialized(&inner) {
-            eprintln!("[CU-DBG] ClassUtils.forName({}) -> found as inner class {}", dotted, inner);
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
     }
 
     if dotted == "jakarta.faces.context.FacesContext" {
-        eprintln!("[CU-DBG] ClassUtils.forName({}) -> not found (null fallback)", dotted);
         return Ok(Some(Value::Object(None)));
     }
-    eprintln!("[CU-DBG] ClassUtils.forName({}) -> ClassNotFoundException", dotted);
     Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into())
 }
 

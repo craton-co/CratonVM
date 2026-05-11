@@ -2649,27 +2649,13 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn NativeContext,
         impl_class: &str,
     ) -> MethodCallResult {
-        eprintln!("[SWS-DBG] getWebServerFactory: allocating {}", impl_class);
         let obj_val = match ctx.new_object(impl_class) {
             Ok(Some(v)) => v,
             Ok(None) => return Ok(Some(Value::Object(None))),
-            Err(e) => {
-                eprintln!("[SWS-DBG] new_object({}) failed: {:?}", impl_class, e);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         // Try to run the no-arg constructor; if it fails, return the raw alloc.
-        match ctx.invoke_special(impl_class, "<init>", "()V", &[obj_val]) {
-            Ok(_) => {
-                eprintln!("[SWS-DBG] {}.<init>() OK", impl_class);
-            }
-            Err(e) => {
-                eprintln!(
-                    "[SWS-DBG] {}.<init>() failed (returning uninit instance): {:?}",
-                    impl_class, e
-                );
-            }
-        }
+        let _ = ctx.invoke_special(impl_class, "<init>", "()V", &[obj_val]);
         Ok(Some(obj_val))
     }
 
@@ -2717,7 +2703,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // container itself won't dispatch requests, but the boot succeeds past
     // the LifecycleException and the demo can advance.
     fn ctx_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        eprintln!("[TOMCAT-DBG] StandardContext lifecycle method intercepted (no-op)");
         Ok(None)
     }
     r.register(
@@ -2755,7 +2740,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // discarded. By making the Callable a no-op that returns null, the
     // Future completes successfully and the engine/host advance.
     fn start_child_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        eprintln!("[TOMCAT-DBG] ContainerBase$StartChild.call() intercepted (no-op)");
         Ok(Some(Value::Object(None)))
     }
     r.register(
@@ -2770,7 +2754,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // doesn't wire up the `holder.group` field. Skip the protocol-handler
     // start; the demo doesn't actually serve requests under CratonVM.
     fn connector_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        eprintln!("[TOMCAT-DBG] Connector.startInternal() intercepted (no-op)");
         Ok(None)
     }
     r.register(
@@ -2796,7 +2779,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // Boot's ServletWebServerApplicationContext.startWebServer with no
     // exception so the demo advances past the embedded-Tomcat phase.
     fn tomcat_web_server_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        eprintln!("[TOMCAT-DBG] TomcatWebServer.start() intercepted (no-op)");
         Ok(None)
     }
     r.register(

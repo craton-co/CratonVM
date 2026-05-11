@@ -539,12 +539,6 @@ fn native_properties_load(
         return Ok(None);
     }
     let parsed = parse_properties(&bytes);
-    eprintln!(
-        "[PROPS-LOAD] obj={:?} stream_bytes={} parsed_entries={}",
-        this,
-        bytes.len(),
-        parsed.len()
-    );
     props_diag_eprintln!("[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes", parsed.len(), bytes.len());
     for (k, v) in &parsed {
         if k.contains("ApplicationContext") || k.contains("ContextFactory") {
@@ -914,12 +908,6 @@ fn build_key_set(
         elems.push(Value::Object(Some(s)));
     }
     let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
-    eprintln!(
-        "[KEYSET-DBG] build_key_set this={:?} keys={} set={:?}",
-        this,
-        snapshot.len(),
-        set
-    );
     set
 }
 
