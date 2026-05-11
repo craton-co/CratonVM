@@ -117,6 +117,11 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         |ctx, _args| get_or_create_default(ctx),
     );
 
+    // Note: `ResourceBundle$Control.getCandidateLocales` override is
+    // registered from `register_essential_natives` (real-JDK path),
+    // since this `register` function is only wired into the synthetic
+    // path. See lib.rs EUREKA-RB-CANDIDATE.
+
     // Neutralise the "should not come down here" fallback by returning null.
     // Most callers handle a null provider gracefully (fall back to defaults
     // or other adapters); an `InternalError` aborts the whole chain.

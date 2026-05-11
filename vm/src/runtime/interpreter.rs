@@ -6053,36 +6053,6 @@ fn execute_instruction(
                             }
                         }
                     }
-                    // NPE-KEY-TRACE: trace "key must not be null" NPEs (always-on, removed after fix)
-                    {
-                        let exc_class_id = shared.heap.class_id_of(obj_ref);
-                        let exc_class_name = shared
-                            .class_manager
-                            .read()
-                            .get_class(exc_class_id)
-                            .map(|c| c.name.clone())
-                            .unwrap_or_default();
-                        if exc_class_name == "java/lang/NullPointerException" {
-                            let msg = match shared.heap.get_field(obj_ref, 0) {
-                                Value::Object(Some(msg_ref)) => {
-                                    read_java_string(&shared.heap, msg_ref).unwrap_or_default()
-                                }
-                                _ => String::new(),
-                            };
-                            if msg.contains("key must not be null") {
-                                eprintln!("[NPE-KEY-TRACE] msg={msg:?}");
-                                for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
-                                    let cn = shared
-                                        .class_manager
-                                        .read()
-                                        .get_class(f.class_id)
-                                        .map(|c| c.name.clone())
-                                        .unwrap_or_default();
-                                    eprintln!("[NPE-KEY-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
-                                }
-                            }
-                        }
-                    }
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
                 }
                 Value::Object(None) => {

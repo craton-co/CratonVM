@@ -5825,6 +5825,99 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+
+    // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
+    // crashes every Spring Boot app (eureka-server is the canonical
+    // reproducer) on `prepareEnvironment` because `LoggerContext.<init>`
+    // is registered as a no-op (see `register_slf4j_natives` /
+    // `register_spring_boot_logback_apply`) and the inherited
+    // `objectMap` / `propertyMap` / `sm` fields stay null. The real-JDK
+    // bytecode for `ContextBase.removeObject` etc. then NPEs as
+    // `Cannot invoke remove on null`. Register null-tolerant stubs on
+    // the concrete `LoggerContext` (receiver class for vtable dispatch)
+    // AND on `ContextBase` (declaring class for slow-path lookup).
+    // Paired with the `check_override` allow-list entries in
+    // `vm/src/vm/vm_exec.rs`.
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "<init>",
+        "()V",
+        native_noop_with_this,
+    );
+    for class_name in [
+        "ch/qos/logback/classic/LoggerContext",
+        "ch/qos/logback/core/ContextBase",
+    ] {
+        registry.register(class_name, "removeObject", "(Ljava/lang/String;)V", native_noop_with_this);
+        registry.register(class_name, "putObject", "(Ljava/lang/String;Ljava/lang/Object;)V", native_noop_with_this);
+        registry.register(class_name, "getObject", "(Ljava/lang/String;)Ljava/lang/Object;", |_, _| Ok(Some(Value::Object(None))));
+        registry.register(class_name, "putProperty", "(Ljava/lang/String;Ljava/lang/String;)V", native_noop_with_this);
+        registry.register(class_name, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", |_, _| Ok(Some(Value::Object(None))));
+    }
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getStatusManager",
+        "()Lch/qos/logback/core/status/StatusManager;",
+        |ctx, _| {
+            let sm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 4);
+            Ok(Some(Value::Object(Some(sm))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/core/BasicStatusManager",
+        "clear",
+        "()V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getTurboFilterList",
+        "()Lch/qos/logback/classic/spi/TurboFilterList;",
+        |ctx, _| {
+            let tfl = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 2);
+            Ok(Some(Value::Object(Some(tfl))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/classic/spi/TurboFilterList",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+        |_, _| Ok(Some(Value::Int(0))),
+    );
+
+    // EUREKA-RB-CANDIDATE: see comment on the `check_override` allow-list
+    // entry in `vm_exec.rs` — `ResourceBundle$Control.getCandidateLocales`
+    // crashes with `NullPointerException: key must not be null` on our
+    // synthetic default Locale (null `baseLocale` field). Return a
+    // single-element `[locale]` list to bypass the buggy path.
+    registry.register(
+        "java/util/ResourceBundle$Control",
+        "getCandidateLocales",
+        "(Ljava/lang/String;Ljava/util/Locale;)Ljava/util/List;",
+        |ctx, args| {
+            let locale = match args.get(2) {
+                Some(Value::Object(Some(l))) => *l,
+                _ => {
+                    return Err(rustjvm_types::error::MethodCallFailed::InternalError(
+                        rustjvm_types::error::VmError::Runtime(
+                            rustjvm_types::error::RuntimeError::NullPointerException {
+                                message: Some(
+                                    "ResourceBundle$Control.getCandidateLocales: locale is null"
+                                        .to_string(),
+                                ),
+                            },
+                        ),
+                    ))
+                }
+            };
+            ctx.invoke(
+                "java/util/Collections",
+                "singletonList",
+                "(Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(locale))],
+            )
+        },
+    );
 }
 
 #[cfg(feature = "synthetic-jdk")]
@@ -24071,10 +24164,10 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
 /// mode by `vm_init.rs`.
 ///
-/// `DefaultLogbackConfiguration.apply(LoggerContext)` sets up the default
-/// logback config (root logger level, console appender, pattern layout, …)
-/// by entering synchronized blocks on internal LoggerContext fields. Because
-/// we serve LoggerContext via `alloc_concurrent_synthetic` (bypassing
+/// `DefaultLogbackConfiguration.apply(LogbackConfigurator)` sets up the
+/// default logback config (root logger level, console appender, pattern
+/// layout, …) by entering synchronized blocks on the wrapped LoggerContext.
+/// Because we serve LoggerContext via `alloc_concurrent_synthetic` (bypassing
 /// logback's `<init>`), the first `monitorenter` at pc=7 NPEs on a null
 /// field. Treat `apply()` as a no-op so the bytecode never runs — logs fall
 /// back to the JVM's default stderr handler, which is fine for Spring Boot
@@ -24084,7 +24177,7 @@ pub fn register_spring_boot_logback_apply(registry: &mut NativeMethodRegistry) {
     registry.register(
         "org/springframework/boot/logging/logback/DefaultLogbackConfiguration",
         "apply",
-        "(Lch/qos/logback/classic/LoggerContext;)V",
+        "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V",
         |_, _| Ok(None),
     );
 }
@@ -24577,6 +24670,118 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lb_factory = "ch/qos/logback/classic/LoggerContext";
     // LoggerContext constructor — no fields to initialize. NEW-6.
     registry.register(lb_factory, "<init>", "()V", native_noop_with_this);
+    // ContextBase.removeObject/putObject/getObject — the LoggerContext
+    // constructor override above leaves the `objectMap`/`propertyMap` fields
+    // null. Spring Boot's `LogbackLoggingSystem.cleanUp` invokes
+    // `ContextBase.removeObject("...")` on every environment-prepared event,
+    // which dereferences the null `objectMap` and NPEs as
+    // `Cannot invoke remove on null`. The NPE is fatal (crashes
+    // SimpleApplicationEventMulticaster), so override these accessors with
+    // no-ops since our synthetic Logback Logger doesn't track per-context
+    // properties anyway.
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "removeObject",
+        "(Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "putObject",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "getObject",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "putProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    // Same overrides on the concrete subclass — invokevirtual resolution
+    // may not see ContextBase methods when the receiver class declares
+    // overrides; register on LoggerContext as well. Also stub the helper
+    // accessors LogbackLoggingSystem.cleanUp() chains through so the
+    // null `objectMap`/`propertyMap` fields are never dereferenced.
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "removeObject",
+        "(Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "putObject",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getObject",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "putProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getStatusManager",
+        "()Lch/qos/logback/core/status/StatusManager;",
+        |ctx, _| {
+            let sm = alloc_concurrent_synthetic(
+                ctx,
+                "ch/qos/logback/core/BasicStatusManager",
+                4,
+            );
+            Ok(Some(Value::Object(Some(sm))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/core/BasicStatusManager",
+        "clear",
+        "()V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getTurboFilterList",
+        "()Lch/qos/logback/classic/spi/TurboFilterList;",
+        |ctx, _| {
+            let tfl = alloc_concurrent_synthetic(
+                ctx,
+                "ch/qos/logback/classic/spi/TurboFilterList",
+                2,
+            );
+            Ok(Some(Value::Object(Some(tfl))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/classic/spi/TurboFilterList",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+        |_, _| Ok(Some(Value::Int(0))),
+    );
     registry.register(lb_factory, "getLogger", "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;", |ctx, args| {
         let name = args.first().copied().unwrap_or(Value::Object(None));
         let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);

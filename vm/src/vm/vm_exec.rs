@@ -5896,6 +5896,52 @@ fn invoke_on_class_shared_inner(
                                 | "lockInterruptibly"
                                 | "isHeldByCurrentThread"
                             ))
+                        // EUREKA-LOGBACK-CLEANUP: LoggerContext.<init> is registered
+                        // as a no-op native, leaving the inherited `objectMap`/
+                        // `propertyMap`/`sm` fields null. Spring Boot's
+                        // `LogbackLoggingSystem.cleanUp` calls
+                        // `loggerContext.removeObject(...)`,
+                        // `loggerContext.getStatusManager().clear()`, and
+                        // `loggerContext.getTurboFilterList().remove(...)` —
+                        // every one of which the real-JDK bytecode services
+                        // by dereferencing a null field, producing the fatal
+                        // `NullPointerException: Cannot invoke remove on null`
+                        // during `prepareEnvironment` on every Spring Boot app
+                        // (eureka-server is the canonical reproducer). Force
+                        // our native stubs (registered in `native-builtins`
+                        // alongside the existing `LoggerContext.<init>` no-op)
+                        // to win so the null fields are never touched.
+                        || (class_name == "ch/qos/logback/classic/LoggerContext"
+                            && matches!(
+                                method_name,
+                                "removeObject" | "putObject" | "getObject"
+                                | "putProperty" | "getProperty"
+                                | "getStatusManager" | "getTurboFilterList"
+                            ))
+                        || (class_name == "ch/qos/logback/core/ContextBase"
+                            && matches!(
+                                method_name,
+                                "removeObject" | "putObject" | "getObject"
+                                | "putProperty" | "getProperty"
+                            ))
+                        || (class_name == "ch/qos/logback/core/BasicStatusManager"
+                            && method_name == "clear")
+                        || (class_name == "ch/qos/logback/classic/spi/TurboFilterList"
+                            && method_name == "remove")
+                        // EUREKA-RB-CANDIDATE: ResourceBundle$Control.getCandidateLocales
+                        // — the real-JDK bytecode passes `locale.getBaseLocale()`
+                        // as a key into `ReferencedKeyMap.computeIfAbsent`. Our
+                        // synthetic default Locale leaves the private `baseLocale`
+                        // field null, so the JDK throws
+                        // `NullPointerException: key must not be null` and that
+                        // NPE crashes early SLF4J/logback bootstrap
+                        // (CachingDateFormatter -> SimpleDateFormat ->
+                        // Calendar.createCalendar -> LocaleProviderAdapter ->
+                        // getCandidateLocales). Force the override registered
+                        // in `locale_bootstrap.rs` which returns a
+                        // `Collections.singletonList(locale)`.
+                        || (class_name == "java/util/ResourceBundle$Control"
+                            && method_name == "getCandidateLocales")
                         // WP4.2: ForkJoinPool.execute(Runnable) /
                         // execute(ForkJoinTask) вЂ” the real JDK bytecode
                         // queues the runnable for a worker thread that
@@ -6539,7 +6585,8 @@ fn invoke_on_class_shared_inner(
                         || (class_name
                             == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
                             && method_name == "apply"
-                            && descriptor == "(Lch/qos/logback/classic/LoggerContext;)V");
+                            && descriptor
+                                == "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
