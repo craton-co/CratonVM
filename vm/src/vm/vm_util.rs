@@ -1636,6 +1636,129 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
         }
+        // R55 (WildFly): `org/jboss/msc/service/ServiceContainerImpl.<clinit>`
+        // can throw NPE downstream of a swallowed `ServiceLogger.<clinit>`
+        // (ServiceLogger.ROOT is left null after its own clinit swallow,
+        // then `invokeinterface ServiceLogger.greeting` on the null ROOT
+        // NPEs at SCI<clinit> pc=70). Our swallow then marks SCI as
+        // initialized with PARTIAL state: SERIAL is set (pc=24, before the
+        // failure point) but `executorSeq` (pc=83, after) and other later
+        // statics are NEVER assigned. Even worse, the post-swallow scan
+        // here can run BEFORE SCI<clinit>'s pc=24 in some interleaved
+        // class-load paths, leaving SERIAL itself null. Downstream
+        // `ServiceContainerImpl.<init>` line 143 does `getstatic SERIAL`
+        // + `invokevirtual AtomicInteger.getAndIncrement` and NPEs with
+        // "Cannot invoke getAndIncrement on null" — the exact failure
+        // that aborts WildFly boot.
+        //
+        // Backfill the two AtomicInteger statics (`SERIAL`, `executorSeq`)
+        // with `new AtomicInteger(1)` instances using the 1-field layout
+        // registered by `native-builtins/src/phases_early.rs` (field 0 =
+        // int value). Only writes when the slot is currently null/zero,
+        // so a successful real-clinit pass is never clobbered.
+        "org/jboss/msc/service/ServiceContainerImpl" => {
+            let ai_name = "java/util/concurrent/atomic/AtomicInteger";
+            let ai_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(ai_name)
+            };
+            let read_static = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, idx,
+                            ));
+                        }
+                        idx += 1;
+                    }
+                }
+                None
+            };
+            if let Some(aid) = ai_id {
+                for fname in ["SERIAL", "executorSeq"] {
+                    let cur = read_static(fname);
+                    let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+                    if needs_fix {
+                        if let Some(ai_obj) = shared.heap.try_alloc_object(aid, 1) {
+                            // Initial value 1, matching SCI<clinit> bytecode
+                            // (`new AtomicInteger / dup / iconst_1 / <init>(I)V`).
+                            shared.heap.set_field(ai_obj, 0, Value::Int(1));
+                            if set_static_by_name(fname, Value::Object(Some(ai_obj))) {
+                                tracing::warn!(
+                                    "Post-clinit fixup: ServiceContainerImpl.{} populated with AtomicInteger(1)",
+                                    fname
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // R55 (WildFly): `org/jboss/msc/service/ServiceLogger.<clinit>` calls
+        // `Logger.getMessageLogger(Class, String)` which throws
+        // IllegalArgumentException in our VM (deep in jboss-logging's
+        // dynamic-proxy plumbing). The swallow then leaves the three static
+        // ServiceLogger fields (ROOT/SERVICE/FAIL) null. Downstream callers
+        // do `getstatic ServiceLogger.ROOT` + `invokeinterface
+        // ServiceLogger.greeting(...)` and NPE — the swallow cascade then
+        // surfaces deeper as the SCI<init> getAndIncrement NPE (because
+        // SCI<clinit> aborts mid-body before pc=24 putstatic SERIAL).
+        //
+        // Backfill with `ServiceLogger_$logger` instances (the concrete
+        // jboss-logging-generated implementation). The `log` instance field
+        // (slot 0) is left null — the only ServiceLogger method invoked from
+        // SCI<clinit> is `greeting()`, which our VM dispatches via the
+        // normal invokeinterface path; the inner `log.logf(...)` is itself
+        // protected by the broader <clinit>-swallow if it NPEs again. The
+        // critical bit is that ROOT/SERVICE/FAIL are non-null so SCI<clinit>
+        // can reach its `putstatic SERIAL` at pc=24.
+        "org/jboss/msc/service/ServiceLogger" => {
+            let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
+            let impl_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(impl_name)
+            };
+            // Fall back to allocating on the interface's own class_id when
+            // the generated impl isn't loaded (defensive — should be rare).
+            let target_id = impl_id.unwrap_or(class_id);
+            // ServiceLogger_$logger has 1 instance field (log:Logger).
+            let num_fields = 1usize;
+            for fname in ["ROOT", "SERVICE", "FAIL"] {
+                // Only fix nulls.
+                let cur = {
+                    let cm = shared.class_manager.read();
+                    cm.get_class(class_id).and_then(|cls| {
+                        let mut idx = 0usize;
+                        for f in &cls.fields {
+                            if f.is_static() {
+                                if &*f.name == fname {
+                                    return Some(super::vm_object::get_static_shared(
+                                        shared, class_id, idx,
+                                    ));
+                                }
+                                idx += 1;
+                            }
+                        }
+                        None
+                    })
+                };
+                let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+                if needs_fix {
+                    if let Some(obj) = shared.heap.try_alloc_object(target_id, num_fields) {
+                        if set_static_by_name(fname, Value::Object(Some(obj))) {
+                            tracing::warn!(
+                                "Post-clinit fixup: ServiceLogger.{} populated with synthetic $logger",
+                                fname
+                            );
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }

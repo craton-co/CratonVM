@@ -3477,17 +3477,50 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field_by_name(this, "contextClassLoader")))
         },
     );
+    // setAccessible(boolean) — must write the JDK `override` field so that
+    // subsequent Method.invoke / Field.get/set / Constructor.newInstance
+    // see the access override (otherwise CGLib's reflective
+    // ClassLoader.defineClass call fails with IllegalAccessException).
+    // Also write the RustJVM extra-slot accessible flag for paths that
+    // consult it directly.
+    fn native_set_accessible_write_override(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let flag = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        ctx.set_field_by_name(this, "override", Value::Int(flag));
+        Ok(None)
+    }
     registry.register(
         "java/lang/reflect/Method",
         "setAccessible",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        native_set_accessible_write_override,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setAccessible",
+        "(Z)V",
+        native_set_accessible_write_override,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "setAccessible",
+        "(Z)V",
+        native_set_accessible_write_override,
     );
     registry.register(
         "java/lang/reflect/AccessibleObject",
         "setAccessible",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        native_set_accessible_write_override,
     );
     registry.register("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = match args.first() {
@@ -23878,6 +23911,61 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register(cb, "start", "()V", |_, _| Ok(None));
     registry.register(cb, "stop", "()V", |_, _| Ok(None));
     registry.register(cb, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // ContextBase.getStatusManager / LoggerContext.getStatusManager — the
+    // real bytecode reads a `BasicStatusManager` field set in <init>,
+    // which is null because we bypass real construction. Spring Boot's
+    // LogbackLoggingSystem.beforeInitialize routes through
+    // `ContextInitializer.statusOnResourceSearch` which calls
+    // `getStatusManager().add(InfoStatus)` — NPE on null. Hand back a
+    // synthetic BasicStatusManager whose interface methods (add/clear/
+    // getCount/getCopyOfStatusList/etc.) are wired to safe no-ops below.
+    fn make_basic_status_manager(ctx: &mut dyn NativeContext) -> Value {
+        let bsm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 0);
+        Value::Object(Some(bsm))
+    }
+    registry.register(cb, "getStatusManager", "()Lch/qos/logback/core/status/StatusManager;", |ctx, _| {
+        Ok(Some(make_basic_status_manager(ctx)))
+    });
+    registry.register(lb_ctx, "getStatusManager", "()Lch/qos/logback/core/status/StatusManager;", |ctx, _| {
+        Ok(Some(make_basic_status_manager(ctx)))
+    });
+
+    // BasicStatusManager surface — interface dispatch resolves to the
+    // receiver's runtime class. Provide no-op natives so any caller
+    // (Spring Boot, Joran, logback internals) that obtains the manager
+    // via getStatusManager() can invoke its methods without NPE.
+    let bsm_cls = "ch/qos/logback/core/BasicStatusManager";
+    registry.register(bsm_cls, "add", "(Lch/qos/logback/core/status/Status;)V", |_, _| Ok(None));
+    registry.register(bsm_cls, "add", "(Lch/qos/logback/core/status/StatusListener;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(bsm_cls, "remove", "(Lch/qos/logback/core/status/StatusListener;)V", |_, _| Ok(None));
+    registry.register(bsm_cls, "clear", "()V", |_, _| Ok(None));
+    registry.register(bsm_cls, "getCount", "()I", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(bsm_cls, "getCopyOfStatusList", "()Ljava/util/List;", |ctx, _| {
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        Ok(Some(Value::Object(Some(list))))
+    });
+    registry.register(bsm_cls, "getCopyOfStatusListenerList", "()Ljava/util/List;", |ctx, _| {
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        Ok(Some(Value::Object(Some(list))))
+    });
+
+    // LoggerContext.getTurboFilterList — Spring Boot's
+    // LogbackLoggingSystem.beforeInitialize line 123 does
+    // `loggerContext.getTurboFilterList().add(FILTER)`. The real field
+    // is null because we bypass logback's <init>. Return a synthetic
+    // TurboFilterList with `add(Object)` no-op so Spring's filter
+    // registration succeeds silently.
+    registry.register(lb_ctx, "getTurboFilterList", "()Lch/qos/logback/classic/spi/TurboFilterList;", |ctx, _| {
+        let tfl = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 0);
+        Ok(Some(Value::Object(Some(tfl))))
+    });
+    let tfl_cls = "ch/qos/logback/classic/spi/TurboFilterList";
+    registry.register(tfl_cls, "add", "(Ljava/lang/Object;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(tfl_cls, "remove", "(Ljava/lang/Object;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(tfl_cls, "clear", "()V", |_, _| Ok(None));
+    registry.register(tfl_cls, "size", "()I", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(tfl_cls, "isEmpty", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
     // Logback Logger surface — paired with the LoggerContext.getLogger
     // native above. Mirrors the SLF4J Logger no-ops registered higher
