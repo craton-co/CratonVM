@@ -4501,8 +4501,40 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
 
 /// Extract elements from a Stream.
 fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    match ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-        Value::Object(Some(arr)) => {
+    // For our synthetic Stream object, field 0 holds an Object[] of elements.
+    // But some streams are real JDK ReferencePipeline instances (returned by
+    // e.g. Spring's MergedAnnotations.stream()). In those cases we can't peek
+    // at field 0 — fall through to materialize via Stream.toArray().
+    let class_id = ctx.class_id_of_object(stream);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_synthetic = class_name == "java/util/stream/Stream";
+    if is_synthetic {
+        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+            let len = ctx.array_length(arr);
+            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        }
+    }
+    // Non-synthetic streams (real JDK ReferencePipeline etc.) require an
+    // `invoke_virtual` call to materialize via `Stream.toArray()` — use
+    // `stream_elements_mut` from a context that has `&mut dyn NativeContext`.
+    Vec::new()
+}
+
+/// Mutable variant of stream_elements that can invoke virtual methods.
+fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    let class_id = ctx.class_id_of_object(stream);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_synthetic = class_name == "java/util/stream/Stream";
+    if is_synthetic {
+        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+            let len = ctx.array_length(arr);
+            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        }
+        return Vec::new();
+    }
+    // Real ReferencePipeline (or any JDK Stream impl): materialize via toArray.
+    match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
             let len = ctx.array_length(arr);
             (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
         }
@@ -4664,9 +4696,22 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         native_stream_max,
     );
 
-    // collect
+    // collect — register on both the Stream interface and JDK's
+    // ReferencePipeline concrete class. JDK code obtained via
+    // `MergedAnnotations.stream()` returns a real `ReferencePipeline`, so
+    // `invokeinterface Stream.collect` dispatches to `ReferencePipeline.collect`
+    // (a JDK method) rather than our `Stream.collect` native. The JDK
+    // implementation would then call `Collector.supplier/accumulator/finisher`
+    // on our synthetic tagged Collector, which has no such methods. Intercept
+    // `ReferencePipeline.collect` so our tagged-Collector dispatch always runs.
     r.register(
         c,
+        "collect",
+        "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+        native_stream_collect,
+    );
+    r.register(
+        "java/util/stream/ReferencePipeline",
         "collect",
         "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
         native_stream_collect,
@@ -5473,6 +5518,25 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;",
         native_collectors_to_collection,
     );
+    // Our synthetic Collector objects need a `characteristics()` method that
+    // returns a non-null Set — JDK stream internals (e.g.
+    // ReduceOps$3.getOpFlags) call `collector.characteristics().contains(UNORDERED)`,
+    // which NPEs if characteristics returns null. We return an empty HashSet so
+    // the stream treats the collector as ordered, matching Collectors.toList /
+    // toCollection semantics for the cases we synthesize.
+    r.register(
+        "java/util/stream/Collector",
+        "characteristics",
+        "()Ljava/util/Set;",
+        native_collector_characteristics,
+    );
+}
+
+fn native_collector_characteristics(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    make_set_of(ctx, &[])
 }
 
 fn native_collectors_to_collection(
@@ -5625,7 +5689,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let elements = stream_elements(ctx, this);
+    let elements = stream_elements_mut(ctx, this);
     let tag = match ctx.get_field(collector, COLLECTOR_FIELD_TAG) {
         Value::Int(t) => t,
         _ => return Ok(Some(Value::Object(None))),
