@@ -725,7 +725,26 @@ impl SharedVm {
         // Registering as synthetic stubs (with empty `methods`) routes
         // dispatch through the native registry on `Enumeration$Impl` instead,
         // where `hasMoreElements`/`nextElement`/`hasNext`/`next` are bound.
-        class_manager.ensure_synthetic_class("java/util/Enumeration$Impl", 2);
+        let enum_impl_id = class_manager.ensure_synthetic_class("java/util/Enumeration$Impl", 2);
+        // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
+        // does `Enumeration<URL> e = classLoader.getResources(...)` (e.g.
+        // `org.apache.commons.logging.LogFactory.getResources`) can perform
+        // the implicit checkcast to `java/util/Enumeration` without throwing
+        // a `ClassCastException`.  We also set `java/lang/Object` as the
+        // superclass so virtual methods like `getClass()` resolve through the
+        // standard chain.
+        let object_id = class_manager
+            .load_class("java/lang/Object")
+            .expect("java/lang/Object must be loadable");
+        let enumeration_id = class_manager
+            .load_class("java/util/Enumeration")
+            .expect("java/util/Enumeration must be loadable");
+        if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
+            cls.superclass = Some(object_id);
+            if !cls.interfaces.contains(&enumeration_id) {
+                cls.interfaces.push(enumeration_id);
+            }
+        }
 
         let gc_backend = match config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
@@ -1202,6 +1221,11 @@ impl SharedVm {
                     }
                     return Ok(Some(Value::Object(Some(target))));
                 }
+                // ArrayList-shaped: use `size` field directly.
+                let size = match ctx.get_field_by_name(this, "size") {
+                    Value::Int(s) => s.max(0) as usize,
+                    _ => 0,
+                };
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
                     _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
