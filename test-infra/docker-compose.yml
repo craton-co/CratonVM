@@ -1,0 +1,37 @@
+version: "3.8"
+# Unified test infra for CratonVM Spring app verification.
+# Test credentials only — never use in production.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: cratonvm-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # Postgres for insurance app (port 54320, db insurance_project, user sa/password)
+  postgres-insurance:
+    image: postgres:15-alpine
+    container_name: cratonvm-pg-insurance
+    ports:
+      - "54320:54320"
+    environment:
+      POSTGRES_DB: insurance_project
+      POSTGRES_USER: sa
+      POSTGRES_PASSWORD: password
+    command: -p 54320
+    restart: unless-stopped
+
+  # Postgres for sportme + letsgo (port 5432, multiple DBs)
+  postgres-main:
+    image: postgres:15-alpine
+    container_name: cratonvm-pg-main
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: root
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
