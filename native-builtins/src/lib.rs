@@ -2470,28 +2470,45 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
         ))))
     });
-    // URL.getPath() on synthetic URL → field 0 (the String path)
+    // URL.getPath() — prefer real-JDK 13-field layout (path@6, file@3,
+    // protocol@0). The earlier synthetic 1-field layout (path@0) is detected
+    // by checking object_num_fields == 1, in which case slot 0 holds the path
+    // string. For multi-field URLs, read by name so we get the path, not the
+    // protocol. R63 (Keycloak): without this, `URL.getPath()` on a PD URL
+    // returns "file" instead of "/C:/.../quarkus-run.jar", and Quarkus's
+    // `Path.of(URLDecoder.decode(getPath(), UTF_8)).getParent().getParent().getParent()`
+    // NPEs at QuarkusEntryPoint.doRun:67.
+    fn url_path_or_file_field(ctx: &mut dyn NativeContext, url: ObjectRef) -> Value {
+        let n = ctx.object_num_fields(url);
+        if n == 1 {
+            // legacy synthetic URL: slot 0 holds the path String.
+            return ctx.get_field(url, 0);
+        }
+        // Real-JDK layout: read by name. Prefer "path"; fall back to "file".
+        let v = ctx.get_field_by_name(url, "path");
+        if let Value::Object(Some(_)) = v { return v; }
+        let v = ctx.get_field_by_name(url, "file");
+        if let Value::Object(Some(_)) = v { return v; }
+        // Last-ditch: slot 3 (file) then slot 6 (path) for the JDK layout.
+        if n > 6 {
+            let v = ctx.get_field(url, 6);
+            if let Value::Object(Some(_)) = v { return v; }
+        }
+        if n > 3 {
+            let v = ctx.get_field(url, 3);
+            if let Value::Object(Some(_)) = v { return v; }
+        }
+        Value::Object(None)
+    }
     registry.register("java/net/URL", "getPath", "()Ljava/lang/String;", |ctx, args| {
         match args.first() {
-            Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 0 {
-                    let v = ctx.get_field(*url, 0);
-                    if let Value::Object(_) = v { return Ok(Some(v)); }
-                }
-                Ok(Some(Value::Object(None)))
-            }
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
             _ => Ok(Some(Value::Object(None))),
         }
     });
     registry.register("java/net/URL", "getFile", "()Ljava/lang/String;", |ctx, args| {
         match args.first() {
-            Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 0 {
-                    let v = ctx.get_field(*url, 0);
-                    if let Value::Object(_) = v { return Ok(Some(v)); }
-                }
-                Ok(Some(Value::Object(None)))
-            }
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
             _ => Ok(Some(Value::Object(None))),
         }
     });

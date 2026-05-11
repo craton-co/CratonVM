@@ -1148,6 +1148,26 @@ fn native_service_container_shutdown(
     Ok(None)
 }
 
+/// R63 (WildFly): `ServiceLogger_$logger.greeting(String)` is the
+/// jboss-logging-generated boot banner emitter. Its bytecode does
+/// `this.log.logf(FQCN, INFO, null, "JBoss MSC version %s", arg)` —
+/// but the `log` instance field is null in our R55 synthetic backfill
+/// of `ServiceLogger.ROOT/SERVICE/FAIL` (we couldn't materialize a
+/// real `org.jboss.logging.Logger` proxy in the post-clinit fixup).
+/// The `invokevirtual Logger.logf` on null then NPEs at line 41
+/// (bci=16) inside `ServiceContainerImpl.<clinit>` line 88. The outer
+/// <clinit> swallow keeps the VM alive but leaves SCI's late statics
+/// unassigned — every subsequent SCI<init> trips on getstatic. By
+/// shimming `greeting` as a no-op we let SCI<clinit> reach all its
+/// `putstatic`s (executorSeq, SERIAL, ...) under its own clinit, so
+/// the R55 post-clinit fixup is no longer the load-bearing path.
+fn native_service_logger_greeting_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
 /// Bind an externally-allocated `ServiceController` Java object to a
 /// controller id (used by T19.2 subsystem glue to hand a pre-built
 /// controller back to the interpreter).
@@ -1251,6 +1271,20 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "complete",
         "()V",
         native_start_context_complete,
+    );
+
+    // R63: silence the boot-banner NPE inside SCI<clinit>. The bytecode
+    // calls `ServiceLogger_$logger.greeting(String)` via invokeinterface
+    // on `ServiceLogger.ROOT`, which dispatches to the generated impl;
+    // the impl's first instruction reads `this.log` (null in our
+    // post-clinit backfill) and NPEs. Returning a no-op from the impl
+    // method lets SCI<clinit> continue past line 88.
+    let logger_impl = "org/jboss/msc/service/ServiceLogger_$logger";
+    r.register(
+        logger_impl,
+        "greeting",
+        "(Ljava/lang/String;)V",
+        native_service_logger_greeting_noop,
     );
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
