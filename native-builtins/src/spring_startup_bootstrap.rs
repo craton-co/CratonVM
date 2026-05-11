@@ -417,43 +417,18 @@ const SICP_CACHE: &str =
     "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache";
 const SICP_NAME: &str = "org/springframework/boot/context/properties/source/ConfigurationPropertyName";
 
-fn enum_prop_source_get_property_names(
-    ctx: &mut dyn NativeContext,
-    src: ObjectRef,
-) -> Option<ObjectRef> {
-    let r = ctx.invoke(
-        "org/springframework/core/env/EnumerablePropertySource",
-        "getPropertyNames",
-        "()[Ljava/lang/String;",
-        &[Value::Object(Some(src))],
-    );
-    match r {
-        Ok(Some(Value::Object(opt))) => opt,
-        _ => None,
-    }
-}
-
 fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // tryUpdate(this, EnumerablePropertySource source) → void
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let source = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
+    let _source = args.get(1).copied();
 
     // Always install an empty Data record so downstream Assert.state(data!=null)
     // never trips.  We accept that this iterable cache contributes no
     // bindings — Binder still queries other property sources directly.
-    let r = install_empty_data(ctx, this);
-    eprintln!(
-        "[SICP-DBG] tryUpdate: source={:?} install_empty_data={:?} data_after={:?}",
-        source.is_some(),
-        r.is_some(),
-        ctx.get_field_by_name(this, "data")
-    );
+    let _ = install_empty_data(ctx, this);
     Ok(None)
 }
 

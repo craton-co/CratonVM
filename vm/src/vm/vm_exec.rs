@@ -4404,7 +4404,19 @@ pub(crate) fn annotation_proxy_invoke_shared(
     // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
     // (`@Filter` attribute is null).
     if method_name == "asMap" {
+        if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+            let desc_obj = shared.heap.get_field(proxy, 0);
+            let desc = if let Value::Object(Some(o)) = desc_obj { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { String::new() };
+            eprintln!("ASMAP-CALL desc={desc}");
+        }
         return annotation_proxy_as_map(shared, thread, proxy, args);
+    }
+    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+        let desc_obj = shared.heap.get_field(proxy, 0);
+        let desc = if let Value::Object(Some(o)) = desc_obj { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { String::new() };
+        if desc.contains("ComponentScan$Filter") || desc.contains("ComponentScan;") {
+            eprintln!("PROXY-CALL desc={desc} method={method_name}");
+        }
     }
     annotation_proxy_dispatch_impl(shared, proxy, method_name, args)
 }
