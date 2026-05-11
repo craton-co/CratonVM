@@ -960,6 +960,22 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()V",
         noop_void,
     );
+
+    // ── ApplicationHome.getStartClass(Enumeration) ────────────────────────
+    // Iterates manifest entries from JAR resources; CratonVM's nested-jar
+    // resource Enumeration loops forever in this path. Returning null is
+    // safe — ApplicationHome interprets it as "couldn't determine start
+    // class" and falls back to a default location.
+    registry.register(
+        "org/springframework/boot/system/ApplicationHome",
+        "getStartClass",
+        "(Ljava/util/Enumeration;)Ljava/lang/Class;",
+        return_null_object,
+    );
+}
+
+fn return_null_object(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
 }
 
 fn noop_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
