@@ -3652,22 +3652,50 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
-            let mut path_str = match ctx.get_field_by_name(uri, "path") {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            if path_str.is_empty() {
-                let full_val = ctx.get_field_by_name(uri, "string");
-                if let Value::Object(Some(s)) = full_val {
-                    let full = ctx.read_string(s).unwrap_or_default();
-                    if let Some(stripped) = full.strip_prefix("file://") {
-                        path_str = stripped.to_string();
-                    } else if let Some(stripped) = full.strip_prefix("file:") {
-                        path_str = stripped.to_string();
-                    } else {
-                        path_str = full;
-                    }
-                }
+            // Resolve the URI's filesystem path. Our URI synthetic has been
+            // populated by `url_parse` (URL.toURI), which writes by INDEX —
+            // not by name — into slots 0..5. The real-JDK `URI` field
+            // layout differs from that index map (URI.path lives at slot 6,
+            // URI.string at slot 18), so `get_field_by_name(uri, "path")`
+            // can return null or stale slots. Read defensively from
+            // multiple sources and strip any `file:` scheme prefix before
+            // handing the result to `p57_to_os_path`.
+            let mut candidates: Vec<String> = Vec::new();
+            // 1. URI.path by name (real-JDK URIs constructed via real-JDK
+            //    URI bytecode populate this; ours don't but cheap to try).
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "path") {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 2. Synthetic URL_FIELD_PATH (slot 3) where url_parse stores
+            //    the post-scheme path for `file:` URIs.
+            if let Value::Object(Some(s)) = ctx.get_field(uri, 3) {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 3. URI.string by name (full URI text on real-JDK URIs).
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 4. Synthetic URL_FIELD_FULL (slot 5) where url_parse stores
+            //    the full URI string. (For our synthetic URIs allocated
+            //    with real-JDK layout this slot may have been clobbered
+            //    with non-string data, so guarded by Object pattern.)
+            if let Value::Object(Some(s)) = ctx.get_field(uri, 5) {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // Pick the first non-empty candidate; strip any `file:` scheme.
+            let mut path_str = String::new();
+            for c in candidates {
+                if c.is_empty() { continue; }
+                let stripped = c
+                    .strip_prefix("file://")
+                    .or_else(|| c.strip_prefix("file:"))
+                    .map(|s| s.to_string())
+                    .unwrap_or(c);
+                // Reject candidates that still look like a URI (contain
+                // ':' before the path's drive letter) — those are stale.
+                if stripped.contains("file:") { continue; }
+                path_str = stripped;
+                break;
             }
             let os_path = p57_to_os_path(&path_str);
             if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {

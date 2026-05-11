@@ -345,9 +345,17 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
             Ok(Some(Value::Object(Some(name_obj))))
         }
         None => {
-            // Primitive mirror or unknown — read name from field 1
+            // Primitive mirror or unknown — read name from field 1.
+            // For array-class mirrors (e.g. `[Ljava/lang/String;`) the internal
+            // name uses '/' separators; `Class.getName()` must report the
+            // dotted form (`[Ljava.lang.String;`) so Spring's
+            // `AnnotationAttributes.assertAttributeType` string-compares
+            // against the expected component class name (which is dotted).
+            // Plain primitive names like "int"/"void" contain no '/', so the
+            // replace is a no-op for them.
             if let Some(prim_name) = mirror_class_name(ctx, this) {
-                let name_obj = ctx.create_string(&prim_name);
+                let dotted_name = prim_name.replace('/', ".");
+                let name_obj = ctx.create_string(&dotted_name);
                 Ok(Some(Value::Object(Some(name_obj))))
             } else {
                 Ok(Some(Value::Object(None)))

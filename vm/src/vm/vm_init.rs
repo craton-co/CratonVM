@@ -1130,17 +1130,78 @@ impl SharedVm {
                 };
                 let template = args.get(1).copied().unwrap_or(Value::Object(None));
                 // Read fields by name so the same native works for
-                // ArrayList, Vector, CopyOnWriteArrayList, etc. Falls
-                // back to iterator-based copy if the receiver isn't an
-                // ArrayList-shaped object (no elementData).
+                // ArrayList, Vector, CopyOnWriteArrayList, etc.
                 let data = match ctx.get_field_by_name(this, "elementData") {
                     Value::Object(Some(arr)) => Some(arr),
                     _ => None,
                 };
-                let size = match ctx.get_field_by_name(this, "size") {
-                    Value::Int(s) => s.max(0) as usize,
-                    _ => 0,
-                };
+                // S111r32 — when the receiver lacks `elementData` (e.g.
+                // EnumSet, HashSet, TreeSet, IdentityHashMap.values()),
+                // we MUST NOT take the ArrayList shortcut: it would read
+                // `size`=0 and silently return an empty array, dropping
+                // the real elements. Iterate via the receiver's own
+                // `iterator()` instead — same shape as
+                // `AbstractCollection.toArray(T[])` in the JDK.
+                if data.is_none() {
+                    // Iterator-based copy using virtual dispatch on the
+                    // receiver's actual class.
+                    let recv_cid = ctx.class_id_of_object(this);
+                    let recv_class = ctx
+                        .class_name_of_id(recv_cid)
+                        .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
+                    let size_v = ctx.invoke(
+                        &recv_class,
+                        "size",
+                        "()I",
+                        &[Value::Object(Some(this))],
+                    )?;
+                    let size = match size_v {
+                        Some(Value::Int(n)) => n.max(0) as usize,
+                        _ => 0,
+                    };
+                    let target = match template {
+                        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+                    };
+                    let it_v = ctx.invoke(
+                        &recv_class,
+                        "iterator",
+                        "()Ljava/util/Iterator;",
+                        &[Value::Object(Some(this))],
+                    )?;
+                    let it = match it_v {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => return Ok(Some(Value::Object(Some(target)))),
+                    };
+                    let it_cid = ctx.class_id_of_object(it);
+                    let it_class = ctx
+                        .class_name_of_id(it_cid)
+                        .unwrap_or_else(|| "java/util/Iterator".to_string());
+                    for i in 0..size {
+                        let has = ctx.invoke(
+                            &it_class,
+                            "hasNext",
+                            "()Z",
+                            &[Value::Object(Some(it))],
+                        )?;
+                        if !matches!(has, Some(Value::Int(1))) {
+                            break;
+                        }
+                        let nxt = ctx.invoke(
+                            &it_class,
+                            "next",
+                            "()Ljava/lang/Object;",
+                            &[Value::Object(Some(it))],
+                        )?;
+                        let v = nxt.unwrap_or(Value::Object(None));
+                        ctx.set_array_element(target, i, v);
+                    }
+                    let target_len = ctx.array_length(target);
+                    if target_len > size {
+                        ctx.set_array_element(target, size, Value::Object(None));
+                    }
+                    return Ok(Some(Value::Object(Some(target))));
+                }
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
                     _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),

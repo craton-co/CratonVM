@@ -4475,6 +4475,20 @@ fn annotation_proxy_as_map(
         shared.heap.alloc_object(cid, 4)
     };
 
+    // S111r32 — detect Adapt.CLASS_TO_STRING in the varargs Adapt[] arg
+    // (`args[1]`) so we can convert `Class` / `Class[]` element values to
+    // their FQN String / String[] representation. Spring's
+    // `ConfigurationWarningsApplicationContextInitializer$ComponentScanPackageCheck`
+    // calls `AnnotationMetadata.getAnnotationAttributes(name, true)` (the
+    // `classValuesAsString=true` overload), which routes through
+    // `AnnotatedElementUtils.getMergedAnnotationAttributes` → `asMap(...,
+    // CLASS_TO_STRING)`, then immediately calls
+    // `attrs.getStringArray("basePackageClasses")`. If we leave the raw
+    // `Class[]` in the map, `AnnotationAttributes.assertAttributeType`
+    // throws `IllegalArgumentException: Attribute 'basePackageClasses' is
+    // of type Class[], but String[] was expected`.
+    let class_to_string = adapt_array_contains(shared, args.get(1).copied(), "CLASS_TO_STRING");
+
     let names_arr = match shared.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(Some(dest_map)))),
@@ -4494,6 +4508,12 @@ fn annotation_proxy_as_map(
             Err(_) => continue,
         };
         let adapted = adapt_annotation_value_for_map(shared, thread, elem_val, args)?;
+        // Apply CLASS_TO_STRING: replace Class / Class[] with String / String[].
+        let adapted = if class_to_string {
+            convert_class_values_to_strings(shared, adapted)
+        } else {
+            adapted
+        };
         let dest_cid = shared.heap.class_id_of(dest_map);
         let _ = invoke_on_class_shared(
             shared,
@@ -4505,6 +4525,128 @@ fn annotation_proxy_as_map(
         )?;
     }
     Ok(Some(Value::Object(Some(dest_map))))
+}
+
+/// Test whether the given (possibly-null) Adapt[] varargs array contains
+/// an enum constant whose `name` slot equals `target_name`.
+fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: &str) -> bool {
+    use crate::memory::heap::ObjectKind;
+    let arr_obj = match arr_val {
+        Some(Value::Object(Some(o))) => o,
+        _ => return false,
+    };
+    if shared.heap.kind_of(arr_obj) != ObjectKind::Array {
+        return false;
+    }
+    let n = shared.heap.array_length(arr_obj);
+    for i in 0..n {
+        let elem = match shared.heap.get_array_element(arr_obj, i) {
+            Ok(Value::Object(Some(o))) => o,
+            _ => continue,
+        };
+        // Enum constant: slot 0 = name String (java.lang.Enum layout).
+        if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, 0) {
+            if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+                if s == target_name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// If `val` is a `Class` mirror, return a String holding its FQN (dotted).
+/// If `val` is a `Class[]`, return a fresh `String[]` of FQNs. Otherwise
+/// return `val` unchanged. Implements the `Adapt.CLASS_TO_STRING` semantics
+/// for `MergedAnnotation.asMap` so that downstream
+/// `AnnotationAttributes.getStringArray("basePackageClasses")` succeeds.
+fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
+    use crate::memory::heap::ObjectKind;
+    let obj = match val {
+        Value::Object(Some(o)) => o,
+        _ => return val,
+    };
+    let kind = shared.heap.kind_of(obj);
+    if kind == ObjectKind::Object {
+        // Detect Class mirror: class_id resolves to java/lang/Class, or the
+        // object has a non-null `name` slot we can convert. The simplest
+        // detection: the class name of `obj` is "java/lang/Class".
+        let cid = shared.heap.class_id_of(obj);
+        let class_name = shared
+            .class_manager
+            .read()
+            .get_class(cid)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        if class_name == "java/lang/Class" {
+            let fqn = class_mirror_fqn(shared, obj);
+            return Value::Object(Some(super::create_java_string(shared, &fqn)));
+        }
+        return val;
+    }
+    if kind == ObjectKind::Array {
+        // Reference array whose component class is `java/lang/Class`.
+        let comp_cid = shared.heap.class_id_of(obj);
+        let comp_name = shared
+            .class_manager
+            .read()
+            .get_class(comp_cid)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        if comp_name == "java/lang/Class" {
+            let n = shared.heap.array_length(obj);
+            let str_cid = shared
+                .load_class_concurrent("java/lang/String")
+                .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            let new_arr = shared.heap.alloc_array(
+                str_cid,
+                rustjvm_types::ArrayElementType::Reference,
+                n,
+            );
+            for i in 0..n {
+                let elem = shared
+                    .heap
+                    .get_array_element(obj, i)
+                    .unwrap_or(Value::Object(None));
+                let s_val = match elem {
+                    Value::Object(Some(m)) => {
+                        let fqn = class_mirror_fqn(shared, m);
+                        Value::Object(Some(super::create_java_string(shared, &fqn)))
+                    }
+                    _ => Value::Object(None),
+                };
+                shared.heap.set_array_element(new_arr, i, s_val).ok();
+            }
+            return Value::Object(Some(new_arr));
+        }
+        return val;
+    }
+    val
+}
+
+/// Read the FQN (dotted) name out of a Class mirror. Tries the
+/// reverse-lookup map first (`class_id_from_mirror`); falls back to slot 1
+/// (the JDK 25 Class layout's `name` field) for primitive / array mirrors
+/// allocated via `primitive_class_mirror`.
+fn class_mirror_fqn(shared: &SharedVm, mirror: ObjectRef) -> String {
+    let mirror_cid = super::class_id_from_mirror(shared, mirror);
+    if let Some(cid) = mirror_cid {
+        if let Some(name) = shared
+            .class_manager
+            .read()
+            .get_class(cid)
+            .map(|c| c.name.to_string())
+        {
+            return name.replace('/', ".");
+        }
+    }
+    if let Value::Object(Some(name_obj)) = shared.heap.get_field(mirror, 1) {
+        if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+            return s.replace('/', ".");
+        }
+    }
+    String::new()
 }
 
 /// Recursively adapt an annotation element value: nested annotation
