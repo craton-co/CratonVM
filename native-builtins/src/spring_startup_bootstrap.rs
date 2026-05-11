@@ -937,4 +937,31 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;Lorg/springframework/boot/context/config/Profiles;)Ljava/util/List;",
         standard_config_data_resolve_profile_specific,
     );
+
+    // ── Hibernate Validator preinitialization shim ─────────────────────────
+    // Spring Boot's `BackgroundPreinitializer$ValidationInitializer.run()`
+    // calls into Hibernate Validator's `buildValidatorFactory()`, which
+    // recursively initialises `ValueExtractorManager`.  In CratonVM's
+    // partial bootstrap, `ValueExtractorManager.<clinit>` throws an
+    // `IllegalArgumentException`, which becomes an `ExceptionInInitializerError`
+    // and is swallowed by BackgroundPreinitializer — but the swallow happens
+    // only after a lot of wasted work and noisy diagnostics.  More importantly,
+    // any later code that touches a Hibernate Validator class hits a
+    // `NoClassDefFoundError` because the previous <clinit> failure poisoned
+    // the class.
+    //
+    // The preinitializer is purely an optimisation — Spring Boot tolerates a
+    // null validator and will initialise it lazily on first use.  We stub
+    // ValidationInitializer.run() as a no-op so the entire validator chain
+    // is skipped at preinit time.
+    registry.register(
+        "org/springframework/boot/autoconfigure/BackgroundPreinitializer$ValidationInitializer",
+        "run",
+        "()V",
+        noop_void,
+    );
+}
+
+fn noop_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
 }

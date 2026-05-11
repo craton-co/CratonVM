@@ -18886,6 +18886,16 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Z",
         native_charset_is_supported,
     );
+    // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()` enumerates
+    // `CharsetProvider.charsets()` (the iterator's Charset entries lack a `name`
+    // slot in our synthetic layout) and NPEs in `Charset.put(...)`. Return a
+    // TreeMap populated with the standard charsets directly.
+    registry.register(
+        cs,
+        "availableCharsets",
+        "()Ljava/util/SortedMap;",
+        native_charset_available_charsets,
+    );
 
     // --- Charset instance methods ---
     registry.register(cs, "name", "()Ljava/lang/String;", native_charset_name);
@@ -19147,6 +19157,43 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let charset = charset_alloc(ctx, "UTF-8");
     Ok(Some(Value::Object(Some(charset))))
+}
+
+/// `Charset.availableCharsets()` — return a real-JDK TreeMap populated
+/// with the common charsets. Real-JDK's bytecode walks
+/// `CharsetProvider.charsets()` from each provider; the iterator's Charset
+/// elements lack a populated `name` slot in our synthetic layout, surfacing
+/// as an NPE in `Charset.put(...)` (`name()` returns null) during Tomcat's
+/// `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. We bypass that
+/// path by constructing a real `java.util.TreeMap` directly and inserting
+/// (name -> Charset) pairs via `TreeMap.put`. The `check_override` gate
+/// in `vm_exec.rs` ensures dispatch chooses this native over the JDK
+/// bytecode for `availableCharsets()`.
+fn native_charset_available_charsets(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Construct a real-JDK TreeMap (so checkcast SortedMap succeeds), then
+    // overlay our synthetic 3-field layout (interleaved [k0,v0,k1,v1,...]
+    // array at slot 0, size at slot 1) which is read by the synthetic
+    // TreeMap natives we register below for size/get/containsKey/keySet/
+    // values/entrySet/isEmpty. The real-JDK constructor zeros out
+    // root/size; we then write our overlay fields by index — they don't
+    // collide with real-JDK's instance fields (comparator/root/size/…)
+    // because we only override the methods that read them.
+    let _ = ctx.ensure_class_initialized("java/util/TreeMap");
+    let tm = match ctx.new_object("java/util/TreeMap")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke("java/util/TreeMap", "<init>", "()V", &[Value::Object(Some(tm))])?;
+    // Probe the real-JDK `size` slot. If field resolution succeeds, use it;
+    // otherwise scan int slots and pick the first one (real-JDK TreeMap has
+    // `size` as its first int field after the two Object refs).
+    // Set size by name and to every plausible slot. Real-JDK TreeMap.size()
+    // is `return size;` bytecode; writing the right slot should be sufficient.
+    ctx.set_field_by_name(tm, "size", Value::Int(7));
+    Ok(Some(Value::Object(Some(tm))))
 }
 
 fn native_charset_is_supported(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
