@@ -396,6 +396,7 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
+    eprintln!("BI-REG: register_essential_natives ENTRY");
     let before = registry.len();
 
     // RBIGDEC.1 — BigInteger / BigDecimal arithmetic + toString overrides.
@@ -7750,7 +7751,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     register_phase71_natives(registry);
 
     // --- Phase 72: Preferences, Beans, JNDI, Datagram, HttpServer, ServerSocket extras ---
+    eprintln!("BI-REG: lib.rs about to call register_phase72_natives");
     register_phase72_natives(registry);
+    eprintln!("BI-REG: lib.rs after register_phase72_natives");
 
     // --- NEW-15: Virtual threads / Loom (JEP 444 / 491) ---
     // Continuation, ContinuationScope, ForkJoinPool.commonPool.

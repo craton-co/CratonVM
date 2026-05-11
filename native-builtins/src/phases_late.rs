@@ -33976,8 +33976,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
+    eprintln!("BI-REG: entering register_phase72_natives");
     register_p72_preferences(registry);
+    eprintln!("BI-REG: about to call register_p72_beans");
     register_p72_beans(registry);
+    eprintln!("BI-REG: finished register_p72_beans");
     register_p72_naming(registry);
     register_p72_datagram(registry);
     register_datagram_channel(registry);
@@ -34762,6 +34765,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 
     // Introspector
     let intro = "java/beans/Introspector";
+    eprintln!("BI-REG: registering Introspector.getBeanInfo natives");
     r.register(
         intro,
         "getBeanInfo",

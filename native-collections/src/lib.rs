@@ -1593,6 +1593,41 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // S111r34: when the receiver is a LinkedHashMap (or subclass like
+    // `org/springframework/core/annotation/AnnotationAttributes`),
+    // delegate to `native_lhm_put` so that subsequent `LinkedHashMap.get`
+    // calls — which JDK25 overrides and we redirect to `native_lhm_get`
+    // (reads from the LHM overlay) — find the entries. Without this
+    // redirect, the put writes to slot-0-based storage which the LHM
+    // `get` native cannot see, and Spring's `AnnotationAttributes.get(...)`
+    // returns null for every key written via `TypeMappedAnnotation.asMap`.
+    // Surfaces as `IllegalArgumentException: Attribute 'type' not found
+    // in attributes for annotation [...ComponentScan$Filter]` in
+    // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`.
+    let cid = ctx.class_id_of_object(this);
+    if let Some(name) = ctx.class_name_of_id(cid) {
+        if name != "java/util/HashMap" {
+            // Walk parent chain to detect LinkedHashMap ancestry.
+            let mut cur = cid;
+            let mut is_lhm = false;
+            while let Some(n) = ctx.class_name_of_id(cur) {
+                if n == "java/util/LinkedHashMap" {
+                    is_lhm = true;
+                    break;
+                }
+                if n == "java/util/HashMap" || n == "java/lang/Object" {
+                    break;
+                }
+                match ctx.superclass_of(cur) {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+            if is_lhm {
+                return native_lhm_put(ctx, args);
+            }
+        }
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
@@ -1612,22 +1647,13 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // deep in Spring's bean factory).
     let (initial_buckets, size, cap) = map_state(ctx, this);
     if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
-        if std::env::var("RUSTJVM_IAE_TRACE").is_ok() && initial_buckets.is_none() {
-            let cn = ctx.class_name_of_id(ctx.class_id_of_object(this)).unwrap_or_default();
-            eprintln!("[MAP-PUT-INIT-RESIZE] this={:?} class={cn} size={size} cap={cap}", this);
-        }
         map_resize(ctx, this);
     }
 
     let (buckets, size, cap) = map_state(ctx, this);
     let buckets = match buckets {
         Some(b) => b,
-        None => {
-            if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
-                eprintln!("[MAP-PUT-NO-BUCKETS-AFTER-RESIZE] this={:?}", this);
-            }
-            return Ok(Some(Value::Object(None)));
-        }
+        None => return Ok(Some(Value::Object(None))),
     };
 
     let idx = map_bucket_index(hash, cap);
@@ -1729,35 +1755,9 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
     }
 
-    // Debug: log misses for ApplicationContextFactory or "type"
+    // Debug: log misses for ApplicationContextFactory
     if let Some(k) = key_ref {
         if let Some(s) = ctx.read_string(k) {
-            if std::env::var("RUSTJVM_IAE_TRACE").is_ok() && s == "type" {
-                eprintln!("[MAP-GET-TYPE-MISS] this={:?} cap={} idx={} hash={}", this, cap, idx, hash);
-                let mut n = ctx.get_array_element(buckets, idx);
-                while let Value::Object(Some(nd)) = n {
-                    let nk = get_node_key(ctx, nd);
-                    let nk_str = if let Value::Object(Some(nkr)) = nk {
-                        ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
-                    } else { format!("<non-obj {:?}>", nk) };
-                    let nh = ctx.get_field(nd, NODE_FIELD_HASH);
-                    eprintln!("[MAP-GET-TYPE-MISS]   bucket[{}] key={} hash={:?}", idx, nk_str, nh);
-                    n = ctx.get_field(nd, NODE_FIELD_NEXT);
-                }
-                // Also dump ALL buckets to see where "type" might be
-                for i in 0..(cap as usize) {
-                    let mut n = ctx.get_array_element(buckets, i);
-                    while let Value::Object(Some(nd)) = n {
-                        let nk = get_node_key(ctx, nd);
-                        let nk_str = if let Value::Object(Some(nkr)) = nk {
-                            ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
-                        } else { format!("<non-obj {:?}>", nk) };
-                        let nh = ctx.get_field(nd, NODE_FIELD_HASH);
-                        eprintln!("[MAP-GET-TYPE-MISS]   ALL bucket[{}] key={} hash={:?}", i, nk_str, nh);
-                        n = ctx.get_field(nd, NODE_FIELD_NEXT);
-                    }
-                }
-            }
             if s.contains("ApplicationContext") {
                 eprintln!("[MAP-GET-DBG] MISS key={} cap={} idx={}", s, cap, idx);
                 // Dump bucket contents for diagnosis
