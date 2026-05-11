@@ -320,6 +320,38 @@ pub(crate) fn native_module_get_layer(
     Ok(Some(Value::Object(Some(layer))))
 }
 
+/// `ModuleLayer.modules()` — return an empty `HashSet<Module>`.
+///
+/// JDK bytecode for `ModuleLayer.modules()` dereferences an internal
+/// `nameToModule` field that our synthetic boot layer never populates,
+/// producing "Cannot invoke values on null". Spring 6/Boot 4's resource
+/// scanner tolerates an empty module set, so this is the safest answer
+/// in real-JDK mode where we don't model JPMS module graphs.
+pub(crate) fn native_module_layer_modules(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+    ctx.set_field(set, 0, Value::Object(None)); // backing array (empty)
+    ctx.set_field(set, 1, Value::Int(0));       // size
+    ctx.set_field(set, 2, Value::Int(16));      // capacity marker
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// `ModuleLayer.configuration()` — return a synthetic `Configuration`.
+///
+/// Spring's `findAllModulePathResources` enumerates modules via
+/// `boot().configuration().modules()`. We don't model JPMS configurations,
+/// so a synthetic one-field `Configuration` is enough — its `modules()`
+/// override returns an empty Set.
+pub(crate) fn native_module_layer_configuration(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 1);
+    Ok(Some(Value::Object(Some(cfg))))
+}
+
 /// Install every JDKSpecific boot-path native this module owns.
 pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     let ml = "java/lang/ModuleLayer";
@@ -333,6 +365,33 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "findModule",
         "(Ljava/lang/String;)Ljava/util/Optional;",
         native_module_layer_find_module,
+    );
+    // Spring's `PathMatchingResourcePatternResolver.findAllModulePathResources`
+    // calls `ModuleLayer.boot().modules()` to enumerate JPMS modules. The JDK
+    // bytecode for `ModuleLayer.modules()` reads `this.nameToModule.values()`,
+    // which NPEs on our synthetic boot layer because we never populate that
+    // field. Return an empty HashSet: Spring tolerates an empty module set
+    // (classpath-jar resources still resolve through other code paths).
+    registry.register(ml, "modules", "()Ljava/util/Set;", native_module_layer_modules);
+    // Spring 6/Boot 4's modulepath scanner actually invokes
+    // `ModuleLayer.boot().configuration().modules()` (a `Set<ResolvedModule>`).
+    // The JDK bytecode for `ModuleLayer.configuration()` reads `this.cf`,
+    // which is null on our synthetic layer — surfacing as the visible
+    // "Cannot invoke modules on null" NPE. Return an empty synthetic
+    // `Configuration` whose `modules()` is overridden below.
+    registry.register(
+        ml,
+        "configuration",
+        "()Ljava/lang/module/Configuration;",
+        native_module_layer_configuration,
+    );
+
+    // java.lang.module.Configuration.modules() — return an empty Set<ResolvedModule>.
+    registry.register(
+        "java/lang/module/Configuration",
+        "modules",
+        "()Ljava/util/Set;",
+        native_module_layer_modules,
     );
 
     let m = "java/lang/Module";
