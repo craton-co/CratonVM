@@ -2794,6 +2794,59 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
                     let value = frame.stack.pop_unchecked();
+                    if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
+                        let cn = frame.class_name();
+                        let mn = frame.method_name();
+                        let interesting = (cn.contains("FilteringSpringBootCondition") && mn == "match")
+                            || (cn.contains("ImportCandidates") && (mn == "getCandidates" || mn == "readCandidateConfigurations" || mn == "load" || mn == "stripComment"))
+                            || (cn.contains("AutoConfigurationImportSelector") && (mn == "removeDuplicates" || mn == "getCandidateConfigurations" || mn == "getAutoConfigurationImportFilters" || mn == "getExclusions"))
+                            || (cn.contains("ConfigurationClassFilter") && mn == "filter")
+                            || (cn.contains("AutoConfigurationEntry") && mn == "getConfigurations");
+                        if interesting {
+                            let extra = match &value {
+                                Value::Object(Some(o)) => {
+                                    let r = *o;
+                                    let cid = shared.heap.class_id_of(r);
+                                    let kind = shared.heap.kind_of(r);
+                                    // Try to read as String first
+                                    if let Some(s) = crate::vm::read_java_string(&shared.heap, r) {
+                                        format!(" cid={:?} kind={:?} STRING=\"{}\"", cid, kind, s)
+                                    } else if matches!(kind, crate::memory::heap::ObjectKind::Object) {
+                                        // Read ArrayList-style 'size' field heuristically — sample
+                                        // field 0..3 to find any Int-typed field
+                                        let mut fields_desc = String::new();
+                                        for fi in 0..6usize {
+                                            let v = shared.heap.get_field(r, fi);
+                                            fields_desc.push_str(&format!("f{}={:?} ", fi, v));
+                                        }
+                                        format!(" cid={:?} kind={:?} fields=[{}]", cid, kind, fields_desc)
+                                    } else {
+                                        // Try array
+                                        let len = shared.heap.array_length(r);
+                                        let mut samples = String::new();
+                                        let to_read = len.min(20);
+                                        for i in 0..to_read {
+                                            match shared.heap.get_array_element(r, i) {
+                                                Ok(Value::Int(v)) => samples.push_str(&format!("{},", v)),
+                                                Ok(Value::Object(Some(oo))) => {
+                                                    if let Some(s) = crate::vm::read_java_string(&shared.heap, oo) {
+                                                        samples.push_str(&format!("\"{}\",", s));
+                                                    } else {
+                                                        samples.push_str("O,");
+                                                    }
+                                                }
+                                                Ok(Value::Object(None)) => samples.push_str("N,"),
+                                                _ => samples.push('?'),
+                                            }
+                                        }
+                                        format!(" cid={:?} kind={:?} array_len={} samples=[{}]", cid, kind, len, samples)
+                                    }
+                                }
+                                _ => String::new(),
+                            };
+                            eprintln!("[SBF-RET] {}.{} -> {:?}{}", cn, mn, value, extra);
+                        }
+                    }
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent
                         pop_and_recycle_frame(shared, thread);
@@ -4286,6 +4339,23 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
         let method_id = synth_method_id(frame_ref);
         let tid = thread.thread_id.0;
         crate::runtime::jvmti::fire_method_entry(tid, method_id);
+    }
+    if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
+        let last = thread.frames.len() - 1;
+        let frame_ref = &thread.frames[last];
+        let cn = frame_ref.class_name();
+        let mn = frame_ref.method_name();
+        if cn.contains("FilteringSpringBootCondition")
+            || cn.contains("OnClassCondition")
+            || cn.contains("OnBeanCondition")
+            || cn.contains("OnWebApplicationCondition")
+            || cn.contains("AutoConfigurationImportSelector")
+            || cn.contains("AutoConfigurationImportFilter")
+            || (cn.contains("SpringFactoriesLoader") && (mn == "loadFactories" || mn == "loadFactoryNames" || mn == "load"))
+            || cn.contains("ImportCandidates")
+        {
+            eprintln!("[SBF-TRACE] enter {}.{}{}", cn, mn, frame_ref.method_descriptor());
+        }
     }
 }
 

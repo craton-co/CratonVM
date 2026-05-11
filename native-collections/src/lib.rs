@@ -7426,14 +7426,20 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
 
-    // Try to read source as ArrayList
-    let (src_data, src_size) = al_state(ctx, source);
+    // Round 49 fix: route through `collect_collection_elements` so we
+    // honour every wrapper layout (ArrayList, Arrays$ArrayList,
+    // LinkedList, HashSet/LinkedHashSet, Collections$UnmodifiableList,
+    // …) — not just the synthetic ArrayList layout.  Previously
+    // `new LinkedHashSet(unmodifiableList)` (the dominant Spring Boot
+    // pattern in `AutoConfigurationImportSelector.removeDuplicates`,
+    // since `ImportCandidates.getCandidates()` returns
+    // `Collections.unmodifiableList(arrayList)`) silently produced an
+    // empty set — wiping every auto-configuration before filtering and
+    // surfacing as `MissingWebServerFactoryBeanException` at boot.
+    let elems = collect_collection_elements(ctx, source);
     let sentinel = Value::Int(1);
-    if let (Some(arr), size) = (src_data, src_size) {
-        for i in 0..size as usize {
-            let val = ctx.get_array_element(arr, i);
-            native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
-        }
+    for val in elems {
+        native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
     }
 
     Ok(None)
@@ -10974,6 +10980,30 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    // Round 49 fix: Collections$UnmodifiableCollection / $UnmodifiableList
+    // wrap their backing collection in field `c`.  Recurse into that to
+    // surface the wrapped list's elements — without this, callers like
+    // `new LinkedHashSet(unmodifiableList)` (Spring's
+    // `AutoConfigurationImportSelector.removeDuplicates`) silently see
+    // zero elements and the auto-configuration pipeline collapses.
+    let cid = ctx.class_id_of_object(coll);
+    if let Some(cls_name) = ctx.class_name_of_id(cid) {
+        if cls_name.starts_with("java/util/Collections$Unmodifiable")
+            || cls_name.starts_with("java/util/Collections$Synchronized")
+            || cls_name.starts_with("java/util/Collections$Checked")
+            || cls_name == "java/util/Collections$SingletonList"
+            || cls_name == "java/util/Collections$SingletonSet"
+        {
+            if let Value::Object(Some(inner)) = ctx.get_field_by_name(coll, "c") {
+                return collect_collection_elements(ctx, inner);
+            }
+            // SingletonList stores the element in field `element`.
+            if let Value::Object(Some(_)) = ctx.get_field_by_name(coll, "element") {
+                let v = ctx.get_field_by_name(coll, "element");
+                return vec![v];
+            }
+        }
+    }
     // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
     // field-index resolver so we honour the real-JDK layout
     // (`modCount`/`elementData`/`size` slots from AbstractList/ArrayList) —
