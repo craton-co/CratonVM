@@ -23991,16 +23991,33 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     });
     registry.register(lb_lg, "isTraceEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
     registry.register(lb_lg, "isDebugEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(lb_lg, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(lb_lg, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
-    registry.register(lb_lg, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isTraceEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isDebugEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isInfoEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isWarnEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isErrorEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(1))));
     registry.register(lb_lg, "setLevel", "(Lch/qos/logback/classic/Level;)V", |_, _| Ok(None));
+    registry.register(lb_lg, "getLevel", "()Lch/qos/logback/classic/Level;", |_, _| Ok(Some(Value::Object(None))));
+    registry.register(lb_lg, "getEffectiveLevel", "()Lch/qos/logback/classic/Level;", |_, _| Ok(Some(Value::Object(None))));
+    // Plain (String,...) and Marker-variant overloads. Spring Boot's
+    // LogAdapter and direct logback-typed callers dispatch through any
+    // of these; all are routed to a no-op so we never enter logback's
+    // internal filterAndLog path (where filter/appender lists are null
+    // because we bypass logback's <init>).
     for sig in [
         "(Ljava/lang/String;)V",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;[Ljava/lang/Object;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)V",
     ] {
         registry.register(lb_lg, "trace", sig, slf4j_noop);
         registry.register(lb_lg, "debug", sig, slf4j_noop);
@@ -24008,6 +24025,47 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         registry.register(lb_lg, "warn", sig, slf4j_noop);
         registry.register(lb_lg, "error", sig, slf4j_noop);
     }
+    // LocationAwareLogger.log(Marker, fqcn, level, msg, args, t). Spring
+    // Boot's slf4j adapter routes here, which then internally calls
+    // filterAndLog_0_Or3Plus → NPE on our synthetic Logger (filter/
+    // appender lists are null). Stub to no-op so we never enter that
+    // path.
+    registry.register(
+        lb_lg,
+        "log",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;ILjava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    // Private filterAndLog_* helpers. Registered as belt-and-suspenders:
+    // if any other Logger entry point we missed reaches into filterAndLog
+    // directly, this short-circuits before touching the null filter/
+    // appender lists on our synthetic Logger.
+    registry.register(
+        lb_lg,
+        "filterAndLog_0_Or3Plus",
+        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    registry.register(
+        lb_lg,
+        "filterAndLog_1",
+        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    registry.register(
+        lb_lg,
+        "filterAndLog_2",
+        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    // AppenderAttachableImpl-style methods that Spring Boot's
+    // LoggingSystem may invoke during bootstrap. Return safe defaults
+    // so callers that walk appenders see an empty list.
+    registry.register(lb_lg, "addAppender", "(Lch/qos/logback/core/Appender;)V", |_, _| Ok(None));
+    registry.register(lb_lg, "detachAppender", "(Lch/qos/logback/core/Appender;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "detachAppender", "(Ljava/lang/String;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "detachAndStopAllAppenders", "()V", |_, _| Ok(None));
+    registry.register(lb_lg, "isAttached", "(Lch/qos/logback/core/Appender;)Z", |_, _| Ok(Some(Value::Int(0))));
 }
 
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {

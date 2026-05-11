@@ -2289,6 +2289,40 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // customizeConnection / URLConnection.getInputStream.  This is
     // semantically equivalent but entirely inside our VM infrastructure.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Spring `ConfigurationClassEnhancer.enhance(Class, ClassLoader)`
+    //
+    // Spring uses CGLIB to subclass every `@Configuration`-annotated class so
+    // that calls between `@Bean` methods return shared bean instances rather
+    // than fresh ones.  CGLIB's `Enhancer.createClass()` exercises a large
+    // bytecode-generation + ClassLoader.defineClass pipeline that is
+    // currently incomplete in this VM and throws a bare
+    // `IllegalStateException` (no message) deep inside.  The exception
+    // surfaces in `ConfigurationClassPostProcessor.enhanceConfigurationClasses`
+    // as:
+    //   IllegalStateException: Cannot load configuration class: <name>
+    //   Caused by: IllegalStateException
+    // SportMe hits this on `RedisHttpSessionConfiguration`.
+    //
+    // Pragmatic workaround: return the original class unchanged so Spring
+    // skips enhancement.  Inter-@Bean-method calls won't be intercepted, but
+    // that is the same trade-off Spring makes for `@Configuration(proxyBeanMethods = false)`
+    // and lets the application advance past container bootstrap.
+    // -----------------------------------------------------------------------
+    r.register(
+        "org/springframework/context/annotation/ConfigurationClassEnhancer",
+        "enhance",
+        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
+        |_ctx, args| {
+            let cls = match args.get(1).cloned() {
+                Some(v) => v,
+                None => return Err(iae("ConfigurationClassEnhancer.enhance: missing class arg")),
+            };
+            eprintln!("[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)");
+            Ok(Some(cls))
+        },
+    );
+
     r.register(
         "org/springframework/core/io/UrlResource",
         "getInputStream",

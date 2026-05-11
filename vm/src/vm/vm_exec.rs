@@ -3592,6 +3592,76 @@ pub fn invoke_or_native(
         class_name
     };
 
+    // peaceful-sammet — primitive-return functional-interface bridge.
+    //
+    // Spring/Eureka call `ToIntFunction.apply(Object)Object` on a receiver
+    // whose actual class is `ToIntFunction` (a lambda proxy whose SAM is
+    // `applyAsInt`). The JDK interface has no `apply` method, so naive
+    // dispatch raises NoSuchMethodError. Redirect to `applyAsX` and box
+    // the primitive result. Same for ToLong/ToDouble, Int/Long/Double-Predicate,
+    // and Int/Long/Double-Function (which has Object apply(int/long/double)).
+    if method_name == "apply"
+        && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
+        && args.len() == 2
+    {
+        let (prim_sam, prim_desc, box_class, box_desc): (
+            &str, &str, &str, &str,
+        ) = match class_name {
+            "java/util/function/ToIntFunction" => (
+                "applyAsInt",
+                "(Ljava/lang/Object;)I",
+                "java/lang/Integer",
+                "(I)Ljava/lang/Integer;",
+            ),
+            "java/util/function/ToLongFunction" => (
+                "applyAsLong",
+                "(Ljava/lang/Object;)J",
+                "java/lang/Long",
+                "(J)Ljava/lang/Long;",
+            ),
+            "java/util/function/ToDoubleFunction" => (
+                "applyAsDouble",
+                "(Ljava/lang/Object;)D",
+                "java/lang/Double",
+                "(D)Ljava/lang/Double;",
+            ),
+            _ => ("", "", "", ""),
+        };
+        if !prim_sam.is_empty() {
+            // Resolve the receiver's actual class for virtual dispatch.
+            let recv_class = match args.first() {
+                Some(Value::Object(Some(o))) => {
+                    let cid = shared.heap.class_id_of(*o);
+                    shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| class_name.to_string())
+                }
+                _ => class_name.to_string(),
+            };
+            let prim_result = invoke_or_native(
+                shared,
+                thread,
+                &recv_class,
+                prim_sam,
+                prim_desc,
+                args,
+            )?;
+            let prim_val = prim_result.unwrap_or(Value::Int(0));
+            let boxed = invoke_shared(
+                shared,
+                thread,
+                box_class,
+                "valueOf",
+                box_desc,
+                &[prim_val],
+            )?;
+            return Ok(boxed);
+        }
+    }
+
     if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
         let bytes = effective_class.as_bytes();
         eprintln!("[invoke_or_native] effective_class={:?} (len={}) class_name={:?} method={:?} desc={:?}",
