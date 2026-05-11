@@ -13339,6 +13339,12 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "newKeySet",
+        "(I)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+        native_chm_new_key_set_cap,
+    );
+    r.register(
+        c,
         "keySet",
         "(Ljava/lang/Object;)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
         native_chm_key_set_view,
@@ -14055,6 +14061,14 @@ fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     );
     ctx.set_field(set, 0, Value::Object(Some(backing)));
     Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_chm_new_key_set_cap(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Ignore capacity hint; behave identically to no-arg newKeySet().
+    // KeySetView's Java-side add() calls CHM.putVal which uses the native
+    // CHM's segment fields that we don't populate, so we must back this with
+    // our HashSet synthetic instead of letting a real KeySetView form.
+    native_chm_new_key_set(ctx, _args)
 }
 
 fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

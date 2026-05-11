@@ -4407,7 +4407,12 @@ pub(crate) fn annotation_proxy_invoke_shared(
         if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
             let desc_obj = shared.heap.get_field(proxy, 0);
             let desc = if let Value::Object(Some(o)) = desc_obj { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { String::new() };
+            // Print call stack
             eprintln!("ASMAP-CALL desc={desc}");
+            for (i, f) in thread.frames.iter().enumerate().rev().take(6) {
+                let cn = shared.class_manager.read().get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                eprintln!("  ASMAP-FRAME[{i}] {}.{}", cn, f.method_name());
+            }
         }
         return annotation_proxy_as_map(shared, thread, proxy, args);
     }
@@ -4471,6 +4476,9 @@ fn annotation_proxy_as_map(
         match res {
             Some(Value::Object(Some(m))) => m,
             _ => {
+                if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+                    eprintln!("ASMAP-FACTORY-FALLBACK factory_apply_returned_null");
+                }
                 let cid = shared
                     .load_class_concurrent(
                         "org/springframework/core/annotation/AnnotationAttributes",
