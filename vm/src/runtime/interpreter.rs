@@ -1119,6 +1119,31 @@ pub fn execute(
                 if let Some(Value::Object(Some(recv_obj))) = args.first().copied() {
                     let recv_cid = shared.heap.class_id_of(recv_obj);
                     let recv_kind = shared.heap.kind_of(recv_obj);
+                    // Round 7 — receiver-is-lambda-proxy rescue. When an
+                    // invokeinterface lands on an interface declaration with no
+                    // Code (e.g. `CacheOverride.close()V`) but the receiver is
+                    // a lambda proxy implementing that interface (e.g.
+                    // `SoftReferenceConfigurationPropertyCache#NOOP`,
+                    // declared as `CacheOverride o = () -> {}`), route through
+                    // try_lambda_dispatch so the proxy's SAM impl_handle runs
+                    // instead of throwing AbstractMethodError.
+                    let recv_is_lambda = shared
+                        .lambda_proxies
+                        .read()
+                        .contains_key(&recv_cid);
+                    if recv_is_lambda {
+                        let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+                        if let Some(inner) = try_lambda_dispatch(
+                            shared,
+                            thread,
+                            recv_obj,
+                            recv_cid,
+                            method_name,
+                            rest,
+                        )? {
+                            return Ok(inner);
+                        }
+                    }
                     // Path A — receiver carries a real (non-zero) class_id.
                     //   Walk its runtime-class chain for a same-signature
                     //   override that has Code (or a registered native) and
@@ -5936,6 +5961,38 @@ fn execute_instruction(
                                 _ => "<no message field>".to_string(),
                             };
                             eprintln!("IAE-ATHROW class={exc_class_name} message={msg:?}");
+                            // Dump local 0 (the AA receiver) of the assertAttributePresence frame
+                            if &*exc_class_name == "java/lang/IllegalArgumentException" {
+                                for f in thread.frames.iter().rev() {
+                                    let cn = shared.class_manager.read().get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                                    if cn == "org/springframework/core/annotation/AnnotationAttributes" && f.method_name() == "assertAttributePresence" {
+                                        if let Value::Object(Some(aa)) = f.get_local(0) {
+                                            // AnnotationAttributes extends LinkedHashMap. Inspect its size via the keySet
+                                            let aa_cid = shared.heap.class_id_of(aa);
+                                            let aa_cn = shared.class_manager.read().get_class(aa_cid).map(|c| c.name.to_string()).unwrap_or_default();
+                                            eprintln!("IAE-AA-DUMP receiver_cid={:?} class={aa_cn}", aa_cid);
+                                            // displayName field
+                                            // Field offsets: 0=annotationType, 1=displayName, 2=validated (maybe diff)
+                                            for slot in 0..6 {
+                                                let v = shared.heap.get_field(aa, slot);
+                                                let s = match v {
+                                                    Value::Object(Some(o)) => {
+                                                        let kid = shared.heap.class_id_of(o);
+                                                        let kcn = shared.class_manager.read().get_class(kid).map(|c| c.name.to_string()).unwrap_or_default();
+                                                        if kcn == "java/lang/String" {
+                                                            format!("String:{:?}", crate::vm::read_java_string(&shared.heap, o).unwrap_or_default())
+                                                        } else { format!("obj:{kcn}") }
+                                                    },
+                                                    Value::Object(None) => "null".to_string(),
+                                                    _ => format!("{:?}", v),
+                                                };
+                                                eprintln!("  AA-SLOT[{slot}] = {s}");
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                             for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                                 let cn = shared
                                     .class_manager
@@ -8427,6 +8484,40 @@ pub(crate) fn try_lambda_dispatch(
                 true,
                 num_captures,
             )?;
+            // Round 7 — if the receiver is itself a lambda proxy whose SAM
+            // matches the impl_handle's member name, recurse through
+            // try_lambda_dispatch directly. Without this, downstream
+            // `invoke_or_native` falls back to the cp interface name (because
+            // class_manager.get_class fails on lambda-proxy class_ids), then
+            // resolves the abstract interface declaration with no Code attribute
+            // and surfaces an AbstractMethodError. Concrete tripwire: Spring
+            // Boot's `CacheOverrides.close()` does
+            // `forEach(CacheOverride::close)` and the iterated items are
+            // themselves NOOP `CacheOverride` lambdas declared as static
+            // fields on `SoftReferenceConfigurationPropertyCache` — every
+            // item is a lambda proxy, never a concrete CacheOverride.
+            if let Value::Object(Some(r)) = &full_args[0] {
+                let rcv_class_id = shared.heap.class_id_of(*r);
+                let recv_is_lambda = shared
+                    .lambda_proxies
+                    .read()
+                    .contains_key(&rcv_class_id);
+                if recv_is_lambda {
+                    let inner = try_lambda_dispatch(
+                        shared,
+                        thread,
+                        *r,
+                        rcv_class_id,
+                        &call_site.impl_handle.member_name,
+                        &full_args[1..],
+                    )?;
+                    if let Some(inner_v) = inner {
+                        return Ok(Some(coerce_return(
+                            shared, thread, &sam_ret, &impl_ret, inner_v,
+                        )?));
+                    }
+                }
+            }
             // Resolve the actual class of the receiver for virtual dispatch.
             let receiver_class = match &full_args[0] {
                 Value::Object(Some(r)) => {

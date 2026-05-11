@@ -4510,6 +4510,11 @@ fn annotation_proxy_as_map(
         _ => return Ok(Some(Value::Object(Some(dest_map)))),
     };
     let n = shared.heap.array_length(names_arr);
+    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+        let cid = shared.heap.class_id_of(dest_map);
+        let cn = shared.class_manager.read().get_class(cid).map(|c| c.name.to_string()).unwrap_or_default();
+        eprintln!("ASMAP-LOOP n={n} dest_map_cid={:?} class={cn}", cid);
+    }
     for i in 0..n {
         let name_val = match shared.heap.get_array_element(names_arr, i) {
             Ok(v) => v,
@@ -4520,6 +4525,11 @@ fn annotation_proxy_as_map(
             Err(_) => continue,
         };
         let adapted = adapt_annotation_value_for_map(shared, thread, elem_val, args)?;
+        if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+            let nstr = if let Value::Object(Some(o)) = name_val { super::read_java_string(&shared.heap, o).unwrap_or_default() } else { "<no-name>".to_string() };
+            let val_kind = match adapted { Value::Object(None) => "null".to_string(), Value::Object(Some(o)) => format!("obj-cid={:?}", shared.heap.class_id_of(o)), _ => format!("{:?}", adapted) };
+            eprintln!("ASMAP-PUT i={i} name={nstr} val={val_kind}");
+        }
         // Apply CLASS_TO_STRING: replace Class / Class[] with String / String[].
         let adapted = if class_to_string {
             convert_class_values_to_strings(shared, adapted)
