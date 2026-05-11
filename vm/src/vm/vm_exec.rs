@@ -5641,6 +5641,55 @@ fn invoke_on_class_shared_inner(
                                 || method_name == "getWriteMethod"
                                 || method_name == "getName"
                                 || method_name == "getPropertyType"))
+                        // SPB.11: Spring's `ExtendedBeanInfo` wraps our
+                        // PropertyDescriptors in `SimplePropertyDescriptor`
+                        // subclasses. Its constructor delegates to
+                        // `super(pd.getName(), readMethod, writeMethod)`,
+                        // which `setName(...)` stores on
+                        // `FeatureDescriptor.name`. We've observed that on
+                        // the subclass instance the bytecode `getfield
+                        // FeatureDescriptor.name` (from
+                        // `FeatureDescriptor.getName()`) resolves to a slot
+                        // that disagrees with what `setName` (and reflective
+                        // `Field.get`) read — getName returns null. The
+                        // `ExtendedBeanInfo$PropertyDescriptorComparator`
+                        // then NPEs on `getName().compareTo(...)`. Force our
+                        // native (in `phases_late.rs`) that resolves `name`
+                        // via the dynamic-hierarchy lookup that agrees with
+                        // setName/reflection.
+                        || (class_name == "java/beans/FeatureDescriptor"
+                            && method_name == "getName")
+                        // SPB.11: Our synthetic MethodDescriptor stores the
+                        // wrapped Method at slot 0 (real-JDK MD has a private
+                        // `method` field at a different layout). Force the
+                        // native so getMethod returns our overlay value.
+                        || (class_name == "java/beans/MethodDescriptor"
+                            && method_name == "getMethod")
+                        // SPB.11: Spring's ExtendedBeanInfoFactory wraps our
+                        // delegate BeanInfo into `new ExtendedBeanInfo(...)`,
+                        // which re-creates each PropertyDescriptor as a
+                        // SimplePropertyDescriptor and loses readMethod/
+                        // writeMethod/propertyType (subclass fields never
+                        // populated; downstream Spring NPEs comparing). Our
+                        // native bypasses the wrapping and returns the
+                        // delegate directly.
+                        || (class_name == "org/springframework/beans/ExtendedBeanInfoFactory"
+                            && method_name == "getBeanInfo")
+                        || (class_name == "org/springframework/beans/SimpleBeanInfoFactory"
+                            && method_name == "getBeanInfo")
+                        // SPB.11: Spring's GenericTypeAwarePropertyDescriptor
+                        // (built by CachedIntrospectionResults) stores
+                        // readMethod/writeMethod/propertyType in its own
+                        // subclass fields. `getfield` on those returns null
+                        // even though `putfield` (in the ctor) and reflective
+                        // `Field.get` agree on the value — a layout mismatch
+                        // for the subclass slot indices. Force our natives
+                        // (resolve by name) to win so BeanWrapperImpl sees
+                        // the real write methods.
+                        || (class_name == "org/springframework/beans/GenericTypeAwarePropertyDescriptor"
+                            && (method_name == "getReadMethod"
+                                || method_name == "getWriteMethod"
+                                || method_name == "getPropertyType"))
                         // KC16-JUL: java.util.logging.Logger.getResourceBundleName /
                         // getResourceBundle — the real JDK bytecode reads the
                         // private `loggerBundle` field which our Logger init
