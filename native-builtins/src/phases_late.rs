@@ -34883,9 +34883,14 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 /// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
 /// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    eprintln!("BI-TRACE: introspector_get_bean_info args.len={}", args.len());
+    let trace = true;
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
-        _ => return Ok(Some(Value::Object(None))),
+        other => {
+            if trace { eprintln!("BI-TRACE: arg0 unexpected: {:?}", other); }
+            return Ok(Some(Value::Object(None)));
+        }
     };
 
     // The argument is a `Class` *mirror*, so `class_id_of_object` returns
@@ -34894,6 +34899,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let class_id = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
         Some(c) => c,
         None => {
+            if trace { eprintln!("BI-TRACE: mirror_class_id returned None"); }
             // Empty BeanInfo is safer than null (matches JDK behaviour for
             // classes with no introspectable bean properties).
             let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
@@ -34902,6 +34908,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             return Ok(Some(Value::Object(Some(bean_info))));
         }
     };
+    if trace {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        eprintln!("BI-TRACE: class_id resolved -> {}", cn);
+    }
 
     // Discover properties from getters/setters across the class + superclasses.
     // Stored as (name, getter_method_mirror, setter_method_mirror, propertyType_mirror).
@@ -34917,6 +34927,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         let declaring_mirror = ctx.get_class_mirror(cid);
 
         let methods = ctx.declared_methods(cid);
+        if trace {
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            eprintln!("BI-TRACE:   walking {} ({} methods)", cn, methods.len());
+        }
         for method in &methods {
             let name = &method.name;
             let desc = &method.descriptor;

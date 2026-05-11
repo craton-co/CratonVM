@@ -4524,6 +4524,11 @@ fn annotation_proxy_as_map(
             &[Value::Object(Some(dest_map)), name_val, adapted],
         )?;
     }
+    // VERIFY: read slot 0 (table) of dest_map and check if it has buckets
+    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+        let s0 = shared.heap.get_field(dest_map, 0);
+        eprintln!("ASMAP-END dest_map={:?} slot0={:?}", dest_map, s0);
+    }
     Ok(Some(Value::Object(Some(dest_map))))
 }
 

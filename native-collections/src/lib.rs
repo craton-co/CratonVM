@@ -1729,9 +1729,35 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
     }
 
-    // Debug: log misses for ApplicationContextFactory
+    // Debug: log misses for ApplicationContextFactory or "type"
     if let Some(k) = key_ref {
         if let Some(s) = ctx.read_string(k) {
+            if std::env::var("RUSTJVM_IAE_TRACE").is_ok() && s == "type" {
+                eprintln!("[MAP-GET-TYPE-MISS] this={:?} cap={} idx={} hash={}", this, cap, idx, hash);
+                let mut n = ctx.get_array_element(buckets, idx);
+                while let Value::Object(Some(nd)) = n {
+                    let nk = get_node_key(ctx, nd);
+                    let nk_str = if let Value::Object(Some(nkr)) = nk {
+                        ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
+                    } else { format!("<non-obj {:?}>", nk) };
+                    let nh = ctx.get_field(nd, NODE_FIELD_HASH);
+                    eprintln!("[MAP-GET-TYPE-MISS]   bucket[{}] key={} hash={:?}", idx, nk_str, nh);
+                    n = ctx.get_field(nd, NODE_FIELD_NEXT);
+                }
+                // Also dump ALL buckets to see where "type" might be
+                for i in 0..(cap as usize) {
+                    let mut n = ctx.get_array_element(buckets, i);
+                    while let Value::Object(Some(nd)) = n {
+                        let nk = get_node_key(ctx, nd);
+                        let nk_str = if let Value::Object(Some(nkr)) = nk {
+                            ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
+                        } else { format!("<non-obj {:?}>", nk) };
+                        let nh = ctx.get_field(nd, NODE_FIELD_HASH);
+                        eprintln!("[MAP-GET-TYPE-MISS]   ALL bucket[{}] key={} hash={:?}", i, nk_str, nh);
+                        n = ctx.get_field(nd, NODE_FIELD_NEXT);
+                    }
+                }
+            }
             if s.contains("ApplicationContext") {
                 eprintln!("[MAP-GET-DBG] MISS key={} cap={} idx={}", s, cap, idx);
                 // Dump bucket contents for diagnosis
@@ -9275,9 +9301,17 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Check for resize
-    let (_, size, cap) = lhm_state(ctx, this);
-    if size + 1 > (cap * 3) / 4 {
+    // Check for resize. Also initialize table when buckets is None
+    // (e.g. `org/springframework/core/annotation/AnnotationAttributes`
+    // constructed via Spring's `new AnnotationAttributes(annotationType, false)`
+    // — LinkedHashMap.<init>() runs as JDK bytecode and leaves our overlay
+    // empty until the first put. Without this init the put would silently
+    // no-op, dropping every key Spring writes via `TypeMappedAnnotation.asMap`
+    // and surfacing as `IllegalArgumentException: Attribute 'type' not found
+    // in attributes for annotation [...]ComponentScan$Filter` deep in
+    // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`).
+    let (initial_buckets, size, cap) = lhm_state(ctx, this);
+    if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
         lhm_resize(ctx, this);
     }
 

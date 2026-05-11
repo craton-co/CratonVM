@@ -5961,6 +5961,18 @@ fn execute_instruction(
                                 _ => "<no message field>".to_string(),
                             };
                             eprintln!("IAE-ATHROW class={exc_class_name} message={msg:?}");
+                            if &*exc_class_name == "java/lang/IllegalArgumentException" {
+                                for f in thread.frames.iter().rev() {
+                                    let cn = shared.class_manager.read().get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                                    if cn == "org/springframework/core/annotation/AnnotationAttributes" && f.method_name() == "assertAttributePresence" {
+                                        if let Value::Object(Some(aa)) = f.get_local(0) {
+                                            let s0 = shared.heap.get_field(aa, 0);
+                                            eprintln!("IAE-AA aa={:?} slot0={:?}", aa, s0);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                             for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                                 let cn = shared
                                     .class_manager
