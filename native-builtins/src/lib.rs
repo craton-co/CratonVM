@@ -24068,6 +24068,27 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register(lb_lg, "isAttached", "(Lch/qos/logback/core/Appender;)Z", |_, _| Ok(Some(Value::Int(0))));
 }
 
+/// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
+/// mode by `vm_init.rs`.
+///
+/// `DefaultLogbackConfiguration.apply(LoggerContext)` sets up the default
+/// logback config (root logger level, console appender, pattern layout, …)
+/// by entering synchronized blocks on internal LoggerContext fields. Because
+/// we serve LoggerContext via `alloc_concurrent_synthetic` (bypassing
+/// logback's `<init>`), the first `monitorenter` at pc=7 NPEs on a null
+/// field. Treat `apply()` as a no-op so the bytecode never runs — logs fall
+/// back to the JVM's default stderr handler, which is fine for Spring Boot
+/// bootstrap. Paired with the `check_override` allow-list entry in
+/// `vm/src/vm/vm_exec.rs`.
+pub fn register_spring_boot_logback_apply(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/springframework/boot/logging/logback/DefaultLogbackConfiguration",
+        "apply",
+        "(Lch/qos/logback/classic/LoggerContext;)V",
+        |_, _| Ok(None),
+    );
+}
+
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lf = "org/slf4j/LoggerFactory";
 

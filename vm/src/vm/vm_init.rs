@@ -1138,6 +1138,12 @@ impl SharedVm {
             // open the archive directly). Paired with the `check_override`
             // allow-list entry for `java/util/jar/JarFile`.
             rustjvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+            // SB3-LOGBACK: Spring Boot 3.2's DefaultLogbackConfiguration.apply
+            // NPEs on its first monitorenter against a synthetic LoggerContext.
+            // Register a no-op native override so the boot path skips logback's
+            // default configuration (logs fall back to JVM stderr). Paired with
+            // the `check_override` allow-list entry in `vm_exec.rs`.
+            rustjvm_native_builtins::register_spring_boot_logback_apply(&mut native_methods);
             // Spring Boot 3 fat-jar launcher: `Launcher.createClassLoader`
             // calls `urls.toArray(new URL[0])` on the 67-element URL list
             // returned by `JarFileArchive.getClassPathUrls`. The real-JDK

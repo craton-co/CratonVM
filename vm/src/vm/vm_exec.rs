@@ -6521,7 +6521,25 @@ fn invoke_on_class_shared_inner(
                                 | "getLevelForName"
                                 | "checkAccess"
                                 | "checkSecurityAccess"
-                            ));
+                            ))
+                        // SB3-LOGBACK: Spring Boot's
+                        // DefaultLogbackConfiguration.apply(LoggerContext) sets
+                        // up the default logback configuration (root logger
+                        // level, console appender, pattern layout, etc.) by
+                        // entering synchronized blocks on internal LoggerContext
+                        // fields. Because we serve LoggerContext via
+                        // `alloc_concurrent_synthetic` (bypassing logback's
+                        // `<init>`), the very first `monitorenter` at pc=7
+                        // dereferences a null field and NPEs.  Force the no-op
+                        // native override (registered alongside the other
+                        // logback bridge natives in `native-builtins/src/lib.rs`)
+                        // so the bytecode never runs — logs fall back to the
+                        // JVM's default stderr handler, which is fine for
+                        // Spring Boot's bootstrap path.
+                        || (class_name
+                            == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
+                            && method_name == "apply"
+                            && descriptor == "(Lch/qos/logback/classic/LoggerContext;)V");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
