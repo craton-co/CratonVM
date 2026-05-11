@@ -14337,19 +14337,37 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let entries = chm_collect_all_entries(ctx, this);
-    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
+    // Build a HashSet of Map.Entry objects. Each entry must be a real
+    // `java/util/Map$Entry` (not raw Object cid=0) so user-bytecode
+    // `checkcast Map$Entry` succeeds after iterating entrySet() — see
+    // Spring DefaultSingletonBeanRegistry.destroyBean iterating the
+    // dependentBeanMap (a ConcurrentHashMap) entrySet.
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let backing = alloc_backing_map(ctx);
-    let cap = (entries.len() * 2).max(MAP_DEFAULT_CAPACITY).next_power_of_two();
+    let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing, 0);
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    for (key, value) in entries {
-        let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
-        ctx.set_field(entry, NODE_FIELD_KEY, key);
-        ctx.set_field(entry, NODE_FIELD_VALUE, value);
-        native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), Value::Object(Some(entry))])?;
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
+    for (key, value) in &entries {
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+        ctx.set_field(entry_obj, 0, *key);
+        ctx.set_field(entry_obj, 1, *value);
+
+        let hash = ctx.identity_hash_code(entry_obj);
+        let (b, size, c) = map_state(ctx, backing);
+        let b = b.unwrap();
+        let idx = map_bucket_index(hash, c);
+        let existing = ctx.get_array_element(b, idx);
+        let head = match existing {
+            Value::Object(obj_opt) => obj_opt,
+            _ => None,
+        };
+        let sentinel = Value::Int(1);
+        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        set_map_size(ctx, backing, size + 1);
     }
     Ok(Some(Value::Object(Some(set))))
 }
