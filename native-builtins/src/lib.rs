@@ -2197,6 +2197,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
+    // Class.hasRealParameterData() — package-private method on java.lang.Class
+    // in newer JDKs, used by reflection (e.g. Spring/Method.getParameters) to
+    // check whether MethodParameters attribute data is available. Returning
+    // false matches the safe default (no parameter data) and unblocks
+    // Spring Boot 4.0.6 (demo) and 2.0.3 (sportme) which throw
+    // NoSuchMethodError on java/lang/Class.hasRealParameterData()Z.
+    registry.register("java/lang/Class", "hasRealParameterData", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
     registry.register("java/lang/Class", "initClassName", "()Ljava/lang/String;", lang_class::native_class_get_name);
     // getName() is a Java method that caches via initClassName(). Override with
     // native since JDK's Class field layout differs from our mirror layout.
