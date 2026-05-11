@@ -4636,6 +4636,20 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_stream_to_array_gen,
+    );
+    // Same override on ReferencePipeline so real-JDK code that dispatches
+    // virtual on the concrete class also hits us.
+    r.register(
+        "java/util/stream/ReferencePipeline",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_stream_to_array_gen,
+    );
+    r.register(
+        c,
         "findFirst",
         "()Ljava/util/Optional;",
         native_stream_find_first,
@@ -5119,6 +5133,61 @@ fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let elements = stream_elements(ctx, this);
     let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `Stream.toArray(IntFunction<A[]> generator)` — invoke the generator
+/// with the element count to produce a correctly-typed array, then copy
+/// elements into it.
+///
+/// Real-JDK code uses this for any `Stream.toArray(String[]::new)` chain,
+/// e.g. `Utils.enumOptions(SecurityProtocol.class)` in Kafka. Without
+/// this native override, dispatch falls into the real JDK
+/// `ReferencePipeline.toArray` which expects a real Spliterator-backed
+/// pipeline, not our synthetic field-0-array stream — silently
+/// returning a 0-length array. That made
+/// `ConfigDef.ValidString.in(...)` build an empty allow-list, and
+/// `ReplicationConfigs.<clinit>` threw
+/// `ConfigException: Invalid value PLAINTEXT for configuration
+/// security.inter.broker.protocol: String must be one of:`.
+fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let generator = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elements = stream_elements(ctx, this);
+    let len = elements.len();
+    // Try to use the generator's apply(int) to allocate a typed array.
+    let arr = match generator {
+        Value::Object(Some(g)) => {
+            let r = ctx.invoke_virtual(
+                g,
+                "apply",
+                "(I)Ljava/lang/Object;",
+                &[Value::Int(len as i32)],
+            );
+            match r {
+                Ok(Some(Value::Object(Some(a)))) => a,
+                _ => alloc_ref_array(ctx, len),
+            }
+        }
+        _ => alloc_ref_array(ctx, len),
+    };
+    // If generator returned a too-small array (or fallback Object[]),
+    // ensure it has enough slots.
+    let cap = ctx.array_length(arr);
+    let arr = if cap < len {
+        alloc_ref_array(ctx, len)
+    } else {
+        arr
+    };
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }

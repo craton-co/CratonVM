@@ -3273,7 +3273,10 @@ fn native_string_index_of_str_from(
         return Ok(Some(Value::Int(-1)));
     }
     let nlen = needle_chars.len();
-    let max_start = src_chars.len().saturating_sub(nlen);
+    if nlen > src_chars.len() {
+        return Ok(Some(Value::Int(-1)));
+    }
+    let max_start = src_chars.len() - nlen;
     let mut i = from as usize;
     while i <= max_start {
         if src_chars[i..i + nlen] == needle_chars[..] {

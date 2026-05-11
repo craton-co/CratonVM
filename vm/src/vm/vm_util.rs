@@ -696,11 +696,37 @@ fn initialize_class_shared(
                                 let cause_class = shared.class_manager.read()
                                     .get_class(exc_class_id).map(|c| c.name.clone())
                                     .unwrap_or_default();
-                                let cause_msg = match shared.heap.get_field(*exc_ref, 0) {
-                                    crate::types::Value::Object(Some(s)) =>
-                                        crate::vm::vm_object::read_java_string(&shared.heap, s)
-                                            .unwrap_or_default(),
-                                    _ => String::new(),
+                                // Read detailMessage by walking the field
+                                // hierarchy by name — slot index varies because
+                                // Throwable has `backtrace` at slot 0 and
+                                // `detailMessage` at slot 1, and subclasses may
+                                // have arbitrary layouts. Reading slot 0
+                                // unconditionally returns `backtrace` (a
+                                // non-String) for most exceptions, so the
+                                // message field looked empty.
+                                let cause_msg = {
+                                    let cm = shared.class_manager.read();
+                                    let mut walk = Some(exc_class_id);
+                                    let mut found: Option<crate::types::ObjectRef> = None;
+                                    while let Some(cid) = walk {
+                                        let Some(cls) = cm.get_class(cid) else { break };
+                                        let mut inst = 0usize;
+                                        for f in &cls.fields {
+                                            if f.is_static() { continue; }
+                                            if &*f.name == "detailMessage" {
+                                                let idx = cls.first_field_index + inst;
+                                                if let crate::types::Value::Object(Some(s)) = shared.heap.get_field(*exc_ref, idx) {
+                                                    found = Some(s);
+                                                }
+                                                break;
+                                            }
+                                            inst += 1;
+                                        }
+                                        if found.is_some() { break; }
+                                        walk = cls.superclass;
+                                    }
+                                    drop(cm);
+                                    found.and_then(|s| crate::vm::vm_object::read_java_string(&shared.heap, s)).unwrap_or_default()
                                 };
                                 tracing::warn!(
                                     class = %class_name_for_jfr,

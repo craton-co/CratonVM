@@ -7071,7 +7071,6 @@ pub(crate) fn native_class_get_enum_constants(
     // paths in the real JDK ultimately need the enum's `$VALUES` array,
     // and our earlier stub that returned an empty array broke every
     // `EnumMap.<init>(Class)` call (e.g. StreamOpFlag.<clinit>).
-    use rustjvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -7097,18 +7096,33 @@ pub(crate) fn native_class_get_enum_constants(
     // Read $VALUES static field.
     let idx = match ctx.static_field_index_by_name(class_id, "$VALUES") {
         Some(i) => i,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            tracing::warn!("native_class_get_enum_constants: no $VALUES field for class={}", class_name);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let values_val = ctx.get_static_field(class_id, idx);
     let src_arr = match values_val {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            tracing::warn!("native_class_get_enum_constants: $VALUES is null/non-object for class={}", class_name);
+            return Ok(Some(Value::Object(None)));
+        }
     };
-    // Clone into a new Object[] so callers can mutate without affecting
-    // the enum's backing array (matches `getEnumConstantsShared().clone()`
-    // semantics used by `getEnumConstants`).
+    // Clone into a new array whose component type is the enum class
+    // itself (matches `getEnumConstantsShared().clone()` semantics —
+    // `$VALUES` is typed `[LEnumClass;`). Callers of `getEnumConstants`
+    // then `checkcast [Ljava/lang/Enum;`, which requires the component
+    // class to be a subclass of `java/lang/Enum`. Using a plain
+    // `Object[]` makes that checkcast fail silently (returning the array
+    // as-is from non-strict casts elsewhere, then yielding 0-length
+    // streams downstream — observed as
+    // `Utils.enumOptions(SecurityProtocol.class)` returning empty,
+    // which caused Kafka's `ReplicationConfigs.<clinit>` to throw
+    // `ConfigException: Invalid value PLAINTEXT for configuration
+    // security.inter.broker.protocol: String must be one of: `).
     let len = ctx.array_length(src_arr);
-    let out = ctx.new_array(ArrayElementType::Reference, len);
+    let out = ctx.new_ref_array(class_id, len);
     for i in 0..len {
         let v = ctx.get_array_element(src_arr, i);
         ctx.set_array_element(out, i, v);
