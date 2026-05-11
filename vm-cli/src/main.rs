@@ -1467,8 +1467,17 @@ fn main() {
         // them to `tracing::debug!` so the full panic doesn't spam the
         // user's stderr during initPhase1. Anything *not* in this list
         // gets the full visibility treatment.
-        let is_known_bootstrap_quiet = msg.contains("unaligned pointer")
-            || msg.contains("null pointer");
+        // Keycloak Round 71: only quiet the bootstrap-class panics while
+        // bootstrap is actually running (init level < 4). Once `main()`
+        // is executing, an unaligned/null pointer panic from a native is
+        // a real fault that must be visible — silently demoting it to
+        // debug produces the "Keycloak exits in 5s with no output"
+        // failure mode where 19 caught NPEs corrupt picocli state and
+        // `parseAndRun` returns without ever calling `start-dev`.
+        let in_bootstrap = rustjvm_native_api::init_level::get_init_level() < 4;
+        let is_known_bootstrap_quiet = (msg.contains("unaligned pointer")
+            || msg.contains("null pointer"))
+            && in_bootstrap;
 
         if is_known_bootstrap_quiet {
             if let Some(loc) = info.location() {

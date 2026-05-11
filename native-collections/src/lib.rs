@@ -1295,7 +1295,41 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
 }
 
 /// Collect all keys from a HashMap into a Vec.
+/// If `this` is a `java.util.Properties` whose `map` field (JDK 25 layout)
+/// points at a `ConcurrentHashMap`, return that CHM. Otherwise None.
+///
+/// JDK 25 changed `Properties` to back its entries with a private
+/// `ConcurrentHashMap<Object,Object> map` field instead of the inherited
+/// `Hashtable.table`. The synthetic-mode slot-0 `buckets` we populate on
+/// `Properties.load()` therefore looks empty to JDK-style readers, and any
+/// helper that walks slot 0 (`map_collect_keys` / `map_collect_entries` /
+/// etc.) reports zero entries. That made `new HashMap<>(props)` empty, which
+/// in turn made Kafka's `KafkaConfig$.populateSynonyms` drop every property
+/// and surface as `Missing required configuration "process.roles"`.
+fn properties_backing_chm(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let slot = ctx.resolve_field_index("java/util/Properties", "map")?;
+    if slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    let m = match ctx.get_field(this, slot) {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let cid = ctx.class_id_of_object(m);
+    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+    if cn == "java/util/concurrent/ConcurrentHashMap"
+        || cn.starts_with("java/util/concurrent/ConcurrentHashMap$")
+    {
+        Some(m)
+    } else {
+        None
+    }
+}
+
 fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    if let Some(chm) = properties_backing_chm(ctx, this) {
+        return chm_collect_all_keys(ctx, chm);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut keys = Vec::new();
     if let Some(b) = buckets {
@@ -1313,6 +1347,9 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 /// Collect all values from a HashMap into a Vec.
 fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    if let Some(chm) = properties_backing_chm(ctx, this) {
+        return chm_collect_all_values(ctx, chm);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut values = Vec::new();
     if let Some(b) = buckets {
@@ -1330,6 +1367,9 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 /// Collect all key-value pairs as (key, value) from a HashMap.
 fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    if let Some(chm) = properties_backing_chm(ctx, this) {
+        return chm_collect_all_entries(ctx, chm);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut entries = Vec::new();
     if let Some(b) = buckets {
@@ -15063,11 +15103,66 @@ fn props_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef
     keys
 }
 
-/// propertyNames() -> returns an Enumeration-like iterator
-/// We return a snapshot ArrayList iterator (same as keySet iterator)
+/// propertyNames() -> returns a real Enumeration<Object> over the property keys.
+///
+/// Previously this delegated to `keySet`, which returns a `HashSet`. HashSet
+/// doesn't implement `Enumeration`, so callers like Kafka's
+/// `Utils.propsToMap` that invoke `hasMoreElements()` / `nextElement()` on
+/// the result fell through to the snapshot-iterator native's generic-Iterator
+/// fallback, which couldn't find a `hasNext` method on HashSet and silently
+/// returned 0 — yielding an empty enumeration and a Properties-derived map
+/// with zero entries. Kafka then reported `Missing required configuration
+/// "process.roles"` even though server.properties listed it.
+///
+/// Now we allocate the same 2-field snapshot object the Enumeration interface
+/// natives expect (field 0 = `Object[]` snapshot, field 1 = `int` cursor).
 fn native_props_property_names(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Just delegate to keySet which returns a HashSet, then get its iterator
-    native_map_key_set(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // JDK 25 `Properties` stores entries in a private `ConcurrentHashMap map`
+    // field, NOT in the inherited `Hashtable.table` array. Real-JDK
+    // `Properties.size()` / `propertyNames()` / `entrySet()` bytecode all
+    // route through `this.map`. Walk that map when present; fall back to the
+    // legacy slot-0 backing for synthetic Properties allocations.
+    let backing = match ctx.resolve_field_index("java/util/Properties", "map") {
+        Some(slot) if slot < ctx.object_num_fields(this) => match ctx.get_field(this, slot) {
+            Value::Object(Some(m)) => Some(m),
+            _ => None,
+        },
+        _ => None,
+    };
+    let keys = match backing {
+        Some(m) => {
+            // `Properties.map` is declared as `ConcurrentHashMap`. Use the
+            // CHM-segmented key collector — `map_collect_keys` walks slot 0
+            // as a plain Node[] and only finds the head segment objects on
+            // a real-JDK CHM, yielding the wrong key type.
+            let cid = ctx.class_id_of_object(m);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cn == "java/util/concurrent/ConcurrentHashMap"
+                || cn.starts_with("java/util/concurrent/ConcurrentHashMap$")
+            {
+                chm_collect_all_keys(ctx, m)
+            } else {
+                map_collect_keys(ctx, m)
+            }
+        }
+        None => map_collect_keys(ctx, this),
+    };
+    let arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    // Use our internal SnapshotEnumeration synthetic class so the
+    // snapshot-iterator natives (`hasMoreElements`/`nextElement` registered on
+    // this class name) win virtual dispatch. Field 0 = Object[] snapshot,
+    // field 1 = cursor.
+    let en = alloc_synthetic(ctx, "rustjvm/internal/SnapshotEnumeration", 2);
+    ctx.set_field(en, 0, Value::Object(Some(arr)));
+    ctx.set_field(en, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(en))))
 }
 
 /// stringPropertyNames() -> Set<String>
@@ -15266,6 +15361,22 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     r.register(en, "hasMoreElements", "()Z", native_snapshot_itr_has_next);
     r.register(
         en,
+        "nextElement",
+        "()Ljava/lang/Object;",
+        native_snapshot_itr_next,
+    );
+
+    // Snapshot Enumeration used by `Properties.propertyNames()` and similar
+    // call sites that need a real Enumeration over a fixed key list. We can't
+    // reuse `Collections$EmptyEnumeration` because its real-JDK bytecode for
+    // `hasMoreElements` is hardcoded to `iconst_0; ireturn` and wins concrete
+    // dispatch over the interface-level Enumeration native, so a non-empty
+    // snapshot built on EmptyEnumeration appears empty. Register concrete
+    // overrides on a dedicated synthetic class.
+    let sne = "rustjvm/internal/SnapshotEnumeration";
+    r.register(sne, "hasMoreElements", "()Z", native_snapshot_itr_has_next);
+    r.register(
+        sne,
         "nextElement",
         "()Ljava/lang/Object;",
         native_snapshot_itr_next,

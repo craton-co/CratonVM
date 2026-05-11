@@ -250,7 +250,16 @@ pub fn safe_native_call(
             // T14: demote to debug for well-known bootstrap-path panics
             // (unaligned pointer reads via Unsafe during initPhase1). The
             // outer initPhase1 handler logs a user-facing warning once.
-            if msg.contains("unaligned pointer") || msg.contains("null pointer") {
+            //
+            // Keycloak Round 71: only demote during the actual bootstrap
+            // window (init_level < 4). Once `main()` is executing
+            // (level 4), an unaligned/null pointer panic represents a
+            // real bug — silently swallowing it produces the
+            // "Keycloak exits in 5s with no output" failure mode.
+            // Surface those at WARN so the CLI bail!() path renders
+            // the InternalError instead of returning a silent Ok.
+            let in_bootstrap = shared.get_init_level() < 4;
+            if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
                 // Bootstrap-path native panic: demoted to debug because these
                 // are well-understood during initPhase1. Still bump the
                 // swallow counter so the CLI can surface a summary when

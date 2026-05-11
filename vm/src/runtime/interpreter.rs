@@ -6053,6 +6053,42 @@ fn execute_instruction(
                             }
                         }
                     }
+                    // RUSTJVM_DBG_ATHROW=1 — env-gated dump of every Java
+                    // exception throw (class name, detailMessage, and a
+                    // short stack trace). Useful when an exception is
+                    // caught by an outer handler that swallows it and the
+                    // app exits silently (Kafka 4.2.0 main()'s catch-all
+                    // around buildServer/startup is the canonical case).
+                    if std::env::var("RUSTJVM_DBG_ATHROW").is_ok() {
+                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(exc_class_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        let mut msg = String::from("<no msg>");
+                        for fi in 0..8 {
+                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi) {
+                                if let Some(s) = read_java_string(&shared.heap, msg_ref) {
+                                    if !s.is_empty() {
+                                        msg = format!("field{fi}={s}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("ATHROW class={exc_class_name} msg={msg:?}");
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(f.class_id)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            eprintln!("  ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
+                    }
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
                 }
                 Value::Object(None) => {

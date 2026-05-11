@@ -24078,13 +24078,28 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getMarkerFactory",
         "()Lorg/slf4j/IMarkerFactory;",
         |ctx, _| {
-            // Allocate AND run the real BasicMarkerFactory.<init> so its
-            // inline `markerMap = new ConcurrentHashMap<>()` initializer
-            // fires. Without this, getMarker(name) NPEs on markerMap.get(name)
+            // Allocate AND run the real MarkerFactory.<init> so its inline
+            // `markerMap = new ConcurrentHashMap<>()` initializer fires.
+            // Without this, getMarker(name) NPEs on markerMap.get(name)
             // (observed during Kafka 4.2.0 boot: kafka/utils/Logging$.<clinit>).
-            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMarkerFactory", 0);
+            //
+            // Kafka ships log4j-slf4j-impl whose `StaticLoggerBinder.<init>`
+            // performs `checkcast Log4jMarkerFactory` on whatever this
+            // returns. If we hand back a `BasicMarkerFactory`, that
+            // checkcast throws ClassCastException, the slf4j clinit is
+            // swallowed, and downstream Kafka.main() exits with code 1.
+            // Prefer the log4j-specific subclass when it's on the
+            // classpath; fall back to BasicMarkerFactory otherwise.
+            let preferred = "org/apache/logging/slf4j/Log4jMarkerFactory";
+            let fallback = "org/slf4j/helpers/BasicMarkerFactory";
+            let chosen = if ctx.ensure_class_initialized(preferred).is_ok() {
+                preferred
+            } else {
+                fallback
+            };
+            let f = alloc_concurrent_synthetic(ctx, chosen, 0);
             let _ = ctx.invoke_special(
-                "org/slf4j/helpers/BasicMarkerFactory",
+                chosen,
                 "<init>",
                 "()V",
                 &[Value::Object(Some(f))],
@@ -24097,7 +24112,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getMarkerFactoryClassStr",
         "()Ljava/lang/String;",
         |ctx, _| {
-            let s = ctx.create_string("org.slf4j.helpers.BasicMarkerFactory");
+            let preferred = "org/apache/logging/slf4j/Log4jMarkerFactory";
+            let chosen = if ctx.ensure_class_initialized(preferred).is_ok() {
+                "org.apache.logging.slf4j.Log4jMarkerFactory"
+            } else {
+                "org.slf4j.helpers.BasicMarkerFactory"
+            };
+            let s = ctx.create_string(chosen);
             Ok(Some(Value::Object(Some(s))))
         },
     );
