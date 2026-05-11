@@ -419,6 +419,40 @@ fn empty_arraylist(ctx: &mut dyn NativeContext) -> MethodCallResult {
     Ok(Some(Value::Object(Some(list))))
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Spring Cloud AbstractEnvironmentDecrypt.decrypt — null-safe shim.
+//
+// `AbstractEnvironmentDecrypt.decrypt(TextEncryptor, PropertySources)` iterates
+// `propertySources`, casts each `EnumerablePropertySource` and reads
+// `getPropertyNames()` straight into `arraylength`.  Under CratonVM's partial
+// bootstrap at least one synthetic property source returns `null` from
+// `getPropertyNames()` (our synthetic StandardEnvironment or one of the
+// MutablePropertySources entries), so the `arraylength` at pc=72 NPEs.
+//
+// The demo has no encrypted properties, so the correct semantic answer here
+// is "no decryptions performed" → an empty Map.  We override `decrypt` on
+// `AbstractEnvironmentDecrypt` to return an empty `HashMap`, bypassing the
+// broken iteration entirely.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn empty_hashmap(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let map = match ctx.new_object("java/util/HashMap").ok().flatten() {
+        Some(Value::Object(Some(o))) => o,
+        _ => crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8),
+    };
+    let _ = ctx.invoke(
+        "java/util/HashMap",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(map))],
+    );
+    Ok(Some(Value::Object(Some(map))))
+}
+
+fn abstract_env_decrypt(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    empty_hashmap(ctx)
+}
+
 fn standard_config_data_resolve(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -884,6 +918,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;)Ljava/util/List;",
         standard_config_data_resolve,
     );
+    // ── Spring Cloud AbstractEnvironmentDecrypt null-safe shim ──
+    // Override decrypt(TextEncryptor, PropertySources) to return an empty Map,
+    // sidestepping the arraylength-on-null NPE from synthetic property sources
+    // whose getPropertyNames() returns null.  The demo has no encrypted props.
+    const ABS_ENV_DECRYPT: &str =
+        "org/springframework/cloud/bootstrap/encrypt/AbstractEnvironmentDecrypt";
+    registry.register(
+        ABS_ENV_DECRYPT,
+        "decrypt",
+        "(Lorg/springframework/security/crypto/encrypt/TextEncryptor;Lorg/springframework/core/env/PropertySources;)Ljava/util/Map;",
+        abstract_env_decrypt,
+    );
+
     registry.register(
         STD_CFG_RES,
         "resolveProfileSpecific",
