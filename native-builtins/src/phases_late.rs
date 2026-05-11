@@ -33976,11 +33976,8 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
-    eprintln!("BI-REG: entering register_phase72_natives");
     register_p72_preferences(registry);
-    eprintln!("BI-REG: about to call register_p72_beans");
     register_p72_beans(registry);
-    eprintln!("BI-REG: finished register_p72_beans");
     register_p72_naming(registry);
     register_p72_datagram(registry);
     register_datagram_channel(registry);
@@ -34765,7 +34762,6 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 
     // Introspector
     let intro = "java/beans/Introspector";
-    eprintln!("BI-REG: registering Introspector.getBeanInfo natives");
     r.register(
         intro,
         "getBeanInfo",
@@ -34860,21 +34856,31 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // we materialise real `java.lang.reflect.Method` mirrors below in
     // `introspector_get_bean_info` and just hand them back here.
     let pd = "java/beans/PropertyDescriptor";
+    // Read our synthetic overlay slots that sit AFTER the real-JDK fields.
+    // See `introspector_get_bean_info` above for why we don't reuse slots 0..3.
     r.register(pd, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base)))
     });
     r.register(pd, "getReadMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base + 1)))
     });
     r.register(pd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base + 2)))
     });
     r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base + 3)))
     });
 }
 
@@ -34887,8 +34893,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 /// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
 /// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    eprintln!("BI-TRACE: introspector_get_bean_info args.len={}", args.len());
-    let trace = true;
+    let trace = false;
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
         other => {
@@ -35030,14 +35035,41 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 
     // Build PropertyDescriptor array.
+    //
+    // CRITICAL: The real-JDK `PropertyDescriptor` class layout has typed
+    // fields at slots 0..N (e.g. an `int` flag at slot 2). Using
+    // `set_field(pd, k, Value::Object(...))` runs through the
+    // descriptor-aware write path which *coerces* our Object reference into
+    // whatever primitive type the real slot declares (we observed slot 2
+    // storing `Int(-1435209072)` after writing a Method mirror). Writing to
+    // those slots is therefore unusable for our synthetic accessors.
+    //
+    // Workaround: allocate the object with `real + 4` slots and stash our
+    // (name, readMethod, writeMethod, propertyType) tuple at the synthetic
+    // overlay slots `real..real+3`. The PD natives below (`getName`,
+    // `getReadMethod`, `getWriteMethod`, `getPropertyType`) read from the
+    // same overlay offsets via `class_num_total_fields(class_id)`. The real
+    // JDK fields are left alone (so any JDK bytecode that does still run
+    // against this object sees its defaults rather than coerced garbage).
+    let pd_class_id = ctx
+        .ensure_class_initialized("java/beans/PropertyDescriptor")
+        .ok();
+    let pd_real_fields = match pd_class_id {
+        Some(cid) => ctx.class_num_total_fields(cid),
+        None => 0,
+    };
     let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), properties.len());
     for (i, (prop_name, getter, setter, type_mirror)) in properties.iter().enumerate() {
-        let pd = alloc_concurrent_synthetic(ctx, "java/beans/PropertyDescriptor", 4);
+        let pd = match pd_class_id {
+            Some(cid) => ctx.alloc_object(cid, pd_real_fields + 4),
+            None => alloc_concurrent_synthetic(ctx, "java/beans/PropertyDescriptor", 4),
+        };
         let name_str = ctx.create_string(prop_name);
-        ctx.set_field(pd, 0, Value::Object(Some(name_str)));
-        ctx.set_field(pd, 1, Value::Object(*getter));
-        ctx.set_field(pd, 2, Value::Object(*setter));
-        ctx.set_field(pd, 3, Value::Object(*type_mirror));
+        let base = pd_real_fields;
+        ctx.set_field(pd, base + 0, Value::Object(Some(name_str)));
+        ctx.set_field(pd, base + 1, Value::Object(*getter));
+        ctx.set_field(pd, base + 2, Value::Object(*setter));
+        ctx.set_field(pd, base + 3, Value::Object(*type_mirror));
         ctx.set_array_element(pd_arr, i, Value::Object(Some(pd)));
     }
 

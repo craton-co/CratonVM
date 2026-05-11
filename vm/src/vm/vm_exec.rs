@@ -5628,6 +5628,19 @@ fn invoke_on_class_shared_inner(
                         // discovered getter/setter pairs.
                         || (class_name == "java/beans/Introspector"
                             && method_name == "getBeanInfo")
+                        // SPB.10 (cont.): our `Introspector.getBeanInfo` returns
+                        // synthetic `PropertyDescriptor`s whose readMethod/writeMethod
+                        // live in slots 1/2. The real-JDK `PropertyDescriptor` bytecode
+                        // reads private fields by name (and references soft Method
+                        // refs through `MethodRef`), so calling its bytecode on our
+                        // synthetic instance returns null. Force our slot-based
+                        // native getters to win so Spring's `BeanWrapperImpl` sees
+                        // the real getter/setter `Method` mirrors we stored.
+                        || (class_name == "java/beans/PropertyDescriptor"
+                            && (method_name == "getReadMethod"
+                                || method_name == "getWriteMethod"
+                                || method_name == "getName"
+                                || method_name == "getPropertyType"))
                         // KC16-JUL: java.util.logging.Logger.getResourceBundleName /
                         // getResourceBundle — the real JDK bytecode reads the
                         // private `loggerBundle` field which our Logger init
