@@ -15980,18 +15980,13 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     // flags: bit 0 = up, bit 1 = loopback, bit 2 = supportsMulticast
     let ni = "java/net/NetworkInterface";
 
-    r.register(ni, "getNetworkInterfaces", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let interfaces = p61_build_network_interfaces(ctx);
-        // Wrap in Enumeration (2-field: arr=0, pos=1)
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, interfaces.len());
-        for (i, iface) in interfaces.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*iface)));
-        }
-        ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
-        ctx.set_field(enum_obj, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(enum_obj))))
-    });
+    // NOTE: `getNetworkInterfaces` is intentionally NOT registered as a
+    // synthetic native in real-JDK mode. See the long comment in
+    // `register_re8_network_interface` (net_phase_e.rs) for details. The
+    // real JDK Java method calls native `getAll()` (returns empty) which
+    // produces a SocketException that callers handle. Returning synthetic
+    // NetworkInterface objects here breaks downstream `getInetAddresses()`
+    // because the real JDK reads field slots we don't populate.
 
     r.register(ni, "getByName", "(Ljava/lang/String;)Ljava/net/NetworkInterface;", |ctx, args| {
         let name_ref = obj_arg(args, 1)?;

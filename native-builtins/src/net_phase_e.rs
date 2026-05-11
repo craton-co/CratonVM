@@ -3275,36 +3275,16 @@ fn re8_build_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
 fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     let ni = "java/net/NetworkInterface";
 
-    r.register(ni, "getNetworkInterfaces", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let ifaces = re8_build_interfaces(ctx);
-        let arr = ctx.new_ref_array(ClassId::new(0), ifaces.len());
-        for (i, iface) in ifaces.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*iface)));
-        }
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
-        ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
-        ctx.set_field(enum_obj, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(enum_obj))))
-    });
-
-    r.register(
-        ni,
-        "networkInterfaces",
-        "()Ljava/util/stream/Stream;",
-        |ctx, _args| {
-            let ifaces = re8_build_interfaces(ctx);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))]).ok();
-            for iface in &ifaces {
-                rustjvm_native_collections::native_al_add(
-                    ctx,
-                    &[Value::Object(Some(list)), Value::Object(Some(*iface))],
-                )
-                .ok();
-            }
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
+    // NOTE: We do NOT register synthetic `getNetworkInterfaces` /
+    // `networkInterfaces` natives. In real-JDK mode the Java methods
+    // call native `getAll()` (registered below) which returns an empty
+    // array, causing `getNetworkInterfaces` to throw SocketException
+    // "No network interfaces configured". Callers like Spring Cloud's
+    // InetUtils.findFirstNonLoopbackAddress() catch that and fall back
+    // to defaults. Returning synthetic NetworkInterface objects here
+    // breaks the real JDK's `getInetAddresses()` because the real
+    // `addrs` field is in a different slot than our synthetic layout,
+    // resulting in `arraylength null` NPE inside NetworkInterface$1.
 
     r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
         let mac = ctx.new_array(ArrayElementType::Byte, 6);
