@@ -3314,6 +3314,67 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(mac))))
     });
     r.register(ni, "getMTU", "()I", |_ctx, _args| Ok(Some(Value::Int(1500))));
+
+    // Low-level "0" suffixed natives used by NetworkInterface (JDK internals).
+    // Safe no-op defaults — sufficient for environment probing (e.g., Spring's
+    // HostInfoEnvironmentPostProcessor) without performing real OS queries.
+    r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(
+        ni,
+        "supportsMulticast0",
+        "(Ljava/lang/String;I)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(ni, "getMTU0", "(Ljava/lang/String;I)I", |_ctx, _args| {
+        Ok(Some(Value::Int(1500)))
+    });
+    r.register(
+        ni,
+        "getMacAddr0",
+        "([BLjava/lang/String;I)[B",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        ni,
+        "getAll",
+        "()[Ljava/net/NetworkInterface;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        ni,
+        "getByName0",
+        "(Ljava/lang/String;)Ljava/net/NetworkInterface;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        ni,
+        "getByInetAddress0",
+        "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        ni,
+        "boundInetAddress0",
+        "(Ljava/net/InetAddress;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        ni,
+        "getByIndex0",
+        "(I)Ljava/net/NetworkInterface;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 }
 
 // ===========================================================================
