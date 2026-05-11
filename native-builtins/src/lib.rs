@@ -5193,6 +5193,48 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // (Keycloak 16 boot) gets the native too.
     crate::phases_late::register_new15_loom(registry);
 
+    // Arrays.stream(Object[]) — real-JDK-mode override.
+    //
+    // Real JDK's `Arrays.stream(T[])` → `Arrays.stream(T[],int,int)` →
+    // `StreamSupport.stream(ArraySpliterator, false)` produces a
+    // `ReferencePipeline$Head` that under CratonVM walks the spliterator
+    // pipeline incorrectly: `count()` and `forEach` happen to work, but
+    // `collect(Collector)` and `toList()` surface 0 elements. Kafka 4.2.0's
+    // `ServerTopicConfigSynonyms.<clinit>` (Kafka.scala:75 →
+    // KafkaConfig$.<clinit> → ServerConfigs.<clinit> →
+    // ServerTopicConfigSynonyms.lambda$static$0) builds its synonym map via
+    // `Arrays.stream(arr).map(...).collect(toList())` and then does
+    // `list.get(0).name()`, NPE-ing on the empty list.
+    //
+    // Workaround: delegate `Arrays.stream(T[])` to
+    // `Arrays.asList(arr).stream()`, which under CratonVM produces a working
+    // `Collection`-backed stream (verified: `Arrays.asList(arr).stream()
+    // .collect(toList())` returns the right elements). Same semantics —
+    // a sequential reference stream over the array's elements — just routed
+    // through the working backing.
+    registry.register(
+        "java/util/Arrays",
+        "stream",
+        "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
+        |ctx, args| {
+            let arr_val = args.first().copied().unwrap_or(Value::Object(None));
+            // Arrays.asList(arr) -> List
+            let list = ctx.invoke(
+                "java/util/Arrays",
+                "asList",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[arr_val],
+            )?;
+            let list_val = list.unwrap_or(Value::Object(None));
+            let list_ref = match list_val {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // list.stream() -> Stream  (invokeinterface on Collection.stream)
+            ctx.invoke_virtual(list_ref, "stream", "()Ljava/util/stream/Stream;", &[])
+        },
+    );
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }

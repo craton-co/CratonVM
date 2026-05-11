@@ -1742,6 +1742,55 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         // protected by the broader <clinit>-swallow if it NPEs again. The
         // critical bit is that ROOT/SERVICE/FAIL are non-null so SCI<clinit>
         // can reach its `putstatic SERIAL` at pc=24.
+        // R63 (WildFly): `org/wildfly/security/auth/server/_private/ElytronMessages.<clinit>`
+        // calls `Logger.getMessageLogger(Class, String)` which throws
+        // IllegalArgumentException in our VM (same jboss-logging dynamic-proxy
+        // path that breaks ServiceLogger). The swallow leaves
+        // `ElytronMessages.log` null, then `SecurityDomain$Builder.build`
+        // does `getstatic ElytronMessages.log` + `invokeinterface
+        // isTraceEnabled()` and NPEs at SecurityDomain.java:1100. WildFly
+        // catches the NPE and aborts with exit code 1. Backfill the `log`
+        // static with a synthetic `ElytronMessages_$logger` instance —
+        // mirrors the ServiceLogger fixup just below.
+        "org/wildfly/security/auth/server/_private/ElytronMessages" => {
+            let impl_name = "org/wildfly/security/auth/server/_private/ElytronMessages_$logger";
+            let impl_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(impl_name)
+            };
+            let target_id = impl_id.unwrap_or(class_id);
+            // ElytronMessages_$logger extends DelegatingBasicLogger which has
+            // one instance field (log:BasicLogger). Allocate with 2 slots to
+            // be safe — extra slots are harmless, missing slots NPE on access.
+            let num_fields = 2usize;
+            let cur = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id).and_then(|cls| {
+                    let mut idx = 0usize;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == "log" {
+                                return Some(super::vm_object::get_static_shared(
+                                    shared, class_id, idx,
+                                ));
+                            }
+                            idx += 1;
+                        }
+                    }
+                    None
+                })
+            };
+            let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+            if needs_fix {
+                if let Some(obj) = shared.heap.try_alloc_object(target_id, num_fields) {
+                    if set_static_by_name("log", Value::Object(Some(obj))) {
+                        tracing::warn!(
+                            "Post-clinit fixup: ElytronMessages.log populated with synthetic $logger"
+                        );
+                    }
+                }
+            }
+        }
         "org/jboss/msc/service/ServiceLogger" => {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {

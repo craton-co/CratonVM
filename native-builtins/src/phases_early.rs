@@ -719,16 +719,10 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
 
-    // Arrays.stream(Object[]) — convenience for Stream.of
-    r.register(arrays, "stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
-        ctx.set_field(stream, 0, Value::Object(Some(arr)));
-        Ok(Some(Value::Object(Some(stream))))
-    });
+    // Arrays.stream(Object[]) intercept lives in real-JDK mode via
+    // `register_essential_natives` (see lib.rs). This function is part of
+    // `register_enterprise_final_natives` which is gated on the
+    // `synthetic-jdk` feature and so does not run in real-JDK mode.
 
     // Arrays.stream(int[]) → IntStream
     r.register(arrays, "stream", "([I)Ljava/util/stream/IntStream;", |ctx, args| {

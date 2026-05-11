@@ -1148,6 +1148,21 @@ fn native_service_container_shutdown(
     Ok(None)
 }
 
+/// R63 (WildFly): `DelegatingBasicLogger.isTraceEnabled()` returns
+/// `this.log.isTraceEnabled()`, but in our synthetic-logger fixups
+/// for ServiceLogger/ElytronMessages the `log` field is null. The
+/// SecurityDomain$Builder.build call at line 1100 invokes
+/// `isTraceEnabled` on the synthetic ElytronMessages_$logger and NPEs.
+/// Shim to return false (trace disabled) so trace-gated code paths
+/// take the fast no-trace branch. Same shim covers isDebugEnabled —
+/// many WildFly call sites follow the same null-log pattern.
+fn native_delegating_logger_returns_false(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
 /// R63 (WildFly): `ServiceLogger_$logger.greeting(String)` is the
 /// jboss-logging-generated boot banner emitter. Its bytecode does
 /// `this.log.logf(FQCN, INFO, null, "JBoss MSC version %s", arg)` —
@@ -1286,6 +1301,17 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)V",
         native_service_logger_greeting_noop,
     );
+
+    // R63 (WildFly): shim DelegatingBasicLogger.isTraceEnabled/isDebugEnabled
+    // to return false. The default impls do `this.log.isTraceEnabled()`,
+    // but our synthetic backfills for ServiceLogger.ROOT/SERVICE/FAIL and
+    // ElytronMessages.log leave `this.log` null. Returning false makes
+    // every "if (log.isTraceEnabled()) ..." guard skip the inner work,
+    // which is what we want for a non-logging boot.
+    let dbl = "org/jboss/logging/DelegatingBasicLogger";
+    r.register(dbl, "isTraceEnabled", "()Z", native_delegating_logger_returns_false);
+    r.register(dbl, "isDebugEnabled", "()Z", native_delegating_logger_returns_false);
+    r.register(dbl, "isInfoEnabled", "()Z", native_delegating_logger_returns_false);
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
 }
