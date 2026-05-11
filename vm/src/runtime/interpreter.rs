@@ -5842,6 +5842,17 @@ fn execute_instruction(
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
+            // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
+            if class_name == "java/util/NoSuchElementException"
+                && std::env::var("RUSTJVM_NSEE_TRACE").is_ok()
+            {
+                eprintln!("[NSEE-TRACE] new java/util/NoSuchElementException at:");
+                let cm = shared.class_manager.read();
+                for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                    let cn = cm.get_class(f.class_id).map(|c| c.name.clone()).unwrap_or_default();
+                    eprintln!("[NSEE-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                }
+            }
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;

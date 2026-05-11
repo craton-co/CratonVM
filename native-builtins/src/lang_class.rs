@@ -4071,9 +4071,31 @@ pub(crate) fn create_constructor_object(
     }
     let desc_str = ctx.create_string(&meta.descriptor);
 
+    // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
+    // attribute. The JDK `Constructor.getExceptionTypes()` Java method
+    // does `return exceptionTypes.clone();`, which NPEs if null. CGLib's
+    // Enhancer.emitConstructors calls this on every superclass constructor
+    // during proxy class generation — see ReflectUtils.getExceptionTypes
+    // (ReflectUtils.java:133/605).
+    let exception_names = ctx.method_exceptions(
+        meta.declaring_class_id,
+        &meta.name,
+        &meta.descriptor,
+    );
+    let exception_arr = ctx.new_ref_array(
+        rustjvm_types::ClassId::new(0),
+        exception_names.len(),
+    );
+    for (i, name) in exception_names.iter().enumerate() {
+        let desc = format!("L{name};");
+        let mirror = descriptor_to_class_mirror(ctx, &desc);
+        ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
+    }
+
     // --- Real JDK Constructor layout ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
     ctx.set_field_by_name(obj, "parameterTypes", Value::Object(Some(param_arr)));
+    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(exception_arr)));
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
 

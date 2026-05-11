@@ -4967,6 +4967,115 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // Round 54: real-JDK mode bypass for java.util.TimeZone.getTimeZone /
+    // getDefault / setDefaultZone and sun/util/calendar/ZoneInfoFile.
+    //
+    // Jackson 2.x `MapperBuilder.<clinit>` -> `BaseSettings.<clinit>`
+    // calls `TimeZone.getTimeZone("UTC")`, which triggers the real JDK
+    // bytecode path `TimeZone.getTimeZone -> ZoneInfo.getTimeZone ->
+    // ZoneInfoFile.getZoneInfo -> ZoneInfoFile.getZoneInfo0`, and the
+    // latter calls `Arrays.binarySearch(regions, ...)` on a NULL
+    // `regions` static array because the ZoneInfoFile.<clinit> failed
+    // earlier to load `${java.home}/lib/tzdb.dat` (silently swallowed
+    // as `java/lang/Error`). The NPE then propagates out as
+    // `RuntimeException("Invalid binary time-zone data: TZDB:UTC")`,
+    // blocking Spring's Jackson `ObjectMapper` bean, which transitively
+    // blocks `ServletWebServerFactoryAutoConfiguration` —
+    // `MissingWebServerFactoryBeanException`.
+    //
+    // Round 13 fixed `ZoneId.systemDefault()` the same way (returned a
+    // synthetic `ZoneOffset` short-circuiting the failing path); this
+    // is the matching fix for the legacy `java.util.TimeZone` API.
+    //
+    // The fix: register `TimeZone.getTimeZone(String)` and
+    // `TimeZone.getDefault()` to allocate a concrete TimeZone subclass
+    // instance (`sun/util/calendar/ZoneInfo` extends `TimeZone`) with
+    // the given ID and a zero offset. Jackson does not use the returned
+    // TimeZone for arithmetic at clinit time — just needs a non-null
+    // object whose `getID()` works.
+    //
+    // Also register `ZoneInfoFile.getZoneInfo0(String)` as a safety net
+    // for any direct caller — returns null so callers fall through to
+    // GMT.
+    fn alloc_synth_timezone(
+        ctx: &mut dyn NativeContext,
+        id_str: &str,
+    ) -> rustjvm_types::Value {
+        // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
+        // Fall back to allocating with class-id 0 if init fails — the
+        // caller only needs an object whose `getID()` returns id_str.
+        let cid = match ctx.ensure_class_initialized("sun/util/calendar/ZoneInfo") {
+            Ok(c) => c,
+            Err(_) => match ctx.ensure_class_initialized("java/util/TimeZone") {
+                Ok(c) => c,
+                Err(_) => return rustjvm_types::Value::Object(None),
+            },
+        };
+        // Field count: be generous (16) to cover both TimeZone (ID) and
+        // ZoneInfo subclass fields (rawOffset, transitions, etc.).
+        let obj = ctx.alloc_object(cid, 16);
+        let s = ctx.create_string(id_str);
+        // TimeZone.ID is the only field readers consult; set by name to
+        // resolve into the correct inherited slot.
+        ctx.set_field_by_name(obj, "ID", Value::Object(Some(s)));
+        // ZoneInfo subclass fields — best-effort, no-op if missing.
+        ctx.set_field_by_name(obj, "rawOffset", Value::Int(0));
+        ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
+        ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
+        rustjvm_types::Value::Object(Some(obj))
+    }
+
+    registry.register(
+        "java/util/TimeZone",
+        "getTimeZone",
+        "(Ljava/lang/String;)Ljava/util/TimeZone;",
+        |ctx, args| {
+            let id = match args.first() {
+                Some(Value::Object(Some(o))) => {
+                    ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
+                }
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(alloc_synth_timezone(ctx, &id)))
+        },
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDefault",
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDefaultRef",
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+    );
+    // Safety net: short-circuit ZoneInfoFile.getZoneInfo0 to return null
+    // for direct callers (the higher-level TimeZone.getTimeZone is now
+    // native so this is unlikely to be hit, but keep it for defensive
+    // coverage of frameworks that call it reflectively).
+    registry.register(
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo0",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+        |ctx, args| {
+            let id = match args.first() {
+                Some(Value::Object(Some(o))) => {
+                    ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
+                }
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(alloc_synth_timezone(ctx, &id)))
+        },
+    );
+
     // CleanerFactory.<clinit> NPE fix — real-JDK
     // `Cleaner.create(...)` bytecode allocates an `InnocuousThread`
     // and calls `t.setPriority(...)` which dereferences a null
@@ -23480,11 +23589,24 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // Spring Boot's LogbackLoggingSystem checks
+    // `LoggerFactory.getILoggerFactory()` returns a
+    // `ch.qos.logback.classic.LoggerContext`. Real-JDK LoggerFactory
+    // bytecode calls `StaticLoggerBinder.getSingleton().getLoggerFactory()`
+    // — so this native is the final arbiter of the returned type.
+    // Prefer allocating a real-classed LoggerContext when logback-classic
+    // is on the classpath; fall back to the synthetic ILoggerFactory
+    // for apps that don't ship logback (the slf4j-API <clinit> just
+    // needs a non-null return; nothing else inspects this object's class).
     registry.register(
         "org/slf4j/impl/StaticLoggerBinder",
         "getLoggerFactory",
         "()Lorg/slf4j/ILoggerFactory;",
         |ctx, _| {
+            if ctx.ensure_class_initialized("ch/qos/logback/classic/LoggerContext").is_ok() {
+                let f = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/LoggerContext", 1);
+                return Ok(Some(Value::Object(Some(f))));
+            }
             let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
             Ok(Some(Value::Object(Some(f))))
         },
@@ -23494,7 +23616,12 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getLoggerFactoryClassStr",
         "()Ljava/lang/String;",
         |ctx, _| {
-            let s = ctx.create_string("org.slf4j.helpers.NOPLoggerFactory");
+            let name = if ctx.ensure_class_initialized("ch/qos/logback/classic/LoggerContext").is_ok() {
+                "ch.qos.logback.classic.LoggerContext"
+            } else {
+                "org.slf4j.helpers.NOPLoggerFactory"
+            };
+            let s = ctx.create_string(name);
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -23667,6 +23794,131 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         registry.register(lg, "info", sig, slf4j_noop);
         registry.register(lg, "warn", sig, slf4j_noop);
         registry.register(lg, "error", sig, slf4j_noop);
+    }
+
+    // Logback LoggerContext bridge — paired with the
+    // `StaticLoggerBinder.getLoggerFactory` native above. When logback
+    // is on the fat-jar classpath we return a real-classed
+    // `LoggerContext` instance so Spring Boot's
+    // `LoggingSystemFactory.LogbackLoggingSystem.beforeInitialize()`
+    // class check passes. The instance's fields (`loggerCache` etc.)
+    // are never initialized through logback's real `<init>` chain, so
+    // we register a `getLogger(String)` native that bypasses the real
+    // bytecode (which NPEs on the uninitialized `loggerCache`
+    // HashMap) and hands back a synthetic SLF4J Logger.
+    let lb_ctx = "ch/qos/logback/classic/LoggerContext";
+    registry.register(lb_ctx, "<init>", "()V", native_noop_with_this);
+    registry.register(
+        lb_ctx,
+        "getLogger",
+        "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
+        |ctx, args| {
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
+            ctx.set_field_by_name(logger, "name", name);
+            ctx.set_field(logger, 0, name);
+            Ok(Some(Value::Object(Some(logger))))
+        },
+    );
+    registry.register(
+        lb_ctx,
+        "getLogger",
+        "(Ljava/lang/Class;)Lch/qos/logback/classic/Logger;",
+        |ctx, args| {
+            let name_val = match args.get(1) {
+                Some(Value::Object(Some(class_mirror))) => {
+                    match ctx.get_field(*class_mirror, 0) {
+                        Value::Object(Some(n)) => Value::Object(Some(n)),
+                        _ => Value::Object(Some(ctx.create_string("unknown"))),
+                    }
+                }
+                _ => Value::Object(Some(ctx.create_string("unknown"))),
+            };
+            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
+            ctx.set_field_by_name(logger, "name", name_val);
+            ctx.set_field(logger, 0, name_val);
+            Ok(Some(Value::Object(Some(logger))))
+        },
+    );
+    registry.register(lb_ctx, "getName", "()Ljava/lang/String;", |ctx, _| {
+        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
+    });
+    registry.register(lb_ctx, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
+    registry.register(lb_ctx, "start", "()V", |_, _| Ok(None));
+    registry.register(lb_ctx, "stop", "()V", |_, _| Ok(None));
+    registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
+    registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // ContextBase is the parent class of LoggerContext. Its real
+    // bytecode `getObject(String)` / `putObject(String, Object)` /
+    // `getCopyOfPropertyMap` reads a `HashMap` field that is null
+    // because we bypass the real `<init>` chain. Spring Boot's
+    // `LogbackLoggingSystem.beforeInitialize()` calls `getObject`
+    // (via `isAlreadyInitialized`) on the LoggerContext we hand out,
+    // so we need these accessor natives to short-circuit before the
+    // null-map dereference. Returning null from getObject is the
+    // documented "not present" contract; putObject becomes a no-op.
+    let cb = "ch/qos/logback/core/ContextBase";
+    registry.register(cb, "getObject", "(Ljava/lang/String;)Ljava/lang/Object;", |_, _| {
+        Ok(Some(Value::Object(None)))
+    });
+    registry.register(cb, "putObject", "(Ljava/lang/String;Ljava/lang/Object;)V", |_, _| Ok(None));
+    registry.register(cb, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", |_, _| {
+        Ok(Some(Value::Object(None)))
+    });
+    registry.register(cb, "putProperty", "(Ljava/lang/String;Ljava/lang/String;)V", |_, _| Ok(None));
+    registry.register(cb, "getCopyOfPropertyMap", "()Ljava/util/Map;", |ctx, _| {
+        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2);
+        Ok(Some(Value::Object(Some(map))))
+    });
+    registry.register(cb, "getName", "()Ljava/lang/String;", |ctx, _| {
+        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
+    });
+    registry.register(cb, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
+    registry.register(cb, "start", "()V", |_, _| Ok(None));
+    registry.register(cb, "stop", "()V", |_, _| Ok(None));
+    registry.register(cb, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // Logback Logger surface — paired with the LoggerContext.getLogger
+    // native above. Mirrors the SLF4J Logger no-ops registered higher
+    // in this fn but on the concrete `ch.qos.logback.classic.Logger`
+    // class so direct logback-typed callers (Spring Boot's
+    // LogAdapter$Slf4jAdapter takes the SLF4J Logger interface so it
+    // already routes through the SLF4J no-ops; user code that casts
+    // to logback's Logger needs these).
+    let lb_lg = "ch/qos/logback/classic/Logger";
+    registry.register(lb_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let v = match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => Value::Object(Some(s)),
+            _ => match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string(""))),
+            },
+        };
+        Ok(Some(v))
+    });
+    registry.register(lb_lg, "isTraceEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isDebugEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "setLevel", "(Lch/qos/logback/classic/Level;)V", |_, _| Ok(None));
+    for sig in [
+        "(Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;[Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ] {
+        registry.register(lb_lg, "trace", sig, slf4j_noop);
+        registry.register(lb_lg, "debug", sig, slf4j_noop);
+        registry.register(lb_lg, "info", sig, slf4j_noop);
+        registry.register(lb_lg, "warn", sig, slf4j_noop);
+        registry.register(lb_lg, "error", sig, slf4j_noop);
     }
 }
 

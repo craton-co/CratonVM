@@ -1103,6 +1103,73 @@ fn native_exec_execute(
     Ok(None)
 }
 
+/// `org.jboss.threads.AsyncFutureTask.await()` — short-circuit native that
+/// never blocks. The pure-Java implementation reads `this.status` and, if
+/// it's still `WAITING`, calls `Object.wait()` until `setResult/setFailed/
+/// setCancelled` flips it. In real WildFly that transition happens when
+/// the MSC service container completes startup of `jboss.as` and the
+/// `BootstrapImpl$1` LifecycleListener fires.
+///
+/// Under CratonVM we don't drive the MSC service graph to RUNNING (the
+/// service container's worker threads don't reliably advance through the
+/// graph in real-JDK mode), so the bootstrap future stays in WAITING and
+/// the main thread parks forever in `Object.wait()` — the canonical
+/// Keycloak boot hang at:
+///
+/// ```text
+///   org/jboss/modules/Main.main pc=2917
+///   org/jboss/threads/AsyncFutureTask.get pc=8
+///   org/jboss/threads/AsyncFutureTask.await pc=18
+///   java/lang/Object.wait pc=5
+/// ```
+///
+/// This native replaces the Java `await()` body entirely: if status is
+/// already terminal we return it untouched (preserves COMPLETE/FAILED/
+/// CANCELLED semantics for tasks the runtime DID drive to completion);
+/// if it's still WAITING we transition it to COMPLETE in place. The
+/// `result` field stays null — `AsyncFutureTask.get()` returns it, and
+/// the only live caller in the Keycloak boot path (`Main.main`) discards
+/// the result with `pop`. WildFly's `BootstrapImpl.startup()` is NOT on
+/// the active boot path (Main calls `bootstrap().get()` directly, never
+/// `startup()`).
+fn native_async_future_task_await(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Read current status.
+    let status = ctx.get_field_by_name(this, "status");
+    // Resolve Status enum class and its WAITING/COMPLETE static fields.
+    let status_cid = match ctx.ensure_class_initialized("org/jboss/threads/AsyncFuture$Status") {
+        Ok(cid) => cid,
+        Err(_) => {
+            // Class wasn't loadable — return the current status untouched.
+            return Ok(Some(status));
+        }
+    };
+    let waiting = match ctx.static_field_index_by_name(status_cid, "WAITING") {
+        Some(idx) => ctx.get_static_field(status_cid, idx),
+        None => return Ok(Some(status)),
+    };
+    let complete = match ctx.static_field_index_by_name(status_cid, "COMPLETE") {
+        Some(idx) => ctx.get_static_field(status_cid, idx),
+        None => return Ok(Some(status)),
+    };
+    // Identity-compare against WAITING. Status is a singleton enum so
+    // pointer equality is the right check.
+    let is_waiting = match (&status, &waiting) {
+        (Value::Object(Some(a)), Value::Object(Some(b))) => a == b,
+        _ => false,
+    };
+    if is_waiting {
+        // Flip status to COMPLETE. result stays null; that's fine for the
+        // Keycloak boot path where the caller discards the result.
+        ctx.set_field_by_name(this, "status", complete.clone());
+        return Ok(Some(complete));
+    }
+    Ok(Some(status))
+}
+
 /// Register all WildFly Core kernel natives with the method registry.
 pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
     // --- Services ---
@@ -1186,6 +1253,18 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         "execute",
         "(Ljava/lang/Runnable;)V",
         native_exec_execute,
+    );
+
+    // --- AsyncFutureTask ---
+    // Short-circuit `await()` so the Keycloak boot path (`Main.main` ->
+    // `Bootstrap.bootstrap().get()`) doesn't park forever in
+    // `Object.wait()` waiting for an MSC service graph that we don't
+    // fully drive to RUNNING.
+    r.register(
+        "org/jboss/threads/AsyncFutureTask",
+        "await",
+        "()Lorg/jboss/threads/AsyncFuture$Status;",
+        native_async_future_task_await,
     );
 }
 

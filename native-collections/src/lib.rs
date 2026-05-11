@@ -1232,12 +1232,36 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     if let Some(old_b) = old_buckets {
         for i in 0..(old_cap as usize) {
             let mut node_val = ctx.get_array_element(old_b, i);
+            let mut steps: usize = 0;
             while let Value::Object(Some(node)) = node_val {
+                steps += 1;
+                if steps > 1_000_000 {
+                    eprintln!(
+                        "[HM-RESIZE-GUARD] aborting old-chain walk at {} nodes (suspected cycle); bucket={}",
+                        steps, i
+                    );
+                    break;
+                }
                 let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
                     Value::Int(h) => h,
                     _ => 0,
                 };
                 let next = ctx.get_field(node, NODE_FIELD_NEXT);
+                // Self-cycle guard before we splice into the new bucket
+                if let Value::Object(Some(nx)) = next {
+                    if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
+                        eprintln!(
+                            "[HM-RESIZE-GUARD] self-cycle in old bucket {} step {}",
+                            i, steps
+                        );
+                        // Truncate: splice node alone, do not continue
+                        let new_idx = map_bucket_index(key_hash, new_cap);
+                        let existing = ctx.get_array_element(new_buckets, new_idx);
+                        ctx.set_field(node, NODE_FIELD_NEXT, existing);
+                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+                        break;
+                    }
+                }
 
                 // Insert into new bucket
                 let new_idx = map_bucket_index(key_hash, new_cap);
@@ -1659,8 +1683,23 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
 
-    // Walk chain looking for existing key (S111r27: layout-aware)
+    // Walk chain looking for existing key (S111r27: layout-aware).
+    // Safety: cap the chain walk to detect pathological cases (cycles or
+    // O(n^2) blowup from massive single-bucket pile-ups). Real chains
+    // should be O(log n) even with poor hashes; anything past 4096 is a
+    // strong signal of a cycle/corruption — break and let the insert
+    // proceed as if not found.
+    let mut walk_count: usize = 0;
+    const CHAIN_WALK_LIMIT: usize = 4096;
     while let Value::Object(Some(node)) = node_val {
+        walk_count += 1;
+        if walk_count > CHAIN_WALK_LIMIT {
+            eprintln!(
+                "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                walk_count, this, idx, cap
+            );
+            break;
+        }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             // Looking for a null-key node
@@ -1683,7 +1722,18 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(old_value));
             }
         }
-        node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+        let next = ctx.get_field(node, NODE_FIELD_NEXT);
+        // Self-cycle guard: if node.next == node, abort immediately.
+        if let Value::Object(Some(nx)) = next {
+            if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
+                eprintln!(
+                    "[HM-PUT-GUARD] self-cycle node detected at walk {}; map={:?} idx={}",
+                    walk_count, this, idx
+                );
+                break;
+            }
+        }
+        node_val = next;
     }
 
     // Key not found — insert at head of chain
@@ -8627,11 +8677,255 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     registry.register(c, "toString", "()Ljava/lang/String;", native_ll_to_string);
     registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ll_iterator);
+    // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
+    // fields via getfield; our overlay-based LL never writes those, so
+    // `List.sort` default-method path crashes with NoSuchElementException
+    // inside Spring's `processDeferredImportSelectors`. Override
+    // `listIterator()` / `listIterator(I)` to return a snapshot-array iterator
+    // with cursor + list_ref so `next`/`hasNext`/`set` work via our overlay.
+    registry.register(
+        c,
+        "listIterator",
+        "()Ljava/util/ListIterator;",
+        native_ll_list_iterator,
+    );
+    registry.register(
+        c,
+        "listIterator",
+        "(I)Ljava/util/ListIterator;",
+        native_ll_list_iterator_idx,
+    );
 
     // LinkedList$Itr
     let itr = "java/util/LinkedList$Itr";
     registry.register(itr, "hasNext", "()Z", native_ll_itr_has_next);
     registry.register(itr, "next", "()Ljava/lang/Object;", native_ll_itr_next);
+
+    // LinkedList$ListItr — synthetic 3-field overlay
+    //   field 0 = Object[] snapshot of list elements
+    //   field 1 = Int cursor (nextIndex)
+    //   field 2 = list ref (so set() can mutate the backing LinkedList node)
+    let lit = "java/util/LinkedList$ListItr";
+    registry.register(lit, "hasNext", "()Z", native_ll_listitr_has_next);
+    registry.register(lit, "next", "()Ljava/lang/Object;", native_ll_listitr_next);
+    registry.register(lit, "hasPrevious", "()Z", native_ll_listitr_has_previous);
+    registry.register(
+        lit,
+        "previous",
+        "()Ljava/lang/Object;",
+        native_ll_listitr_previous,
+    );
+    registry.register(lit, "nextIndex", "()I", native_ll_listitr_next_index);
+    registry.register(lit, "previousIndex", "()I", native_ll_listitr_previous_index);
+    registry.register(lit, "set", "(Ljava/lang/Object;)V", native_ll_listitr_set);
+    registry.register(lit, "remove", "()V", native_ll_listitr_remove_noop);
+    registry.register(lit, "add", "(Ljava/lang/Object;)V", native_ll_listitr_remove_noop);
+}
+
+fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    let size = ll_size(ctx, this) as usize;
+    let arr = alloc_ref_array(ctx, size);
+    let mut cur = match ll_get(this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let mut i = 0;
+    while let Some(node) = cur {
+        if i >= size {
+            break;
+        }
+        let elem = ctx.get_field(node, LL_NODE_ELEM);
+        ctx.set_array_element(arr, i, elem);
+        cur = match ctx.get_field(node, LL_NODE_NEXT) {
+            Value::Object(Some(n)) => Some(n),
+            _ => None,
+        };
+        i += 1;
+    }
+    arr
+}
+
+fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let arr = ll_snapshot_array(ctx, this);
+    let it = alloc_synthetic(ctx, "java/util/LinkedList$ListItr", 3);
+    ctx.set_field(it, 0, Value::Object(Some(arr)));
+    ctx.set_field(it, 1, Value::Int(0));
+    ctx.set_field(it, 2, Value::Object(Some(this)));
+    Ok(Some(Value::Object(Some(it))))
+}
+
+fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let arr = ll_snapshot_array(ctx, this);
+    let it = alloc_synthetic(ctx, "java/util/LinkedList$ListItr", 3);
+    ctx.set_field(it, 0, Value::Object(Some(arr)));
+    ctx.set_field(it, 1, Value::Int(idx.max(0)));
+    ctx.set_field(it, 2, Value::Object(Some(this)));
+    Ok(Some(Value::Object(Some(it))))
+}
+
+fn native_ll_listitr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr) as i32;
+    Ok(Some(Value::Int(if cursor < len { 1 } else { 0 })))
+}
+
+fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr) as i32;
+    if cursor >= len {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No more elements".to_string(),
+        }
+        .into());
+    }
+    let elem = ctx.get_array_element(arr, cursor as usize);
+    ctx.set_field(this, 1, Value::Int(cursor + 1));
+    Ok(Some(elem))
+}
+
+fn native_ll_listitr_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if cursor > 0 { 1 } else { 0 })))
+}
+
+fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No previous element".to_string(),
+            }
+            .into())
+        }
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No previous element".to_string(),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if cursor <= 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No previous element".to_string(),
+        }
+        .into());
+    }
+    let elem = ctx.get_array_element(arr, (cursor - 1) as usize);
+    ctx.set_field(this, 1, Value::Int(cursor - 1));
+    Ok(Some(elem))
+}
+
+fn native_ll_listitr_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(cursor)))
+}
+
+fn native_ll_listitr_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(cursor - 1)))
+}
+
+fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Set the element at (cursor - 1) in both the snapshot array AND the
+    // backing LinkedList node, so `List.sort` actually sorts.
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let idx = cursor - 1;
+    if idx < 0 {
+        return Ok(None);
+    }
+    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+        ctx.set_array_element(arr, idx as usize, elem);
+    }
+    if let Value::Object(Some(list)) = ctx.get_field(this, 2) {
+        if let Some(node) = ll_node_at(ctx, list, idx) {
+            ctx.set_field(node, LL_NODE_ELEM, elem);
+        }
+    }
+    Ok(None)
+}
+
+fn native_ll_listitr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
 }
 
 fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
