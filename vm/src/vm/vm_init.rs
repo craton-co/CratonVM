@@ -746,6 +746,23 @@ impl SharedVm {
             }
         }
 
+        // Same treatment for `Comparator$Native`: real-JDK code that does
+        // `Stream.sorted(comparator)` (e.g. Spring's `ConfigurationClassParser`)
+        // performs an implicit checkcast to `java/util/Comparator`. Our
+        // synthetic class must declare `Object` as superclass and
+        // `java/util/Comparator` as an implemented interface for the cast to
+        // succeed.
+        let cmp_native_id = class_manager.ensure_synthetic_class("java/util/Comparator$Native", 3);
+        let comparator_id = class_manager
+            .load_class("java/util/Comparator")
+            .expect("java/util/Comparator must be loadable");
+        if let Some(cls) = class_manager.get_class_mut(cmp_native_id) {
+            cls.superclass = Some(object_id);
+            if !cls.interfaces.contains(&comparator_id) {
+                cls.interfaces.push(comparator_id);
+            }
+        }
+
         let gc_backend = match config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
             crate::config::GcAlgorithm::G1 => GcBackend::G1,
