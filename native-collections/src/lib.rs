@@ -5350,6 +5350,12 @@ const COLLECTOR_TAG_TO_MAP_MERGE: i32 = 12;
 /// `Collectors.collectingAndThen(downstream, finisher)` — ARG1=downstream
 /// Collector, ARG2=finisher Function applied to the downstream result.
 const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
+/// `Collectors.toCollection(Supplier)` — ARG1=Supplier producing the target
+/// Collection. Stream elements are added to the supplied Collection via
+/// `Collection.add(Object)`. Required by Spring Boot 4.x
+/// `AutoConfigurationImportSelector.AutoConfigurationGroup.selectImports` which
+/// collects entries into a user-supplied LinkedHashSet.
+const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/stream/Collectors";
@@ -5458,6 +5464,25 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         native_collectors_partitioning_by_downstream,
     );
+    // toCollection(Supplier) — needed by Spring Boot 4.x
+    // AutoConfigurationImportSelector which collects into a user-supplied
+    // LinkedHashSet.
+    r.register(
+        c,
+        "toCollection",
+        "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;",
+        native_collectors_to_collection,
+    );
+}
+
+fn native_collectors_to_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_COLLECTION);
+    let supplier = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, supplier);
+    Ok(Some(Value::Object(Some(c))))
 }
 
 fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
@@ -5609,6 +5634,35 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     match tag {
         COLLECTOR_TAG_TO_LIST => make_list_of(ctx, &elements),
         COLLECTOR_TAG_TO_SET => make_set_of(ctx, &elements),
+        COLLECTOR_TAG_TO_COLLECTION => {
+            // Invoke the supplier to materialize the target Collection, then
+            // add each stream element via Collection.add(Object). Fall back to
+            // a HashSet if the supplier is missing or fails.
+            let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+            let coll_obj = match supplier {
+                Value::Object(Some(s)) => {
+                    match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
+                        Ok(Some(Value::Object(Some(c)))) => Some(c),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match coll_obj {
+                Some(c) => {
+                    for elem in &elements {
+                        let _ = ctx.invoke_virtual(
+                            c,
+                            "add",
+                            "(Ljava/lang/Object;)Z",
+                            &[*elem],
+                        )?;
+                    }
+                    Ok(Some(Value::Object(Some(c))))
+                }
+                None => make_set_of(ctx, &elements),
+            }
+        }
         COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
         COLLECTOR_TAG_JOINING => {
             let mut parts = Vec::with_capacity(elements.len());
