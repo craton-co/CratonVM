@@ -2211,6 +2211,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // native since JDK's Class field layout differs from our mirror layout.
     registry.register("java/lang/Class", "getName", "()Ljava/lang/String;", lang_class::native_class_get_name);
     registry.register("java/lang/Class", "getComponentType", "()Ljava/lang/Class;", lang_class::native_class_get_component_type);
+    // Round 63: Class.arrayType() — bypass JDK's `Array.newInstance(this, 0).getClass()`
+    // chain, which leaked nulls into Spring's GenericConversionService$Converters.
+    // getClassHierarchy when invoked on the superclass / interfaces of an array
+    // argument (e.g. `Object`, `Cloneable`, `Serializable`). Direct mirror lookup
+    // matches what `Object.getClass()` produces for an actual array instance.
+    registry.register("java/lang/Class", "arrayType", "()Ljava/lang/Class;", lang_class::native_class_array_type);
     registry.register("java/lang/Class", "getDeclaringClass0", "()Ljava/lang/Class;", lang_class::native_class_get_declaring_class);
     registry.register("java/lang/Class", "getSimpleBinaryName0", "()Ljava/lang/String;", lang_class::native_class_get_simple_binary_name);
     registry.register("java/lang/Class", "getEnclosingMethod0", "()[Ljava/lang/Object;", lang_class::native_class_get_enclosing_method);

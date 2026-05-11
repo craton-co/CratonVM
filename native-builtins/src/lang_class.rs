@@ -6516,6 +6516,45 @@ pub(crate) fn native_class_get_component_type(
     Ok(Some(Value::Object(None)))
 }
 
+/// `Class.arrayType()` — return a `Class` mirror that represents the
+/// array type whose component is `this`.
+///
+/// JDK's bytecode implementation is `Array.newInstance(this, 0).getClass()`,
+/// which on CratonVM has been observed to surface null entries in
+/// Spring's `GenericConversionService$Converters.getClassHierarchy`
+/// (which calls `Class.arrayType()` on the superclass / interfaces of an
+/// array-typed argument and then dereferences the result with
+/// `componentType()` on the next iteration). Bypass that fragile two-step
+/// chain by synthesising the array-type mirror directly from the
+/// component class's name, mirroring what `Object.getClass()` does for an
+/// actual array object (see `native_object_get_class`).
+pub(crate) fn native_class_array_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = mirror_class_name(ctx, this).unwrap_or_default();
+    // Primitive component → "[I", "[J", … ; object/array component → "[L<name>;" or "[<arrayname>".
+    let array_name = match name.as_str() {
+        "int"     => "[I".to_string(),
+        "long"    => "[J".to_string(),
+        "float"   => "[F".to_string(),
+        "double"  => "[D".to_string(),
+        "boolean" => "[Z".to_string(),
+        "byte"    => "[B".to_string(),
+        "char"    => "[C".to_string(),
+        "short"   => "[S".to_string(),
+        "void"    => return Ok(Some(Value::Object(None))),
+        other if other.starts_with('[') => format!("[{other}"),
+        other => format!("[L{};", other),
+    };
+    let mirror = ctx.primitive_class_mirror(&array_name);
+    Ok(Some(Value::Object(Some(mirror))))
+}
+
 pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
