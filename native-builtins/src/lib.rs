@@ -8895,8 +8895,25 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 }
             }
         };
-        // Create a class mirror with the array type name
-        // Use primitive_class_mirror which creates a fresh mirror with a custom name
+        // Create a class mirror with the array type name.  We need a real
+        // (non-primitive) class mirror so that `Class.isPrimitive()` returns
+        // false and the identity matches the `Foo[].class` literal — both
+        // are required by Spring's `ClassUtils.resolvePrimitiveIfNecessary`
+        // (called via `TypeDescriptor.getObjectType`) which otherwise reads
+        // `isPrimitive()==true` for an `Object[]` mirror produced here and
+        // returns `null`, surfacing as `NPE: Cannot invoke isInstance on
+        // null` inside `GenericConversionService.convert`.
+        if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
+            let mirror = ctx.get_class_mirror(arr_cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        let _ = ctx.load_class(&array_class_name);
+        if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
+            let mirror = ctx.get_class_mirror(arr_cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        // Last-resort fallback (e.g. degenerate names that fail to synthesise):
+        // keep the old behaviour so we never return a null mirror.
         let mirror = ctx.primitive_class_mirror(&array_class_name);
         return Ok(Some(Value::Object(Some(mirror))));
     }
