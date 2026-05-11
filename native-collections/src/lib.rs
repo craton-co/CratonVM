@@ -7526,7 +7526,27 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
     }
 }
 
+fn native_comparator_compare_method(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [this, a, b]
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let a = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let b = args.get(2).cloned().unwrap_or(Value::Object(None));
+    comparator_compare(ctx, this, a, b)
+}
+
 fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/util/Comparator$Native",
+        "compare",
+        "(Ljava/lang/Object;Ljava/lang/Object;)I",
+        native_comparator_compare_method,
+    );
     registry.register(
         "java/util/Comparator",
         "naturalOrder",
