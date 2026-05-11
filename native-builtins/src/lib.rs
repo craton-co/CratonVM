@@ -2376,13 +2376,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             })
         });
         if let Some(raw_path) = path_opt {
+            // R63 (Keycloak/Quarkus): `find_class_source_path` returns the
+            // classpath entry verbatim — which may be a relative path like
+            // `lib/quarkus-run.jar` when launched via `cd <appdir> && --jar
+            // lib/quarkus-run.jar`.  Without canonicalization, the resulting
+            // URL `file:lib/quarkus-run.jar` is opaque (no `/` after `file:`),
+            // and Quarkus's `Path.of(QuarkusEntryPoint.class.getProtectionDomain()
+            // .getCodeSource().getLocation().toURI()).getParent()` produces a
+            // single-segment Path whose `getParent()` is null — exactly the
+            // QuarkusEntryPoint.doRun:67 NPE.  Canonicalize so the URL is
+            // always absolute (`file:/C:/.../lib/quarkus-run.jar`).
+            let abs_path = std::fs::canonicalize(&raw_path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .map(|s| s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+                .unwrap_or(raw_path);
             // Normalise backslashes to forward slashes so Path/File code
             // further up the stack works the same on every platform.
-            let fwd = raw_path.replace('\\', "/");
+            let fwd = abs_path.replace('\\', "/");
             // Ensure absolute-style leading slash for Windows drive paths
             // (e.g. `C:/craton/...` → `/C:/craton/...`), matching the
             // URL-encoded form HotSpot produces.
             let path = if fwd.len() >= 2 && &fwd[1..2] == ":" {
+                format!("/{fwd}")
+            } else if !fwd.starts_with('/') {
+                // Non-Windows relative path that we couldn't canonicalize —
+                // prefix with `/` so the URL is hierarchical (file:/...) and
+                // `Path.of(uri).getParent()` returns a real parent.
                 format!("/{fwd}")
             } else {
                 fwd
@@ -23999,7 +24019,17 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getMarkerFactory",
         "()Lorg/slf4j/IMarkerFactory;",
         |ctx, _| {
+            // Allocate AND run the real BasicMarkerFactory.<init> so its
+            // inline `markerMap = new ConcurrentHashMap<>()` initializer
+            // fires. Without this, getMarker(name) NPEs on markerMap.get(name)
+            // (observed during Kafka 4.2.0 boot: kafka/utils/Logging$.<clinit>).
             let f = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMarkerFactory", 0);
+            let _ = ctx.invoke_special(
+                "org/slf4j/helpers/BasicMarkerFactory",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(f))],
+            );
             Ok(Some(Value::Object(Some(f))))
         },
     );
