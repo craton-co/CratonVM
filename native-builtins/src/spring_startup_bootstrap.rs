@@ -385,6 +385,55 @@ fn dlbf_register_bean_definition(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// StandardConfigDataLocationResolver.resolve — null-safe shim.
+//
+// Spring Boot 4.x `StandardConfigDataLocationResolver.resolve(ctx, location)`
+// calls `location.split()` which returns a `ConfigDataLocation[]`.  Each
+// element is passed to `getReferences(ctx, loc)` which dereferences `loc`
+// via `loc.getResourceLocation(...)`.
+//
+// In CratonVM's partial bootstrap, one of the array entries ends up null
+// (likely because `StringUtils.delimitedListToStringArray` or `Properties`
+// returns a null mid-array).  The result is:
+//
+//     NullPointerException: Cannot invoke getResourceLocation on null
+//
+// Without application.yml/properties on the demo classpath, the correct
+// behaviour is to load no config-data resources.  We override the public
+// `resolve(ConfigDataLocationResolverContext, ConfigDataLocation)` to return
+// an empty `ArrayList` — Spring proceeds without any config-data overrides
+// from the standard locations.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn empty_arraylist(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let list = match ctx.new_object("java/util/ArrayList").ok().flatten() {
+        Some(Value::Object(Some(o))) => o,
+        _ => crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 8),
+    };
+    let _ = ctx.invoke(
+        "java/util/ArrayList",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(list))],
+    );
+    Ok(Some(Value::Object(Some(list))))
+}
+
+fn standard_config_data_resolve(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    empty_arraylist(ctx)
+}
+
+fn standard_config_data_resolve_profile_specific(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    empty_arraylist(ctx)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // SpringIterableConfigurationPropertySource$Cache — null-safe shims.
 //
 // Spring Boot 4.x's `SpringIterableConfigurationPropertySource$Cache.tryUpdate`
@@ -823,5 +872,22 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "tryUpdate",
         "(Lorg/springframework/core/env/EnumerablePropertySource;)V",
         cache_try_update,
+    );
+
+    // ── StandardConfigDataLocationResolver null-safe shim ──
+    // See comment block above standard_config_data_resolve for rationale.
+    const STD_CFG_RES: &str =
+        "org/springframework/boot/context/config/StandardConfigDataLocationResolver";
+    registry.register(
+        STD_CFG_RES,
+        "resolve",
+        "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;)Ljava/util/List;",
+        standard_config_data_resolve,
+    );
+    registry.register(
+        STD_CFG_RES,
+        "resolveProfileSpecific",
+        "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;Lorg/springframework/boot/context/config/Profiles;)Ljava/util/List;",
+        standard_config_data_resolve_profile_specific,
     );
 }
