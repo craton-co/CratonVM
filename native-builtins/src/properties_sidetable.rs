@@ -1316,6 +1316,128 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiConsumer;)V",
         native_properties_for_each,
     );
+    // Spring Boot 4 `AutoConfigurationMetadataLoader.loadMetadata` aggregates
+    // `META-INF/spring-autoconfigure-metadata.properties` from every classpath
+    // jar by calling `aggregate.putAll(perJarProperties)` for each loaded
+    // file.  Because Properties stores its entries in the side-table (not in
+    // the inherited `HashMap` buckets), the generic `Map.putAll` walker in
+    // `native_map_put_all` finds zero entries on the source Properties and
+    // the aggregate stays empty.  Result: every `OnClassCondition`/
+    // `OnWebApplicationCondition` filter sees an empty
+    // `AutoConfigurationMetadata`, all `ConditionalOnClass`/`ConditionalOnWeb`
+    // lookups return null, and downstream auto-config classes (e.g.
+    // `TomcatServletWebServerAutoConfiguration`) get dropped — Spring then
+    // fails with `MissingWebServerFactoryBeanException`.
+    //
+    // Side-table-aware putAll: snapshot the source's side-table and store
+    // each (k,v) into `this`'s side-table directly.
+    registry.register(
+        "java/util/Properties",
+        "putAll",
+        "(Ljava/util/Map;)V",
+        native_properties_put_all,
+    );
+}
+
+/// Native `Properties.putAll(Map)` — side-table-aware copy.
+///
+/// The generic `Map.putAll` walker in `native-collections` enumerates the
+/// source by reading its `HashMap` buckets / `LinkedHashMap` insertion-order
+/// list.  Properties keep their entries in the per-object side-table, so a
+/// generic walk sees zero entries and the destination Properties stays
+/// empty.  This override snapshots the source side-table and stores each
+/// `(k,v)` into the destination via `put_kv`.
+fn native_properties_put_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // 1) Side-table snapshot — covers Properties->Properties putAll (the
+    //    dominant case that previously silently dropped all entries because
+    //    Properties stores its data outside the inherited HashMap buckets).
+    let snapshot = snapshot_kv(other);
+    if !snapshot.is_empty() {
+        for (k, v) in snapshot {
+            put_kv(this, &k, &v);
+        }
+        return Ok(None);
+    }
+    // 2) Fallback — source is a regular Map (HashMap/LinkedHashMap).  Walk
+    //    its entries through the generic Map.entrySet() so we don't depend
+    //    on internal field layouts, then mirror each (k,v) into `this`'s
+    //    side-table as well as the inherited Hashtable buckets.
+    let entries_obj = match ctx.invoke(
+        "java/util/Map",
+        "entrySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(other))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    let it = match ctx.invoke(
+        "java/util/Set",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(entries_obj))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    loop {
+        let has_next = match ctx.invoke(
+            "java/util/Iterator",
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(it))],
+        ) {
+            Ok(Some(Value::Int(n))) => n != 0,
+            _ => false,
+        };
+        if !has_next {
+            break;
+        }
+        let entry = match ctx.invoke(
+            "java/util/Iterator",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(it))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => break,
+        };
+        let key_obj = match ctx.invoke(
+            "java/util/Map$Entry",
+            "getKey",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(entry))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let val_obj = match ctx.invoke(
+            "java/util/Map$Entry",
+            "getValue",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(entry))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let k = ctx.read_string(key_obj).unwrap_or_default();
+        let v = ctx.read_string(val_obj).unwrap_or_default();
+        if !k.is_empty() {
+            put_kv(this, &k, &v);
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
