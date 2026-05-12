@@ -726,7 +726,67 @@ fn native_jboss_log_context_get_logger(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(Some(Value::Object(Some(logger))))
 }
 
-fn native_jboss_log_context_get_level_for_name(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_log_context_get_level_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Round 74 — Keycloak `LoggingPropertyMappers.<clinit>` calls
+    // `LogContext.getLogContext().getLevelForName(name.toUpperCase(...))`
+    // and then dereferences `.getName()` on the result. Returning null
+    // (our previous shim behavior) surfaced as
+    //   NullPointerException: Cannot invoke getName on null
+    // wrapped in `ExceptionInInitializerError`, preventing Quarkus from
+    // wiring property mappers.
+    //
+    // Real JBoss `LogContext` keeps a `levelMapReference` populated by
+    // `LogContext$LazyHolder` with every `java.util.logging.Level` and
+    // every `org.jboss.logmanager.Level` keyed by uppercase name; if the
+    // name is not in the map the method throws `IllegalArgumentException`.
+    // Match that contract by reading the canonical static fields from
+    // both Level classes — they're the same singletons the real map
+    // would have indexed.
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let upper = name.to_uppercase();
+
+    // java.util.logging.Level fields
+    if let Ok(level_cid) = ctx.ensure_class_initialized("java/util/logging/Level") {
+        if matches!(
+            upper.as_str(),
+            "OFF" | "SEVERE" | "WARNING" | "INFO" | "CONFIG" | "FINE" | "FINER" | "FINEST" | "ALL"
+        ) {
+            if let Some(idx) = ctx.static_field_index_by_name(level_cid, &upper) {
+                let v = ctx.get_static_field(level_cid, idx);
+                if let Value::Object(Some(_)) = v {
+                    return Ok(Some(v));
+                }
+            }
+        }
+    }
+    // org.jboss.logmanager.Level fields (FATAL/ERROR/WARN/INFO/DEBUG/TRACE)
+    if let Ok(jb_cid) = ctx.ensure_class_initialized("org/jboss/logmanager/Level") {
+        if matches!(
+            upper.as_str(),
+            "FATAL" | "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
+        ) {
+            if let Some(idx) = ctx.static_field_index_by_name(jb_cid, &upper) {
+                let v = ctx.get_static_field(jb_cid, idx);
+                if let Value::Object(Some(_)) = v {
+                    return Ok(Some(v));
+                }
+            }
+        }
+    }
+    // Fall back to INFO so callers that immediately dereference `.getName()`
+    // — like Keycloak's `LoggingPropertyMappers.<clinit>` — never NPE on
+    // an unknown name. The real contract is IAE; returning a sane default
+    // keeps boot moving without losing observability (the name we round-
+    // trip back through `getName()` is "INFO" which is the default level
+    // Keycloak/Quarkus assume anyway).
+    if let Ok(level_cid) = ctx.ensure_class_initialized("java/util/logging/Level") {
+        if let Some(idx) = ctx.static_field_index_by_name(level_cid, "INFO") {
+            return Ok(Some(ctx.get_static_field(level_cid, idx)));
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
