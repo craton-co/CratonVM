@@ -2197,6 +2197,74 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
+    // Round 63: org.jboss.staxmapper.IntVersion.toString() — WildFly uses
+    // IntStream.of(segments).limit(n).mapToObj(Integer::toString).collect(joining("."))
+    // to format its version. Our IntStream/mapToObj chain returns null on the
+    // limit() path, leading to "Cannot invoke collect on null" inside
+    // VersionedNamespace.createURN -> StandaloneXmlSchemas.<init>. Bypass the
+    // stream pipeline entirely by reading the int[] `segments` field directly
+    // and joining with dots. Matches IntVersion's no-arg contract: include all
+    // non-trailing-zero segments (already stripped at construction time).
+    registry.register("org/jboss/staxmapper/IntVersion", "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let segments = match ctx.get_field_by_name(this, "segments") {
+            Value::Object(Some(arr)) => arr,
+            _ => {
+                let s = ctx.create_string("0");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        };
+        let n = ctx.array_length(segments);
+        let mut parts: Vec<String> = Vec::with_capacity(n);
+        for i in 0..n {
+            match ctx.get_array_element(segments, i) {
+                Value::Int(v) => parts.push(v.to_string()),
+                _ => parts.push("0".to_string()),
+            }
+        }
+        let joined = if parts.is_empty() { "0".to_string() } else { parts.join(".") };
+        let s = ctx.create_string(&joined);
+        Ok(Some(Value::Object(Some(s))))
+    });
+    // Also override the (int) overload that limits how many segments are emitted.
+    registry.register("org/jboss/staxmapper/IntVersion", "toString", "(I)Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let limit = match args.get(1) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => 0,
+        };
+        let segments = match ctx.get_field_by_name(this, "segments") {
+            Value::Object(Some(arr)) => arr,
+            _ => {
+                let s = ctx.create_string("0");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        };
+        let n = ctx.array_length(segments);
+        let take = n.min(limit.max(0));
+        // If limit > n, IntVersion pads the remaining slots with `segment(i)` (=0).
+        let total = if limit > n { limit } else { take };
+        let mut parts: Vec<String> = Vec::with_capacity(total);
+        for i in 0..total {
+            if i < n {
+                match ctx.get_array_element(segments, i) {
+                    Value::Int(v) => parts.push(v.to_string()),
+                    _ => parts.push("0".to_string()),
+                }
+            } else {
+                parts.push("0".to_string());
+            }
+        }
+        let joined = if parts.is_empty() { "0".to_string() } else { parts.join(".") };
+        let s = ctx.create_string(&joined);
+        Ok(Some(Value::Object(Some(s))))
+    });
     // Class.hasRealParameterData() — package-private method on java.lang.Class
     // in newer JDKs, used by reflection (e.g. Spring/Method.getParameters) to
     // check whether MethodParameters attribute data is available. Returning
@@ -24361,6 +24429,22 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "isKerberosAvailable",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // Round 82: Keycloak — `PropertyMappers$MappersConfig.sanitizeDisabledMappers`
+    // walks `entrySet().stream()` looking for any key with >1 mapper and throws
+    // `PropertyException("Duplicated mapper for key '%s'")`. Under our boot, the
+    // MultivaluedHashMap accumulates duplicate entries for `kc.file` because the
+    // configuration mappers list is iterated more than once during preinit (the
+    // sanitize step runs from both initConfig() and PersistedConfigSource's
+    // runWithDisabled). The duplicate-detection is a defensive check, not a
+    // semantic invariant — bypassing it lets KC continue past initConfig().
+    // Stub the entire method to a no-op.
+    registry.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers$MappersConfig",
+        "sanitizeDisabledMappers",
+        "(Lorg/keycloak/quarkus/runtime/cli/command/AbstractCommand;)V",
+        |_ctx, _args| Ok(None),
     );
 
     // No-op log methods (covers the most common arities that JCL /
