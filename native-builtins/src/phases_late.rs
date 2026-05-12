@@ -24,6 +24,95 @@ use crate::lang_invoke::{register_p60_callsite, register_p63_method_handles_look
 use crate::lang_misc::register_p60_record;
 // register_javax_annotation removed (was Spring Boot stub)
 
+// ---------------------------------------------------------------------------
+// RWF86.1: BufferedReader side-table for `Files.newBufferedReader` results.
+//
+// WildFly's `ProductConfig.getProductConfProperties` opens product.conf via
+// `Files.newBufferedReader(path, UTF_8)` and passes the result to
+// `Properties.load(Reader)`.  Real-JDK BufferedReader bytecode dereferences
+// `this.in` in `ensureOpen()` and throws "Stream closed" because our
+// synthetic allocator never fills that slot.  Storing the file contents in
+// a side-table keyed by ObjectRef pointer identity lets our `read([CII)I`
+// / `read()I` native overrides serve characters without touching the JDK
+// instance fields.
+//
+// Security posture mirrors `properties_sidetable`:
+//   * Per-reader size cap (16 MiB) — `Files.newBufferedReader` already
+//     loaded the whole file into memory, so this just bounds growth from
+//     pathological caller-side inputs.
+//   * Total-object cap (10_000 readers) — caps total side-table memory.
+//   * The side-table never holds the file path or any system-property
+//     value, so leaking the map cannot exfiltrate filesystem layout.
+// ---------------------------------------------------------------------------
+
+const BR_MAX_PER_READER_BYTES: usize = 16 * 1024 * 1024;
+const BR_MAX_READERS: usize = 10_000;
+
+fn br_sidetable() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn br_sidetable_register(reader: ObjectRef, content: String) {
+    let key = reader.as_ptr() as usize;
+    // Encode as UTF-16 code units (Java char semantics).
+    let mut buf: Vec<u16> = Vec::with_capacity(content.len());
+    for c in content.encode_utf16() {
+        if buf.len() >= BR_MAX_PER_READER_BYTES / 2 {
+            break;
+        }
+        buf.push(c);
+    }
+    let mut m = br_sidetable().lock();
+    if m.len() >= BR_MAX_READERS {
+        // Evict an arbitrary entry to keep the map bounded.  Per-reader
+        // identity isn't required for correctness — the same key always
+        // refers to the same content for a given allocation.
+        if let Some(k) = m.keys().next().copied() {
+            m.remove(&k);
+        }
+    }
+    m.insert(key, (buf, 0));
+}
+
+fn br_sidetable_read_chars(
+    ctx: &mut dyn NativeContext,
+    reader: ObjectRef,
+    out_arr: ObjectRef,
+    off: usize,
+    len: usize,
+) -> Option<i32> {
+    let key = reader.as_ptr() as usize;
+    let mut m = br_sidetable().lock();
+    let entry = m.get_mut(&key)?;
+    let (buf, pos) = entry;
+    if *pos >= buf.len() {
+        return Some(-1);
+    }
+    let avail = buf.len() - *pos;
+    let n = avail.min(len);
+    for i in 0..n {
+        let cu = buf[*pos + i] as i32;
+        ctx.set_array_element(out_arr, off + i, Value::Int(cu));
+    }
+    *pos += n;
+    Some(n as i32)
+}
+
+fn br_sidetable_read_one(_ctx: &mut dyn NativeContext, reader: ObjectRef) -> Option<i32> {
+    let key = reader.as_ptr() as usize;
+    let mut m = br_sidetable().lock();
+    let entry = m.get_mut(&key)?;
+    let (buf, pos) = entry;
+    if *pos >= buf.len() {
+        return Some(-1);
+    }
+    let c = buf[*pos] as i32;
+    *pos += 1;
+    Some(c)
+}
+
 pub(crate) fn register_phase55_natives(registry: &mut NativeMethodRegistry) {
     register_phase55_charset(registry);
     register_phase55_executors(registry);
@@ -4930,6 +5019,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let s = ctx.create_string(&content);
                     ctx.set_field(reader, 0, Value::Object(Some(s)));
                     ctx.set_field(reader, 1, Value::Int(0)); // position
+                    br_sidetable_register(reader, content);
                     Ok(Some(Value::Object(Some(reader))))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
@@ -4952,11 +5042,77 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let s = ctx.create_string(&content);
                     ctx.set_field(reader, 0, Value::Object(Some(s)));
                     ctx.set_field(reader, 1, Value::Int(0));
+                    br_sidetable_register(reader, content);
                     Ok(Some(Value::Object(Some(reader))))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),
                 }.into()),
+            }
+        },
+    );
+
+    // RWF86.1: native shims for BufferedReader.read([CII)I and read()I that
+    // honour our `Files.newBufferedReader`-allocated readers.  Real JDK
+    // BufferedReader bytecode calls `ensureOpen()` which reads `this.in` —
+    // a field we never set on the synthetic object — and throws
+    // "Stream closed".  By overriding `read` natively for readers we
+    // registered in `BR_SIDETABLE`, WildFly's `ProductConfig` /
+    // `Properties.load(Reader)` path completes the read loop instead of
+    // bailing with IOException.  For readers NOT in the side-table we
+    // delegate to the underlying Reader at slot 0 so the existing
+    // `BufferedReader(<init>(Reader))` shim path keeps working.
+    r.register(
+        "java/io/BufferedReader",
+        "read",
+        "([CII)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let out_arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let off = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            let len = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            if len == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
+            let out_len = ctx.array_length(out_arr);
+            if off > out_len || off.saturating_add(len) > out_len {
+                return Ok(Some(Value::Int(-1)));
+            }
+            // Side-table-backed reader (from Files.newBufferedReader).
+            if let Some(n) = br_sidetable_read_chars(ctx, this, out_arr, off, len) {
+                return Ok(Some(Value::Int(n)));
+            }
+            // Fallback: delegate to underlying Reader at slot 0.
+            match ctx.get_field(this, 0) {
+                Value::Object(Some(inner)) => {
+                    let r = ctx.invoke_virtual(
+                        inner, "read", "([CII)I",
+                        &[Value::Object(Some(out_arr)), Value::Int(off as i32), Value::Int(len as i32)],
+                    )?;
+                    Ok(r.or(Some(Value::Int(-1))))
+                }
+                _ => Ok(Some(Value::Int(-1))),
+            }
+        },
+    );
+    r.register(
+        "java/io/BufferedReader",
+        "read",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(c) = br_sidetable_read_one(ctx, this) {
+                return Ok(Some(Value::Int(c)));
+            }
+            match ctx.get_field(this, 0) {
+                Value::Object(Some(inner)) => {
+                    let r = ctx.invoke_virtual(inner, "read", "()I", &[])?;
+                    Ok(r.or(Some(Value::Int(-1))))
+                }
+                _ => Ok(Some(Value::Int(-1))),
             }
         },
     );

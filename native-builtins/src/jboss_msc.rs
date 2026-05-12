@@ -1660,6 +1660,39 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // RWF86.2 — `LoggerProviders.findProvider()` short-circuit.  WildFly's
+    // `Logger.<clinit>` triggers `LoggerProviders.<clinit>` which iterates
+    // tryJBossLogManager -> tryLog4j2 -> trySlf4j -> tryLog4j -> tryJDK.
+    // In our environment `java.util.logging.LogManager.getLogManager()`
+    // returns the JDK default class (not `org.jboss.logmanager.LogManager`)
+    // even though jboss-modules sets `java.util.logging.manager` — the JDK's
+    // own bootstrap caches the LogManager singleton before the property is
+    // set, so the if-acmp check in tryJBossLogManager pc=20 fails and
+    // throws IllegalStateException.  The subsequent tryLog4j2 path NPEs
+    // inside `logProvider` because the constructed Log4j2LoggerProvider
+    // isn't fully wired in our env (LogManager.<clinit> -> ProviderUtil
+    // ServiceLoader returns null).  Both downstream throwers cascade out
+    // of `LoggerProviders.<clinit>` and abort WildFly boot at
+    // `ServiceContainerImpl.<clinit>`.  Short-circuit by returning a fresh
+    // `JDKLoggerProvider` instance — JDK Logger backing works fine via
+    // our `LogManager.getLogger` native and matches what WildFly's
+    // standalone.sh would set via `-Dorg.jboss.logging.provider=jdk`.
+    r.register(
+        "org/jboss/logging/LoggerProviders",
+        "findProvider",
+        "()Lorg/jboss/logging/LoggerProvider;",
+        |ctx, _args| {
+            let cls = "org/jboss/logging/JDKLoggerProvider";
+            let obj = match ctx.new_object(cls) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // <init>()V — AbstractLoggerProvider parent is null-safe.
+            let _ = ctx.invoke(cls, "<init>", "()V", &[Value::Object(Some(obj))]);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
 }
 
