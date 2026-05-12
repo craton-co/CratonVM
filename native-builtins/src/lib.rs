@@ -14078,8 +14078,11 @@ pub(crate) fn compile_java_regex(
 ///   `\p{ScriptName}` / `\P{ScriptName}` (same accepted-without-prefix shape).
 fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
     // Fast path: if the pattern doesn't contain `\p{In` or `\p{Is` (or the
-    // capital-P negated forms), there's nothing to rewrite.
-    if !(pattern.contains("\\p{In") || pattern.contains("\\P{In")
+    // capital-P negated forms), and no `\Q...\E` quoted-literal blocks,
+    // there's nothing to rewrite.
+    let has_quote_block = pattern.contains("\\Q");
+    if !has_quote_block
+        && !(pattern.contains("\\p{In") || pattern.contains("\\P{In")
         || pattern.contains("\\p{Is") || pattern.contains("\\P{Is"))
     {
         return std::borrow::Cow::Borrowed(pattern);
@@ -14088,6 +14091,37 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
     let bytes = pattern.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // Translate `\Q...\E` Java "quoted literal" blocks: content between
+        // `\Q` and `\E` is treated as a literal string by Java's regex engine,
+        // but neither the `regex` crate nor `fancy-regex` 0.13 accepts the
+        // `\Q` escape. Rewrite each block by emitting `\x` for every
+        // regex-metacharacter byte inside, preserving everything else. Used by
+        // Keycloak's `DeclarativeUserProfileProviderFactory.getRegexPatternString`
+        // to build allow-lists like `(\Qfoo\E|\Qbar\E)`; without translation
+        // the regex compile fails and aborts Keycloak's Quarkus boot during
+        // `setDefaultUserProfileConfiguration`.
+        if i + 1 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'Q' {
+            let start = i + 2;
+            // Find terminating `\E`; if missing, Java treats the rest of the
+            // pattern as literal up to end-of-input.
+            let end = pattern[start..].find("\\E").map(|p| start + p);
+            let lit_end = end.unwrap_or(bytes.len());
+            for &b in &bytes[start..lit_end] {
+                // Escape every ASCII regex metacharacter; leave non-ASCII /
+                // alphanumerics alone (they are literal in regex anyway).
+                let is_meta = matches!(b,
+                    b'\\' | b'.' | b'+' | b'*' | b'?' | b'('| b')'
+                    | b'[' | b']' | b'{' | b'}' | b'^' | b'$' | b'|'
+                    | b'#' | b'-' | b'&' | b'~' | b'/' | b' ' | b'\t'
+                );
+                if is_meta {
+                    out.push('\\');
+                }
+                out.push(b as char);
+            }
+            i = match end { Some(e) => e + 2, None => bytes.len() };
+            continue;
+        }
         // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
         // All matched bytes are ASCII so byte indexing is safe.
         if i + 5 < bytes.len()

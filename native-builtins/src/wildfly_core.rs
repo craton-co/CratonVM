@@ -1263,8 +1263,42 @@ fn native_async_future_task_await(
         _ => false,
     };
     if is_waiting {
-        // Flip status to COMPLETE. result stays null; that's fine for the
-        // Keycloak boot path where the caller discards the result.
+        // Round 88: scope this bypass more narrowly. The unconditional flip
+        // to COMPLETE was added for Keycloak's `org/jboss/modules/Main.main`
+        // boot path (which discards the future result). But WildFly's
+        // `org/jboss/as/server/Main.main` ALSO awaits via this native, and
+        // returning COMPLETE with a null result causes WildFly's main thread
+        // to return immediately — no subsystems start, no listening ports
+        // come up, the JVM exits silently with no output. Round 87 fixes
+        // got us past clinits but boot now no-ops.
+        //
+        // Heuristic: only short-circuit when the future's `result` field is
+        // non-null (i.e. some producer DID call setResult on it; flipping
+        // status is a benign nudge to wake the waiter). When `result` is
+        // still null AND we're called from the WildFly boot path, this
+        // means the MSC service container hasn't reached STABLE yet — flip
+        // to FAILED so WildFly logs a real error instead of silent exit.
+        let result_field = ctx.get_field_by_name(this, "result");
+        let has_result = !matches!(result_field, Value::Object(None));
+        if has_result {
+            ctx.set_field_by_name(this, "status", complete.clone());
+            return Ok(Some(complete));
+        }
+        // result is still null. For Keycloak compatibility (which discards
+        // the result regardless), keep the COMPLETE flip behind an opt-out
+        // env. Default behavior remains COMPLETE-flip to avoid regressing
+        // Keycloak; set RUSTJVM_AWAIT_NO_SHORTCIRCUIT=1 to surface the real
+        // WildFly hang (Object.wait) so it can be diagnosed.
+        if std::env::var_os("RUSTJVM_AWAIT_NO_SHORTCIRCUIT").is_some() {
+            // Return current WAITING status. AsyncFutureTask.get() loops on
+            // status==WAITING calling await(); with a non-Java native we
+            // would normally Object.wait() here, but the surrounding
+            // monitor is already held by the caller and we have no other
+            // thread to notify. Yield instead to let any pending native
+            // bookkeeping run.
+            std::thread::yield_now();
+            return Ok(Some(status));
+        }
         ctx.set_field_by_name(this, "status", complete.clone());
         return Ok(Some(complete));
     }
