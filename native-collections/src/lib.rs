@@ -1634,11 +1634,38 @@ pub fn native_map_to_string_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     native_map_to_string(ctx, args)
 }
 
+/// Detect if a receiver is a TreeMap (or subclass). The `java/util/Map`
+/// interface natives below use a HashMap-style field layout (buckets/size/
+/// capacity at slots 0/1/2) which conflicts with TreeMap's
+/// (data/size/comparator). Without this check, a `Map.put`/`get`/`size` call
+/// on a TreeMap receiver silently no-ops, leaving size=0 and
+/// dropping every entry. This blocked Keycloak FeatureOptions.<clinit>:
+/// FeaturePropertyMappers stores feature→mapper entries in a TreeMap, and
+/// when the JDK's TreeMap.keySpliteratorFor ran it traversed a null root
+/// because the put native had never reached `tm_put`.
+fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(this);
+    loop {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/TreeMap" => return true,
+            Some(n) if n == "java/util/HashMap" || n == "java/lang/Object" => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+}
+
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_size(ctx, args);
+    }
     let (_, size, _) = map_state(ctx, this);
     Ok(Some(Value::Int(size)))
 }
@@ -1648,6 +1675,9 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_is_empty(ctx, args);
+    }
     let (_, size, _) = map_state(ctx, this);
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
@@ -1671,12 +1701,27 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let cid = ctx.class_id_of_object(this);
     if let Some(name) = ctx.class_name_of_id(cid) {
         if name != "java/util/HashMap" {
-            // Walk parent chain to detect LinkedHashMap ancestry.
+            // Walk parent chain to detect LinkedHashMap or TreeMap ancestry.
+            // Without the TreeMap branch, the `java/util/Map.put` interface
+            // override (registered as an abstract-method native) falls
+            // through to the HashMap-bucket code below for a TreeMap
+            // receiver. TreeMap's field 0 is `root` (a TreeMap.Entry),
+            // not a bucket array, so `map_state`/`map_resize` corrupt the
+            // object and every subsequent put is a silent no-op. Symptom:
+            // `new TreeMap().put(k,v)` leaves size=0 and get returns null,
+            // which broke Keycloak FeatureOptions.<clinit> (the JDK
+            // TreeMap.keySpliteratorFor NPE was downstream — actual data
+            // never reached the tree).
             let mut cur = cid;
             let mut is_lhm = false;
+            let mut is_tm = false;
             while let Some(n) = ctx.class_name_of_id(cur) {
                 if n == "java/util/LinkedHashMap" {
                     is_lhm = true;
+                    break;
+                }
+                if n == "java/util/TreeMap" {
+                    is_tm = true;
                     break;
                 }
                 if n == "java/util/HashMap" || n == "java/lang/Object" {
@@ -1689,6 +1734,9 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
             if is_lhm {
                 return native_lhm_put(ctx, args);
+            }
+            if is_tm {
+                return native_tm_put(ctx, args);
             }
         }
     }
@@ -1803,6 +1851,9 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_get(ctx, args);
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -1924,6 +1975,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_contains_key(ctx, args);
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -1993,6 +2047,9 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_key_set(ctx, args);
+    }
     let keys = map_collect_keys(ctx, this);
     // Build a HashSet from the keys
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
@@ -2032,6 +2089,9 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_values(ctx, args);
+    }
     let values = map_collect_values(ctx, this);
     // Build an ArrayList from the values
     let __al_n_fields = al_slots(ctx).2;
@@ -2051,6 +2111,9 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_entry_set(ctx, args);
+    }
     let entries = map_collect_entries(ctx, this);
     // Build a HashSet of Map.Entry objects
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
@@ -4956,6 +5019,28 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let keys = map_collect_keys(ctx, backing);
     make_stream(ctx, &keys)
+}
+
+// TreeSet.stream() — snapshot of sorted elements (also serves TreeMap.keySet()
+// since native_tm_key_set returns a synthetic TreeSet). Real JDK's
+// TreeSet.spliterator() goes through TreeMap.keySpliteratorFor(), which requires
+// the JDK's `root`/`size` red-black tree fields populated by put(); our
+// synthetic layout does not provide those, so without this override the stream
+// is empty (observed: `m.keySet().stream().count()` returned 0 for a 3-entry
+// TreeMap, which broke Keycloak FeatureOptions.<clinit>).
+fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let elements: Vec<Value> = match data_opt {
+        Some(d) => (0..size as usize)
+            .map(|i| ctx.get_array_element(d, i))
+            .collect(),
+        None => Vec::new(),
+    };
+    make_stream(ctx, &elements)
 }
 
 // -- Intermediate operations --
@@ -13652,6 +13737,7 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         native_ts_sub_set,
     );
     registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";

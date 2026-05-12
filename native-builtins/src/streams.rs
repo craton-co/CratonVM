@@ -28,6 +28,8 @@ use rustjvm_types::Value;
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 
+use crate::alloc_concurrent_synthetic;
+
 /// Process-wide demand counter for `Flow.Subscription.request(long)`.
 ///
 /// Keyed by the subscription ObjectRef's raw pointer (stable for the
@@ -91,6 +93,35 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(cls, "isParallel", "()Z", native_stream_return_false);
     }
+
+    // Round 63: `BaseStream.iterator()` is abstract on BaseStream and inherited
+    // by Stream/IntStream/etc.  Spring Cloud Eureka (and other Spring Boot
+    // apps) call `IterableConfigurationPropertySource.iterator()` which is a
+    // default method `return stream().iterator();`. When `stream()` returns a
+    // synthetic Stream whose runtime class is the interface itself (no
+    // concrete pipeline), the invokeinterface raises NSME because no concrete
+    // class is on the dispatch chain that declares a non-abstract `iterator`.
+    // Register the call-site descriptor (`()Ljava/util/Iterator;`) on Stream
+    // and BaseStream, returning an empty Iterator — semantically equivalent
+    // to an empty stream, which matches our sequential-only synthetic-stream
+    // shape when no elements are buffered.
+    for cls in &[
+        "java/util/stream/BaseStream",
+        "java/util/stream/Stream",
+        "java/util/stream/IntStream",
+        "java/util/stream/LongStream",
+        "java/util/stream/DoubleStream",
+    ] {
+        registry.register(cls, "iterator", "()Ljava/util/Iterator;", native_stream_empty_iterator);
+    }
+}
+
+/// Native helper: return a fresh empty `Collections$EmptyIterator`.
+/// Used by `BaseStream.iterator()` when the receiver is a bare/synthetic
+/// Stream interface that lost its concrete pipeline class.
+fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
+    Ok(Some(Value::Object(Some(iter))))
 }
 
 /// Native helper: return `this` (the first argument). Used by

@@ -1379,6 +1379,49 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
+    // --- Stream.iterator() → Iterator (inherited from BaseStream) ---
+    // Spring Boot's `IterableConfigurationPropertySource.iterator()` default
+    // method calls `this.stream().iterator()`. Our synthetic Stream
+    // (field 0 = Object[]) has no iterator native, so the invokeinterface
+    // dispatches against bare `java/util/stream/Stream` (the receiver's
+    // class_id_of) and NSME's because `BaseStream.iterator()` is abstract.
+    // Reuse the ServiceLoader$Itr layout (field 0 = array, field 1 = idx)
+    // whose hasNext/next natives are already registered in `servlet.rs`.
+    r.register(stream, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr_val = ctx.get_field(this, 0);
+        let arr = if let Value::Object(Some(a)) = arr_val {
+            a
+        } else {
+            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)
+        };
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        ctx.set_field(itr, 0, Value::Object(Some(arr)));
+        ctx.set_field(itr, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(itr))))
+    });
+    // BaseStream.iterator() variant (some bytecode resolves against BaseStream)
+    r.register("java/util/stream/BaseStream", "iterator", "()Ljava/util/Iterator;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr_val = ctx.get_field(this, 0);
+        let arr = if let Value::Object(Some(a)) = arr_val {
+            a
+        } else {
+            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)
+        };
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        ctx.set_field(itr, 0, Value::Object(Some(arr)));
+        ctx.set_field(itr, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(itr))))
+    });
+
+    // --- Stream.spliterator() → Spliterator (inherited from BaseStream) ---
+    // Some Spring code paths call spliterator() directly. We don't have a
+    // full Spliterator implementation, but returning an iterator-like
+    // backing object lets downstream `forEachRemaining` paths drive elements.
+    // Skipped for now: only register iterator() which is the demonstrated
+    // call site.
+
     // --- Stream.unordered() → Stream ---
     r.register(
         stream,
@@ -4538,6 +4581,56 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+
+    // newFileChannel(Path, Set<? extends OpenOption>, FileAttribute[]) -> FileChannel
+    // Real JDK delegates to WindowsFileSystemProvider.newFileChannel which
+    // overrides this abstract method. We provide a synthetic FileChannel
+    // backed by fd_table (same shape as RandomAccessFile.getChannel) so the
+    // existing j.n.c.FileChannel native methods can drive it.
+    r.register(
+        fsp,
+        "newFileChannel",
+        "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, path_obj);
+            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW via toString
+            let set_obj = match args.get(2) {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            let (mut writable, mut create, mut append) = (false, false, false);
+            if let Some(set) = set_obj {
+                // Try to iterate by calling toString() on the Set first (cheap & robust)
+                if let Ok(Some(Value::Object(Some(s)))) =
+                    ctx.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
+                {
+                    let s = ctx.read_string(s).unwrap_or_default();
+                    writable = s.contains("WRITE") || s.contains("APPEND");
+                    create = s.contains("CREATE");
+                    append = s.contains("APPEND");
+                }
+            }
+            let _ = append; // append handled by seek-to-end below
+            let fd_id = if writable {
+                ctx.fd_table().open_read_write(&p, create)
+            } else {
+                ctx.fd_table().open_read_write(&p, false)
+                    .or_else(|_| ctx.fd_table().open_read(&p))
+            }
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("Cannot open {}: {}", p, e),
+            })?;
+            if append {
+                if let Ok(sz) = ctx.fd_table().file_size(fd_id) {
+                    let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(sz));
+                }
+            }
+            let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
+            ctx.set_field(fc, 0, Value::Int(fd_id as i32));
+            Ok(Some(Value::Object(Some(fc))))
         },
     );
 
