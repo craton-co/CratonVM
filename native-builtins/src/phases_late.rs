@@ -4716,6 +4716,66 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Round 63 — Kafka 4.2.0 calls `FileChannel.size()` on the synthetic
+    // FileChannel returned by `newFileChannel` above (via
+    // `BatchFileReader.build → FileRecords.<init>`). The real JDK
+    // FileChannel declares `size()` abstract — without a native here we
+    // throw AbstractMethodError and Kafka exits silently through its
+    // outer `Throwable` catch + `Exit.exit(1)`. Register a minimal set
+    // of FileChannel natives that drive the synthetic via fd_table.
+    let fc_cls = "java/nio/channels/FileChannel";
+    r.register(fc_cls, "size", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v >= 0 => v as u32,
+            _ => return Ok(Some(Value::Long(0))),
+        };
+        let sz = ctx.fd_table().file_size(fd_id).unwrap_or(0);
+        Ok(Some(Value::Long(sz as i64)))
+    });
+    r.register(fc_cls, "position", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v >= 0 => v as u32,
+            _ => return Ok(Some(Value::Long(0))),
+        };
+        let pos = ctx
+            .fd_table()
+            .rw_seek(fd_id, std::io::SeekFrom::Current(0))
+            .unwrap_or(0);
+        Ok(Some(Value::Long(pos as i64)))
+    });
+    r.register(
+        fc_cls,
+        "position",
+        "(J)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pos = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let fd_id = match ctx.get_field(this, 0) {
+                Value::Int(v) if v >= 0 => v as u32,
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(pos as u64));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(fc_cls, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Int(v) = ctx.get_field(this, 0) {
+            if v >= 0 {
+                let _ = ctx.fd_table().close(v as u32);
+            }
+        }
+        Ok(None)
+    });
+    r.register(fc_cls, "isOpen", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+
     // --- Files additional methods ---
     r.register(
         files,
