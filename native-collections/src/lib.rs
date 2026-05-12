@@ -1912,9 +1912,50 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let result = native_map_get(ctx, args)?;
-    let found = !matches!(result, Some(Value::Object(None)));
-    Ok(Some(Value::Int(if found { 1 } else { 0 })))
+    // Round 72: must not conflate `containsKey` with `get(...) != null`.
+    // HashMap allows null values, so an entry with a null value must still
+    // report containsKey == true. Walk the bucket chain directly and check
+    // for node presence, mirroring `native_map_get` but returning a boolean
+    // on node match regardless of the stored value. (Kafka 4.2
+    // `ConfigDef.parse` puts `early.start.listeners` with a null default;
+    // `AbstractConfig.get` then calls `values.containsKey(...)` and would
+    // wrongly throw "Unknown configuration" if we returned false here.)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let (key_ref, hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(None) => (None, 0, true),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let (buckets, _, cap) = map_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
+
+    let idx = map_bucket_index(hash, cap);
+    let mut node_val = ctx.get_array_element(buckets, idx);
+
+    while let Value::Object(Some(node)) = node_val {
+        let node_key_field = get_node_key(ctx, node);
+        if is_null_key {
+            if matches!(node_key_field, Value::Object(None)) {
+                return Ok(Some(Value::Int(1)));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+
+    Ok(Some(Value::Int(0)))
 }
 
 fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
