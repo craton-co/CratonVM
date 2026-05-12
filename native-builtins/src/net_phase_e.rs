@@ -2407,6 +2407,38 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // -----------------------------------------------------------------------
+    // RedisOperationsSessionRepository.cleanupExpiredSessions
+    //
+    // The repository registers a @Scheduled(cron = "0 * * * * *") method
+    // which Spring's ScheduledAnnotationBeanPostProcessor wires onto the
+    // TaskScheduler.  Because the @Autowired RedisConnectionFactory setter
+    // never fires under CratonVM (see RedisAccessor.afterPropertiesSet no-op
+    // above), the first cron firing executes
+    //   this.expirationPolicy.cleanExpiredSessions()
+    // which calls into a RedisTemplate with a null factory and throws
+    //   java.lang.IllegalStateException: RedisConnectionFactory is required
+    // The TaskUtils$LoggingErrorHandler logs it; SpringApplication then sees
+    // the failed cleanup, marks "Application run failed", and tries to
+    // cancel the cron task — at which point ScheduledTask.cancel() asserts
+    //   Assert.notNull(this.future, "No scheduled future")
+    // failing because the registrar's future map was torn down already.
+    //
+    // Pragmatic bypass: turn cleanupExpiredSessions into a no-op so the
+    // cron firing succeeds silently, no error is reported, no shutdown is
+    // triggered, and the application stays up.  Same shape as the other
+    // session/redis bypasses above.
+    // -----------------------------------------------------------------------
+    r.register(
+        "org/springframework/session/data/redis/RedisOperationsSessionRepository",
+        "cleanupExpiredSessions",
+        "()V",
+        |_ctx, _args| {
+            eprintln!("[REDIS-DBG] RedisOperationsSessionRepository.cleanupExpiredSessions -> no-op");
+            Ok(None)
+        },
+    );
+
     r.register(
         "org/springframework/core/io/UrlResource",
         "getInputStream",
@@ -3662,6 +3694,34 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         "getByIndex0",
         "(I)Ljava/net/NetworkInterface;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // R76 (Eureka / Spring Cloud bootstrap fix):
+    // `HostInfoEnvironmentPostProcessor.postProcessEnvironment` calls
+    // `InetUtils.findFirstNonLoopbackHostInfo` -> `findFirstNonLoopbackAddress`
+    // -> `NetworkInterface.getNetworkInterfaces` which throws SocketException
+    // "No network interfaces configured" (because our `getAll()` returns []).
+    // Spring catches it, but the resulting catch path then keeps walking
+    // through Spring's property-binding code with NUMEROUS recursive
+    // `Binder.bind` calls (`ConfigDataEnvironment.processAndApply` ->
+    // `withProfiles` -> `Binder.bindAggregate` -> `IndexedElementsBinder.
+    // bindIndexed` ...). With JIT compilation of these hot paths, the
+    // ConfigurationPropertyName parsing tight loop eventually SEGVs in
+    // JIT-compiled code (round 71 post-main panic visibility hook shows
+    // no Rust panic — it is a native SEGV in JIT, not a panic).
+    //
+    // Surgical fix: turn `HostInfoEnvironmentPostProcessor.
+    // postProcessEnvironment(ConfigurableEnvironment,SpringApplication)V`
+    // into a no-op. This skips the SocketException-throw + Spring catch
+    // entirely. The cloud post-processor only sets "spring.cloud.client.
+    // ip-address" / ".hostname" properties from the picked interface;
+    // when not set, downstream callers fall back to the same defaults
+    // we'd compute manually, so the bypass is safe.
+    r.register(
+        "org/springframework/cloud/client/HostInfoEnvironmentPostProcessor",
+        "postProcessEnvironment",
+        "(Lorg/springframework/core/env/ConfigurableEnvironment;Lorg/springframework/boot/SpringApplication;)V",
+        |_ctx, _args| Ok(None),
     );
 }
 

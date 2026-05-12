@@ -1302,6 +1302,33 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_service_logger_greeting_noop,
     );
 
+    // R71 (WildFly): same `this.log == null` NPE pattern, but on the
+    // service-failure code path. After MSC ServiceContainer install
+    // completes, StartTask.startService eventually invokes
+    // ControllerTask.run, whose catch(Throwable) block dispatches
+    // `ServiceLogger.SERVICE.internalServiceError(t, name)` —
+    // dispatches to ServiceLogger_$logger.internalServiceError, whose
+    // first instruction is `this.log.logf(...)` and NPEs on null log.
+    // Register no-op shims for every error/diagnostic method in the
+    // ServiceLogger_$logger generated impl so any failure-path log
+    // call from MSC degrades to silence rather than NPE.
+    for (name, sig) in [
+        ("startFailed", "(Lorg/jboss/msc/service/StartException;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("listenerFailed", "(Ljava/lang/Throwable;Ljava/lang/Object;)V"),
+        ("exceptionAfterComplete", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("stopFailed", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("stopServiceMissing", "(Lorg/jboss/msc/service/ServiceName;)V"),
+        ("uninjectFailed", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;Lorg/jboss/msc/service/ValueInjection;)V"),
+        ("internalServiceError", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("uncaughtException", "(Ljava/lang/Throwable;Ljava/lang/Thread;)V"),
+        ("profileOutputCloseFailed", "(Ljava/io/IOException;)V"),
+        ("mbeanFailed", "(Ljava/lang/Exception;)V"),
+        ("injectFailed", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("mbeanServerNotAvailable", "(Ljava/lang/Exception;)V"),
+    ] {
+        r.register(logger_impl, name, sig, native_service_logger_greeting_noop);
+    }
+
     // R63 (WildFly): shim DelegatingBasicLogger.isTraceEnabled/isDebugEnabled
     // to return false. The default impls do `this.log.isTraceEnabled()`,
     // but our synthetic backfills for ServiceLogger.ROOT/SERVICE/FAIL and

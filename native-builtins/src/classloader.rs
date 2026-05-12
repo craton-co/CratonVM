@@ -1332,13 +1332,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         "ClassLoader.getResource resolved"
     );
 
-    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-    let full_str = ctx.create_string(&url_str);
-    // Populate field 0 (read by net_phase_e's openStream fallback) and
-    // field 5 (synthetic "full URL string" slot). Mirrors the bulk
-    // getResources path which also writes both slots.
-    ctx.set_field(url, 0, Value::Object(Some(full_str)));
-    ctx.set_field(url, 5, Value::Object(Some(full_str)));
+    let url = crate::jboss_module_loader::build_synthetic_url(ctx, &url_str);
     Ok(Some(Value::Object(Some(url))))
 }
 
@@ -1406,12 +1400,7 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // relying on java.util.Vector's internal layout.
     let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
-        let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-        let full_str = ctx.create_string(u);
-        // Populate field 0 (read by net_phase_e's openStream fallback) and
-        // field 5 (our synthetic "full URL string" slot).
-        ctx.set_field(url_obj, 0, Value::Object(Some(full_str)));
-        ctx.set_field(url_obj, 5, Value::Object(Some(full_str)));
+        let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
@@ -1635,9 +1624,8 @@ fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let resource_name = name.trim_start_matches('/');
     match ctx.find_resource(resource_name) {
         Some(_) => {
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-            let full_str = ctx.create_string(&format!("classpath:{name}"));
-            ctx.set_field(url, 5, Value::Object(Some(full_str)));
+            let spec = format!("classpath:{name}");
+            let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec);
             Ok(Some(Value::Object(Some(url))))
         }
         None => Ok(Some(Value::Object(None))),

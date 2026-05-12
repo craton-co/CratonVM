@@ -1381,7 +1381,6 @@ pub(crate) fn native_module_classloader_get_resource(
             return Ok(Some(Value::Object(None)));
         }
     };
-    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
     let url_string = if hit_root.ends_with(".jar") {
         // Normalize Windows backslashes for valid URL path component.
         let path = hit_root.replace('\\', "/");
@@ -1390,10 +1389,52 @@ pub(crate) fn native_module_classloader_get_resource(
         let path = hit_root.replace('\\', "/");
         format!("file:/{path}/{trimmed}")
     };
-    let full = ctx.create_string(&url_string);
-    ctx.set_field(url, 0, Value::Object(Some(full)));
-    ctx.set_field(url, 5, Value::Object(Some(full)));
+    let url = build_synthetic_url(ctx, &url_string);
     Ok(Some(Value::Object(Some(url))))
+}
+
+/// Allocate a `java.net.URL` and populate the JDK-visible fields by name.
+///
+/// The legacy synthetic-URL pattern was `alloc(... "java/net/URL", 6); set_field(0, full); set_field(5, full);`,
+/// which assumed our minimal 6-slot synthetic layout where slot 0 / slot 5 cached
+/// the original spec. In real-JDK mode the class is loaded from `rt.jar`, slot 0
+/// is the `protocol` field, and so the old code made
+/// `url.getProtocol()` return the entire URL string — breaking SmallRye's
+/// `ClassPathUtils.processAsPath` for every `jar:file:` URL we hand back from
+/// `ModuleClassLoader.findResources` (Keycloak 26 startup).
+///
+/// This helper parses out `protocol` / `host` / `file` from the spec and writes
+/// them via `set_field_by_name`, then keeps the legacy slot 0 / slot 5
+/// writes for any synthetic-mode consumers that still index by slot.
+pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> ObjectRef {
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+    let full = ctx.create_string(spec);
+    let (protocol, file_part) = if let Some(rest) = spec.strip_prefix("jar:") {
+        ("jar", rest.to_string())
+    } else if let Some(rest) = spec.strip_prefix("file:") {
+        ("file", rest.to_string())
+    } else if let Some(pos) = spec.find(':') {
+        (&spec[..pos], spec[pos + 1..].to_string())
+    } else {
+        ("file", spec.to_string())
+    };
+    let proto_obj = ctx.create_string(protocol);
+    let host_empty = ctx.create_string("");
+    let file_obj = ctx.create_string(&file_part);
+    ctx.set_field_by_name(url, "protocol", Value::Object(Some(proto_obj)));
+    ctx.set_field_by_name(url, "host", Value::Object(Some(host_empty)));
+    ctx.set_field_by_name(url, "port", Value::Int(-1));
+    ctx.set_field_by_name(url, "file", Value::Object(Some(file_obj)));
+    ctx.set_field_by_name(url, "path", Value::Object(Some(file_obj)));
+    ctx.set_field_by_name(url, "query", Value::Object(None));
+    ctx.set_field_by_name(url, "authority", Value::Object(None));
+    // Intentionally do NOT write slots 0/5 by raw index: in real-JDK URL
+    // those slots are the `protocol` / `authority` named fields (already set
+    // above by name), and clobbering them with the full URL spec would make
+    // `url.getProtocol()` return the entire string — exactly the bug this
+    // helper fixes.
+    let _ = full;
+    url
 }
 
 /// `ModuleClassLoader.findResources(String) -> Enumeration<URL>` and
@@ -1448,10 +1489,7 @@ pub(crate) fn native_module_classloader_find_resources(
 
     let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
-        let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-        let full_str = ctx.create_string(u);
-        ctx.set_field(url_obj, 0, Value::Object(Some(full_str)));
-        ctx.set_field(url_obj, 5, Value::Object(Some(full_str)));
+        let url_obj = build_synthetic_url(ctx, u);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
