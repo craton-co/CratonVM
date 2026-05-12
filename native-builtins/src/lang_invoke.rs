@@ -2092,7 +2092,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 // java.lang.invoke extras — MethodHandleProxies, LambdaMetafactory
 // =============================================================================
 
-pub(crate) fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
+pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // MethodHandleProxies
     let mhp = "java/lang/invoke/MethodHandleProxies";
     r.register(

@@ -939,6 +939,15 @@ impl SharedVm {
                 // the MemberName, and our Field's JDK layout must match —
                 // which we fix in lang_class.rs::create_field_object.
                 rustjvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
+                // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
+                // log4j ServiceLoaderUtil.callServiceLoader calls
+                // LambdaMetafactory.metafactory directly (not via invokedynamic).
+                // The real-JDK implementation drives InnerClassLambdaMetafactory →
+                // java.lang.classfile API, which trips StackMapGenerator with
+                // "Bad CP index: 0" inside our incomplete classfile shim.
+                // Intercept with a native stub that returns null so the JDK path
+                // is bypassed entirely (callers tolerate the missing call site).
+                rustjvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
                 // RA.8 + WP1.8: Real ServiceLoader.load/iterator that walks
                 // META-INF/services. Registration + classpath-scan bootstrap
                 // are kept together in `init_service_loader_bootstrap` so
@@ -1297,6 +1306,16 @@ impl SharedVm {
             rustjvm_native_builtins::lang_invoke::register_t4_method_handle_invoke(&mut native_methods);
             // C5: See the synthetic-jdk branch above for rationale.
             rustjvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
+            // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
+            // log4j ServiceLoaderUtil.callServiceLoader (and similar code paths
+            // in WildFly's PropertiesUtil bootstrap) invokes
+            // LambdaMetafactory.metafactory directly (not via invokedynamic).
+            // The real-JDK implementation drives InnerClassLambdaMetafactory →
+            // java.lang.classfile API, which trips our incomplete classfile
+            // shim with "Bad CP index: 0" inside StackMapGenerator. Intercept
+            // with a native stub that returns null so the JDK path is bypassed
+            // entirely; the surrounding code tolerates a null call site.
+            rustjvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
             // RA.8 + WP1.8: ServiceLoader bootstrap — see
             // `init_service_loader_bootstrap` doc for the rationale around
             // keeping registration + classpath seeding in a single entry.
