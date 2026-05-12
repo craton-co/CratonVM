@@ -1156,25 +1156,102 @@ fn native_exec_builder_set_keep_alive_long(
     Ok(Some(Value::Object(Some(this))))
 }
 
+// ---------------------------------------------------------------------------
+// Round 89: Deferred Runnable queue for EnhancedQueueExecutor.execute.
+//
+// Round 69's "run synchronously on the calling thread" choice causes a subtle
+// ordering bug at WildFly boot: `MSC$Service.addListener(...)` is invoked
+// from `BootstrapImpl.bootstrap()` AFTER the MSC service controller has been
+// `execute()`-d on EQE. With synchronous-on-caller execute, the listener
+// chain fires before any subsystem starts, `AsyncFutureTask.setResult(...)`
+// runs, the boot future flips to COMPLETE, and `Main.main` returns instantly
+// (~18s of clinit work, then silent exit, no banner).
+//
+// Fix: ENQUEUE Runnables (per-EQE FIFO) and DRAIN them at the natural
+// "I am about to wait" point — `AsyncFutureTask.await()`. The caller
+// thread itself runs the drained tasks, so we keep single-thread semantics
+// (no cross-thread interpreter dispatch) but the boot listener fires only
+// AFTER the bootstrap task body has run end-to-end.
+// ---------------------------------------------------------------------------
+
+use rustjvm_types::ObjectRef;
+
+/// Per-EQE pending-Runnable queue. Keyed by the EQE `this` ObjectRef.
+/// `RUSTJVM_EQE_SYNC_EXECUTE=1` reverts to the Round-69 sync-on-caller
+/// behaviour (escape hatch for Keycloak in case the deferral regresses it).
+static EQE_PENDING: OnceLock<Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>>> = OnceLock::new();
+
+fn eqe_pending() -> &'static Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>> {
+    EQE_PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drain ALL pending Runnables across every known EQE, running each
+/// `run()` on the calling thread. Called from `AsyncFutureTask.await()`
+/// just before we'd otherwise short-circuit to COMPLETE — this ensures
+/// the bootstrap task body actually runs (subsystem start, listener
+/// callbacks, log output) before the future is reported complete.
+///
+/// We iterate until no more tasks are produced (running task N may enqueue
+/// task N+1), bounded by a generous safety cap to prevent infinite loops
+/// from a misbehaving service.
+fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
+    const MAX_ITERATIONS: usize = 4096;
+    let mut iterations = 0usize;
+    loop {
+        if iterations >= MAX_ITERATIONS {
+            break;
+        }
+        // Snapshot one runnable from any queue. Lock briefly to avoid
+        // holding it while re-entering the interpreter.
+        let next = {
+            let mut map = match eqe_pending().lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let mut found: Option<ObjectRef> = None;
+            let mut empty_keys: Vec<ObjectRef> = Vec::new();
+            for (k, q) in map.iter_mut() {
+                if let Some(r) = q.pop_front() {
+                    found = Some(r);
+                    break;
+                }
+                empty_keys.push(*k);
+            }
+            for k in empty_keys {
+                if let Some(q) = map.get(&k) {
+                    if q.is_empty() {
+                        map.remove(&k);
+                    }
+                }
+            }
+            found
+        };
+        match next {
+            Some(r) => {
+                let _ = ctx.invoke_virtual(r, "run", "()V", &[]);
+                iterations += 1;
+            }
+            None => break,
+        }
+    }
+    if std::env::var_os("RUSTJVM_DBG_EQE").is_some() {
+        eprintln!("[eqe] drained {} runnables", iterations);
+    }
+    let _ = iterations;
+}
+
 fn native_exec_execute(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // execute(Runnable) — we bind the Runnable pointer via the pool
-    // registry; actual dispatch goes through `ctx.invoke_virtual` in
-    // production, but since we can't safely call back into the
-    // interpreter from a worker thread from the native bridge here,
-    // we record the rejection count on queue overflow and no-op
-    // otherwise. Full wiring lands when the cross-thread invoke API
-    // arrives (tracked in T19.2 follow-up notes).
     if args.len() < 2 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
             message: format!("execute: expected (this, runnable), got {}", args.len()),
         }));
     }
     let this = obj_arg(args, 0)?;
-    let runnable = match args.get(1) {
-        Some(Value::Object(Some(_))) => args[1].clone(),
+    let runnable_ref = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
         _ => {
             return Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::NullPointerException {
@@ -1190,16 +1267,23 @@ fn native_exec_execute(
     let pool = get_or_create_pool(&name);
     // Submit a bookkeeping marker so pool stats reflect activity.
     let _ = pool.submit(|| {});
-    // Execute the user's Runnable synchronously on the calling thread.
-    // The cross-thread dispatch path isn't wired through the interpreter
-    // yet (would require running the runnable on a fresh JvmThread with
-    // its own call stack and root snapshot), but synchronous execution
-    // unblocks WildFly / Keycloak boot which queues a single bootstrap
-    // task to EQE and then `AsyncFutureTask.get()`s on its completion.
-    // Running on the calling thread means the bootstrap task completes
-    // BEFORE `get()` is reached, so the wait returns immediately.
-    if let Value::Object(Some(r)) = runnable {
-        let _ = ctx.invoke_virtual(r, "run", "()V", &[]);
+
+    if std::env::var_os("RUSTJVM_EQE_SYNC_EXECUTE").is_some() {
+        // Round-69 behaviour (sync on caller). Escape hatch.
+        let _ = ctx.invoke_virtual(runnable_ref, "run", "()V", &[]);
+        return Ok(None);
+    }
+
+    // Round 89: enqueue for later drain in AsyncFutureTask.await().
+    {
+        let mut map = match eqe_pending().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.entry(this).or_insert_with(VecDeque::new).push_back(runnable_ref);
+        if std::env::var_os("RUSTJVM_DBG_EQE").is_some() {
+            eprintln!("[eqe] enqueue pool={} pending_keys={}", name, map.len());
+        }
     }
     Ok(None)
 }
@@ -1238,7 +1322,13 @@ fn native_async_future_task_await(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Read current status.
+    // Round 89: drain any pending Runnables enqueued via EQE.execute first.
+    // This is the natural "I am about to wait" point — running queued work
+    // on the calling thread here means BootstrapImpl's LifecycleListener
+    // (which sets the future result) fires only AFTER the bootstrap task
+    // body has actually executed, not before MSC's addListener call returns.
+    drain_all_pending_runnables(ctx);
+    // Re-read status — it may have flipped to COMPLETE during the drain.
     let status = ctx.get_field_by_name(this, "status");
     // Resolve Status enum class and its WAITING/COMPLETE static fields.
     let status_cid = match ctx.ensure_class_initialized("org/jboss/threads/AsyncFuture$Status") {

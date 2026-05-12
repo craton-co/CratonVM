@@ -2065,6 +2065,93 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let val = match args.first() { Some(Value::Long(v)) => *v, _ => 0 };
         Ok(Some(Value::Object(Some(ctx.create_string(&format!("{:x}", val as u64))))))
     });
+    // Round 63 (peaceful-sammet) — Long.toString(long,int) and Integer.toString(int,int)
+    // overrides for real-JDK mode. SnakeYAML 2.0 SafeConstructor.<clinit> calls
+    // Long.toString(Long.MAX_VALUE, radix) for radix in {2,8,10,16}; the JDK
+    // bytecode path throws ArrayIndexOutOfBoundsException in our interpreter
+    // (the root cause has not been pinpointed, but bypassing via a native
+    // implementation unblocks the SafeConstructor clinit so ua_parser.Parser.<init>
+    // and DeviceRepresentationProviderFactoryImpl.<clinit> succeed, advancing
+    // Keycloak past the YAML init failure).
+    registry.register("java/lang/Long", "toString", "(JI)Ljava/lang/String;", |ctx, args| {
+        let val = match args.first() { Some(Value::Long(v)) => *v, _ => 0 };
+        let radix = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => 10 };
+        let radix = if !(2..=36).contains(&radix) { 10 } else { radix };
+        let text = if radix == 10 {
+            val.to_string()
+        } else if val == i64::MIN {
+            // -i64::MIN overflows; build absolute value manually
+            let mut s = String::from("-");
+            let mut v = (i64::MIN as i128).unsigned_abs() as u128;
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit((v % radix as u128) as u32, radix).unwrap_or('?'));
+                v /= radix as u128;
+            }
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else if val < 0 {
+            let mut v = (-val) as u64;
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+                v /= radix as u64;
+            }
+            let mut s = String::from("-");
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else {
+            let mut v = val as u64;
+            if v == 0 { "0".to_string() } else {
+                let mut buf = Vec::new();
+                while v > 0 {
+                    buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+                    v /= radix as u64;
+                }
+                buf.into_iter().rev().collect()
+            }
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
+    });
+    registry.register("java/lang/Integer", "toString", "(II)Ljava/lang/String;", |ctx, args| {
+        let val = match args.first() { Some(Value::Int(v)) => *v, _ => 0 };
+        let radix = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => 10 };
+        let radix = if !(2..=36).contains(&radix) { 10 } else { radix };
+        let text = if radix == 10 {
+            val.to_string()
+        } else if val == i32::MIN {
+            let mut s = String::from("-");
+            let mut v = (i32::MIN as i64).unsigned_abs();
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+                v /= radix as u64;
+            }
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else if val < 0 {
+            let mut v = (-val) as u32;
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+                v /= radix;
+            }
+            let mut s = String::from("-");
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else {
+            let mut v = val as u32;
+            if v == 0 { "0".to_string() } else {
+                let mut buf = Vec::new();
+                while v > 0 {
+                    buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+                    v /= radix;
+                }
+                buf.into_iter().rev().collect()
+            }
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
+    });
 
     // Object.toString override — JDK bytecode uses string concat (invokedynamic)
     // which depends on Unsafe byte-level array writes we don't support.
