@@ -4406,28 +4406,56 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let style_cls = "picocli/CommandLine$Help$Ansi$Style";
         let class_id = match ctx.ensure_class_initialized(style_cls) {
             Ok(id) => id,
-            Err(_) => return rustjvm_types::Value::Object(None),
+            Err(_) => {
+                if std::env::var("RUSTJVM_DBG_PICOCLI_STYLE").is_ok() {
+                    eprintln!("[picocli-style] ensure_class_initialized failed");
+                }
+                return rustjvm_types::Value::Object(None);
+            }
         };
         let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
+        let dbg = std::env::var("RUSTJVM_DBG_PICOCLI_STYLE").is_ok();
+        // Round 93: Style constants are STATIC enum fields — must use
+        // `static_field_index_by_name`, not `resolve_field_index` (which
+        // only walks INSTANCE fields). Round 92's fallback was reaching
+        // the `Object(None)` branch on every call, leaking null IStyle
+        // to `Ansi.string`, which then NPEs in `Style.on()`.
         // Try the plain name first (e.g. "reset", "bold").
-        if let Some(idx) = ctx.resolve_field_index(style_cls, &name) {
+        if let Some(idx) = ctx.static_field_index_by_name(class_id, &name) {
             let v = ctx.get_static_field(class_id, idx);
+            if dbg {
+                eprintln!("[picocli-style] plain {} -> idx={} val_null={}", name, idx, matches!(v, rustjvm_types::Value::Object(None)));
+            }
             if !matches!(v, rustjvm_types::Value::Object(None)) {
                 return v;
             }
+        } else if dbg {
+            eprintln!("[picocli-style] plain {} -> no static field", name);
         }
         // Then the prefixed form (e.g. "fg_red", "bg_blue").
         let prefixed = format!("{}{}", prefix, name);
-        if let Some(idx) = ctx.resolve_field_index(style_cls, &prefixed) {
+        if let Some(idx) = ctx.static_field_index_by_name(class_id, &prefixed) {
             let v = ctx.get_static_field(class_id, idx);
+            if dbg {
+                eprintln!("[picocli-style] prefixed {} -> idx={} val_null={}", prefixed, idx, matches!(v, rustjvm_types::Value::Object(None)));
+            }
             if !matches!(v, rustjvm_types::Value::Object(None)) {
                 return v;
             }
+        } else if dbg {
+            eprintln!("[picocli-style] prefixed {} -> no static field", prefixed);
         }
         // Fallback: return the always-present `reset` style. Any IStyle is
         // legal here — Ansi.OFF.string strips markup wholesale anyway.
-        if let Some(idx) = ctx.resolve_field_index(style_cls, "reset") {
-            return ctx.get_static_field(class_id, idx);
+        if let Some(idx) = ctx.static_field_index_by_name(class_id, "reset") {
+            let v = ctx.get_static_field(class_id, idx);
+            if dbg {
+                eprintln!("[picocli-style] reset fallback idx={} val_null={}", idx, matches!(v, rustjvm_types::Value::Object(None)));
+            }
+            return v;
+        }
+        if dbg {
+            eprintln!("[picocli-style] reset static field not found, returning null");
         }
         rustjvm_types::Value::Object(None)
     }

@@ -630,9 +630,20 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
             let action = obj_arg(args, 0)?;
             let cb = action_code_base(ctx, action);
             let digests = action_cert_digests(ctx, action);
+            let dbg = std::env::var_os("RUSTJVM_DBG_DOPRIV").is_some();
+            if dbg {
+                let cid = ctx.class_id_of_object(action);
+                let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
+                eprintln!("[doPriv] ENTER action class={cls}");
+            }
             push_privileged_frame_full(cb, digests);
             let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
+            if dbg {
+                let cid = ctx.class_id_of_object(action);
+                let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
+                eprintln!("[doPriv] EXIT action class={cls} ok={}", result.is_ok());
+            }
             result
         },
     );
