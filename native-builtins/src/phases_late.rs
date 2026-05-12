@@ -3884,6 +3884,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
 
     // --- Path.getFileName() → Path (or null) ---
+    // Real JDK: returns null when the path has no file component (e.g. "/").
+    // CratonVM divergence: smallrye-config 3.16's
+    // AbstractLocationConfigSourceLoader$ConfigSourceClassPathConsumer.accept(Path)
+    // immediately invokes .toString() on the returned Path and assumes it is
+    // non-null.  When our synthetic Path holds a normalized string like
+    // "/" or "" (e.g. forward-slash inputs that std::path::Path::file_name
+    // refuses to split on Windows), returning null triggers a "Cannot invoke
+    // toString on null" NPE that aborts Keycloak 26 boot.  Fall back to a
+    // manual basename via the last path separator so the consumer's
+    // validExtension() check rejects it cleanly instead of NPEing.
     r.register(
         path,
         "getFileName",
@@ -3893,13 +3903,32 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, this);
             let name = std::path::Path::new(&p)
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string());
+                .map(|n| n.to_string_lossy().to_string())
+                .or_else(|| {
+                    // Manual basename: take the substring after the last '/' or '\\'.
+                    let trimmed = p.trim_end_matches(['/', '\\']);
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        let idx = trimmed
+                            .rfind(|c: char| c == '/' || c == '\\')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        Some(trimmed[idx..].to_string())
+                    }
+                });
             match name {
                 Some(n) => {
                     let result = p57_alloc_path(ctx, &n);
                     Ok(Some(Value::Object(Some(result))))
                 }
-                None => Ok(Some(Value::Object(None))),
+                None => {
+                    // Root path with no component — return an empty-named Path
+                    // so callers that immediately .toString() see "" instead of
+                    // dereferencing null.
+                    let result = p57_alloc_path(ctx, "");
+                    Ok(Some(Value::Object(Some(result))))
+                }
             }
         },
     );
