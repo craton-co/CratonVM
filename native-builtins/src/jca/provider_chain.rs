@@ -974,6 +974,38 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     r.register("java/security/Provider$ServiceKey", "<clinit>", "()V", clinit_noop);
     r.register("java/security/Provider$EngineDescription", "<clinit>", "()V", clinit_noop);
 
+    // Round 87 (WildFly): skip BouncyCastle's EC asymmetric-provider
+    // configuration.  `EC.<clinit>` calls `ECNamedCurveTable.getNames()`,
+    // which iterates through every named-curve table (ANSSI, GMNamedCurves,
+    // ECGOST3410NamedCurves, ...).  Under the real-JDK interpreter (no JIT)
+    // this walk takes ~5 minutes and then hits an operand-stack tag
+    // mismatch in a downstream curve `<clinit>` ("expected long on stack,
+    // got float(...)"), which the B6 silent-swallow logs but which leaves
+    // BouncyCastle in a half-initialized state.  WildFly doesn't actually
+    // need EC algorithms to boot; no-op the EC asymmetric provider's
+    // class-init and `Mappings.configure` so `BouncyCastleProvider.setup()`
+    // moves on to the next algorithm immediately.  EC support is not
+    // registered, but the provider chain continues normally and downstream
+    // WildFly subsystems initialize.
+    r.register(
+        "org/bouncycastle/jcajce/provider/asymmetric/EC",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
+    r.register(
+        "org/bouncycastle/jcajce/provider/asymmetric/EC$Mappings",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
+    r.register(
+        "org/bouncycastle/jcajce/provider/asymmetric/EC$Mappings",
+        "configure",
+        "(Lorg/bouncycastle/jcajce/provider/config/ConfigurableProvider;)V",
+        clinit_noop,
+    );
+
     // WP6.5 finish: service-map population + lookup.
     //
     // `Provider.put(Object,Object)` is the public surface BouncyCastle's
