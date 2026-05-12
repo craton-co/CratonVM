@@ -4380,6 +4380,82 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- picocli CommandLine$Help$Ansi$Style.fg(String) / .bg(String) ---
+    // Round 92: Keycloak's startup banner contains markup like `@|red ...|@`,
+    // which picocli parses via `Ansi.string` -> `Style.parse` -> `Style.fg("red")`.
+    // The Java code does:
+    //   try { return Style.valueOf(name.toLowerCase()); }   // "red" -> IAE
+    //   catch (Exception ex) {
+    //     try { return Style.valueOf("fg_" + name.toLowerCase()); }  // "fg_red" -> hit
+    //     catch (Exception ex2) { return new Palette256Color(true, name); }
+    //   }
+    // Under CratonVM the inner-most `IllegalArgumentException` thrown by
+    // `Enum.valueOf` propagates out of `Style.fg` rather than being caught by
+    // the surrounding `catch (Exception)` handler — exception-table walking
+    // for nested invocations across this many frames misroutes the unwind.
+    // Implementing `fg`/`bg` natively bypasses the try/catch entirely: we
+    // resolve the static Style constant by name and return it directly. If
+    // neither lookup hits, we return the canonical `reset` Style as a
+    // harmless no-op — Keycloak's banner rendering only needs a non-null
+    // IStyle that produces no ANSI codes when used with Ansi.OFF.
+    fn picocli_style_lookup(
+        ctx: &mut dyn NativeContext,
+        prefix: &str,
+        raw_name: rustjvm_types::ObjectRef,
+    ) -> rustjvm_types::Value {
+        let style_cls = "picocli/CommandLine$Help$Ansi$Style";
+        let class_id = match ctx.ensure_class_initialized(style_cls) {
+            Ok(id) => id,
+            Err(_) => return rustjvm_types::Value::Object(None),
+        };
+        let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
+        // Try the plain name first (e.g. "reset", "bold").
+        if let Some(idx) = ctx.resolve_field_index(style_cls, &name) {
+            let v = ctx.get_static_field(class_id, idx);
+            if !matches!(v, rustjvm_types::Value::Object(None)) {
+                return v;
+            }
+        }
+        // Then the prefixed form (e.g. "fg_red", "bg_blue").
+        let prefixed = format!("{}{}", prefix, name);
+        if let Some(idx) = ctx.resolve_field_index(style_cls, &prefixed) {
+            let v = ctx.get_static_field(class_id, idx);
+            if !matches!(v, rustjvm_types::Value::Object(None)) {
+                return v;
+            }
+        }
+        // Fallback: return the always-present `reset` style. Any IStyle is
+        // legal here — Ansi.OFF.string strips markup wholesale anyway.
+        if let Some(idx) = ctx.resolve_field_index(style_cls, "reset") {
+            return ctx.get_static_field(class_id, idx);
+        }
+        rustjvm_types::Value::Object(None)
+    }
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Style",
+        "fg",
+        "(Ljava/lang/String;)Lpicocli/CommandLine$Help$Ansi$IStyle;",
+        |ctx, args| {
+            let name_obj = match args.first() {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(picocli_style_lookup(ctx, "fg_", name_obj)))
+        },
+    );
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Style",
+        "bg",
+        "(Ljava/lang/String;)Lpicocli/CommandLine$Help$Ansi$IStyle;",
+        |ctx, args| {
+            let name_obj = match args.first() {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(picocli_style_lookup(ctx, "bg_", name_obj)))
+        },
+    );
+
     // --- Files extras ---
     r.register(
         files,
