@@ -6666,7 +6666,22 @@ fn invoke_on_class_shared_inner(
                         // this check to the Copier/BootstrapDirectory phase.
                         || (class_name == "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble"
                             && method_name == "verify"
-                            && descriptor == "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V");
+                            && descriptor == "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V")
+                        // Round 63: org.jboss.staxmapper.IntVersion.toString()
+                        // — the real-JDK bytecode uses
+                        //   IntStream.of(segments).limit(n).mapToObj(Integer::toString)
+                        //     .collect(Collectors.joining("."))
+                        // Our IntStream/mapToObj/limit chain returns null at the
+                        // collect() call, NPEing inside
+                        // VersionedNamespace.createURN → StandaloneXmlSchemas.<init>
+                        // during WildFly boot. Our native (registered in lib.rs)
+                        // reads the int[] `segments` field directly and joins
+                        // with dots; force the override so the broken stream
+                        // path never runs.
+                        || (class_name == "org/jboss/staxmapper/IntVersion"
+                            && method_name == "toString"
+                            && (descriptor == "()Ljava/lang/String;"
+                                || descriptor == "(I)Ljava/lang/String;"));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
