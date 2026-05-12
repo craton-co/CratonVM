@@ -3574,6 +3574,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Z)V",
         native_set_accessible_write_override,
     );
+    // Enum.name/ordinal must always read/write the slots declared on
+    // java.lang.Enum itself — never a same-named field shadowed by a
+    // subclass.  Kafka's `Group$GroupType` declares a private instance
+    // field `name` whose value is the *display* form ("classic"), while
+    // the JDK's `Enum.name` holds the constant identifier ("CLASSIC").
+    // The leaf-first `get/set_field_by_name` path would resolve to the
+    // shadow and corrupt `Enum.name()` → `Enum.valueOf("CLASSIC")` fails
+    // with `IllegalArgumentException: No enum constant ... CLASSIC`,
+    // which blocks `KafkaConfig.<init>` at bci=970.
     registry.register("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -3581,8 +3590,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         };
         let name = args.get(1).copied().unwrap_or(Value::Object(None));
         let ord = args.get(2).copied().unwrap_or(Value::Int(0));
-        ctx.set_field_by_name(this, "name", name);
-        ctx.set_field_by_name(this, "ordinal", ord);
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
+            ctx.set_field(this, slot, name);
+        } else {
+            ctx.set_field_by_name(this, "name", name);
+        }
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "ordinal") {
+            ctx.set_field(this, slot, ord);
+        } else {
+            ctx.set_field_by_name(this, "ordinal", ord);
+        }
         Ok(None)
     });
     registry.register("java/lang/Enum", "ordinal", "()I", |ctx, args| {
@@ -3590,6 +3607,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "ordinal") {
+            return Ok(Some(ctx.get_field(this, slot)));
+        }
         Ok(Some(ctx.get_field_by_name(this, "ordinal")))
     });
     registry.register("java/lang/Enum", "name", "()Ljava/lang/String;", |ctx, args| {
@@ -3597,6 +3617,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
+            return Ok(Some(ctx.get_field(this, slot)));
+        }
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
     registry.register("java/lang/Enum", "toString", "()Ljava/lang/String;", |ctx, args| {
@@ -3604,6 +3627,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
+            return Ok(Some(ctx.get_field(this, slot)));
+        }
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
     // Spring Boot 2 launcher: avoid ctor-side ClassCastException in

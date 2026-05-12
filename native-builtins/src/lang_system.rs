@@ -1,7 +1,7 @@
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
+use rustjvm_types::{ObjectRef, Value};
 use rustjvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
@@ -1275,10 +1275,34 @@ pub(crate) fn native_system_init_phase1(
     // `resolve_field_index` is instance-only; `out`/`err`/`in`/`lineSeparator`
     // are all statics, so we use the static-by-name path (the same one
     // `setIn0`/`setOut0`/`setErr0` use elsewhere in this crate).
+    // Helper: build a UTF-8 Charset stub matching the layout used by
+    // `Charset.forName` / `Charset.defaultCharset` natives (slot 0 = name String).
+    // Keycloak's Picocli.getErrWriter goes `new PrintWriter(System.err)` →
+    // `PrintWriter(OutputStream, boolean)` which reads `((PrintStream)err).charset()`,
+    // a plain getfield on the `charset` field. If that field is null, the
+    // downstream `new OutputStreamWriter(stream, charset)` throws NPE("charset")
+    // and Quarkus silently exits during command-line parsing. We must therefore
+    // stamp a non-null Charset on System.out/err at bootstrap time.
+    fn install_charset(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+        let cs_class = match ctx.ensure_class_initialized("java/nio/charset/Charset") {
+            Ok(cid) => cid,
+            Err(_) => return,
+        };
+        let cs_fields = ctx.class_num_total_fields(cs_class).max(1);
+        let cs_obj = ctx.alloc_object(cs_class, cs_fields);
+        let name = ctx.create_string("UTF-8");
+        ctx.set_field(cs_obj, 0, Value::Object(Some(name)));
+        // Use field-by-name so we hit the real-JDK `charset` slot (its
+        // declared index differs from any synthetic ordering).
+        ctx.set_field_by_name(stream, "charset", Value::Object(Some(cs_obj)));
+    }
+
     if let Some(out_stream) = ctx.get_system_stream("out") {
+        install_charset(ctx, out_stream);
         ctx.set_static_field_by_name("java/lang/System", "out", Value::Object(Some(out_stream)));
     }
     if let Some(err_stream) = ctx.get_system_stream("err") {
+        install_charset(ctx, err_stream);
         ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }
     // S110 — System.in: wire up to OS stdin (fd id 0 in our FileDescriptorTable,

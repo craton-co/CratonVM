@@ -12005,6 +12005,29 @@ fn populate_virtual_invoke_cache(
         // so that calls like `SumTask.fork()` (where the native is registered
         // on `RecursiveTask`/`ForkJoinTask`) reach the Rust override and not
         // the inherited JDK bytecode.
+        //
+        // Round 63 (peaceful-sammet) — receiver-bytecode short-circuit:
+        // if the *receiver* class declares its own bytecode for this
+        // method, the subclass override must win over any ancestor's
+        // native registration. Without this guard, Kafka's
+        // `Group$GroupType.toString()` (a subclass override that reads
+        // the subclass `name` field — "classic"/lowercase) was being
+        // shadowed by the native `Enum.toString()` registered on
+        // `java/lang/Enum`, which reads `Enum.name` ("CLASSIC"/upper).
+        // First call dispatched via the slow path (correct override);
+        // this cache populator then poisoned the inline cache with the
+        // parent native, breaking subsequent calls and causing
+        // `GroupCoordinatorConfig.<clinit>` to default the rebalance
+        // protocols list to `["CONSUMER", "CLASSIC", "STREAMS"]`
+        // instead of the lowercase forms the validator accepts.
+        let receiver_has_own_bytecode = cm
+            .get_class(receiver_class_id)
+            .map(|c| c.find_method(&method_name, &descriptor).is_some())
+            .unwrap_or(false);
+        if receiver_has_own_bytecode {
+            // Skip the ancestor-native promotion entirely — fall through
+            // to the bytecode dispatch path below.
+        } else {
         let mut cid = receiver_class_id;
         while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
             if let Some(parent) = cm.get_class(parent_id) {
@@ -12061,6 +12084,7 @@ fn populate_virtual_invoke_cache(
                 }
             }
             cid = parent_id;
+        }
         }
     }
 
