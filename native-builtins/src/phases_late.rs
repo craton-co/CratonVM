@@ -4316,6 +4316,70 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- SmallRyeConfig.getConfigMapping(Class, String) — Round 87 ---
+    // Quarkus's generated `SharedConfig.<clinit>` calls
+    // `SmallRyeConfig.getConfigMapping(VertxHttpBuildTimeConfig.class, ...)`
+    // (and other @ConfigMapping interfaces) at static-init.  Under CratonVM
+    // those mappings are never registered with the SmallRyeConfig instance
+    // (build-time reflective discovery doesn't run), so the lookup throws
+    // `NoSuchElementException("SRCFG00027: Could not find a mapping for ...")`,
+    // wrapping into ExceptionInInitializerError and aborting Keycloak boot.
+    //
+    // Same family as the Round 80 `KeyStoreConfigSourceFactory.getConfigSources`
+    // fix, but this one short-circuits the lookup at its source so any future
+    // @ConfigMapping interface (KC has many) is handled uniformly.
+    //
+    // Strategy: allocate a synthetic instance whose ClassId is the requested
+    // @ConfigMapping interface.  Quarkus's SharedConfig static-init writes the
+    // result to a `static final` slot; downstream interface-method calls will
+    // either be re-shimmed individually as they surface or hit defensive
+    // null/default paths.  This unblocks SharedConfig.<clinit> past pc=2154.
+    r.register(
+        "io/smallrye/config/SmallRyeConfig",
+        "getConfigMapping",
+        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args[0] = this, args[1] = Class<T>, args[2] = String prefix
+            let class_mirror = match args.get(1) {
+                Some(Value::Object(Some(c))) => *c,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Resolve interface name and ClassId; fall back to None on failure.
+            let cls_name = crate::lang_class::mirror_class_name(ctx, class_mirror);
+            let cls_name = match cls_name {
+                Some(n) => n,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // alloc_concurrent_synthetic ensures the class is initialized and
+            // sizes the object to the class's declared field count (interfaces
+            // typically have none — slot count auto-grows in real-JDK mode).
+            let obj = alloc_concurrent_synthetic(ctx, &cls_name, 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // The single-arg form `getConfigMapping(Class)` delegates to the two-arg
+    // form on real SmallRyeConfig, but when the JIT/interp doesn't re-enter
+    // the bytecode path (e.g. direct invokevirtual without inline cache), we
+    // mirror the same logic here so both arms are covered.
+    r.register(
+        "io/smallrye/config/SmallRyeConfig",
+        "getConfigMapping",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+        |ctx, args| {
+            let class_mirror = match args.get(1) {
+                Some(Value::Object(Some(c))) => *c,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let cls_name = match crate::lang_class::mirror_class_name(ctx, class_mirror) {
+                Some(n) => n,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            let obj = alloc_concurrent_synthetic(ctx, &cls_name, 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
     // --- Files extras ---
     r.register(
         files,
