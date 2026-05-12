@@ -36,6 +36,272 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+/// Native `Duration.parse(CharSequence)` for real-JDK mode.
+///
+/// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
+/// then calls `Matcher.start(int)` on optional groups; CratonVM's
+/// synthetic Matcher throws AIOOBE on unmatched groups. Override the
+/// static factory so common ISO-8601 inputs (Quarkus emits `P3D` /
+/// `PT...` values from config defaults) parse without touching the
+/// regex engine.
+///
+/// Supported grammar: `[+-]P[nD][T[nH][nM][n[.n]S]]`. Construction
+/// is delegated to `Duration.ofSeconds(long, long)` so the resulting
+/// object has the real-JDK field layout.
+fn essential_dur_parse(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    fn parse_unsigned(b: &[u8]) -> Option<(u64, usize)> {
+        let mut i = 0usize;
+        let mut sign_present = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            sign_present = true;
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let n: u64 = std::str::from_utf8(&b[start..i]).ok()?.parse().ok()?;
+        let _ = sign_present;
+        Some((n, i))
+    }
+    fn parse_signed(b: &[u8]) -> Option<(u64, i128, usize)> {
+        let mut i = 0usize;
+        let mut sign: i128 = 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            if b[i] == b'-' {
+                sign = -1;
+            }
+            i += 1;
+        }
+        let (n, consumed) = parse_unsigned(&b[i..])?;
+        if consumed == 0 {
+            return None;
+        }
+        // parse_unsigned consumed `consumed` bytes from b[i..]; but
+        // parse_unsigned itself may have stripped its own sign — avoid
+        // double-stripping by reading raw digits only here.
+        let start = i;
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == start {
+            return None;
+        }
+        let n: u64 = std::str::from_utf8(&b[start..j]).ok()?.parse().ok()?;
+        Some((n, sign, j))
+    }
+    let s_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Text cannot be null".to_string(),
+            }
+            .into())
+        }
+    };
+    let text = ctx.read_string(s_obj).unwrap_or_default();
+    let trimmed = text.trim().to_string();
+    let raw_err = || rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        message: format!("Text cannot be parsed to a Duration: {trimmed}"),
+    };
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return Err(raw_err().into());
+    }
+    let mut i = 0usize;
+    let mut negative = false;
+    if bytes[i] == b'+' {
+        i += 1;
+    } else if bytes[i] == b'-' {
+        negative = true;
+        i += 1;
+    }
+    if i >= bytes.len() || (bytes[i] != b'P' && bytes[i] != b'p') {
+        return Err(raw_err().into());
+    }
+    i += 1;
+    let mut total_seconds: i128 = 0;
+    let mut total_nanos: i32 = 0;
+    let mut saw_any = false;
+    // Days segment
+    if i < bytes.len() && bytes[i] != b'T' && bytes[i] != b't' {
+        let (n, sign, consumed) = parse_signed(&bytes[i..]).ok_or_else(raw_err)?;
+        i += consumed;
+        if i >= bytes.len() || (bytes[i] != b'D' && bytes[i] != b'd') {
+            return Err(raw_err().into());
+        }
+        i += 1;
+        total_seconds = total_seconds.saturating_add(sign * n as i128 * 86_400);
+        saw_any = true;
+    }
+    // Time segment
+    if i < bytes.len() {
+        if bytes[i] != b'T' && bytes[i] != b't' {
+            return Err(raw_err().into());
+        }
+        i += 1;
+        let mut last_pos = 0;
+        let mut t_saw = false;
+        while i < bytes.len() {
+            let (n, sign, consumed) = parse_signed(&bytes[i..]).ok_or_else(raw_err)?;
+            i += consumed;
+            // Fractional seconds (only valid before S, but parse leniently)
+            let mut frac_nanos: i64 = 0;
+            if i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b',') {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if start == i {
+                    return Err(raw_err().into());
+                }
+                let take = (i - start).min(9);
+                let digits = &trimmed[start..start + take];
+                let mut nanos: i64 = digits.parse::<i64>().unwrap_or(0);
+                for _ in digits.len()..9 {
+                    nanos *= 10;
+                }
+                frac_nanos = nanos;
+            }
+            if i >= bytes.len() {
+                return Err(raw_err().into());
+            }
+            let unit = bytes[i];
+            i += 1;
+            let pos = match unit {
+                b'H' | b'h' => 1,
+                b'M' | b'm' => 2,
+                b'S' | b's' => 3,
+                _ => return Err(raw_err().into()),
+            };
+            if pos <= last_pos {
+                return Err(raw_err().into());
+            }
+            last_pos = pos;
+            t_saw = true;
+            saw_any = true;
+            match pos {
+                1 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 3600),
+                2 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 60),
+                3 => {
+                    total_seconds = total_seconds.saturating_add(sign * n as i128);
+                    let mut combined = total_nanos as i64 + sign as i64 * frac_nanos;
+                    while combined < 0 {
+                        combined += 1_000_000_000;
+                        total_seconds -= 1;
+                    }
+                    while combined >= 1_000_000_000 {
+                        combined -= 1_000_000_000;
+                        total_seconds += 1;
+                    }
+                    total_nanos = combined as i32;
+                }
+                _ => {}
+            }
+        }
+        if !t_saw {
+            return Err(raw_err().into());
+        }
+    }
+    if !saw_any {
+        return Err(raw_err().into());
+    }
+    if negative {
+        let total = -(total_seconds * 1_000_000_000 + total_nanos as i128);
+        total_seconds = total.div_euclid(1_000_000_000);
+        total_nanos = total.rem_euclid(1_000_000_000) as i32;
+    }
+    let secs = total_seconds.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    // Delegate to JDK's `Duration.ofSeconds(long,long)` so the returned
+    // object has the proper internal layout.
+    match ctx.invoke(
+        "java/time/Duration",
+        "ofSeconds",
+        "(JJ)Ljava/time/Duration;",
+        &[Value::Long(secs), Value::Long(total_nanos as i64)],
+    ) {
+        Ok(Some(v)) => Ok(Some(v)),
+        Ok(None) => Err(raw_err().into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Native override for `io.quarkus.runtime.configuration.LocaleConverter.convert(String)`.
+///
+/// The JDK-bytecode converter validates inputs via
+/// `Locale.forLanguageTag(...).getLanguage().isEmpty()` and throws
+/// `IllegalArgumentException("Unable to resolve locale: <input>")` on
+/// failure. CratonVM's `Locale.forLanguageTag` doesn't populate the
+/// language field in real-JDK mode, so even the well-formed default
+/// expression `"${user.language:en}-${user.country:}"` (often
+/// rendered as `"en-"` when user.country is unset) is rejected during
+/// Quarkus config validation, blocking Keycloak boot.
+///
+/// Mirror the validator's intent leniently: split on `-` / `_`, treat
+/// `null` / empty as null, treat `"all"` as `Locale.ROOT`, otherwise
+/// construct `new Locale(language, country)` via the JDK constructor —
+/// good enough for downstream consumers that read language/country
+/// directly.
+fn essential_quarkus_locale_convert(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let s_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let raw = ctx.read_string(s_obj).unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    if trimmed == "all" {
+        // Locale.ROOT
+        return ctx.invoke(
+            "java/util/Locale",
+            "getDefault",
+            "()Ljava/util/Locale;",
+            &[],
+        );
+    }
+    // Normalise: replace '_' with '-' then split.
+    let normalised: String = trimmed.replace('_', "-");
+    let mut parts = normalised.split('-');
+    let lang = parts.next().unwrap_or("").to_string();
+    let country = parts.next().unwrap_or("").to_string();
+    let variant = parts.next().unwrap_or("").to_string();
+    // Construct via Locale's (String,String,String) constructor — works
+    // regardless of `forLanguageTag`'s CLDR-data dependencies.
+    let cls = "java/util/Locale";
+    let loc_obj = match ctx.new_object(cls) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let l = ctx.create_string(&lang);
+    let c = ctx.create_string(&country);
+    let v = ctx.create_string(&variant);
+    let _ = ctx.invoke(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        &[
+            Value::Object(Some(loc_obj)),
+            Value::Object(Some(l)),
+            Value::Object(Some(c)),
+            Value::Object(Some(v)),
+        ],
+    );
+    Ok(Some(Value::Object(Some(loc_obj))))
+}
+
 /// Decode `java.lang.String` used as a system/property key when
 /// `NativeContext::read_string` yields empty (compact `String` layout edge cases).
 pub(crate) fn property_key_from_java_string(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> String {
@@ -1317,6 +1583,39 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&sep)))))
         },
     );
+    // Duration.parse — JDK bytecode uses regex Matcher.start(int) on
+    // unmatched groups, which CratonVM's synthetic Matcher rejects with
+    // AIOOBE. Stub the parser natively so ISO-8601 inputs like "P3D",
+    // "PT5M" round-trip without touching the regex engine.
+    registry.register(
+        "java/time/Duration",
+        "parse",
+        "(Ljava/lang/CharSequence;)Ljava/time/Duration;",
+        essential_dur_parse,
+    );
+
+    // Quarkus LocaleConverter — its convert(String) rejects any tag for
+    // which `Locale.forLanguageTag(...).getLanguage()` is empty. In
+    // CratonVM's real-JDK mode `Locale.forLanguageTag` doesn't fully
+    // populate the Locale (no native CLDR data), so even valid inputs
+    // like "en" or the default-expression value "en-" (produced when
+    // `${user.country:}` resolves to empty) get rejected with
+    // "Unable to resolve locale". Override the converter to construct
+    // a Locale via the simpler `new Locale(lang, country)` path so
+    // Quarkus's `quarkus.locales` validation passes.
+    registry.register(
+        "io/quarkus/runtime/configuration/LocaleConverter",
+        "convert",
+        "(Ljava/lang/String;)Ljava/util/Locale;",
+        essential_quarkus_locale_convert,
+    );
+    registry.register(
+        "io/quarkus/runtime/configuration/LocaleConverter",
+        "convert",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        essential_quarkus_locale_convert,
+    );
+
     registry.register(
         "java/lang/System",
         "getProperties",
@@ -1325,10 +1624,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Return a lightweight synthetic Properties object.  The
             // Properties.getProperty/getProperty(default) native overrides
             // below intercept the common read paths and delegate to our
-            // VM's system property store — so we don't need to populate
-            // the Properties' internal Hashtable slots (which would cascade
-            // into many allocations during early bootstrap and OOM).
+            // VM's system property store — so individual lookups work
+            // without touching the inherited Hashtable slots.
+            //
+            // However, callers that *enumerate* (Properties.forEach,
+            // stringPropertyNames, size, entrySet) read from the
+            // side-table directly. SmallRye / Quarkus's
+            // `PropertiesConfigSource` iterates `System.getProperties()`
+            // to materialise its config map; if the side-table is empty,
+            // expressions like `${user.country:}` resolve to the empty
+            // default — producing values like `quarkus.locales=en-`.
+            // Pre-populate the side-table with the current system
+            // property snapshot so enumeration sees the live values.
             let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
+            for (k, v) in ctx.list_system_properties() {
+                crate::properties_sidetable::store_property_in_sidetable(props, &k, &v);
+            }
             Ok(Some(Value::Object(Some(props))))
         },
     );
