@@ -1567,7 +1567,156 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     r.register(ihs_iter, "hasNext", "()Z", native_ihs_iter_has_next);
     r.register(ihs_iter, "next", "()Ljava/lang/Object;", native_ihs_iter_next);
 
+    // R84 (WildFly): natively implement `org.jboss.logging.Logger.getMessageLogger`
+    // overloads. The real implementation goes through `MethodHandles.lookup() +
+    // privateLookupIn(intf) + Lookup.findClass("<intf>_$logger") +
+    // Lookup.findConstructor(...)`. Our `MethodHandles$Lookup.accessClass` runs
+    // the JDK Java code that calls `VerifyAccess.isClassAccessible`, which in
+    // turn requires `isSamePackage(lookupClass, targetClass)` to match
+    // ClassLoader identity AND package name. With our app/platform-loader
+    // resolution (returning the singleton AppClassLoader for everything
+    // non-bootstrap), this normally works — but the interface and the
+    // generated `_$logger` impl can have subtly different module/loader views
+    // during JBoss-Modules-mediated loading, causing IllegalAccessException →
+    // IllegalArgumentException ("The given lookup does not have access to the
+    // implementation class") to be thrown. The swallow then leaves the
+    // resulting message-logger static fields null, cascading into NPEs
+    // (already partially patched with backfills for ServiceLogger /
+    // ElytronMessages — RemotingSubsystemRootResource and others have no
+    // backfill, so their boot subsystems silently die).
+    //
+    // The native shim bypasses MethodHandles entirely:
+    //   1. derive `<intf_name>_$logger` from the intf Class mirror,
+    //   2. `Logger.getLogger(category)` to get the delegate log,
+    //   3. `new <intf>_$logger(log)` (which super(log)s into DelegatingBasicLogger).
+    //
+    // Returns the freshly constructed message-logger or null on any error
+    // (best-effort — caller usually stores into a static and downstream code
+    // does null-tolerant `if (log == null) ...` checks via our shims).
+    let logger = "org/jboss/logging/Logger";
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let intf_mirror = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/Class;Ljava/lang/String;Ljava/util/Locale;)Ljava/lang/Object;",
+        |ctx, args| {
+            let intf_mirror = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args: [lookup, intfClass, category]
+            let intf_mirror = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/Class;Ljava/lang/String;Ljava/util/Locale;)Ljava/lang/Object;",
+        |ctx, args| {
+            let intf_mirror = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
+}
+
+/// Construct a `<intf>_$logger` instance natively, bypassing the
+/// MethodHandles/Lookup path that JBoss Logging normally uses.
+/// Returns `Value::Object(None)` on any failure.
+fn native_construct_message_logger(
+    ctx: &mut dyn NativeContext,
+    intf_mirror: rustjvm_types::ObjectRef,
+    category: &str,
+) -> Value {
+    // 1. Resolve the interface name.
+    let intf_name = match crate::lang_class::mirror_class_name(ctx, intf_mirror) {
+        Some(n) => n,
+        None => return Value::Object(None),
+    };
+    let impl_name = format!("{intf_name}_$logger");
+
+    // 2. Get the delegate Logger via `Logger.getLogger(category)`. Returns
+    //    null on error — caller can still store the resulting object since
+    //    most _$logger methods are null-tolerant via our shims.
+    let cat_str = ctx.create_string(category);
+    let log_obj = match ctx.invoke(
+        "org/jboss/logging/Logger",
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/jboss/logging/Logger;",
+        &[Value::Object(Some(cat_str))],
+    ) {
+        Ok(Some(v)) => v,
+        _ => Value::Object(None),
+    };
+
+    // 3. `new <impl_name>(log)` — the canonical generated constructor takes
+    //    a single `Logger` parameter and `super(log)`s into
+    //    `DelegatingBasicLogger`.
+    let new_obj = match ctx.new_object(&impl_name) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Value::Object(None),
+    };
+    let init_args = [Value::Object(Some(new_obj)), log_obj];
+    match ctx.invoke(
+        &impl_name,
+        "<init>",
+        "(Lorg/jboss/logging/Logger;)V",
+        &init_args,
+    ) {
+        Ok(_) => Value::Object(Some(new_obj)),
+        Err(_) => {
+            // Constructor failed — return the bare instance anyway. The
+            // `log` field will be null but downstream NPE-tolerant shims
+            // (DelegatingBasicLogger.is*Enabled, ServiceLogger_$logger
+            // method no-ops) keep boot going. Beats a null return that
+            // propagates into static fields whose readers do raw
+            // invokeinterface without null checks.
+            Value::Object(Some(new_obj))
+        }
+    }
 }
 
 // ===========================================================================

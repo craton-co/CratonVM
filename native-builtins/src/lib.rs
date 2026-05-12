@@ -2274,6 +2274,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "hasRealParameterData", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    // Round 63: Keycloak start-dev re-augmentation no-op.
+    //
+    // `start-dev` invokes `AbstractAutoBuildCommand.runReAugmentation` which
+    // calls `Build.runCommand()` to rebuild production config in-process via
+    // a child picocli CommandLine. That nested rebuild path goes through
+    // `Picocli.updateSpecHelpAndUnmatched`, which recursively removes the
+    // `-h/--help` short option from every subcommand spec before re-adding
+    // a Keycloak-specific help mixin. The recursion re-enters the same spec
+    // a second time after the first pass has already added the new `-h`
+    // option, and picocli's `CommandSpec.addOption` throws
+    // `DuplicateOptionAnnotationsException("Option name '-h' is used by both
+    // option --help and field AutoHelpMixin.helpRequested")`. That bubbles
+    // up as `CommandLine.ExecutionException("Failed to update server
+    // configuration.")` from `Build.runCommand` (pc=120/134), aborting
+    // start-dev before the dev-mode server can boot.
+    //
+    // Re-augmentation is a production optimization (precompute the runtime
+    // image of `kc.sh build`). Dev-mode (`start-dev`) does not require it —
+    // Quarkus's dev runtime re-resolves configuration on demand. Stubbing
+    // `Build.runCommand` to a no-op lets `runReAugmentation` return cleanly
+    // and `start-dev` proceeds to Quarkus bootstrap.
+    registry.register(
+        "org/keycloak/quarkus/runtime/cli/command/Build",
+        "runCommand",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register("java/lang/Class", "initClassName", "()Ljava/lang/String;", lang_class::native_class_get_name);
     // getName() is a Java method that caches via initClassName(). Override with
     // native since JDK's Class field layout differs from our mirror layout.
