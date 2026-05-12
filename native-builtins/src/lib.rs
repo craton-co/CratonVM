@@ -2344,37 +2344,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
         ))))
     });
-    // URL.getPath() on synthetic URL → field 0 (the String path)
-    registry.register("java/net/URL", "getPath", "()Ljava/lang/String;", |ctx, args| {
-        match args.first() {
-            Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 0 {
-                    let v = ctx.get_field(*url, 0);
-                    if let Value::Object(_) = v { return Ok(Some(v)); }
-                }
-                Ok(Some(Value::Object(None)))
-            }
-            _ => Ok(Some(Value::Object(None))),
-        }
-    });
-    registry.register("java/net/URL", "getFile", "()Ljava/lang/String;", |ctx, args| {
-        match args.first() {
-            Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 0 {
-                    let v = ctx.get_field(*url, 0);
-                    if let Value::Object(_) = v { return Ok(Some(v)); }
-                }
-                Ok(Some(Value::Object(None)))
-            }
-            _ => Ok(Some(Value::Object(None))),
-        }
-    });
+    // URL.getPath()/getFile()/getProtocol()/getHost() — fixed to use the real-JDK
+    // URL field layout (protocol=0, host=1, port=2, file=3, query=4, authority=5,
+    // path=6). The legacy versions of these natives indexed the wrong slots
+    // (e.g. getProtocol read field 1 / host), which made Keycloak's SmallRye
+    // config loader throw "Unexpected protocol null for URL jar:file:..." when
+    // scanning the classpath.
     registry.register("java/net/URL", "getProtocol", "()Ljava/lang/String;", |ctx, args| {
         match args.first() {
             Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 1 {
-                    let v = ctx.get_field(*url, 1);
-                    if let Value::Object(_) = v { return Ok(Some(v)); }
+                if ctx.object_num_fields(*url) > 0 {
+                    let v = ctx.get_field(*url, 0);
+                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
                 }
                 Ok(Some(Value::Object(Some(ctx.create_string("file")))))
             }
@@ -2384,11 +2365,42 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/net/URL", "getHost", "()Ljava/lang/String;", |ctx, args| {
         match args.first() {
             Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 2 {
-                    let v = ctx.get_field(*url, 2);
-                    if let Value::Object(_) = v { return Ok(Some(v)); }
+                if ctx.object_num_fields(*url) > 1 {
+                    let v = ctx.get_field(*url, 1);
+                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
                 }
                 Ok(Some(Value::Object(Some(ctx.create_string("")))))
+            }
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
+    registry.register("java/net/URL", "getFile", "()Ljava/lang/String;", |ctx, args| {
+        match args.first() {
+            Some(Value::Object(Some(url))) => {
+                if ctx.object_num_fields(*url) > 3 {
+                    let v = ctx.get_field(*url, 3);
+                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
+                }
+                Ok(Some(Value::Object(None)))
+            }
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
+    registry.register("java/net/URL", "getPath", "()Ljava/lang/String;", |ctx, args| {
+        match args.first() {
+            Some(Value::Object(Some(url))) => {
+                if ctx.object_num_fields(*url) > 6 {
+                    let v = ctx.get_field(*url, 6);
+                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
+                }
+                // Fall back to the `file` slot for URLs that don't separate
+                // path/query (e.g. legacy 1-field synthetic URLs would have
+                // already been routed above when their field count is small).
+                if ctx.object_num_fields(*url) > 3 {
+                    let v = ctx.get_field(*url, 3);
+                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
+                }
+                Ok(Some(Value::Object(None)))
             }
             _ => Ok(Some(Value::Object(None))),
         }
@@ -14337,7 +14349,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
     });
 }
 
-fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
+pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // --- ReentrantLock ---
     let rl = "java/util/concurrent/locks/ReentrantLock";
     registry.register(rl, "<init>", "()V", native_rl_init);
@@ -15172,6 +15184,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(size)))
     });
+    // drainTo is registered in letsgo_compat::register_letsgo_compat_natives
 
     // --- ArrayBlockingQueue: 3-field (data=0 array, size=1 int, head=2 int) ---
     let abq = "java/util/concurrent/ArrayBlockingQueue";
@@ -21146,6 +21159,26 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         return;
     }
 
+    // Opaque `jar:` URLs of the form `jar:<inner-url>!/<entry>`. SmallRye and
+    // Quarkus' classpath scanners produce these for nested jars, then call
+    // `url.getProtocol()`. The generic `://` splitter below would set the
+    // protocol to "" (jar: has no authority), which Keycloak's
+    // `ClassPathUtils.processAsPath` reports as
+    // `IllegalArgumentException("Unexpected protocol null for URL …")`.
+    if let Some(rest) = url_str.strip_prefix("jar:") {
+        let full_obj = ctx.create_string(url_str);
+        let proto_obj = ctx.create_string("jar");
+        let host_empty = ctx.create_string("");
+        let file_obj = ctx.create_string(rest);
+        ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
+        ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
+        ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
+        ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(file_obj)));
+        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
+        ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+        return;
+    }
+
     // Parse: protocol://host[:port][/path][?query]
     let (protocol, rest) = if let Some(pos) = url_str.find("://") {
         (&url_str[..pos], &url_str[pos + 3..])
@@ -21209,7 +21242,44 @@ fn native_url_get_protocol(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, URL_FIELD_PROTOCOL)))
+    // Look up the `protocol` field by name (works for both real-JDK URL and
+    // our synthetic 13-field URL — slot 0 in both, but we ask by name so
+    // we're immune to any future layout shuffle).
+    let v = ctx.get_field_by_name(this, "protocol");
+    if let Value::Object(Some(_)) = v {
+        return Ok(Some(v));
+    }
+    // Fallback: real-JDK URL constructors we don't intercept (e.g.
+    // `URL(String, String, int, String, URLStreamHandler)` used by
+    // `JarURLConnection`) sometimes leave `protocol` unset under our VM.
+    // Reconstruct the scheme from the canonical fields (`file`, then our
+    // synthetic-only `URL_FIELD_FULL` cache). SmallRye's
+    // `ClassPathUtils.processAsPath` calls `url.getProtocol()` on
+    // `jar:file:…!/…` URLs and throws "Unexpected protocol null" if we
+    // return null, which crashed Keycloak's SmallRye config builder before
+    // the Quarkus banner.
+    let candidates = [
+        ctx.get_field_by_name(this, "file"),
+        ctx.get_field(this, URL_FIELD_FULL),
+    ];
+    for cand in candidates {
+        if let Value::Object(Some(s)) = cand {
+            let full = ctx.read_string(s).unwrap_or_default();
+            if let Some(idx) = full.find(':') {
+                let scheme = &full[..idx];
+                if !scheme.is_empty()
+                    && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+                {
+                    let so = ctx.create_string(scheme);
+                    return Ok(Some(Value::Object(Some(so))));
+                }
+            }
+        }
+    }
+    Ok(Some(v))
 }
 fn native_url_get_host(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {

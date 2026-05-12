@@ -30,6 +30,7 @@
 //!    is on the classpath.
 
 use rustjvm_vm::config::VmConfig;
+use rustjvm_vm::native::register_builtins;
 use rustjvm_vm::types::Value;
 use rustjvm_vm::vm::Vm;
 
@@ -94,7 +95,7 @@ fn vm_no_spi() -> Vm {
 fn class_for_name_string_native_registered() {
     use rustjvm_native_api::NativeMethodRegistry;
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
     assert!(
         r.find(
             "java/lang/Class",

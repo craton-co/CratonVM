@@ -33,6 +33,7 @@
 
 use rustjvm_native_api::NativeMethodRegistry;
 use rustjvm_vm::config::VmConfig;
+use rustjvm_vm::native::register_builtins;
 use rustjvm_vm::types::Value;
 use rustjvm_vm::vm::Vm;
 
@@ -80,7 +81,7 @@ fn field_get_set_natives_registered() {
     // The VM's vm_init.rs uses `register_builtins` (essential + synthetic
     // overrides) under `use_synthetic_jdk = true` (the default), so this
     // matches the production registry shape.
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Field",
@@ -111,7 +112,7 @@ fn field_typed_accessors_registered() {
     // The VM's vm_init.rs uses `register_builtins` (essential + synthetic
     // overrides) under `use_synthetic_jdk = true` (the default), so this
     // matches the production registry shape.
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
     for (name, sig) in &[
         ("getInt", "(Ljava/lang/Object;)I"),
         ("setInt", "(Ljava/lang/Object;I)V"),
@@ -147,7 +148,7 @@ fn field_metadata_natives_registered() {
     // The VM's vm_init.rs uses `register_builtins` (essential + synthetic
     // overrides) under `use_synthetic_jdk = true` (the default), so this
     // matches the production registry shape.
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
     for (name, sig) in &[
         ("getName", "()Ljava/lang/String;"),
         ("getType", "()Ljava/lang/Class;"),

@@ -41,6 +41,7 @@
 
 use rustjvm_native_api::NativeMethodRegistry;
 use rustjvm_vm::config::VmConfig;
+use rustjvm_vm::native::register_builtins;
 use rustjvm_vm::types::Value;
 use rustjvm_vm::vm::Vm;
 
@@ -99,7 +100,7 @@ fn class_get_declared_methods_native_registered() {
 #[cfg(feature = "synthetic-jdk")]
 fn class_get_declared_methods_public_native_registered_synthetic() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
     assert!(
         r.find(
             "java/lang/Class",

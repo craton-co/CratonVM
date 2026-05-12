@@ -47,6 +47,7 @@
 
 use rustjvm_native_api::NativeMethodRegistry;
 use rustjvm_vm::config::VmConfig;
+use rustjvm_vm::native::register_builtins;
 use rustjvm_vm::types::Value;
 use rustjvm_vm::vm::Vm;
 
@@ -154,7 +155,7 @@ fn each_jdbc_core_type_has_registered_natives() {
     // VM's `vm_init.rs` uses the same entry point under
     // `use_synthetic_jdk = true` (the default). The registry-only
     // `register_essential_natives` does not include phase68.
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
 
     // (class, canonical method, descriptor) — each tuple proves
     // reachability of `class` either by registering a native ON it
@@ -241,7 +242,7 @@ fn each_jdbc_core_type_has_registered_natives() {
 #[cfg(feature = "synthetic-jdk")]
 fn each_jdbc_core_type_has_multiple_anchor_natives() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
 
     // (label, class, method, descriptor) — at least 3 per type.
     const WIDE_ANCHORS: &[(&str, &str, &str, &str)] = &[
@@ -382,7 +383,7 @@ fn each_jdbc_core_type_has_multiple_anchor_natives() {
 #[cfg(feature = "synthetic-jdk")]
 fn statement_subtype_alias_chain_resolves() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
 
     // `Statement.execute(String)Z` is registered against `java/sql/Statement`.
     // Aliasing means looking up the same descriptor against the subtype

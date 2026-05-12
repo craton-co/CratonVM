@@ -314,8 +314,20 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
     }
     let mut out = vec![args[0].clone()];
     let mut i = 1usize;
+    let mut past_separator = false;
     while i < args.len() {
         let a = args[i].as_str();
+        if past_separator {
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            past_separator = true;
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
         if a == "-jar" && i + 1 < args.len() {
             out.push("--jar".into());
             out.push(args[i + 1].clone());
@@ -344,9 +356,23 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
 /// property flags (Java-style) before handing the rest to clap.  Returns
 /// `(filtered_args, system_properties)`.
 fn extract_system_properties(raw: Vec<String>) -> (Vec<String>, Vec<(String, String)>) {
+    eprintln!("DEBUG extract_system_properties input: {:?}", raw);
     let mut filtered = Vec::with_capacity(raw.len());
     let mut props = Vec::new();
+    let mut past_separator = false;
     for arg in raw {
+        // Anything after `--` is a program argument and must be preserved
+        // verbatim — including bare `-Dfoo=bar` tokens that the *Java program*
+        // (e.g. jboss-modules) wants to consume itself.
+        if past_separator {
+            filtered.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            past_separator = true;
+            filtered.push(arg);
+            continue;
+        }
         if let Some(kv) = arg.strip_prefix("-D") {
             if let Some((k, v)) = kv.split_once('=') {
                 props.push((k.to_string(), v.to_string()));
@@ -389,7 +415,18 @@ struct HotspotFlags {
 fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     let mut filtered = Vec::with_capacity(raw.len());
     let mut out = HotspotFlags::default();
+    let mut past_separator = false;
     for arg in raw {
+        // Tokens after `--` are program arguments — pass through unchanged.
+        if past_separator {
+            filtered.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            past_separator = true;
+            filtered.push(arg);
+            continue;
+        }
         match arg.as_str() {
             // Boolean toggles: -XX:+Foo / -XX:-Foo
             "-XX:+HeapDumpOnOutOfMemoryError" => out.heap_dump_on_oom = Some(true),

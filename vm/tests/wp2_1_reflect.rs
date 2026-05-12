@@ -9,6 +9,7 @@
 //! `apps/reflect_probe/ReflectProbe.java` driven by the `rustjvm` CLI binary.
 
 use rustjvm_native_api::NativeMethodRegistry;
+use rustjvm_vm::native::register_builtins;
 
 #[test]
 fn wp2_1_natives_register_without_panic() {
@@ -136,7 +137,7 @@ fn class_get_record_components_register() {
 fn record_component_natives_register() {
     // RecordComponent layout (lang_misc::register_p60_record): slot 0=name, 1=type, 2=declaringRecord
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_builtins(&mut r);
+    register_builtins(&mut r);
     let rc = "java/lang/reflect/RecordComponent";
     assert!(
         r.find(rc, "getName", "()Ljava/lang/String;").is_some(),
