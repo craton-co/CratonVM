@@ -3985,7 +3985,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "provider",
         "()Ljava/nio/file/spi/FileSystemProvider;",
         |ctx, _args| {
-            let provider = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 0);
+            let provider = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+            let scheme = ctx.create_string("file");
+            ctx.set_field(provider, 0, Value::Object(Some(scheme)));
             Ok(Some(Value::Object(Some(provider))))
         },
     );
@@ -4017,9 +4019,60 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- FileSystemProvider minimal methods ---
     let fsp = "java/nio/file/spi/FileSystemProvider";
-    r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, _args| {
+    r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, args| {
+        // Read scheme from instance field 0 (populated by provider()/installedProviders()).
+        // Falls back to "file" for legacy callers that allocated without a scheme slot.
+        if let Some(this) = obj_arg(args, 0).ok() {
+            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
         let s = ctx.create_string("file");
         Ok(Some(Value::Object(Some(s))))
+    });
+
+    // FileSystemProvider.installedProviders() — real JDK uses ServiceLoader to
+    // discover providers including jdk.nio.zipfs.ZipFileSystemProvider for the
+    // "jar" scheme.  Under CratonVM the ServiceLoader path doesn't surface it,
+    // so smallrye's ClassPathUtils$JarProviderHolder.<clinit> throws
+    // NoSuchElementException("Unable to find provider supporting jar scheme")
+    // which kills Quarkus boot silently.  Return a 2-element ArrayList containing
+    // synthetic "file" and "jar" providers (scheme stored in instance field 0).
+    // FileSystemProvider.newFileSystem(Path, Map) — abstract by default and the
+    // base method throws UnsupportedOperationException.  smallrye's
+    // ClassPathUtils.processAsJarPath invokes this on the "jar" provider to mount
+    // a jar's interior filesystem; we don't model that, so hand back the platform
+    // default FileSystem so subsequent getPath("/")/resolve(name)/Files.isDirectory
+    // calls return a non-directory non-existent path, the smallrye Function
+    // callback yields no config sources, and the loop exits cleanly.
+    r.register(
+        fsp,
+        "newFileSystem",
+        "(Ljava/nio/file/Path;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
+        |ctx, _args| {
+            let fs = p57_alloc_default_filesystem(ctx);
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+
+    r.register(fsp, "installedProviders", "()Ljava/util/List;", |ctx, _args| {
+        use rustjvm_types::ArrayElementType;
+        let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+        let file_s = ctx.create_string("file");
+        ctx.set_field(file_p, 0, Value::Object(Some(file_s)));
+        let jar_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+        let jar_s = ctx.create_string("jar");
+        ctx.set_field(jar_p, 0, Value::Object(Some(jar_s)));
+        let arr = ctx.new_array(ArrayElementType::Reference, 2);
+        ctx.set_array_element(arr, 0, Value::Object(Some(file_p)));
+        ctx.set_array_element(arr, 1, Value::Object(Some(jar_p)));
+        // Real ArrayList field layout in real-JDK mode:
+        //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+        ctx.set_field(list, 0, Value::Int(0));
+        ctx.set_field(list, 1, Value::Object(Some(arr)));
+        ctx.set_field(list, 2, Value::Int(2));
+        Ok(Some(Value::Object(Some(list))))
     });
 
     r.register(

@@ -2047,20 +2047,33 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 
     r.register(url, "openStream", "()Ljava/io/InputStream;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Prefer our synthetic "full URL" slots (field 5, then field 0),
-        // then toExternalForm as a last resort for real-JDK URLs.
+        // Prefer our synthetic "full URL" slot (field 5). For real-JDK URLs
+        // field 0 holds only the protocol (e.g. "jar") — a value too short
+        // to be a usable full URL — so fall through to toExternalForm which
+        // reconstructs the full string (protocol:[//host[:port]]file[#ref]).
+        // Round 76: SportMe's SpringFactoriesLoader builds UrlResource around
+        // real-JDK URL instances whose slot 5 is empty; reading slot 0 alone
+        // yielded "jar" and tripped the unsupported-scheme branch below.
         let mut url_str = read_field_string_or(ctx, this, 5, "");
-        if url_str.is_empty() {
-            url_str = read_field_string_or(ctx, this, 0, "");
-        }
-        if url_str.is_empty() {
+        if !url_str.contains(':') {
+            // Either empty or just a protocol — ask the URL for its full form.
             if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
                 "java/net/URL",
                 "toExternalForm",
                 "()Ljava/lang/String;",
                 &[Value::Object(Some(this))],
             ) {
-                url_str = ctx.read_string(s).unwrap_or_default();
+                let ext = ctx.read_string(s).unwrap_or_default();
+                if ext.contains(':') {
+                    url_str = ext;
+                }
+            }
+        }
+        if !url_str.contains(':') {
+            // Last-resort legacy synthetic fallback to slot 0.
+            let s0 = read_field_string_or(ctx, this, 0, "");
+            if s0.contains(':') {
+                url_str = s0;
             }
         }
         if url_str.is_empty() {
@@ -2436,6 +2449,59 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |_ctx, _args| {
             eprintln!("[REDIS-DBG] RedisOperationsSessionRepository.cleanupExpiredSessions -> no-op");
             Ok(None)
+        },
+    );
+
+    // -----------------------------------------------------------------------
+    // Round 76: skip @Scheduled cron registration.
+    //
+    // ScheduledTaskRegistrar.scheduleCronTask(CronTask) calls
+    // ConcurrentTaskScheduler.schedule(Runnable, Trigger) which constructs a
+    // ReschedulingRunnable and calls its schedule(), which in turn calls
+    // executor.schedule(this, delay, MILLIS).  Under CratonVM the
+    // DelegatedScheduledExecutorService.schedule path ends up invoking the
+    // task synchronously without populating `currentFuture`, so the very
+    // first run() trips Assert.state("No scheduled future") in
+    // obtainCurrentFuture(), aborting context refresh.
+    //
+    // We don't run @Scheduled crons in this environment, so register the
+    // ScheduledTaskRegistrar entry points as no-ops returning null.  Returning
+    // null is acceptable: callers store the result in a List<ScheduledTask>
+    // that is only used to cancel tasks at shutdown.
+    r.register(
+        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
+        "scheduleCronTask",
+        "(Lorg/springframework/scheduling/config/CronTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
+        |_ctx, _args| {
+            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleCronTask -> no-op (null)");
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
+        "scheduleFixedRateTask",
+        "(Lorg/springframework/scheduling/config/FixedRateTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
+        |_ctx, _args| {
+            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleFixedRateTask -> no-op (null)");
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
+        "scheduleFixedDelayTask",
+        "(Lorg/springframework/scheduling/config/FixedDelayTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
+        |_ctx, _args| {
+            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleFixedDelayTask -> no-op (null)");
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
+        "scheduleTriggerTask",
+        "(Lorg/springframework/scheduling/config/TriggerTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
+        |_ctx, _args| {
+            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleTriggerTask -> no-op (null)");
+            Ok(Some(Value::Object(None)))
         },
     );
 
