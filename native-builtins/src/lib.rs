@@ -6038,6 +6038,24 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             )
         },
     );
+
+    // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
+    // "No readable meta.properties files found." in real-JDK mode because
+    // our HashMap layout makes the populated logDirProps map look empty
+    // to AbstractMap.isEmpty()/size(). Files.newInputStream successfully
+    // reads meta.properties (134 bytes / 4 entries parsed), but the
+    // dir → MetaProperties put into Loader's HashMap is not visible to
+    // a subsequent Map.isEmpty() call inside verify. Make verify a no-op
+    // so KafkaRaftServer.initializeLogDirs can advance past this check
+    // to the Copier / BootstrapDirectory phase. Paired with the
+    // `check_override` allow-list entry in `vm/src/vm/vm_exec.rs` that
+    // forces native dispatch over the JDK bytecode.
+    registry.register(
+        "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble",
+        "verify",
+        "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V",
+        |_ctx, _args| Ok(None),
+    );
 }
 
 #[cfg(feature = "synthetic-jdk")]

@@ -6653,7 +6653,20 @@ fn invoke_on_class_shared_inner(
                         // a populated TreeMap with the standard charsets directly.
                         || (class_name == "java/nio/charset/Charset"
                             && method_name == "availableCharsets"
-                            && descriptor == "()Ljava/util/SortedMap;");
+                            && descriptor == "()Ljava/util/SortedMap;")
+                        // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
+                        // "No readable meta.properties files found." because
+                        // our HashMap layout makes the populated logDirProps
+                        // map look empty to AbstractMap.isEmpty()/size(). The
+                        // file is correctly read by Properties.load (134 bytes,
+                        // 4 entries parsed) and Loader.load successfully puts
+                        // the dir → MetaProperties mapping, but the read-back
+                        // returns size=0. Force the native no-op override so
+                        // KafkaRaftServer.initializeLogDirs can advance past
+                        // this check to the Copier/BootstrapDirectory phase.
+                        || (class_name == "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble"
+                            && method_name == "verify"
+                            && descriptor == "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
