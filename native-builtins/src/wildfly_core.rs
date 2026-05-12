@@ -1014,6 +1014,84 @@ fn native_process_state_get_state(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+// ===========================================================================
+// ControlledProcessState state-transition shims.
+//
+// WildFly 39's `ControlledProcessState` stores its state in a JDK
+// `AtomicStampedReference`. CratonVM intrinsifies that class with a 1-field
+// layout (ref slot only), while the JDK bytecode for ASR routes writes
+// through a VarHandle that we don't fully model. The combination leaves
+// the `state` field of `ControlledProcessState` reading back as `null` on
+// the `setStarting()` boot path, producing:
+//
+//   java.lang.NullPointerException: Cannot invoke set on null
+//     at org.jboss.as.controller.ControlledProcessState.setStarting(...)
+//     at org.jboss.as.controller.AbstractControllerService.start(...)
+//
+// which surfaces as `JBTHR00005: Operation failed` and aborts the server
+// with `WFLYSRV0239`. Since the canonical state lives in our Rust-side
+// `global_model_controller()` (and is what user code observing
+// `getState()` already sees via the intrinsic above), we can safely
+// short-circuit the bytecode state-transition methods to a no-op /
+// state-update pair. The receiver may be `null` (interpreter dispatches
+// the native even on null this), which matches the JDK contract because
+// these methods only mutate per-instance bookkeeping that is otherwise
+// unobserved.
+fn native_process_state_set_starting(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    *global_model_controller()
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = ProcessState::Starting;
+    Ok(None)
+}
+
+fn native_process_state_set_running(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    global_model_controller().mark_running();
+    Ok(None)
+}
+
+fn native_process_state_set_stopping(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    global_model_controller().mark_stopping();
+    Ok(None)
+}
+
+fn native_process_state_set_stopped(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    *global_model_controller()
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = ProcessState::Stopped;
+    Ok(None)
+}
+
+fn native_process_state_noop_object(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // setRestartRequired() / setReloadRequired() return a stamp token used
+    // by their revert counterparts. We don't model RESTART_REQUIRED /
+    // RELOAD_REQUIRED transitions; return null which `revert*` then ignores.
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_process_state_noop_void(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
 fn native_exec_builder_build(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1262,6 +1340,43 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         "getState",
         "()Lorg/jboss/as/controller/ControlledProcessState$State;",
         native_process_state_get_state,
+    );
+    // State-transition shims — bypass the AtomicStampedReference-backed
+    // bytecode path (see comment on the implementations above).
+    let cps = "org/jboss/as/controller/ControlledProcessState";
+    r.register(cps, "setStarting", "()V", native_process_state_set_starting);
+    r.register(cps, "setRunning", "()V", native_process_state_set_running);
+    r.register(cps, "setStopping", "()V", native_process_state_set_stopping);
+    r.register(cps, "setStopped", "()V", native_process_state_set_stopped);
+    r.register(
+        cps,
+        "setRestartRequired",
+        "()Ljava/lang/Object;",
+        native_process_state_noop_object,
+    );
+    r.register(
+        cps,
+        "setReloadRequired",
+        "()Ljava/lang/Object;",
+        native_process_state_noop_object,
+    );
+    r.register(
+        cps,
+        "revertRestartRequired",
+        "(Ljava/lang/Object;)V",
+        native_process_state_noop_void,
+    );
+    r.register(
+        cps,
+        "revertReloadRequired",
+        "(Ljava/lang/Object;)V",
+        native_process_state_noop_void,
+    );
+    r.register(
+        cps,
+        "checkRestartRequired",
+        "()V",
+        native_process_state_noop_void,
     );
 
     // --- EnhancedQueueExecutor ---

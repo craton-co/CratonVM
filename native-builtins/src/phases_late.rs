@@ -4178,6 +4178,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- Keycloak PersistedConfigSource.loadPersistedConfig ---
+    // CratonVM divergence: on Windows this method opens
+    // lib/quarkus/generated-bytecode.jar via FileInputStream + ZipInputStream
+    // and iterates entries looking for META-INF/keycloak-persisted.properties.
+    // The jar shipped with Keycloak 26.6.1 does not contain that entry, and
+    // somewhere during the entry walk CratonVM's IO/zip pipeline hits an
+    // EOFException in ZipInputStream.readFully (readLOC -> getNextEntry).
+    // The exception escapes loadPersistedConfig (it returns InputStream, not
+    // wrapped) and is rethrown by readProperties() as RuntimeException
+    // "Failed to load persisted properties.", which Keycloak's
+    // AbstractAutoBuildCommand wraps into picocli ExecutionException
+    // "Failed to update server configuration." aborting start-dev.
+    // Returning null is the spec-compliant "no persisted config" answer
+    // (readProperties() then returns Collections.emptyMap()).
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/PersistedConfigSource",
+        "loadPersistedConfig",
+        "()Ljava/io/InputStream;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
     // --- smallrye-config KeyStoreConfigSourceFactory.getConfigSources ---
     // CratonVM divergence: In real Quarkus, the @ConfigMapping interface
     // io.smallrye.config.source.keystore.KeyStoreConfig is auto-registered with
