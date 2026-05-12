@@ -1183,6 +1183,162 @@ fn native_service_logger_greeting_noop(
     Ok(None)
 }
 
+/// R79 (WildFly): MSC's `IdentityHashSet$IdentityHashSetIterator.next()`
+/// throws `ConcurrentModificationException` when `this$0.modCount`
+/// drifts from the iterator's `expectedCount`. This happens during
+/// `ServiceControllerImpl$RemoveChildrenTask.execute`, which walks
+/// `controller.children` while concurrently calling `setMode(REMOVE)`
+/// on each child — setMode propagates back into the same children set
+/// and bumps modCount. The real MSC handles this via per-controller
+/// `synchronized` blocks across distinct executor threads, but our
+/// interpreter executes the worker tasks more eagerly and trips the
+/// check. We replace `hasNext` and `next` with CME-tolerant variants
+/// that re-read `this$0.table` / `this$0.modCount` on every call and
+/// keep `expectedCount` in sync so the bytecode never trips the
+/// `modCount != expectedCount` branch.
+///
+/// Field layout (matches jboss-msc 1.5.x bytecode):
+/// * `this$0`        : outer `IdentityHashSet`
+/// * `next`          : int, scan cursor
+/// * `expectedCount` : int, copy of `this$0.modCount` at iterator construction
+/// * `current`       : int, index of last returned element
+/// * `hasNext`       : boolean, cached `hasNext()` result
+/// * `table`         : `Object[]`, cached copy of `this$0.table`
+fn ihs_iter_refresh_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    // Always re-read table from the outer set — concurrent resize
+    // would otherwise leave us iterating a stale snapshot.
+    let outer = match ctx.get_field_by_name(this, "this$0") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let table = match ctx.get_field_by_name(outer, "table") {
+        Value::Object(Some(t)) => t,
+        _ => return None,
+    };
+    ctx.set_field_by_name(this, "table", Value::Object(Some(table)));
+    // Keep expectedCount aligned so any *other* code path that reads
+    // it (or the bytecode `next()` fallback) won't trip the CME check.
+    let modc = match ctx.get_field_by_name(outer, "modCount") {
+        Value::Int(i) => i,
+        _ => 0,
+    };
+    ctx.set_field_by_name(this, "expectedCount", Value::Int(modc));
+    Some(table)
+}
+
+fn native_ihs_iter_has_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // If we've already advanced and have a cached hit, return it.
+    if let Value::Int(1) = ctx.get_field_by_name(this, "hasNext") {
+        return Ok(Some(Value::Int(1)));
+    }
+    let table = match ihs_iter_refresh_table(ctx, this) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let len = ctx.array_length(table);
+    let mut idx = match ctx.get_field_by_name(this, "next") {
+        Value::Int(i) => i.max(0) as usize,
+        _ => 0,
+    };
+    while idx < len {
+        match ctx.get_array_element(table, idx) {
+            Value::Object(Some(_)) => {
+                ctx.set_field_by_name(this, "next", Value::Int(idx as i32));
+                ctx.set_field_by_name(this, "hasNext", Value::Int(1));
+                return Ok(Some(Value::Int(1)));
+            }
+            _ => idx += 1,
+        }
+    }
+    ctx.set_field_by_name(this, "next", Value::Int(len as i32));
+    ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_ihs_iter_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Re-sync table + expectedCount; advance to a non-null slot.
+    let cached_has = matches!(ctx.get_field_by_name(this, "hasNext"), Value::Int(1));
+    if !cached_has {
+        // Inline hasNext() — same logic as native_ihs_iter_has_next.
+        let table = match ihs_iter_refresh_table(ctx, this) {
+            Some(t) => t,
+            None => {
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NoSuchElementException {
+                        message: "IdentityHashSet iterator exhausted".to_string(),
+                    },
+                )));
+            }
+        };
+        let len = ctx.array_length(table);
+        let mut idx = match ctx.get_field_by_name(this, "next") {
+            Value::Int(i) => i.max(0) as usize,
+            _ => 0,
+        };
+        let mut found = false;
+        while idx < len {
+            if let Value::Object(Some(_)) = ctx.get_array_element(table, idx) {
+                ctx.set_field_by_name(this, "next", Value::Int(idx as i32));
+                ctx.set_field_by_name(this, "hasNext", Value::Int(1));
+                found = true;
+                break;
+            }
+            idx += 1;
+        }
+        if !found {
+            ctx.set_field_by_name(this, "next", Value::Int(len as i32));
+            ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NoSuchElementException {
+                    message: "IdentityHashSet iterator exhausted".to_string(),
+                },
+            )));
+        }
+    } else {
+        // hasNext was cached true: still re-sync expectedCount/table
+        // so a concurrent modCount bump doesn't bite a subsequent call.
+        let _ = ihs_iter_refresh_table(ctx, this);
+    }
+    let table = match ctx.get_field_by_name(this, "table") {
+        Value::Object(Some(t)) => t,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NoSuchElementException {
+                    message: "IdentityHashSet iterator: null table".to_string(),
+                },
+            )));
+        }
+    };
+    let next_idx = match ctx.get_field_by_name(this, "next") {
+        Value::Int(i) => i,
+        _ => 0,
+    };
+    let len = ctx.array_length(table) as i32;
+    if next_idx < 0 || next_idx >= len {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NoSuchElementException {
+                message: "IdentityHashSet iterator past end".to_string(),
+            },
+        )));
+    }
+    let value = ctx.get_array_element(table, next_idx as usize);
+    // current = next; next++; hasNext = false
+    ctx.set_field_by_name(this, "current", Value::Int(next_idx));
+    ctx.set_field_by_name(this, "next", Value::Int(next_idx + 1));
+    ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+    // Skip nulls between current and next call (best-effort) and keep
+    // expectedCount synced — the outer set may have shifted entries.
+    Ok(Some(value))
+}
+
 /// Bind an externally-allocated `ServiceController` Java object to a
 /// controller id (used by T19.2 subsystem glue to hand a pre-built
 /// controller back to the interpreter).
@@ -1339,6 +1495,16 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     r.register(dbl, "isTraceEnabled", "()Z", native_delegating_logger_returns_false);
     r.register(dbl, "isDebugEnabled", "()Z", native_delegating_logger_returns_false);
     r.register(dbl, "isInfoEnabled", "()Z", native_delegating_logger_returns_false);
+
+    // R79 (WildFly): replace MSC IdentityHashSet's iterator with a
+    // CME-tolerant native implementation. Eager worker scheduling in
+    // our interpreter causes setMode(REMOVE) inside RemoveChildrenTask
+    // to bump the outer set's modCount mid-iteration; the bytecode
+    // `next()` then throws CME. The native re-reads the table and
+    // re-syncs expectedCount on every call. See native_ihs_iter_next.
+    let ihs_iter = "org/jboss/msc/service/IdentityHashSet$IdentityHashSetIterator";
+    r.register(ihs_iter, "hasNext", "()Z", native_ihs_iter_has_next);
+    r.register(ihs_iter, "next", "()Ljava/lang/Object;", native_ihs_iter_next);
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
 }

@@ -4029,6 +4029,47 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
+    // Round 63 — Keycloak 26.6.1 calls FileSystem.close() during shutdown/cleanup
+    // paths. FileSystem.close() is abstract in the real JDK; without a native
+    // override the synthetic default-FS object throws AbstractMethodError. We
+    // make close() a no-op (the synthetic FS has no underlying resource).
+    r.register(fs_class, "close", "()V", |_ctx, _args| Ok(None));
+
+    // Supplementary FileSystem methods that are abstract in real JDK and may
+    // be invoked on the synthetic default-FS object.
+    r.register(
+        fs_class,
+        "supportedFileAttributeViews",
+        "()Ljava/util/Set;",
+        |ctx, _args| {
+            let s = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        fs_class,
+        "getFileStores",
+        "()Ljava/lang/Iterable;",
+        |ctx, _args| {
+            use rustjvm_types::ArrayElementType;
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(0));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+    r.register(
+        fs_class,
+        "newWatchService",
+        "()Ljava/nio/file/WatchService;",
+        |ctx, _args| {
+            let ws = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchService", 1);
+            Ok(Some(Value::Object(Some(ws))))
+        },
+    );
+
     r.register(
         fs_class,
         "getRootDirectories",
