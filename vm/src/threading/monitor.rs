@@ -24,6 +24,64 @@ use crate::threading::jvm_thread::ThreadId;
 use crate::types::ObjectRef;
 
 // ---------------------------------------------------------------------------
+// KC16-watchdog: global stack-dump-request flag for parked Object.wait()ers
+// ---------------------------------------------------------------------------
+//
+// The interpreter top-of-loop polls `SharedVm::stack_dump_pending()` so any
+// thread executing bytecode acks the watchdog within a single dispatch.
+// Threads parked in `Object.wait()` are blocked OFF the interpreter loop
+// (inside `parking_lot::Condvar::wait_for`) and therefore never reach the
+// top-of-loop check. This static flag lets the watchdog wake them.
+//
+// `SharedVm::request_stack_dump()` sets this flag in addition to its own
+// per-VM flag. The wait loop in `Monitor::wait` polls it every 5ms (the
+// same cadence as the interrupt flag) and exits the wait when set; the
+// monitor_wait caller then sees the `SharedVm` flag and dumps frames
+// through the normal path.
+static STACK_DUMP_WAIT_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn stack_dump_wait_flag() -> &'static std::sync::atomic::AtomicBool {
+    &STACK_DUMP_WAIT_FLAG
+}
+
+/// KC16-watchdog: signal all threads parked in `Object.wait()` to exit the
+/// condvar wait and re-check their state (where the interpreter loop will
+/// observe `SharedVm::stack_dump_pending()` and emit a frame snapshot).
+///
+/// Called by `SharedVm::request_stack_dump()`.
+pub fn signal_stack_dump_to_waiters() {
+    STACK_DUMP_WAIT_FLAG.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// KC16-watchdog: callback installed by the VM that emits the current
+/// thread's frame chain from a wait-site context. Set by `SharedVm`
+/// during construction so `Monitor::wait` can reach the per-thread
+/// frame table held in the `JvmThread` registry.
+type WaitSiteDumpFn = Arc<dyn Fn(ThreadId) + Send + Sync>;
+static WAIT_SITE_DUMP: std::sync::OnceLock<WaitSiteDumpFn> = std::sync::OnceLock::new();
+
+pub fn install_wait_site_dump<F>(f: F)
+where
+    F: Fn(ThreadId) + Send + Sync + 'static,
+{
+    let _ = WAIT_SITE_DUMP.set(Arc::new(f));
+}
+
+fn emit_wait_site_frames(thread_id: ThreadId) {
+    if let Some(f) = WAIT_SITE_DUMP.get() {
+        f(thread_id);
+    } else {
+        tracing::warn!(
+            target: "kc16_watchdog",
+            thread_id = ?thread_id,
+            "Object.wait() observed stack_dump request but no dump callback installed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Monitor — per-object lock
 // ---------------------------------------------------------------------------
 
@@ -150,8 +208,25 @@ impl Monitor {
         // Block on wait_condvar with periodic interrupt checks.
         // We use short timed waits so that Thread.interrupt() (which only sets
         // a flag) can wake us within a bounded interval.
+        //
+        // KC16-watchdog: also poll the global stack-dump flag so a thread
+        // parked in Object.wait() (e.g. AsyncFutureTask.await ->
+        // EnhancedQueueExecutor handoff) observes the watchdog's request
+        // and dumps its frame chain from the wait site. Without this
+        // poll, a thread that entered wait() before the watchdog fired
+        // sits forever in `wait_condvar.wait()` and ack_count stays at
+        // 0, leaving the watchdog's only signal as the misleading
+        // "main thread is in native (Rust) code" banner.
+        //
+        // Important: observing the dump flag does NOT consume it and
+        // does NOT cause `wait()` to return spuriously. After emitting
+        // one frame snapshot per wait call we set a local "already
+        // dumped" guard and re-park; this preserves Java semantics
+        // (a notify is still required to return) while letting the
+        // watchdog see at least one snapshot before it aborts.
         let poll_interval = std::time::Duration::from_millis(5);
         let mut was_interrupted = false;
+        let mut frames_dumped = false;
         match timeout_ms {
             Some(ms) if ms > 0 => {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -168,6 +243,12 @@ impl Monitor {
                             break;
                         }
                     }
+                    if !frames_dumped
+                        && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        emit_wait_site_frames(thread_id);
+                        frames_dumped = true;
+                    }
                 }
             }
             _ => {
@@ -179,6 +260,13 @@ impl Monitor {
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
                             break;
+                        }
+                        if !frames_dumped
+                            && stack_dump_wait_flag()
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            emit_wait_site_frames(thread_id);
+                            frames_dumped = true;
                         }
                         // If the condvar was signalled (not timed out), break
                         // to allow the caller to re-check its condition.

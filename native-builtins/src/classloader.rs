@@ -1332,13 +1332,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         "ClassLoader.getResource resolved"
     );
 
-    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-    let full_str = ctx.create_string(&url_str);
-    // Populate field 0 (read by net_phase_e's openStream fallback) and
-    // field 5 (synthetic "full URL string" slot). Mirrors the bulk
-    // getResources path which also writes both slots.
-    ctx.set_field(url, 0, Value::Object(Some(full_str)));
-    ctx.set_field(url, 5, Value::Object(Some(full_str)));
+    let url = crate::jboss_module_loader::build_synthetic_url(ctx, &url_str);
     Ok(Some(Value::Object(Some(url))))
 }
 
@@ -1385,8 +1379,8 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     // S111r23-DBG: log spring.factories URL enumeration to diagnose factory loading
-    if resource_name == "META-INF/spring.factories" {
-        eprintln!("[GRES-DBG] getResources(META-INF/spring.factories) -> {} URLs", urls.len());
+    if resource_name == "META-INF/spring.factories" || resource_name.contains("META-INF/spring/") {
+        eprintln!("[GRES-DBG] getResources({}) -> {} URLs", resource_name, urls.len());
         for u in &urls {
             eprintln!("[GRES-DBG]   url: {}", u);
         }
@@ -1406,12 +1400,7 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // relying on java.util.Vector's internal layout.
     let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
-        let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-        let full_str = ctx.create_string(u);
-        // Populate field 0 (read by net_phase_e's openStream fallback) and
-        // field 5 (our synthetic "full URL string" slot).
-        ctx.set_field(url_obj, 0, Value::Object(Some(full_str)));
-        ctx.set_field(url_obj, 5, Value::Object(Some(full_str)));
+        let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
@@ -1635,9 +1624,8 @@ fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let resource_name = name.trim_start_matches('/');
     match ctx.find_resource(resource_name) {
         Some(_) => {
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-            let full_str = ctx.create_string(&format!("classpath:{name}"));
-            ctx.set_field(url, 5, Value::Object(Some(full_str)));
+            let spec = format!("classpath:{name}");
+            let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec);
             Ok(Some(Value::Object(Some(url))))
         }
         None => Ok(Some(Value::Object(None))),
@@ -2402,6 +2390,14 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     r.register(cl, "getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;", cl_get_resource_as_stream);
     r.register(cl, "getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;", cl_get_defined_package);
     r.register(cl, "getDefinedPackages", "()[Ljava/lang/Package;", cl_get_defined_packages);
+    // `ClassLoader.getPackages()` — real JDK bytecode is
+    // `return packages().toArray(Package[]::new)` with a stream pipeline that
+    // (in our boot) leaks a `ReferencePipeline$Head` into the caller's local
+    // typed as `Package[]`, causing NPE on arraylength in
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
+    // Override with an empty array — matches the empty `getDefinedPackages`
+    // override and is sufficient for jboss-modules' sanity scan.
+    r.register(cl, "getPackages", "()[Ljava/lang/Package;", cl_get_defined_packages);
     r.register(cl, "setDefaultAssertionStatus", "(Z)V", cl_set_default_assertion_status);
     r.register(cl, "registerAsParallelCapable", "()Z", cl_register_as_parallel_capable);
     r.register(cl, "isRegisteredAsParallelCapable", "()Z", cl_is_registered_as_parallel_capable);

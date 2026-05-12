@@ -345,9 +345,17 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
             Ok(Some(Value::Object(Some(name_obj))))
         }
         None => {
-            // Primitive mirror or unknown — read name from field 1
+            // Primitive mirror or unknown — read name from field 1.
+            // For array-class mirrors (e.g. `[Ljava/lang/String;`) the internal
+            // name uses '/' separators; `Class.getName()` must report the
+            // dotted form (`[Ljava.lang.String;`) so Spring's
+            // `AnnotationAttributes.assertAttributeType` string-compares
+            // against the expected component class name (which is dotted).
+            // Plain primitive names like "int"/"void" contain no '/', so the
+            // replace is a no-op for them.
             if let Some(prim_name) = mirror_class_name(ctx, this) {
-                let name_obj = ctx.create_string(&prim_name);
+                let dotted_name = prim_name.replace('/', ".");
+                let name_obj = ctx.create_string(&dotted_name);
                 Ok(Some(Value::Object(Some(name_obj))))
             } else {
                 Ok(Some(Value::Object(None)))
@@ -658,6 +666,65 @@ pub(crate) fn native_class_get_resource(
     }
 }
 
+/// RKC16r23 — detect jboss-logging's i18n localized-logger fallback names.
+///
+/// jboss-logging generates classes named `<base>_$logger` and walks the
+/// `Class.forName` chain `_$logger_<lang>_<country>` → `_$logger_<lang>` →
+/// `_$logger` (then a parallel `_$bundle` chain). Only the base names ship
+/// in app jars; the locale-suffixed variants always CNFE.
+///
+/// Returns true if `name` ends with `_$logger_<token>` or
+/// `_$logger_<token>_<token>` (or the `_$bundle_` equivalents) where
+/// every locale token is two-or-three ASCII lowercase letters
+/// (`<lang>`) or two ASCII uppercase letters (`<country>`).
+fn i18n_logger_locale_suffix(name: &str) -> bool {
+    let marker_logger = "_$logger_";
+    let marker_bundle = "_$bundle_";
+    let suffix = if let Some(idx) = name.rfind(marker_logger) {
+        &name[idx + marker_logger.len()..]
+    } else if let Some(idx) = name.rfind(marker_bundle) {
+        &name[idx + marker_bundle.len()..]
+    } else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return false;
+    }
+    let mut parts = suffix.split('_');
+    let lang = parts.next().unwrap_or("");
+    let is_lang = (2..=3).contains(&lang.len())
+        && lang.chars().all(|c| c.is_ascii_lowercase());
+    if !is_lang {
+        return false;
+    }
+    match parts.next() {
+        None => true, // `_$logger_<lang>`
+        Some(country) => {
+            // `_$logger_<lang>_<country>` (no further parts; variant possible
+            // but rare — accept country=2 upper or 2-3 alphanum).
+            let ok = country.len() == 2
+                && country.chars().all(|c| c.is_ascii_uppercase());
+            ok && parts.next().is_none()
+        }
+    }
+}
+
+/// RKC16r23 — gate the verbose `Class.forName` diagnostic prints behind an
+/// env var so they don't pollute boot logs in normal runs. Set
+/// `RUSTJVM_S111_DBG=1` to re-enable.
+fn s111_dbg_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RUSTJVM_S111_DBG").is_ok())
+}
+
+macro_rules! s111_dbg {
+    ($($arg:tt)*) => {
+        if crate::lang_class::s111_dbg_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -670,6 +737,38 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     };
     let dotted_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal_name = dotted_name.replace('.', "/");
+
+    // RKC16r23 — jboss-logging i18n localized-logger lookup short-circuit.
+    //
+    // jboss-logging's `Messages.getBundle` / `LoggerProviders.doGetMessageLogger`
+    // walks a fallback chain of `<FQCN>_$logger_<lang>_<country>`,
+    // `<FQCN>_$logger_<lang>`, `<FQCN>_$logger` for every i18n logger lookup.
+    // The first two almost never exist (no app ships per-locale generated
+    // classes); they're spec'd to throw CNFE so the chain tries the next.
+    //
+    // Inside CratonVM, each `loadClass` round-trip for a missing class is
+    // expensive: ModuleClassLoader's `loadClass` walks the dependency graph,
+    // tries every resource-root JAR, fails, throws CNFE. For Keycloak this
+    // happens on every WARN/ERROR log call — turning what should be a no-op
+    // cached negative into a tight loop of class-loader walks that visibly
+    // dominates boot time.
+    //
+    // Real OpenJDK has the same CNFE cost in principle but jboss-logging's
+    // own `Messages` infrastructure caches the resolved bundle Class per
+    // `Class<?>` key, so the chain only walks once per bundle interface. In
+    // our run the cache lookup isn't hitting (likely the `Messages` static
+    // field is being re-clinit'd or the WeakReference clears) — and rather
+    // than reverse-engineer jboss-logging's internals, we short-circuit the
+    // negative answer at the VM boundary: any name matching the
+    // `<...>_$logger_<lang>(_<country>)?` suffix where the suffix's
+    // language and (optional) country tokens look like locale codes
+    // returns CNFE immediately without calling out to loader.loadClass.
+    if i18n_logger_locale_suffix(&dotted_name) {
+        return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+            class_name: dotted_name,
+        }
+        .into());
+    }
 
     // RKC16N.12 — when `Class.forName` is invoked with an explicit non-null
     // classloader, route through `loader.loadClass(name)` so module-scoped
@@ -691,7 +790,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             let cid = ctx.class_id_of_object(*loader);
             ctx.class_name_of_id(cid).unwrap_or_default()
         };
-        eprintln!("[S111-DBG] Class.forName({}) loader={}", dotted_name, loader_class_name_debug);
+        s111_dbg!("[S111-DBG] Class.forName({}) loader={}", dotted_name, loader_class_name_debug);
         let invoke_args = [Value::Object(Some(*loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
             *loader,
@@ -700,13 +799,13 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             &invoke_args[1..],
         ) {
             Ok(Some(mirror)) => {
-                eprintln!("[S111-DBG] loadClass({}) succeeded via invoke_virtual", dotted_name);
+                s111_dbg!("[S111-DBG] loadClass({}) succeeded via invoke_virtual", dotted_name);
                 return Ok(Some(mirror));
             }
             // ClassLoader.loadClass returning null is technically illegal
             // (per spec it must throw CNFE) but defensively translate it.
             Ok(None) => {
-                eprintln!("[S111-DBG] loadClass({}) returned null", dotted_name);
+                s111_dbg!("[S111-DBG] loadClass({}) returned null", dotted_name);
                 return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
@@ -725,7 +824,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     rustjvm_types::error::LinkageError::NoSuchMethodError { .. },
                 ),
             )) => {
-                eprintln!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
+                s111_dbg!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
                 // Fall through to bootstrap-style ensure_class_initialized below.
             }
             // S111r20 — Spring Boot 2.x LaunchedURLClassLoader.loadClass
@@ -751,7 +850,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     || loader_class_name.contains("launch/LaunchedURLClassLoader")
                     || loader_class_name == "java/net/URLClassLoader";
                 if is_launched_url_cl {
-                    eprintln!("[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback", dotted_name);
+                    s111_dbg!("[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback", dotted_name);
                     // Fall through to ensure_class_initialized below.
                 } else {
                     // For module-scoped loaders (JBoss Modules, OSGi, etc.)
@@ -763,11 +862,11 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             }
             // Propagate internal VM errors without re-wrapping.
             Err(e) => {
-                eprintln!("[S111-DBG] loadClass({}) -> InternalError {:?}, propagating", dotted_name, e);
+                s111_dbg!("[S111-DBG] loadClass({}) -> InternalError {:?}, propagating", dotted_name, e);
                 return Err(e);
             }
         }
-        eprintln!("[S111-DBG] falling through to ensure_class_initialized({})", dotted_name);
+        s111_dbg!("[S111-DBG] falling through to ensure_class_initialized({})", dotted_name);
     }
 
     match ctx.ensure_class_initialized(&internal_name) {
@@ -785,10 +884,23 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
         }
-        Err(_) => Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: dotted_name,
-        }
-        .into()),
+        Err(e) => {
+            if let rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
+                let exc_cid = ctx.class_id_of_object(*exc_ref);
+                let exc_class = ctx.class_name_of_id(exc_cid).unwrap_or_default();
+                let msg = match ctx.get_field(*exc_ref, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                s111_dbg!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
+            } else {
+                s111_dbg!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
+            }
+            Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: dotted_name,
+            }
+            .into())
+        },
     }
 }
 
@@ -3959,9 +4071,31 @@ pub(crate) fn create_constructor_object(
     }
     let desc_str = ctx.create_string(&meta.descriptor);
 
+    // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
+    // attribute. The JDK `Constructor.getExceptionTypes()` Java method
+    // does `return exceptionTypes.clone();`, which NPEs if null. CGLib's
+    // Enhancer.emitConstructors calls this on every superclass constructor
+    // during proxy class generation — see ReflectUtils.getExceptionTypes
+    // (ReflectUtils.java:133/605).
+    let exception_names = ctx.method_exceptions(
+        meta.declaring_class_id,
+        &meta.name,
+        &meta.descriptor,
+    );
+    let exception_arr = ctx.new_ref_array(
+        rustjvm_types::ClassId::new(0),
+        exception_names.len(),
+    );
+    for (i, name) in exception_names.iter().enumerate() {
+        let desc = format!("L{name};");
+        let mirror = descriptor_to_class_mirror(ctx, &desc);
+        ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
+    }
+
     // --- Real JDK Constructor layout ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
     ctx.set_field_by_name(obj, "parameterTypes", Value::Object(Some(param_arr)));
+    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(exception_arr)));
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
 
@@ -5010,8 +5144,31 @@ pub(crate) fn annotation_element_to_java_typed(
     use rustjvm_native_api::AnnotationElementValue;
     match val {
         AnnotationElementValue::Int(v) => {
-            let obj = crate::alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
-            ctx.set_field(obj, 0, Value::Int(*v));
+            // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
+            // boolean/byte/char/short/int (the `.class` AnnotationDefault
+            // attribute encodes Z/B/C/S/I tags as int constants in the CP).
+            // When the caller knows the annotation method's return-type
+            // descriptor we must box into the matching wrapper, else
+            // Spring's `TypeMappedAnnotation.adapt` rejects e.g.
+            // `proxyBeanMethods` (declared `boolean`) when given an Integer
+            // (`should be compatible with java.lang.Boolean but a
+            // java.lang.Integer value was returned`), causing
+            // `ConfigurationClassParser.processImports` to silently drop the
+            // `@Import(AutoConfigurationImportSelector.class)` directive on
+            // `@SpringBootApplication` and ultimately surfacing as
+            // `MissingWebServerFactoryBeanException`.
+            let (wrapper, value) = match return_type_desc {
+                Some("Z") => (
+                    "java/lang/Boolean",
+                    Value::Int(if *v != 0 { 1 } else { 0 }),
+                ),
+                Some("B") => ("java/lang/Byte", Value::Int(*v as i8 as i32)),
+                Some("C") => ("java/lang/Character", Value::Int(*v & 0xFFFF)),
+                Some("S") => ("java/lang/Short", Value::Int(*v as i16 as i32)),
+                _ => ("java/lang/Integer", Value::Int(*v)),
+            };
+            let obj = crate::alloc_concurrent_synthetic(ctx, wrapper, 1);
+            ctx.set_field(obj, 0, value);
             Value::Object(Some(obj))
         }
         AnnotationElementValue::Long(v) => {
@@ -5214,8 +5371,15 @@ pub(crate) fn annotation_element_to_java_typed(
                 })
                 .unwrap_or(rustjvm_types::ClassId::new(0));
             let arr = ctx.new_ref_array(comp_cid, elems.len());
+            // Round 18: derive the per-element return-type descriptor from
+            // the array descriptor (strip leading `[`) so primitive elements
+            // box into the correct wrapper (Z/B/C/S → Boolean/Byte/Char/Short
+            // instead of always Integer).
+            let elem_desc: Option<String> = return_type_desc
+                .and_then(|rd| rd.strip_prefix('['))
+                .map(|s| s.to_string());
             for (i, elem) in elems.iter().enumerate() {
-                let v = annotation_element_to_java(ctx, elem);
+                let v = annotation_element_to_java_typed(ctx, elem, elem_desc.as_deref());
                 ctx.set_array_element(arr, i, v);
             }
             Value::Object(Some(arr))
@@ -5254,6 +5418,13 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
         }
     };
     let annotations = ctx.class_annotations(class_id);
+    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") || cn.contains("SpringBootConfiguration") {
+            eprintln!("[GDA] {} -> {} annotations", cn, annotations.len());
+            for a in &annotations { eprintln!("    {}", a.type_descriptor); }
+        }
+    }
     let arr = build_annotation_array(ctx, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -5701,6 +5872,18 @@ pub(crate) fn native_method_get_annotations(ctx: &mut dyn NativeContext, args: &
         }
     };
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
+    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") {
+            eprintln!("[MGA] {}.{}{} -> {} method-anns", cn, method_name, method_desc, annotations.len());
+            for a in &annotations {
+                eprintln!("    {} elements={}", a.type_descriptor, a.elements.len());
+                for (en, ev) in &a.elements {
+                    eprintln!("      {} -> {:?}", en, ev);
+                }
+            }
+        }
+    }
     let arr = build_annotation_array(ctx, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -5760,6 +5943,18 @@ pub(crate) fn native_method_get_annotation(ctx: &mut dyn NativeContext, args: &[
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
+    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        if cn.contains("SpringBootApplication") {
+            eprintln!("[GMA] {}.{}{} target={} -> {} method-anns", cn, method_name, method_desc, target_desc, annotations.len());
+            for a in &annotations {
+                eprintln!("    {} elements={}", a.type_descriptor, a.elements.len());
+                for (en, ev) in &a.elements {
+                    eprintln!("      {} -> {:?}", en, ev);
+                }
+            }
+        }
+    }
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
             let proxy = create_annotation_proxy(ctx, ann);
@@ -6274,7 +6469,12 @@ pub(crate) fn native_class_get_component_type(
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            if std::env::var("RUSTJVM_DBG_COMPONENT_TYPE").is_ok() {
+                eprintln!("[CT-DBG] getComponentType receiver=null");
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     // Array classes have names like "[I", "[Ljava/lang/String;"
@@ -6303,10 +6503,56 @@ pub(crate) fn native_class_get_component_type(
                 if let Ok(cid) = ctx.ensure_class_initialized(comp_name) {
                     return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
                 }
+                // SB3.2 — when the component class can't be loaded
+                // (e.g. nested array `[[L...;`, or absent class), still
+                // return a non-null Class mirror so callers that assume
+                // `array.componentType() != null` (Spring's
+                // `ConstructorResolver.resolveAutowiredArgument` does
+                // `Array.newInstance(type.componentType(), 0)`) do not NPE.
+                return Ok(Some(Value::Object(Some(synthetic_class_mirror(ctx, comp_name)))));
             }
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// `Class.arrayType()` — return a `Class` mirror that represents the
+/// array type whose component is `this`.
+///
+/// JDK's bytecode implementation is `Array.newInstance(this, 0).getClass()`,
+/// which on CratonVM has been observed to surface null entries in
+/// Spring's `GenericConversionService$Converters.getClassHierarchy`
+/// (which calls `Class.arrayType()` on the superclass / interfaces of an
+/// array-typed argument and then dereferences the result with
+/// `componentType()` on the next iteration). Bypass that fragile two-step
+/// chain by synthesising the array-type mirror directly from the
+/// component class's name, mirroring what `Object.getClass()` does for an
+/// actual array object (see `native_object_get_class`).
+pub(crate) fn native_class_array_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = mirror_class_name(ctx, this).unwrap_or_default();
+    // Primitive component → "[I", "[J", … ; object/array component → "[L<name>;" or "[<arrayname>".
+    let array_name = match name.as_str() {
+        "int"     => "[I".to_string(),
+        "long"    => "[J".to_string(),
+        "float"   => "[F".to_string(),
+        "double"  => "[D".to_string(),
+        "boolean" => "[Z".to_string(),
+        "byte"    => "[B".to_string(),
+        "char"    => "[C".to_string(),
+        "short"   => "[S".to_string(),
+        "void"    => return Ok(Some(Value::Object(None))),
+        other if other.starts_with('[') => format!("[{other}"),
+        other => format!("[L{};", other),
+    };
+    let mirror = ctx.primitive_class_mirror(&array_name);
+    Ok(Some(Value::Object(Some(mirror))))
 }
 
 pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6712,6 +6958,29 @@ pub fn i2_register_classloader_package_natives(
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
     );
+    // `ClassLoader.getPackages()` — real JDK bytecode is
+    // `return packages().toArray(Package[]::new)`. In our boot the stream
+    // pipeline leaks a `ReferencePipeline$Head` into the caller's local
+    // typed as `Package[]`, NPE-ing on arraylength inside
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
+    // Override with empty array (same shape as `getDefinedPackages`).
+    r.register(
+        cl,
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        i2_classloader_get_defined_packages,
+    );
+    // `Package.getPackages()` is static and delegates to
+    // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`.
+    // Override here as well so direct callers (the WildFly boot path) get an
+    // empty array even if the static delegation pulls a different ClassLoader
+    // mirror.
+    r.register(
+        "java/lang/Package",
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        i2_classloader_get_defined_packages,
+    );
     r.register(
         cl,
         "getNamedPackage",
@@ -6802,7 +7071,6 @@ pub(crate) fn native_class_get_enum_constants(
     // paths in the real JDK ultimately need the enum's `$VALUES` array,
     // and our earlier stub that returned an empty array broke every
     // `EnumMap.<init>(Class)` call (e.g. StreamOpFlag.<clinit>).
-    use rustjvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6828,18 +7096,33 @@ pub(crate) fn native_class_get_enum_constants(
     // Read $VALUES static field.
     let idx = match ctx.static_field_index_by_name(class_id, "$VALUES") {
         Some(i) => i,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            tracing::warn!("native_class_get_enum_constants: no $VALUES field for class={}", class_name);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let values_val = ctx.get_static_field(class_id, idx);
     let src_arr = match values_val {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            tracing::warn!("native_class_get_enum_constants: $VALUES is null/non-object for class={}", class_name);
+            return Ok(Some(Value::Object(None)));
+        }
     };
-    // Clone into a new Object[] so callers can mutate without affecting
-    // the enum's backing array (matches `getEnumConstantsShared().clone()`
-    // semantics used by `getEnumConstants`).
+    // Clone into a new array whose component type is the enum class
+    // itself (matches `getEnumConstantsShared().clone()` semantics —
+    // `$VALUES` is typed `[LEnumClass;`). Callers of `getEnumConstants`
+    // then `checkcast [Ljava/lang/Enum;`, which requires the component
+    // class to be a subclass of `java/lang/Enum`. Using a plain
+    // `Object[]` makes that checkcast fail silently (returning the array
+    // as-is from non-strict casts elsewhere, then yielding 0-length
+    // streams downstream — observed as
+    // `Utils.enumOptions(SecurityProtocol.class)` returning empty,
+    // which caused Kafka's `ReplicationConfigs.<clinit>` to throw
+    // `ConfigException: Invalid value PLAINTEXT for configuration
+    // security.inter.broker.protocol: String must be one of: `).
     let len = ctx.array_length(src_arr);
-    let out = ctx.new_array(ArrayElementType::Reference, len);
+    let out = ctx.new_ref_array(class_id, len);
     for i in 0..len {
         let v = ctx.get_array_element(src_arr, i);
         ctx.set_array_element(out, i, v);

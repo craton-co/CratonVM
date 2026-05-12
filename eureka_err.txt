@@ -1,0 +1,609 @@
+BI-REG: register_essential_natives ENTRY
+[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: com.digsol.eurekaserver.EurekaServerApplication
+[2m2026-05-11T03:07:37.928982Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::diagnostics[0m[2m:[0m B6: silent-swallow — error suppressed to keep VM running [3msite[0m[2m=[0m<clinit> [3mcategory[0m[2m=[0mnon-critical-exception [3mdetail[0m[2m=[0mclass=sun/util/calendar/ZoneInfoFile exc=java/lang/Error
+[2m2026-05-11T03:07:37.929085Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 21] class=sun/util/calendar/ZoneInfoFile sun/util/calendar/ZoneInfo.getTimeZone pc=4
+[2m2026-05-11T03:07:37.930755Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 20] class=sun/util/calendar/ZoneInfoFile java/util/TimeZone.getTimeZone pc=33
+[2m2026-05-11T03:07:37.930782Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 19] class=sun/util/calendar/ZoneInfoFile java/util/TimeZone.setDefaultZone pc=41
+[2m2026-05-11T03:07:37.930796Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 18] class=sun/util/calendar/ZoneInfoFile java/util/TimeZone.getDefaultRef pc=11
+[2m2026-05-11T03:07:37.930809Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 17] class=sun/util/calendar/ZoneInfoFile java/util/TimeZone.getDefault pc=3
+[2m2026-05-11T03:07:37.930821Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 16] class=sun/util/calendar/ZoneInfoFile java/util/Calendar.defaultTimeZone pc=3
+[2m2026-05-11T03:07:37.930833Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 15] class=sun/util/calendar/ZoneInfoFile java/util/Calendar.getInstance pc=4
+[2m2026-05-11T03:07:37.930845Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 14] class=sun/util/calendar/ZoneInfoFile java/text/SimpleDateFormat.initializeCalendar pc=30
+[2m2026-05-11T03:07:37.930857Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 13] class=sun/util/calendar/ZoneInfoFile java/text/SimpleDateFormat.<init> pc=46
+[2m2026-05-11T03:07:37.930868Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 12] class=sun/util/calendar/ZoneInfoFile java/text/SimpleDateFormat.<init> pc=11
+[2m2026-05-11T03:07:37.930881Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 11] class=sun/util/calendar/ZoneInfoFile ch/qos/logback/core/util/CachingDateFormatter.<init> pc=25
+[2m2026-05-11T03:07:37.930893Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 10] class=sun/util/calendar/ZoneInfoFile ch/qos/logback/classic/layout/TTLLLayout.<init> pc=14
+[2m2026-05-11T03:07:37.930905Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 9] class=sun/util/calendar/ZoneInfoFile ch/qos/logback/classic/BasicConfigurator.configure pc=45
+[2m2026-05-11T03:07:37.930918Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 8] class=sun/util/calendar/ZoneInfoFile org/slf4j/impl/StaticLoggerBinder.init pc=14
+[2m2026-05-11T03:07:37.930929Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 7] class=sun/util/calendar/ZoneInfoFile org/slf4j/LoggerFactory.bind pc=19
+[2m2026-05-11T03:07:37.930941Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 6] class=sun/util/calendar/ZoneInfoFile org/slf4j/LoggerFactory.performInitialization pc=3
+[2m2026-05-11T03:07:37.930952Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 5] class=sun/util/calendar/ZoneInfoFile org/slf4j/LoggerFactory.getILoggerFactory pc=24
+[2m2026-05-11T03:07:37.930964Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 4] class=sun/util/calendar/ZoneInfoFile org/slf4j/LoggerFactory.getLogger pc=3
+[2m2026-05-11T03:07:37.930976Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 3] class=sun/util/calendar/ZoneInfoFile org/apache/commons/logging/LogAdapter$Slf4jAdapter.createLocationAwareLog pc=4
+[2m2026-05-11T03:07:37.931034Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 2] class=sun/util/calendar/ZoneInfoFile org/springframework/boot/SpringApplication.<clinit> pc=5
+[2m2026-05-11T03:07:37.931053Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 1] class=sun/util/calendar/ZoneInfoFile com/digsol/eurekaserver/EurekaServerApplication.main pc=6
+[2m2026-05-11T03:07:37.931066Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m   [SWALLOW-LIVE 0] class=sun/util/calendar/ZoneInfoFile org/springframework/boot/loader/MainMethodRunner.run pc=52
+[GOD-DBG] getOrDefault native IS running
+Failed to instantiate [ch.qos.logback.classic.LoggerContext]
+Reported exception:
+java.lang.RuntimeException: Invalid binary time-zone data: TZDB:UTC, version: null
+Caused by: java.lang.NullPointerException: arraylength null (in java/util/Arrays.binarySearch([Ljava/lang/Object;Ljava/lang/Object;)I pc=4)
+	at org.springframework.boot.loader.MainMethodRunner.run(MainMethodRunner.java:49)
+	at com.digsol.eurekaserver.EurekaServerApplication.main(EurekaServerApplication.java:12)
+	at org.springframework.boot.SpringApplication.<clinit>(SpringApplication.java:178)
+	at org.apache.commons.logging.LogAdapter$Slf4jAdapter.createLocationAwareLog(LogAdapter.java:130)
+	at org.slf4j.LoggerFactory.getLogger(LoggerFactory.java:362)
+	at org.slf4j.LoggerFactory.getILoggerFactory(LoggerFactory.java:417)
+	at org.slf4j.LoggerFactory.performInitialization(LoggerFactory.java:124)
+	at org.slf4j.LoggerFactory.bind(LoggerFactory.java:150)
+	at org.slf4j.impl.StaticLoggerBinder.init(StaticLoggerBinder.java:84)
+	at ch.qos.logback.classic.BasicConfigurator.configure(BasicConfigurator.java:48)
+	at ch.qos.logback.classic.layout.TTLLLayout.<init>(TTLLLayout.java:25)
+	at ch.qos.logback.core.util.CachingDateFormatter.<init>(CachingDateFormatter.java:33)
+	at java.text.SimpleDateFormat.<init>(SimpleDateFormat.java:606)
+	at java.text.SimpleDateFormat.<init>(SimpleDateFormat.java:627)
+	at java.text.SimpleDateFormat.initializeCalendar(SimpleDateFormat.java:683)
+	at java.util.Calendar.getInstance(Calendar.java:1659)
+	at java.util.Calendar.defaultTimeZone(Calendar.java:1679)
+	at java.util.TimeZone.getDefault(TimeZone.java:709)
+	at java.util.TimeZone.getDefaultRef(TimeZone.java:720)
+	at java.util.TimeZone.setDefaultZone(TimeZone.java:744)
+	at java.util.TimeZone.getTimeZone(TimeZone.java:605)
+	at sun.util.calendar.ZoneInfoFile.getZoneInfo(ZoneInfoFile.java:129)
+	at sun.util.calendar.ZoneInfoFile.getZoneInfo0(ZoneInfoFile.java:144)
+	at java.util.Arrays.binarySearch(Arrays.java:2171)
+[GRES-DBG] getResources(META-INF/spring.factories) -> 10 URLs
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=144
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480011df8 } stream_bytes=144 parsed_entries=1
+[CIA-DBG] computeIfAbsent native IS running
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=91
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480012078 } stream_bytes=91 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.beans.BeanInfoFactory
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=136
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x164800122f8 } stream_bytes=136 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=871
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480012578 } stream_bytes=871 parsed_entries=3
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.BootstrapRegistryInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=510
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x164800128e8 } stream_bytes=510 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=6069
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480012b18 } stream_bytes=6069 parsed_entries=14
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] MISS key=org.springframework.boot.ApplicationContextFactory cap=16 idx=8
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] found key=org.springframework.boot.ApplicationContextFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.logging.LoggingSystemFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.logging.LoggingSystemFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.logging.LoggingSystemFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.PropertySourceLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.PropertySourceLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] MISS key=org.springframework.context.ApplicationContextInitializer cap=16 idx=14
+[MAP-GET-DBG]   bucket[14] key=org.springframework.boot.context.config.ConfigDataLoader
+[MAP-GET-DBG]   bucket[14] key=org.springframework.boot.env.PropertySourceLoader
+[MAP-GET-DBG]   bucket[14] key=org.springframework.boot.env.EnvironmentPostProcessor
+[MAP-GET-DBG]   node slots: s0=Object(Some(ObjectRef { ptr: 0x1648009b340 })) s1=Object(Some(ObjectRef { ptr: 0x16480012fc8 })) s2=Int(23683902) s3=Object(Some(ObjectRef { ptr: 0x164800a0a78 }))
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalysisReporter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLocationResolver
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLocationResolver
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.SpringApplicationRunListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.SpringBootExceptionReporter
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3375
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480013568 } stream_bytes=3375 parsed_entries=9
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportFilter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportFilter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportFilter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=1677
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480013b08 } stream_bytes=1677 parsed_entries=5
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.BootstrapRegistryInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.BootstrapRegistryInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=2032
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480013e78 } stream_bytes=2032 parsed_entries=3
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=111
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480014148 } stream_bytes=111 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.loader.jarmode.JarMode
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.RefreshBootstrapRegistryInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.RefreshBootstrapRegistryInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(kotlin.Metadata)
+[CU-DBG] ClassUtils.forName(kotlin.Metadata) -> ClassNotFoundException
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.netflix.eureka.config.EurekaConfigServerBootstrapper)
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.netflix.eureka.config.EurekaConfigServerBootstrapper) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.TextEncryptorConfigBootstrapper)
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.TextEncryptorConfigBootstrapper) -> found direct
+[GOD-DBG] getOrDefault called key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CU-DBG] ClassUtils.forName(org.springframework.boot.autoconfigure.logging.ConditionEvaluationReportLoggingListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.autoconfigure.logging.ConditionEvaluationReportLoggingListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.context.ServerPortInfoApplicationContextInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.context.ServerPortInfoApplicationContextInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.config.DelegatingApplicationContextInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.config.DelegatingApplicationContextInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.autoconfigure.SharedMetadataReaderFactoryContextInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.autoconfigure.SharedMetadataReaderFactoryContextInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.rsocket.context.RSocketPortInfoApplicationContextInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.rsocket.context.RSocketPortInfoApplicationContextInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.ContextIdApplicationContextInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.ContextIdApplicationContextInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.ConfigurationWarningsApplicationContextInitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.ConfigurationWarningsApplicationContextInitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.LoggingSystemShutdownListener)
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.LoggingSystemShutdownListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.config.AnsiOutputApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.config.AnsiOutputApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.ClearCachesApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.ClearCachesApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.config.DelegatingApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.config.DelegatingApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.BootstrapApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.bootstrap.BootstrapApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.autoconfigure.BackgroundPreinitializer)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.autoconfigure.BackgroundPreinitializer) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.env.EnvironmentPostProcessorApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.env.EnvironmentPostProcessorApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.FileEncodingApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.FileEncodingApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.context.restart.RestartListener)
+[CU-DBG] ClassUtils.forName(org.springframework.cloud.context.restart.RestartListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.logging.LoggingApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.logging.LoggingApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.builder.ParentContextCloserApplicationListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.builder.ParentContextCloserApplicationListener) -> found direct
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.event.EventPublishingRunListener)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.context.event.EventPublishingRunListener) -> found direct
+[GRES-DBG] getResources(META-INF/spring.factories) -> 10 URLs
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=144
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480102560 } stream_bytes=144 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=91
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x164801027e0 } stream_bytes=91 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.beans.BeanInfoFactory
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=136
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480102a60 } stream_bytes=136 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=871
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480102ce0 } stream_bytes=871 parsed_entries=3
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.BootstrapRegistryInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=510
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480103050 } stream_bytes=510 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=6069
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480103280 } stream_bytes=6069 parsed_entries=14
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] MISS key=org.springframework.boot.ApplicationContextFactory cap=16 idx=8
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] found key=org.springframework.boot.ApplicationContextFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.logging.LoggingSystemFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.logging.LoggingSystemFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.logging.LoggingSystemFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.PropertySourceLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.PropertySourceLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLoader
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] MISS key=org.springframework.context.ApplicationContextInitializer cap=16 idx=14
+[MAP-GET-DBG]   bucket[14] key=org.springframework.boot.context.config.ConfigDataLoader
+[MAP-GET-DBG]   bucket[14] key=org.springframework.boot.env.PropertySourceLoader
+[MAP-GET-DBG]   bucket[14] key=org.springframework.boot.env.EnvironmentPostProcessor
+[MAP-GET-DBG]   node slots: s0=Object(Some(ObjectRef { ptr: 0x1648009b340 })) s1=Object(Some(ObjectRef { ptr: 0x16480103730 })) s2=Int(23683902) s3=Object(Some(ObjectRef { ptr: 0x1648012eaa0 }))
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalysisReporter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLocationResolver
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.context.config.ConfigDataLocationResolver
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.SpringApplicationRunListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.SpringBootExceptionReporter
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3375
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480103cd0 } stream_bytes=3375 parsed_entries=9
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitializationDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportFilter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportFilter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportFilter
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.AutoConfigurationImportListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationContextInitializer
+[MAP-GET-DBG] found key=org.springframework.context.ApplicationContextInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.sql.init.dependency.DatabaseInitializerDetector
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.template.TemplateAvailabilityProvider
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=1677
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x16480104270 } stream_bytes=1677 parsed_entries=5
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.ApplicationListener
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.bootstrap.BootstrapConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.BootstrapRegistryInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.BootstrapRegistryInitializer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=2032
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x164801045e0 } stream_bytes=2032 parsed_entries=3
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.diagnostics.FailureAnalyzer
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.env.EnvironmentPostProcessor
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.EnableAutoConfiguration
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=111
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x164801048b0 } stream_bytes=111 parsed_entries=1
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.loader.jarmode.JarMode
+[GOD-DBG] getOrDefault called key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] found key=org.springframework.boot.ApplicationContextFactory
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.reactive.context.AnnotationConfigReactiveWebServerApplicationContext.Factory)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.reactive.context.AnnotationConfigReactiveWebServerApplicationContext.Factory) -> found as inner class org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext$Factory
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext.Factory)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext.Factory) -> found as inner class org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext$Factory
+[2m2026-05-11T03:07:39.189510Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[KEYSET-DBG] build_key_set this=ObjectRef { ptr: 0x164801fda38 } keys=0 set=ObjectRef { ptr: 0x1648029ca70 }
+[KEYSET-DBG] build_key_set this=ObjectRef { ptr: 0x164801fda38 } keys=0 set=ObjectRef { ptr: 0x16480312758 }
+[KEYSET-DBG] build_key_set this=ObjectRef { ptr: 0x164801fda38 } keys=0 set=ObjectRef { ptr: 0x164803197f8 }
+[GOD-DBG] getOrDefault called key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] found key=org.springframework.boot.ApplicationContextFactory
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.reactive.context.AnnotationConfigReactiveWebServerApplicationContext.Factory)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.reactive.context.AnnotationConfigReactiveWebServerApplicationContext.Factory) -> found as inner class org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext$Factory
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext.Factory)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext.Factory) -> found as inner class org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext$Factory
+[GOD-DBG] getOrDefault called key=org.springframework.boot.ApplicationContextFactory
+[MAP-GET-DBG] found key=org.springframework.boot.ApplicationContextFactory
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.reactive.context.AnnotationConfigReactiveWebServerApplicationContext.Factory)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.reactive.context.AnnotationConfigReactiveWebServerApplicationContext.Factory) -> found as inner class org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext$Factory
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext.Factory)
+[CU-DBG] ClassUtils.forName(org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext.Factory) -> found as inner class org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext$Factory
+[CU-DBG] ClassUtils.forName(org.eclipse.core.runtime.FileLocator)
+[CU-DBG] ClassUtils.forName(org.eclipse.core.runtime.FileLocator) -> ClassNotFoundException
+[CU-DBG] ClassUtils.forName(javax.inject.Provider)
+[CU-DBG] ClassUtils.forName(javax.inject.Provider) -> found direct
+[CU-DBG] ClassUtils.forName(javax.inject.Qualifier)
+[CU-DBG] ClassUtils.forName(javax.inject.Qualifier) -> found direct
+[CU-DBG] ClassUtils.forName(javax.annotation.ManagedBean)
+[CU-DBG] ClassUtils.forName(javax.annotation.ManagedBean) -> found direct
+[CU-DBG] ClassUtils.forName(javax.inject.Named)
+[CU-DBG] ClassUtils.forName(javax.inject.Named) -> found direct
+[MAP-GET-DBG] MISS key=org.springframework.boot.context.ContextIdApplicationContextInitializer$ContextId cap=16 idx=10
+[MAP-GET-DBG] MISS key=org.springframework.boot.context.ContextIdApplicationContextInitializer$ContextId cap=16 idx=10
+[CU-DBG] ClassUtils.forName(javax.annotation.ManagedBean)
+[CU-DBG] ClassUtils.forName(javax.annotation.ManagedBean) -> found direct
+[CU-DBG] ClassUtils.forName(javax.inject.Named)
+[CU-DBG] ClassUtils.forName(javax.inject.Named) -> found direct
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.SpringBootApplication
+[CIA-DBG] computeIfAbsent: key=org.springframework.cloud.netflix.eureka.server.EnableEurekaServer
+[CIA-DBG] computeIfAbsent: key=&org.springframework.boot.autoconfigure.internalCachingMetadataReaderFactory
+[MAP-GET-DBG] MISS key=org.springframework.boot.context.ContextIdApplicationContextInitializer$ContextId cap=1 idx=0
+[MAP-GET-DBG] found key=org.springframework.boot.context.ContextIdApplicationContextInitializer$ContextId
+[MAP-GET-DBG] MISS key=org.springframework.boot.context.ContextIdApplicationContextInitializer$ContextId cap=1 idx=0
+[MAP-GET-DBG] found key=org.springframework.boot.context.ContextIdApplicationContextInitializer$ContextId
+[CIA-DBG] computeIfAbsent: key=org.springframework.boot.autoconfigure.internalCachingMetadataReaderFactory
+[CIA-DBG] computeIfAbsent: key=org.springframework.context.annotation.internalConfigurationAnnotationProcessor
+[CU-DBG] ClassUtils.forName(org.springframework.beans.ExtendedBeanInfoFactory)
+[CU-DBG] ClassUtils.forName(org.springframework.beans.ExtendedBeanInfoFactory) -> found direct
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.annotation.ConfigurationClassPostProcessorBeanInfo
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: java.lang.ObjectBeanInfo
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: java.lang.ObjectCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.annotation.ConfigurationClassPostProcessorCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.support.BeanDefinitionRegistryPostProcessorCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.config.BeanFactoryPostProcessorCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.core.PriorityOrderedCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.core.OrderedCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.ResourceLoaderAwareBeanInfo
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.ResourceLoaderAwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.AwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.ApplicationStartupAwareBeanInfo
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.ApplicationStartupAwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.AwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.BeanClassLoaderAwareBeanInfo
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.BeanClassLoaderAwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.AwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.EnvironmentAwareBeanInfo
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.context.EnvironmentAwareCustomizer
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: org.springframework.beans.factory.AwareCustomizer

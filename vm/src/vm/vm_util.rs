@@ -426,6 +426,19 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "java/math/BigInteger") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // R15 (WildFly): some real-JDK / WildFly classes complete
+                // <clinit> normally yet leave a critical static field null
+                // because the metafactory-driven Stream/IntFunction lambda
+                // chain that should have populated it produced an empty
+                // result.  org/jboss/modules/Module.systemPaths is the case
+                // that crashes WildFly boot at
+                // ConcurrentClassLoader.getResources -> arraylength null.
+                // Run the fixup so it can backfill the field with an empty
+                // String[].  Idempotent: every arm checks for null before
+                // writing.
+                if matches!(&*class_name_for_jfr, "org/jboss/modules/Module") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -494,6 +507,13 @@ fn initialize_class_shared(
                         | "java/lang/AbstractMethodError"
                         | "java/lang/IncompatibleClassChangeError"
                         | "java/lang/UnsatisfiedLinkError"
+                        // Bare `java/lang/Error` (no specific subclass) — used
+                        // by some optional-classpath probes (e.g. logback's
+                        // ContextSelectorStaticBinder.<clinit> when the
+                        // logback config is absent or partially parseable in
+                        // CratonVM real-JDK mode). Treated as recoverable
+                        // for the same framework allowlist below.
+                        | "java/lang/Error"
                     );
                     // Only swallow for JDK/framework classes, not for arbitrary app classes.
                     // This prevents masking real errors in user code.
@@ -513,6 +533,24 @@ fn initialize_class_shared(
                         // getClassPathArchivesIterator / getMainClass bypass
                         // the archive-traversal logic entirely.
                         || class_name_for_jfr.starts_with("org/springframework/boot/loader/")
+                        // SLF4J/logback impl classes whose <clinit> wires up an
+                        // entire logging backend (logback Joran XML config,
+                        // ContextSelectorStaticBinder, status printer, etc.)
+                        // that touches many partial-real-JDK paths. The
+                        // CratonVM `register_slf4j_binder_stubs_pub` natives
+                        // (vm_init.rs) already provide synthetic singletons
+                        // for `getSingleton()` / `getLoggerFactory()` / the
+                        // MDC and Marker binders, so a failed real <clinit>
+                        // is harmless: SLF4J's `LoggerFactory.bind()` only
+                        // calls `StaticLoggerBinder.getSingleton()`, which
+                        // routes through our native and never reads the
+                        // half-initialized `SINGLETON` static. Without this,
+                        // Spring Boot fat-jars bundling logback fail with a
+                        // NoClassDefFoundError at the linkage of the
+                        // getSingleton invokestatic, even though the class
+                        // is correctly extracted from BOOT-INF/lib.
+                        || class_name_for_jfr.starts_with("org/slf4j/impl/")
+                        || class_name_for_jfr.starts_with("ch/qos/logback/")
                         || class_name_for_jfr.starts_with("com/sun/");
                     is_swallowable_type && is_framework_class
                 } else {
@@ -589,6 +627,36 @@ fn initialize_class_shared(
                             "non-critical-exception",
                             &format!("class={} exc={}", class_name_for_jfr, exc_detail),
                         );
+                        // Diagnostic: dump captured stack trace for the
+                        // swallowed clinit exception so we can pinpoint where
+                        // bare-NPEs originate during boot.
+                        if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
+                            let h = shared.heap.identity_hash_code(*exc_ref);
+                            if let Some(frames) = thread.throwable_stacks.get(&h) {
+                                for (i, f) in frames.iter().enumerate().take(20) {
+                                    tracing::warn!(
+                                        "  [SWALLOW-TRACE {}] at {}.{} ({}:{}) bci={}",
+                                        i,
+                                        f.class_name,
+                                        f.method_name,
+                                        f.source_file.as_deref().unwrap_or("?"),
+                                        f.line_number,
+                                        f.byte_code_index,
+                                    );
+                                }
+                            } else {
+                                let cm = shared.class_manager.read();
+                                for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
+                                    let cn = cm.get_class(f.class_id)
+                                        .map(|c| c.name.to_string())
+                                        .unwrap_or_default();
+                                    tracing::warn!(
+                                        "  [SWALLOW-LIVE {}] class={} {}.{} pc={}",
+                                        i, class_name_for_jfr, cn, f.method_name(), f.pc,
+                                    );
+                                }
+                            }
+                        }
                     }
                     finalize_init(shared, class_id, ClassState::Initialized);
 
@@ -628,11 +696,37 @@ fn initialize_class_shared(
                                 let cause_class = shared.class_manager.read()
                                     .get_class(exc_class_id).map(|c| c.name.clone())
                                     .unwrap_or_default();
-                                let cause_msg = match shared.heap.get_field(*exc_ref, 0) {
-                                    crate::types::Value::Object(Some(s)) =>
-                                        crate::vm::vm_object::read_java_string(&shared.heap, s)
-                                            .unwrap_or_default(),
-                                    _ => String::new(),
+                                // Read detailMessage by walking the field
+                                // hierarchy by name — slot index varies because
+                                // Throwable has `backtrace` at slot 0 and
+                                // `detailMessage` at slot 1, and subclasses may
+                                // have arbitrary layouts. Reading slot 0
+                                // unconditionally returns `backtrace` (a
+                                // non-String) for most exceptions, so the
+                                // message field looked empty.
+                                let cause_msg = {
+                                    let cm = shared.class_manager.read();
+                                    let mut walk = Some(exc_class_id);
+                                    let mut found: Option<crate::types::ObjectRef> = None;
+                                    while let Some(cid) = walk {
+                                        let Some(cls) = cm.get_class(cid) else { break };
+                                        let mut inst = 0usize;
+                                        for f in &cls.fields {
+                                            if f.is_static() { continue; }
+                                            if &*f.name == "detailMessage" {
+                                                let idx = cls.first_field_index + inst;
+                                                if let crate::types::Value::Object(Some(s)) = shared.heap.get_field(*exc_ref, idx) {
+                                                    found = Some(s);
+                                                }
+                                                break;
+                                            }
+                                            inst += 1;
+                                        }
+                                        if found.is_some() { break; }
+                                        walk = cls.superclass;
+                                    }
+                                    drop(cm);
+                                    found.and_then(|s| crate::vm::vm_object::read_java_string(&shared.heap, s)).unwrap_or_default()
                                 };
                                 tracing::warn!(
                                     class = %class_name_for_jfr,
@@ -640,6 +734,101 @@ fn initialize_class_shared(
                                     message = %cause_msg,
                                     "<clinit> failed вЂ” wrapping in ExceptionInInitializerError"
                                 );
+                                // Diagnostic: dump captured stack trace from
+                                // throwable_stacks so we can pinpoint where
+                                // bare-NPEs originate during boot.
+                                let h = shared.heap.identity_hash_code(*exc_ref);
+                                if let Some(frames) = thread.throwable_stacks.get(&h) {
+                                    for (i, f) in frames.iter().enumerate().take(20) {
+                                        tracing::warn!(
+                                            "  [CLINIT-TRACE {}] at {}.{} ({}:{}) bci={}",
+                                            i,
+                                            f.class_name,
+                                            f.method_name,
+                                            f.source_file.as_deref().unwrap_or("?"),
+                                            f.line_number,
+                                            f.byte_code_index,
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!("  [CLINIT-TRACE] no captured frames for hash={} — falling back to live thread.frames", h);
+                                    // Fallback: live frames captured at the moment
+                                    // we observe propagation. Even though some
+                                    // frames have already been popped via athrow
+                                    // unwinding, the deepest remaining frame is
+                                    // typically the <clinit> we are about to
+                                    // wrap, plus all surviving callers. This
+                                    // beats no info at all.
+                                    let cm = shared.class_manager.read();
+                                    for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                                        let cn = cm.get_class(f.class_id)
+                                            .map(|c| c.name.to_string())
+                                            .unwrap_or_default();
+                                        tracing::warn!(
+                                            "  [CLINIT-LIVE {}] at {}.{} pc={}",
+                                            i, cn, f.method_name(), f.pc,
+                                        );
+                                    }
+                                }
+                                // Walk the cause chain — many JDK/log4j
+                                // wrappers re-throw RuntimeException over a
+                                // deeper NPE/IAE. Print up to 4 levels.
+                                {
+                                    let cm = shared.class_manager.read();
+                                    // Resolve Throwable.cause field index by name
+                                    let cause_idx_of = |obj: crate::types::ObjectRef| -> Option<usize> {
+                                        let mut walk = Some(shared.heap.class_id_of(obj));
+                                        while let Some(k) = walk {
+                                            if let Some(cls) = cm.get_class(k) {
+                                                let mut inst = 0usize;
+                                                for f in &cls.fields {
+                                                    if !f.is_static() {
+                                                        if &*f.name == "cause" {
+                                                            return Some(cls.first_field_index + inst);
+                                                        }
+                                                        inst += 1;
+                                                    }
+                                                }
+                                                walk = cls.superclass;
+                                            } else { break; }
+                                        }
+                                        None
+                                    };
+                                    let mut cur = *exc_ref;
+                                    for depth in 0..4 {
+                                        let Some(ci) = cause_idx_of(cur) else { break; };
+                                        let cause_val = shared.heap.get_field(cur, ci);
+                                        let cause_obj = match cause_val {
+                                            Value::Object(Some(o)) if o != cur => o,
+                                            _ => break,
+                                        };
+                                        let cause_cid = shared.heap.class_id_of(cause_obj);
+                                        let cause_name = cm.get_class(cause_cid)
+                                            .map(|c| c.name.to_string()).unwrap_or_default();
+                                        let cause_msg = match shared.heap.get_field(cause_obj, 0) {
+                                            Value::Object(Some(s)) =>
+                                                crate::vm::vm_object::read_java_string(&shared.heap, s)
+                                                    .unwrap_or_default(),
+                                            _ => String::new(),
+                                        };
+                                        tracing::warn!(
+                                            "  [CLINIT-CAUSE depth={}] {}: {}",
+                                            depth, cause_name, cause_msg,
+                                        );
+                                        let ch = shared.heap.identity_hash_code(cause_obj);
+                                        if let Some(frames) = thread.throwable_stacks.get(&ch) {
+                                            for (i, f) in frames.iter().enumerate().take(15) {
+                                                tracing::warn!(
+                                                    "    [CAUSE-TRACE {}] at {}.{} ({}:{}) bci={}",
+                                                    i, f.class_name, f.method_name,
+                                                    f.source_file.as_deref().unwrap_or("?"),
+                                                    f.line_number, f.byte_code_index,
+                                                );
+                                            }
+                                        }
+                                        cur = cause_obj;
+                                    }
+                                }
                             }
                             match crate::runtime::exceptions::create_exception_object(
                                 shared,
@@ -978,6 +1167,59 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     };
 
     match class_name {
+        "org/jboss/modules/Module" => {
+            // R15 (WildFly): The static fields `systemPaths` and
+            // `systemPackages` are populated in `<clinit>` via a
+            // `Stream.toArray(String[]::new)` chain. In our VM that pipeline
+            // sometimes leaves the static slot null (the lambda metafactory
+            // for `IntFunction<String[]>` does not always produce a real
+            // typed array — investigation pending). Result: every call to
+            // `ConcurrentClassLoader.getResources` (and other system-path
+            // checks) NPEs at the leading `arraylength` instruction with
+            // `systemPaths == null`. The downstream effect is that log4j's
+            // `PropertyFilePropertySource.loadPropertiesFile` throws an NPE
+            // mid-`SimpleLoggerContext.<init>`, propagating up as
+            // ExceptionInInitializerError -> ServerLogger.<clinit> ->
+            // SystemExiter -> System.exit(1). Backfill empty arrays so the
+            // system-path scan loop in getResources/findClass produces zero
+            // hits and falls through to `findResources` / `loadClass`.
+            // This matches the production behavior on a JDK where the
+            // `jboss.modules.system.pkgs` system property is unset (the
+            // common case): both arrays end up empty.
+            let read_static = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, idx,
+                            ));
+                        }
+                        idx += 1;
+                    }
+                }
+                None
+            };
+            for fname in ["systemPaths", "systemPackages"] {
+                let cur = read_static(fname);
+                let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+                if needs_fix {
+                    let arr = shared.heap.alloc_array(
+                        ClassId::new(0),
+                        ArrayElementType::Reference,
+                        0,
+                    );
+                    if set_static_by_name(fname, Value::Object(Some(arr))) {
+                        tracing::warn!(
+                            "Post-clinit fixup: org/jboss/modules/Module.{} backfilled with empty String[]",
+                            fname
+                        );
+                    }
+                }
+            }
+        }
         "java/util/logging/LogManager" => {
             // LogManager.manager must be non-null for getLogManager()
             if let Some(mgr) = shared.heap.try_alloc_object(class_id, 4) {
@@ -1414,6 +1656,178 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         if set_static_by_name("DEFAULT", Value::Object(Some(obj))) {
                             tracing::warn!(
                                 "Post-clinit fixup: ApplicationStartup.DEFAULT populated"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // R55 (WildFly): `org/jboss/msc/service/ServiceContainerImpl.<clinit>`
+        // can throw NPE downstream of a swallowed `ServiceLogger.<clinit>`
+        // (ServiceLogger.ROOT is left null after its own clinit swallow,
+        // then `invokeinterface ServiceLogger.greeting` on the null ROOT
+        // NPEs at SCI<clinit> pc=70). Our swallow then marks SCI as
+        // initialized with PARTIAL state: SERIAL is set (pc=24, before the
+        // failure point) but `executorSeq` (pc=83, after) and other later
+        // statics are NEVER assigned. Even worse, the post-swallow scan
+        // here can run BEFORE SCI<clinit>'s pc=24 in some interleaved
+        // class-load paths, leaving SERIAL itself null. Downstream
+        // `ServiceContainerImpl.<init>` line 143 does `getstatic SERIAL`
+        // + `invokevirtual AtomicInteger.getAndIncrement` and NPEs with
+        // "Cannot invoke getAndIncrement on null" — the exact failure
+        // that aborts WildFly boot.
+        //
+        // Backfill the two AtomicInteger statics (`SERIAL`, `executorSeq`)
+        // with `new AtomicInteger(1)` instances using the 1-field layout
+        // registered by `native-builtins/src/phases_early.rs` (field 0 =
+        // int value). Only writes when the slot is currently null/zero,
+        // so a successful real-clinit pass is never clobbered.
+        "org/jboss/msc/service/ServiceContainerImpl" => {
+            let ai_name = "java/util/concurrent/atomic/AtomicInteger";
+            let ai_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(ai_name)
+            };
+            let read_static = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, idx,
+                            ));
+                        }
+                        idx += 1;
+                    }
+                }
+                None
+            };
+            if let Some(aid) = ai_id {
+                for fname in ["SERIAL", "executorSeq"] {
+                    let cur = read_static(fname);
+                    let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+                    if needs_fix {
+                        if let Some(ai_obj) = shared.heap.try_alloc_object(aid, 1) {
+                            // Initial value 1, matching SCI<clinit> bytecode
+                            // (`new AtomicInteger / dup / iconst_1 / <init>(I)V`).
+                            shared.heap.set_field(ai_obj, 0, Value::Int(1));
+                            if set_static_by_name(fname, Value::Object(Some(ai_obj))) {
+                                tracing::warn!(
+                                    "Post-clinit fixup: ServiceContainerImpl.{} populated with AtomicInteger(1)",
+                                    fname
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // R55 (WildFly): `org/jboss/msc/service/ServiceLogger.<clinit>` calls
+        // `Logger.getMessageLogger(Class, String)` which throws
+        // IllegalArgumentException in our VM (deep in jboss-logging's
+        // dynamic-proxy plumbing). The swallow then leaves the three static
+        // ServiceLogger fields (ROOT/SERVICE/FAIL) null. Downstream callers
+        // do `getstatic ServiceLogger.ROOT` + `invokeinterface
+        // ServiceLogger.greeting(...)` and NPE — the swallow cascade then
+        // surfaces deeper as the SCI<init> getAndIncrement NPE (because
+        // SCI<clinit> aborts mid-body before pc=24 putstatic SERIAL).
+        //
+        // Backfill with `ServiceLogger_$logger` instances (the concrete
+        // jboss-logging-generated implementation). The `log` instance field
+        // (slot 0) is left null — the only ServiceLogger method invoked from
+        // SCI<clinit> is `greeting()`, which our VM dispatches via the
+        // normal invokeinterface path; the inner `log.logf(...)` is itself
+        // protected by the broader <clinit>-swallow if it NPEs again. The
+        // critical bit is that ROOT/SERVICE/FAIL are non-null so SCI<clinit>
+        // can reach its `putstatic SERIAL` at pc=24.
+        // R63 (WildFly): `org/wildfly/security/auth/server/_private/ElytronMessages.<clinit>`
+        // calls `Logger.getMessageLogger(Class, String)` which throws
+        // IllegalArgumentException in our VM (same jboss-logging dynamic-proxy
+        // path that breaks ServiceLogger). The swallow leaves
+        // `ElytronMessages.log` null, then `SecurityDomain$Builder.build`
+        // does `getstatic ElytronMessages.log` + `invokeinterface
+        // isTraceEnabled()` and NPEs at SecurityDomain.java:1100. WildFly
+        // catches the NPE and aborts with exit code 1. Backfill the `log`
+        // static with a synthetic `ElytronMessages_$logger` instance —
+        // mirrors the ServiceLogger fixup just below.
+        "org/wildfly/security/auth/server/_private/ElytronMessages" => {
+            let impl_name = "org/wildfly/security/auth/server/_private/ElytronMessages_$logger";
+            let impl_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(impl_name)
+            };
+            let target_id = impl_id.unwrap_or(class_id);
+            // ElytronMessages_$logger extends DelegatingBasicLogger which has
+            // one instance field (log:BasicLogger). Allocate with 2 slots to
+            // be safe — extra slots are harmless, missing slots NPE on access.
+            let num_fields = 2usize;
+            let cur = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id).and_then(|cls| {
+                    let mut idx = 0usize;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == "log" {
+                                return Some(super::vm_object::get_static_shared(
+                                    shared, class_id, idx,
+                                ));
+                            }
+                            idx += 1;
+                        }
+                    }
+                    None
+                })
+            };
+            let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+            if needs_fix {
+                if let Some(obj) = shared.heap.try_alloc_object(target_id, num_fields) {
+                    if set_static_by_name("log", Value::Object(Some(obj))) {
+                        tracing::warn!(
+                            "Post-clinit fixup: ElytronMessages.log populated with synthetic $logger"
+                        );
+                    }
+                }
+            }
+        }
+        "org/jboss/msc/service/ServiceLogger" => {
+            let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
+            let impl_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name(impl_name)
+            };
+            // Fall back to allocating on the interface's own class_id when
+            // the generated impl isn't loaded (defensive — should be rare).
+            let target_id = impl_id.unwrap_or(class_id);
+            // ServiceLogger_$logger has 1 instance field (log:Logger).
+            let num_fields = 1usize;
+            for fname in ["ROOT", "SERVICE", "FAIL"] {
+                // Only fix nulls.
+                let cur = {
+                    let cm = shared.class_manager.read();
+                    cm.get_class(class_id).and_then(|cls| {
+                        let mut idx = 0usize;
+                        for f in &cls.fields {
+                            if f.is_static() {
+                                if &*f.name == fname {
+                                    return Some(super::vm_object::get_static_shared(
+                                        shared, class_id, idx,
+                                    ));
+                                }
+                                idx += 1;
+                            }
+                        }
+                        None
+                    })
+                };
+                let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
+                if needs_fix {
+                    if let Some(obj) = shared.heap.try_alloc_object(target_id, num_fields) {
+                        if set_static_by_name(fname, Value::Object(Some(obj))) {
+                            tracing::warn!(
+                                "Post-clinit fixup: ServiceLogger.{} populated with synthetic $logger",
+                                fname
                             );
                         }
                     }

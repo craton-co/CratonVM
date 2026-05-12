@@ -1,0 +1,278 @@
+﻿
+Welcome to Gradle 8.10.2!
+
+Here are the highlights of this release:
+ - Support for Java 23
+ - Faster configuration cache
+ - Better configuration cache reports
+
+For more details see https://docs.gradle.org/8.10.2/release-notes.html
+
+To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.10.2/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+> Task :modules:ejbca-ws:common:processResources NO-SOURCE
+> Task :modules:cesecore-ejb-interface:processResources NO-SOURCE
+> Task :modules:ejbca-entity:processResources NO-SOURCE
+> Task :modules:ejbca-ejb-interface:processResources NO-SOURCE
+> Task :modules:edition-specific:interface:processResources NO-SOURCE
+> Task :modules:admin-gui:processResources NO-SOURCE
+> Task :modules:certificatestore:processResources NO-SOURCE
+> Task :modules:cesecore-ejb:processResources NO-SOURCE
+> Task :modules:clearcache-war:processResources NO-SOURCE
+> Task :modules:crlstore:processResources NO-SOURCE
+> Task :modules:ejbca-cmp-war:processResources NO-SOURCE
+> Task :modules:ejbca-ejb:processResources NO-SOURCE
+> Task :modules:ejbca-rest-common:processResources NO-SOURCE
+> Task :modules:ejbca-rest-ca:processResources NO-SOURCE
+> Task :modules:ejbca-properties:compileJava NO-SOURCE
+> Task :modules:ejbca-rest-system:processResources NO-SOURCE
+> Task :modules:ejbca-properties:processResources NO-SOURCE
+> Task :modules:ejbca-rest-certificate:processResources NO-SOURCE
+> Task :modules:ejbca-properties:classes UP-TO-DATE
+> Task :modules:ejbca-rest-api:processResources NO-SOURCE
+> Task :modules:ejbca-webdist-war:processResources NO-SOURCE
+> Task :modules:ejbca-scep-war:processResources NO-SOURCE
+> Task :modules:ejbca-ws-cli:processResources NO-SOURCE
+> Task :modules:ejbca-ws:processResources NO-SOURCE
+> Task :modules:healthcheck-war:processResources NO-SOURCE
+> Task :modules:ra-gui:processResources NO-SOURCE
+> Task :modules:va:processResources NO-SOURCE
+> Task :modules:edition-specific:ejb:processResources NO-SOURCE
+> Task :modules:cesecore-x509ca:processResources
+> Task :modules:systemtests:interface:processResources
+> Task :modules:ejbca-common-web:processResources
+> Task :modules:va:extensions:processResources NO-SOURCE
+> Task :modules:systemtests:common:processResources NO-SOURCE
+> Task :modules:ejbca-common:processResources
+> Task :modules:systemtests:ejb:processResources
+> Task :modules:cesecore-entity:processResources NO-SOURCE
+> Task :modules:plugins:processResources
+> Task :modules:ejbca-properties:jar
+> Task :modules:cesecore-common:compileJava
+./gradlew.bat : Note: Some input files use or override a deprecated API.
+At line:1 char:216
++ ... tonVM\apps\ejbca-ce-main'; ./gradlew.bat --no-daemon ear 2>&1 | Out-F ...
++                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Note: Some inpu...deprecated API.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Note: Recompile with -Xlint:deprecation for details.
+Note: Some input files use unchecked or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+
+> Task :modules:cesecore-common:processResources
+> Task :modules:cesecore-common:classes
+> Task :modules:cesecore-common:jar
+> Task :modules:cesecore-x509ca:compileJava
+> Task :modules:cesecore-x509ca:classes
+
+> Task :modules:cesecore-entity:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\cesecore-entity\src\org\cesecore\roles\RoleInformation.java uses 
+or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:cesecore-x509ca:jar
+> Task :modules:cesecore-entity:classes
+> Task :modules:cesecore-entity:jar
+> Task :modules:cesecore-ejb-interface:compileJava
+> Task :modules:cesecore-ejb-interface:classes
+> Task :modules:cesecore-ejb-interface:jar
+
+> Task :modules:cesecore-ejb:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\cesecore-ejb\src\org\cesecore\authorization\AuthorizationSessionB
+ean.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:cesecore-ejb:classes
+
+> Task :modules:ejbca-common:compileJava
+C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ejbca-common\src\org\ejbca\core\model\ca\publisher\GeneralPurposeCustom
+Publisher.java:295: warning: [removal] finalize() in Object has been deprecated and marked for removal
+    protected void finalize() throws Throwable {
+                   ^
+C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ejbca-common\src\org\ejbca\core\model\ca\publisher\GeneralPurposeCustom
+Publisher.java:299: warning: [removal] finalize() in Object has been deprecated and marked for removal
+        super.finalize();
+             ^
+C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ejbca-common\src\org\ejbca\core\model\ra\ExtendedInformation.java:244: 
+warning: [removal] Float(float) in Float has been deprecated and marked for removal
+			String msg = intres.getLocalizedMessage("endentity.extendedinfoupgrade", new Float(getVersion()));
+			                                                                         ^
+C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ejbca-common\src\org\ejbca\core\model\ra\ExtendedInformation.java:316: 
+warning: [removal] Float(float) in Float has been deprecated and marked for removal
+    		data.put(VERSION, new Float(LATEST_VERSION));
+    		                  ^
+
+> Task :modules:cesecore-ejb:jar
+
+> Task :modules:ejbca-common:compileJava
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+4 warnings
+
+> Task :modules:ejbca-common:classes
+> Task :modules:ejbca-common:jar
+> Task :modules:ejbca-ws:common:compileJava
+> Task :modules:ejbca-ws:common:classes
+> Task :modules:ejbca-entity:compileJava
+> Task :modules:ejbca-entity:classes
+> Task :modules:ejbca-entity:jar
+> Task :modules:ejbca-ws:common:jar
+
+> Task :modules:ejbca-ws-cli:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ejbca-ws-cli\src\org\ejbca\core\protocol\ws\client\EJBCAWSRABaseC
+ommand.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:ejbca-ws-cli:classes
+
+> Task :modules:ejbca-ejb-interface:compileJava
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:ejbca-ws-cli:jar
+> Task :modules:ejbca-ejb-interface:classes
+> Task :modules:ejbca-ejb-interface:jar
+> Task :modules:clearcache-war:compileJava
+> Task :modules:clearcache-war:classes
+> Task :modules:clearcache-war:war
+> Task :modules:healthcheck-war:compileJava
+> Task :modules:healthcheck-war:classes
+> Task :modules:healthcheck-war:war
+
+> Task :modules:systemtests:interface:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\systemtests\src-interface\org\cesecore\mock\authentication\tokens
+\UsernameAccessMatchValue.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:edition-specific:interface:compileJava
+> Task :modules:edition-specific:interface:classes
+> Task :modules:edition-specific:interface:jar
+> Task :modules:systemtests:interface:classes
+> Task :modules:systemtests:interface:jar
+
+> Task :modules:ejbca-common-web:compileJava
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:edition-specific:ejb:compileJava
+> Task :modules:edition-specific:ejb:classes
+> Task :modules:edition-specific:ejb:jar
+> Task :modules:ejbca-common-web:classes
+> Task :modules:ejbca-common-web:jar
+> Task :modules:certificatestore:compileJava
+> Task :modules:certificatestore:classes
+> Task :modules:crlstore:compileJava
+> Task :modules:crlstore:classes
+> Task :modules:certificatestore:war
+> Task :modules:ejbca-webdist-war:compileJava
+> Task :modules:ejbca-webdist-war:classes
+> Task :modules:ejbca-scep-war:compileJava
+> Task :modules:ejbca-scep-war:classes
+> Task :modules:ejbca-webdist-war:war
+> Task :modules:ejbca-cmp-war:compileJava
+> Task :modules:ejbca-cmp-war:classes
+> Task :modules:crlstore:war
+> Task :modules:ejbca-scep-war:war
+> Task :modules:ejbca-cmp-war:war
+> Task :modules:va:extensions:compileJava
+> Task :modules:va:extensions:classes
+> Task :modules:va:compileJava
+> Task :modules:va:classes
+
+> Task :modules:plugins:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\plugins\src\org\ejbca\core\model\CertSafePublisher.java uses or o
+verrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:va:extensions:jar
+> Task :modules:ejbca-ws:compileJava
+> Task :modules:ejbca-ws:classes
+> Task :modules:va:war
+> Task :modules:ejbca-ws:jar
+> Task :modules:plugins:classes
+> Task :modules:plugins:jar
+
+> Task :modules:ejbca-rest-common:compileJava
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:ra-gui:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ra-gui\src\org\ejbca\ra\jsfext\RaExceptionHandlerFactory.java use
+s or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:ra-gui:classes
+
+> Task :modules:admin-gui:compileJava
+C:\Projects\CratonVM\apps\ejbca-ce-main\modules\admin-gui\src\org\ejbca\ui\psm\jsf\JsfDynamicUiPsmFactory.java:414: war
+ning: [removal] setSize(int) in HtmlInputFile has been deprecated and marked for removal
+        result.setSize(44);
+              ^
+
+> Task :modules:ra-gui:war
+
+> Task :modules:ejbca-ejb:compileJava
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :modules:ejbca-rest-common:classes
+
+> Task :modules:admin-gui:compileJava
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+1 warning
+
+> Task :modules:ejbca-rest-common:jar
+> Task :modules:ejbca-rest-system:compileJava
+> Task :modules:ejbca-rest-system:classes
+> Task :modules:ejbca-rest-system:jar
+> Task :modules:ejbca-rest-certificate:compileJava
+> Task :modules:ejbca-rest-certificate:classes
+> Task :modules:ejbca-rest-ca:compileJava
+> Task :modules:ejbca-rest-ca:classes
+> Task :modules:ejbca-rest-ca:jar
+> Task :modules:ejbca-rest-certificate:jar
+
+> Task :modules:ejbca-rest-api:compileJava
+warning: unknown enum constant Include.NON_NULL
+  reason: class file for com.fasterxml.jackson.annotation.JsonInclude$Include not found
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+warning: unknown enum constant Include.NON_NULL
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\ejbca-rest-api\src\org\ejbca\util\swagger\SnakeCaseConverter.java
+ uses unchecked or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+11 warnings
+
+> Task :modules:ejbca-rest-api:classes
+> Task :modules:ejbca-ejb:classes
+> Task :modules:ejbca-ejb:jar
+> Task :modules:ejbca-rest-api:war
+> Task :modules:systemtests:common:compileJava
+> Task :modules:systemtests:common:classes
+> Task :modules:systemtests:common:jar
+
+> Task :modules:systemtests:ejb:compileJava
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\systemtests\src\org\cesecore\certificates\certificate\certextensi
+ons\DummyCertificateExtension.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+Note: C:\Projects\CratonVM\apps\ejbca-ce-main\modules\systemtests\src\org\ejbca\ServerLogCheckUtil.java uses unchecked 
+or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+
+> Task :modules:systemtests:ejb:classes
+> Task :modules:systemtests:ejb:jar
+> Task :modules:admin-gui:classes
+> Task :modules:admin-gui:war
+> Task :ear
+
+BUILD SUCCESSFUL in 3m 38s
+79 actionable tasks: 79 executed

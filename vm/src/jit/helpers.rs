@@ -860,6 +860,30 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // SAFETY: vm_ptr and info_ptr originate from JIT code; both point to valid, live objects.
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
+    // Defensive gate: when the user-facing RUSTJVM_DISABLE_JIT kill-switch is set,
+    // no JIT code should be executing — so this dispatch helper must never run.
+    // Reaching it means a JIT entry point bypassed the flag (a real bug). Returning
+    // 0 here is preferable to UB from a stale compiled callsite; emit a one-shot
+    // warning so the bypass is visible during bisection.
+    if std::env::var_os("RUSTJVM_DISABLE_JIT")
+        .map(|v| {
+            let s = v.to_string_lossy().into_owned();
+            !s.is_empty() && s != "0"
+        })
+        .unwrap_or(false)
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[rustjvm] WARN: jit_invoke_dispatch reached with RUSTJVM_DISABLE_JIT=1 \
+                 (callee {}.{}{}). A JIT entry-point bypassed the kill-switch — \
+                 returning 0 to avoid undefined behavior.",
+                info.class_name, info.method_name, info.descriptor,
+            );
+        }
+        return 0;
+    }
     if std::env::var_os("RUSTJVM_DBG_JIT_DISPATCH").is_some() {
         let p = args_ptr as *const i64;
         let mut buf = String::new();

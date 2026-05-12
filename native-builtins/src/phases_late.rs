@@ -24,6 +24,95 @@ use crate::lang_invoke::{register_p60_callsite, register_p63_method_handles_look
 use crate::lang_misc::register_p60_record;
 // register_javax_annotation removed (was Spring Boot stub)
 
+// ---------------------------------------------------------------------------
+// RWF86.1: BufferedReader side-table for `Files.newBufferedReader` results.
+//
+// WildFly's `ProductConfig.getProductConfProperties` opens product.conf via
+// `Files.newBufferedReader(path, UTF_8)` and passes the result to
+// `Properties.load(Reader)`.  Real-JDK BufferedReader bytecode dereferences
+// `this.in` in `ensureOpen()` and throws "Stream closed" because our
+// synthetic allocator never fills that slot.  Storing the file contents in
+// a side-table keyed by ObjectRef pointer identity lets our `read([CII)I`
+// / `read()I` native overrides serve characters without touching the JDK
+// instance fields.
+//
+// Security posture mirrors `properties_sidetable`:
+//   * Per-reader size cap (16 MiB) — `Files.newBufferedReader` already
+//     loaded the whole file into memory, so this just bounds growth from
+//     pathological caller-side inputs.
+//   * Total-object cap (10_000 readers) — caps total side-table memory.
+//   * The side-table never holds the file path or any system-property
+//     value, so leaking the map cannot exfiltrate filesystem layout.
+// ---------------------------------------------------------------------------
+
+const BR_MAX_PER_READER_BYTES: usize = 16 * 1024 * 1024;
+const BR_MAX_READERS: usize = 10_000;
+
+fn br_sidetable() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn br_sidetable_register(reader: ObjectRef, content: String) {
+    let key = reader.as_ptr() as usize;
+    // Encode as UTF-16 code units (Java char semantics).
+    let mut buf: Vec<u16> = Vec::with_capacity(content.len());
+    for c in content.encode_utf16() {
+        if buf.len() >= BR_MAX_PER_READER_BYTES / 2 {
+            break;
+        }
+        buf.push(c);
+    }
+    let mut m = br_sidetable().lock();
+    if m.len() >= BR_MAX_READERS {
+        // Evict an arbitrary entry to keep the map bounded.  Per-reader
+        // identity isn't required for correctness — the same key always
+        // refers to the same content for a given allocation.
+        if let Some(k) = m.keys().next().copied() {
+            m.remove(&k);
+        }
+    }
+    m.insert(key, (buf, 0));
+}
+
+fn br_sidetable_read_chars(
+    ctx: &mut dyn NativeContext,
+    reader: ObjectRef,
+    out_arr: ObjectRef,
+    off: usize,
+    len: usize,
+) -> Option<i32> {
+    let key = reader.as_ptr() as usize;
+    let mut m = br_sidetable().lock();
+    let entry = m.get_mut(&key)?;
+    let (buf, pos) = entry;
+    if *pos >= buf.len() {
+        return Some(-1);
+    }
+    let avail = buf.len() - *pos;
+    let n = avail.min(len);
+    for i in 0..n {
+        let cu = buf[*pos + i] as i32;
+        ctx.set_array_element(out_arr, off + i, Value::Int(cu));
+    }
+    *pos += n;
+    Some(n as i32)
+}
+
+fn br_sidetable_read_one(_ctx: &mut dyn NativeContext, reader: ObjectRef) -> Option<i32> {
+    let key = reader.as_ptr() as usize;
+    let mut m = br_sidetable().lock();
+    let entry = m.get_mut(&key)?;
+    let (buf, pos) = entry;
+    if *pos >= buf.len() {
+        return Some(-1);
+    }
+    let c = buf[*pos] as i32;
+    *pos += 1;
+    Some(c)
+}
+
 pub(crate) fn register_phase55_natives(registry: &mut NativeMethodRegistry) {
     register_phase55_charset(registry);
     register_phase55_executors(registry);
@@ -1378,6 +1467,49 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
     r.register(stream, "isParallel", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+
+    // --- Stream.iterator() → Iterator (inherited from BaseStream) ---
+    // Spring Boot's `IterableConfigurationPropertySource.iterator()` default
+    // method calls `this.stream().iterator()`. Our synthetic Stream
+    // (field 0 = Object[]) has no iterator native, so the invokeinterface
+    // dispatches against bare `java/util/stream/Stream` (the receiver's
+    // class_id_of) and NSME's because `BaseStream.iterator()` is abstract.
+    // Reuse the ServiceLoader$Itr layout (field 0 = array, field 1 = idx)
+    // whose hasNext/next natives are already registered in `servlet.rs`.
+    r.register(stream, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr_val = ctx.get_field(this, 0);
+        let arr = if let Value::Object(Some(a)) = arr_val {
+            a
+        } else {
+            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)
+        };
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        ctx.set_field(itr, 0, Value::Object(Some(arr)));
+        ctx.set_field(itr, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(itr))))
+    });
+    // BaseStream.iterator() variant (some bytecode resolves against BaseStream)
+    r.register("java/util/stream/BaseStream", "iterator", "()Ljava/util/Iterator;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr_val = ctx.get_field(this, 0);
+        let arr = if let Value::Object(Some(a)) = arr_val {
+            a
+        } else {
+            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)
+        };
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        ctx.set_field(itr, 0, Value::Object(Some(arr)));
+        ctx.set_field(itr, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(itr))))
+    });
+
+    // --- Stream.spliterator() → Spliterator (inherited from BaseStream) ---
+    // Some Spring code paths call spliterator() directly. We don't have a
+    // full Spliterator implementation, but returning an iterator-like
+    // backing object lets downstream `forEachRemaining` paths drive elements.
+    // Skipped for now: only register iterator() which is the demonstrated
+    // call site.
 
     // --- Stream.unordered() → Stream ---
     r.register(
@@ -3652,22 +3784,50 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
-            let mut path_str = match ctx.get_field_by_name(uri, "path") {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            if path_str.is_empty() {
-                let full_val = ctx.get_field_by_name(uri, "string");
-                if let Value::Object(Some(s)) = full_val {
-                    let full = ctx.read_string(s).unwrap_or_default();
-                    if let Some(stripped) = full.strip_prefix("file://") {
-                        path_str = stripped.to_string();
-                    } else if let Some(stripped) = full.strip_prefix("file:") {
-                        path_str = stripped.to_string();
-                    } else {
-                        path_str = full;
-                    }
-                }
+            // Resolve the URI's filesystem path. Our URI synthetic has been
+            // populated by `url_parse` (URL.toURI), which writes by INDEX —
+            // not by name — into slots 0..5. The real-JDK `URI` field
+            // layout differs from that index map (URI.path lives at slot 6,
+            // URI.string at slot 18), so `get_field_by_name(uri, "path")`
+            // can return null or stale slots. Read defensively from
+            // multiple sources and strip any `file:` scheme prefix before
+            // handing the result to `p57_to_os_path`.
+            let mut candidates: Vec<String> = Vec::new();
+            // 1. URI.path by name (real-JDK URIs constructed via real-JDK
+            //    URI bytecode populate this; ours don't but cheap to try).
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "path") {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 2. Synthetic URL_FIELD_PATH (slot 3) where url_parse stores
+            //    the post-scheme path for `file:` URIs.
+            if let Value::Object(Some(s)) = ctx.get_field(uri, 3) {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 3. URI.string by name (full URI text on real-JDK URIs).
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 4. Synthetic URL_FIELD_FULL (slot 5) where url_parse stores
+            //    the full URI string. (For our synthetic URIs allocated
+            //    with real-JDK layout this slot may have been clobbered
+            //    with non-string data, so guarded by Object pattern.)
+            if let Value::Object(Some(s)) = ctx.get_field(uri, 5) {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // Pick the first non-empty candidate; strip any `file:` scheme.
+            let mut path_str = String::new();
+            for c in candidates {
+                if c.is_empty() { continue; }
+                let stripped = c
+                    .strip_prefix("file://")
+                    .or_else(|| c.strip_prefix("file:"))
+                    .map(|s| s.to_string())
+                    .unwrap_or(c);
+                // Reject candidates that still look like a URI (contain
+                // ':' before the path's drive letter) — those are stale.
+                if stripped.contains("file:") { continue; }
+                path_str = stripped;
+                break;
             }
             let os_path = p57_to_os_path(&path_str);
             if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
@@ -3813,6 +3973,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
 
     // --- Path.getFileName() → Path (or null) ---
+    // Real JDK: returns null when the path has no file component (e.g. "/").
+    // CratonVM divergence: smallrye-config 3.16's
+    // AbstractLocationConfigSourceLoader$ConfigSourceClassPathConsumer.accept(Path)
+    // immediately invokes .toString() on the returned Path and assumes it is
+    // non-null.  When our synthetic Path holds a normalized string like
+    // "/" or "" (e.g. forward-slash inputs that std::path::Path::file_name
+    // refuses to split on Windows), returning null triggers a "Cannot invoke
+    // toString on null" NPE that aborts Keycloak 26 boot.  Fall back to a
+    // manual basename via the last path separator so the consumer's
+    // validExtension() check rejects it cleanly instead of NPEing.
     r.register(
         path,
         "getFileName",
@@ -3822,13 +3992,32 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, this);
             let name = std::path::Path::new(&p)
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string());
+                .map(|n| n.to_string_lossy().to_string())
+                .or_else(|| {
+                    // Manual basename: take the substring after the last '/' or '\\'.
+                    let trimmed = p.trim_end_matches(['/', '\\']);
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        let idx = trimmed
+                            .rfind(|c: char| c == '/' || c == '\\')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        Some(trimmed[idx..].to_string())
+                    }
+                });
             match name {
                 Some(n) => {
                     let result = p57_alloc_path(ctx, &n);
                     Ok(Some(Value::Object(Some(result))))
                 }
-                None => Ok(Some(Value::Object(None))),
+                None => {
+                    // Root path with no component — return an empty-named Path
+                    // so callers that immediately .toString() see "" instead of
+                    // dereferencing null.
+                    let result = p57_alloc_path(ctx, "");
+                    Ok(Some(Value::Object(Some(result))))
+                }
             }
         },
     );
@@ -3914,7 +4103,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "provider",
         "()Ljava/nio/file/spi/FileSystemProvider;",
         |ctx, _args| {
-            let provider = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 0);
+            let provider = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+            let scheme = ctx.create_string("file");
+            ctx.set_field(provider, 0, Value::Object(Some(scheme)));
             Ok(Some(Value::Object(Some(provider))))
         },
     );
@@ -3926,6 +4117,47 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(fs_class, "isReadOnly", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+
+    // Round 63 — Keycloak 26.6.1 calls FileSystem.close() during shutdown/cleanup
+    // paths. FileSystem.close() is abstract in the real JDK; without a native
+    // override the synthetic default-FS object throws AbstractMethodError. We
+    // make close() a no-op (the synthetic FS has no underlying resource).
+    r.register(fs_class, "close", "()V", |_ctx, _args| Ok(None));
+
+    // Supplementary FileSystem methods that are abstract in real JDK and may
+    // be invoked on the synthetic default-FS object.
+    r.register(
+        fs_class,
+        "supportedFileAttributeViews",
+        "()Ljava/util/Set;",
+        |ctx, _args| {
+            let s = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        fs_class,
+        "getFileStores",
+        "()Ljava/lang/Iterable;",
+        |ctx, _args| {
+            use rustjvm_types::ArrayElementType;
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(0));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+    r.register(
+        fs_class,
+        "newWatchService",
+        "()Ljava/nio/file/WatchService;",
+        |ctx, _args| {
+            let ws = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchService", 1);
+            Ok(Some(Value::Object(Some(ws))))
+        },
+    );
 
     r.register(
         fs_class,
@@ -3946,9 +4178,60 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- FileSystemProvider minimal methods ---
     let fsp = "java/nio/file/spi/FileSystemProvider";
-    r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, _args| {
+    r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, args| {
+        // Read scheme from instance field 0 (populated by provider()/installedProviders()).
+        // Falls back to "file" for legacy callers that allocated without a scheme slot.
+        if let Some(this) = obj_arg(args, 0).ok() {
+            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
         let s = ctx.create_string("file");
         Ok(Some(Value::Object(Some(s))))
+    });
+
+    // FileSystemProvider.installedProviders() — real JDK uses ServiceLoader to
+    // discover providers including jdk.nio.zipfs.ZipFileSystemProvider for the
+    // "jar" scheme.  Under CratonVM the ServiceLoader path doesn't surface it,
+    // so smallrye's ClassPathUtils$JarProviderHolder.<clinit> throws
+    // NoSuchElementException("Unable to find provider supporting jar scheme")
+    // which kills Quarkus boot silently.  Return a 2-element ArrayList containing
+    // synthetic "file" and "jar" providers (scheme stored in instance field 0).
+    // FileSystemProvider.newFileSystem(Path, Map) — abstract by default and the
+    // base method throws UnsupportedOperationException.  smallrye's
+    // ClassPathUtils.processAsJarPath invokes this on the "jar" provider to mount
+    // a jar's interior filesystem; we don't model that, so hand back the platform
+    // default FileSystem so subsequent getPath("/")/resolve(name)/Files.isDirectory
+    // calls return a non-directory non-existent path, the smallrye Function
+    // callback yields no config sources, and the loop exits cleanly.
+    r.register(
+        fsp,
+        "newFileSystem",
+        "(Ljava/nio/file/Path;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
+        |ctx, _args| {
+            let fs = p57_alloc_default_filesystem(ctx);
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+
+    r.register(fsp, "installedProviders", "()Ljava/util/List;", |ctx, _args| {
+        use rustjvm_types::ArrayElementType;
+        let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+        let file_s = ctx.create_string("file");
+        ctx.set_field(file_p, 0, Value::Object(Some(file_s)));
+        let jar_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+        let jar_s = ctx.create_string("jar");
+        ctx.set_field(jar_p, 0, Value::Object(Some(jar_s)));
+        let arr = ctx.new_array(ArrayElementType::Reference, 2);
+        ctx.set_array_element(arr, 0, Value::Object(Some(file_p)));
+        ctx.set_array_element(arr, 1, Value::Object(Some(jar_p)));
+        // Real ArrayList field layout in real-JDK mode:
+        //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+        ctx.set_field(list, 0, Value::Int(0));
+        ctx.set_field(list, 1, Value::Object(Some(arr)));
+        ctx.set_field(list, 2, Value::Int(2));
+        Ok(Some(Value::Object(Some(list))))
     });
 
     r.register(
@@ -3981,6 +4264,223 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let os_path = p57_to_os_path(&path_str);
             let result = p57_alloc_path(ctx, &os_path);
             Ok(Some(Value::Object(Some(result))))
+        },
+    );
+
+    // --- Keycloak PersistedConfigSource.loadPersistedConfig ---
+    // CratonVM divergence: on Windows this method opens
+    // lib/quarkus/generated-bytecode.jar via FileInputStream + ZipInputStream
+    // and iterates entries looking for META-INF/keycloak-persisted.properties.
+    // The jar shipped with Keycloak 26.6.1 does not contain that entry, and
+    // somewhere during the entry walk CratonVM's IO/zip pipeline hits an
+    // EOFException in ZipInputStream.readFully (readLOC -> getNextEntry).
+    // The exception escapes loadPersistedConfig (it returns InputStream, not
+    // wrapped) and is rethrown by readProperties() as RuntimeException
+    // "Failed to load persisted properties.", which Keycloak's
+    // AbstractAutoBuildCommand wraps into picocli ExecutionException
+    // "Failed to update server configuration." aborting start-dev.
+    // Returning null is the spec-compliant "no persisted config" answer
+    // (readProperties() then returns Collections.emptyMap()).
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/PersistedConfigSource",
+        "loadPersistedConfig",
+        "()Ljava/io/InputStream;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // --- smallrye-config KeyStoreConfigSourceFactory.getConfigSources ---
+    // CratonVM divergence: In real Quarkus, the @ConfigMapping interface
+    // io.smallrye.config.source.keystore.KeyStoreConfig is auto-registered with
+    // the SmallRyeConfig instance via build-time discovery/reflection.  Under
+    // CratonVM that registration path is not active, so the factory's call to
+    // SmallRyeConfig.getConfigMapping(KeyStoreConfig.class) throws
+    // NoSuchElementException("SRCFG00027: Could not find a mapping for
+    // io.smallrye.config.source.keystore.KeyStoreConfig"), aborting Keycloak
+    // 26 boot during Configuration.getConfig().  Keycloak's default config
+    // does not use keystore-backed config sources, so returning an empty
+    // Iterable here is semantically equivalent to having no configured
+    // keystores.  Short-circuit at getConfigSources so we never hit the
+    // mapping lookup in getKeyStoreConfig.
+    r.register(
+        "io/smallrye/config/source/keystore/KeyStoreConfigSourceFactory",
+        "getConfigSources",
+        "(Lio/smallrye/config/ConfigSourceContext;)Ljava/lang/Iterable;",
+        |ctx, _args| {
+            use rustjvm_types::ArrayElementType;
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(0));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+
+    // --- SmallRyeConfig.getConfigMapping(Class, String) — Round 87 ---
+    // Quarkus's generated `SharedConfig.<clinit>` calls
+    // `SmallRyeConfig.getConfigMapping(VertxHttpBuildTimeConfig.class, ...)`
+    // (and other @ConfigMapping interfaces) at static-init.  Under CratonVM
+    // those mappings are never registered with the SmallRyeConfig instance
+    // (build-time reflective discovery doesn't run), so the lookup throws
+    // `NoSuchElementException("SRCFG00027: Could not find a mapping for ...")`,
+    // wrapping into ExceptionInInitializerError and aborting Keycloak boot.
+    //
+    // Same family as the Round 80 `KeyStoreConfigSourceFactory.getConfigSources`
+    // fix, but this one short-circuits the lookup at its source so any future
+    // @ConfigMapping interface (KC has many) is handled uniformly.
+    //
+    // Strategy: allocate a synthetic instance whose ClassId is the requested
+    // @ConfigMapping interface.  Quarkus's SharedConfig static-init writes the
+    // result to a `static final` slot; downstream interface-method calls will
+    // either be re-shimmed individually as they surface or hit defensive
+    // null/default paths.  This unblocks SharedConfig.<clinit> past pc=2154.
+    r.register(
+        "io/smallrye/config/SmallRyeConfig",
+        "getConfigMapping",
+        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args[0] = this, args[1] = Class<T>, args[2] = String prefix
+            let class_mirror = match args.get(1) {
+                Some(Value::Object(Some(c))) => *c,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Resolve interface name and ClassId; fall back to None on failure.
+            let cls_name = crate::lang_class::mirror_class_name(ctx, class_mirror);
+            let cls_name = match cls_name {
+                Some(n) => n,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // alloc_concurrent_synthetic ensures the class is initialized and
+            // sizes the object to the class's declared field count (interfaces
+            // typically have none — slot count auto-grows in real-JDK mode).
+            let obj = alloc_concurrent_synthetic(ctx, &cls_name, 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // The single-arg form `getConfigMapping(Class)` delegates to the two-arg
+    // form on real SmallRyeConfig, but when the JIT/interp doesn't re-enter
+    // the bytecode path (e.g. direct invokevirtual without inline cache), we
+    // mirror the same logic here so both arms are covered.
+    r.register(
+        "io/smallrye/config/SmallRyeConfig",
+        "getConfigMapping",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+        |ctx, args| {
+            let class_mirror = match args.get(1) {
+                Some(Value::Object(Some(c))) => *c,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let cls_name = match crate::lang_class::mirror_class_name(ctx, class_mirror) {
+                Some(n) => n,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            let obj = alloc_concurrent_synthetic(ctx, &cls_name, 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // --- picocli CommandLine$Help$Ansi$Style.fg(String) / .bg(String) ---
+    // Round 92: Keycloak's startup banner contains markup like `@|red ...|@`,
+    // which picocli parses via `Ansi.string` -> `Style.parse` -> `Style.fg("red")`.
+    // The Java code does:
+    //   try { return Style.valueOf(name.toLowerCase()); }   // "red" -> IAE
+    //   catch (Exception ex) {
+    //     try { return Style.valueOf("fg_" + name.toLowerCase()); }  // "fg_red" -> hit
+    //     catch (Exception ex2) { return new Palette256Color(true, name); }
+    //   }
+    // Under CratonVM the inner-most `IllegalArgumentException` thrown by
+    // `Enum.valueOf` propagates out of `Style.fg` rather than being caught by
+    // the surrounding `catch (Exception)` handler — exception-table walking
+    // for nested invocations across this many frames misroutes the unwind.
+    // Implementing `fg`/`bg` natively bypasses the try/catch entirely: we
+    // resolve the static Style constant by name and return it directly. If
+    // neither lookup hits, we return the canonical `reset` Style as a
+    // harmless no-op — Keycloak's banner rendering only needs a non-null
+    // IStyle that produces no ANSI codes when used with Ansi.OFF.
+    fn picocli_style_lookup(
+        ctx: &mut dyn NativeContext,
+        prefix: &str,
+        raw_name: rustjvm_types::ObjectRef,
+    ) -> rustjvm_types::Value {
+        let style_cls = "picocli/CommandLine$Help$Ansi$Style";
+        let class_id = match ctx.ensure_class_initialized(style_cls) {
+            Ok(id) => id,
+            Err(_) => {
+                if std::env::var("RUSTJVM_DBG_PICOCLI_STYLE").is_ok() {
+                    eprintln!("[picocli-style] ensure_class_initialized failed");
+                }
+                return rustjvm_types::Value::Object(None);
+            }
+        };
+        let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
+        let dbg = std::env::var("RUSTJVM_DBG_PICOCLI_STYLE").is_ok();
+        // Round 93: Style constants are STATIC enum fields — must use
+        // `static_field_index_by_name`, not `resolve_field_index` (which
+        // only walks INSTANCE fields). Round 92's fallback was reaching
+        // the `Object(None)` branch on every call, leaking null IStyle
+        // to `Ansi.string`, which then NPEs in `Style.on()`.
+        // Try the plain name first (e.g. "reset", "bold").
+        if let Some(idx) = ctx.static_field_index_by_name(class_id, &name) {
+            let v = ctx.get_static_field(class_id, idx);
+            if dbg {
+                eprintln!("[picocli-style] plain {} -> idx={} val_null={}", name, idx, matches!(v, rustjvm_types::Value::Object(None)));
+            }
+            if !matches!(v, rustjvm_types::Value::Object(None)) {
+                return v;
+            }
+        } else if dbg {
+            eprintln!("[picocli-style] plain {} -> no static field", name);
+        }
+        // Then the prefixed form (e.g. "fg_red", "bg_blue").
+        let prefixed = format!("{}{}", prefix, name);
+        if let Some(idx) = ctx.static_field_index_by_name(class_id, &prefixed) {
+            let v = ctx.get_static_field(class_id, idx);
+            if dbg {
+                eprintln!("[picocli-style] prefixed {} -> idx={} val_null={}", prefixed, idx, matches!(v, rustjvm_types::Value::Object(None)));
+            }
+            if !matches!(v, rustjvm_types::Value::Object(None)) {
+                return v;
+            }
+        } else if dbg {
+            eprintln!("[picocli-style] prefixed {} -> no static field", prefixed);
+        }
+        // Fallback: return the always-present `reset` style. Any IStyle is
+        // legal here — Ansi.OFF.string strips markup wholesale anyway.
+        if let Some(idx) = ctx.static_field_index_by_name(class_id, "reset") {
+            let v = ctx.get_static_field(class_id, idx);
+            if dbg {
+                eprintln!("[picocli-style] reset fallback idx={} val_null={}", idx, matches!(v, rustjvm_types::Value::Object(None)));
+            }
+            return v;
+        }
+        if dbg {
+            eprintln!("[picocli-style] reset static field not found, returning null");
+        }
+        rustjvm_types::Value::Object(None)
+    }
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Style",
+        "fg",
+        "(Ljava/lang/String;)Lpicocli/CommandLine$Help$Ansi$IStyle;",
+        |ctx, args| {
+            let name_obj = match args.first() {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(picocli_style_lookup(ctx, "fg_", name_obj)))
+        },
+    );
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Style",
+        "bg",
+        "(Ljava/lang/String;)Lpicocli/CommandLine$Help$Ansi$IStyle;",
+        |ctx, args| {
+            let name_obj = match args.first() {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(picocli_style_lookup(ctx, "bg_", name_obj)))
         },
     );
 
@@ -4104,33 +4604,54 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
     });
 
+    fn read_all_lines_impl(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> rustjvm_types::error::MethodCallResult {
+        let path_obj = obj_arg(args, 0)?;
+        let p = p57_read_path(ctx, path_obj);
+        match std::fs::read_to_string(&p) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                // Resolve real-JDK ArrayList layout: elementData / size slots
+                // can be at (1,2) when AbstractList.modCount occupies slot 0.
+                // Fall back to synthetic (0,1) layout when the class isn't
+                // available via the resolver.
+                let data_slot = ctx
+                    .resolve_field_index("java/util/ArrayList", "elementData")
+                    .unwrap_or(0);
+                let size_slot = ctx
+                    .resolve_field_index("java/util/ArrayList", "size")
+                    .unwrap_or(1);
+                let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+                use rustjvm_types::ArrayElementType;
+                let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
+                for (i, line) in lines.iter().enumerate() {
+                    let s = ctx.create_string(line);
+                    ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                }
+                ctx.set_field(list, data_slot, Value::Object(Some(arr)));
+                ctx.set_field(list, size_slot, Value::Int(lines.len() as i32));
+                Ok(Some(Value::Object(Some(list))))
+            }
+            Err(e) => Err(RuntimeError::IllegalStateException {
+                message: format!("IOException: {}", e),
+            }
+            .into()),
+        }
+    }
     r.register(
         files,
         "readAllLines",
         "(Ljava/nio/file/Path;)Ljava/util/List;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            match std::fs::read_to_string(&p) {
-                Ok(content) => {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                    use rustjvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
-                    for (i, line) in lines.iter().enumerate() {
-                        let s = ctx.create_string(line);
-                        ctx.set_array_element(arr, i, Value::Object(Some(s)));
-                    }
-                    ctx.set_field(list, 0, Value::Object(Some(arr)));
-                    ctx.set_field(list, 1, Value::Int(lines.len() as i32));
-                    Ok(Some(Value::Object(Some(list))))
-                }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
-            }
-        },
+        read_all_lines_impl,
+    );
+    r.register(
+        files,
+        "readAllLines",
+        "(Ljava/nio/file/Path;Ljava/nio/charset/Charset;)Ljava/util/List;",
+        read_all_lines_impl,
     );
 
     r.register(
@@ -4492,6 +5013,116 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // newFileChannel(Path, Set<? extends OpenOption>, FileAttribute[]) -> FileChannel
+    // Real JDK delegates to WindowsFileSystemProvider.newFileChannel which
+    // overrides this abstract method. We provide a synthetic FileChannel
+    // backed by fd_table (same shape as RandomAccessFile.getChannel) so the
+    // existing j.n.c.FileChannel native methods can drive it.
+    r.register(
+        fsp,
+        "newFileChannel",
+        "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, path_obj);
+            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW via toString
+            let set_obj = match args.get(2) {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            let (mut writable, mut create, mut append) = (false, false, false);
+            if let Some(set) = set_obj {
+                // Try to iterate by calling toString() on the Set first (cheap & robust)
+                if let Ok(Some(Value::Object(Some(s)))) =
+                    ctx.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
+                {
+                    let s = ctx.read_string(s).unwrap_or_default();
+                    writable = s.contains("WRITE") || s.contains("APPEND");
+                    create = s.contains("CREATE");
+                    append = s.contains("APPEND");
+                }
+            }
+            let _ = append; // append handled by seek-to-end below
+            let fd_id = if writable {
+                ctx.fd_table().open_read_write(&p, create)
+            } else {
+                ctx.fd_table().open_read_write(&p, false)
+                    .or_else(|_| ctx.fd_table().open_read(&p))
+            }
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("Cannot open {}: {}", p, e),
+            })?;
+            if append {
+                if let Ok(sz) = ctx.fd_table().file_size(fd_id) {
+                    let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(sz));
+                }
+            }
+            let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
+            ctx.set_field(fc, 0, Value::Int(fd_id as i32));
+            Ok(Some(Value::Object(Some(fc))))
+        },
+    );
+
+    // Round 63 — Kafka 4.2.0 calls `FileChannel.size()` on the synthetic
+    // FileChannel returned by `newFileChannel` above (via
+    // `BatchFileReader.build → FileRecords.<init>`). The real JDK
+    // FileChannel declares `size()` abstract — without a native here we
+    // throw AbstractMethodError and Kafka exits silently through its
+    // outer `Throwable` catch + `Exit.exit(1)`. Register a minimal set
+    // of FileChannel natives that drive the synthetic via fd_table.
+    let fc_cls = "java/nio/channels/FileChannel";
+    r.register(fc_cls, "size", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v >= 0 => v as u32,
+            _ => return Ok(Some(Value::Long(0))),
+        };
+        let sz = ctx.fd_table().file_size(fd_id).unwrap_or(0);
+        Ok(Some(Value::Long(sz as i64)))
+    });
+    r.register(fc_cls, "position", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v >= 0 => v as u32,
+            _ => return Ok(Some(Value::Long(0))),
+        };
+        let pos = ctx
+            .fd_table()
+            .rw_seek(fd_id, std::io::SeekFrom::Current(0))
+            .unwrap_or(0);
+        Ok(Some(Value::Long(pos as i64)))
+    });
+    r.register(
+        fc_cls,
+        "position",
+        "(J)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pos = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let fd_id = match ctx.get_field(this, 0) {
+                Value::Int(v) if v >= 0 => v as u32,
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(pos as u64));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(fc_cls, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Int(v) = ctx.get_field(this, 0) {
+            if v >= 0 {
+                let _ = ctx.fd_table().close(v as u32);
+            }
+        }
+        Ok(None)
+    });
+    r.register(fc_cls, "isOpen", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+
     // --- Files additional methods ---
     r.register(
         files,
@@ -4556,6 +5187,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let s = ctx.create_string(&content);
                     ctx.set_field(reader, 0, Value::Object(Some(s)));
                     ctx.set_field(reader, 1, Value::Int(0)); // position
+                    br_sidetable_register(reader, content);
                     Ok(Some(Value::Object(Some(reader))))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
@@ -4578,11 +5210,77 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let s = ctx.create_string(&content);
                     ctx.set_field(reader, 0, Value::Object(Some(s)));
                     ctx.set_field(reader, 1, Value::Int(0));
+                    br_sidetable_register(reader, content);
                     Ok(Some(Value::Object(Some(reader))))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),
                 }.into()),
+            }
+        },
+    );
+
+    // RWF86.1: native shims for BufferedReader.read([CII)I and read()I that
+    // honour our `Files.newBufferedReader`-allocated readers.  Real JDK
+    // BufferedReader bytecode calls `ensureOpen()` which reads `this.in` —
+    // a field we never set on the synthetic object — and throws
+    // "Stream closed".  By overriding `read` natively for readers we
+    // registered in `BR_SIDETABLE`, WildFly's `ProductConfig` /
+    // `Properties.load(Reader)` path completes the read loop instead of
+    // bailing with IOException.  For readers NOT in the side-table we
+    // delegate to the underlying Reader at slot 0 so the existing
+    // `BufferedReader(<init>(Reader))` shim path keeps working.
+    r.register(
+        "java/io/BufferedReader",
+        "read",
+        "([CII)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let out_arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let off = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            let len = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            if len == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
+            let out_len = ctx.array_length(out_arr);
+            if off > out_len || off.saturating_add(len) > out_len {
+                return Ok(Some(Value::Int(-1)));
+            }
+            // Side-table-backed reader (from Files.newBufferedReader).
+            if let Some(n) = br_sidetable_read_chars(ctx, this, out_arr, off, len) {
+                return Ok(Some(Value::Int(n)));
+            }
+            // Fallback: delegate to underlying Reader at slot 0.
+            match ctx.get_field(this, 0) {
+                Value::Object(Some(inner)) => {
+                    let r = ctx.invoke_virtual(
+                        inner, "read", "([CII)I",
+                        &[Value::Object(Some(out_arr)), Value::Int(off as i32), Value::Int(len as i32)],
+                    )?;
+                    Ok(r.or(Some(Value::Int(-1))))
+                }
+                _ => Ok(Some(Value::Int(-1))),
+            }
+        },
+    );
+    r.register(
+        "java/io/BufferedReader",
+        "read",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(c) = br_sidetable_read_one(ctx, this) {
+                return Ok(Some(Value::Int(c)));
+            }
+            match ctx.get_field(this, 0) {
+                Value::Object(Some(inner)) => {
+                    let r = ctx.invoke_virtual(inner, "read", "()I", &[])?;
+                    Ok(r.or(Some(Value::Int(-1))))
+                }
+                _ => Ok(Some(Value::Int(-1))),
             }
         },
     );
@@ -5205,6 +5903,105 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             },
         );
     }
+
+    // Round 24 — Files.write(Path, Iterable<? extends CharSequence>, OpenOption...)
+    // and the (..., Charset, ...) overload. Used by JBoss
+    // ProcessEnvironment.obtainProcessUUID to write standalone/data/process.uuid.
+    // Also Files.write(Path, byte[], OpenOption...) — needed in real-JDK mode
+    // where register_p71_files_bridge is not invoked. Without these, the JDK
+    // bytecode falls through to FileSystemProvider.newOutputStream which we
+    // do not implement and throws "Не удается найти указанный файл" (errno 2).
+    let files_cls = "java/nio/file/Files";
+    r.register(
+        files_cls,
+        "write",
+        "(Ljava/nio/file/Path;[B[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let arr = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, path_obj);
+            let len = ctx.array_length(arr);
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| match ctx.get_array_element(arr, i) {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                })
+                .collect();
+            match std::fs::write(&p, &bytes) {
+                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                Err(e) => Err(RuntimeError::IllegalStateException {
+                    message: format!("IOException: {}", e),
+                }
+                .into()),
+            }
+        },
+    );
+    fn write_iterable_impl(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> rustjvm_types::error::MethodCallResult {
+        let path_obj = obj_arg(args, 0)?;
+        let iterable = obj_arg(args, 1)?;
+        let p = p57_read_path(ctx, path_obj);
+        let it_val = ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])
+            .ok().flatten();
+        let it = match it_val {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Err(RuntimeError::IllegalStateException {
+                message: "Files.write(Iterable): null iterator".to_string(),
+            }.into()),
+        };
+        let mut out = String::new();
+        loop {
+            let has = ctx.invoke_virtual(it, "hasNext", "()Z", &[]).ok().flatten();
+            match has {
+                Some(Value::Int(1)) => {}
+                _ => break,
+            }
+            let nxt = ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
+                .ok().flatten();
+            let elem = match nxt {
+                Some(Value::Object(Some(o))) => o,
+                _ => break,
+            };
+            // CharSequence: try read_string first (Strings), fall back to toString().
+            let s = ctx.read_string(elem).unwrap_or_else(|| {
+                let s_val = ctx.invoke_virtual(elem, "toString", "()Ljava/lang/String;", &[])
+                    .ok().flatten();
+                match s_val {
+                    Some(Value::Object(Some(so))) => ctx.read_string(so).unwrap_or_default(),
+                    _ => String::new(),
+                }
+            });
+            out.push_str(&s);
+            out.push('\n');
+        }
+        match std::fs::write(&p, out.as_bytes()) {
+            Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+            Err(e) => Err(RuntimeError::IllegalStateException {
+                message: format!("IOException: {}", e),
+            }
+            .into()),
+        }
+    }
+    r.register(
+        files_cls,
+        "write",
+        "(Ljava/nio/file/Path;Ljava/lang/Iterable;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        write_iterable_impl,
+    );
+    r.register(
+        files_cls,
+        "write",
+        "(Ljava/nio/file/Path;Ljava/lang/Iterable;Ljava/nio/charset/Charset;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            // Charset arg at slot 2 ignored — we always emit UTF-8, matching
+            // the platform default we report from `Charset.defaultCharset`.
+            // Forward the (path, iterable, options) shape by reordering.
+            let trimmed: Vec<Value> = vec![args[0], args[1], args.get(3).copied().unwrap_or(Value::Object(None))];
+            write_iterable_impl(ctx, &trimmed)
+        },
+    );
 }
 
 fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
@@ -10909,7 +11706,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             }.into()),
         };
         let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        eprintln!("[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: {}", dotted);
         let internal = dotted.replace('.', "/");
         match ctx.ensure_class_initialized(&internal) {
             Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
@@ -10924,7 +11720,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             }.into()),
         };
         let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        eprintln!("[LUC-DBG] LaunchedURLClassLoader.loadClass(2) called: {}", dotted);
         let internal = dotted.replace('.', "/");
         match ctx.ensure_class_initialized(&internal) {
             Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
@@ -10999,10 +11794,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
 
     // S111r27 — intercept DefaultApplicationContextFactory.create to diagnose
     // what exception is thrown and provide a direct bypass if needed.
-    let dacf = "org/springframework/boot/DefaultApplicationContextFactory";
-    r.register(dacf, "create",
-        "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/context/ConfigurableApplicationContext;",
-        spring_default_app_ctx_factory_create);
+    //
+    // DISABLED: the shim allocated a context with NO primary configuration source
+    // registered, so SpringApplication.prepareContext -> load(...) never received
+    // EurekaServerApplication.class as a @Configuration bean def. In real Spring
+    // Boot, DefaultApplicationContextFactory.create just instantiates the context
+    // and the caller does the load. Running the real bytecode is correct now that
+    // HashMap / LinkedHashMap / MergedAnnotation / ClassLoader prerequisites are
+    // fixed.
+    let _ = spring_default_app_ctx_factory_create;
+    // let dacf = "org/springframework/boot/DefaultApplicationContextFactory";
+    // r.register(dacf, "create",
+    //     "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/context/ConfigurableApplicationContext;",
+    //     spring_default_app_ctx_factory_create);
 }
 
 /// S111r21 — native implementation of Spring's ClassUtils.forName(String, ClassLoader).
@@ -11030,7 +11834,6 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
         }.into()),
     };
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
-    eprintln!("[CU-DBG] ClassUtils.forName({})", dotted);
 
     // Handle primitive language names (Spring converts these to wrapper classes)
     let prim_class_id: Option<&str> = match dotted.as_str() {
@@ -11064,7 +11867,6 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
     // Regular class name: try direct binary name first (a.b.Foo → a/b/Foo)
     let internal = dotted.replace('.', "/");
     if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        eprintln!("[CU-DBG] ClassUtils.forName({}) -> found direct", dotted);
         return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
     }
 
@@ -11073,16 +11875,13 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
     if let Some(last_slash) = internal.rfind('/') {
         let inner = format!("{}${}", &internal[..last_slash], &internal[last_slash + 1..]);
         if let Ok(cid) = ctx.ensure_class_initialized(&inner) {
-            eprintln!("[CU-DBG] ClassUtils.forName({}) -> found as inner class {}", dotted, inner);
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
     }
 
     if dotted == "jakarta.faces.context.FacesContext" {
-        eprintln!("[CU-DBG] ClassUtils.forName({}) -> not found (null fallback)", dotted);
         return Ok(Some(Value::Object(None)));
     }
-    eprintln!("[CU-DBG] ClassUtils.forName({}) -> ClassNotFoundException", dotted);
     Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into())
 }
 
@@ -13040,6 +13839,28 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
                 ctx.set_field(pkg_obj, i, Value::Object(None));
             }
             Ok(Some(Value::Object(Some(pkg_obj))))
+        },
+    );
+
+    // Package.getPackages() — static. Real-JDK bytecode delegates to
+    // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`,
+    // which in turn calls `packages().toArray(...)` with `packages()` returning
+    // a Stream over the `packages` ConcurrentHashMap. In our boot, that path
+    // routes back through bytecode which (in JDK 25) leaks a Stream object
+    // where a `Package[]` is required (observed: `ReferencePipeline$Head`
+    // returned from `ClassLoader.getPackages()[Ljava/lang/Package;`,
+    // triggering NPE on arraylength in callers like
+    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` during WildFly boot).
+    // Override with an empty `Package[]` — JBoss-modules only uses this for a
+    // sanity scan and tolerates an empty result. Mirrors the existing
+    // `ClassLoader.getDefinedPackages()` empty-array override.
+    r.register(
+        pkg,
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        |ctx, _args| {
+            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(empty))))
         },
     );
 }
@@ -15801,18 +16622,13 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     // flags: bit 0 = up, bit 1 = loopback, bit 2 = supportsMulticast
     let ni = "java/net/NetworkInterface";
 
-    r.register(ni, "getNetworkInterfaces", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let interfaces = p61_build_network_interfaces(ctx);
-        // Wrap in Enumeration (2-field: arr=0, pos=1)
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, interfaces.len());
-        for (i, iface) in interfaces.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*iface)));
-        }
-        ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
-        ctx.set_field(enum_obj, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(enum_obj))))
-    });
+    // NOTE: `getNetworkInterfaces` is intentionally NOT registered as a
+    // synthetic native in real-JDK mode. See the long comment in
+    // `register_re8_network_interface` (net_phase_e.rs) for details. The
+    // real JDK Java method calls native `getAll()` (returns empty) which
+    // produces a SocketException that callers handle. Returning synthetic
+    // NetworkInterface objects here breaks downstream `getInetAddresses()`
+    // because the real JDK reads field slots we don't populate.
 
     r.register(ni, "getByName", "(Ljava/lang/String;)Ljava/net/NetworkInterface;", |ctx, args| {
         let name_ref = obj_arg(args, 1)?;
@@ -30043,12 +30859,25 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
 
     // StreamSupport
     let ss = "java/util/stream/StreamSupport";
+    eprintln!("[STREAM-SUPPORT-DBG] registering StreamSupport.stream");
     r.register(
         ss,
         "stream",
         "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;",
         |ctx, args| {
-            // Convert spliterator to stream (1-field synthetic with backing array)
+            eprintln!("[STREAM-SUPPORT-DBG] StreamSupport.stream native fired");
+            // Convert spliterator to stream (1-field synthetic with backing array).
+            //
+            // Two cases:
+            //  * Synthetic spliterator (built by our `Collection.spliterator`,
+            //    `Spliterators.spliterator`, etc.): field 0 is already the
+            //    backing Object[] — just snapshot it.
+            //  * Real-JDK Spliterator subclass (e.g. log4j's
+            //    `ServiceLoaderUtil$ServiceLoaderSpliterator`, whose field 0
+            //    is an `Iterator`, not an array). We can't read its private
+            //    layout; drain it via `forEachRemaining(Consumer)` into a
+            //    collector consumer whose `accept` natively appends to a
+            //    growing Object[].
             let spliterator = match args.first() {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
@@ -30058,9 +30887,14 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(stream))));
                 }
             };
-            let arr = match ctx.get_field(spliterator, 0) {
-                Value::Object(Some(a)) => a,
-                _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+            let field0 = ctx.get_field(spliterator, 0);
+            let arr = match field0 {
+                Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+                _ => {
+                    // Real Spliterator subclass — drain via a collecting
+                    // consumer.
+                    drain_spliterator(ctx, spliterator)?
+                }
             };
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -30100,6 +30934,92 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(stream))))
         },
     );
+
+    // Collector consumer used by `drain_spliterator`. Layout:
+    //   field 0: Object[] storage (capacity == array_length)
+    //   field 1: Int — current logical length
+    // `accept(Object)V` appends, growing the storage on demand.
+    r.register(
+        "rustjvm/internal/StreamCollector",
+        "accept",
+        "(Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            let mut len = match ctx.get_field(this, 1) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            let storage = match ctx.get_field(this, 0) {
+                Value::Object(Some(a)) => a,
+                _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16),
+            };
+            let cap = ctx.array_length(storage);
+            let storage = if len >= cap {
+                let new_cap = (cap * 2).max(16);
+                let bigger = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+                for i in 0..len {
+                    let v = ctx.get_array_element(storage, i);
+                    ctx.set_array_element(bigger, i, v);
+                }
+                ctx.set_field(this, 0, Value::Object(Some(bigger)));
+                bigger
+            } else {
+                storage
+            };
+            ctx.set_array_element(storage, len, elem);
+            len += 1;
+            ctx.set_field(this, 1, Value::Int(len as i32));
+            Ok(None)
+        },
+    );
+}
+
+/// Drain a (possibly real-JDK) Spliterator into a freshly-allocated
+/// Object[] by repeatedly invoking `tryAdvance(Consumer)` with a synthetic
+/// collector consumer. Used when `StreamSupport.stream` is handed a
+/// Spliterator whose field-0 layout we don't control (e.g. log4j's
+/// `ServiceLoaderUtil$ServiceLoaderSpliterator`).
+fn drain_spliterator(
+    ctx: &mut dyn NativeContext,
+    spliterator: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Allocate the collector consumer.
+    let collector = alloc_concurrent_synthetic(ctx, "rustjvm/internal/StreamCollector", 2);
+    let initial = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+    ctx.set_field(collector, 0, Value::Object(Some(initial)));
+    ctx.set_field(collector, 1, Value::Int(0));
+
+    // Drive the spliterator. Try forEachRemaining first (one virtual call),
+    // fall back to tryAdvance loop if forEachRemaining isn't usable.
+    // NOTE: `invoke_virtual` prepends the receiver itself — `args` must NOT
+    // include it. The previous version double-passed the receiver, producing
+    // a malformed 3-arg call for a 2-arg method, which silently dropped the
+    // collector and left the output array empty (the symptom that surfaced
+    // as the FORE-DBG trace and as `Stream.forEach` returning zero elements
+    // during WildFly's log4j init).
+    let _ = ctx.invoke_virtual(
+        spliterator,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        &[Value::Object(Some(collector))],
+    );
+
+    // Snapshot to an exactly-sized array.
+    let len = match ctx.get_field(collector, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let storage = match ctx.get_field(collector, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)),
+    };
+    let out = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+    for i in 0..len {
+        let v = ctx.get_array_element(storage, i);
+        ctx.set_array_element(out, i, v);
+    }
+    Ok(out)
 }
 
 // =============================================================================
@@ -34552,108 +35472,428 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     r.register(bi, "getBeanDescriptor", "()Ljava/beans/BeanDescriptor;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
-    r.register(bi, "getMethodDescriptors", "()[Ljava/beans/MethodDescriptor;", |ctx, _args| {
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
-        Ok(Some(Value::Object(Some(arr))))
+    // SPB.11: Spring's ExtendedBeanInfo constructor calls
+    // `delegate.getMethodDescriptors()` and then `findCandidateWriteMethods`
+    // (looking for set*-prefixed candidates) → `handleCandidateWriteMethod`
+    // which calls `pd.setWriteMethod(method)` on the matching
+    // SimplePropertyDescriptor. Returning an empty array here causes Spring
+    // to never wire setters into its SimplePropertyDescriptor instances, so
+    // `pd.getWriteMethod()` later returns null — surfaces as
+    // `NotWritablePropertyException` on `metadataReaderFactory` etc.
+    //
+    // Slot 1 of our BeanInfo holds an Object[] of MethodDescriptor mirrors
+    // (populated by `introspector_get_bean_info`). Each MethodDescriptor is
+    // a 1-slot synthetic with the underlying `java.lang.reflect.Method` at
+    // slot 0; the matching `MethodDescriptor.getMethod()` native is
+    // registered below.
+    r.register(bi, "getMethodDescriptors", "()[Ljava/beans/MethodDescriptor;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mds = ctx.get_field(this, 1);
+        match mds {
+            Value::Object(Some(_)) => Ok(Some(mds)),
+            _ => {
+                let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+                Ok(Some(Value::Object(Some(arr))))
+            }
+        }
+    });
+    // MethodDescriptor.getMethod() — synthetic overlay: the wrapped
+    // java.lang.reflect.Method lives at slot 0 of our 1-field synthetic.
+    r.register("java/beans/MethodDescriptor", "getMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Real-JDK MD has a `method` field; our synthetic stub stores the
+        // Method at slot 0. Try by name first; fall through to slot 0 when
+        // the by-name lookup misses (synthetic-stub case).
+        let by_name = ctx.get_field_by_name(this, "method");
+        if matches!(by_name, Value::Object(Some(_))) {
+            return Ok(Some(by_name));
+        }
+        Ok(Some(ctx.get_field(this, 0)))
     });
     r.register(bi, "getEventSetDescriptors", "()[Ljava/beans/EventSetDescriptor;", |ctx, _args| {
         let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // PropertyDescriptor = 4-field (name=0, readMethodName=1, writeMethodName=2, propertyTypeDesc=3)
+    // FeatureDescriptor.getName(): JDK declares `private String name` on
+    // FeatureDescriptor. Our synthetic PropertyDescriptors are allocated with
+    // a trailing overlay, and Spring wraps them in subclasses (e.g.
+    // ExtendedBeanInfo$SimplePropertyDescriptor) that allocate a LARGER
+    // object. We've observed that on the subclass instance the bytecode
+    // `getfield FeatureDescriptor.name` resolves to a slot that disagrees
+    // with what `setName(...)` wrote — getName() comes back null even though
+    // reflective `Field.get(name)` returns the value setName stored. The
+    // root-cause is a getfield index mismatch for the subclass layout; until
+    // that's untangled, intercept getName at the FeatureDescriptor level and
+    // resolve `name` via the dynamic-hierarchy lookup that *does* agree with
+    // setName/reflection. Without this Spring's
+    // ExtendedBeanInfo$PropertyDescriptorComparator NPEs because
+    // `pd.getName().compareTo(...)` sees null on both sides.
+    // SPB.11: Bypass Spring's ExtendedBeanInfoFactory.getBeanInfo, which
+    // wraps our delegate BeanInfo in `new ExtendedBeanInfo(delegate)` and
+    // re-creates each PropertyDescriptor as a `SimplePropertyDescriptor`.
+    // That wrapping leaves `SimplePropertyDescriptor.readMethod/writeMethod/
+    // propertyType` null (the 1-arg copy ctor only forwards to the JDK PD
+    // super-ctor and does not populate the Spring subclass's own fields),
+    // so downstream `getReadMethod/getWriteMethod/getPropertyType` all
+    // return null and Spring NPEs while sorting in
+    // `PropertyDescriptorComparator` or comparing types in
+    // `findExistingPropertyDescriptor`. Our delegate already exposes the
+    // setters/getters with proper Method mirrors — return it directly.
+    let factory_native = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
+        let cls = match args.get(1) {
+            Some(v) => v.clone(),
+            None => return Ok(Some(Value::Object(None))),
+        };
+        // Delegate straight to our Introspector.getBeanInfo native.
+        introspector_get_bean_info(ctx, &[cls])
+    };
+    r.register(
+        "org/springframework/beans/ExtendedBeanInfoFactory",
+        "getBeanInfo",
+        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
+        factory_native,
+    );
+    // SPB.11: Spring CIR also queries SimpleBeanInfoFactory (the fallback
+    // when no SpringFactoriesLoader-loaded BeanInfoFactory returns a
+    // BeanInfo). Its `PropertyDescriptorUtils.determineBasicProperties`
+    // path bypasses java.beans.Introspector entirely and builds Spring's
+    // own PDs — which BeanWrapperImpl then refuses to wrap (we've observed
+    // BeanWrapper.getPropertyDescriptors() returning an empty array, so
+    // `isWritableProperty("metadataReaderFactory")` returns false). Force
+    // the same delegate to feed CIR.
+    r.register(
+        "org/springframework/beans/SimpleBeanInfoFactory",
+        "getBeanInfo",
+        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
+        factory_native,
+    );
+
+    // Register on both FeatureDescriptor (where getName is declared) AND
+    // PropertyDescriptor (the typical invokevirtual call-site class). The
+    // VM's hierarchy-walk doesn't always reach our parent-class native, so
+    // duplicate the registration on the subclass call-site for safety.
+    r.register("java/beans/FeatureDescriptor", "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+
+    // PropertyDescriptor = 4-field
+    //   field 0: name (String)
+    //   field 1: readMethod (java.lang.reflect.Method or null)
+    //   field 2: writeMethod (java.lang.reflect.Method or null)
+    //   field 3: propertyType (java.lang.Class or null)
+    //
+    // Spring's BeanWrapperImpl checks `pd.getWriteMethod() != null` to decide
+    // whether a property is writable. Returning null here surfaces as
+    // `NotWritablePropertyException` even when the bean has a real setter, so
+    // we materialise real `java.lang.reflect.Method` mirrors below in
+    // `introspector_get_bean_info` and just hand them back here.
     let pd = "java/beans/PropertyDescriptor";
+    // Read our synthetic overlay slots that sit AFTER the real-JDK fields.
+    // See `introspector_get_bean_info` above for why we don't reuse slots 0..3.
     r.register(pd, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        // SPB.11: Prefer `FeatureDescriptor.name` (which `setName(...)` writes
+        // and reflective `Field.get(...)` agrees with). This matches both
+        // (a) our synthetic PDs (we populate `name` via `set_field_by_name`
+        // at construction) AND (b) subclasses whose super-ctor calls
+        // `setName(...)`. Subclass-safe via dynamic-hierarchy resolution.
+        Ok(Some(ctx.get_field_by_name(this, "name")))
     });
-    r.register(pd, "getReadMethod", "()Ljava/lang/reflect/Method;", |_ctx, _args| {
-        // Return null — caller should use the name string from field 1
-        Ok(Some(Value::Object(None)))
+
+    // SPB.11: Spring's `GenericTypeAwarePropertyDescriptor` (built by
+    // `CachedIntrospectionResults.buildGenericTypeAwarePropertyDescriptor`)
+    // stores its read/write methods in its own `readMethod`/`writeMethod`
+    // fields. We've observed that `getfield` on those fields returns null
+    // even when `Field.get(...)` reflectively returns the right Method —
+    // a field-slot mismatch in our class-layout computation for subclass
+    // fields. Force getReadMethod/getWriteMethod to consult the dynamic
+    // `readMethod`/`writeMethod` field via name-resolved lookup (which
+    // matches the slot that the ctor's `putfield` wrote to). Without this,
+    // `BeanWrapperImpl.isWritableProperty("metadataReaderFactory")` returns
+    // false on Spring Boot demo and surfaces as `NotWritablePropertyException`.
+    let gtapd = "org/springframework/beans/GenericTypeAwarePropertyDescriptor";
+    r.register(gtapd, "getReadMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "readMethod")))
     });
-    r.register(pd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(gtapd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "writeMethod")))
     });
-    r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(gtapd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pt = ctx.get_field_by_name(this, "propertyType");
+        if matches!(pt, Value::Object(Some(_))) {
+            return Ok(Some(pt));
+        }
+        // Fallback: derive from write method's parameter type, then read
+        // method's return type (matches JDK findPropertyType behaviour).
+        let wm = ctx.get_field_by_name(this, "writeMethod");
+        if let Value::Object(Some(m)) = wm {
+            // We can't easily call Method.getParameterTypes() here without
+            // recursion machinery, so leave null — the read path below will
+            // catch the common cases.
+            let _ = m;
+        }
+        Ok(Some(pt))
+    });
+    r.register(pd, "getReadMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base + 1)))
+    });
+    r.register(pd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // SPB.11: For subclasses (GTAPD etc.) prefer their own `writeMethod`
+        // instance field (resolved via dynamic-hierarchy lookup, which
+        // agrees with the slot the subclass ctor's putfield wrote to). For
+        // our synthetic PDs the by-name lookup misses → fall back to the
+        // overlay slot at `base + 2` populated in `introspector_get_bean_info`.
+        let by_name = ctx.get_field_by_name(this, "writeMethod");
+        if matches!(by_name, Value::Object(Some(_))) {
+            return Ok(Some(by_name));
+        }
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base + 2)))
+    });
+    r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let cid = ctx.class_id_of_object(this);
+        let base = ctx.class_num_total_fields(cid);
+        Ok(Some(ctx.get_field(this, base + 3)))
     });
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.
 /// BeanInfo = 2-field synthetic (propertyDescriptors=0 PD[], beanDescriptor=1)
-/// PropertyDescriptor = 4-field (name=0, readMethod=1 String, writeMethod=2 String, propertyType=3 String)
+/// PropertyDescriptor = 4-field (name=0, readMethod=1 Method, writeMethod=2 Method, propertyType=3 Class)
+///
+/// Walks the target class plus its superclasses so that inherited setters
+/// (e.g. `ConfigurationClassPostProcessor.setMetadataReaderFactory`, declared
+/// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
+/// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let trace = false;
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
-        _ => return Ok(Some(Value::Object(None))),
+        other => {
+            if trace { eprintln!("BI-TRACE: arg0 unexpected: {:?}", other); }
+            return Ok(Some(Value::Object(None)));
+        }
     };
 
-    let class_id = ctx.class_id_of_object(class_mirror);
-    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    if class_name.is_empty() {
-        return Ok(Some(Value::Object(None)));
+    // The argument is a `Class` *mirror*, so `class_id_of_object` returns
+    // `java/lang/Class` itself. We need the represented class — use
+    // `mirror_class_id`, which consults the VM's mirror→ClassId table.
+    let class_id = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
+        Some(c) => c,
+        None => {
+            if trace { eprintln!("BI-TRACE: mirror_class_id returned None"); }
+            // Empty BeanInfo is safer than null (matches JDK behaviour for
+            // classes with no introspectable bean properties).
+            let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 2);
+            ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
+            return Ok(Some(Value::Object(Some(bean_info))));
+        }
+    };
+    if trace {
+        let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
+        eprintln!("BI-TRACE: class_id resolved -> {}", cn);
     }
 
-    let methods = ctx.declared_methods(class_id);
+    // Discover properties from getters/setters across the class + superclasses.
+    // Stored as (name, getter_method_mirror, setter_method_mirror, propertyType_mirror).
+    let mut properties: Vec<(String, Option<ObjectRef>, Option<ObjectRef>, Option<ObjectRef>)> =
+        Vec::new();
 
-    // Discover properties from getters/setters
-    let mut properties: Vec<(String, Option<String>, Option<String>, String)> = Vec::new(); // (name, getter, setter, type_desc)
+    let mut current = Some(class_id);
+    let mut seen_method_keys: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    while let Some(cid) = current {
+        // Resolve the mirror for this declaring class so the Method mirror
+        // points at the class that actually declares the method.
+        let declaring_mirror = ctx.get_class_mirror(cid);
 
-    for method in &methods {
-        let name = &method.name;
-        let desc = &method.descriptor;
+        let methods = ctx.declared_methods(cid);
+        if trace {
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            eprintln!("BI-TRACE:   walking {} ({} methods)", cn, methods.len());
+        }
+        for method in &methods {
+            let name = &method.name;
+            let desc = &method.descriptor;
+            // Dedupe across inheritance: subclass override wins.
+            let key = (name.clone(), desc.clone());
+            if !seen_method_keys.insert(key) {
+                continue;
+            }
 
-        // getter: getXxx() -> T or isXxx() -> boolean
-        if (name.starts_with("get") && name.len() > 3 && desc.starts_with("()"))
-            || (name.starts_with("is") && name.len() > 2 && desc == "()Z")
-        {
-            let prop_start = if name.starts_with("get") { 3 } else { 2 };
-            let prop_name = decapitalize(&name[prop_start..]);
-            let ret_type = desc.split(')').nth(1).unwrap_or("Ljava/lang/Object;").to_string();
+            // getter: getXxx() -> T (T != void) or isXxx() -> boolean.
+            let is_get = name.starts_with("get") && name.len() > 3 && desc.starts_with("()")
+                && !desc.ends_with(")V");
+            let is_is = name.starts_with("is") && name.len() > 2 && desc == "()Z";
+            if is_get || is_is {
+                let prop_start = if is_get { 3 } else { 2 };
+                let prop_name = decapitalize(&name[prop_start..]);
+                let ret_desc = desc.split(')').nth(1).unwrap_or("Ljava/lang/Object;").to_string();
+                let ret_mirror =
+                    crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &ret_desc);
+                let mm = crate::jmx_openmbean::build_method_mirror(
+                    ctx,
+                    declaring_mirror,
+                    name,
+                    desc,
+                    method.access_flags,
+                );
+                if let Some(existing) =
+                    properties.iter_mut().find(|(n, _, _, _)| *n == prop_name)
+                {
+                    if existing.1.is_none() {
+                        existing.1 = Some(mm);
+                    }
+                    if existing.3.is_none() {
+                        existing.3 = Some(ret_mirror);
+                    }
+                } else {
+                    properties.push((prop_name, Some(mm), None, Some(ret_mirror)));
+                }
+            }
 
-            if let Some(existing) = properties.iter_mut().find(|(n, _, _, _)| *n == prop_name) {
-                existing.1 = Some(name.clone());
-            } else {
-                properties.push((prop_name, Some(name.clone()), None, ret_type));
+            // setter: setXxx(T) -> void with exactly one parameter.
+            if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
+                // Validate it's a single-parameter setter and extract that
+                // parameter's descriptor token.
+                let (params, _ret) =
+                    crate::jmx_openmbean::parse_method_descriptor_pub(desc);
+                if params.len() != 1 {
+                    continue;
+                }
+                let prop_name = decapitalize(&name[3..]);
+                let param_mirror =
+                    crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &params[0]);
+                let mm = crate::jmx_openmbean::build_method_mirror(
+                    ctx,
+                    declaring_mirror,
+                    name,
+                    desc,
+                    method.access_flags,
+                );
+                if let Some(existing) =
+                    properties.iter_mut().find(|(n, _, _, _)| *n == prop_name)
+                {
+                    if existing.2.is_none() {
+                        existing.2 = Some(mm);
+                    }
+                    if existing.3.is_none() {
+                        existing.3 = Some(param_mirror);
+                    }
+                } else {
+                    properties.push((prop_name, None, Some(mm), Some(param_mirror)));
+                }
             }
         }
-
-        // setter: setXxx(T) -> void
-        if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
-            let prop_name = decapitalize(&name[3..]);
-            // Extract parameter type from descriptor like "(Ljava/lang/String;)V" -> "Ljava/lang/String;"
-            let param_type = desc.trim_start_matches('(').split(')').next().unwrap_or("").to_string();
-
-            if let Some(existing) = properties.iter_mut().find(|(n, _, _, _)| *n == prop_name) {
-                existing.2 = Some(name.clone());
-            } else {
-                properties.push((prop_name, None, Some(name.clone()), param_type));
-            }
-        }
+        current = ctx.superclass_of(cid);
     }
 
-    // Build PropertyDescriptor array
+    // Always include the synthetic "class" property (java.beans includes it
+    // because every Object has `getClass()`). Spring's reflection caches key
+    // off PD presence, so omitting it can mislead callers.
+    if !properties.iter().any(|(n, _, _, _)| n == "class") {
+        let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
+            Ok(cid) => ctx.get_class_mirror(cid),
+            Err(_) => class_mirror,
+        };
+        let getter = crate::jmx_openmbean::build_method_mirror(
+            ctx,
+            class_mirror,
+            "getClass",
+            "()Ljava/lang/Class;",
+            0x0001, /* ACC_PUBLIC */
+        );
+        properties.push(("class".to_string(), Some(getter), None, Some(class_class_mirror)));
+    }
+
+    // Build PropertyDescriptor array.
+    //
+    // CRITICAL: The real-JDK `PropertyDescriptor` class layout has typed
+    // fields at slots 0..N (e.g. an `int` flag at slot 2). Using
+    // `set_field(pd, k, Value::Object(...))` runs through the
+    // descriptor-aware write path which *coerces* our Object reference into
+    // whatever primitive type the real slot declares (we observed slot 2
+    // storing `Int(-1435209072)` after writing a Method mirror). Writing to
+    // those slots is therefore unusable for our synthetic accessors.
+    //
+    // Workaround: allocate the object with `real + 4` slots and stash our
+    // (name, readMethod, writeMethod, propertyType) tuple at the synthetic
+    // overlay slots `real..real+3`. The PD natives below (`getName`,
+    // `getReadMethod`, `getWriteMethod`, `getPropertyType`) read from the
+    // same overlay offsets via `class_num_total_fields(class_id)`. The real
+    // JDK fields are left alone (so any JDK bytecode that does still run
+    // against this object sees its defaults rather than coerced garbage).
+    let pd_class_id = ctx
+        .ensure_class_initialized("java/beans/PropertyDescriptor")
+        .ok();
+    let pd_real_fields = match pd_class_id {
+        Some(cid) => ctx.class_num_total_fields(cid),
+        None => 0,
+    };
     let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), properties.len());
-    for (i, (prop_name, getter, setter, type_desc)) in properties.iter().enumerate() {
-        let pd = alloc_concurrent_synthetic(ctx, "java/beans/PropertyDescriptor", 4);
+    for (i, (prop_name, getter, setter, type_mirror)) in properties.iter().enumerate() {
+        let pd = match pd_class_id {
+            Some(cid) => ctx.alloc_object(cid, pd_real_fields + 4),
+            None => alloc_concurrent_synthetic(ctx, "java/beans/PropertyDescriptor", 4),
+        };
         let name_str = ctx.create_string(prop_name);
-        ctx.set_field(pd, 0, Value::Object(Some(name_str)));
-        if let Some(g) = getter {
-            let gs = ctx.create_string(g);
-            ctx.set_field(pd, 1, Value::Object(Some(gs)));
-        }
-        if let Some(s) = setter {
-            let ss = ctx.create_string(s);
-            ctx.set_field(pd, 2, Value::Object(Some(ss)));
-        }
-        let ts = ctx.create_string(type_desc);
-        ctx.set_field(pd, 3, Value::Object(Some(ts)));
+        let base = pd_real_fields;
+        ctx.set_field(pd, base + 0, Value::Object(Some(name_str)));
+        ctx.set_field(pd, base + 1, Value::Object(*getter));
+        ctx.set_field(pd, base + 2, Value::Object(*setter));
+        ctx.set_field(pd, base + 3, Value::Object(*type_mirror));
+        // ALSO populate JDK's real `FeatureDescriptor.name` field so that
+        // bytecode `PropertyDescriptor.getName()` (inherited from
+        // FeatureDescriptor) returns the right value. Without this, Spring's
+        // `ExtendedBeanInfo$PropertyDescriptorComparator.compare` (which calls
+        // `pd.getName().compareTo(...)`) NPEs because FeatureDescriptor.name
+        // is null on our synthetic PDs. We have no native override for
+        // getName because the method is declared on FeatureDescriptor — JDK
+        // bytecode reads its private field directly.
+        ctx.set_field_by_name(pd, "name", Value::Object(Some(name_str)));
         ctx.set_array_element(pd_arr, i, Value::Object(Some(pd)));
     }
 
-    // Build BeanInfo
+    // SPB.11: Build MethodDescriptor[] populated with each setter Method
+    // mirror. Spring's ExtendedBeanInfo iterates these (via
+    // `findCandidateWriteMethods`) to discover candidate setters, and then
+    // calls `pd.setWriteMethod(method)` on the matching SimplePropertyDescriptor
+    // — without that callback, SPD's `this.writeMethod` field is left null
+    // and `pd.getWriteMethod()` returns null, surfacing as
+    // `NotWritablePropertyException` in Spring's BeanWrapperImpl. Each MD
+    // is a 1-slot synthetic with the wrapped Method at the JDK-named
+    // `method` field (resolved by name in the MethodDescriptor.getMethod
+    // native above; the synthetic stub's slot 0 IS the `method` field).
+    let setter_methods: Vec<ObjectRef> = properties
+        .iter()
+        .filter_map(|(_, _, setter, _)| *setter)
+        .collect();
+    let md_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), setter_methods.len());
+    for (i, m) in setter_methods.iter().enumerate() {
+        let md = alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1);
+        // Write to the JDK-named field if it exists, falling back to slot 0
+        // on the synthetic stub.
+        ctx.set_field_by_name(md, "method", Value::Object(Some(*m)));
+        ctx.set_field(md, 0, Value::Object(Some(*m)));
+        ctx.set_array_element(md_arr, i, Value::Object(Some(md)));
+    }
+
+    // Build BeanInfo: slot 0 = PD[], slot 1 = MethodDescriptor[].
     let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 2);
     ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
+    ctx.set_field(bean_info, 1, Value::Object(Some(md_arr)));
 
     Ok(Some(Value::Object(Some(bean_info))))
 }

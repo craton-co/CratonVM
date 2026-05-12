@@ -539,12 +539,6 @@ fn native_properties_load(
         return Ok(None);
     }
     let parsed = parse_properties(&bytes);
-    eprintln!(
-        "[PROPS-LOAD] obj={:?} stream_bytes={} parsed_entries={}",
-        this,
-        bytes.len(),
-        parsed.len()
-    );
     props_diag_eprintln!("[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes", parsed.len(), bytes.len());
     for (k, v) in &parsed {
         if k.contains("ApplicationContext") || k.contains("ContextFactory") {
@@ -695,17 +689,17 @@ fn native_properties_get_property_1(
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(this, &key) {
-        eprintln!(
-            "[PROPS-GET] this={:?} key={:?} -> sidetable hit ({} bytes)",
-            this,
-            key,
-            v.len()
+        tracing::debug!(
+            target: "rustjvm_vm::props_sidetable",
+            ?this, key = %key, bytes = v.len(),
+            "PROPS-GET sidetable hit"
         );
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
-    eprintln!(
-        "[PROPS-GET] this={:?} key={:?} -> sidetable MISS, falling back to system",
-        this, key
+    tracing::debug!(
+        target: "rustjvm_vm::props_sidetable",
+        ?this, key = %key,
+        "PROPS-GET sidetable MISS, falling back to system"
     );
     match ctx
         .get_system_property(&key)
@@ -914,12 +908,6 @@ fn build_key_set(
         elems.push(Value::Object(Some(s)));
     }
     let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
-    eprintln!(
-        "[KEYSET-DBG] build_key_set this={:?} keys={} set={:?}",
-        this,
-        snapshot.len(),
-        set
-    );
     set
 }
 
@@ -1025,7 +1013,29 @@ fn native_properties_entry_set(
     for (k, _v) in snapshot.iter().take(5) {
         props_diag_eprintln!("[PROPS-DBG]   entry key={}", k);
     }
-    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
+    // Build a real-JDK HashSet by allocating it via new_object + <init>
+    // and populating via HashSet.add(Object). This routes through real
+    // HashMap.put bytecode, ensuring the bucket array (`table`) is populated
+    // in a way that real-JDK HashSet/Map iterators can walk. Going through
+    // `make_hashset_with_elements`'s raw-field path produced a HashMap whose
+    // `size` field reported correctly but whose `table` did not align with
+    // what the real-JDK iterator expected, so iteration silently yielded 0
+    // entries — breaking Spring's SpringFactoriesLoader (which iterates
+    // properties.entrySet() to build the EnableAutoConfiguration list).
+    let set = match ctx.new_object("java/util/HashSet") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            // Fallback: synthetic empty HashSet via collections helper.
+            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+    };
+    let _ = ctx.invoke(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
     for (k, v) in &snapshot {
         let entry = crate::alloc_concurrent_synthetic(
             ctx,
@@ -1034,11 +1044,17 @@ fn native_properties_entry_set(
         );
         let ks = ctx.create_string(k);
         let vs = ctx.create_string(v);
-        ctx.set_field(entry, 0, Value::Object(Some(ks)));
-        ctx.set_field(entry, 1, Value::Object(Some(vs)));
-        elems.push(Value::Object(Some(entry)));
+        // Use field-by-name to handle any inherited-field offset (real-JDK
+        // SimpleImmutableEntry has only `key` and `value`, but be safe).
+        ctx.set_field_by_name(entry, "key", Value::Object(Some(ks)));
+        ctx.set_field_by_name(entry, "value", Value::Object(Some(vs)));
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(entry))],
+        );
     }
-    let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1288,6 +1304,128 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiConsumer;)V",
         native_properties_for_each,
     );
+    // Spring Boot 4 `AutoConfigurationMetadataLoader.loadMetadata` aggregates
+    // `META-INF/spring-autoconfigure-metadata.properties` from every classpath
+    // jar by calling `aggregate.putAll(perJarProperties)` for each loaded
+    // file.  Because Properties stores its entries in the side-table (not in
+    // the inherited `HashMap` buckets), the generic `Map.putAll` walker in
+    // `native_map_put_all` finds zero entries on the source Properties and
+    // the aggregate stays empty.  Result: every `OnClassCondition`/
+    // `OnWebApplicationCondition` filter sees an empty
+    // `AutoConfigurationMetadata`, all `ConditionalOnClass`/`ConditionalOnWeb`
+    // lookups return null, and downstream auto-config classes (e.g.
+    // `TomcatServletWebServerAutoConfiguration`) get dropped — Spring then
+    // fails with `MissingWebServerFactoryBeanException`.
+    //
+    // Side-table-aware putAll: snapshot the source's side-table and store
+    // each (k,v) into `this`'s side-table directly.
+    registry.register(
+        "java/util/Properties",
+        "putAll",
+        "(Ljava/util/Map;)V",
+        native_properties_put_all,
+    );
+}
+
+/// Native `Properties.putAll(Map)` — side-table-aware copy.
+///
+/// The generic `Map.putAll` walker in `native-collections` enumerates the
+/// source by reading its `HashMap` buckets / `LinkedHashMap` insertion-order
+/// list.  Properties keep their entries in the per-object side-table, so a
+/// generic walk sees zero entries and the destination Properties stays
+/// empty.  This override snapshots the source side-table and stores each
+/// `(k,v)` into the destination via `put_kv`.
+fn native_properties_put_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // 1) Side-table snapshot — covers Properties->Properties putAll (the
+    //    dominant case that previously silently dropped all entries because
+    //    Properties stores its data outside the inherited HashMap buckets).
+    let snapshot = snapshot_kv(other);
+    if !snapshot.is_empty() {
+        for (k, v) in snapshot {
+            put_kv(this, &k, &v);
+        }
+        return Ok(None);
+    }
+    // 2) Fallback — source is a regular Map (HashMap/LinkedHashMap).  Walk
+    //    its entries through the generic Map.entrySet() so we don't depend
+    //    on internal field layouts, then mirror each (k,v) into `this`'s
+    //    side-table as well as the inherited Hashtable buckets.
+    let entries_obj = match ctx.invoke(
+        "java/util/Map",
+        "entrySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(other))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    let it = match ctx.invoke(
+        "java/util/Set",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(entries_obj))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    loop {
+        let has_next = match ctx.invoke(
+            "java/util/Iterator",
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(it))],
+        ) {
+            Ok(Some(Value::Int(n))) => n != 0,
+            _ => false,
+        };
+        if !has_next {
+            break;
+        }
+        let entry = match ctx.invoke(
+            "java/util/Iterator",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(it))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => break,
+        };
+        let key_obj = match ctx.invoke(
+            "java/util/Map$Entry",
+            "getKey",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(entry))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let val_obj = match ctx.invoke(
+            "java/util/Map$Entry",
+            "getValue",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(entry))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let k = ctx.read_string(key_obj).unwrap_or_default();
+        let v = ctx.read_string(val_obj).unwrap_or_default();
+        if !k.is_empty() {
+            put_kv(this, &k, &v);
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

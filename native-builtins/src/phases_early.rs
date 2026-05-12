@@ -719,16 +719,10 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
 
-    // Arrays.stream(Object[]) — convenience for Stream.of
-    r.register(arrays, "stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
-        ctx.set_field(stream, 0, Value::Object(Some(arr)));
-        Ok(Some(Value::Object(Some(stream))))
-    });
+    // Arrays.stream(Object[]) intercept lives in real-JDK mode via
+    // `register_essential_natives` (see lib.rs). This function is part of
+    // `register_enterprise_final_natives` which is gated on the
+    // `synthetic-jdk` feature and so does not run in real-JDK mode.
 
     // Arrays.stream(int[]) → IntStream
     r.register(arrays, "stream", "([I)Ljava/util/stream/IntStream;", |ctx, args| {
@@ -3098,6 +3092,27 @@ pub(crate) fn register_enum_set_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "clear", "()V", native_es_clear);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_es_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_es_to_array);
+    // S111r32 — typed `toArray(T[])` overload. Spring's
+    // `MergedAnnotation$Adapt.values(boolean, boolean)` builds an EnumSet,
+    // adds CLASS_TO_STRING, then calls `set.toArray(new Adapt[0])` to get
+    // back a `[LAdapt;` array. Without this override, the call falls through
+    // to the inherited `AbstractCollection.toArray(T[])` — which uses field
+    // `elementData` (only present on ArrayList) — and returns an empty
+    // array. The downstream `MergedAnnotation.asMap(factory, adapts)`
+    // therefore sees an empty `adapts` list and skips the
+    // `Adapt.CLASS_TO_STRING` conversion in `TypeMappedAnnotation.adapt`,
+    // leaving `Class[]` (e.g. `basePackageClasses` on `@ComponentScan`) in
+    // the resulting `AnnotationAttributes`. Spring Boot's
+    // `ConfigurationWarningsApplicationContextInitializer` then calls
+    // `attrs.getStringArray("basePackageClasses")` and throws
+    // `IllegalArgumentException: Attribute 'basePackageClasses' is of type
+    // Class[], but String[] was expected`, blocking eureka startup.
+    r.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_es_to_array_typed,
+    );
     r.register(c, "clone", "()Ljava/lang/Object;", native_es_clone);
 }
 
@@ -3269,6 +3284,55 @@ fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(empty))))
+}
+
+/// `EnumSet.toArray(T[] dest)` — JLS-compliant typed overload. Reuses the
+/// caller-provided `dest` if it's at least `size` long; otherwise allocates
+/// a new array of the same component class as `dest`. Copies our backing
+/// elements into slots `0..size` and writes a trailing `null` if `dest` is
+/// strictly larger than `size`.
+fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let template = args.get(1).copied().unwrap_or(Value::Object(None));
+    let backing = match es_get_backing(ctx, this) {
+        Some(b) => b,
+        None => {
+            // No backing — return the template (or an empty Object[]).
+            return Ok(Some(template));
+        }
+    };
+    let size = match ctx.get_field(backing, 1) {
+        Value::Int(n) => n.max(0) as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(backing, 0) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    // Pick destination: reuse template if big enough, else allocate fresh
+    // with the same component as template (or a plain Object[] if template
+    // is null).
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        Value::Object(Some(arr)) => {
+            // Template's component class lives on its array header.
+            let comp_cid = ctx.class_id_of_object(arr);
+            ctx.new_ref_array(comp_cid, size)
+        }
+        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+    };
+    if let Some(d) = data {
+        let copy = size.min(ctx.array_length(d));
+        for i in 0..copy {
+            ctx.set_array_element(target, i, ctx.get_array_element(d, i));
+        }
+    }
+    // JLS: write null at index `size` if target is longer.
+    let target_len = ctx.array_length(target);
+    if target_len > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    Ok(Some(Value::Object(Some(target))))
 }
 
 fn native_es_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14520,7 +14584,7 @@ fn register_scanner_find_within_horizon(r: &mut NativeMethodRegistry) {
 fn scanner_find_within_horizon_impl(
     ctx: &mut dyn NativeContext,
     this: rustjvm_types::ObjectRef,
-    regex: regex::Regex,
+    regex: crate::JavaRegex,
     horizon: i32,
 ) -> MethodCallResult {
     if horizon < 0 {
@@ -14561,10 +14625,9 @@ fn scanner_find_within_horizon_impl(
     let hay = &source[pos..window_end];
     match regex.find(hay) {
         Some(m) => {
-            let matched = m.as_str().to_string();
-            let new_pos = pos + m.end();
+            let new_pos = pos + m.end;
             ctx.set_field(this, SC_FIELD_POS, Value::Int(new_pos as i32));
-            Ok(Some(Value::Object(Some(ctx.create_string(&matched)))))
+            Ok(Some(Value::Object(Some(ctx.create_string(&m.text)))))
         }
         None => Ok(Some(Value::Object(None))),
     }

@@ -1119,6 +1119,31 @@ pub fn execute(
                 if let Some(Value::Object(Some(recv_obj))) = args.first().copied() {
                     let recv_cid = shared.heap.class_id_of(recv_obj);
                     let recv_kind = shared.heap.kind_of(recv_obj);
+                    // Round 7 — receiver-is-lambda-proxy rescue. When an
+                    // invokeinterface lands on an interface declaration with no
+                    // Code (e.g. `CacheOverride.close()V`) but the receiver is
+                    // a lambda proxy implementing that interface (e.g.
+                    // `SoftReferenceConfigurationPropertyCache#NOOP`,
+                    // declared as `CacheOverride o = () -> {}`), route through
+                    // try_lambda_dispatch so the proxy's SAM impl_handle runs
+                    // instead of throwing AbstractMethodError.
+                    let recv_is_lambda = shared
+                        .lambda_proxies
+                        .read()
+                        .contains_key(&recv_cid);
+                    if recv_is_lambda {
+                        let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+                        if let Some(inner) = try_lambda_dispatch(
+                            shared,
+                            thread,
+                            recv_obj,
+                            recv_cid,
+                            method_name,
+                            rest,
+                        )? {
+                            return Ok(inner);
+                        }
+                    }
                     // Path A — receiver carries a real (non-zero) class_id.
                     //   Walk its runtime-class chain for a same-signature
                     //   override that has Code (or a registered native) and
@@ -2769,6 +2794,59 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
                     let value = frame.stack.pop_unchecked();
+                    if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
+                        let cn = frame.class_name();
+                        let mn = frame.method_name();
+                        let interesting = (cn.contains("FilteringSpringBootCondition") && mn == "match")
+                            || (cn.contains("ImportCandidates") && (mn == "getCandidates" || mn == "readCandidateConfigurations" || mn == "load" || mn == "stripComment"))
+                            || (cn.contains("AutoConfigurationImportSelector") && (mn == "removeDuplicates" || mn == "getCandidateConfigurations" || mn == "getAutoConfigurationImportFilters" || mn == "getExclusions"))
+                            || (cn.contains("ConfigurationClassFilter") && mn == "filter")
+                            || (cn.contains("AutoConfigurationEntry") && mn == "getConfigurations");
+                        if interesting {
+                            let extra = match &value {
+                                Value::Object(Some(o)) => {
+                                    let r = *o;
+                                    let cid = shared.heap.class_id_of(r);
+                                    let kind = shared.heap.kind_of(r);
+                                    // Try to read as String first
+                                    if let Some(s) = crate::vm::read_java_string(&shared.heap, r) {
+                                        format!(" cid={:?} kind={:?} STRING=\"{}\"", cid, kind, s)
+                                    } else if matches!(kind, crate::memory::heap::ObjectKind::Object) {
+                                        // Read ArrayList-style 'size' field heuristically — sample
+                                        // field 0..3 to find any Int-typed field
+                                        let mut fields_desc = String::new();
+                                        for fi in 0..6usize {
+                                            let v = shared.heap.get_field(r, fi);
+                                            fields_desc.push_str(&format!("f{}={:?} ", fi, v));
+                                        }
+                                        format!(" cid={:?} kind={:?} fields=[{}]", cid, kind, fields_desc)
+                                    } else {
+                                        // Try array
+                                        let len = shared.heap.array_length(r);
+                                        let mut samples = String::new();
+                                        let to_read = len.min(20);
+                                        for i in 0..to_read {
+                                            match shared.heap.get_array_element(r, i) {
+                                                Ok(Value::Int(v)) => samples.push_str(&format!("{},", v)),
+                                                Ok(Value::Object(Some(oo))) => {
+                                                    if let Some(s) = crate::vm::read_java_string(&shared.heap, oo) {
+                                                        samples.push_str(&format!("\"{}\",", s));
+                                                    } else {
+                                                        samples.push_str("O,");
+                                                    }
+                                                }
+                                                Ok(Value::Object(None)) => samples.push_str("N,"),
+                                                _ => samples.push('?'),
+                                            }
+                                        }
+                                        format!(" cid={:?} kind={:?} array_len={} samples=[{}]", cid, kind, len, samples)
+                                    }
+                                }
+                                _ => String::new(),
+                            };
+                            eprintln!("[SBF-RET] {}.{} -> {:?}{}", cn, mn, value, extra);
+                        }
+                    }
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent
                         pop_and_recycle_frame(shared, thread);
@@ -4262,6 +4340,23 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
         let tid = thread.thread_id.0;
         crate::runtime::jvmti::fire_method_entry(tid, method_id);
     }
+    if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
+        let last = thread.frames.len() - 1;
+        let frame_ref = &thread.frames[last];
+        let cn = frame_ref.class_name();
+        let mn = frame_ref.method_name();
+        if cn.contains("FilteringSpringBootCondition")
+            || cn.contains("OnClassCondition")
+            || cn.contains("OnBeanCondition")
+            || cn.contains("OnWebApplicationCondition")
+            || cn.contains("AutoConfigurationImportSelector")
+            || cn.contains("AutoConfigurationImportFilter")
+            || (cn.contains("SpringFactoriesLoader") && (mn == "loadFactories" || mn == "loadFactoryNames" || mn == "load"))
+            || cn.contains("ImportCandidates")
+        {
+            eprintln!("[SBF-TRACE] enter {}.{}{}", cn, mn, frame_ref.method_descriptor());
+        }
+    }
 }
 
 /// Convert a [`Value`] to the JVMTI-flavoured [`LocalValue`].
@@ -4638,7 +4733,10 @@ fn execute_instruction(
             // Reference array store — needs write barrier for generational GC
             let value = thread.frames[frame_idx].stack.pop()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             // SATB barrier: log old array element before overwriting
             // Widening: index conversion
             if let Ok(old_elem) = shared.heap.get_array_element(array_ref, index as usize) {
@@ -4659,7 +4757,10 @@ fn execute_instruction(
         | Instruction::Sastore => {
             let value = thread.frames[frame_idx].stack.pop()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
@@ -4673,7 +4774,10 @@ fn execute_instruction(
         Instruction::Lastore => {
             let v = thread.frames[frame_idx].stack.pop_long()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Long(v))
@@ -4682,7 +4786,10 @@ fn execute_instruction(
         Instruction::Dastore => {
             let d = thread.frames[frame_idx].stack.pop_double()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -5735,6 +5842,17 @@ fn execute_instruction(
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
+            // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
+            if class_name == "java/util/NoSuchElementException"
+                && std::env::var("RUSTJVM_NSEE_TRACE").is_ok()
+            {
+                eprintln!("[NSEE-TRACE] new java/util/NoSuchElementException at:");
+                let cm = shared.class_manager.read();
+                for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                    let cn = cm.get_class(f.class_id).map(|c| c.name.clone()).unwrap_or_default();
+                    eprintln!("[NSEE-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                }
+            }
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -5818,10 +5936,24 @@ fn execute_instruction(
             let current_class_name = shared.class_manager.read()
                 .get_class(class_id)
                 .map(|c| c.name.to_string()).unwrap_or_default();
-            let arr_ref = pop_object_ref_ctx(
+            let mname = thread.frames[frame_idx].method_name().to_string();
+            let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
+            // S111r14 diag: print full Java stack trace on arraylength failure
+            let arr_ref = match pop_object_ref_ctx(
                 &mut thread.frames[frame_idx].stack,
-                Some(format!("arraylength null (in {current_class_name} pc={pc})")),
-            )?;
+                Some(format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})")),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+                        eprintln!("[ARRAYLEN-DIAG] failure in {current_class_name}.{mname}{mdesc} pc={pc}");
+                        for (i, f) in thread.frames.iter().enumerate().rev() {
+                            eprintln!("  frame[{i}]: {}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             let len = shared.heap.array_length(arr_ref);
             thread.frames[frame_idx]
                 .stack
@@ -5919,6 +6051,42 @@ fn execute_instruction(
                                     .unwrap_or_default();
                                 eprintln!("IAE-ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                             }
+                        }
+                    }
+                    // RUSTJVM_DBG_ATHROW=1 — env-gated dump of every Java
+                    // exception throw (class name, detailMessage, and a
+                    // short stack trace). Useful when an exception is
+                    // caught by an outer handler that swallows it and the
+                    // app exits silently (Kafka 4.2.0 main()'s catch-all
+                    // around buildServer/startup is the canonical case).
+                    if std::env::var("RUSTJVM_DBG_ATHROW").is_ok() {
+                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(exc_class_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        let mut msg = String::from("<no msg>");
+                        for fi in 0..8 {
+                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi) {
+                                if let Some(s) = read_java_string(&shared.heap, msg_ref) {
+                                    if !s.is_empty() {
+                                        msg = format!("field{fi}={s}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("ATHROW class={exc_class_name} msg={msg:?}");
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(f.class_id)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            eprintln!("  ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                         }
                     }
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
@@ -6144,7 +6312,10 @@ fn execute_instruction(
 
         // -- Monitor --
         Instruction::Monitorenter => {
-            let obj_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let obj_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("monitorenter in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             let mon_start = std::time::Instant::now();
             shared.monitors.enter(obj_ref, thread.thread_id);
             let mon_dur = mon_start.elapsed();
@@ -6166,7 +6337,10 @@ fn execute_instruction(
             }
         }
         Instruction::Monitorexit => {
-            let obj_ref = pop_object_ref(&mut thread.frames[frame_idx].stack)?;
+            let _diag_pc = thread.frames[frame_idx].pc;
+            let _diag_method = thread.frames[frame_idx].method_name().to_string();
+            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            let obj_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("monitorexit in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
             shared.monitors.exit(obj_ref, thread.thread_id)?;
         }
 
@@ -7659,6 +7833,54 @@ fn execute_invoke(
                     // (m.getClassLoader() NPEs). Fix lives in
                     // `native-builtins/src/lib.rs` as a native override that
                     // treats null module as `isSystem=true`.
+                    if std::env::var("RUSTJVM_DBG_NPE_INVOKE").is_ok() {
+                        eprintln!("[NPE-DBG] invokevirtual null receiver: {}.{}", method_class_name, method_name);
+                    }
+                    // Round 63 — `org/springframework/core/convert/support/
+                    // GenericConversionService$Converters.getClassHierarchy`
+                    // dereferences `Class.componentType()` directly on the
+                    // result of `addToClassHierarchy`, which can leak null
+                    // into the local list (Spring's `addToClassHierarchy`
+                    // never re-asserts non-null after `arrayType` /
+                    // `resolvePrimitiveIfNecessary`). On that specific
+                    // path, the JDK contract for `componentType()` —
+                    // "returns null if this Class does not represent an
+                    // array class" — gives us a defensible null-tolerant
+                    // shape: treat `null.componentType()` as null, and
+                    // similarly treat `null.getSuperclass()` /
+                    // `null.arrayType()` as null and `null.getInterfaces()`
+                    // as the empty `Class[]`. The hierarchy walk then
+                    // simply skips the spurious null entry.
+                    if &*method_class_name == "java/lang/Class" {
+                        if &*method_name == "componentType"
+                            || &*method_name == "getComponentType"
+                            || &*method_name == "getSuperclass"
+                            || &*method_name == "arrayType"
+                        {
+                            thread.frames[frame_idx]
+                                .stack
+                                .push(Value::Object(None))?;
+                            return Ok(CachedCallResult::Handled);
+                        }
+                        if &*method_name == "getInterfaces" {
+                            let class_class_id = shared
+                                .class_manager
+                                .read()
+                                .get_loaded_class_id("java/lang/Class")
+                                .unwrap_or(rustjvm_types::ClassId::new(0));
+                            let arr = gc_alloc_array(
+                                shared,
+                                thread,
+                                class_class_id,
+                                ArrayElementType::Reference,
+                                0,
+                            )?;
+                            thread.frames[frame_idx]
+                                .stack
+                                .push(Value::Object(Some(arr)))?;
+                            return Ok(CachedCallResult::Handled);
+                        }
+                    }
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
@@ -8311,7 +8533,10 @@ pub(crate) fn try_lambda_dispatch(
         for desc in &descriptors {
             if let Some(callback) = shared.native_methods.find(iface, method_name, desc) {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                let result = callback(&mut ctx, &full_args)?;
+                let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+                let result = callback(&mut ctx, &full_args);
+                rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                let result = result?;
                 return Ok(Some(result));
             }
         }
@@ -8392,6 +8617,40 @@ pub(crate) fn try_lambda_dispatch(
                 true,
                 num_captures,
             )?;
+            // Round 7 — if the receiver is itself a lambda proxy whose SAM
+            // matches the impl_handle's member name, recurse through
+            // try_lambda_dispatch directly. Without this, downstream
+            // `invoke_or_native` falls back to the cp interface name (because
+            // class_manager.get_class fails on lambda-proxy class_ids), then
+            // resolves the abstract interface declaration with no Code attribute
+            // and surfaces an AbstractMethodError. Concrete tripwire: Spring
+            // Boot's `CacheOverrides.close()` does
+            // `forEach(CacheOverride::close)` and the iterated items are
+            // themselves NOOP `CacheOverride` lambdas declared as static
+            // fields on `SoftReferenceConfigurationPropertyCache` — every
+            // item is a lambda proxy, never a concrete CacheOverride.
+            if let Value::Object(Some(r)) = &full_args[0] {
+                let rcv_class_id = shared.heap.class_id_of(*r);
+                let recv_is_lambda = shared
+                    .lambda_proxies
+                    .read()
+                    .contains_key(&rcv_class_id);
+                if recv_is_lambda {
+                    let inner = try_lambda_dispatch(
+                        shared,
+                        thread,
+                        *r,
+                        rcv_class_id,
+                        &call_site.impl_handle.member_name,
+                        &full_args[1..],
+                    )?;
+                    if let Some(inner_v) = inner {
+                        return Ok(Some(coerce_return(
+                            shared, thread, &sam_ret, &impl_ret, inner_v,
+                        )?));
+                    }
+                }
+            }
             // Resolve the actual class of the receiver for virtual dispatch.
             let receiver_class = match &full_args[0] {
                 Value::Object(Some(r)) => {
@@ -9235,7 +9494,10 @@ fn execute_invokestatic_cached(
             }
             args.reverse();
             let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-            let result = callback(&mut ctx, &args)?;
+            let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+            let cb_result = callback(&mut ctx, &args);
+            rustjvm_native_api::native_ring::record_exit(_ring_idx);
+            let result = cb_result?;
             if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native invokestatic return values.
                 push_invoke_return_value(
@@ -11176,13 +11438,19 @@ fn execute_invokevirtual_vtable_fast(
     let receiver_obj = match receiver_val {
         Value::Object(Some(obj_ref)) => obj_ref,
         Value::Object(None) => {
-            return Err(RuntimeError::NullPointerException {
-                message: Some(format!(
-                    "Cannot invoke {} on null",
-                    &*method_name
-                )),
-            }
-            .into());
+            // Round 63 — Spring's GenericConversionService$Converters
+            // .getClassHierarchy threads nulls through
+            // `Class.componentType/getSuperclass/getInterfaces/arrayType`.
+            // See the matching block in execute_invoke_cached for the
+            // detailed rationale. Mirror that null-tolerant shape here so
+            // the inline-cache fast path doesn't NPE first.
+            //
+            // We need the constant-pool class of the call site, which we
+            // can read out of the resolution cache populated in step 2.
+            // We don't have it locally yet, so fall back to the slow path
+            // by emitting a CacheMiss — `execute_invoke_cached` will run
+            // its own block with the full method-ref triple in hand.
+            return Ok(CachedCallResult::CacheMiss);
         }
         _ => return Ok(CachedCallResult::CacheMiss),
     };
@@ -11254,16 +11522,22 @@ fn execute_invokevirtual_vtable_fast(
                     // own bytecode for the method, the bytecode override wins
                     // over any deeper native ancestor (e.g. Object.toString).
                     // Stop walking so the vtable bytecode path runs.
-                    if parent.find_method(&method_name, &method_descriptor).is_some() {
-                        break;
-                    }
-                    if shared
+                    //
+                    // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                    // the parent has BOTH bytecode AND a Rust native, the
+                    // native wins. See `populate_virtual_invoke_cache` for
+                    // the LinkedHashMap-overlay rationale.
+                    let has_bytecode = parent.find_method(&method_name, &method_descriptor).is_some();
+                    let has_native = shared
                         .native_methods
                         .find(&parent.name, &method_name, &method_descriptor)
-                        .is_some()
-                    {
+                        .is_some();
+                    if has_native {
                         drop(cm);
                         return Ok(CachedCallResult::CacheMiss);
+                    }
+                    if has_bytecode {
+                        break;
                     }
                 }
                 cid = parent_id;
@@ -11508,10 +11782,10 @@ fn execute_invokevirtual_cached(
                     Ok(CachedCallResult::FramePushed)
                 }
                 Value::Object(None) => {
-                    Err(RuntimeError::NullPointerException {
-                        message: Some("Cannot invoke method on null".to_string()),
-                    }
-                    .into())
+                    // Round 63 — defer to slow path which has the
+                    // null-tolerant shim for Spring's
+                    // `GenericConversionService$Converters.getClassHierarchy`.
+                    Ok(CachedCallResult::CacheMiss)
                 }
                 _ => Ok(CachedCallResult::CacheMiss),
             }
@@ -11557,7 +11831,10 @@ fn execute_invokevirtual_cached(
                     }
                     args.reverse();
                     let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                    let result = callback(&mut ctx, &args)?;
+                    let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+                    let cb_result = callback(&mut ctx, &args);
+                    rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                    let result = cb_result?;
                     if let Some(value) = result {
                         // T18.K4 — tag-exact push for J/D native virtual return values.
                         push_invoke_return_value(
@@ -11568,10 +11845,10 @@ fn execute_invokevirtual_cached(
                     Ok(CachedCallResult::Handled)
                 }
                 Value::Object(None) => {
-                    Err(RuntimeError::NullPointerException {
-                        message: Some("Cannot invoke method on null".to_string()),
-                    }
-                    .into())
+                    // Round 63 — defer to slow path which has the
+                    // null-tolerant shim for Spring's
+                    // `GenericConversionService$Converters.getClassHierarchy`.
+                    Ok(CachedCallResult::CacheMiss)
                 }
                 _ => Ok(CachedCallResult::CacheMiss),
             }
@@ -11633,7 +11910,10 @@ fn execute_invokevirtual_cached(
             }
             args.reverse();
             let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-            let result = callback(&mut ctx, &args)?;
+            let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+            let cb_result = callback(&mut ctx, &args);
+            rustjvm_native_api::native_ring::record_exit(_ring_idx);
+            let result = cb_result?;
             if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native virtual fallback return values.
                 push_invoke_return_value(
@@ -11725,6 +12005,29 @@ fn populate_virtual_invoke_cache(
         // so that calls like `SumTask.fork()` (where the native is registered
         // on `RecursiveTask`/`ForkJoinTask`) reach the Rust override and not
         // the inherited JDK bytecode.
+        //
+        // Round 63 (peaceful-sammet) — receiver-bytecode short-circuit:
+        // if the *receiver* class declares its own bytecode for this
+        // method, the subclass override must win over any ancestor's
+        // native registration. Without this guard, Kafka's
+        // `Group$GroupType.toString()` (a subclass override that reads
+        // the subclass `name` field — "classic"/lowercase) was being
+        // shadowed by the native `Enum.toString()` registered on
+        // `java/lang/Enum`, which reads `Enum.name` ("CLASSIC"/upper).
+        // First call dispatched via the slow path (correct override);
+        // this cache populator then poisoned the inline cache with the
+        // parent native, breaking subsequent calls and causing
+        // `GroupCoordinatorConfig.<clinit>` to default the rebalance
+        // protocols list to `["CONSUMER", "CLASSIC", "STREAMS"]`
+        // instead of the lowercase forms the validator accepts.
+        let receiver_has_own_bytecode = cm
+            .get_class(receiver_class_id)
+            .map(|c| c.find_method(&method_name, &descriptor).is_some())
+            .unwrap_or(false);
+        if receiver_has_own_bytecode {
+            // Skip the ancestor-native promotion entirely — fall through
+            // to the bytecode dispatch path below.
+        } else {
         let mut cid = receiver_class_id;
         while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
             if let Some(parent) = cm.get_class(parent_id) {
@@ -11733,10 +12036,37 @@ fn populate_virtual_invoke_cache(
                 // the bytecode override wins over any deeper native ancestor
                 // (e.g. Object.toString). Stop walking so the bytecode dispatch
                 // path runs (via find_method_recursive below).
+                //
+                // Round 19 (peaceful-sammet) — IMPORTANT exception: if the
+                // parent has BOTH its own bytecode AND a Rust native registered
+                // for this method, the native wins. Our LinkedHashMap natives
+                // store state in an external overlay (not real fields), so
+                // executing JDK bytecode for inherited callers like
+                // `AnnotationAttributes` (which extends `LinkedHashMap`) walks
+                // empty real fields and returns empty `entrySet()` /
+                // `keySet()`, breaking Spring's
+                // `MetadataReader.getAnnotationAttributes("...Import", true)`
+                // for `@EnableAutoConfiguration` and surfacing as
+                // `MissingWebServerFactoryBean` on Spring Boot startup.
+                let parent_name = parent.name.to_string();
                 if parent.find_method(&method_name, &descriptor).is_some() {
+                    if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
+                        let gate = RedefineGate::snapshot(
+                            cm.class_redefine_generation_handle(receiver_class_id),
+                        );
+                        drop(cm);
+                        let target = CachedInvokeTarget::VirtualNative {
+                            receiver_class_id,
+                            callback,
+                            num_params: num_params as u16,
+                            gate,
+                        };
+                        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+                        thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+                        return;
+                    }
                     break;
                 }
-                let parent_name = parent.name.to_string();
                 if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
                     let gate = RedefineGate::snapshot(
                         cm.class_redefine_generation_handle(receiver_class_id),
@@ -11754,6 +12084,7 @@ fn populate_virtual_invoke_cache(
                 }
             }
             cid = parent_id;
+        }
         }
     }
 
@@ -11795,6 +12126,67 @@ fn populate_virtual_invoke_cache(
             thread.invoke_cache.put(caller_class_id, cp_index, false, target);
         }
         return;
+    }
+
+    // S111r13: For real-JDK Map functional methods (computeIfAbsent / compute
+    // / merge / putIfAbsent / forEach / replaceAll / getOrDefault / replace /
+    // putMapEntries — internal helper invoked from putAll / Map.copyOf), the
+    // bytecode reads `getfield table` followed by `arraylength`.  Our
+    // synthetic HashMap layout stores the `Int(capacity)` in slot 2 instead
+    // of an array, surfacing as
+    //   `expected object reference, got int(N)`.
+    // Mirror the force-native override list at vm_exec.rs:invoke_on_class_shared_inner.
+    // This branch fires when find_method_recursive resolved to non-native
+    // bytecode declared on HashMap (or a sibling), but a Rust native exists
+    // for the (declaring_class, method, descriptor) triple — caching the
+    // bytecode would re-introduce the layout mismatch on every dispatch
+    // through this call-site.
+    {
+        let declaring_name = store
+            .get(declaring_id)
+            .map(|c| &*c.name)
+            .unwrap_or("");
+        let force = matches!(
+            declaring_name,
+            "java/util/HashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/Hashtable"
+            | "java/util/concurrent/ConcurrentHashMap"
+        ) && matches!(
+            &*method_name,
+            "computeIfAbsent" | "compute" | "computeIfPresent"
+            | "merge" | "putIfAbsent" | "replace"
+            | "forEach" | "replaceAll" | "getOrDefault"
+            | "putMapEntries" | "putAll"
+            | "keySet" | "values" | "entrySet"
+            // S111r14: see vm_exec.rs — logback LoggerContext.<init>
+            // hits HashMap.put → putVal → arraylength on Int(16).
+            | "put" | "get" | "remove"
+            | "containsKey" | "containsValue"
+            | "size" | "isEmpty" | "clear"
+            | "<init>"
+        );
+        if force {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(declaring_name, &method_name, &descriptor)
+            {
+                let gate = RedefineGate::snapshot(
+                    cm.class_redefine_generation_handle(declaring_id),
+                );
+                drop(cm);
+                let target = CachedInvokeTarget::VirtualNative {
+                    receiver_class_id,
+                    callback,
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+                return;
+            }
+        }
     }
 
     let Some(code_attr) = method.code() else {
@@ -12003,13 +12395,13 @@ fn pop_object_ref_ctx(
         }
         other => {
             if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
-                eprintln!("[pop_object_ref] ERROR: expected object reference, got {other}");
+                eprintln!("[pop_object_ref] ERROR: expected object reference, got {other} ctx={context:?}");
                 // Print a Rust backtrace to identify the calling opcode handler
                 let bt = std::backtrace::Backtrace::capture();
                 eprintln!("[pop_object_ref] Rust backtrace:\n{bt}");
             }
             Err(VmError::Internal {
-                message: format!("expected object reference, got {other}"),
+                message: format!("expected object reference, got {other} ctx={context:?}"),
             }
             .into())
         }

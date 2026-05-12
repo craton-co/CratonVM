@@ -827,16 +827,55 @@ const CTX_FIELD_CONTROLLER_ID: usize = 0;
 const CTX_NUM_SLOTS: usize = 1;
 
 /// Helper to allocate a Java `ServiceName` object wrapping an
-/// `Arc<ServiceName>` via its canonical String.  Field 0 is unused
-/// (could later be populated with the segments array); field 1 holds
-/// the canonical String so `getCanonicalName()` can return it directly.
-fn alloc_java_service_name(
+/// `Arc<ServiceName>` via its canonical String.
+///
+/// In **real-JDK mode** the loaded `org.jboss.msc.service.ServiceName`
+/// class declares four instance fields in this order:
+///   0. `name`         : `String`  (the leaf segment)
+///   1. `canonicalName`: `String`  (the dotted full name; written via the
+///                                  `canonicalNameUpdater` AtomicRef CAS)
+///   2. `parent`       : `ServiceName`
+///   3. `hashCode`     : `int`     (cached, computed in the ctor)
+///
+/// Real Java bytecode (e.g. `ServiceName.equals(ServiceName)` at
+/// `ServiceName.java:230`) reads both `name` (slot 0) and `hashCode`
+/// (slot 3). When we leave `name` at its default null, the `equals`
+/// fast path triggers `null.equals(o.name)` → `NullPointerException:
+/// Cannot invoke equals on null`. WildFly's
+/// `ConsoleAvailabilityService.addService` is the first caller that
+/// trips this because it compares two synthesised
+/// `getCapabilityServiceName()` results inside
+/// `ServiceBuilderImpl.assertNotInstanceId`.
+///
+/// The fix populates the `name` field with the leaf segment (the part
+/// after the last `.`) and seeds `hashCode` with the canonical name's
+/// hash, so JDK equals/hashCode behave consistently across all of our
+/// synthetic mirrors. Fields are addressed by name so this stays
+/// correct regardless of the loaded class's exact field layout.
+pub(crate) fn alloc_java_service_name(
     ctx: &mut dyn NativeContext,
     name: &Arc<ServiceName>,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceName", 2);
-    let canonical = ctx.create_string(name.canonical());
-    ctx.set_field(obj, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
+    let canonical_text = name.canonical();
+    let canonical = ctx.create_string(canonical_text);
+    // canonicalName is updated via an AtomicReferenceFieldUpdater in the
+    // JDK ctor; using `set_field_by_name` is safe — it writes the same
+    // slot the updater would CAS into.
+    ctx.set_field_by_name(obj, "canonicalName", Value::Object(Some(canonical)));
+    // Leaf segment for the `name` field. Use the whole canonical text if
+    // there are no dots (matches the JDK ctor for a top-level
+    // ServiceName.of(String)).
+    let leaf = canonical_text.rsplit('.').next().unwrap_or(canonical_text);
+    let leaf_str = ctx.create_string(leaf);
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(leaf_str)));
+    // Stable, deterministic hash that matches our equals contract on
+    // synthetic mirrors. The exact value does not need to mirror the
+    // JDK's `calculateHashCode` — `ServiceName.equals` compares both
+    // sides' `hashCode` fields, so as long as two mirrors of the same
+    // canonical name produce the same value we're good.
+    let h: i32 = canonical_text.bytes().fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
+    ctx.set_field_by_name(obj, "hashCode", Value::Int(h));
     obj
 }
 
@@ -1148,6 +1187,212 @@ fn native_service_container_shutdown(
     Ok(None)
 }
 
+/// R63 (WildFly): `org/jboss/msc/service/Lockable.acquireWrite()/acquireRead()`
+/// uses a hand-rolled AQS-style wait loop that calls `Object.wait()` when the
+/// lock is contended. CratonVM's interpreter is effectively single-threaded for
+/// MSC boot — the MSC ContainerExecutor runs tasks inline on the main thread —
+/// so a recursive task path can re-enter `acquireWrite` while the bit is already
+/// set. There is no other thread to call `notify()`, so `Object.wait()` blocks
+/// forever. Since all "concurrent" task execution happens on one thread, locking
+/// is unnecessary: shim acquire/release to no-ops so MSC boot proceeds.
+fn native_lockable_lock_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// R63 (WildFly): `DelegatingBasicLogger.isTraceEnabled()` returns
+/// `this.log.isTraceEnabled()`, but in our synthetic-logger fixups
+/// for ServiceLogger/ElytronMessages the `log` field is null. The
+/// SecurityDomain$Builder.build call at line 1100 invokes
+/// `isTraceEnabled` on the synthetic ElytronMessages_$logger and NPEs.
+/// Shim to return false (trace disabled) so trace-gated code paths
+/// take the fast no-trace branch. Same shim covers isDebugEnabled —
+/// many WildFly call sites follow the same null-log pattern.
+fn native_delegating_logger_returns_false(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// R63 (WildFly): `ServiceLogger_$logger.greeting(String)` is the
+/// jboss-logging-generated boot banner emitter. Its bytecode does
+/// `this.log.logf(FQCN, INFO, null, "JBoss MSC version %s", arg)` —
+/// but the `log` instance field is null in our R55 synthetic backfill
+/// of `ServiceLogger.ROOT/SERVICE/FAIL` (we couldn't materialize a
+/// real `org.jboss.logging.Logger` proxy in the post-clinit fixup).
+/// The `invokevirtual Logger.logf` on null then NPEs at line 41
+/// (bci=16) inside `ServiceContainerImpl.<clinit>` line 88. The outer
+/// <clinit> swallow keeps the VM alive but leaves SCI's late statics
+/// unassigned — every subsequent SCI<init> trips on getstatic. By
+/// shimming `greeting` as a no-op we let SCI<clinit> reach all its
+/// `putstatic`s (executorSeq, SERIAL, ...) under its own clinit, so
+/// the R55 post-clinit fixup is no longer the load-bearing path.
+fn native_service_logger_greeting_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// R79 (WildFly): MSC's `IdentityHashSet$IdentityHashSetIterator.next()`
+/// throws `ConcurrentModificationException` when `this$0.modCount`
+/// drifts from the iterator's `expectedCount`. This happens during
+/// `ServiceControllerImpl$RemoveChildrenTask.execute`, which walks
+/// `controller.children` while concurrently calling `setMode(REMOVE)`
+/// on each child — setMode propagates back into the same children set
+/// and bumps modCount. The real MSC handles this via per-controller
+/// `synchronized` blocks across distinct executor threads, but our
+/// interpreter executes the worker tasks more eagerly and trips the
+/// check. We replace `hasNext` and `next` with CME-tolerant variants
+/// that re-read `this$0.table` / `this$0.modCount` on every call and
+/// keep `expectedCount` in sync so the bytecode never trips the
+/// `modCount != expectedCount` branch.
+///
+/// Field layout (matches jboss-msc 1.5.x bytecode):
+/// * `this$0`        : outer `IdentityHashSet`
+/// * `next`          : int, scan cursor
+/// * `expectedCount` : int, copy of `this$0.modCount` at iterator construction
+/// * `current`       : int, index of last returned element
+/// * `hasNext`       : boolean, cached `hasNext()` result
+/// * `table`         : `Object[]`, cached copy of `this$0.table`
+fn ihs_iter_refresh_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    // Always re-read table from the outer set — concurrent resize
+    // would otherwise leave us iterating a stale snapshot.
+    let outer = match ctx.get_field_by_name(this, "this$0") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let table = match ctx.get_field_by_name(outer, "table") {
+        Value::Object(Some(t)) => t,
+        _ => return None,
+    };
+    ctx.set_field_by_name(this, "table", Value::Object(Some(table)));
+    // Keep expectedCount aligned so any *other* code path that reads
+    // it (or the bytecode `next()` fallback) won't trip the CME check.
+    let modc = match ctx.get_field_by_name(outer, "modCount") {
+        Value::Int(i) => i,
+        _ => 0,
+    };
+    ctx.set_field_by_name(this, "expectedCount", Value::Int(modc));
+    Some(table)
+}
+
+fn native_ihs_iter_has_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // If we've already advanced and have a cached hit, return it.
+    if let Value::Int(1) = ctx.get_field_by_name(this, "hasNext") {
+        return Ok(Some(Value::Int(1)));
+    }
+    let table = match ihs_iter_refresh_table(ctx, this) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let len = ctx.array_length(table);
+    let mut idx = match ctx.get_field_by_name(this, "next") {
+        Value::Int(i) => i.max(0) as usize,
+        _ => 0,
+    };
+    while idx < len {
+        match ctx.get_array_element(table, idx) {
+            Value::Object(Some(_)) => {
+                ctx.set_field_by_name(this, "next", Value::Int(idx as i32));
+                ctx.set_field_by_name(this, "hasNext", Value::Int(1));
+                return Ok(Some(Value::Int(1)));
+            }
+            _ => idx += 1,
+        }
+    }
+    ctx.set_field_by_name(this, "next", Value::Int(len as i32));
+    ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_ihs_iter_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Re-sync table + expectedCount; advance to a non-null slot.
+    let cached_has = matches!(ctx.get_field_by_name(this, "hasNext"), Value::Int(1));
+    if !cached_has {
+        // Inline hasNext() — same logic as native_ihs_iter_has_next.
+        let table = match ihs_iter_refresh_table(ctx, this) {
+            Some(t) => t,
+            None => {
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NoSuchElementException {
+                        message: "IdentityHashSet iterator exhausted".to_string(),
+                    },
+                )));
+            }
+        };
+        let len = ctx.array_length(table);
+        let mut idx = match ctx.get_field_by_name(this, "next") {
+            Value::Int(i) => i.max(0) as usize,
+            _ => 0,
+        };
+        let mut found = false;
+        while idx < len {
+            if let Value::Object(Some(_)) = ctx.get_array_element(table, idx) {
+                ctx.set_field_by_name(this, "next", Value::Int(idx as i32));
+                ctx.set_field_by_name(this, "hasNext", Value::Int(1));
+                found = true;
+                break;
+            }
+            idx += 1;
+        }
+        if !found {
+            ctx.set_field_by_name(this, "next", Value::Int(len as i32));
+            ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NoSuchElementException {
+                    message: "IdentityHashSet iterator exhausted".to_string(),
+                },
+            )));
+        }
+    } else {
+        // hasNext was cached true: still re-sync expectedCount/table
+        // so a concurrent modCount bump doesn't bite a subsequent call.
+        let _ = ihs_iter_refresh_table(ctx, this);
+    }
+    let table = match ctx.get_field_by_name(this, "table") {
+        Value::Object(Some(t)) => t,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NoSuchElementException {
+                    message: "IdentityHashSet iterator: null table".to_string(),
+                },
+            )));
+        }
+    };
+    let next_idx = match ctx.get_field_by_name(this, "next") {
+        Value::Int(i) => i,
+        _ => 0,
+    };
+    let len = ctx.array_length(table) as i32;
+    if next_idx < 0 || next_idx >= len {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NoSuchElementException {
+                message: "IdentityHashSet iterator past end".to_string(),
+            },
+        )));
+    }
+    let value = ctx.get_array_element(table, next_idx as usize);
+    // current = next; next++; hasNext = false
+    ctx.set_field_by_name(this, "current", Value::Int(next_idx));
+    ctx.set_field_by_name(this, "next", Value::Int(next_idx + 1));
+    ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+    // Skip nulls between current and next call (best-effort) and keep
+    // expectedCount synced — the outer set may have shifted entries.
+    Ok(Some(value))
+}
+
 /// Bind an externally-allocated `ServiceController` Java object to a
 /// controller id (used by T19.2 subsystem glue to hand a pre-built
 /// controller back to the interpreter).
@@ -1239,6 +1484,13 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_service_controller_get_state,
     );
 
+    // R63 WildFly: Lockable acquire/release shims (see native_lockable_lock_noop).
+    let lockable = "org/jboss/msc/service/Lockable";
+    r.register(lockable, "acquireWrite", "()V", native_lockable_lock_noop);
+    r.register(lockable, "acquireRead", "()V", native_lockable_lock_noop);
+    r.register(lockable, "releaseWrite", "()V", native_lockable_lock_noop);
+    r.register(lockable, "releaseRead", "()V", native_lockable_lock_noop);
+
     let start_ctx = "org/jboss/msc/service/StartContext";
     r.register(
         start_ctx,
@@ -1253,7 +1505,251 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_start_context_complete,
     );
 
+    // R63: silence the boot-banner NPE inside SCI<clinit>. The bytecode
+    // calls `ServiceLogger_$logger.greeting(String)` via invokeinterface
+    // on `ServiceLogger.ROOT`, which dispatches to the generated impl;
+    // the impl's first instruction reads `this.log` (null in our
+    // post-clinit backfill) and NPEs. Returning a no-op from the impl
+    // method lets SCI<clinit> continue past line 88.
+    let logger_impl = "org/jboss/msc/service/ServiceLogger_$logger";
+    r.register(
+        logger_impl,
+        "greeting",
+        "(Ljava/lang/String;)V",
+        native_service_logger_greeting_noop,
+    );
+
+    // R71 (WildFly): same `this.log == null` NPE pattern, but on the
+    // service-failure code path. After MSC ServiceContainer install
+    // completes, StartTask.startService eventually invokes
+    // ControllerTask.run, whose catch(Throwable) block dispatches
+    // `ServiceLogger.SERVICE.internalServiceError(t, name)` —
+    // dispatches to ServiceLogger_$logger.internalServiceError, whose
+    // first instruction is `this.log.logf(...)` and NPEs on null log.
+    // Register no-op shims for every error/diagnostic method in the
+    // ServiceLogger_$logger generated impl so any failure-path log
+    // call from MSC degrades to silence rather than NPE.
+    for (name, sig) in [
+        ("startFailed", "(Lorg/jboss/msc/service/StartException;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("listenerFailed", "(Ljava/lang/Throwable;Ljava/lang/Object;)V"),
+        ("exceptionAfterComplete", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("stopFailed", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("stopServiceMissing", "(Lorg/jboss/msc/service/ServiceName;)V"),
+        ("uninjectFailed", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;Lorg/jboss/msc/service/ValueInjection;)V"),
+        ("internalServiceError", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("uncaughtException", "(Ljava/lang/Throwable;Ljava/lang/Thread;)V"),
+        ("profileOutputCloseFailed", "(Ljava/io/IOException;)V"),
+        ("mbeanFailed", "(Ljava/lang/Exception;)V"),
+        ("injectFailed", "(Ljava/lang/Throwable;Lorg/jboss/msc/service/ServiceName;)V"),
+        ("mbeanServerNotAvailable", "(Ljava/lang/Exception;)V"),
+    ] {
+        r.register(logger_impl, name, sig, native_service_logger_greeting_noop);
+    }
+
+    // R63 (WildFly): shim DelegatingBasicLogger.isTraceEnabled/isDebugEnabled
+    // to return false. The default impls do `this.log.isTraceEnabled()`,
+    // but our synthetic backfills for ServiceLogger.ROOT/SERVICE/FAIL and
+    // ElytronMessages.log leave `this.log` null. Returning false makes
+    // every "if (log.isTraceEnabled()) ..." guard skip the inner work,
+    // which is what we want for a non-logging boot.
+    let dbl = "org/jboss/logging/DelegatingBasicLogger";
+    r.register(dbl, "isTraceEnabled", "()Z", native_delegating_logger_returns_false);
+    r.register(dbl, "isDebugEnabled", "()Z", native_delegating_logger_returns_false);
+    r.register(dbl, "isInfoEnabled", "()Z", native_delegating_logger_returns_false);
+
+    // R79 (WildFly): replace MSC IdentityHashSet's iterator with a
+    // CME-tolerant native implementation. Eager worker scheduling in
+    // our interpreter causes setMode(REMOVE) inside RemoveChildrenTask
+    // to bump the outer set's modCount mid-iteration; the bytecode
+    // `next()` then throws CME. The native re-reads the table and
+    // re-syncs expectedCount on every call. See native_ihs_iter_next.
+    let ihs_iter = "org/jboss/msc/service/IdentityHashSet$IdentityHashSetIterator";
+    r.register(ihs_iter, "hasNext", "()Z", native_ihs_iter_has_next);
+    r.register(ihs_iter, "next", "()Ljava/lang/Object;", native_ihs_iter_next);
+
+    // R84 (WildFly): natively implement `org.jboss.logging.Logger.getMessageLogger`
+    // overloads. The real implementation goes through `MethodHandles.lookup() +
+    // privateLookupIn(intf) + Lookup.findClass("<intf>_$logger") +
+    // Lookup.findConstructor(...)`. Our `MethodHandles$Lookup.accessClass` runs
+    // the JDK Java code that calls `VerifyAccess.isClassAccessible`, which in
+    // turn requires `isSamePackage(lookupClass, targetClass)` to match
+    // ClassLoader identity AND package name. With our app/platform-loader
+    // resolution (returning the singleton AppClassLoader for everything
+    // non-bootstrap), this normally works — but the interface and the
+    // generated `_$logger` impl can have subtly different module/loader views
+    // during JBoss-Modules-mediated loading, causing IllegalAccessException →
+    // IllegalArgumentException ("The given lookup does not have access to the
+    // implementation class") to be thrown. The swallow then leaves the
+    // resulting message-logger static fields null, cascading into NPEs
+    // (already partially patched with backfills for ServiceLogger /
+    // ElytronMessages — RemotingSubsystemRootResource and others have no
+    // backfill, so their boot subsystems silently die).
+    //
+    // The native shim bypasses MethodHandles entirely:
+    //   1. derive `<intf_name>_$logger` from the intf Class mirror,
+    //   2. `Logger.getLogger(category)` to get the delegate log,
+    //   3. `new <intf>_$logger(log)` (which super(log)s into DelegatingBasicLogger).
+    //
+    // Returns the freshly constructed message-logger or null on any error
+    // (best-effort — caller usually stores into a static and downstream code
+    // does null-tolerant `if (log == null) ...` checks via our shims).
+    let logger = "org/jboss/logging/Logger";
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let intf_mirror = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/Class;Ljava/lang/String;Ljava/util/Locale;)Ljava/lang/Object;",
+        |ctx, args| {
+            let intf_mirror = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args: [lookup, intfClass, category]
+            let intf_mirror = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+    r.register(
+        logger,
+        "getMessageLogger",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/Class;Ljava/lang/String;Ljava/util/Locale;)Ljava/lang/Object;",
+        |ctx, args| {
+            let intf_mirror = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let category = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+        },
+    );
+
+    // RWF86.2 — `LoggerProviders.findProvider()` short-circuit.  WildFly's
+    // `Logger.<clinit>` triggers `LoggerProviders.<clinit>` which iterates
+    // tryJBossLogManager -> tryLog4j2 -> trySlf4j -> tryLog4j -> tryJDK.
+    // In our environment `java.util.logging.LogManager.getLogManager()`
+    // returns the JDK default class (not `org.jboss.logmanager.LogManager`)
+    // even though jboss-modules sets `java.util.logging.manager` — the JDK's
+    // own bootstrap caches the LogManager singleton before the property is
+    // set, so the if-acmp check in tryJBossLogManager pc=20 fails and
+    // throws IllegalStateException.  The subsequent tryLog4j2 path NPEs
+    // inside `logProvider` because the constructed Log4j2LoggerProvider
+    // isn't fully wired in our env (LogManager.<clinit> -> ProviderUtil
+    // ServiceLoader returns null).  Both downstream throwers cascade out
+    // of `LoggerProviders.<clinit>` and abort WildFly boot at
+    // `ServiceContainerImpl.<clinit>`.  Short-circuit by returning a fresh
+    // `JDKLoggerProvider` instance — JDK Logger backing works fine via
+    // our `LogManager.getLogger` native and matches what WildFly's
+    // standalone.sh would set via `-Dorg.jboss.logging.provider=jdk`.
+    r.register(
+        "org/jboss/logging/LoggerProviders",
+        "findProvider",
+        "()Lorg/jboss/logging/LoggerProvider;",
+        |ctx, _args| {
+            let cls = "org/jboss/logging/JDKLoggerProvider";
+            let obj = match ctx.new_object(cls) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // <init>()V — AbstractLoggerProvider parent is null-safe.
+            let _ = ctx.invoke(cls, "<init>", "()V", &[Value::Object(Some(obj))]);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
+}
+
+/// Construct a `<intf>_$logger` instance natively, bypassing the
+/// MethodHandles/Lookup path that JBoss Logging normally uses.
+/// Returns `Value::Object(None)` on any failure.
+fn native_construct_message_logger(
+    ctx: &mut dyn NativeContext,
+    intf_mirror: rustjvm_types::ObjectRef,
+    category: &str,
+) -> Value {
+    // 1. Resolve the interface name.
+    let intf_name = match crate::lang_class::mirror_class_name(ctx, intf_mirror) {
+        Some(n) => n,
+        None => return Value::Object(None),
+    };
+    let impl_name = format!("{intf_name}_$logger");
+
+    // 2. Get the delegate Logger via `Logger.getLogger(category)`. Returns
+    //    null on error — caller can still store the resulting object since
+    //    most _$logger methods are null-tolerant via our shims.
+    let cat_str = ctx.create_string(category);
+    let log_obj = match ctx.invoke(
+        "org/jboss/logging/Logger",
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/jboss/logging/Logger;",
+        &[Value::Object(Some(cat_str))],
+    ) {
+        Ok(Some(v)) => v,
+        _ => Value::Object(None),
+    };
+
+    // 3. `new <impl_name>(log)` — the canonical generated constructor takes
+    //    a single `Logger` parameter and `super(log)`s into
+    //    `DelegatingBasicLogger`.
+    let new_obj = match ctx.new_object(&impl_name) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Value::Object(None),
+    };
+    let init_args = [Value::Object(Some(new_obj)), log_obj];
+    match ctx.invoke(
+        &impl_name,
+        "<init>",
+        "(Lorg/jboss/logging/Logger;)V",
+        &init_args,
+    ) {
+        Ok(_) => Value::Object(Some(new_obj)),
+        Err(_) => {
+            // Constructor failed — return the bare instance anyway. The
+            // `log` field will be null but downstream NPE-tolerant shims
+            // (DelegatingBasicLogger.is*Enabled, ServiceLogger_$logger
+            // method no-ops) keep boot going. Beats a null return that
+            // propagates into static fields whose readers do raw
+            // invokeinterface without null checks.
+            Value::Object(Some(new_obj))
+        }
+    }
 }
 
 // ===========================================================================

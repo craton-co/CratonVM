@@ -1322,8 +1322,12 @@ impl NativeMethodRegistry {
                 );
             }
         }
-        self.keys.insert(key, triple);
+        self.keys.insert(key, triple.clone());
         self.methods.insert(key, callback);
+        // Native-call ring buffer: register pointer→name so the
+        // watchdog can resolve callback pointers back to human-readable
+        // method names. Cheap one-time write per registration.
+        crate::native_ring::register_name(callback as usize, &triple);
     }
 
     /// Look up a native method implementation (zero allocation).

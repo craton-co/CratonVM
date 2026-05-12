@@ -1,0 +1,10 @@
+﻿./mvnw.cmd : WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+At line:1 char:164
++ ... s\CratonVM\apps\demo'; ./mvnw.cmd -q -DskipTests package 2>&1 | Out-F ...
++                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (WARNING: A term...has been called:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by lombok.permit.Permit
+WARNING: Please consider reporting this to the maintainers of class lombok.permit.Permit
+WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release

@@ -9,6 +9,40 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::{create_java_string, invoke_on_class_shared, SharedVm};
 
+/// Resolve `Throwable.detailMessage` (or any inherited String field by
+/// that name) and write `string_ref` to it. Walks the class hierarchy
+/// using `first_field_index` + declaration-order non-static field
+/// counting — the same scheme `resolve_field_index_in_hierarchy` uses.
+///
+/// Used by the exception-fallback path when the `(String)V` constructor
+/// is unavailable: writing to slot 0 unconditionally would corrupt
+/// `Throwable.backtrace` (slot 0) with a String reference and leave
+/// `detailMessage` (slot 1) and `cause` (slot 2) untouched.
+fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: ObjectRef) {
+    let class_id = shared.heap.class_id_of(obj);
+    let cm = shared.class_manager.read();
+    let mut walk = Some(class_id);
+    while let Some(cid) = walk {
+        let Some(cls) = cm.get_class(cid) else { break };
+        let mut inst = 0usize;
+        for f in &cls.fields {
+            if f.is_static() {
+                continue;
+            }
+            if &*f.name == "detailMessage" {
+                let idx = cls.first_field_index + inst;
+                drop(cm);
+                shared
+                    .heap
+                    .set_field(obj, idx, Value::Object(Some(string_ref)));
+                return;
+            }
+            inst += 1;
+        }
+        walk = cls.superclass;
+    }
+}
+
 /// Create a Java exception object on the heap.
 ///
 /// Steps:
@@ -85,10 +119,9 @@ pub fn create_exception_object(
             Ok(_) => { /* Constructor succeeded — message is set */ }
             Err(MethodCallFailed::InternalError(_)) => {
                 // String-arg constructor not found — fall back to ()V and
-                // manually set detailMessage (field 0). Some synthetic
-                // exception classes are allocated with zero slots (no
-                // Throwable.detailMessage field); in that case we simply
-                // drop the message rather than asserting.
+                // manually set detailMessage. Resolve by name so we hit the
+                // real-JDK Throwable layout slot (slot 1, after backtrace),
+                // not slot 0 (which is `backtrace`, an internal Object ref).
                 let _ = invoke_on_class_shared(
                     shared,
                     thread,
@@ -97,20 +130,12 @@ pub fn create_exception_object(
                     "()V",
                     &[Value::Object(Some(obj_ref))],
                 );
-                if num_fields >= 1 {
-                    shared
-                        .heap
-                        .set_field(obj_ref, 0, Value::Object(Some(string_ref)));
-                }
+                set_detail_message_by_name(shared, obj_ref, string_ref);
             }
             Err(MethodCallFailed::ExceptionThrown(_)) => {
                 // Constructor threw — still set the message field manually
-                // if the object has room for it.
-                if num_fields >= 1 {
-                    shared
-                        .heap
-                        .set_field(obj_ref, 0, Value::Object(Some(string_ref)));
-                }
+                // by name so we honour the real-JDK Throwable layout.
+                set_detail_message_by_name(shared, obj_ref, string_ref);
             }
         }
     } else {
@@ -195,6 +220,30 @@ pub fn throw_runtime_error(
                             .map(|c| c.name.clone())
                             .unwrap_or_default();
                         eprintln!("SUREFIRE-NPE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                    }
+                }
+            }
+            // R15 (WildFly): trace NPE origins inside log4j SimpleLoggerContext
+            // / PropertiesUtil chain so we can pinpoint which native /
+            // bytecode op produces the bare-NPE that bubbles up as the
+            // ExceptionInInitializerError that crashes WildFly boot.
+            {
+                let in_log4j_init = thread.frames.iter().any(|f| {
+                    let cn = shared.class_manager.read()
+                        .get_class(f.class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    cn.starts_with("org/apache/logging/log4j/")
+                        || cn.starts_with("org/jboss/logging/")
+                });
+                if in_log4j_init {
+                    eprintln!("[WF-NPE-TRACE] msg={:?}", error);
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
+                        let cn = shared.class_manager.read()
+                            .get_class(f.class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!("[WF-NPE-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                     }
                 }
             }

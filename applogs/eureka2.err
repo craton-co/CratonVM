@@ -1,0 +1,204 @@
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+[S111-DBG] Class.forName(com.digsol.eurekaserver.EurekaServerApplication) loader=org/springframework/boot/loader/LaunchedURLClassLoader
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: com.digsol.eurekaserver.EurekaServerApplication
+[S111-DBG] loadClass(com.digsol.eurekaserver.EurekaServerApplication) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.apache.logging.log4j.spi.ExtendedLogger) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.apache.logging.log4j.spi.ExtendedLogger) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.apache.logging.slf4j.SLF4JProvider) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.apache.logging.slf4j.SLF4JProvider) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.slf4j.spi.LocationAwareLogger) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.slf4j.spi.LocationAwareLogger) succeeded via invoke_virtual
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457a0a8 } key="java.lang.invoke.MethodHandle.DEBUG_NAMES" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457a0a8 } key="java.lang.invoke.MethodHandle.TRACE_INTERPRETER" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457a0a8 } key="java.lang.invoke.MethodHandle.TRACE_METHOD_LINKAGE" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457a0a8 } key="java.lang.invoke.MethodHandle.TRACE_RESOLVE" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="java.home" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.home" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.dir" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.name" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="java.io.tmpdir" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="java.library.path" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="sun.boot.library.path" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="jdk.serialFilter" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="jdk.serialFilterFactory" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="native.encoding" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="file.encoding" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="java.properties.date" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="sun.jnu.encoding" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="java.locale.useOldISOCodes" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="os.name" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="os.arch" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="os.version" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.language" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.language.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.language.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.region" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.script" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.country" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.variant" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.script.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.script.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.country.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.country.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.variant.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.variant.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.extensions" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.extensions.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d457f278 } key="user.extensions.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x221d4583a60 } key="user.timezone" -> sidetable MISS, falling back to system
+[GOD-DBG] getOrDefault native IS running
+Failed to instantiate [ch.qos.logback.classic.LoggerContext]
+Reported exception:
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45cc4c8 }
+[GRES-DBG] getResources(META-INF/spring.factories) -> 10 URLs
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[PROPS-GET] this=ObjectRef { ptr: 0x221d451d918 } key="spring.xml.ignore" -> sidetable MISS, falling back to system
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=144
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451d9f8 } stream_bytes=144 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45d6ec0 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=91
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451dbd8 } stream_bytes=91 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45d8340 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=136
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451ddb8 } stream_bytes=136 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45d9838 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=871
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451df98 } stream_bytes=871 parsed_entries=3
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45db4b0 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=510
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451e178 } stream_bytes=510 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45dcc70 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=6069
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451e358 } stream_bytes=6069 parsed_entries=14
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45e22b8 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3375
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451e538 } stream_bytes=3375 parsed_entries=9
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45e5d28 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=1677
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451e718 } stream_bytes=1677 parsed_entries=5
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45e8350 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=2032
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451e8f8 } stream_bytes=2032 parsed_entries=3
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ea928 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=111
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451ead8 } stream_bytes=111 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ebeb0 }
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ec720 }
+[GOD-DBG] getOrDefault called key=org.springframework.context.ApplicationContextInitializer
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ecf18 }
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ed438 }
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ee410 }
+[GRES-DBG] getResources(META-INF/spring.factories) -> 10 URLs
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-server-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=144
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451fbd8 } stream_bytes=144 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45f1298 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=91
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451fdb8 } stream_bytes=91 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45f23f0 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=136
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d451ff98 } stream_bytes=136 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45f3570 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=871
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d4520178 } stream_bytes=871 parsed_entries=3
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45f4b10 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=510
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d4520358 } stream_bytes=510 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45f5ec8 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=6069
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d4520538 } stream_bytes=6069 parsed_entries=14
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45f8ff8 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3375
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d4520718 } stream_bytes=3375 parsed_entries=9
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45fb800 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=1677
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d45208f8 } stream_bytes=1677 parsed_entries=5
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45fd508 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=2032
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d4520ad8 } stream_bytes=2032 parsed_entries=3
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d45ff0b0 }
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/Users/Admin/Yandex.Disk/PRO/JAVA/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=111
+[PROPS-LOAD] obj=ObjectRef { ptr: 0x221d4520cb8 } stream_bytes=111 parsed_entries=1
+[HS-ITR-DBG] native_hs_iterator: collected 0 keys from backing map ObjectRef { ptr: 0x221d46002d8 }
+[GOD-DBG] getOrDefault called key=org.springframework.boot.ApplicationContextFactory
+[PROPS-GET] this=ObjectRef { ptr: 0x221d451d918 } key="spring.getenv.ignore" -> sidetable MISS, falling back to system
+[2m2026-05-09T13:57:54.543941Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_exec[0m[2m:[0m NoSuchMethodError [3mmethod[0m[2m=[0m"java/lang/String.getCause()Ljava/lang/Throwable;"
+Error in thread "main" linkage error: no such method: java/lang/String.getCause()Ljava/lang/Throwable;

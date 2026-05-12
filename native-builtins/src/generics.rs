@@ -18,6 +18,31 @@ pub use rustjvm_reader::signature::{
 
 use crate::alloc_concurrent_synthetic;
 
+/// Build the JVM internal name for an array whose component is a concrete
+/// (non-generic) type sig. Returns None for type-variable components, wildcards,
+/// or other generics that cannot collapse into a plain `Class<?>`.
+fn component_array_name(sig: &TypeSig) -> Option<String> {
+    match sig {
+        TypeSig::Base(ch) => Some(format!("[{}", ch)),
+        TypeSig::Class { name, type_args } if type_args.is_empty() => {
+            Some(format!("[L{};", name))
+        }
+        TypeSig::Class { .. } => {
+            // Parameterized component (e.g. List<T>) -> erase to raw class.
+            // Real JDK reifier produces a GenericArrayType here, but Spring
+            // (and most callers) accept the erased Class<?> for `.resolve()`.
+            // We still return None so the caller falls back to GenericArrayType
+            // for parametric components — preserving prior behavior.
+            None
+        }
+        TypeSig::TypeVar(_) => None,
+        TypeSig::Array(inner) => {
+            let inner_name = component_array_name(inner)?;
+            Some(format!("[{}", inner_name))
+        }
+    }
+}
+
 /// Convert a TypeSig into a java.lang.reflect.Type runtime object.
 pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
     match sig {
@@ -43,13 +68,21 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             }
         }
         TypeSig::Class { name, type_args } if type_args.is_empty() => {
-            // Non-parameterized class -> Class mirror
-            let cid = ctx
-                .class_id_by_name(name)
-                .or_else(|| ctx.ensure_class_initialized(name).ok());
-            if let Some(cid) = cid {
+            // Non-parameterized class -> Class mirror.
+            //
+            // Use `load_class` (loads but does NOT trigger <clinit>) — calling
+            // `ensure_class_initialized` here cascades through Joda's
+            // `DateTimeZone.<clinit>` (which fails on default-tz lookup),
+            // surfacing as `arg.resolve()==null` in Spring's
+            // `GenericConversionService.getRequiredTypeInfo` and the IAE
+            // "Unable to determine source type <S> and target type <T>".
+            // Real-JDK reifier likewise returns Class mirrors without forcing
+            // initialization.
+            if let Some(cid) = ctx.class_id_by_name(name) {
                 let mirror = ctx.get_class_mirror(cid);
                 Value::Object(Some(mirror))
+            } else if let Ok(Some(v)) = ctx.load_class(name) {
+                v
             } else {
                 Value::Object(None)
             }
@@ -59,12 +92,16 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // field 0 = rawType (Class mirror), field 1 = actualTypeArguments (Type[])
             let pt =
                 alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 2);
-            let cid = ctx
-                .class_id_by_name(name)
-                .or_else(|| ctx.ensure_class_initialized(name).ok());
-            if let Some(cid) = cid {
-                let raw_mirror = ctx.get_class_mirror(cid);
-                ctx.set_field(pt, 0, Value::Object(Some(raw_mirror)));
+            let raw_val = if let Some(cid) = ctx.class_id_by_name(name) {
+                let m = ctx.get_class_mirror(cid);
+                Value::Object(Some(m))
+            } else if let Ok(Some(v)) = ctx.load_class(name) {
+                v
+            } else {
+                Value::Object(None)
+            };
+            if !matches!(raw_val, Value::Object(None)) {
+                ctx.set_field(pt, 0, raw_val);
             }
             let args_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), type_args.len());
             for (i, arg) in type_args.iter().enumerate() {
@@ -89,7 +126,25 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             Value::Object(Some(tv))
         }
         TypeSig::Array(component) => {
-            // GenericArrayType: field 0 = componentType
+            // For concrete component types (primitive or non-generic class), the
+            // real JDK reifier returns a plain `Class<?>` for the array type
+            // (e.g. signature `[C` => `char[].class`, not a GenericArrayType).
+            // Only `T[]` / `List<T>[]` etc. become GenericArrayType.
+            //
+            // Spring's `ResolvableType.resolve()` returns null for any non-Class
+            // generic type — so for `Formatter<char[]>` this caused
+            // "Unable to extract the parameterized field type from Formatter
+            //  [CharArrayFormatter]".
+            let array_name = component_array_name(component);
+            if let Some(name) = array_name {
+                if let Some(cid) = ctx.class_id_by_name(&name) {
+                    return Value::Object(Some(ctx.get_class_mirror(cid)));
+                }
+                if let Ok(Some(v)) = ctx.load_class(&name) {
+                    return v;
+                }
+            }
+            // Fallback: GenericArrayType for unresolvable / type-variable components.
             let gat = alloc_concurrent_synthetic(ctx, "java/lang/reflect/GenericArrayType", 1);
             let comp_val = type_sig_to_java(ctx, component);
             ctx.set_field(gat, 0, comp_val);

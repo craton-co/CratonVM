@@ -1141,6 +1141,41 @@ fn nfe<S: Into<String>>(m: S) -> MethodCallFailed {
 
 /// Register all XNIO OptionMap / IoFuture / XnioExecutor natives.
 pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
+    // R84 (WildFly): `org.wildfly.io.OptionAttributeDefinition$Builder.determineOptionType`
+    // reflects on `option.getClass().getDeclaredField("type")` to read the
+    // option's value-type Class. We synthesize `org.xnio.Option` instances
+    // (rather than the real `SingleOption`/`TypeOption` subclasses) and our
+    // stub field is named `typeClass`, so the reflection lookup throws
+    // `NoSuchFieldException` → wrapped as `IllegalArgumentException`. That
+    // takes down `RemotingSubsystemRootResource.<clinit>` and silently
+    // disables the entire subsystem. Shim `determineOptionType` to read
+    // OPT_TYPE_CLASS (slot 2) directly, bypassing reflection.
+    registry.register(
+        "org/wildfly/io/OptionAttributeDefinition$Builder",
+        "determineOptionType",
+        "(Lorg/xnio/Option;)Ljava/lang/Class;",
+        |ctx, args| {
+            let opt = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Slot 2 == OPT_TYPE_CLASS — populated by Option.simple.
+            // For options we did not create (real bytecode Option
+            // subclasses), the slot may be uninitialised; fall back to
+            // java.lang.String so the caller's isAssignableFrom chain
+            // categorises it as STRING (a safe default for XNIO options).
+            let v = ctx.get_field(opt, OPT_TYPE_CLASS);
+            match v {
+                Value::Object(Some(_)) => Ok(Some(v)),
+                _ => {
+                    let _ = ctx.load_class("java/lang/String")?;
+                    let cid = ctx.class_id_by_name("java/lang/String");
+                    Ok(Some(Value::Object(cid.map(|c| ctx.get_class_mirror(c)))))
+                }
+            }
+        },
+    );
+
     // Option
     registry.register(
         "org/xnio/Option",

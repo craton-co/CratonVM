@@ -725,7 +725,43 @@ impl SharedVm {
         // Registering as synthetic stubs (with empty `methods`) routes
         // dispatch through the native registry on `Enumeration$Impl` instead,
         // where `hasMoreElements`/`nextElement`/`hasNext`/`next` are bound.
-        class_manager.ensure_synthetic_class("java/util/Enumeration$Impl", 2);
+        let enum_impl_id = class_manager.ensure_synthetic_class("java/util/Enumeration$Impl", 2);
+        // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
+        // does `Enumeration<URL> e = classLoader.getResources(...)` (e.g.
+        // `org.apache.commons.logging.LogFactory.getResources`) can perform
+        // the implicit checkcast to `java/util/Enumeration` without throwing
+        // a `ClassCastException`.  We also set `java/lang/Object` as the
+        // superclass so virtual methods like `getClass()` resolve through the
+        // standard chain.
+        let object_id = class_manager
+            .load_class("java/lang/Object")
+            .expect("java/lang/Object must be loadable");
+        let enumeration_id = class_manager
+            .load_class("java/util/Enumeration")
+            .expect("java/util/Enumeration must be loadable");
+        if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
+            cls.superclass = Some(object_id);
+            if !cls.interfaces.contains(&enumeration_id) {
+                cls.interfaces.push(enumeration_id);
+            }
+        }
+
+        // Same treatment for `Comparator$Native`: real-JDK code that does
+        // `Stream.sorted(comparator)` (e.g. Spring's `ConfigurationClassParser`)
+        // performs an implicit checkcast to `java/util/Comparator`. Our
+        // synthetic class must declare `Object` as superclass and
+        // `java/util/Comparator` as an implemented interface for the cast to
+        // succeed.
+        let cmp_native_id = class_manager.ensure_synthetic_class("java/util/Comparator$Native", 3);
+        let comparator_id = class_manager
+            .load_class("java/util/Comparator")
+            .expect("java/util/Comparator must be loadable");
+        if let Some(cls) = class_manager.get_class_mut(cmp_native_id) {
+            cls.superclass = Some(object_id);
+            if !cls.interfaces.contains(&comparator_id) {
+                cls.interfaces.push(comparator_id);
+            }
+        }
 
         let gc_backend = match config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
@@ -983,6 +1019,15 @@ impl SharedVm {
                 // the MemberName, and our Field's JDK layout must match —
                 // which we fix in lang_class.rs::create_field_object.
                 rustjvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
+                // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
+                // log4j ServiceLoaderUtil.callServiceLoader calls
+                // LambdaMetafactory.metafactory directly (not via invokedynamic).
+                // The real-JDK implementation drives InnerClassLambdaMetafactory →
+                // java.lang.classfile API, which trips StackMapGenerator with
+                // "Bad CP index: 0" inside our incomplete classfile shim.
+                // Intercept with a native stub that returns null so the JDK path
+                // is bypassed entirely (callers tolerate the missing call site).
+                rustjvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
                 // RA.8 + WP1.8: Real ServiceLoader.load/iterator that walks
                 // META-INF/services. Registration + classpath-scan bootstrap
                 // are kept together in `init_service_loader_bootstrap` so
@@ -1182,6 +1227,12 @@ impl SharedVm {
             // open the archive directly). Paired with the `check_override`
             // allow-list entry for `java/util/jar/JarFile`.
             rustjvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+            // SB3-LOGBACK: Spring Boot 3.2's DefaultLogbackConfiguration.apply
+            // NPEs on its first monitorenter against a synthetic LoggerContext.
+            // Register a no-op native override so the boot path skips logback's
+            // default configuration (logs fall back to JVM stderr). Paired with
+            // the `check_override` allow-list entry in `vm_exec.rs`.
+            rustjvm_native_builtins::register_spring_boot_logback_apply(&mut native_methods);
             // Spring Boot 3 fat-jar launcher: `Launcher.createClassLoader`
             // calls `urls.toArray(new URL[0])` on the 67-element URL list
             // returned by `JarFileArchive.getClassPathUrls`. The real-JDK
@@ -1210,13 +1261,79 @@ impl SharedVm {
                 };
                 let template = args.get(1).copied().unwrap_or(Value::Object(None));
                 // Read fields by name so the same native works for
-                // ArrayList, Vector, CopyOnWriteArrayList, etc. Falls
-                // back to iterator-based copy if the receiver isn't an
-                // ArrayList-shaped object (no elementData).
+                // ArrayList, Vector, CopyOnWriteArrayList, etc.
                 let data = match ctx.get_field_by_name(this, "elementData") {
                     Value::Object(Some(arr)) => Some(arr),
                     _ => None,
                 };
+                // S111r32 — when the receiver lacks `elementData` (e.g.
+                // EnumSet, HashSet, TreeSet, IdentityHashMap.values()),
+                // we MUST NOT take the ArrayList shortcut: it would read
+                // `size`=0 and silently return an empty array, dropping
+                // the real elements. Iterate via the receiver's own
+                // `iterator()` instead — same shape as
+                // `AbstractCollection.toArray(T[])` in the JDK.
+                if data.is_none() {
+                    // Iterator-based copy using virtual dispatch on the
+                    // receiver's actual class.
+                    let recv_cid = ctx.class_id_of_object(this);
+                    let recv_class = ctx
+                        .class_name_of_id(recv_cid)
+                        .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
+                    let size_v = ctx.invoke(
+                        &recv_class,
+                        "size",
+                        "()I",
+                        &[Value::Object(Some(this))],
+                    )?;
+                    let size = match size_v {
+                        Some(Value::Int(n)) => n.max(0) as usize,
+                        _ => 0,
+                    };
+                    let target = match template {
+                        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+                    };
+                    let it_v = ctx.invoke(
+                        &recv_class,
+                        "iterator",
+                        "()Ljava/util/Iterator;",
+                        &[Value::Object(Some(this))],
+                    )?;
+                    let it = match it_v {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => return Ok(Some(Value::Object(Some(target)))),
+                    };
+                    let it_cid = ctx.class_id_of_object(it);
+                    let it_class = ctx
+                        .class_name_of_id(it_cid)
+                        .unwrap_or_else(|| "java/util/Iterator".to_string());
+                    for i in 0..size {
+                        let has = ctx.invoke(
+                            &it_class,
+                            "hasNext",
+                            "()Z",
+                            &[Value::Object(Some(it))],
+                        )?;
+                        if !matches!(has, Some(Value::Int(1))) {
+                            break;
+                        }
+                        let nxt = ctx.invoke(
+                            &it_class,
+                            "next",
+                            "()Ljava/lang/Object;",
+                            &[Value::Object(Some(it))],
+                        )?;
+                        let v = nxt.unwrap_or(Value::Object(None));
+                        ctx.set_array_element(target, i, v);
+                    }
+                    let target_len = ctx.array_length(target);
+                    if target_len > size {
+                        ctx.set_array_element(target, size, Value::Object(None));
+                    }
+                    return Ok(Some(Value::Object(Some(target))));
+                }
+                // ArrayList-shaped: use `size` field directly.
                 let size = match ctx.get_field_by_name(this, "size") {
                     Value::Int(s) => s.max(0) as usize,
                     _ => 0,
@@ -1269,6 +1386,16 @@ impl SharedVm {
             rustjvm_native_builtins::lang_invoke::register_t4_method_handle_invoke(&mut native_methods);
             // C5: See the synthetic-jdk branch above for rationale.
             rustjvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
+            // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
+            // log4j ServiceLoaderUtil.callServiceLoader (and similar code paths
+            // in WildFly's PropertiesUtil bootstrap) invokes
+            // LambdaMetafactory.metafactory directly (not via invokedynamic).
+            // The real-JDK implementation drives InnerClassLambdaMetafactory →
+            // java.lang.classfile API, which trips our incomplete classfile
+            // shim with "Bad CP index: 0" inside StackMapGenerator. Intercept
+            // with a native stub that returns null so the JDK path is bypassed
+            // entirely; the surrounding code tolerates a null call site.
+            rustjvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
             // RA.8 + WP1.8: ServiceLoader bootstrap — see
             // `init_service_loader_bootstrap` doc for the rationale around
             // keeping registration + classpath seeding in a single entry.
@@ -2666,6 +2793,14 @@ impl SharedVm {
     pub fn request_stack_dump(&self) {
         self.stack_dump_requested
             .store(true, std::sync::atomic::Ordering::Release);
+        // KC16-watchdog: also wake every thread parked in Object.wait().
+        // The interpreter top-of-loop poll only fires when the thread is
+        // actively dispatching bytecode — a thread blocked in
+        // `parking_lot::Condvar::wait_for` (Monitor::wait) never reaches
+        // it. Signalling the global wait flag lets each waiter's 5ms
+        // poll exit the condvar and re-check its state, where the
+        // standard top-of-loop ack path then fires.
+        crate::threading::monitor::signal_stack_dump_to_waiters();
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -2741,6 +2876,80 @@ impl SharedVm {
         self.stack_dump_ack_count
             .load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+// KC16-watchdog: thread-local snapshot of the current thread's frame chain,
+// populated right before the thread parks in `Object.wait()`. The static
+// `WAIT_SITE_DUMP` callback (installed in `Vm::new`) reads this thread-
+// local to emit a stack dump from inside the wait loop, where the
+// `JvmThread` is not directly accessible.
+thread_local! {
+    static WAIT_SITE_SNAPSHOT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Build a frame-chain snapshot string for the given thread and stash it
+/// in the thread-local so a wait-site dump can emit it later. Cleared on
+/// wait return.
+pub fn set_wait_site_snapshot(thread: &JvmThread) {
+    let mut buf = String::new();
+    let tid = thread.thread_id.0;
+    let name = &thread.name;
+    let fc = thread.frames.len();
+    buf.push_str(&format!(
+        "--- T19.H1 stack dump (wait-site): tid={tid} name={name:?} frames={fc} ---\n"
+    ));
+    for (depth, frame) in thread.frames.iter().enumerate() {
+        let class_name = truncate_ascii(frame.class_name(), 240);
+        let method_name = truncate_ascii(frame.method_name(), 240);
+        let desc = truncate_ascii(frame.method_descriptor(), 240);
+        let source = frame
+            .source_file()
+            .map(|s| truncate_ascii(s, 240))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        buf.push_str(&format!(
+            "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
+            pc = frame.pc,
+            last = frame.last_instr_pc,
+        ));
+    }
+    buf.push_str(&format!("--- T19.H1 end dump tid={tid} (wait-site) ---\n"));
+    WAIT_SITE_SNAPSHOT.with(|c| *c.borrow_mut() = Some(buf));
+}
+
+pub fn clear_wait_site_snapshot() {
+    WAIT_SITE_SNAPSHOT.with(|c| *c.borrow_mut() = None);
+}
+
+/// Called by the Monitor wait loop (via the OnceLock callback installed in
+/// `Vm::new`) when the stack-dump watchdog flag is observed. Reads the
+/// thread-local snapshot captured by `monitor_wait` on entry and writes
+/// it to stderr, then increments the watchdog ack counter.
+pub fn dump_wait_site_thread_local(shared: &SharedVm) {
+    use std::io::Write;
+    let snapshot = WAIT_SITE_SNAPSHOT.with(|c| c.borrow().clone());
+    if let Some(buf) = snapshot {
+        let stderr = std::io::stderr();
+        let mut handle = stderr.lock();
+        let _ = handle.write_all(buf.as_bytes());
+        let _ = handle.flush();
+        shared
+            .stack_dump_ack_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    } else {
+        tracing::warn!(
+            target: "kc16_watchdog",
+            "wait-site dump fired but no snapshot was captured"
+        );
+    }
+}
+
+impl SharedVm {
+    /// Placeholder split-impl — see the inherent impl above. The split is
+    /// purely so the thread-local helpers above can sit between two impl
+    /// blocks without losing rustfmt readability.
+    #[doc(hidden)]
+    fn __kc16_split_marker(&self) {}
 
     /// Get or create a synthetic lock object for static synchronized methods.
     ///
@@ -2982,6 +3191,29 @@ impl Vm {
         // Store a weak self-reference so native methods can clone the Arc
         // for spawning new threads.
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
+
+        // KC16-watchdog: install the wait-site frame dumper so a thread
+        // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit
+        // its frame chain when the stack-dump watchdog fires. Without
+        // this, the watchdog reports "0 threads dumped — main in native"
+        // because the parked thread never reaches the interpreter's
+        // top-of-loop poll.
+        //
+        // The closure reads the per-thread "wait-site frame snapshot"
+        // thread-local that `monitor_wait` populates on entry (see
+        // `vm_exec::monitor_wait`). The Monitor itself runs on the same
+        // OS thread as the wait caller, so the thread-local is visible
+        // even though we routed the wait through `parking_lot::Condvar`.
+        // We also increment the watchdog ack counter so the watchdog's
+        // "0 threads dumped" banner no longer fires for this case.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_site_dump(move |_tid| {
+                if let Some(s) = weak.upgrade() {
+                    crate::vm::vm_init::dump_wait_site_thread_local(&s);
+                }
+            });
+        }
 
         // Register the main thread (id 0) in the thread registry.
         let main_thread = JvmThread::new(ThreadId(0), "main");

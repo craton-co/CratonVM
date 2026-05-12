@@ -984,10 +984,18 @@ fn verify_final_method_constraint(class: &Class, store: &ClassStore) -> Result<(
             continue;
         }
 
-        // Check if this method overrides a FINAL method in a superclass
+        // Check if this method overrides a FINAL method in a superclass.
+        // Per JVMS, private and static methods are not inherited and therefore
+        // cannot be overridden — a same-named method in a subclass is a
+        // distinct method, not an override.
         if let Some((super_method, _)) =
             find_method_recursive(super_id, &method.name, &method.descriptor, store)
         {
+            if super_method.access_flags.contains(MethodAccessFlags::PRIVATE)
+                || super_method.is_static()
+            {
+                continue;
+            }
             if super_method.access_flags.contains(MethodAccessFlags::FINAL) {
                 return Err(LinkageError::VerifyError {
                     class_name: class.name.to_string(),

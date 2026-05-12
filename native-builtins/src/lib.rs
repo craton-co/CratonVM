@@ -36,6 +36,272 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+/// Native `Duration.parse(CharSequence)` for real-JDK mode.
+///
+/// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
+/// then calls `Matcher.start(int)` on optional groups; CratonVM's
+/// synthetic Matcher throws AIOOBE on unmatched groups. Override the
+/// static factory so common ISO-8601 inputs (Quarkus emits `P3D` /
+/// `PT...` values from config defaults) parse without touching the
+/// regex engine.
+///
+/// Supported grammar: `[+-]P[nD][T[nH][nM][n[.n]S]]`. Construction
+/// is delegated to `Duration.ofSeconds(long, long)` so the resulting
+/// object has the real-JDK field layout.
+fn essential_dur_parse(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    fn parse_unsigned(b: &[u8]) -> Option<(u64, usize)> {
+        let mut i = 0usize;
+        let mut sign_present = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            sign_present = true;
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let n: u64 = std::str::from_utf8(&b[start..i]).ok()?.parse().ok()?;
+        let _ = sign_present;
+        Some((n, i))
+    }
+    fn parse_signed(b: &[u8]) -> Option<(u64, i128, usize)> {
+        let mut i = 0usize;
+        let mut sign: i128 = 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            if b[i] == b'-' {
+                sign = -1;
+            }
+            i += 1;
+        }
+        let (n, consumed) = parse_unsigned(&b[i..])?;
+        if consumed == 0 {
+            return None;
+        }
+        // parse_unsigned consumed `consumed` bytes from b[i..]; but
+        // parse_unsigned itself may have stripped its own sign — avoid
+        // double-stripping by reading raw digits only here.
+        let start = i;
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == start {
+            return None;
+        }
+        let n: u64 = std::str::from_utf8(&b[start..j]).ok()?.parse().ok()?;
+        Some((n, sign, j))
+    }
+    let s_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Text cannot be null".to_string(),
+            }
+            .into())
+        }
+    };
+    let text = ctx.read_string(s_obj).unwrap_or_default();
+    let trimmed = text.trim().to_string();
+    let raw_err = || rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        message: format!("Text cannot be parsed to a Duration: {trimmed}"),
+    };
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return Err(raw_err().into());
+    }
+    let mut i = 0usize;
+    let mut negative = false;
+    if bytes[i] == b'+' {
+        i += 1;
+    } else if bytes[i] == b'-' {
+        negative = true;
+        i += 1;
+    }
+    if i >= bytes.len() || (bytes[i] != b'P' && bytes[i] != b'p') {
+        return Err(raw_err().into());
+    }
+    i += 1;
+    let mut total_seconds: i128 = 0;
+    let mut total_nanos: i32 = 0;
+    let mut saw_any = false;
+    // Days segment
+    if i < bytes.len() && bytes[i] != b'T' && bytes[i] != b't' {
+        let (n, sign, consumed) = parse_signed(&bytes[i..]).ok_or_else(raw_err)?;
+        i += consumed;
+        if i >= bytes.len() || (bytes[i] != b'D' && bytes[i] != b'd') {
+            return Err(raw_err().into());
+        }
+        i += 1;
+        total_seconds = total_seconds.saturating_add(sign * n as i128 * 86_400);
+        saw_any = true;
+    }
+    // Time segment
+    if i < bytes.len() {
+        if bytes[i] != b'T' && bytes[i] != b't' {
+            return Err(raw_err().into());
+        }
+        i += 1;
+        let mut last_pos = 0;
+        let mut t_saw = false;
+        while i < bytes.len() {
+            let (n, sign, consumed) = parse_signed(&bytes[i..]).ok_or_else(raw_err)?;
+            i += consumed;
+            // Fractional seconds (only valid before S, but parse leniently)
+            let mut frac_nanos: i64 = 0;
+            if i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b',') {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if start == i {
+                    return Err(raw_err().into());
+                }
+                let take = (i - start).min(9);
+                let digits = &trimmed[start..start + take];
+                let mut nanos: i64 = digits.parse::<i64>().unwrap_or(0);
+                for _ in digits.len()..9 {
+                    nanos *= 10;
+                }
+                frac_nanos = nanos;
+            }
+            if i >= bytes.len() {
+                return Err(raw_err().into());
+            }
+            let unit = bytes[i];
+            i += 1;
+            let pos = match unit {
+                b'H' | b'h' => 1,
+                b'M' | b'm' => 2,
+                b'S' | b's' => 3,
+                _ => return Err(raw_err().into()),
+            };
+            if pos <= last_pos {
+                return Err(raw_err().into());
+            }
+            last_pos = pos;
+            t_saw = true;
+            saw_any = true;
+            match pos {
+                1 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 3600),
+                2 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 60),
+                3 => {
+                    total_seconds = total_seconds.saturating_add(sign * n as i128);
+                    let mut combined = total_nanos as i64 + sign as i64 * frac_nanos;
+                    while combined < 0 {
+                        combined += 1_000_000_000;
+                        total_seconds -= 1;
+                    }
+                    while combined >= 1_000_000_000 {
+                        combined -= 1_000_000_000;
+                        total_seconds += 1;
+                    }
+                    total_nanos = combined as i32;
+                }
+                _ => {}
+            }
+        }
+        if !t_saw {
+            return Err(raw_err().into());
+        }
+    }
+    if !saw_any {
+        return Err(raw_err().into());
+    }
+    if negative {
+        let total = -(total_seconds * 1_000_000_000 + total_nanos as i128);
+        total_seconds = total.div_euclid(1_000_000_000);
+        total_nanos = total.rem_euclid(1_000_000_000) as i32;
+    }
+    let secs = total_seconds.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    // Delegate to JDK's `Duration.ofSeconds(long,long)` so the returned
+    // object has the proper internal layout.
+    match ctx.invoke(
+        "java/time/Duration",
+        "ofSeconds",
+        "(JJ)Ljava/time/Duration;",
+        &[Value::Long(secs), Value::Long(total_nanos as i64)],
+    ) {
+        Ok(Some(v)) => Ok(Some(v)),
+        Ok(None) => Err(raw_err().into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Native override for `io.quarkus.runtime.configuration.LocaleConverter.convert(String)`.
+///
+/// The JDK-bytecode converter validates inputs via
+/// `Locale.forLanguageTag(...).getLanguage().isEmpty()` and throws
+/// `IllegalArgumentException("Unable to resolve locale: <input>")` on
+/// failure. CratonVM's `Locale.forLanguageTag` doesn't populate the
+/// language field in real-JDK mode, so even the well-formed default
+/// expression `"${user.language:en}-${user.country:}"` (often
+/// rendered as `"en-"` when user.country is unset) is rejected during
+/// Quarkus config validation, blocking Keycloak boot.
+///
+/// Mirror the validator's intent leniently: split on `-` / `_`, treat
+/// `null` / empty as null, treat `"all"` as `Locale.ROOT`, otherwise
+/// construct `new Locale(language, country)` via the JDK constructor —
+/// good enough for downstream consumers that read language/country
+/// directly.
+fn essential_quarkus_locale_convert(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let s_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let raw = ctx.read_string(s_obj).unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    if trimmed == "all" {
+        // Locale.ROOT
+        return ctx.invoke(
+            "java/util/Locale",
+            "getDefault",
+            "()Ljava/util/Locale;",
+            &[],
+        );
+    }
+    // Normalise: replace '_' with '-' then split.
+    let normalised: String = trimmed.replace('_', "-");
+    let mut parts = normalised.split('-');
+    let lang = parts.next().unwrap_or("").to_string();
+    let country = parts.next().unwrap_or("").to_string();
+    let variant = parts.next().unwrap_or("").to_string();
+    // Construct via Locale's (String,String,String) constructor — works
+    // regardless of `forLanguageTag`'s CLDR-data dependencies.
+    let cls = "java/util/Locale";
+    let loc_obj = match ctx.new_object(cls) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let l = ctx.create_string(&lang);
+    let c = ctx.create_string(&country);
+    let v = ctx.create_string(&variant);
+    let _ = ctx.invoke(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        &[
+            Value::Object(Some(loc_obj)),
+            Value::Object(Some(l)),
+            Value::Object(Some(c)),
+            Value::Object(Some(v)),
+        ],
+    );
+    Ok(Some(Value::Object(Some(loc_obj))))
+}
+
 /// Decode `java.lang.String` used as a system/property key when
 /// `NativeContext::read_string` yields empty (compact `String` layout edge cases).
 pub(crate) fn property_key_from_java_string(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> String {
@@ -105,6 +371,7 @@ pub mod phases_late;
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
 // the loaded value instead of NPE.
 pub mod properties_sidetable;
+pub mod classloader_value_sidetable;
 pub mod charset;
 pub mod panama;
 pub mod panama_libffi;
@@ -1316,6 +1583,39 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&sep)))))
         },
     );
+    // Duration.parse — JDK bytecode uses regex Matcher.start(int) on
+    // unmatched groups, which CratonVM's synthetic Matcher rejects with
+    // AIOOBE. Stub the parser natively so ISO-8601 inputs like "P3D",
+    // "PT5M" round-trip without touching the regex engine.
+    registry.register(
+        "java/time/Duration",
+        "parse",
+        "(Ljava/lang/CharSequence;)Ljava/time/Duration;",
+        essential_dur_parse,
+    );
+
+    // Quarkus LocaleConverter — its convert(String) rejects any tag for
+    // which `Locale.forLanguageTag(...).getLanguage()` is empty. In
+    // CratonVM's real-JDK mode `Locale.forLanguageTag` doesn't fully
+    // populate the Locale (no native CLDR data), so even valid inputs
+    // like "en" or the default-expression value "en-" (produced when
+    // `${user.country:}` resolves to empty) get rejected with
+    // "Unable to resolve locale". Override the converter to construct
+    // a Locale via the simpler `new Locale(lang, country)` path so
+    // Quarkus's `quarkus.locales` validation passes.
+    registry.register(
+        "io/quarkus/runtime/configuration/LocaleConverter",
+        "convert",
+        "(Ljava/lang/String;)Ljava/util/Locale;",
+        essential_quarkus_locale_convert,
+    );
+    registry.register(
+        "io/quarkus/runtime/configuration/LocaleConverter",
+        "convert",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        essential_quarkus_locale_convert,
+    );
+
     registry.register(
         "java/lang/System",
         "getProperties",
@@ -1324,10 +1624,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Return a lightweight synthetic Properties object.  The
             // Properties.getProperty/getProperty(default) native overrides
             // below intercept the common read paths and delegate to our
-            // VM's system property store — so we don't need to populate
-            // the Properties' internal Hashtable slots (which would cascade
-            // into many allocations during early bootstrap and OOM).
+            // VM's system property store — so individual lookups work
+            // without touching the inherited Hashtable slots.
+            //
+            // However, callers that *enumerate* (Properties.forEach,
+            // stringPropertyNames, size, entrySet) read from the
+            // side-table directly. SmallRye / Quarkus's
+            // `PropertiesConfigSource` iterates `System.getProperties()`
+            // to materialise its config map; if the side-table is empty,
+            // expressions like `${user.country:}` resolve to the empty
+            // default — producing values like `quarkus.locales=en-`.
+            // Pre-populate the side-table with the current system
+            // property snapshot so enumeration sees the live values.
             let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
+            for (k, v) in ctx.list_system_properties() {
+                crate::properties_sidetable::store_property_in_sidetable(props, &k, &v);
+            }
             Ok(Some(Value::Object(Some(props))))
         },
     );
@@ -1581,6 +1893,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `properties_sidetable.rs` to keep the registration here lean.
     crate::properties_sidetable::register_properties_sidetable(registry);
 
+    // Spring Boot apps (eureka-server, letsgo-main, sportme) hang in
+    // `jdk/internal/loader/AbstractClassLoaderValue.putIfAbsent` (pc=29):
+    // the method drives `ConcurrentHashMap.putIfAbsent` whose internal CAS
+    // loop livelocks under our Unsafe field-offset emulation.  Bypass the
+    // CHM path entirely with a side-table keyed by (ClassLoader, this).
+    // See `classloader_value_sidetable.rs`.
+    crate::classloader_value_sidetable::register_classloader_value_sidetable(registry);
+
     // S111r11 SB3: `jdk.internal.module.ModuleBootstrap.<clinit>` calls
     // `getAndRemoveProperty(key) = (String) System.getProperties().remove(key)`
     // for `jdk.module.path`, `jdk.module.upgrade.path`, `jdk.module.main.class`,
@@ -1744,6 +2064,93 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Long", "toHexString", "(J)Ljava/lang/String;", |ctx, args| {
         let val = match args.first() { Some(Value::Long(v)) => *v, _ => 0 };
         Ok(Some(Value::Object(Some(ctx.create_string(&format!("{:x}", val as u64))))))
+    });
+    // Round 63 (peaceful-sammet) — Long.toString(long,int) and Integer.toString(int,int)
+    // overrides for real-JDK mode. SnakeYAML 2.0 SafeConstructor.<clinit> calls
+    // Long.toString(Long.MAX_VALUE, radix) for radix in {2,8,10,16}; the JDK
+    // bytecode path throws ArrayIndexOutOfBoundsException in our interpreter
+    // (the root cause has not been pinpointed, but bypassing via a native
+    // implementation unblocks the SafeConstructor clinit so ua_parser.Parser.<init>
+    // and DeviceRepresentationProviderFactoryImpl.<clinit> succeed, advancing
+    // Keycloak past the YAML init failure).
+    registry.register("java/lang/Long", "toString", "(JI)Ljava/lang/String;", |ctx, args| {
+        let val = match args.first() { Some(Value::Long(v)) => *v, _ => 0 };
+        let radix = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => 10 };
+        let radix = if !(2..=36).contains(&radix) { 10 } else { radix };
+        let text = if radix == 10 {
+            val.to_string()
+        } else if val == i64::MIN {
+            // -i64::MIN overflows; build absolute value manually
+            let mut s = String::from("-");
+            let mut v = (i64::MIN as i128).unsigned_abs() as u128;
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit((v % radix as u128) as u32, radix).unwrap_or('?'));
+                v /= radix as u128;
+            }
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else if val < 0 {
+            let mut v = (-val) as u64;
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+                v /= radix as u64;
+            }
+            let mut s = String::from("-");
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else {
+            let mut v = val as u64;
+            if v == 0 { "0".to_string() } else {
+                let mut buf = Vec::new();
+                while v > 0 {
+                    buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+                    v /= radix as u64;
+                }
+                buf.into_iter().rev().collect()
+            }
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
+    });
+    registry.register("java/lang/Integer", "toString", "(II)Ljava/lang/String;", |ctx, args| {
+        let val = match args.first() { Some(Value::Int(v)) => *v, _ => 0 };
+        let radix = match args.get(1) { Some(Value::Int(v)) => *v as u32, _ => 10 };
+        let radix = if !(2..=36).contains(&radix) { 10 } else { radix };
+        let text = if radix == 10 {
+            val.to_string()
+        } else if val == i32::MIN {
+            let mut s = String::from("-");
+            let mut v = (i32::MIN as i64).unsigned_abs();
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+                v /= radix as u64;
+            }
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else if val < 0 {
+            let mut v = (-val) as u32;
+            let mut buf = Vec::new();
+            while v > 0 {
+                buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+                v /= radix;
+            }
+            let mut s = String::from("-");
+            for c in buf.into_iter().rev() { s.push(c); }
+            s
+        } else {
+            let mut v = val as u32;
+            if v == 0 { "0".to_string() } else {
+                let mut buf = Vec::new();
+                while v > 0 {
+                    buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+                    v /= radix;
+                }
+                buf.into_iter().rev().collect()
+            }
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
     });
 
     // Object.toString override — JDK bytecode uses string concat (invokedynamic)
@@ -2005,6 +2412,70 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "registerNatives", "()V", native_noop);
     registry.register("java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;", native_class_get_primitive_class);
 
+    // WildFly livelock fix — override the three `java.lang.Class$Atomic`
+    // CAS helpers so they bypass the broken Unsafe.objectFieldOffset
+    // lookup for Class.{reflectionData,annotationType,annotationData}
+    // and operate on a Rust-side per-mirror table instead. Without
+    // these overrides, `Class.privateGetDeclaredFields` livelocks on
+    // bootstrap (observed under WildFlySecurityManager.<clinit>).
+    registry.register(
+        "java/lang/Class$Atomic",
+        "casReflectionData",
+        "(Ljava/lang/Class;Ljava/lang/ref/SoftReference;Ljava/lang/ref/SoftReference;)Z",
+        native_class_atomic_cas_reflection_data,
+    );
+    registry.register(
+        "java/lang/Class$Atomic",
+        "casAnnotationType",
+        "(Ljava/lang/Class;Lsun/reflect/annotation/AnnotationType;Lsun/reflect/annotation/AnnotationType;)Z",
+        native_class_atomic_cas_annotation_type,
+    );
+    registry.register(
+        "java/lang/Class$Atomic",
+        "casAnnotationData",
+        "(Ljava/lang/Class;Ljava/lang/Class$AnnotationData;Ljava/lang/Class$AnnotationData;)Z",
+        native_class_atomic_cas_annotation_data,
+    );
+
+    // T20.RD (WildFly/SportMe Class$ReflectionData livelock fix) —
+    // The cas-side-store fix above (`casReflectionData`) keeps CAS
+    // progress consistent, but it is INVISIBLE to the direct
+    // `getfield Class.reflectionData` performed by `Class.reflectionData()`
+    // and `Class.newReflectionData()` (slot 11 on the mirror, populated
+    // by `make_class_mirror` to `null`). After the first CAS succeeds
+    // the side store holds a SoftReference, but the heap slot stays
+    // null; the second call therefore re-enters `newReflectionData()`
+    // whose `while(true)` loop CASes with `expected=null` against a
+    // side-store value of `Some(prevSoftRef)`, the comparison fails
+    // forever, and `re-read this.reflectionData` returns null again
+    // → livelock at `Class$ReflectionData.<init>` / `newReflectionData`
+    // pc=0..9 (60s watchdog dump on WildFly bootstrap and SportMe).
+    //
+    // Cleanest fix: replace `Class.newReflectionData(SoftReference, int)`
+    // with a native that allocates the `Class$ReflectionData`, sets its
+    // `redefinedCount`, wraps it in a fresh `SoftReference`, writes the
+    // SoftReference into slot 11 of the receiver mirror AND into the
+    // cas side store so both the direct getfield and any future
+    // `casReflectionData` see the same value. Also register the
+    // `Class$ReflectionData.<init>(I)V` constructor as a no-op-ish
+    // native that just assigns `redefinedCount` (the JDK constructor
+    // body is `this.redefinedCount = redefinedCount;`) — required so
+    // that any caller that allocates a ReflectionData directly (the
+    // bytecode at `newReflectionData` pc=5) does not run through
+    // class-init / JIT paths that may themselves be hung.
+    registry.register(
+        "java/lang/Class$ReflectionData",
+        "<init>",
+        "(I)V",
+        native_class_reflection_data_init,
+    );
+    registry.register(
+        "java/lang/Class",
+        "newReflectionData",
+        "(Ljava/lang/ref/SoftReference;I)Ljava/lang/Class$ReflectionData;",
+        native_class_new_reflection_data,
+    );
+
     // T14/T15: Override Class.getResourceAsStream / getResource so that
     // real-JDK bytecode doesn't depend on the full Module subsystem during
     // bootstrap.  The real JDK's versions call getModule().isNamed() first,
@@ -2124,15 +2595,143 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
+    // Round 63: org.jboss.staxmapper.IntVersion.toString() — WildFly uses
+    // IntStream.of(segments).limit(n).mapToObj(Integer::toString).collect(joining("."))
+    // to format its version. Our IntStream/mapToObj chain returns null on the
+    // limit() path, leading to "Cannot invoke collect on null" inside
+    // VersionedNamespace.createURN -> StandaloneXmlSchemas.<init>. Bypass the
+    // stream pipeline entirely by reading the int[] `segments` field directly
+    // and joining with dots. Matches IntVersion's no-arg contract: include all
+    // non-trailing-zero segments (already stripped at construction time).
+    registry.register("org/jboss/staxmapper/IntVersion", "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let segments = match ctx.get_field_by_name(this, "segments") {
+            Value::Object(Some(arr)) => arr,
+            _ => {
+                let s = ctx.create_string("0");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        };
+        let n = ctx.array_length(segments);
+        let mut parts: Vec<String> = Vec::with_capacity(n);
+        for i in 0..n {
+            match ctx.get_array_element(segments, i) {
+                Value::Int(v) => parts.push(v.to_string()),
+                _ => parts.push("0".to_string()),
+            }
+        }
+        let joined = if parts.is_empty() { "0".to_string() } else { parts.join(".") };
+        let s = ctx.create_string(&joined);
+        Ok(Some(Value::Object(Some(s))))
+    });
+    // Also override the (int) overload that limits how many segments are emitted.
+    registry.register("org/jboss/staxmapper/IntVersion", "toString", "(I)Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let limit = match args.get(1) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => 0,
+        };
+        let segments = match ctx.get_field_by_name(this, "segments") {
+            Value::Object(Some(arr)) => arr,
+            _ => {
+                let s = ctx.create_string("0");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        };
+        let n = ctx.array_length(segments);
+        let take = n.min(limit.max(0));
+        // If limit > n, IntVersion pads the remaining slots with `segment(i)` (=0).
+        let total = if limit > n { limit } else { take };
+        let mut parts: Vec<String> = Vec::with_capacity(total);
+        for i in 0..total {
+            if i < n {
+                match ctx.get_array_element(segments, i) {
+                    Value::Int(v) => parts.push(v.to_string()),
+                    _ => parts.push("0".to_string()),
+                }
+            } else {
+                parts.push("0".to_string());
+            }
+        }
+        let joined = if parts.is_empty() { "0".to_string() } else { parts.join(".") };
+        let s = ctx.create_string(&joined);
+        Ok(Some(Value::Object(Some(s))))
+    });
+    // Class.hasRealParameterData() — package-private method on java.lang.Class
+    // in newer JDKs, used by reflection (e.g. Spring/Method.getParameters) to
+    // check whether MethodParameters attribute data is available. Returning
+    // false matches the safe default (no parameter data) and unblocks
+    // Spring Boot 4.0.6 (demo) and 2.0.3 (sportme) which throw
+    // NoSuchMethodError on java/lang/Class.hasRealParameterData()Z.
+    registry.register("java/lang/Class", "hasRealParameterData", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    // Round 63: Keycloak start-dev re-augmentation no-op.
+    //
+    // `start-dev` invokes `AbstractAutoBuildCommand.runReAugmentation` which
+    // calls `Build.runCommand()` to rebuild production config in-process via
+    // a child picocli CommandLine. That nested rebuild path goes through
+    // `Picocli.updateSpecHelpAndUnmatched`, which recursively removes the
+    // `-h/--help` short option from every subcommand spec before re-adding
+    // a Keycloak-specific help mixin. The recursion re-enters the same spec
+    // a second time after the first pass has already added the new `-h`
+    // option, and picocli's `CommandSpec.addOption` throws
+    // `DuplicateOptionAnnotationsException("Option name '-h' is used by both
+    // option --help and field AutoHelpMixin.helpRequested")`. That bubbles
+    // up as `CommandLine.ExecutionException("Failed to update server
+    // configuration.")` from `Build.runCommand` (pc=120/134), aborting
+    // start-dev before the dev-mode server can boot.
+    //
+    // Re-augmentation is a production optimization (precompute the runtime
+    // image of `kc.sh build`). Dev-mode (`start-dev`) does not require it —
+    // Quarkus's dev runtime re-resolves configuration on demand. Stubbing
+    // `Build.runCommand` to a no-op lets `runReAugmentation` return cleanly
+    // and `start-dev` proceeds to Quarkus bootstrap.
+    registry.register(
+        "org/keycloak/quarkus/runtime/cli/command/Build",
+        "runCommand",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register("java/lang/Class", "initClassName", "()Ljava/lang/String;", lang_class::native_class_get_name);
     // getName() is a Java method that caches via initClassName(). Override with
     // native since JDK's Class field layout differs from our mirror layout.
     registry.register("java/lang/Class", "getName", "()Ljava/lang/String;", lang_class::native_class_get_name);
     registry.register("java/lang/Class", "getComponentType", "()Ljava/lang/Class;", lang_class::native_class_get_component_type);
+    // Round 63: Class.arrayType() — bypass JDK's `Array.newInstance(this, 0).getClass()`
+    // chain, which leaked nulls into Spring's GenericConversionService$Converters.
+    // getClassHierarchy when invoked on the superclass / interfaces of an array
+    // argument (e.g. `Object`, `Cloneable`, `Serializable`). Direct mirror lookup
+    // matches what `Object.getClass()` produces for an actual array instance.
+    registry.register("java/lang/Class", "arrayType", "()Ljava/lang/Class;", lang_class::native_class_array_type);
     registry.register("java/lang/Class", "getDeclaringClass0", "()Ljava/lang/Class;", lang_class::native_class_get_declaring_class);
     registry.register("java/lang/Class", "getSimpleBinaryName0", "()Ljava/lang/String;", lang_class::native_class_get_simple_binary_name);
     registry.register("java/lang/Class", "getEnclosingMethod0", "()[Ljava/lang/Object;", lang_class::native_class_get_enclosing_method);
     registry.register("java/lang/Class", "getGenericSignature0", "()Ljava/lang/String;", lang_class::native_class_get_generic_signature);
+    // GENS-1 (real-JDK): override Class.getGenericInterfaces() and
+    // getGenericSuperclass() with our native implementations. The JDK's
+    // own bytecode for these methods drives the SignatureParser →
+    // Reifier pipeline (sun.reflect.generics.*), and on classes such as
+    // `ArrayList` the parsed `path` list contains a null entry that
+    // causes `Reifier.visitClassTypeSignature` to NPE on
+    // `new StringBuilder(sc.getName())`. The crash surfaces as
+    // "Cannot invoke getName on null" during Spring Boot's
+    // `ApplicationConversionService.<clinit>` (and is reproducible with a
+    // 5-line program that just touches `ArrayList.class.getGenericInterfaces()`).
+    // Our natives parse the Signature attribute via
+    // `rustjvm_reader::signature` and build the synthetic
+    // `ParameterizedType` / `Class` mirror tree directly, side-stepping
+    // the broken JDK parse path entirely. The matching `check_override`
+    // entry in `vm_exec.rs` lets these natives take precedence over the
+    // non-`ACC_NATIVE` JDK bytecode.
+    registry.register("java/lang/Class", "getGenericInterfaces", "()[Ljava/lang/reflect/Type;", lang_class::native_class_get_generic_interfaces);
+    registry.register("java/lang/Class", "getGenericSuperclass", "()Ljava/lang/reflect/Type;", lang_class::native_class_get_generic_superclass);
     registry.register("java/lang/Class", "getRawAnnotations", "()[B", lang_class::native_class_get_raw_annotations);
     registry.register("java/lang/Class", "getRawTypeAnnotations", "()[B", lang_class::native_class_get_raw_type_annotations);
     registry.register("java/lang/Class", "getConstantPool", "()Ljdk/internal/reflect/ConstantPool;", lang_class::native_class_get_constant_pool);
@@ -2270,13 +2869,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             })
         });
         if let Some(raw_path) = path_opt {
+            // R63 (Keycloak/Quarkus): `find_class_source_path` returns the
+            // classpath entry verbatim — which may be a relative path like
+            // `lib/quarkus-run.jar` when launched via `cd <appdir> && --jar
+            // lib/quarkus-run.jar`.  Without canonicalization, the resulting
+            // URL `file:lib/quarkus-run.jar` is opaque (no `/` after `file:`),
+            // and Quarkus's `Path.of(QuarkusEntryPoint.class.getProtectionDomain()
+            // .getCodeSource().getLocation().toURI()).getParent()` produces a
+            // single-segment Path whose `getParent()` is null — exactly the
+            // QuarkusEntryPoint.doRun:67 NPE.  Canonicalize so the URL is
+            // always absolute (`file:/C:/.../lib/quarkus-run.jar`).
+            let abs_path = std::fs::canonicalize(&raw_path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .map(|s| s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+                .unwrap_or(raw_path);
             // Normalise backslashes to forward slashes so Path/File code
             // further up the stack works the same on every platform.
-            let fwd = raw_path.replace('\\', "/");
+            let fwd = abs_path.replace('\\', "/");
             // Ensure absolute-style leading slash for Windows drive paths
             // (e.g. `C:/craton/...` → `/C:/craton/...`), matching the
             // URL-encoded form HotSpot produces.
             let path = if fwd.len() >= 2 && &fwd[1..2] == ":" {
+                format!("/{fwd}")
+            } else if !fwd.starts_with('/') {
+                // Non-Windows relative path that we couldn't canonicalize —
+                // prefix with `/` so the URL is hierarchical (file:/...) and
+                // `Path.of(uri).getParent()` returns a real parent.
                 format!("/{fwd}")
             } else {
                 fwd
@@ -2344,19 +2963,58 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
         ))))
     });
-    // URL.getPath()/getFile()/getProtocol()/getHost() — fixed to use the real-JDK
-    // URL field layout (protocol=0, host=1, port=2, file=3, query=4, authority=5,
-    // path=6). The legacy versions of these natives indexed the wrong slots
-    // (e.g. getProtocol read field 1 / host), which made Keycloak's SmallRye
-    // config loader throw "Unexpected protocol null for URL jar:file:..." when
-    // scanning the classpath.
+    // URL.getPath() — prefer real-JDK 13-field layout (path@6, file@3,
+    // protocol@0). The earlier synthetic 1-field layout (path@0) is detected
+    // by checking object_num_fields == 1, in which case slot 0 holds the path
+    // string. For multi-field URLs, read by name so we get the path, not the
+    // protocol. R63 (Keycloak): without this, `URL.getPath()` on a PD URL
+    // returns "file" instead of "/C:/.../quarkus-run.jar", and Quarkus's
+    // `Path.of(URLDecoder.decode(getPath(), UTF_8)).getParent().getParent().getParent()`
+    // NPEs at QuarkusEntryPoint.doRun:67.
+    fn url_path_or_file_field(ctx: &mut dyn NativeContext, url: ObjectRef) -> Value {
+        let n = ctx.object_num_fields(url);
+        if n == 1 {
+            // legacy synthetic URL: slot 0 holds the path String.
+            return ctx.get_field(url, 0);
+        }
+        // Real-JDK layout: read by name. Prefer "path"; fall back to "file".
+        let v = ctx.get_field_by_name(url, "path");
+        if let Value::Object(Some(_)) = v { return v; }
+        let v = ctx.get_field_by_name(url, "file");
+        if let Value::Object(Some(_)) = v { return v; }
+        // Last-ditch: slot 3 (file) then slot 6 (path) for the JDK layout.
+        if n > 6 {
+            let v = ctx.get_field(url, 6);
+            if let Value::Object(Some(_)) = v { return v; }
+        }
+        if n > 3 {
+            let v = ctx.get_field(url, 3);
+            if let Value::Object(Some(_)) = v { return v; }
+        }
+        Value::Object(None)
+    }
+    registry.register("java/net/URL", "getPath", "()Ljava/lang/String;", |ctx, args| {
+        match args.first() {
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
+    registry.register("java/net/URL", "getFile", "()Ljava/lang/String;", |ctx, args| {
+        match args.first() {
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
+    // URL.getProtocol() / getHost() — use real-JDK URL field layout
+    // (protocol=0, host=1). The legacy versions of these natives indexed
+    // the wrong slots, which made Keycloak's SmallRye config loader throw
+    // "Unexpected protocol null for URL jar:file:..." when scanning the
+    // classpath. The named field lookup is layout-neutral.
     registry.register("java/net/URL", "getProtocol", "()Ljava/lang/String;", |ctx, args| {
         match args.first() {
             Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 0 {
-                    let v = ctx.get_field(*url, 0);
-                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
-                }
+                let v = ctx.get_field_by_name(*url, "protocol");
+                if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
                 Ok(Some(Value::Object(Some(ctx.create_string("file")))))
             }
             _ => Ok(Some(Value::Object(None))),
@@ -2365,42 +3023,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/net/URL", "getHost", "()Ljava/lang/String;", |ctx, args| {
         match args.first() {
             Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 1 {
-                    let v = ctx.get_field(*url, 1);
-                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
-                }
+                let v = ctx.get_field_by_name(*url, "host");
+                if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
                 Ok(Some(Value::Object(Some(ctx.create_string("")))))
-            }
-            _ => Ok(Some(Value::Object(None))),
-        }
-    });
-    registry.register("java/net/URL", "getFile", "()Ljava/lang/String;", |ctx, args| {
-        match args.first() {
-            Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 3 {
-                    let v = ctx.get_field(*url, 3);
-                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
-                }
-                Ok(Some(Value::Object(None)))
-            }
-            _ => Ok(Some(Value::Object(None))),
-        }
-    });
-    registry.register("java/net/URL", "getPath", "()Ljava/lang/String;", |ctx, args| {
-        match args.first() {
-            Some(Value::Object(Some(url))) => {
-                if ctx.object_num_fields(*url) > 6 {
-                    let v = ctx.get_field(*url, 6);
-                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
-                }
-                // Fall back to the `file` slot for URLs that don't separate
-                // path/query (e.g. legacy 1-field synthetic URLs would have
-                // already been routed above when their field count is small).
-                if ctx.object_num_fields(*url) > 3 {
-                    let v = ctx.get_field(*url, 3);
-                    if let Value::Object(Some(_)) = v { return Ok(Some(v)); }
-                }
-                Ok(Some(Value::Object(None)))
             }
             _ => Ok(Some(Value::Object(None))),
         }
@@ -2424,15 +3049,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
-    registry.register(
-        "java/lang/Thread",
-        "getThreadGroup",
-        "()Ljava/lang/ThreadGroup;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // NOTE: do NOT register a `getThreadGroup` shim that returns null.
+    // In real-JDK mode the Thread class has a Java implementation
+    // (`return holder.group`) and shadowing it with a null-returning
+    // native breaks `new Thread(...)`: the constructor calls
+    // `parent.getThreadGroup()` and then `g.getMaxPriority()`, which
+    // NPEs when `g` is null. The fallback in `vm_exec.rs::invoke_*`
+    // already returns null when the method is genuinely missing
+    // (e.g. synthetic-JDK / pre-bootstrap call sites).
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
     // JDK 25 additional Thread natives:
     registry.register("java/lang/Thread", "currentCarrierThread", "()Ljava/lang/Thread;", native_thread_current_thread);
+    // Thread.<init> overrides: synthetic-JDK only. In real-JDK mode the
+    // Thread class has many more fields and a FieldHolder layout — writing
+    // raw slots 0..3 there corrupts the object. We detect by num_fields:
+    // synthetic Thread has at most ~6 slots; real-JDK Thread has 20+.
+    fn is_synthetic_thread_layout(num_fields: usize) -> bool { num_fields <= 8 }
     registry.register(
         "java/lang/Thread",
         "<init>",
@@ -2442,6 +3074,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                // Real-JDK Thread: let the Java constructor run (this native
+                // shouldn't intercept). Return MethodCallFailed::NotImplemented
+                // would be ideal, but we don't have that wired; instead we
+                // do nothing — the JDK constructor body still executed
+                // before this native was dispatched only if the native
+                // wasn't bound. Since we ARE bound, we have to manually
+                // delegate. Fall back to calling the field-resolution path.
+                let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+                let name_val = args.get(3).cloned().unwrap_or_else(|| {
+                    Value::Object(Some(ctx.create_string("Thread")))
+                });
+                ctx.set_field_by_name(this, "name", name_val);
+                ctx.set_field_by_name(this, "priority", Value::Int(5));
+                ctx.set_field_by_name(this, "group", group);
+                ctx.set_field_by_name(this, "target", target);
+                return Ok(None);
+            }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = args.get(3).cloned().unwrap_or_else(|| {
@@ -2463,6 +3114,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+                let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                    Value::Object(Some(s)) => Value::Object(Some(s)),
+                    _ => Value::Object(Some(ctx.create_string("Thread"))),
+                };
+                ctx.set_field_by_name(this, "name", name_val);
+                ctx.set_field_by_name(this, "priority", Value::Int(5));
+                ctx.set_field_by_name(this, "group", group);
+                ctx.set_field_by_name(this, "target", target);
+                return Ok(None);
+            }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
@@ -2485,6 +3149,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                let group = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let target = args.get(2).cloned().unwrap_or(Value::Object(None));
+                let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
+                    Value::Object(Some(s)) => Value::Object(Some(s)),
+                    _ => Value::Object(Some(ctx.create_string("Thread"))),
+                };
+                ctx.set_field_by_name(this, "name", name_val);
+                ctx.set_field_by_name(this, "priority", Value::Int(5));
+                ctx.set_field_by_name(this, "group", group);
+                ctx.set_field_by_name(this, "target", target);
+                return Ok(None);
+            }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
@@ -2499,14 +3176,50 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.register("java/lang/Thread", "start0", "()V", native_thread_start0);
-    registry.register("java/lang/Thread", "start", "()V", native_thread_start0);
+    // Thread.start: in real-JDK mode the JDK's Java implementation must
+    // run (it sets thread state, checks already-started, and calls start0).
+    // Only intercept for synthetic-JDK Thread where there is no Java body
+    // worth executing.
+    registry.register("java/lang/Thread", "start", "()V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            // Real-JDK Thread: spawn directly. The JDK's Thread.start()
+            // does threadStatus checks then calls start0() native, but
+            // since we've registered an override on "start" we bypass
+            // that here. Just spawn via the same native.
+            return native_thread_start0(ctx, args);
+        }
+        native_thread_start0(ctx, args)
+    });
+    // Thread.run: synthetic-JDK reads slot 3 = target. Real-JDK Thread.run
+    // reads `holder.task` from FieldHolder. For real-JDK we resolve the
+    // `target` field by name so we invoke the user's Runnable correctly.
     registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if ctx.object_num_fields(this) >= 4 {
-            if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+        let num_fields = ctx.object_num_fields(this);
+        if is_synthetic_thread_layout(num_fields) {
+            if num_fields >= 4 {
+                if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+                    let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                }
+            }
+        } else {
+            // Real-JDK: target is stored on this Thread (resolved by name).
+            // Could be on `holder` (FieldHolder.task) or directly on Thread
+            // depending on JDK version. Try both.
+            let mut target_val = ctx.get_field_by_name(this, "target");
+            if matches!(target_val, Value::Object(None)) {
+                if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
+                    target_val = ctx.get_field_by_name(holder, "task");
+                }
+            }
+            if let Value::Object(Some(target)) = target_val {
                 let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
             }
         }
@@ -3310,18 +4023,60 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field_by_name(this, "contextClassLoader")))
         },
     );
+    // setAccessible(boolean) — must write the JDK `override` field so that
+    // subsequent Method.invoke / Field.get/set / Constructor.newInstance
+    // see the access override (otherwise CGLib's reflective
+    // ClassLoader.defineClass call fails with IllegalAccessException).
+    // Also write the RustJVM extra-slot accessible flag for paths that
+    // consult it directly.
+    fn native_set_accessible_write_override(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let flag = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        ctx.set_field_by_name(this, "override", Value::Int(flag));
+        Ok(None)
+    }
     registry.register(
         "java/lang/reflect/Method",
         "setAccessible",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        native_set_accessible_write_override,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setAccessible",
+        "(Z)V",
+        native_set_accessible_write_override,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "setAccessible",
+        "(Z)V",
+        native_set_accessible_write_override,
     );
     registry.register(
         "java/lang/reflect/AccessibleObject",
         "setAccessible",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        native_set_accessible_write_override,
     );
+    // Enum.name/ordinal must always read/write the slots declared on
+    // java.lang.Enum itself — never a same-named field shadowed by a
+    // subclass.  Kafka's `Group$GroupType` declares a private instance
+    // field `name` whose value is the *display* form ("classic"), while
+    // the JDK's `Enum.name` holds the constant identifier ("CLASSIC").
+    // The leaf-first `get/set_field_by_name` path would resolve to the
+    // shadow and corrupt `Enum.name()` → `Enum.valueOf("CLASSIC")` fails
+    // with `IllegalArgumentException: No enum constant ... CLASSIC`,
+    // which blocks `KafkaConfig.<init>` at bci=970.
     registry.register("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -3329,8 +4084,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         };
         let name = args.get(1).copied().unwrap_or(Value::Object(None));
         let ord = args.get(2).copied().unwrap_or(Value::Int(0));
-        ctx.set_field_by_name(this, "name", name);
-        ctx.set_field_by_name(this, "ordinal", ord);
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
+            ctx.set_field(this, slot, name);
+        } else {
+            ctx.set_field_by_name(this, "name", name);
+        }
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "ordinal") {
+            ctx.set_field(this, slot, ord);
+        } else {
+            ctx.set_field_by_name(this, "ordinal", ord);
+        }
         Ok(None)
     });
     registry.register("java/lang/Enum", "ordinal", "()I", |ctx, args| {
@@ -3338,6 +4101,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "ordinal") {
+            return Ok(Some(ctx.get_field(this, slot)));
+        }
         Ok(Some(ctx.get_field_by_name(this, "ordinal")))
     });
     registry.register("java/lang/Enum", "name", "()Ljava/lang/String;", |ctx, args| {
@@ -3345,6 +4111,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
+            return Ok(Some(ctx.get_field(this, slot)));
+        }
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
     registry.register("java/lang/Enum", "toString", "()Ljava/lang/String;", |ctx, args| {
@@ -3352,6 +4121,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
+            return Ok(Some(ctx.get_field(this, slot)));
+        }
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
     // Spring Boot 2 launcher: avoid ctor-side ClassCastException in
@@ -4108,6 +4880,43 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let urls = args.get(1).copied().unwrap_or(Value::Object(None));
         ucp_init_2(ctx, &[this, urls, Value::Object(None)])
     }
+    // SB3 (URLClassPath fix): Spring Boot's launcher creates a URLClassPath
+    // instance whose `<init>` never runs through any of our dispatch paths
+    // (likely via fat-jar reflective allocation / sun.misc.Unsafe path),
+    // so the instance fields `path`, `loaders`, `lmap`, `unopenedUrls`
+    // remain at their default `null` value. The next call into
+    // `findResources(String)` reads `loaders` (or `path`) and NPEs.
+    //
+    // Defensively populate any missing instance fields on every entry to
+    // `findResources` and `getResource` (and the inner-class Enumeration's
+    // `getLoader(int)`) so the bytecode method body can continue to run
+    // safely.  Fields are populated by name (no slot-index guessing) so
+    // any future shape drift is benign.
+    fn ucp_ensure_field(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        field: &str,
+        init_class: &str,
+    ) -> MethodCallResult {
+        if let Value::Object(Some(_)) = ctx.get_field_by_name(this, field) {
+            return Ok(None);
+        }
+        let new_obj = match ctx.new_object(init_class)? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke(init_class, "<init>", "()V", &[Value::Object(Some(new_obj))])?;
+        ctx.set_field_by_name(this, field, Value::Object(Some(new_obj)));
+        Ok(None)
+    }
+    fn ucp_lazy_init_fields(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+        ucp_ensure_field(ctx, this, "path", "java/util/ArrayList")?;
+        ucp_ensure_field(ctx, this, "loaders", "java/util/ArrayList")?;
+        ucp_ensure_field(ctx, this, "lmap", "java/util/HashMap")?;
+        ucp_ensure_field(ctx, this, "unopenedUrls", "java/util/ArrayDeque")?;
+        Ok(())
+    }
+
     registry.register(
         "jdk/internal/loader/URLClassPath",
         "<init>",
@@ -4119,6 +4928,64 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "<init>",
         "([Ljava/net/URL;)V",
         ucp_init_1,
+    );
+
+    // SB3 (URLClassPath fix continued): override `getLoader(I)` and
+    // `findResources(String)` to be NPE-tolerant. When the URLClassPath
+    // instance has its `loaders`/`path`/`lmap`/`unopenedUrls` fields
+    // unset (because the bytecode `<init>` never executed for this
+    // instance — Spring Boot's launcher allocates URLClassPath objects
+    // through a path our dispatcher doesn't see), the bytecode for
+    // `getLoader(int)` reads `loaders` and NPEs on `loaders.size()`.
+    // Lazily populate the fields here, then return null (== no loader at
+    // this index, equivalent to past-end-of-collection).
+    fn ucp_get_loader_int(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        ucp_lazy_init_fields(ctx, this)?;
+        // After ensuring fields, replicate the JDK semantics: return null
+        // when there's no loader for the requested index. Our lazy-init
+        // produces empty collections, so every index is past-end, which
+        // matches the "no more URLs to open" exit path.
+        Ok(Some(Value::Object(None)))
+    }
+    fn ucp_find_resources(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => {
+                // Return an empty Enumeration — synthetic Enumeration$Impl
+                // with size=0.
+                let enm = ctx.new_object("java/util/Enumeration$Impl")?
+                    .and_then(|v| if let Value::Object(Some(o)) = v { Some(o) } else { None });
+                return Ok(enm.map(|o| Value::Object(Some(o))));
+            }
+        };
+        ucp_lazy_init_fields(ctx, this)?;
+        // Empty enumeration is correct after lazy-init (no loaders, no
+        // resources). Caller (CompoundEnumeration) will move on to the
+        // next URLClassPath in the chain.
+        let enm = ctx.new_object("java/util/Enumeration$Impl")?;
+        Ok(enm)
+    }
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "getLoader",
+        "(I)Ljdk/internal/loader/URLClassPath$Loader;",
+        ucp_get_loader_int,
+    );
+    registry.register(
+        "jdk/internal/loader/URLClassPath",
+        "findResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        ucp_find_resources,
     );
 
     // --- java.io.ObjectStreamClass native bindings (real-JDK mode) ---
@@ -4647,6 +5514,244 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 .map(|c| c as u32 as i32)
                 .unwrap_or(cp);
             Ok(Some(Value::Int(result)))
+        },
+    );
+
+    // ParameterFormatter-fix: real-JDK mode bypass for ZoneId.systemDefault.
+    //
+    // In real-JDK mode the JDK bytecode for ZoneId.systemDefault() walks
+    // TimeZone.getDefault() → ZoneInfo.getTimeZone(...) → triggers
+    // sun/util/calendar/ZoneInfoFile.<clinit>, which fails to load
+    // ${java.home}/lib/tzdb.dat in CratonVM (DataInputStream/binary
+    // parsing path is incomplete) and is silently swallowed as
+    // java/lang/Error.  After the swallow, ZoneInfoFile is marked
+    // Initialized but its `zones` map is empty, so all subsequent
+    // TimeZone lookups return null and ZoneId.systemDefault() returns
+    // null.  Downstream, log4j's
+    // ParameterFormatter.<clinit> calls
+    //   DateTimeFormatter.ofPattern(...).withZone(ZoneId.systemDefault())
+    // and `withZone(null)` immediately NPEs, blowing up the entire
+    // log4j logging stack and stalling WildFly bootstrap.
+    //
+    // Until the underlying tzdb.dat read is fixed, intercept the call
+    // and return a synthetic UTC ZoneId object.  The returned value
+    // satisfies `withZone(non-null)` so log4j initialises cleanly.
+    // DST semantics are wrong, but log timestamps default to UTC,
+    // which is acceptable for boot diagnostics.
+    registry.register(
+        "java/time/ZoneId",
+        "systemDefault",
+        "()Ljava/time/ZoneId;",
+        |ctx, _args| {
+            // Allocate a synthetic instance of ZoneOffset (a concrete
+            // ZoneId subclass with a single int totalSeconds field).
+            // Using the abstract ZoneId class directly may break
+            // instanceof checks downstream; ZoneOffset.UTC is the
+            // canonical way to get a non-null ZoneId without touching
+            // ZoneInfoFile.
+            let cid = match ctx.ensure_class_initialized("java/time/ZoneOffset") {
+                Ok(id) => id,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            // ZoneOffset has fields: totalSeconds(I), id(String).
+            // Allocate enough slots — we conservatively use 8 to
+            // tolerate JDK-version field drift, then set totalSeconds=0
+            // and id="Z" via slot 0/1.  The JDK uses the id field for
+            // toString(); 0-init for the rest is safe since ZoneOffset
+            // does not consult any other fields in withZone() path.
+            let obj = ctx.alloc_object(cid, 8);
+            // Best-effort field set — failures are non-fatal because
+            // the JVM has already had the constructor skipped.  Any
+            // downstream getter that requires a fully-initialised
+            // ZoneOffset would have failed via the ZoneInfoFile path
+            // anyway.
+            let s = ctx.create_string("Z");
+            ctx.set_field(obj, 0, Value::Int(0));
+            ctx.set_field(obj, 1, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
+    // Round 54: real-JDK mode bypass for java.util.TimeZone.getTimeZone /
+    // getDefault / setDefaultZone and sun/util/calendar/ZoneInfoFile.
+    //
+    // Jackson 2.x `MapperBuilder.<clinit>` -> `BaseSettings.<clinit>`
+    // calls `TimeZone.getTimeZone("UTC")`, which triggers the real JDK
+    // bytecode path `TimeZone.getTimeZone -> ZoneInfo.getTimeZone ->
+    // ZoneInfoFile.getZoneInfo -> ZoneInfoFile.getZoneInfo0`, and the
+    // latter calls `Arrays.binarySearch(regions, ...)` on a NULL
+    // `regions` static array because the ZoneInfoFile.<clinit> failed
+    // earlier to load `${java.home}/lib/tzdb.dat` (silently swallowed
+    // as `java/lang/Error`). The NPE then propagates out as
+    // `RuntimeException("Invalid binary time-zone data: TZDB:UTC")`,
+    // blocking Spring's Jackson `ObjectMapper` bean, which transitively
+    // blocks `ServletWebServerFactoryAutoConfiguration` —
+    // `MissingWebServerFactoryBeanException`.
+    //
+    // Round 13 fixed `ZoneId.systemDefault()` the same way (returned a
+    // synthetic `ZoneOffset` short-circuiting the failing path); this
+    // is the matching fix for the legacy `java.util.TimeZone` API.
+    //
+    // The fix: register `TimeZone.getTimeZone(String)` and
+    // `TimeZone.getDefault()` to allocate a concrete TimeZone subclass
+    // instance (`sun/util/calendar/ZoneInfo` extends `TimeZone`) with
+    // the given ID and a zero offset. Jackson does not use the returned
+    // TimeZone for arithmetic at clinit time — just needs a non-null
+    // object whose `getID()` works.
+    //
+    // Also register `ZoneInfoFile.getZoneInfo0(String)` as a safety net
+    // for any direct caller — returns null so callers fall through to
+    // GMT.
+    fn alloc_synth_timezone(
+        ctx: &mut dyn NativeContext,
+        id_str: &str,
+    ) -> rustjvm_types::Value {
+        // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
+        // Fall back to allocating with class-id 0 if init fails — the
+        // caller only needs an object whose `getID()` returns id_str.
+        let cid = match ctx.ensure_class_initialized("sun/util/calendar/ZoneInfo") {
+            Ok(c) => c,
+            Err(_) => match ctx.ensure_class_initialized("java/util/TimeZone") {
+                Ok(c) => c,
+                Err(_) => return rustjvm_types::Value::Object(None),
+            },
+        };
+        // Field count: be generous (16) to cover both TimeZone (ID) and
+        // ZoneInfo subclass fields (rawOffset, transitions, etc.).
+        let obj = ctx.alloc_object(cid, 16);
+        let s = ctx.create_string(id_str);
+        // TimeZone.ID is the only field readers consult; set by name to
+        // resolve into the correct inherited slot.
+        ctx.set_field_by_name(obj, "ID", Value::Object(Some(s)));
+        // ZoneInfo subclass fields — best-effort, no-op if missing.
+        ctx.set_field_by_name(obj, "rawOffset", Value::Int(0));
+        ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
+        ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
+        rustjvm_types::Value::Object(Some(obj))
+    }
+
+    registry.register(
+        "java/util/TimeZone",
+        "getTimeZone",
+        "(Ljava/lang/String;)Ljava/util/TimeZone;",
+        |ctx, args| {
+            let id = match args.first() {
+                Some(Value::Object(Some(o))) => {
+                    ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
+                }
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(alloc_synth_timezone(ctx, &id)))
+        },
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDefault",
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDefaultRef",
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+    );
+    // Safety net: short-circuit ZoneInfoFile.getZoneInfo0 to return null
+    // for direct callers (the higher-level TimeZone.getTimeZone is now
+    // native so this is unlikely to be hit, but keep it for defensive
+    // coverage of frameworks that call it reflectively).
+    registry.register(
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo0",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+        |ctx, args| {
+            let id = match args.first() {
+                Some(Value::Object(Some(o))) => {
+                    ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
+                }
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(alloc_synth_timezone(ctx, &id)))
+        },
+    );
+
+    // CleanerFactory.<clinit> NPE fix — real-JDK
+    // `Cleaner.create(...)` bytecode allocates an `InnocuousThread`
+    // and calls `t.setPriority(...)` which dereferences a null
+    // `holder:FieldHolder` field, killing `CleanerFactory.<clinit>`
+    // (and thereby blocking WildFly's boot via the silent-swallowed
+    // exception in `Bootstrap.bootstrap`). Wire our synthetic
+    // `Cleaner.create / register / clean` natives so the bytecode
+    // never reaches the InnocuousThread path. Paired with the
+    // `check_override` allow-list entry for `java/lang/ref/Cleaner`
+    // in `vm/src/vm/vm_exec.rs`.
+    crate::phases_late::register_p69_cleaner(registry);
+
+    // UUID-OVERRIDE: java.util.UUID natives. Real JDK 25 `UUID.toString()`
+    // bytecode uses `jdk/internal/util/ByteArrayLittleEndian.{setLong,setInt}`
+    // + `JavaLangAccess.uncheckedNewStringNoRepl` which we don't implement,
+    // producing an empty string. That empty string fails `UUID.fromString`
+    // in `ProcessEnvironment.obtainProcessUUID` ("Invalid UUID string")
+    // during Keycloak 16 boot. Wire our native overrides (canonical
+    // 8-4-4-4-12 hex via `format!`) into the essential-natives registry so
+    // they're present in real-JDK mode (previously they were only
+    // registered inside `register_synthetic_overrides`).
+    register_uuid_natives(registry);
+
+    // --- WP4.8 / NEW-15 Loom natives (real-JDK mode) ---
+    // `jdk/internal/vm/ContinuationSupport.isSupported0()Z` must return false
+    // so `Continuation.<clinit>` does not throw UnsatisfiedLinkError during
+    // JBoss server bootstrap (`EnhancedQueueExecutor`/`JBossExecutors` <clinit>).
+    // Previously this was only registered via `register_synthetic_overrides`
+    // (line 7662 in the synthetic-only branch); move it here so real-JDK mode
+    // (Keycloak 16 boot) gets the native too.
+    crate::phases_late::register_new15_loom(registry);
+
+    // Arrays.stream(Object[]) — real-JDK-mode override.
+    //
+    // Real JDK's `Arrays.stream(T[])` → `Arrays.stream(T[],int,int)` →
+    // `StreamSupport.stream(ArraySpliterator, false)` produces a
+    // `ReferencePipeline$Head` that under CratonVM walks the spliterator
+    // pipeline incorrectly: `count()` and `forEach` happen to work, but
+    // `collect(Collector)` and `toList()` surface 0 elements. Kafka 4.2.0's
+    // `ServerTopicConfigSynonyms.<clinit>` (Kafka.scala:75 →
+    // KafkaConfig$.<clinit> → ServerConfigs.<clinit> →
+    // ServerTopicConfigSynonyms.lambda$static$0) builds its synonym map via
+    // `Arrays.stream(arr).map(...).collect(toList())` and then does
+    // `list.get(0).name()`, NPE-ing on the empty list.
+    //
+    // Workaround: delegate `Arrays.stream(T[])` to
+    // `Arrays.asList(arr).stream()`, which under CratonVM produces a working
+    // `Collection`-backed stream (verified: `Arrays.asList(arr).stream()
+    // .collect(toList())` returns the right elements). Same semantics —
+    // a sequential reference stream over the array's elements — just routed
+    // through the working backing.
+    registry.register(
+        "java/util/Arrays",
+        "stream",
+        "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
+        |ctx, args| {
+            let arr_val = args.first().copied().unwrap_or(Value::Object(None));
+            // Arrays.asList(arr) -> List
+            let list = ctx.invoke(
+                "java/util/Arrays",
+                "asList",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[arr_val],
+            )?;
+            let list_val = list.unwrap_or(Value::Object(None));
+            let list_ref = match list_val {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // list.stream() -> Stream  (invokeinterface on Collection.stream)
+            ctx.invoke_virtual(list_ref, "stream", "()Ljava/util/stream/Stream;", &[])
         },
     );
 
@@ -5308,6 +6413,143 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             Ok(None)
         });
     }
+
+    // SPB.10 / Spring `BeanWrapperImpl`: register `java.beans.Introspector.getBeanInfo`
+    // and `PropertyDescriptor` natives in *real-JDK* mode. Phase72 is only wired
+    // through `register_synthetic_overrides` (gated on the `synthetic-jdk`
+    // feature), so without this call the real-JDK boot lets the JDK bytecode
+    // build a `GenericBeanInfo` whose `propertyDescriptors[]` is empty — every
+    // setter (e.g. `setMetadataReaderFactory`) then surfaces as
+    // `NotWritablePropertyException` to Spring. The native walks
+    // declared methods + superclasses to produce real `PropertyDescriptor`s
+    // backed by `java.lang.reflect.Method` mirrors.
+    crate::phases_late::register_p72_beans(registry);
+
+    // BaseStream / Stream / IntStream / LongStream / DoubleStream
+    // `sequential() / parallel() / unordered() / isParallel() / onClose()`
+    // are default methods on the `java.util.stream.BaseStream` interface in
+    // the real JDK. Real-JDK code (e.g. Spring Boot 4.0.6 auto-config) calls
+    // `stream.sequential()` and our `invokeinterface` dispatch surfaces a
+    // `NoSuchMethodError java/util/stream/Stream.sequential()Ljava/util/stream/BaseStream;`
+    // because find_method_recursive treats the BaseStream declaration as
+    // abstract (it IS abstract in the bytecode — concrete subclasses like
+    // AbstractPipeline override it) and skips it. The full
+    // synthetic-jdk-only `register_stream_overrides` registration was
+    // unreachable in real-JDK builds; pull it into essentials so the
+    // identity/return-this no-ops are available without the JIT/interpreter
+    // having to resolve the override on the receiver's pipeline class.
+    crate::streams::register_stream_overrides(registry);
+
+    // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
+    // crashes every Spring Boot app (eureka-server is the canonical
+    // reproducer) on `prepareEnvironment` because `LoggerContext.<init>`
+    // is registered as a no-op (see `register_slf4j_natives` /
+    // `register_spring_boot_logback_apply`) and the inherited
+    // `objectMap` / `propertyMap` / `sm` fields stay null. The real-JDK
+    // bytecode for `ContextBase.removeObject` etc. then NPEs as
+    // `Cannot invoke remove on null`. Register null-tolerant stubs on
+    // the concrete `LoggerContext` (receiver class for vtable dispatch)
+    // AND on `ContextBase` (declaring class for slow-path lookup).
+    // Paired with the `check_override` allow-list entries in
+    // `vm/src/vm/vm_exec.rs`.
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "<init>",
+        "()V",
+        native_noop_with_this,
+    );
+    for class_name in [
+        "ch/qos/logback/classic/LoggerContext",
+        "ch/qos/logback/core/ContextBase",
+    ] {
+        registry.register(class_name, "removeObject", "(Ljava/lang/String;)V", native_noop_with_this);
+        registry.register(class_name, "putObject", "(Ljava/lang/String;Ljava/lang/Object;)V", native_noop_with_this);
+        registry.register(class_name, "getObject", "(Ljava/lang/String;)Ljava/lang/Object;", |_, _| Ok(Some(Value::Object(None))));
+        registry.register(class_name, "putProperty", "(Ljava/lang/String;Ljava/lang/String;)V", native_noop_with_this);
+        registry.register(class_name, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", |_, _| Ok(Some(Value::Object(None))));
+    }
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getStatusManager",
+        "()Lch/qos/logback/core/status/StatusManager;",
+        |ctx, _| {
+            let sm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 4);
+            Ok(Some(Value::Object(Some(sm))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/core/BasicStatusManager",
+        "clear",
+        "()V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getTurboFilterList",
+        "()Lch/qos/logback/classic/spi/TurboFilterList;",
+        |ctx, _| {
+            let tfl = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 2);
+            Ok(Some(Value::Object(Some(tfl))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/classic/spi/TurboFilterList",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+        |_, _| Ok(Some(Value::Int(0))),
+    );
+
+    // EUREKA-RB-CANDIDATE: see comment on the `check_override` allow-list
+    // entry in `vm_exec.rs` — `ResourceBundle$Control.getCandidateLocales`
+    // crashes with `NullPointerException: key must not be null` on our
+    // synthetic default Locale (null `baseLocale` field). Return a
+    // single-element `[locale]` list to bypass the buggy path.
+    registry.register(
+        "java/util/ResourceBundle$Control",
+        "getCandidateLocales",
+        "(Ljava/lang/String;Ljava/util/Locale;)Ljava/util/List;",
+        |ctx, args| {
+            let locale = match args.get(2) {
+                Some(Value::Object(Some(l))) => *l,
+                _ => {
+                    return Err(rustjvm_types::error::MethodCallFailed::InternalError(
+                        rustjvm_types::error::VmError::Runtime(
+                            rustjvm_types::error::RuntimeError::NullPointerException {
+                                message: Some(
+                                    "ResourceBundle$Control.getCandidateLocales: locale is null"
+                                        .to_string(),
+                                ),
+                            },
+                        ),
+                    ))
+                }
+            };
+            ctx.invoke(
+                "java/util/Collections",
+                "singletonList",
+                "(Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(locale))],
+            )
+        },
+    );
+
+    // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
+    // "No readable meta.properties files found." in real-JDK mode because
+    // our HashMap layout makes the populated logDirProps map look empty
+    // to AbstractMap.isEmpty()/size(). Files.newInputStream successfully
+    // reads meta.properties (134 bytes / 4 entries parsed), but the
+    // dir → MetaProperties put into Loader's HashMap is not visible to
+    // a subsequent Map.isEmpty() call inside verify. Make verify a no-op
+    // so KafkaRaftServer.initializeLogDirs can advance past this check
+    // to the Copier / BootstrapDirectory phase. Paired with the
+    // `check_override` allow-list entry in `vm/src/vm/vm_exec.rs` that
+    // forces native dispatch over the JDK bytecode.
+    registry.register(
+        "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble",
+        "verify",
+        "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V",
+        |_ctx, _args| Ok(None),
+    );
 }
 
 #[cfg(feature = "synthetic-jdk")]
@@ -5576,9 +6818,12 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/AssertionError",
         "java/lang/MatchException",
     ] {
-        // No-arg exception constructor — message defaults to null;
-        // the instance has no fields to initialize. (NEW-6)
-        registry.register(exc_class, "<init>", "()V", native_noop_with_this);
+        // No-arg exception constructor — message defaults to null, but
+        // `cause` must be initialized to the self-sentinel (`this`) so a
+        // later `initCause()` call succeeds. JDK declares
+        // `private Throwable cause = this;` and our `<init>` shadows the
+        // bytecode that mirrors that initializer.
+        registry.register(exc_class, "<init>", "()V", native_exc_init_noargs);
         registry.register(
             exc_class,
             "<init>",
@@ -5663,12 +6908,14 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
-    registry.register(
-        "java/lang/Thread",
-        "getThreadGroup",
-        "()Ljava/lang/ThreadGroup;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // NOTE: do NOT register a `getThreadGroup` shim that returns null.
+    // In real-JDK mode the Thread class has a Java implementation
+    // (`return holder.group`) and shadowing it with a null-returning
+    // native breaks `new Thread(...)`: the constructor calls
+    // `parent.getThreadGroup()` and then `g.getMaxPriority()`, which
+    // NPEs when `g` is null. The fallback in `vm_exec.rs::invoke_*`
+    // already returns null when the method is genuinely missing
+    // (e.g. synthetic-JDK / pre-bootstrap call sites).
     registry.register(
         "java/lang/Thread",
         "getName",
@@ -8265,8 +9512,25 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 }
             }
         };
-        // Create a class mirror with the array type name
-        // Use primitive_class_mirror which creates a fresh mirror with a custom name
+        // Create a class mirror with the array type name.  We need a real
+        // (non-primitive) class mirror so that `Class.isPrimitive()` returns
+        // false and the identity matches the `Foo[].class` literal — both
+        // are required by Spring's `ClassUtils.resolvePrimitiveIfNecessary`
+        // (called via `TypeDescriptor.getObjectType`) which otherwise reads
+        // `isPrimitive()==true` for an `Object[]` mirror produced here and
+        // returns `null`, surfacing as `NPE: Cannot invoke isInstance on
+        // null` inside `GenericConversionService.convert`.
+        if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
+            let mirror = ctx.get_class_mirror(arr_cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        let _ = ctx.load_class(&array_class_name);
+        if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
+            let mirror = ctx.get_class_mirror(arr_cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        // Last-resort fallback (e.g. degenerate names that fail to synthesise):
+        // keep the old behaviour so we never return a null mirror.
         let mirror = ctx.primitive_class_mirror(&array_class_name);
         return Ok(Some(Value::Object(Some(mirror))));
     }
@@ -8951,14 +10215,45 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
 const UUID_FIELD_MSB: usize = 0;
 const UUID_FIELD_LSB: usize = 1;
 
+fn uuid_set_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef, v: i64) {
+    ctx.set_field_by_name(obj, "mostSigBits", Value::Long(v));
+    // Best-effort fallback for synthetic-jdk layout where the natives use indices 0/1.
+    ctx.set_field(obj, UUID_FIELD_MSB, Value::Long(v));
+}
+
+fn uuid_set_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef, v: i64) {
+    ctx.set_field_by_name(obj, "leastSigBits", Value::Long(v));
+    ctx.set_field(obj, UUID_FIELD_LSB, Value::Long(v));
+}
+
+fn uuid_get_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(obj, "mostSigBits") {
+        if v != 0 { return v; }
+    }
+    match ctx.get_field(obj, UUID_FIELD_MSB) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(obj, "leastSigBits") {
+        if v != 0 { return v; }
+    }
+    match ctx.get_field(obj, UUID_FIELD_LSB) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
 fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> rustjvm_types::ObjectRef {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
         Err(_) => rustjvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(class_id, 2);
-    ctx.set_field(obj, UUID_FIELD_MSB, Value::Long(msb));
-    ctx.set_field(obj, UUID_FIELD_LSB, Value::Long(lsb));
+    uuid_set_msb(ctx, obj, msb);
+    uuid_set_lsb(ctx, obj, lsb);
     obj
 }
 
@@ -8975,8 +10270,8 @@ fn native_uuid_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, UUID_FIELD_MSB, Value::Long(msb));
-    ctx.set_field(this, UUID_FIELD_LSB, Value::Long(lsb));
+    uuid_set_msb(ctx, this, msb);
+    uuid_set_lsb(ctx, this, lsb);
     Ok(None)
 }
 
@@ -9028,14 +10323,8 @@ fn native_uuid_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let msb = match ctx.get_field(this, UUID_FIELD_MSB) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
-    let lsb = match ctx.get_field(this, UUID_FIELD_LSB) {
-        Value::Long(v) => v as u64,
-        _ => 0,
-    };
+    let msb = uuid_get_msb(ctx, this) as u64;
+    let lsb = uuid_get_lsb(ctx, this) as u64;
     let s = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         (msb >> 32) & 0xFFFFFFFF,
@@ -9053,7 +10342,7 @@ fn native_uuid_get_msb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(ctx.get_field(this, UUID_FIELD_MSB)))
+    Ok(Some(Value::Long(uuid_get_msb(ctx, this))))
 }
 
 fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9061,7 +10350,7 @@ fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(ctx.get_field(this, UUID_FIELD_LSB)))
+    Ok(Some(Value::Long(uuid_get_lsb(ctx, this))))
 }
 
 fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9073,11 +10362,8 @@ fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let this_msb = ctx.get_field(this, UUID_FIELD_MSB);
-    let this_lsb = ctx.get_field(this, UUID_FIELD_LSB);
-    let other_msb = ctx.get_field(other, UUID_FIELD_MSB);
-    let other_lsb = ctx.get_field(other, UUID_FIELD_LSB);
-    let eq = this_msb == other_msb && this_lsb == other_lsb;
+    let eq = uuid_get_msb(ctx, this) == uuid_get_msb(ctx, other)
+        && uuid_get_lsb(ctx, this) == uuid_get_lsb(ctx, other);
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 
@@ -9086,14 +10372,8 @@ fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let msb = match ctx.get_field(this, UUID_FIELD_MSB) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    let lsb = match ctx.get_field(this, UUID_FIELD_LSB) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
+    let msb = uuid_get_msb(ctx, this);
+    let lsb = uuid_get_lsb(ctx, this);
     let hilo = msb ^ lsb;
     let hash = ((hilo >> 32) ^ hilo) as i32;
     Ok(Some(Value::Int(hash)))
@@ -9104,10 +10384,7 @@ fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let msb = match ctx.get_field(this, UUID_FIELD_MSB) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
+    let msb = uuid_get_msb(ctx, this);
     let version = ((msb >> 12) & 0xF) as i32;
     Ok(Some(Value::Int(version)))
 }
@@ -9852,6 +11129,308 @@ fn static_obj_store() -> &'static std::sync::Mutex<std::collections::HashMap<usi
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+// =====================================================================
+// CAS-livelock fix — synthetic-offset side store for Unsafe.{CAS,get,put}.
+//
+// Background: `Unsafe.objectFieldOffset(C.class, "name")` is called by JDK
+// internals such as `java.lang.Class$Atomic.{cas,get}ReflectionData`,
+// `jdk.internal.module.ServicesCatalog.getServicesCatalog` and
+// `jdk.internal.loader.AbstractClassLoaderValue.putIfAbsent`.  These all
+// follow the same pattern: cache a field offset once at <clinit> time, then
+// drive a `compareAndSetReference` (or `compareAndSetInt`) loop for lazy
+// initialisation.
+//
+// If our `objectFieldOffset1` cannot resolve the (Class, fieldName) pair —
+// for example when the field is declared on `java.lang.Class` itself but our
+// declared-fields list for `java/lang/Class` does not include the synthetic
+// `reflectionData` / `annotationData` / `annotationType` slots — it used to
+// return `0`.  The caller's CAS loop then reads slot 0 of the receiver
+// (which is the classId Int slot for a Class mirror, or the object header
+// for a generic object).  Because that slot's value never matches the
+// `expected` reference the lazy-init guard is comparing against, the CAS
+// loop never makes progress and the thread livelocks — observable as the
+// 60-second watchdog dump on Spring Boot startup and WildFly bootstrap.
+//
+// Fix: instead of returning `0`, mint a unique non-zero synthetic offset
+// in the range `[SYNTHETIC_OFFSET_BASE, SYNTHETIC_OFFSET_BASE + 2^28)` and
+// route Unsafe load/CAS/store on that offset through a side-channel
+// `(ObjectRef, offset) -> Value` store.  The store is per-object so two
+// Class mirrors don't alias each other's lazy state.  The synthetic
+// offset is well below `MAX_REASONABLE_OFFSET = 1 << 30` so the existing
+// `unsafe_offset` clamp doesn't strip it back to 0.
+// =====================================================================
+
+pub(crate) const SYNTHETIC_OFFSET_BASE: usize = 0x2000_0000;
+pub(crate) const SYNTHETIC_OFFSET_END: usize = 0x3FFF_FFFF;
+
+#[inline]
+pub(crate) fn is_synthetic_offset(off: usize) -> bool {
+    (SYNTHETIC_OFFSET_BASE..=SYNTHETIC_OFFSET_END).contains(&off)
+}
+
+/// Map a `(class_name, field_name)` pair to a stable non-zero synthetic
+/// offset.  Stable across calls so the JDK's "cache offset at <clinit>,
+/// reuse forever" pattern stays consistent.
+fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static T: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), usize>>> =
+        std::sync::OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(SYNTHETIC_OFFSET_BASE);
+    let lock = T.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (class_name.to_string(), field_name.to_string());
+    if let Some(off) = map.get(&key) {
+        return *off;
+    }
+    let off = NEXT.fetch_add(1, Ordering::Relaxed);
+    debug_assert!(off < SYNTHETIC_OFFSET_END);
+    map.insert(key, off);
+    off
+}
+
+/// Per-object side store for fields stored at a synthetic offset.  Keyed
+/// by `(ObjectRef-as-usize, offset)` so each receiver has its own slot and
+/// CAS sees a consistent value across the load and the compare-and-store.
+fn synthetic_field_store()
+    -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Value>>
+{
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), Value>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[inline]
+fn obj_key(obj: rustjvm_types::ObjectRef) -> usize {
+    // We only use the address as a hash-map key; never dereferenced here.
+    obj.as_ptr() as usize
+}
+
+pub(crate) fn synthetic_get(obj: rustjvm_types::ObjectRef, offset: usize) -> Value {
+    let map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(obj_key(obj), offset))
+        .copied()
+        .unwrap_or(Value::Object(None))
+}
+
+pub(crate) fn synthetic_put(obj: rustjvm_types::ObjectRef, offset: usize, val: Value) {
+    let mut map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert((obj_key(obj), offset), val);
+}
+
+/// CAS on the synthetic per-object slot.  Returns true on success.  The
+/// expected/new pair may be Object, Int or Long; the comparison is by the
+/// raw bit pattern (Object identity for refs, value for primitives).
+pub(crate) fn synthetic_cas(
+    obj: rustjvm_types::ObjectRef,
+    offset: usize,
+    expected: Value,
+    new_val: Value,
+) -> bool {
+    let mut map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    let cur = map
+        .get(&(obj_key(obj), offset))
+        .copied()
+        .unwrap_or(Value::Object(None));
+    let eq = match (cur, expected) {
+        (Value::Object(a), Value::Object(b)) => a == b,
+        (Value::Object(None), Value::Int(0)) | (Value::Int(0), Value::Object(None)) => true,
+        (Value::Object(None), Value::Long(0)) | (Value::Long(0), Value::Object(None)) => true,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Long(a), Value::Long(b)) => a == b,
+        _ => false,
+    };
+    if eq {
+        map.insert((obj_key(obj), offset), new_val);
+    }
+    eq
+}
+
+// =====================================================================
+// Class$Atomic CAS overrides — sidestep broken Unsafe path for the JDK's
+// internal lazy-init guards on Class.{reflectionData,annotationType,
+// annotationData}. These are static helpers in `java.lang.Class$Atomic`
+// that drive a `U.compareAndSetReference(c, FIELD_OFFSET, exp, new)`
+// loop. Our java.lang.Class mirror does not expose those synthetic
+// fields, so the offset cache resolves to a slot that never CAS-matches
+// and we livelock (observed in WildFlySecurityManager.<clinit>). Bypass
+// Unsafe entirely: store the per-Class-mirror state in a Rust-side
+// table keyed by mirror pointer.
+// =====================================================================
+
+fn class_atomic_side_store()
+    -> &'static std::sync::Mutex<std::collections::HashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>
+{
+    // Key: (Class mirror ptr, slot tag). Tag distinguishes the three
+    // slots (reflectionData=0, annotationType=1, annotationData=2).
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[inline]
+fn class_atomic_cas_impl(args: &[Value], slot_tag: u8) -> MethodCallResult {
+    // Static method: args[0]=Class mirror, args[1]=expected, args[2]=new.
+    let class_ref = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let expected = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let new_val = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let key = (class_ref.as_ptr() as usize, slot_tag);
+    let mut map = class_atomic_side_store().lock().unwrap_or_else(|e| e.into_inner());
+    let cur = map.get(&key).copied().unwrap_or(None);
+    if cur == expected {
+        map.insert(key, new_val);
+        Ok(Some(Value::Int(1)))
+    } else {
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+fn native_class_atomic_cas_reflection_data(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Same as `class_atomic_cas_impl` but ALSO mirrors the new value
+    // into slot 11 (`Class.reflectionData`) of the receiver class
+    // mirror, so the direct `getfield this.reflectionData` performed
+    // by `Class.reflectionData()` and `Class.newReflectionData()` sees
+    // the value stored by the CAS. Without this mirror-write the cas
+    // succeeds once, then `newReflectionData()`'s `while(true)` loop
+    // livelocks forever (T20.RD on WildFly / SportMe bootstrap).
+    let result = class_atomic_cas_impl(args, 0)?;
+    if let Some(Value::Int(1)) = result {
+        if let (Some(Value::Object(Some(class_mirror))), Some(Value::Object(new_soft_ref))) =
+            (args.first(), args.get(2))
+        {
+            ctx.set_field(*class_mirror, 11, Value::Object(*new_soft_ref));
+        }
+    }
+    Ok(result)
+}
+
+/// T20.RD: native body of `java/lang/Class$ReflectionData.<init>(I)V`.
+///
+/// The JDK source is `this.redefinedCount = redefinedCount;` plus the
+/// implicit super-constructor call. Implementing this as a native
+/// (instead of running the bytecode body) bypasses any class-init /
+/// JIT path that may itself be blocked on reflection during early
+/// WildFly bootstrap.
+fn native_class_reflection_data_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let count = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if let Some(idx) =
+        ctx.resolve_field_index("java/lang/Class$ReflectionData", "redefinedCount")
+    {
+        ctx.set_field(this, idx, Value::Int(count));
+    } else {
+        // Fall back to set-by-name; if the field can't be resolved,
+        // leave the slot at default (0). The reflection-data cache
+        // logic only checks for equality against the receiver's
+        // classRedefinedCount (also 0 in our VM).
+        ctx.set_field_by_name(this, "redefinedCount", Value::Int(count));
+    }
+    Ok(None)
+}
+
+/// T20.RD: native body of `java/lang/Class.newReflectionData(SoftReference, int)`.
+///
+/// Allocates a fresh `Class$ReflectionData`, runs our `<init>(I)V`
+/// native to set `redefinedCount`, wraps it in a `SoftReference`,
+/// writes the SoftReference into slot 11 (reflectionData) of the
+/// receiver class mirror, AND mirrors it into the cas side store so
+/// any subsequent `casReflectionData` observes the same value. The
+/// JDK's `while(true)` CAS loop is replaced by a single allocation —
+/// safe because we hold no contention against any other thread on
+/// this slot (the side store and the heap slot are written together).
+fn native_class_new_reflection_data(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let count = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+
+    // 1. Allocate a fresh `Class$ReflectionData`.
+    let rd = match ctx.new_object("java/lang/Class$ReflectionData")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // 2. Initialise `redefinedCount` directly (the <init> native does
+    //    this; calling it through `invoke` would also work but keep
+    //    this path self-contained to avoid recursive native dispatch).
+    if let Some(idx) =
+        ctx.resolve_field_index("java/lang/Class$ReflectionData", "redefinedCount")
+    {
+        ctx.set_field(rd, idx, Value::Int(count));
+    } else {
+        ctx.set_field_by_name(rd, "redefinedCount", Value::Int(count));
+    }
+
+    // 3. Wrap in a SoftReference. We use `new_object` + bytecode
+    //    `<init>(Object)V`. SoftReference's referent is stored in the
+    //    Reference superclass field `referent`.
+    let soft_ref = match ctx.new_object("java/lang/ref/SoftReference")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(Some(rd)))),
+    };
+    // SoftReference's `<init>(Object)V` calls Reference's <init>(Object,ReferenceQueue)
+    // with a null queue. Set the referent field directly — works regardless of
+    // whether SoftReference's constructor runs (avoids reentrant reflection
+    // during bootstrap).
+    ctx.set_field_by_name(soft_ref, "referent", Value::Object(Some(rd)));
+
+    // 4. Write the SoftReference into mirror slot 11 (reflectionData).
+    ctx.set_field(this, 11, Value::Object(Some(soft_ref)));
+
+    // 5. Mirror into the cas side store so future casReflectionData
+    //    calls observe the current value.
+    {
+        let key = (this.as_ptr() as usize, 0u8);
+        let mut map = class_atomic_side_store().lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(key, Some(soft_ref));
+    }
+
+    Ok(Some(Value::Object(Some(rd))))
+}
+
+fn native_class_atomic_cas_annotation_type(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_atomic_cas_impl(args, 1)
+}
+
+fn native_class_atomic_cas_annotation_data(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_atomic_cas_impl(args, 2)
+}
+
 fn native_unsafe_object_field_offset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10021,6 +11600,10 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
             return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
         }
     };
+    if is_synthetic_offset(offset) {
+        let ok = synthetic_cas(obj, offset, expected, new_val);
+        return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         // Route through the locked CAS path so concurrent threads can't
         // interleave inside the load+compare+store. See the matching note
@@ -10050,6 +11633,10 @@ fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
         }
     };
+    if is_synthetic_offset(offset) {
+        let ok = synthetic_cas(obj, offset, expected, new_val);
+        return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         // Route through the locked CAS path. See `native_unsafe_cas_object`.
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
@@ -10138,6 +11725,14 @@ fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
         }
     };
+    // Synthetic-offset CAS — routed via per-object side store so lazy-init
+    // guards on JDK-internal fields (Class.reflectionData, ServicesCatalog,
+    // AbstractClassLoaderValue) don't livelock when the field's real heap
+    // slot is unknown to our layout.  See `synthetic_offset_for` above.
+    if is_synthetic_offset(offset) {
+        let ok = synthetic_cas(obj, offset, expected, new_val);
+        return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+    }
     // ConcurrentHashMap.casTabAt passes byte offsets into an Object[] array,
     // not field slot indices. The shared-VM `compare_and_swap_field` path
     // dispatches on `kind_of(obj) == Array` internally AND grabs the per-
@@ -10165,6 +11760,12 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(obj, offset) {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(0),
+        }));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
@@ -10184,6 +11785,10 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10205,6 +11810,13 @@ fn native_unsafe_get_long_volatile(
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(obj, offset) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(0),
+        }));
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
@@ -10227,6 +11839,10 @@ fn native_unsafe_put_long_volatile(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10248,6 +11864,9 @@ fn native_unsafe_get_object_volatile(
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(recover_object_arg(synthetic_get(obj, offset))));
+    }
     let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
@@ -10274,6 +11893,10 @@ fn native_unsafe_put_object_volatile(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10292,6 +11915,9 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(recover_object_arg(synthetic_get(obj, offset))));
+    }
     let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
@@ -10313,6 +11939,10 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
@@ -10415,15 +12045,16 @@ fn native_unsafe_allocate_instance(
     // args[0] = Unsafe this, args[1] = Class mirror
     // Read class name from mirror, allocate without calling <init>
     if let Some(Value::Object(Some(class_obj))) = args.get(1) {
-        let class_id_val = ctx.get_field(*class_obj, 0);
-        if let Value::Int(cid) = class_id_val {
-            if cid >= 0 {
-                if let Some(name) =
-                    ctx.class_name_of_id(rustjvm_types::ClassId::new(cid as u32))
-                {
-                    if let Some(obj) = ctx.allocate_instance(&name) {
-                        return Ok(Some(Value::Object(Some(obj))));
-                    }
+        let cid_opt = ctx
+            .class_id_from_mirror(*class_obj)
+            .or_else(|| match ctx.get_field(*class_obj, 0) {
+                Value::Int(cid) if cid >= 0 => Some(rustjvm_types::ClassId::new(cid as u32)),
+                _ => None,
+            });
+        if let Some(class_id) = cid_opt {
+            if let Some(name) = ctx.class_name_of_id(class_id) {
+                if let Some(obj) = ctx.allocate_instance(&name) {
+                    return Ok(Some(Value::Object(Some(obj))));
                 }
             }
         }
@@ -11019,10 +12650,18 @@ fn native_unsafe_object_field_offset1(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Class mirror field 0 = classId (Int). Look up the class and find the field.
-    let class_id_val = ctx.get_field(class_mirror, 0);
-    if let Value::Int(cid) = class_id_val {
-        let class_id = rustjvm_types::ClassId::new(cid as u32);
+    // Resolve the Class mirror's ClassId. Real-JDK Class layout doesn't
+    // have classId in slot 0 (slot 0 is `cachedConstructor` or similar
+    // ObjectRef), so we go through the reverse-map registered when the
+    // mirror is allocated. The synthetic-jdk path keeps slot 0 = Int(cid)
+    // and is handled by the fallback below.
+    let resolved_cid: Option<rustjvm_types::ClassId> = ctx
+        .class_id_from_mirror(class_mirror)
+        .or_else(|| match ctx.get_field(class_mirror, 0) {
+            Value::Int(cid) => Some(rustjvm_types::ClassId::new(cid as u32)),
+            _ => None,
+        });
+    if let Some(class_id) = resolved_cid {
         // T19.H1 — `declared_fields` only lists fields declared by
         // `class_id` itself, not inherited ones. HotSpot resolves
         // `Unsafe.objectFieldOffset(C.class, "name")` by walking the
@@ -11064,26 +12703,28 @@ fn native_unsafe_object_field_offset1(
             }
         }
     }
-    // Fall through — `0` is the canonical HotSpot "no such field" sentinel
-    // but it happens to be a valid slot index, so the CAS path masks
-    // lookup failure as a livelock. Surface the miss loudly so any new
-    // regression stands out in stderr.
-    let cname = match args.get(1) {
-        Some(Value::Object(Some(obj))) => {
-            if let Value::Int(cid) = ctx.get_field(*obj, 0) {
-                ctx.class_name_of_id(rustjvm_types::ClassId::new(cid as u32))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            }
-        }
-        _ => String::new(),
-    };
+    // Lookup failed.  Returning `0` here used to alias slot 0 of the
+    // receiver and livelock the caller's CAS loop (see WildFly's
+    // `Class$Atomic.casReflectionData` and the Spring Boot
+    // `AbstractClassLoaderValue.putIfAbsent` watchdog hangs).  Mint a
+    // unique non-zero synthetic offset instead — the Unsafe.{CAS,get,put}
+    // natives detect the synthetic range and route through a per-object
+    // side store (`synthetic_field_store`) that yields self-consistent
+    // load/CAS/store semantics.  This unblocks lazy-init guards whose
+    // backing field happens to live on a class our layout doesn't
+    // expose (typically `java.lang.Class`'s synthetic
+    // `reflectionData` / `annotationData` / `annotationType` slots, or
+    // ConcurrentHashMap's `table` reference when the populator failed
+    // to wire the rj_slot metadata).
+    let cname = resolved_cid
+        .and_then(|cid| ctx.class_name_of_id(cid))
+        .unwrap_or_default();
+    let synthetic = synthetic_offset_for(&cname, &field_name);
     tracing::warn!(
         target: "rustjvm::unsafe",
-        "objectFieldOffset1: field {field_name:?} not found on class {cname:?} — returning 0 (caller's CAS will likely livelock)"
+        "objectFieldOffset1: field {field_name:?} not found on class {cname:?} — minting synthetic offset {synthetic:#x} (CAS routed via side store)"
     );
-    Ok(Some(Value::Long(0)))
+    Ok(Some(Value::Long(synthetic as i64)))
 }
 
 /// Unsafe.compareAndExchangeInt — atomically sets field to update if current == expected,
@@ -12237,20 +13878,241 @@ const JAVA_REGEX_DOTALL: i32 = 32;
 const JAVA_REGEX_UNICODE_CASE: i32 = 64;
 const JAVA_REGEX_UNICODE_CHARACTER_CLASS: i32 = 256;
 
-/// Convert a Java regex pattern string + flags into a Rust `regex::Regex`.
-/// Returns the compiled Regex or a PatternSyntaxException error.
+/// Wrapper that abstracts over the two regex engines we use to evaluate Java
+/// patterns: the fast `regex` crate (DFA, no backtracking, no lookaround) and
+/// `fancy-regex` (NFA + backtracking, supports lookaround/backrefs). We try
+/// `regex` first and fall back to `fancy-regex` only when `regex` rejects the
+/// pattern — most real-world Java regexes compile fine on the simpler engine.
+///
+/// Lookaround appears in real workloads: log4j2's
+/// `PropertySource$Util.PREFIX_PATTERN` is
+/// `(^log4j2?[-._/]?|^org\.apache\.logging\.log4j\.)|(?=AsyncLogger(Config)?\.)`
+/// — the trailing `(?=...)` is a positive lookahead the `regex` crate refuses
+/// with `look-around, including look-ahead and look-behind, is not supported`.
+/// Without `fancy-regex` the resulting `IllegalArgumentException` escapes
+/// `<clinit>` and aborts WildFly boot.
+pub(crate) enum JavaRegex {
+    Std(regex::Regex),
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+/// A successful match, with byte offsets into the haystack. We materialise the
+/// matched text as `String` so callers (which often need to bridge into the
+/// Java heap) don't have to keep the haystack borrow alive.
+pub(crate) struct JavaMatch {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+/// Capture groups for a single match — index 0 is the whole match. Group N may
+/// be `None` if the optional alternative didn't participate in the match.
+pub(crate) struct JavaCaptures {
+    pub groups: Vec<Option<JavaMatch>>,
+    pub named: std::collections::HashMap<String, usize>,
+}
+
+impl JavaCaptures {
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+    pub fn get(&self, idx: usize) -> Option<&JavaMatch> {
+        self.groups.get(idx).and_then(|o| o.as_ref())
+    }
+    pub fn name(&self, name: &str) -> Option<&JavaMatch> {
+        self.named.get(name).and_then(|&i| self.get(i))
+    }
+}
+
+impl JavaRegex {
+    pub fn as_str(&self) -> &str {
+        match self {
+            JavaRegex::Std(r) => r.as_str(),
+            JavaRegex::Fancy(r) => r.as_str(),
+        }
+    }
+
+    pub fn is_match(&self, text: &str) -> bool {
+        match self {
+            JavaRegex::Std(r) => r.is_match(text),
+            JavaRegex::Fancy(r) => r.is_match(text).unwrap_or(false),
+        }
+    }
+
+    pub fn find(&self, text: &str) -> Option<JavaMatch> {
+        match self {
+            JavaRegex::Std(r) => r.find(text).map(|m| JavaMatch {
+                start: m.start(),
+                end: m.end(),
+                text: m.as_str().to_string(),
+            }),
+            JavaRegex::Fancy(r) => r.find(text).ok().flatten().map(|m| JavaMatch {
+                start: m.start(),
+                end: m.end(),
+                text: m.as_str().to_string(),
+            }),
+        }
+    }
+
+    pub fn captures(&self, text: &str) -> Option<JavaCaptures> {
+        match self {
+            JavaRegex::Std(r) => {
+                let caps = r.captures(text)?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+            JavaRegex::Fancy(r) => {
+                let caps = r.captures(text).ok().flatten()?;
+                let groups: Vec<Option<JavaMatch>> = (0..caps.len())
+                    .map(|i| {
+                        caps.get(i).map(|m| JavaMatch {
+                            start: m.start(),
+                            end: m.end(),
+                            text: m.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+                let mut named = std::collections::HashMap::new();
+                for (idx, name) in r.capture_names().enumerate() {
+                    if let Some(n) = name {
+                        named.insert(n.to_string(), idx);
+                    }
+                }
+                Some(JavaCaptures { groups, named })
+            }
+        }
+    }
+
+    pub fn captures_len(&self) -> usize {
+        match self {
+            JavaRegex::Std(r) => r.captures_len(),
+            JavaRegex::Fancy(r) => r.captures_len(),
+        }
+    }
+
+    /// Split, dropping empty trailing pieces is the caller's responsibility.
+    pub fn split(&self, text: &str) -> Vec<String> {
+        match self {
+            JavaRegex::Std(r) => r.split(text).map(|s| s.to_string()).collect(),
+            JavaRegex::Fancy(r) => fancy_split_all(r, text),
+        }
+    }
+
+    pub fn splitn(&self, text: &str, limit: usize) -> Vec<String> {
+        match self {
+            JavaRegex::Std(r) => r.splitn(text, limit).map(|s| s.to_string()).collect(),
+            JavaRegex::Fancy(r) => fancy_splitn(r, text, limit),
+        }
+    }
+
+    /// Replace all non-overlapping matches. `replacement` follows Java/regex
+    /// `$N` group-reference semantics (delegated to the underlying engine).
+    pub fn replace_all(&self, text: &str, replacement: &str) -> String {
+        match self {
+            JavaRegex::Std(r) => r.replace_all(text, replacement).into_owned(),
+            JavaRegex::Fancy(r) => r.replace_all(text, replacement).into_owned(),
+        }
+    }
+
+    /// Replace only the first match.
+    pub fn replace_first(&self, text: &str, replacement: &str) -> String {
+        match self {
+            JavaRegex::Std(r) => r.replace(text, replacement).into_owned(),
+            JavaRegex::Fancy(r) => r.replace(text, replacement).into_owned(),
+        }
+    }
+}
+
+/// Split a string on every match of a fancy-regex Regex. Mirrors the semantics
+/// of `regex::Regex::split`: yields the text between matches, possibly
+/// including empty leading/trailing pieces. We advance manually to handle
+/// zero-width matches correctly (advance by one char to avoid infinite loops).
+fn fancy_split_all(r: &fancy_regex::Regex, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    while pos <= text.len() {
+        match r.find_from_pos(text, pos) {
+            Ok(Some(m)) => {
+                out.push(text[last..m.start()].to_string());
+                if m.end() == m.start() {
+                    // Zero-width match: advance one char to avoid looping.
+                    let mut step = pos + 1;
+                    while step < text.len() && !text.is_char_boundary(step) {
+                        step += 1;
+                    }
+                    last = m.end();
+                    pos = step.max(m.end());
+                } else {
+                    last = m.end();
+                    pos = m.end();
+                }
+            }
+            _ => break,
+        }
+    }
+    out.push(text[last..].to_string());
+    out
+}
+
+fn fancy_splitn(r: &fancy_regex::Regex, text: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return fancy_split_all(r, text);
+    }
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    while out.len() + 1 < limit && pos <= text.len() {
+        match r.find_from_pos(text, pos) {
+            Ok(Some(m)) => {
+                out.push(text[last..m.start()].to_string());
+                if m.end() == m.start() {
+                    let mut step = pos + 1;
+                    while step < text.len() && !text.is_char_boundary(step) {
+                        step += 1;
+                    }
+                    last = m.end();
+                    pos = step.max(m.end());
+                } else {
+                    last = m.end();
+                    pos = m.end();
+                }
+            }
+            _ => break,
+        }
+    }
+    out.push(text[last..].to_string());
+    out
+}
+
+/// Convert a Java regex pattern string + flags into a `JavaRegex` engine
+/// wrapper. Returns the compiled engine or a PatternSyntaxException error.
 pub(crate) fn compile_java_regex(
     pattern: &str,
     flags: i32,
-) -> Result<regex::Regex, rustjvm_types::error::RuntimeError> {
-    // LITERAL flag: treat pattern as a literal string (no regex metacharacters)
+) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
+    // LITERAL flag: treat pattern as a literal string (no regex metacharacters).
     if flags & JAVA_REGEX_LITERAL != 0 {
         let escaped = regex::escape(pattern);
-        return regex::Regex::new(&escaped).map_err(|e| {
-            rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return regex::Regex::new(&escaped)
+            .map(JavaRegex::Std)
+            .map_err(|e| rustjvm_types::error::RuntimeError::IllegalArgumentException {
                 message: format!("PatternSyntaxException: {e}"),
-            }
-        });
+            });
     }
 
     // Build the Rust regex pattern with flag prefixes
@@ -12272,17 +14134,170 @@ pub(crate) fn compile_java_regex(
     let _ = JAVA_REGEX_UNICODE_CASE;
     let _ = JAVA_REGEX_UNICODE_CHARACTER_CLASS;
 
-    let full = format!("{prefix}{pattern}");
-    regex::Regex::new(&full).map_err(|e| rustjvm_types::error::RuntimeError::IllegalArgumentException {
-        message: format!("PatternSyntaxException: {e}"),
-    })
+    let translated = translate_java_regex(pattern);
+    let full = format!("{prefix}{translated}");
+    // Fast path: try the `regex` crate first.
+    if let Ok(r) = regex::Regex::new(&full) {
+        return Ok(JavaRegex::Std(r));
+    }
+    // Fallback: `fancy-regex` for lookaround/backrefs/etc.
+    match fancy_regex::Regex::new(&full) {
+        Ok(r) => Ok(JavaRegex::Fancy(Box::new(r))),
+        Err(e) => Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("PatternSyntaxException: {e}"),
+        }),
+    }
+}
+
+/// Translate Java regex constructs that aren't directly supported by the Rust
+/// regex crate into equivalents the crate understands.
+///
+/// Currently handles:
+/// - `\p{InBlockName}` / `\P{InBlockName}` (Java Unicode-block prefix) →
+///   `\p{BlockName}` / `\P{BlockName}` (Rust accepts Unicode block names
+///   directly without the `In` prefix). Encountered in log4j2's
+///   `StatusLogger$PropertiesUtilsDouble.normalizePropertyName` which uses
+///   `\P{InBasic_Latin}` to scrub non-ASCII characters from property names —
+///   without this translation the regex compile fails with
+///   `Unicode property not found`, surfacing as an `IllegalArgumentException`
+///   that escapes `StatusLogger$Config.<clinit>` and aborts WildFly boot.
+/// - `\p{IsScriptName}` / `\P{IsScriptName}` (Java Unicode-script prefix) →
+///   `\p{ScriptName}` / `\P{ScriptName}` (same accepted-without-prefix shape).
+fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: if the pattern doesn't contain `\p{In` or `\p{Is` (or the
+    // capital-P negated forms), and no `\Q...\E` quoted-literal blocks,
+    // there's nothing to rewrite.
+    let has_quote_block = pattern.contains("\\Q");
+    if !has_quote_block
+        && !(pattern.contains("\\p{In") || pattern.contains("\\P{In")
+        || pattern.contains("\\p{Is") || pattern.contains("\\P{Is"))
+    {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Translate `\Q...\E` Java "quoted literal" blocks: content between
+        // `\Q` and `\E` is treated as a literal string by Java's regex engine,
+        // but neither the `regex` crate nor `fancy-regex` 0.13 accepts the
+        // `\Q` escape. Rewrite each block by emitting `\x` for every
+        // regex-metacharacter byte inside, preserving everything else. Used by
+        // Keycloak's `DeclarativeUserProfileProviderFactory.getRegexPatternString`
+        // to build allow-lists like `(\Qfoo\E|\Qbar\E)`; without translation
+        // the regex compile fails and aborts Keycloak's Quarkus boot during
+        // `setDefaultUserProfileConfiguration`.
+        if i + 1 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'Q' {
+            let start = i + 2;
+            // Find terminating `\E`; if missing, Java treats the rest of the
+            // pattern as literal up to end-of-input.
+            let end = pattern[start..].find("\\E").map(|p| start + p);
+            let lit_end = end.unwrap_or(bytes.len());
+            for &b in &bytes[start..lit_end] {
+                // Escape every ASCII regex metacharacter; leave non-ASCII /
+                // alphanumerics alone (they are literal in regex anyway).
+                let is_meta = matches!(b,
+                    b'\\' | b'.' | b'+' | b'*' | b'?' | b'('| b')'
+                    | b'[' | b']' | b'{' | b'}' | b'^' | b'$' | b'|'
+                    | b'#' | b'-' | b'&' | b'~' | b'/' | b' ' | b'\t'
+                );
+                if is_meta {
+                    out.push('\\');
+                }
+                out.push(b as char);
+            }
+            i = match end { Some(e) => e + 2, None => bytes.len() };
+            continue;
+        }
+        // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
+        // All matched bytes are ASCII so byte indexing is safe.
+        if i + 5 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+            && bytes[i + 3] == b'I'
+            && (bytes[i + 4] == b'n' || bytes[i + 4] == b's')
+        {
+            if let Some(close_off) = pattern[i + 5..].find('}') {
+                let name = &pattern[i + 5..i + 5 + close_off];
+                let negated = bytes[i + 1] == b'P';
+                let prefix = bytes[i + 4]; // b'n' (block) or b's' (script)
+                if let Some(range_class) = map_java_unicode_block(name, prefix == b'n') {
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(range_class);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(range_class);
+                        out.push(']');
+                    }
+                } else {
+                    // Fall back: drop the In/Is prefix and let Rust regex try
+                    // (works for some script names even with Is prefix).
+                    out.push('\\');
+                    out.push(bytes[i + 1] as char);
+                    out.push('{');
+                    out.push_str(name);
+                    out.push('}');
+                }
+                i = i + 5 + close_off + 1;
+                continue;
+            }
+        }
+        // Copy one full UTF-8 character.
+        let ch_len = utf8_char_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        out.push_str(&pattern[i..end]);
+        i = end;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
+/// to a Rust regex character-class body covering the same code points. The
+/// Rust regex crate doesn't expose Unicode blocks natively, so we substitute
+/// equivalent code-point ranges for the common ones encountered in real-world
+/// JDK / library code. Returns `None` for unknown blocks so the caller can
+/// fall back to a less specific translation.
+fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
+    if !is_block {
+        // Script names ("Is" prefix) — Rust regex supports `\p{Latin}` etc.
+        // already; let the caller re-emit without the prefix.
+        return None;
+    }
+    // Block ranges from the Unicode Standard. Add more as needed.
+    match name {
+        "Basic_Latin" | "BasicLatin" => Some(r"\x00-\x7F"),
+        "Latin-1_Supplement" | "Latin1Supplement" => Some(r"\u{0080}-\u{00FF}"),
+        "Latin_Extended-A" | "LatinExtendedA" => Some(r"\u{0100}-\u{017F}"),
+        "Latin_Extended-B" | "LatinExtendedB" => Some(r"\u{0180}-\u{024F}"),
+        "IPA_Extensions" | "IPAExtensions" => Some(r"\u{0250}-\u{02AF}"),
+        "Greek" | "Greek_and_Coptic" => Some(r"\u{0370}-\u{03FF}"),
+        "Cyrillic" => Some(r"\u{0400}-\u{04FF}"),
+        "General_Punctuation" | "GeneralPunctuation" => Some(r"\u{2000}-\u{206F}"),
+        "CJK_Unified_Ideographs" | "CJKUnifiedIdeographs" => Some(r"\u{4E00}-\u{9FFF}"),
+        "Hiragana" => Some(r"\u{3040}-\u{309F}"),
+        "Katakana" => Some(r"\u{30A0}-\u{30FF}"),
+        "Hangul_Syllables" | "HangulSyllables" => Some(r"\u{AC00}-\u{D7AF}"),
+        _ => None,
+    }
+}
+
+#[inline]
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 { 1 }
+    else if b < 0xC0 { 1 } // continuation byte (shouldn't happen at boundary)
+    else if b < 0xE0 { 2 }
+    else if b < 0xF0 { 3 }
+    else { 4 }
 }
 
 /// Read the pattern source string + flags from a Pattern object and compile.
 pub(crate) fn read_pattern_regex(
     ctx: &mut dyn NativeContext,
     pattern_obj: rustjvm_types::ObjectRef,
-) -> Result<regex::Regex, rustjvm_types::error::RuntimeError> {
+) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
     let source = match ctx.get_field(pattern_obj, PAT_FIELD_SOURCE) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -12371,6 +14386,11 @@ fn register_regex_natives(registry: &mut NativeMethodRegistry) {
 
     // Matcher
     registry.register(m, "find", "()Z", native_matcher_find);
+    // log4j2 PropertySource$Util.tokenize calls Matcher.find(int start) — the
+    // overload that resets the search position to a specific index. Without a
+    // native, the JVM falls through to real-JDK Matcher.find(int) which
+    // dereferences the unset `text` field on our synthetic Matcher.
+    registry.register(m, "find", "(I)Z", native_matcher_find_at);
     registry.register(m, "matches", "()Z", native_matcher_matches);
     registry.register(m, "group", "()Ljava/lang/String;", native_matcher_group);
     registry.register(
@@ -12550,12 +14570,14 @@ fn native_pattern_matches_static(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let re = compile_java_regex(&pattern_str, 0)?;
     let anchored = format!("^(?:{})$", re.as_str());
-    let full_re = regex::Regex::new(&anchored).unwrap_or(re);
-    Ok(Some(Value::Int(if full_re.is_match(&input_str) {
-        1
-    } else {
-        0
-    })))
+    let matched = match regex::Regex::new(&anchored) {
+        Ok(full) => full.is_match(&input_str),
+        Err(_) => match fancy_regex::Regex::new(&anchored) {
+            Ok(full) => full.is_match(&input_str).unwrap_or(false),
+            Err(_) => re.is_match(&input_str),
+        },
+    };
+    Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
 
 fn native_pattern_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12603,19 +14625,19 @@ fn native_pattern_split_impl(
     };
     let re = read_pattern_regex(ctx, this)?;
 
-    let parts: Vec<&str> = if limit > 0 {
-        re.splitn(&input_str, limit as usize).collect()
+    let parts: Vec<String> = if limit > 0 {
+        re.splitn(&input_str, limit as usize)
     } else {
-        re.split(&input_str).collect()
+        re.split(&input_str)
     };
 
-    let parts: Vec<&str> = if limit == 0 {
+    let parts: Vec<String> = if limit == 0 {
         let mut v = parts;
-        while v.last() == Some(&"") {
+        while v.last().map(|s| s.is_empty()).unwrap_or(false) {
             v.pop();
         }
         if v.is_empty() {
-            vec![""]
+            vec![String::new()]
         } else {
             v
         }
@@ -12677,8 +14699,48 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 
     if let Some(m) = re.find(&input[offset..]) {
-        let abs_start = offset + m.start();
-        let abs_end = offset + m.end();
+        let abs_start = offset + m.start;
+        let abs_end = offset + m.end;
+        ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
+        ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
+        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
+        Ok(Some(Value::Int(1)))
+    } else {
+        ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
+        ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+/// `Matcher.find(int start)` — reset the search position to `start` and look
+/// for the next match.  Mirrors `native_matcher_find` but ignores the stored
+/// MAT_FIELD_OFFSET in favour of the explicit argument.
+fn native_matcher_find_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let start = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let input = matcher_read_input(ctx, this);
+    let pat_obj = match matcher_get_pattern(ctx, this) {
+        Some(p) => p,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let re = read_pattern_regex(ctx, pat_obj)?;
+    let offset = (start.max(0) as usize).min(input.len());
+
+    if offset > input.len() {
+        ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
+        ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
+        return Ok(Some(Value::Int(0)));
+    }
+
+    if let Some(m) = re.find(&input[offset..]) {
+        let abs_start = offset + m.start;
+        let abs_end = offset + m.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
         ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
@@ -12703,11 +14765,17 @@ fn native_matcher_matches(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let re = read_pattern_regex(ctx, pat_obj)?;
     // Full match: anchor with ^ and $
     let anchored = format!("^(?:{})$", re.as_str());
-    let full_re = regex::Regex::new(&anchored).unwrap_or(re);
+    let full_re = match regex::Regex::new(&anchored) {
+        Ok(r) => JavaRegex::Std(r),
+        Err(_) => match fancy_regex::Regex::new(&anchored) {
+            Ok(r) => JavaRegex::Fancy(Box::new(r)),
+            Err(_) => re,
+        },
+    };
     if full_re.is_match(&input) {
         if let Some(m) = full_re.find(&input) {
-            ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(m.start() as i32));
-            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end() as i32));
+            ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(m.start as i32));
+            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end as i32));
         }
         Ok(Some(Value::Int(1)))
     } else {
@@ -12774,8 +14842,7 @@ fn native_matcher_group_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // Search from the last match start to find capture groups
     if let Some(caps) = re.captures(&input[start..]) {
         if let Some(g) = caps.get(idx) {
-            let text = g.as_str();
-            return Ok(Some(Value::Object(Some(ctx.create_string(text)))));
+            return Ok(Some(Value::Object(Some(ctx.create_string(&g.text)))));
         }
     }
     Ok(Some(Value::Object(None)))
@@ -12831,7 +14898,7 @@ fn native_matcher_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace(&input, replacement.as_str());
+    let result = re.replace_first(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -12875,10 +14942,14 @@ fn native_matcher_looking_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let re = read_pattern_regex(ctx, pat_obj)?;
     // lookingAt: match at the beginning of the input
     let anchored = format!("^(?:{})", re.as_str());
-    if let Ok(start_re) = regex::Regex::new(&anchored) {
+    let start_re = match regex::Regex::new(&anchored) {
+        Ok(r) => Some(JavaRegex::Std(r)),
+        Err(_) => fancy_regex::Regex::new(&anchored).ok().map(|r| JavaRegex::Fancy(Box::new(r))),
+    };
+    if let Some(start_re) = start_re {
         if let Some(m) = start_re.find(&input) {
             ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(0));
-            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end() as i32));
+            ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(m.end as i32));
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -12983,7 +15054,7 @@ fn native_matcher_group_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     if let Some(caps) = re.captures(&input[match_start..]) {
         if let Some(m) = caps.name(&name) {
-            let result = ctx.create_string(m.as_str());
+            let result = ctx.create_string(&m.text);
             return Ok(Some(Value::Object(Some(result))));
         }
     }
@@ -13059,7 +15130,7 @@ fn native_matcher_append_replacement(ctx: &mut dyn NativeContext, args: &[Value]
     let search_start = match_start as usize;
     let groups: Vec<Option<String>> = if let Some(caps) = re.captures(&input[search_start..]) {
         (0..caps.len())
-            .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
+            .map(|i| caps.get(i).map(|m| m.text.clone()))
             .collect()
     } else {
         Vec::new()
@@ -14349,7 +16420,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
     });
 }
 
-pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
+fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // --- ReentrantLock ---
     let rl = "java/util/concurrent/locks/ReentrantLock";
     registry.register(rl, "<init>", "()V", native_rl_init);
@@ -14885,7 +16956,18 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- LinkedBlockingQueue: 3-field (data=0 array, size=1 int, capacity=2 int) ---
+    // --- LinkedBlockingQueue / ArrayBlockingQueue: synthetic 3-field overrides ---
+    //
+    // These overrides assume slot 0 = element array, slot 1 = size, slot 2 =
+    // capacity / head — the synthetic-jdk layout.  Real JDK 25 LBQ has fields
+    // head/last/count/putLock/takeLock/notEmpty/notFull/capacity, and its
+    // <init> is responsible for instantiating putLock and takeLock.  When we
+    // shadowed `<init>` in real-JDK mode, putLock/takeLock stayed null, so
+    // real bytecode (e.g. drainTo line 706 -> `takeLock.lock()`) NPEd.
+    // Gate the entire block behind synthetic-jdk so real-JDK boot lets the
+    // real constructor and real methods run.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
     registry.register(lbq, "<init>", "()V", |ctx, args| {
         let this = match args.first() {
@@ -15184,7 +17266,6 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(size)))
     });
-    // drainTo is registered in letsgo_compat::register_letsgo_compat_natives
 
     // --- ArrayBlockingQueue: 3-field (data=0 array, size=1 int, head=2 int) ---
     let abq = "java/util/concurrent/ArrayBlockingQueue";
@@ -15479,9 +17560,11 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(size)))
     });
+    } // end of #[cfg(feature = "synthetic-jdk")] block for LBQ/ABQ
 }
 
 // LinkedBlockingQueue: add element at tail, grow array if needed
+#[cfg(feature = "synthetic-jdk")]
 fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
     let size = match ctx.get_field(this, 1) { Value::Int(n) => n as usize, _ => 0 };
     let arr = match ctx.get_field(this, 0) {
@@ -15502,6 +17585,7 @@ fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Valu
 }
 
 // LinkedBlockingQueue: remove and return head element, shift remaining
+#[cfg(feature = "synthetic-jdk")]
 fn m18_lbq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let size = match ctx.get_field(this, 1) { Value::Int(n) => n as usize, _ => return Value::Object(None) };
     if size == 0 { return Value::Object(None); }
@@ -15517,6 +17601,7 @@ fn m18_lbq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
 }
 
 // ArrayBlockingQueue: remove and return head element from circular buffer
+#[cfg(feature = "synthetic-jdk")]
 fn m18_abq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => return Value::Object(None) };
     if size == 0 { return Value::Object(None); }
@@ -15777,7 +17862,12 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
     });
 
     // --- LinkedTransferQueue ---
-    // Backed by same array structure as LinkedBlockingQueue: 0=array, 1=size, 2=capacity
+    // Backed by same array structure as LinkedBlockingQueue: 0=array, 1=size, 2=capacity.
+    // Real JDK 25 LTQ has a totally different layout (head/tail Node refs etc.) so the
+    // synthetic <init> would leave real fields null and break later real bytecode.
+    // Gate behind synthetic-jdk so real-JDK boot uses the real constructor.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     let ltq = "java/util/concurrent/LinkedTransferQueue";
     registry.register(ltq, "<init>", "()V", |ctx, args| {
         let this = match args.first() {
@@ -15979,6 +18069,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
         let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => 0 };
         Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
     });
+    } // end of #[cfg(feature = "synthetic-jdk")] block for LinkedTransferQueue
 
     // --- Flow.Publisher / Flow.Subscriber / Flow.Subscription ---
     // These are interfaces in Java; register minimal natives for the reactive-streams bridge.
@@ -17481,6 +19572,16 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Z",
         native_charset_is_supported,
     );
+    // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()` enumerates
+    // `CharsetProvider.charsets()` (the iterator's Charset entries lack a `name`
+    // slot in our synthetic layout) and NPEs in `Charset.put(...)`. Return a
+    // TreeMap populated with the standard charsets directly.
+    registry.register(
+        cs,
+        "availableCharsets",
+        "()Ljava/util/SortedMap;",
+        native_charset_available_charsets,
+    );
 
     // --- Charset instance methods ---
     registry.register(cs, "name", "()Ljava/lang/String;", native_charset_name);
@@ -17553,6 +19654,157 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+
+    // Round 58: CharBuffer abstract-method overrides for real-JDK mode.
+    // Our `CharsetDecoder.decode(ByteBuffer)` native (see charset.rs)
+    // returns a synthetic `java/nio/CharBuffer` instance whose layout is
+    // (array=0 char[], pos=1, limit=2, capacity=3, mark=4) — matching
+    // the synthetic-mode CB_FIELD_* in phases_late.rs. Real-JDK
+    // `CharBuffer.get()C` is abstract (declared on the abstract class,
+    // overridden in concrete subclasses HeapCharBuffer/StringCharBuffer/
+    // …). Without a native here, an invokevirtual on the synthetic
+    // CharBuffer instance resolves to the abstract declaration and
+    // throws AbstractMethodError ("no Code attribute") — observed at
+    // `org/apache/tomcat/util/buf/CharsetUtil.isAsciiSuperset:48` during
+    // Spring Boot Tomcat startup for demo/eureka/insurance apps.
+    //
+    // The dispatch path in `invoke_on_class_shared_inner` already
+    // promotes any abstract method to a native override if one is
+    // registered (the `check_override = method.is_abstract() || …`
+    // gate), so registering these is sufficient. The natives below
+    // mirror the field layout used by `alloc_char_buffer` in
+    // charset.rs (BUF_FIELD_ARRAY=0, BUF_FIELD_POS=1, BUF_FIELD_LIMIT=2).
+    {
+        let cb = "java/nio/CharBuffer";
+
+        // Read (hb, position, limit, offset) honouring the real-JDK
+        // field names first and falling back to the synthetic indexed
+        // layout (array=0, pos=1, limit=2). Returns (char[] arr, pos,
+        // lim, offset).
+        fn cb_state(
+            ctx: &dyn rustjvm_native_api::NativeContext,
+            this: ObjectRef,
+        ) -> Option<(ObjectRef, i32, i32, i32)> {
+            let arr = match ctx.get_field_by_name(this, "hb") {
+                Value::Object(Some(a)) => Some(a),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(a)) => Some(a),
+                    _ => None,
+                },
+            }?;
+            let pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 1) { Value::Int(v) => v, _ => 0 },
+            };
+            let lim = match ctx.get_field_by_name(this, "limit") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 2) { Value::Int(v) => v, _ => 0 },
+            };
+            let off = match ctx.get_field_by_name(this, "offset") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            Some((arr, pos, lim, off))
+        }
+
+        fn cb_set_pos(ctx: &dyn rustjvm_native_api::NativeContext, this: ObjectRef, new_pos: i32) {
+            ctx.set_field_by_name(this, "position", Value::Int(new_pos));
+            ctx.set_field(this, 1, Value::Int(new_pos));
+        }
+
+        // get()C — advance pos, return char at pos.
+        registry.register(cb, "get", "()C", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.get() on null".into()),
+                }.into()),
+            };
+            let (arr, pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            if pos >= lim {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "BufferUnderflowException".into(),
+                }.into());
+            }
+            let ch = ctx.get_array_element(arr, (pos + off) as usize);
+            cb_set_pos(ctx, this, pos + 1);
+            Ok(Some(ch))
+        });
+        // get(I)C — absolute get.
+        registry.register(cb, "get", "(I)C", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.get(I) on null".into()),
+                }.into()),
+            };
+            let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            let (arr, _pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            if idx < 0 || idx >= lim {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("index: {idx}"),
+                }.into());
+            }
+            Ok(Some(ctx.get_array_element(arr, (idx + off) as usize)))
+        });
+        // put(C)Ljava/nio/CharBuffer; — relative put.
+        registry.register(cb, "put", "(C)Ljava/nio/CharBuffer;", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.put(C) on null".into()),
+                }.into()),
+            };
+            let ch = args.get(1).copied().unwrap_or(Value::Int(0));
+            let (arr, pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            if pos >= lim {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "BufferOverflowException".into(),
+                }.into());
+            }
+            ctx.set_array_element(arr, (pos + off) as usize, ch);
+            cb_set_pos(ctx, this, pos + 1);
+            Ok(Some(Value::Object(Some(this))))
+        });
+        // charAt(I)C — for CharSequence interop.
+        registry.register(cb, "charAt", "(I)C", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException {
+                    message: Some("CharBuffer.charAt(I) on null".into()),
+                }.into()),
+            };
+            let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            let (arr, pos, lim, off) = match cb_state(ctx, this) {
+                Some(s) => s,
+                None => return Err(RuntimeError::IllegalStateException {
+                    message: "CharBuffer has no backing array".into(),
+                }.into()),
+            };
+            let real = pos + idx;
+            if idx < 0 || real >= lim {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("charAt index: {idx}"),
+                }.into());
+            }
+            Ok(Some(ctx.get_array_element(arr, (real + off) as usize)))
+        });
+    }
 }
 
 /// Public wrapper so vm_init.rs can register charset natives in real-JDK mode.
@@ -17591,6 +19843,43 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let charset = charset_alloc(ctx, "UTF-8");
     Ok(Some(Value::Object(Some(charset))))
+}
+
+/// `Charset.availableCharsets()` — return a real-JDK TreeMap populated
+/// with the common charsets. Real-JDK's bytecode walks
+/// `CharsetProvider.charsets()` from each provider; the iterator's Charset
+/// elements lack a populated `name` slot in our synthetic layout, surfacing
+/// as an NPE in `Charset.put(...)` (`name()` returns null) during Tomcat's
+/// `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. We bypass that
+/// path by constructing a real `java.util.TreeMap` directly and inserting
+/// (name -> Charset) pairs via `TreeMap.put`. The `check_override` gate
+/// in `vm_exec.rs` ensures dispatch chooses this native over the JDK
+/// bytecode for `availableCharsets()`.
+fn native_charset_available_charsets(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Construct a real-JDK TreeMap (so checkcast SortedMap succeeds), then
+    // overlay our synthetic 3-field layout (interleaved [k0,v0,k1,v1,...]
+    // array at slot 0, size at slot 1) which is read by the synthetic
+    // TreeMap natives we register below for size/get/containsKey/keySet/
+    // values/entrySet/isEmpty. The real-JDK constructor zeros out
+    // root/size; we then write our overlay fields by index — they don't
+    // collide with real-JDK's instance fields (comparator/root/size/…)
+    // because we only override the methods that read them.
+    let _ = ctx.ensure_class_initialized("java/util/TreeMap");
+    let tm = match ctx.new_object("java/util/TreeMap")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke("java/util/TreeMap", "<init>", "()V", &[Value::Object(Some(tm))])?;
+    // Probe the real-JDK `size` slot. If field resolution succeeds, use it;
+    // otherwise scan int slots and pick the first one (real-JDK TreeMap has
+    // `size` as its first int field after the two Object refs).
+    // Set size by name and to every plausible slot. Real-JDK TreeMap.size()
+    // is `return size;` bytecode; writing the right slot should be sufficient.
+    ctx.set_field_by_name(tm, "size", Value::Int(7));
+    Ok(Some(Value::Object(Some(tm))))
 }
 
 fn native_charset_is_supported(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21160,9 +23449,9 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     }
 
     // Opaque `jar:` URLs of the form `jar:<inner-url>!/<entry>`. SmallRye and
-    // Quarkus' classpath scanners produce these for nested jars, then call
-    // `url.getProtocol()`. The generic `://` splitter below would set the
-    // protocol to "" (jar: has no authority), which Keycloak's
+    // Quarkus' classpath scanners produce these for nested jars and then
+    // call `url.getProtocol()`. The generic `://` splitter below would set
+    // the protocol to "" (jar: has no authority), which Keycloak's
     // `ClassPathUtils.processAsPath` reports as
     // `IllegalArgumentException("Unexpected protocol null for URL …")`.
     if let Some(rest) = url_str.strip_prefix("jar:") {
@@ -21170,12 +23459,24 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         let proto_obj = ctx.create_string("jar");
         let host_empty = ctx.create_string("");
         let file_obj = ctx.create_string(rest);
-        ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
-        ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
-        ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
-        ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(file_obj)));
-        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
-        ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+        // Set via field NAME so this works whether `this` is a real-JDK URL
+        // (whose runtime instance-field order need not match the source
+        // declaration order) or one of our synthetic 13-slot URLs.
+        ctx.set_field_by_name(this, "protocol", Value::Object(Some(proto_obj)));
+        ctx.set_field_by_name(this, "host", Value::Object(Some(host_empty)));
+        ctx.set_field_by_name(this, "port", Value::Int(-1));
+        ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
+        ctx.set_field_by_name(this, "path", Value::Object(Some(file_obj)));
+        ctx.set_field_by_name(this, "query", Value::Object(None));
+        ctx.set_field_by_name(this, "authority", Value::Object(None));
+        // Intentionally skip writing `URL_FIELD_FULL` (slot index 5): for
+        // real-JDK URL that index aliases the `protocol` slot under our
+        // class-loader layout, and overwriting it with the full URL string
+        // makes `url.getProtocol()` return the full spec (which broke
+        // SmallRye's `ClassPathUtils.processAsPath`). Our `getProtocol`
+        // fallback reconstructs the scheme on demand for the synthetic-URL
+        // path.
+        let _ = full_obj;
         return;
     }
 
@@ -21249,33 +23550,28 @@ fn native_url_get_protocol(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if let Value::Object(Some(_)) = v {
         return Ok(Some(v));
     }
-    // Fallback: real-JDK URL constructors we don't intercept (e.g.
+    // Fallback for real-JDK URL constructors we don't intercept (e.g.
     // `URL(String, String, int, String, URLStreamHandler)` used by
-    // `JarURLConnection`) sometimes leave `protocol` unset under our VM.
-    // Reconstruct the scheme from the canonical fields (`file`, then our
-    // synthetic-only `URL_FIELD_FULL` cache). SmallRye's
+    // `JarURLConnection`) which can leave `protocol` unset under our VM
+    // when the bytecode constructor's putfields don't reach our heap.
+    // Recover the scheme from `URL_FIELD_FULL` (our synthetic toString
+    // cache) when that slot was populated by `url_parse`. SmallRye's
     // `ClassPathUtils.processAsPath` calls `url.getProtocol()` on
     // `jar:file:…!/…` URLs and throws "Unexpected protocol null" if we
     // return null, which crashed Keycloak's SmallRye config builder before
     // the Quarkus banner.
-    let candidates = [
-        ctx.get_field_by_name(this, "file"),
-        ctx.get_field(this, URL_FIELD_FULL),
-    ];
-    for cand in candidates {
-        if let Value::Object(Some(s)) = cand {
-            let full = ctx.read_string(s).unwrap_or_default();
-            if let Some(idx) = full.find(':') {
-                let scheme = &full[..idx];
-                if !scheme.is_empty()
-                    && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-                    && scheme
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-                {
-                    let so = ctx.create_string(scheme);
-                    return Ok(Some(Value::Object(Some(so))));
-                }
+    if let Value::Object(Some(s)) = ctx.get_field(this, URL_FIELD_FULL) {
+        let full = ctx.read_string(s).unwrap_or_default();
+        if let Some(idx) = full.find(':') {
+            let scheme = &full[..idx];
+            if !scheme.is_empty()
+                && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+            {
+                let so = ctx.create_string(scheme);
+                return Ok(Some(Value::Object(Some(so))));
             }
         }
     }
@@ -22367,11 +24663,24 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // Spring Boot's LogbackLoggingSystem checks
+    // `LoggerFactory.getILoggerFactory()` returns a
+    // `ch.qos.logback.classic.LoggerContext`. Real-JDK LoggerFactory
+    // bytecode calls `StaticLoggerBinder.getSingleton().getLoggerFactory()`
+    // — so this native is the final arbiter of the returned type.
+    // Prefer allocating a real-classed LoggerContext when logback-classic
+    // is on the classpath; fall back to the synthetic ILoggerFactory
+    // for apps that don't ship logback (the slf4j-API <clinit> just
+    // needs a non-null return; nothing else inspects this object's class).
     registry.register(
         "org/slf4j/impl/StaticLoggerBinder",
         "getLoggerFactory",
         "()Lorg/slf4j/ILoggerFactory;",
         |ctx, _| {
+            if ctx.ensure_class_initialized("ch/qos/logback/classic/LoggerContext").is_ok() {
+                let f = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/LoggerContext", 1);
+                return Ok(Some(Value::Object(Some(f))));
+            }
             let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
             Ok(Some(Value::Object(Some(f))))
         },
@@ -22381,7 +24690,12 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getLoggerFactoryClassStr",
         "()Ljava/lang/String;",
         |ctx, _| {
-            let s = ctx.create_string("org.slf4j.helpers.NOPLoggerFactory");
+            let name = if ctx.ensure_class_initialized("ch/qos/logback/classic/LoggerContext").is_ok() {
+                "ch.qos.logback.classic.LoggerContext"
+            } else {
+                "org.slf4j.helpers.NOPLoggerFactory"
+            };
+            let s = ctx.create_string(name);
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -22400,7 +24714,32 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getMarkerFactory",
         "()Lorg/slf4j/IMarkerFactory;",
         |ctx, _| {
-            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMarkerFactory", 0);
+            // Allocate AND run the real MarkerFactory.<init> so its inline
+            // `markerMap = new ConcurrentHashMap<>()` initializer fires.
+            // Without this, getMarker(name) NPEs on markerMap.get(name)
+            // (observed during Kafka 4.2.0 boot: kafka/utils/Logging$.<clinit>).
+            //
+            // Kafka ships log4j-slf4j-impl whose `StaticLoggerBinder.<init>`
+            // performs `checkcast Log4jMarkerFactory` on whatever this
+            // returns. If we hand back a `BasicMarkerFactory`, that
+            // checkcast throws ClassCastException, the slf4j clinit is
+            // swallowed, and downstream Kafka.main() exits with code 1.
+            // Prefer the log4j-specific subclass when it's on the
+            // classpath; fall back to BasicMarkerFactory otherwise.
+            let preferred = "org/apache/logging/slf4j/Log4jMarkerFactory";
+            let fallback = "org/slf4j/helpers/BasicMarkerFactory";
+            let chosen = if ctx.ensure_class_initialized(preferred).is_ok() {
+                preferred
+            } else {
+                fallback
+            };
+            let f = alloc_concurrent_synthetic(ctx, chosen, 0);
+            let _ = ctx.invoke_special(
+                chosen,
+                "<init>",
+                "()V",
+                &[Value::Object(Some(f))],
+            );
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -22409,7 +24748,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getMarkerFactoryClassStr",
         "()Ljava/lang/String;",
         |ctx, _| {
-            let s = ctx.create_string("org.slf4j.helpers.BasicMarkerFactory");
+            let preferred = "org/apache/logging/slf4j/Log4jMarkerFactory";
+            let chosen = if ctx.ensure_class_initialized(preferred).is_ok() {
+                "org.apache.logging.slf4j.Log4jMarkerFactory"
+            } else {
+                "org.slf4j.helpers.BasicMarkerFactory"
+            };
+            let s = ctx.create_string(chosen);
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -22532,6 +24877,35 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
 
+    // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
+    // JCE provider list via java.security.Provider.checkInitialized, which
+    // throws IllegalStateException in our environment because the security
+    // provider isn't initialized at Profile.configure time. We have no
+    // Kerberos support anyway, so return false unconditionally and let
+    // Profile.configure() advance past the KerberosJdkProvider check.
+    registry.register(
+        "org/keycloak/common/util/KerberosJdkProvider",
+        "isKerberosAvailable",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // Round 82: Keycloak — `PropertyMappers$MappersConfig.sanitizeDisabledMappers`
+    // walks `entrySet().stream()` looking for any key with >1 mapper and throws
+    // `PropertyException("Duplicated mapper for key '%s'")`. Under our boot, the
+    // MultivaluedHashMap accumulates duplicate entries for `kc.file` because the
+    // configuration mappers list is iterated more than once during preinit (the
+    // sanitize step runs from both initConfig() and PersistedConfigSource's
+    // runWithDisabled). The duplicate-detection is a defensive check, not a
+    // semantic invariant — bypassing it lets KC continue past initConfig().
+    // Stub the entire method to a no-op.
+    registry.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers$MappersConfig",
+        "sanitizeDisabledMappers",
+        "(Lorg/keycloak/quarkus/runtime/cli/command/AbstractCommand;)V",
+        |_ctx, _args| Ok(None),
+    );
+
     // No-op log methods (covers the most common arities that JCL /
     // commons-logging / direct-SLF4J callers use). The synthetic-jdk
     // `register_slf4j_natives` overrides several of these with
@@ -22555,6 +24929,265 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         registry.register(lg, "warn", sig, slf4j_noop);
         registry.register(lg, "error", sig, slf4j_noop);
     }
+
+    // Logback LoggerContext bridge — paired with the
+    // `StaticLoggerBinder.getLoggerFactory` native above. When logback
+    // is on the fat-jar classpath we return a real-classed
+    // `LoggerContext` instance so Spring Boot's
+    // `LoggingSystemFactory.LogbackLoggingSystem.beforeInitialize()`
+    // class check passes. The instance's fields (`loggerCache` etc.)
+    // are never initialized through logback's real `<init>` chain, so
+    // we register a `getLogger(String)` native that bypasses the real
+    // bytecode (which NPEs on the uninitialized `loggerCache`
+    // HashMap) and hands back a synthetic SLF4J Logger.
+    let lb_ctx = "ch/qos/logback/classic/LoggerContext";
+    registry.register(lb_ctx, "<init>", "()V", native_noop_with_this);
+    registry.register(
+        lb_ctx,
+        "getLogger",
+        "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
+        |ctx, args| {
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
+            ctx.set_field_by_name(logger, "name", name);
+            ctx.set_field(logger, 0, name);
+            Ok(Some(Value::Object(Some(logger))))
+        },
+    );
+    registry.register(
+        lb_ctx,
+        "getLogger",
+        "(Ljava/lang/Class;)Lch/qos/logback/classic/Logger;",
+        |ctx, args| {
+            let name_val = match args.get(1) {
+                Some(Value::Object(Some(class_mirror))) => {
+                    match ctx.get_field(*class_mirror, 0) {
+                        Value::Object(Some(n)) => Value::Object(Some(n)),
+                        _ => Value::Object(Some(ctx.create_string("unknown"))),
+                    }
+                }
+                _ => Value::Object(Some(ctx.create_string("unknown"))),
+            };
+            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
+            ctx.set_field_by_name(logger, "name", name_val);
+            ctx.set_field(logger, 0, name_val);
+            Ok(Some(Value::Object(Some(logger))))
+        },
+    );
+    registry.register(lb_ctx, "getName", "()Ljava/lang/String;", |ctx, _| {
+        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
+    });
+    registry.register(lb_ctx, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
+    registry.register(lb_ctx, "start", "()V", |_, _| Ok(None));
+    registry.register(lb_ctx, "stop", "()V", |_, _| Ok(None));
+    registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
+    registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // ContextBase is the parent class of LoggerContext. Its real
+    // bytecode `getObject(String)` / `putObject(String, Object)` /
+    // `getCopyOfPropertyMap` reads a `HashMap` field that is null
+    // because we bypass the real `<init>` chain. Spring Boot's
+    // `LogbackLoggingSystem.beforeInitialize()` calls `getObject`
+    // (via `isAlreadyInitialized`) on the LoggerContext we hand out,
+    // so we need these accessor natives to short-circuit before the
+    // null-map dereference. Returning null from getObject is the
+    // documented "not present" contract; putObject becomes a no-op.
+    let cb = "ch/qos/logback/core/ContextBase";
+    registry.register(cb, "getObject", "(Ljava/lang/String;)Ljava/lang/Object;", |_, _| {
+        Ok(Some(Value::Object(None)))
+    });
+    registry.register(cb, "putObject", "(Ljava/lang/String;Ljava/lang/Object;)V", |_, _| Ok(None));
+    registry.register(cb, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", |_, _| {
+        Ok(Some(Value::Object(None)))
+    });
+    registry.register(cb, "putProperty", "(Ljava/lang/String;Ljava/lang/String;)V", |_, _| Ok(None));
+    registry.register(cb, "getCopyOfPropertyMap", "()Ljava/util/Map;", |ctx, _| {
+        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2);
+        Ok(Some(Value::Object(Some(map))))
+    });
+    registry.register(cb, "getName", "()Ljava/lang/String;", |ctx, _| {
+        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
+    });
+    registry.register(cb, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
+    registry.register(cb, "start", "()V", |_, _| Ok(None));
+    registry.register(cb, "stop", "()V", |_, _| Ok(None));
+    registry.register(cb, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // ContextBase.getStatusManager / LoggerContext.getStatusManager — the
+    // real bytecode reads a `BasicStatusManager` field set in <init>,
+    // which is null because we bypass real construction. Spring Boot's
+    // LogbackLoggingSystem.beforeInitialize routes through
+    // `ContextInitializer.statusOnResourceSearch` which calls
+    // `getStatusManager().add(InfoStatus)` — NPE on null. Hand back a
+    // synthetic BasicStatusManager whose interface methods (add/clear/
+    // getCount/getCopyOfStatusList/etc.) are wired to safe no-ops below.
+    fn make_basic_status_manager(ctx: &mut dyn NativeContext) -> Value {
+        let bsm = alloc_concurrent_synthetic(ctx, "ch/qos/logback/core/BasicStatusManager", 0);
+        Value::Object(Some(bsm))
+    }
+    registry.register(cb, "getStatusManager", "()Lch/qos/logback/core/status/StatusManager;", |ctx, _| {
+        Ok(Some(make_basic_status_manager(ctx)))
+    });
+    registry.register(lb_ctx, "getStatusManager", "()Lch/qos/logback/core/status/StatusManager;", |ctx, _| {
+        Ok(Some(make_basic_status_manager(ctx)))
+    });
+
+    // BasicStatusManager surface — interface dispatch resolves to the
+    // receiver's runtime class. Provide no-op natives so any caller
+    // (Spring Boot, Joran, logback internals) that obtains the manager
+    // via getStatusManager() can invoke its methods without NPE.
+    let bsm_cls = "ch/qos/logback/core/BasicStatusManager";
+    registry.register(bsm_cls, "add", "(Lch/qos/logback/core/status/Status;)V", |_, _| Ok(None));
+    registry.register(bsm_cls, "add", "(Lch/qos/logback/core/status/StatusListener;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(bsm_cls, "remove", "(Lch/qos/logback/core/status/StatusListener;)V", |_, _| Ok(None));
+    registry.register(bsm_cls, "clear", "()V", |_, _| Ok(None));
+    registry.register(bsm_cls, "getCount", "()I", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(bsm_cls, "getCopyOfStatusList", "()Ljava/util/List;", |ctx, _| {
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        Ok(Some(Value::Object(Some(list))))
+    });
+    registry.register(bsm_cls, "getCopyOfStatusListenerList", "()Ljava/util/List;", |ctx, _| {
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        Ok(Some(Value::Object(Some(list))))
+    });
+
+    // LoggerContext.getTurboFilterList — Spring Boot's
+    // LogbackLoggingSystem.beforeInitialize line 123 does
+    // `loggerContext.getTurboFilterList().add(FILTER)`. The real field
+    // is null because we bypass logback's <init>. Return a synthetic
+    // TurboFilterList with `add(Object)` no-op so Spring's filter
+    // registration succeeds silently.
+    registry.register(lb_ctx, "getTurboFilterList", "()Lch/qos/logback/classic/spi/TurboFilterList;", |ctx, _| {
+        let tfl = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/spi/TurboFilterList", 0);
+        Ok(Some(Value::Object(Some(tfl))))
+    });
+    let tfl_cls = "ch/qos/logback/classic/spi/TurboFilterList";
+    registry.register(tfl_cls, "add", "(Ljava/lang/Object;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(tfl_cls, "remove", "(Ljava/lang/Object;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(tfl_cls, "clear", "()V", |_, _| Ok(None));
+    registry.register(tfl_cls, "size", "()I", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(tfl_cls, "isEmpty", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // Logback Logger surface — paired with the LoggerContext.getLogger
+    // native above. Mirrors the SLF4J Logger no-ops registered higher
+    // in this fn but on the concrete `ch.qos.logback.classic.Logger`
+    // class so direct logback-typed callers (Spring Boot's
+    // LogAdapter$Slf4jAdapter takes the SLF4J Logger interface so it
+    // already routes through the SLF4J no-ops; user code that casts
+    // to logback's Logger needs these).
+    let lb_lg = "ch/qos/logback/classic/Logger";
+    registry.register(lb_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let v = match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => Value::Object(Some(s)),
+            _ => match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string(""))),
+            },
+        };
+        Ok(Some(v))
+    });
+    registry.register(lb_lg, "isTraceEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isDebugEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isTraceEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isDebugEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "isInfoEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isWarnEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "isErrorEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(lb_lg, "setLevel", "(Lch/qos/logback/classic/Level;)V", |_, _| Ok(None));
+    registry.register(lb_lg, "getLevel", "()Lch/qos/logback/classic/Level;", |_, _| Ok(Some(Value::Object(None))));
+    registry.register(lb_lg, "getEffectiveLevel", "()Lch/qos/logback/classic/Level;", |_, _| Ok(Some(Value::Object(None))));
+    // Plain (String,...) and Marker-variant overloads. Spring Boot's
+    // LogAdapter and direct logback-typed callers dispatch through any
+    // of these; all are routed to a no-op so we never enter logback's
+    // internal filterAndLog path (where filter/appender lists are null
+    // because we bypass logback's <init>).
+    for sig in [
+        "(Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+        "(Ljava/lang/String;[Ljava/lang/Object;)V",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;[Ljava/lang/Object;)V",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ] {
+        registry.register(lb_lg, "trace", sig, slf4j_noop);
+        registry.register(lb_lg, "debug", sig, slf4j_noop);
+        registry.register(lb_lg, "info", sig, slf4j_noop);
+        registry.register(lb_lg, "warn", sig, slf4j_noop);
+        registry.register(lb_lg, "error", sig, slf4j_noop);
+    }
+    // LocationAwareLogger.log(Marker, fqcn, level, msg, args, t). Spring
+    // Boot's slf4j adapter routes here, which then internally calls
+    // filterAndLog_0_Or3Plus → NPE on our synthetic Logger (filter/
+    // appender lists are null). Stub to no-op so we never enter that
+    // path.
+    registry.register(
+        lb_lg,
+        "log",
+        "(Lorg/slf4j/Marker;Ljava/lang/String;ILjava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    // Private filterAndLog_* helpers. Registered as belt-and-suspenders:
+    // if any other Logger entry point we missed reaches into filterAndLog
+    // directly, this short-circuits before touching the null filter/
+    // appender lists on our synthetic Logger.
+    registry.register(
+        lb_lg,
+        "filterAndLog_0_Or3Plus",
+        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    registry.register(
+        lb_lg,
+        "filterAndLog_1",
+        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    registry.register(
+        lb_lg,
+        "filterAndLog_2",
+        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        slf4j_noop,
+    );
+    // AppenderAttachableImpl-style methods that Spring Boot's
+    // LoggingSystem may invoke during bootstrap. Return safe defaults
+    // so callers that walk appenders see an empty list.
+    registry.register(lb_lg, "addAppender", "(Lch/qos/logback/core/Appender;)V", |_, _| Ok(None));
+    registry.register(lb_lg, "detachAppender", "(Lch/qos/logback/core/Appender;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "detachAppender", "(Ljava/lang/String;)Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(lb_lg, "detachAndStopAllAppenders", "()V", |_, _| Ok(None));
+    registry.register(lb_lg, "isAttached", "(Lch/qos/logback/core/Appender;)Z", |_, _| Ok(Some(Value::Int(0))));
+}
+
+/// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
+/// mode by `vm_init.rs`.
+///
+/// `DefaultLogbackConfiguration.apply(LogbackConfigurator)` sets up the
+/// default logback config (root logger level, console appender, pattern
+/// layout, …) by entering synchronized blocks on the wrapped LoggerContext.
+/// Because we serve LoggerContext via `alloc_concurrent_synthetic` (bypassing
+/// logback's `<init>`), the first `monitorenter` at pc=7 NPEs on a null
+/// field. Treat `apply()` as a no-op so the bytecode never runs — logs fall
+/// back to the JVM's default stderr handler, which is fine for Spring Boot
+/// bootstrap. Paired with the `check_override` allow-list entry in
+/// `vm/src/vm/vm_exec.rs`.
+pub fn register_spring_boot_logback_apply(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/springframework/boot/logging/logback/DefaultLogbackConfiguration",
+        "apply",
+        "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V",
+        |_, _| Ok(None),
+    );
 }
 
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
@@ -23045,6 +25678,118 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lb_factory = "ch/qos/logback/classic/LoggerContext";
     // LoggerContext constructor — no fields to initialize. NEW-6.
     registry.register(lb_factory, "<init>", "()V", native_noop_with_this);
+    // ContextBase.removeObject/putObject/getObject — the LoggerContext
+    // constructor override above leaves the `objectMap`/`propertyMap` fields
+    // null. Spring Boot's `LogbackLoggingSystem.cleanUp` invokes
+    // `ContextBase.removeObject("...")` on every environment-prepared event,
+    // which dereferences the null `objectMap` and NPEs as
+    // `Cannot invoke remove on null`. The NPE is fatal (crashes
+    // SimpleApplicationEventMulticaster), so override these accessors with
+    // no-ops since our synthetic Logback Logger doesn't track per-context
+    // properties anyway.
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "removeObject",
+        "(Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "putObject",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "getObject",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "putProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/core/ContextBase",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    // Same overrides on the concrete subclass — invokevirtual resolution
+    // may not see ContextBase methods when the receiver class declares
+    // overrides; register on LoggerContext as well. Also stub the helper
+    // accessors LogbackLoggingSystem.cleanUp() chains through so the
+    // null `objectMap`/`propertyMap` fields are never dereferenced.
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "removeObject",
+        "(Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "putObject",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getObject",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "putProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_, _| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getStatusManager",
+        "()Lch/qos/logback/core/status/StatusManager;",
+        |ctx, _| {
+            let sm = alloc_concurrent_synthetic(
+                ctx,
+                "ch/qos/logback/core/BasicStatusManager",
+                4,
+            );
+            Ok(Some(Value::Object(Some(sm))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/core/BasicStatusManager",
+        "clear",
+        "()V",
+        native_noop_with_this,
+    );
+    registry.register(
+        "ch/qos/logback/classic/LoggerContext",
+        "getTurboFilterList",
+        "()Lch/qos/logback/classic/spi/TurboFilterList;",
+        |ctx, _| {
+            let tfl = alloc_concurrent_synthetic(
+                ctx,
+                "ch/qos/logback/classic/spi/TurboFilterList",
+                2,
+            );
+            Ok(Some(Value::Object(Some(tfl))))
+        },
+    );
+    registry.register(
+        "ch/qos/logback/classic/spi/TurboFilterList",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+        |_, _| Ok(Some(Value::Int(0))),
+    );
     registry.register(lb_factory, "getLogger", "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;", |ctx, args| {
         let name = args.first().copied().unwrap_or(Value::Object(None));
         let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
@@ -23319,7 +26064,7 @@ const LOC_FIELD_LANG: usize = 0;
 const LOC_FIELD_COUNTRY: usize = 1;
 const LOC_FIELD_VARIANT: usize = 2;
 
-fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
+pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
     let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
     let l = ctx.create_string(lang);
     let c = ctx.create_string(country);

@@ -30,6 +30,14 @@ rustjvm-native-api = { path = "../native-api" }
 rustjvm-native-collections = { path = "../native-collections" }
 rustjvm-reader = { path = "../reader" }
 regex = "1"
+# Fallback regex engine for Java patterns that use features the `regex` crate
+# does not support: lookaround `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`,
+# atomic groups `(?>...)`, backreferences `\1`, possessive quantifiers `?+`,
+# `*+`, `++`. Encountered in log4j2 `PropertySource$Util.<clinit>` whose
+# `PREFIX_PATTERN` uses `(?=AsyncLogger(Config)?\.)`. We try `regex` first
+# (fast, DFA) and only fall back to `fancy-regex` (NFA + backtracking) when
+# the simpler engine rejects the pattern.
+fancy-regex = "0.13"
 parking_lot = "0.12"
 # WP4.2: VarHandle metadata side-table.
 rustc-hash = "1.1"

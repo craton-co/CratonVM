@@ -1,0 +1,69 @@
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+[2m2026-05-09T13:35:30.711299Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::diagnostics[0m[2m:[0m B6: silent-swallow — error suppressed to keep VM running [3msite[0m[2m=[0m<clinit> [3mcategory[0m[2m=[0mnon-critical-exception [3mdetail[0m[2m=[0mclass=java/util/jar/JarFile exc=java/lang/NullPointerException: Cannot invoke intValue on null
+[S111-DBG] Class.forName(com.digsol.eurekaserver.EurekaServerApplication) loader=org/springframework/boot/loader/LaunchedURLClassLoader
+[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: com.digsol.eurekaserver.EurekaServerApplication
+[S111-DBG] loadClass(com.digsol.eurekaserver.EurekaServerApplication) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.apache.logging.log4j.spi.ExtendedLogger) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.apache.logging.log4j.spi.ExtendedLogger) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.apache.logging.slf4j.SLF4JProvider) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.apache.logging.slf4j.SLF4JProvider) succeeded via invoke_virtual
+[S111-DBG] Class.forName(org.slf4j.spi.LocationAwareLogger) loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+[S111-DBG] loadClass(org.slf4j.spi.LocationAwareLogger) succeeded via invoke_virtual
+[PROPS-GET] this=ObjectRef { ptr: 0x2806628cd00 } key="java.lang.invoke.MethodHandle.DEBUG_NAMES" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x2806628cd00 } key="java.lang.invoke.MethodHandle.TRACE_INTERPRETER" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x2806628cd00 } key="java.lang.invoke.MethodHandle.TRACE_METHOD_LINKAGE" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x2806628cd00 } key="java.lang.invoke.MethodHandle.TRACE_RESOLVE" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="java.home" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.home" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.dir" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.name" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="java.io.tmpdir" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="java.library.path" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="sun.boot.library.path" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="jdk.serialFilter" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="jdk.serialFilterFactory" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="native.encoding" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="file.encoding" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="java.properties.date" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="sun.jnu.encoding" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="java.locale.useOldISOCodes" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="os.name" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="os.arch" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="os.version" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.language" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.language.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.language.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.region" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.script" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.country" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.variant" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.script.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.script.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.country.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.country.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.variant.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.variant.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.extensions" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.extensions.display" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x280662922f8 } key="user.extensions.format" -> sidetable MISS, falling back to system
+[PROPS-GET] this=ObjectRef { ptr: 0x28066296ab8 } key="user.timezone" -> sidetable MISS, falling back to system
+[GOD-DBG] getOrDefault native IS running
+Failed to instantiate [ch.qos.logback.classic.LoggerContext]
+Reported exception:
+[2m2026-05-09T13:35:31.041429Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m <clinit> failed вЂ” wrapping in ExceptionInInitializerError [3mclass[0m[2m=[0morg/springframework/boot/SpringApplication [3mcause[0m[2m=[0mjava/lang/NullPointerException Cannot invoke lock on null
+Exception in thread "main" java/lang/reflect/InvocationTargetException
+Caused by: java/lang/ExceptionInInitializerError
+	at org/springframework/boot/loader/MainMethodRunner.run(MainMethodRunner.java:49)
+	at com/digsol/eurekaserver/EurekaServerApplication.main(EurekaServerApplication.java:12)
+Caused by: java/lang/NullPointerException: Cannot invoke lock on null
+	at org/springframework/boot/loader/MainMethodRunner.run(MainMethodRunner.java:49)
+	at com/digsol/eurekaserver/EurekaServerApplication.main(EurekaServerApplication.java:12)
+	at org/springframework/boot/SpringApplication.<clinit>(SpringApplication.java:178)
+	at org/apache/commons/logging/LogAdapter$Slf4jAdapter.createLocationAwareLog(LogAdapter.java:130)
+	at org/slf4j/LoggerFactory.getLogger(LoggerFactory.java:362)
+	at org/slf4j/LoggerFactory.getILoggerFactory(LoggerFactory.java:417)
+	at org/slf4j/LoggerFactory.performInitialization(LoggerFactory.java:124)
+	at org/slf4j/LoggerFactory.bind(LoggerFactory.java:177)
+	at org/slf4j/LoggerFactory.postBindCleanUp(LoggerFactory.java:183)
+	at org/slf4j/LoggerFactory.replayEvents(LoggerFactory.java:211)
+	at java/util/concurrent/LinkedBlockingQueue.drainTo(LinkedBlockingQueue.java:706)

@@ -486,23 +486,38 @@ fn native_introspector_get_methods(
 /// Allocate a `java.lang.reflect.Method` mirror with the JDK-25 field
 /// layout used by `lang_class::native_method_get_*` accessors:
 /// `clazz`, `name`, `parameterTypes`, `returnType`, `modifiers`.
-fn build_method_mirror(
+pub(crate) fn build_method_mirror(
     ctx: &mut dyn NativeContext,
     declaring_class_mirror: ObjectRef,
     name: &str,
     descriptor: &str,
     modifiers: u16,
 ) -> ObjectRef {
+    // SPB.11: Delegate to the canonical `create_method_object` so that the
+    // RustJVM extra metadata slots (raw descriptor, parameter count,
+    // accessible flag) are populated. Without those, `Method.invoke`
+    // reads `param_descs.len() == 0` from a missing descriptor and throws
+    // "wrong number of arguments". `create_method_object` also populates
+    // `exceptionTypes`, annotation byte arrays, and other JDK-named
+    // fields the reflective code relies on.
+    if let Some(declaring_class_id) = crate::lang_class::mirror_class_id(ctx, declaring_class_mirror) {
+        let meta = rustjvm_native_api::registry::MethodMetadata {
+            name: name.to_string(),
+            descriptor: descriptor.to_string(),
+            access_flags: modifiers,
+            declaring_class_id,
+            exceptions: Vec::new(),
+        };
+        return crate::lang_class::create_method_object(ctx, &meta);
+    }
+    // Fallback when we can't resolve the declaring class id — fill in only
+    // the JDK-named fields we can. Method.invoke will still error, but the
+    // mirror is at least non-null for `getName`/`getParameterCount`.
     let method_obj = alloc_concurrent_synthetic(ctx, "java/lang/reflect/Method", 12);
     ctx.set_field_by_name(method_obj, "clazz", Value::Object(Some(declaring_class_mirror)));
     let name_str = ctx.create_string(name);
     ctx.set_field_by_name(method_obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(method_obj, "modifiers", Value::Int(modifiers as i32));
-
-    // Parse the descriptor into return + parameter types. We don't have
-    // the upstream `descriptor::parse` helper exposed here, so we do a
-    // minimal walk: descriptors are "(Tparam...)Treturn" where each T
-    // is `B`, `C`, `D`, `F`, `I`, `J`, `S`, `Z`, `V`, `[T`, or `Lname;`.
     let (params, ret) = parse_method_descriptor(descriptor);
     let param_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), params.len());
     for (i, p) in params.iter().enumerate() {
@@ -586,6 +601,21 @@ fn read_one_descriptor(bytes: &[u8], start: usize) -> Option<(String, usize)> {
 
 /// Convert a single descriptor token (e.g. `"I"`, `"Ljava/lang/String;"`,
 /// `"[I"`) to the corresponding `java.lang.Class` mirror.
+/// Public re-export wrapper for `parse_method_descriptor` so callers in
+/// other modules (notably the `java.beans.Introspector` native) can reuse
+/// the descriptor parser without duplicating it.
+pub(crate) fn parse_method_descriptor_pub(d: &str) -> (Vec<String>, String) {
+    parse_method_descriptor(d)
+}
+
+/// Public re-export wrapper for `type_descriptor_to_class_mirror`.
+pub(crate) fn type_descriptor_to_class_mirror_pub(
+    ctx: &mut dyn NativeContext,
+    desc: &str,
+) -> ObjectRef {
+    type_descriptor_to_class_mirror(ctx, desc)
+}
+
 fn type_descriptor_to_class_mirror(
     ctx: &mut dyn NativeContext,
     desc: &str,

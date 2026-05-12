@@ -8,6 +8,8 @@ target/
 .vscode/
 *.iml
 apps/
+.smoke-cache/
+
 
 # NOTE: .class files in test_classes/ and demo/ are intentional test fixtures
 # and should remain checked in. Do not add a blanket *.class ignore.

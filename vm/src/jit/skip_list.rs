@@ -791,6 +791,39 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+        // SPB.9d (Session 117) — eureka-server boot SEGFAULTs deep in
+        // Spring's BeanInfo/ExtendedBeanInfo introspection. Spring
+        // introspects every bean class via `java/beans/Introspector`,
+        // which delegates into `com/sun/beans/introspect/MethodInfo`
+        // and `ClassInfo` and sorts methods/properties via
+        // comparators. Frame trace + RUSTJVM_DBG_JIT_DISPATCH=1 show
+        // the very last hot JIT-compiled callees on the crash path are
+        // `MethodInfo$MethodOrder.compare`, `String.compareTo`,
+        // `Method.getName`, `Arrays.hashCode`, `Method.toString`,
+        // and `StringJoiner.<init>` — i.e. a JIT-compiled comparator
+        // chain driven by `java/util/Arrays.sort`. With JIT disabled
+        // the run terminates cleanly with the parallel agent's
+        // `Attribute 'type' not found` (rc=1, no segfault); with JIT
+        // enabled the comparator returns inconsistent ordering,
+        // corrupting transient sort state and SEGFAULTing in a
+        // downstream `Method.toString` -> `StringJoiner` allocation.
+        // Same allocate-then-putfield archetype as NEW-1.3 / SPB.1.
+        //
+        // Blanket-ban the JDK BeanInfo introspection package and the
+        // `java/beans/` reflection-driven sort callers. Liftable via
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=com/sun/beans/,java/beans/`
+        // when the underlying allocate-then-putfield miscompile is
+        // root-caused.
+        if class_name.starts_with("com/sun/beans/")
+            && !package_allowed("com/sun/beans/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("java/beans/")
+            && !package_allowed("java/beans/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if class_name.starts_with("org/springframework/beans/factory/")
             && !class_name.starts_with("org/springframework/beans/factory/support/")
             && !package_allowed("org/springframework/beans/factory/", allow_packages)
@@ -1081,6 +1114,39 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/HashSet", "iterator")
         | ("java/util/AbstractCollection", "addAll")
         | ("java/util/AbstractCollection", "toArray")
+        // SPB.9d (Session 117) — eureka-server JIT-mode SEGFAULTs deep
+        // inside `org/springframework/core/annotation/*` annotation
+        // processing during BeanInfo introspection. Spring's
+        // `ExtendedBeanInfo` introspects bean properties for every bean
+        // class via `java/beans/Introspector`, which sorts methods using
+        // `com/sun/beans/introspect/MethodInfo$MethodOrder.compare` and
+        // sorts properties using
+        // `org/springframework/beans/ExtendedBeanInfo$PropertyDescriptorComparator.compare`.
+        // RUSTJVM_DBG_JIT_DISPATCH=1 (run 117a) shows the hot JIT-callees
+        // before the segfault are: `MethodInfo$MethodOrder.compare` (149x),
+        // `PropertyDescriptorComparator.compare` (17x),
+        // `Method.getName()` (360x), `String.compareTo(String)` (167x),
+        // and `StringJoiner.<init>(LCS;LCS;LCS;)V` (24x), all called
+        // from a JIT-compiled sort comparator chain. With
+        // `RUSTJVM_DISABLE_JIT=1` the run terminates earlier with the
+        // parallel agent's `IllegalArgumentException: Attribute 'type'
+        // not found` (rc=1, no segfault); with JIT enabled the
+        // miscompiled comparator returns inconsistent ordering, causing
+        // `Arrays.sort` to corrupt the comparator's transient state and
+        // SEGFAULT during a subsequent allocate-then-putfield sequence
+        // (`StringJoiner.<init>` / `Method.toString`). Same archetype as
+        // NEW-1.3 / SPB.1.
+        //
+        // Conservative skip: ban the two comparator entry points plus
+        // `StringJoiner.<init>` (the immediate downstream alloc that
+        // exhibits the bad pointer). Liftable via
+        // `RUSTJVM_JIT_ALLOW_PACKAGES=java/util/,com/sun/beans/`.
+        | ("java/util/StringJoiner", "<init>")
+        | ("com/sun/beans/introspect/MethodInfo$MethodOrder", "compare")
+        | (
+            "org/springframework/beans/ExtendedBeanInfo$PropertyDescriptorComparator",
+            "compare",
+        )
         | ("org/springframework/util/StringUtils", "toStringArray")
         | ("org/springframework/core/env/MapPropertySource", "getPropertyNames")
         | ("org/springframework/core/env/MapPropertySource", "getProperty")
@@ -1297,6 +1363,31 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/ImmutableCollections$MapN", "probe")
         | ("java/util/ImmutableCollections$SetN", "contains")
         | ("java/util/ImmutableCollections$SetN", "probe")
+        // SPB.5 (Insurance-backend, Spring Boot 3.2.0) — JIT_DISPATCH trace
+        // shows the segfault occurs inside the JIT-compiled
+        // `Objects.hash(Object[])` / `Arrays.hashCode(Object[])` /
+        // `ArraysSupport.hashCode(Object[],int,int,int)` chain. The first
+        // call returns correctly (1625377124), then on the 5th invocation
+        // the run STATUS_ACCESS_VIOLATIONs without a matching
+        // `JIT_DISPATCH_RET`. The `[Ljava/lang/Object;III)I` overload of
+        // `ArraysSupport.hashCode` is a virtual-dispatch hot loop: it
+        // iterates the input Object[] and for each element calls
+        // `Objects.hashCode(o)` -> `Object.hashCode()`, which is the
+        // canonical pattern that miscompiles under the per-callee
+        // threshold (W2-CHM / RBC.1 archetype, but applied to a virtual
+        // dispatch site instead of an allocate-then-putfield). With
+        // `RUSTJVM_DISABLE_JIT=1` the bootstrap advances ~16 lines further
+        // and surfaces a clean Java-level
+        // `MissingWebServerFactoryBeanException` — proof the segfault is
+        // JIT-only. Skip-list the entire `Objects.hash` / `Arrays.hashCode`
+        // / `ArraysSupport.hashCode` cluster (Spring uses these heavily in
+        // `ConfigurationPropertyName.hashCode` and its bind-path keys).
+        // Other ArraysSupport intrinsic dispatchers (vectorizedHashCode is
+        // a native, not a Java method) are unaffected.
+        | ("jdk/internal/util/ArraysSupport", "hashCode")
+        | ("java/util/Arrays", "hashCode")
+        | ("java/util/Objects", "hash")
+        | ("java/util/Objects", "hashCode")
     )
 }
 

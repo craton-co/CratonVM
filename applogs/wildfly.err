@@ -1,0 +1,4 @@
+[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
+Exception in thread "main" java/lang/NullPointerException: Cannot invoke intValue on null
+	at org/jboss/modules/Main.main(Main.java:283)
+	at java/lang/Runtime$Version.feature(Runtime.java:1093)

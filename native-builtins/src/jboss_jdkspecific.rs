@@ -320,6 +320,38 @@ pub(crate) fn native_module_get_layer(
     Ok(Some(Value::Object(Some(layer))))
 }
 
+/// `ModuleLayer.modules()` — return an empty `HashSet<Module>`.
+///
+/// JDK bytecode for `ModuleLayer.modules()` dereferences an internal
+/// `nameToModule` field that our synthetic boot layer never populates,
+/// producing "Cannot invoke values on null". Spring 6/Boot 4's resource
+/// scanner tolerates an empty module set, so this is the safest answer
+/// in real-JDK mode where we don't model JPMS module graphs.
+pub(crate) fn native_module_layer_modules(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+    ctx.set_field(set, 0, Value::Object(None)); // backing array (empty)
+    ctx.set_field(set, 1, Value::Int(0));       // size
+    ctx.set_field(set, 2, Value::Int(16));      // capacity marker
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// `ModuleLayer.configuration()` — return a synthetic `Configuration`.
+///
+/// Spring's `findAllModulePathResources` enumerates modules via
+/// `boot().configuration().modules()`. We don't model JPMS configurations,
+/// so a synthetic one-field `Configuration` is enough — its `modules()`
+/// override returns an empty Set.
+pub(crate) fn native_module_layer_configuration(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 1);
+    Ok(Some(Value::Object(Some(cfg))))
+}
+
 /// Install every JDKSpecific boot-path native this module owns.
 pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     let ml = "java/lang/ModuleLayer";
@@ -333,6 +365,33 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "findModule",
         "(Ljava/lang/String;)Ljava/util/Optional;",
         native_module_layer_find_module,
+    );
+    // Spring's `PathMatchingResourcePatternResolver.findAllModulePathResources`
+    // calls `ModuleLayer.boot().modules()` to enumerate JPMS modules. The JDK
+    // bytecode for `ModuleLayer.modules()` reads `this.nameToModule.values()`,
+    // which NPEs on our synthetic boot layer because we never populate that
+    // field. Return an empty HashSet: Spring tolerates an empty module set
+    // (classpath-jar resources still resolve through other code paths).
+    registry.register(ml, "modules", "()Ljava/util/Set;", native_module_layer_modules);
+    // Spring 6/Boot 4's modulepath scanner actually invokes
+    // `ModuleLayer.boot().configuration().modules()` (a `Set<ResolvedModule>`).
+    // The JDK bytecode for `ModuleLayer.configuration()` reads `this.cf`,
+    // which is null on our synthetic layer — surfacing as the visible
+    // "Cannot invoke modules on null" NPE. Return an empty synthetic
+    // `Configuration` whose `modules()` is overridden below.
+    registry.register(
+        ml,
+        "configuration",
+        "()Ljava/lang/module/Configuration;",
+        native_module_layer_configuration,
+    );
+
+    // java.lang.module.Configuration.modules() — return an empty Set<ResolvedModule>.
+    registry.register(
+        "java/lang/module/Configuration",
+        "modules",
+        "()Ljava/util/Set;",
+        native_module_layer_modules,
     );
 
     let m = "java/lang/Module";
@@ -356,6 +415,80 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     registry.register(m, "getClassLoader", "()Ljava/lang/ClassLoader;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
+
+    // ── Round 63: WildFly `WildFlySecurityManager` <clinit> NPE ────────────
+    //
+    // `org.wildfly.security.manager._private.JDKSpecific.getCallerClass(int n)`
+    // is the per-JDK shim WildFly uses to find the call-site that triggered
+    // a permission check. Its real-JDK body is roughly:
+    //
+    //   static Class<?> getCallerClass(int n) {
+    //       return getStackWalker()
+    //           .walk(s -> s.skip(n).findFirst())
+    //           .get()
+    //           .getDeclaringClass();
+    //   }
+    //
+    // Two CratonVM-side weaknesses combine to produce
+    // `NullPointerException: Cannot invoke getDeclaringClass on null`:
+    //   1. Our synthetic StackWalker stream sometimes hands back an empty
+    //      Optional when `skip(n)` overshoots the available frames.
+    //   2. The downstream `Optional.get()` on the synthetic Optional then
+    //      yields null rather than NoSuchElementException.
+    //
+    // WildFlySecurityManager's `<clinit>` block calls `getCallerClass(2)` to
+    // seed a class reference — the result is only used to allow/deny the
+    // *initial* security-domain context. A spec-safe fallback is to return
+    // the @CallerSensitive caller class via our existing stack-trace
+    // capture, falling back to `java.lang.Object` (the JDK universally-
+    // permitted base) when no Java frame is available.
+    //
+    // The same shim ships in `org.jboss.modules.JDKSpecific` (JBoss
+    // Modules' own copy with the identical signature) — register both so
+    // future loader paths don't trip on the same null deref.
+    fn native_jdkspecific_get_caller_class(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let depth = match args.first() {
+            Some(Value::Int(d)) => *d as i64,
+            _ => 0,
+        };
+        let frames = ctx.capture_stack_trace(0);
+        // Frames are bottom-up (main at [0], innermost top at [len-1]).
+        // The native frame itself isn't recorded, so frames[len-1] is the
+        // @CallerSensitive method that invoked us. WildFly's `n` counts
+        // outward from that point: n=0 → its own frame, n=1 → its caller.
+        let target = if !frames.is_empty() {
+            let len = frames.len() as i64;
+            let idx = (len - 1 - depth).max(0) as usize;
+            frames.get(idx).cloned()
+        } else {
+            None
+        };
+        let class_name = target
+            .map(|f| f.class_name.replace('.', "/"))
+            .unwrap_or_else(|| "java/lang/Object".to_string());
+        let cid = ctx
+            .ensure_class_initialized(&class_name)
+            .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))
+            .unwrap_or(rustjvm_types::ClassId::new(0));
+        let mirror = ctx.get_class_mirror(cid);
+        Ok(Some(Value::Object(Some(mirror))))
+    }
+
+    registry.register(
+        "org/wildfly/security/manager/_private/JDKSpecific",
+        "getCallerClass",
+        "(I)Ljava/lang/Class;",
+        native_jdkspecific_get_caller_class,
+    );
+    registry.register(
+        "org/jboss/modules/JDKSpecific",
+        "getCallerClass",
+        "(I)Ljava/lang/Class;",
+        native_jdkspecific_get_caller_class,
+    );
 }
 
 #[cfg(test)]

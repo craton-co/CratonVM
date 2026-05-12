@@ -8,30 +8,45 @@ use crate::obj_arg;
 
 /// Helper: write Throwable.detailMessage on a Throwable subclass.
 ///
-/// In real-JDK Throwable, detailMessage is at slot 1 (after backtrace at
-/// slot 0). In our synthetic-stub layout, it's at slot 0 (the stubs use
-/// unnamed `_f0`, `_f1`). Use `set_field_by_name` to honour the real-JDK
-/// layout when present, then mirror to slot 0 so synthetic-stub code paths
-/// (which read slot 0 directly) still observe the message.
+/// Real-JDK Throwable layout: slot 0 = `backtrace` (an internal Object
+/// reference), slot 1 = `detailMessage`, slot 2 = `cause`. Resolve by
+/// name so we always hit `detailMessage` regardless of declared subclass
+/// fields. The previous implementation also mirrored to slot 0 to support
+/// a now-removed synthetic-stub layout — that mirror clobbered
+/// Throwable.backtrace with a String reference and corrupted any
+/// downstream consumer that read backtrace as an Object[].
 fn write_throwable_detail_message(ctx: &mut dyn NativeContext, this: ObjectRef, msg: Value) {
     ctx.set_field_by_name(this, "detailMessage", msg);
-    ctx.set_field(this, 0, msg);
 }
 
 /// Helper: write Throwable.cause on a Throwable subclass.
 ///
-/// Mirrors `write_throwable_detail_message`: by-name first (real-JDK slot
-/// is `cause` at slot 2 after backtrace+detailMessage), then slot 1 to
-/// keep the synthetic-stub layout in sync.
+/// Real-JDK Throwable layout: `cause` is at slot 2. Resolve by name. The
+/// previous implementation also mirrored to slot 1 (the synthetic-stub
+/// cause slot), but slot 1 in the real-JDK layout is `detailMessage` —
+/// the mirror clobbered the message field whenever both helpers ran
+/// (e.g. via `<init>(String, Throwable)`).
 fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
     ctx.set_field_by_name(this, "cause", cause);
-    ctx.set_field(this, 1, cause);
 }
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
+///
+/// JDK semantics: `Throwable.cause` is declared `private Throwable cause = this;`
+/// — a self-reference sentinel meaning "no cause set yet". A later
+/// `initCause(c)` checks `cause != this` and throws `IllegalStateException`
+/// ("Can't overwrite cause") otherwise. Because we shadow the JDK
+/// `Throwable.<init>` with this native, we must mirror the field
+/// initializer ourselves; without it, the sentinel stays null and the
+/// real-JDK `initCause` bytecode (which still runs because we don't
+/// shadow it on every dispatch path) treats the field as already-set.
 pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let (Some(Value::Object(Some(this))), Some(msg)) = (args.first(), args.get(1)) {
-        write_throwable_detail_message(ctx, *this, *msg);
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Some(msg) = args.get(1) {
+            write_throwable_detail_message(ctx, *this, *msg);
+        }
+        // Initialize cause to self-sentinel so a later initCause() succeeds.
+        write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
     }
     Ok(None)
 }
@@ -53,6 +68,15 @@ pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &
 pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(cause)) = (args.first(), args.get(1)) {
         write_throwable_cause(ctx, *this, *cause);
+    }
+    Ok(None)
+}
+
+/// Exception <init>()V — no message, no cause. Mirrors the JDK
+/// `cause = this` sentinel so later `initCause()` calls succeed.
+pub(crate) fn native_exc_init_noargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
     }
     Ok(None)
 }
@@ -245,14 +269,15 @@ pub(crate) fn native_throwable_get_cause(ctx: &mut dyn NativeContext, args: &[Va
         }
         return Ok(Some(by_name_target));
     }
-    // Synthetic-stub fallback: layout has no named `cause` but reserves
-    // slot 1 for the cause reference.
-    let slot1 = ctx.get_field(this, 1);
-    match slot1 {
-        Value::Object(Some(obj)) if obj == this => Ok(Some(Value::Object(None))),
-        Value::Object(obj_opt) => Ok(Some(Value::Object(obj_opt))),
-        _ => Ok(Some(Value::Object(None))),
-    }
+    // Real-JDK only: when neither `cause` nor `target` named fields hold a
+    // value, the cause is genuinely null. The previous synthetic-stub
+    // fallback that read `slot 1` was wrong here — slot 1 of a real-JDK
+    // Throwable layout is `detailMessage` (a String), so the fallback
+    // returned the message text as the cause and Spring Boot's
+    // `getExitCodeFromExitCodeGeneratorException` recursion then dispatched
+    // `Throwable.getCause()` on a String, surfacing as
+    // `NoSuchMethodError: java/lang/String.getCause()Ljava/lang/Throwable;`.
+    Ok(Some(Value::Object(None)))
 }
 
 /// initCause(Throwable) — set the cause field, return this.
@@ -302,7 +327,93 @@ pub(crate) fn native_throwable_to_string(ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-/// printStackTrace() — print class name + message to output
+/// Build "ClassName: message" or just "ClassName" for a throwable, reading
+/// the real-JDK `detailMessage` field by name with a slot-0 fallback for
+/// synthetic stubs.
+fn throwable_header_line(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
+    let class_id = ctx.class_id_of_object(t);
+    let class_name = ctx
+        .class_name_of_id(class_id)
+        .unwrap_or_else(|| "java/lang/Throwable".to_string())
+        .replace('/', ".");
+    let by_name = ctx.get_field_by_name(t, "detailMessage");
+    let detail = match by_name {
+        Value::Object(Some(_)) => by_name,
+        _ => ctx.get_field(t, 0),
+    };
+    match detail {
+        Value::Object(Some(sr)) => match ctx.read_string(sr) {
+            Some(m) => format!("{class_name}: {m}"),
+            None => class_name,
+        },
+        _ => class_name,
+    }
+}
+
+/// Read the cause field, returning None if missing or self-referential
+/// (the JDK `cause = this` "uninitialized" sentinel).
+fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRef> {
+    let by_name = ctx.get_field_by_name(t, "cause");
+    if let Value::Object(Some(c)) = by_name {
+        if c == t { return None; }
+        return Some(c);
+    }
+    None
+}
+
+/// Format the captured stack-trace frames for `t` as "\tat C.m(F:L)" lines.
+fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String> {
+    let hash = ctx.identity_hash_code(t);
+    let frames: Vec<(String, String, Option<String>, i32)> = ctx
+        .get_stack_trace(hash)
+        .map(|tr| {
+            tr.iter()
+                .map(|e| {
+                    (
+                        e.class_name.replace('/', "."),
+                        e.method_name.to_string(),
+                        e.source_file.as_ref().map(|f| f.to_string()),
+                        e.line_number,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    frames
+        .into_iter()
+        .map(|(cls, meth, file, line)| {
+            let loc = match (file.as_deref(), line) {
+                (Some(f), n) if n > 0 => format!("{f}:{n}"),
+                (Some(f), _) => f.to_string(),
+                (None, n) if n > 0 => format!("Unknown Source:{n}"),
+                _ => "Unknown Source".to_string(),
+            };
+            format!("\tat {cls}.{meth}({loc})")
+        })
+        .collect()
+}
+
+/// Emit a single line: record it for in-VM consumers and write it to the
+/// host process's stderr fd (2) so `printStackTrace` actually shows up
+/// when the JVM runs an embedded program. The record_printed_line call
+/// keeps existing tests that scan `thread.printed_lines` working.
+fn emit_stack_line(ctx: &mut dyn NativeContext, line: String) {
+    ctx.record_printed_line(line.clone());
+    let sep = ctx
+        .get_system_property("line.separator")
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n".to_string() } else { "\n".to_string() });
+    let _ = ctx.fd_table().write_string(2, &line);
+    let _ = ctx.fd_table().write_string(2, &sep);
+}
+
+/// printStackTrace() / printStackTrace(PrintStream) / printStackTrace(PrintWriter).
+///
+/// Walks the full cause chain (with a cycle guard) and prints each
+/// throwable's "ClassName: message" header followed by its captured
+/// stack frames as "\tat ..." lines. Output goes both to the recorded-
+/// line buffer (so tests scanning `thread.printed_lines` keep working)
+/// and to the host process's stderr fd so users actually see the trace
+/// when WildFly / Keycloak / etc. dump exceptions during boot.
 pub(crate) fn native_throwable_print_stack_trace(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -312,51 +423,31 @@ pub(crate) fn native_throwable_print_stack_trace(
         _ => return Ok(None),
     };
 
-    // Get the class name
-    let class_id = ctx.class_id_of_object(this);
-    let class_name = ctx
-        .class_name_of_id(class_id)
-        .unwrap_or_else(|| "java/lang/Throwable".to_string())
-        .replace('/', ".");
+    // Header for the top-level throwable.
+    let header = throwable_header_line(ctx, this);
+    emit_stack_line(ctx, header);
+    for f in throwable_frame_lines(ctx, this) {
+        emit_stack_line(ctx, f);
+    }
 
-    // Get the message (field 0)
-    let detail = ctx.get_field(this, 0);
-    let header = match detail {
-        Value::Object(Some(str_ref)) => {
-            if let Some(msg) = ctx.read_string(str_ref) {
-                format!("{class_name}: {msg}")
-            } else {
-                class_name
-            }
+    // Walk the cause chain with a cycle guard. Limit depth defensively
+    // to avoid pathological loops if `cause` was somehow self-referential
+    // through a non-equality identity.
+    let mut seen: Vec<ObjectRef> = vec![this];
+    let mut current = throwable_cause(ctx, this);
+    let mut depth = 0;
+    while let Some(c) = current {
+        depth += 1;
+        if depth > 32 || seen.iter().any(|s| *s == c) {
+            break;
         }
-        _ => class_name,
-    };
-
-    ctx.record_printed_line(header);
-
-    // Print cause chain
-    let cause = ctx.get_field(this, 1);
-    if let Value::Object(Some(cause_ref)) = cause {
-        // Avoid self-referential cause
-        if !std::ptr::eq(cause_ref.as_ptr(), this.as_ptr()) {
-            let cause_class_id = ctx.class_id_of_object(cause_ref);
-            let cause_class_name = ctx
-                .class_name_of_id(cause_class_id)
-                .unwrap_or_else(|| "?".to_string())
-                .replace('/', ".");
-            let cause_detail = ctx.get_field(cause_ref, 0);
-            let cause_line = match cause_detail {
-                Value::Object(Some(sr)) => {
-                    if let Some(m) = ctx.read_string(sr) {
-                        format!("Caused by: {cause_class_name}: {m}")
-                    } else {
-                        format!("Caused by: {cause_class_name}")
-                    }
-                }
-                _ => format!("Caused by: {cause_class_name}"),
-            };
-            ctx.record_printed_line(cause_line);
+        seen.push(c);
+        let inner = throwable_header_line(ctx, c);
+        emit_stack_line(ctx, format!("Caused by: {inner}"));
+        for f in throwable_frame_lines(ctx, c) {
+            emit_stack_line(ctx, f);
         }
+        current = throwable_cause(ctx, c);
     }
 
     Ok(None)

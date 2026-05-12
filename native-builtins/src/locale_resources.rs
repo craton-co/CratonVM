@@ -496,8 +496,18 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         rb_handle_get_object,
     );
     registry.register(rb, "containsKey", "(Ljava/lang/String;)Z", rb_contains_key);
-    registry.register(rb, "getLocale", "()Ljava/util/Locale;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // Per JLS / java.util.ResourceBundle Javadoc: getLocale() must NEVER
+    // return null on a successfully loaded bundle. Stock JDK returns the
+    // bundle's locale (or Locale.ROOT for a base bundle). Returning null
+    // here causes Tomcat's StringManager.<init> to NPE on
+    // `bundle.getLocale().equals(Locale.ROOT)`, which converts to
+    // ExceptionInInitializerError on Tomcat.<clinit>. That in turn makes
+    // Spring's `OnClassCondition` evaluate `@ConditionalOnClass(Tomcat.class)`
+    // to false, and `ServletWebServerFactoryConfiguration$EmbeddedTomcat`
+    // never registers a ServletWebServerFactory bean →
+    // MissingWebServerFactoryBeanException at app startup.
+    registry.register(rb, "getLocale", "()Ljava/util/Locale;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
     });
     registry.register(rb, "getBaseBundleName", "()Ljava/lang/String;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
@@ -590,6 +600,14 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let locale = args.get(1).copied().unwrap_or(Value::Object(None));
+            // Persist the `locale` field on the DFS instance so that the
+            // public setCurrencySymbol/setInternationalCurrencySymbol setters
+            // — which re-enter the JDK's `initializeCurrency(this.locale)` —
+            // do not NPE on `locale.getCountry()`. Also pre-set
+            // `currencyInitialized=true` to short-circuit the JDK's
+            // re-entrant currency initialization (Kafka 4.2.0 boot path).
+            ctx.set_field_by_name(this, "locale", locale);
+            ctx.set_field_by_name(this, "currencyInitialized", Value::Int(1));
             // Set every public char/string field via the corresponding
             // setter so we don't depend on instance-field layout.
             let _ = ctx.invoke_virtual(this, "setDecimalSeparator", "(C)V", &[Value::Int('.' as i32)]);
@@ -619,7 +637,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // DFS.getLocale() returning whatever was set during
             // serialization (or null).  Jackson / SimpleDateFormat
             // never read DFS.getLocale() during their bootstrap.
-            let _ = locale; // suppress unused warning
             Ok(None)
         },
     );

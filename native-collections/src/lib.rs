@@ -65,6 +65,14 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_concurrent_hashmap_natives(registry);
     register_properties_natives(registry);
     register_collections_extras_natives(registry);
+    // BlockingQueue family (LinkedBlockingQueue, ArrayBlockingQueue,
+    // ConcurrentLinkedQueue, ConcurrentLinkedDeque) is overridden with a
+    // synthetic 4-field layout (head/tail/size/capacity) that conflicts with
+    // the real JDK's field layout (head/last/count/putLock/takeLock/notEmpty/
+    // notFull/capacity for LBQ).  In real-JDK mode the synthetic <init> never
+    // assigns putLock/takeLock, so later real bytecode (e.g. drainTo line 706
+    // in JDK 25) NPEs on `takeLock.lock()`.  Gate behind synthetic-jdk only.
+    #[cfg(feature = "synthetic-jdk")]
     register_blocking_queue_natives(registry);
     register_iterator_protocol_natives(registry);
     // ScheduledThreadPoolExecutor.schedule is implemented in
@@ -234,7 +242,10 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
 }
 
 // ===========================================================================
-// ArrayList — Object layout: field 0 = Object[] elementData, field 1 = Int size
+// ArrayList — synthetic-jdk layout: field 0 = Object[] elementData, field 1 = Int size
+// Real-JDK layout: AbstractList.modCount(I) at slot 0, ArrayList.elementData at slot 1,
+// ArrayList.size at slot 2. We resolve the real layout via field-index lookup and fall
+// back to the synthetic layout when the real class is unavailable.
 // ===========================================================================
 
 const AL_FIELD_DATA: usize = 0;
@@ -242,17 +253,63 @@ const AL_FIELD_SIZE: usize = 1;
 const AL_NUM_FIELDS: usize = 2;
 const AL_DEFAULT_CAPACITY: usize = 10;
 
+/// Resolve ArrayList field slots: returns (data_slot, size_slot, n_fields).
+/// In real-JDK mode this follows the actual `elementData` / `size` field
+/// indices (with `modCount` from `AbstractList` taking slot 0); in
+/// synthetic-jdk mode it falls back to (0, 1, 2). The result is cheap to
+/// compute (the underlying resolver caches by class), so we recompute it on
+/// each access rather than caching globally.
+#[inline]
+fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
+    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData");
+    let size = ctx.resolve_field_index("java/util/ArrayList", "size");
+    match (data, size) {
+        (Some(d), Some(s)) => {
+            let n = std::cmp::max(d, s) + 1;
+            (d, s, n)
+        }
+        _ => (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS),
+    }
+}
+
+/// Allocate an ArrayList instance, sized to fit whichever field layout the
+/// runtime is using. Initializes elementData and size to (buf, init_size).
+fn alloc_arraylist_with(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    init_size: i32,
+) -> ObjectRef {
+    let (data_slot, size_slot, n_fields) = al_slots(ctx);
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", n_fields);
+    ctx.set_field(list, data_slot, Value::Object(Some(buf)));
+    ctx.set_field(list, size_slot, Value::Int(init_size));
+    list
+}
+
 /// Extract ArrayList state: (elementData, size).
 fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32) {
-    let data = match ctx.get_field(this, AL_FIELD_DATA) {
+    let (data_slot, size_slot, _) = al_slots(ctx);
+    let data = match ctx.get_field(this, data_slot) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
         _ => None,
     };
-    let size = match ctx.get_field(this, AL_FIELD_SIZE) {
+    let size = match ctx.get_field(this, size_slot) {
         Value::Int(s) => s,
         _ => 0,
     };
     (data, size)
+}
+
+#[inline]
+fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
+    let (data_slot, _, _) = al_slots(ctx);
+    ctx.set_field(this, data_slot, Value::Object(Some(buf)));
+}
+
+#[inline]
+fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
+    let (_, size_slot, _) = al_slots(ctx);
+    ctx.set_field(this, size_slot, Value::Int(size));
 }
 
 /// Ensure the backing array has room for at least `min_cap` elements.
@@ -284,7 +341,7 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
         }
     }
 
-    ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
+    al_set_data(ctx, this, new_buf);
     new_buf
 }
 
@@ -390,8 +447,8 @@ pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-    ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    al_set_data(ctx, this, buf);
+    al_set_size(ctx, this, 0);
     Ok(None)
 }
 
@@ -406,8 +463,8 @@ fn native_al_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => AL_DEFAULT_CAPACITY,
     };
     let buf = alloc_ref_array(ctx, cap);
-    ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    al_set_data(ctx, this, buf);
+    al_set_size(ctx, this, 0);
     Ok(None)
 }
 
@@ -483,7 +540,7 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let size = size as usize;
     let buf = al_ensure_capacity(ctx, this, size + 1);
     ctx.set_array_element(buf, size, elem);
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size + 1) as i32));
+    al_set_size(ctx, this, (size + 1) as i32);
     Ok(Some(Value::Int(1))) // returns true
 }
 
@@ -509,7 +566,7 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         ctx.set_array_element(buf, i + 1, val);
     }
     ctx.set_array_element(buf, index, elem);
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size + 1) as i32));
+    al_set_size(ctx, this, (size + 1) as i32);
     Ok(None)
 }
 
@@ -539,7 +596,7 @@ pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     // Null out the last element
     ctx.set_array_element(data, size - 1, Value::Object(None));
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size - 1) as i32));
+    al_set_size(ctx, this, (size - 1) as i32);
     Ok(Some(old))
 }
 
@@ -564,7 +621,7 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 ctx.set_array_element(data, j - 1, val);
             }
             ctx.set_array_element(data, size - 1, Value::Object(None));
-            ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size - 1) as i32));
+            al_set_size(ctx, this, (size - 1) as i32);
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -582,7 +639,7 @@ pub fn native_al_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             ctx.set_array_element(d, i, Value::Object(None));
         }
     }
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    al_set_size(ctx, this, 0);
     Ok(None)
 }
 
@@ -719,10 +776,13 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Create ArrayList$Itr: field 0 = list, field 1 = cursor
-    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", AL_ITR_NUM_FIELDS);
-    ctx.set_field(itr, AL_ITR_FIELD_LIST, Value::Object(Some(this)));
-    ctx.set_field(itr, AL_ITR_FIELD_CURSOR, Value::Int(0));
+    // Create ArrayList$Itr. Real-JDK has fields: cursor, lastRet,
+    // expectedModCount, this$0. Use field-name resolution so we write to
+    // the right slots regardless of layout.
+    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+    ctx.set_field(itr, list_slot, Value::Object(Some(this)));
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -755,7 +815,7 @@ fn native_al_trim_to_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 ctx.set_array_element(new_buf, i, val);
             }
         }
-        ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
+        al_set_data(ctx, this, new_buf);
     }
     Ok(None)
 }
@@ -805,11 +865,7 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let val = ctx.get_array_element(other_data, i);
         ctx.set_array_element(buf, my_size + i, val);
     }
-    ctx.set_field(
-        this,
-        AL_FIELD_SIZE,
-        Value::Int((my_size + other_size) as i32),
-    );
+    al_set_size(ctx, this, (my_size + other_size) as i32);
     Ok(Some(Value::Int(1)))
 }
 
@@ -828,7 +884,8 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let (data, _size) = al_state(ctx, this);
     let sub_size = to.saturating_sub(from);
-    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let new_buf = alloc_ref_array(ctx, std::cmp::max(sub_size, AL_DEFAULT_CAPACITY));
     if let Some(d) = data {
         for i in 0..sub_size {
@@ -836,8 +893,8 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             ctx.set_array_element(new_buf, i, val);
         }
     }
-    ctx.set_field(new_list, AL_FIELD_DATA, Value::Object(Some(new_buf)));
-    ctx.set_field(new_list, AL_FIELD_SIZE, Value::Int(sub_size as i32));
+    al_set_data(ctx, new_list, new_buf);
+    al_set_size(ctx, new_list, sub_size as i32);
     Ok(Some(Value::Object(Some(new_list))))
 }
 
@@ -917,14 +974,11 @@ const NODE_NUM_FIELDS: usize = 4;
 
 /// Extract HashMap state: (buckets, size, capacity).
 fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
-    let buckets = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
+    let buckets_slot0 = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => {
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
                 Some(arr)
             } else {
-                // Real-JDK map variants can expose non-table objects in slot 0
-                // during partial initialization / alternate layouts. Do not
-                // treat those as bucket arrays.
                 eprintln!(
                     "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
                     this, arr
@@ -934,14 +988,47 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         }
         _ => None,
     };
-    // S111r26: Size layout detection.
-    // Legacy layout: slot 1 = Int(size).
-    // Real JDK layout: slot 1 = Object(entrySet), slot 2 = Int(size).
-    let size = match ctx.get_field(this, MAP_FIELD_SIZE) {
-        Value::Int(s) => s,                             // legacy: slot 1 is Int
-        _ => match ctx.get_field(this, 2) {             // JDK: slot 2 is Int(size)
-            Value::Int(s) => s,
-            _ => 0,
+    // For JDK-constructed maps (e.g. AnnotationAttributes via Spring's
+    // `new AnnotationAttributes(annotationType, false)`), the absolute
+    // slot 0 is NOT necessarily the `table` field. Fall back to the
+    // JDK-resolved `table` slot when slot 0 doesn't yield a bucket array.
+    let buckets = buckets_slot0.or_else(|| {
+        let slot = ctx.resolve_field_index("java/util/HashMap", "table")?;
+        if slot == MAP_FIELD_BUCKETS || slot >= ctx.object_num_fields(this) {
+            return None;
+        }
+        match ctx.get_field(this, slot) {
+            Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
+            _ => None,
+        }
+    });
+    // S111r28: Read size from the JDK-resolved `size` field by name when the
+    // class metadata is available. The synthetic absolute-slot-1 fallback
+    // only fires for raw `alloc_object(ClassId::new(0), ...)` allocations
+    // that were never bound to the real `java/util/HashMap` class — those
+    // still use the legacy `slot 1 = Int(size)` convention.
+    //
+    // Why name-resolution: real-JDK HashMap inherits AbstractMap's
+    // `keySet`/`values` reference fields, so absolute slot 1 actually
+    // corresponds to the inherited `values` field (descriptor
+    // `Ljava/util/Collection;`). Writing `Int(0)` there triggers the
+    // descriptor-aware coercion path which rewrites `Int(0)` as
+    // `Object(None)` (see `coerce_field_value_by_descriptor`'s `b'L'` arm),
+    // so subsequent reads see `Object(None)` instead of `Int(0)` and we
+    // would fall through to slot 2 (`MAP_FIELD_CAPACITY`) and report the
+    // bucket count as the size.
+    let size_by_name = ctx
+        .resolve_field_index("java/util/HashMap", "size")
+        .filter(|&slot| slot < ctx.object_num_fields(this))
+        .map(|slot| ctx.get_field(this, slot));
+    let size = match size_by_name {
+        Some(Value::Int(s)) => s,
+        _ => match ctx.get_field(this, MAP_FIELD_SIZE) {
+            Value::Int(s) => s,                            // legacy: slot 1 is Int
+            _ => match ctx.get_field(this, 2) {            // ancient fallback
+                Value::Int(s) => s,
+                _ => 0,
+            },
         },
     };
     // S111r26: Use bucket array length as the true capacity.  When
@@ -962,8 +1049,40 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     (buckets, size, cap)
 }
 
+/// S111r28: Write the HashMap `size` field to BOTH the legacy synthetic
+/// slot (absolute slot 1) and the JDK-resolved `size` slot when the class
+/// metadata is available. Reads through `map_state` prefer the name-resolved
+/// slot, which has descriptor `I` and is immune from the `b'L'` Int→Object
+/// coercion that mangles slot 1 (= `AbstractMap.values: Collection`).
+fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
+    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
+    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "size") {
+        if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Int(size));
+        }
+    }
+}
+
+/// S111r28 helper: best-effort write of a JDK-named HashMap field to the
+/// resolved slot, but only when the slot is within the allocated field
+/// count of `this`. Synthetic backing maps (e.g. inside HashSet) are
+/// allocated with `MAP_NUM_FIELDS = 3` regardless of the real-JDK class
+/// metadata, so naively writing to slot 4+ would land in undefined memory.
+fn try_set_jdk_map_field(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    value: Value,
+) {
+    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", field_name) {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, value);
+        }
+    }
+}
+
 /// Compute hash for a key.
-fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
+fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
     // Try to read as string for better distribution
     if let Some(s) = ctx.read_string(key) {
         let mut h: i32 = 0;
@@ -971,8 +1090,9 @@ fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
             h = h.wrapping_mul(31).wrapping_add(ch as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
-        h ^ (h >> 16)
-    } else if let Some(prim) = unbox_wrapper(ctx, key) {
+        return h ^ (h >> 16);
+    }
+    if let Some(prim) = unbox_wrapper(ctx, key) {
         // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
         let h = match prim {
             Value::Int(v) => v,
@@ -984,15 +1104,23 @@ fn map_hash_key(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
             }
             _ => ctx.identity_hash_code(key),
         };
-        h ^ (h >> 16)
-    } else {
-        let h = ctx.identity_hash_code(key);
-        h ^ (h >> 16)
+        return h ^ (h >> 16);
     }
+    // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
+    // MUST call their `hashCode()` so HashMap honours the equals/hashCode
+    // contract — otherwise `HashMap.get(equalKey) == null` for non-identical
+    // but equal keys (Spring's `AnnotationTypeMapping.aliasedBy` keyed by
+    // `java.lang.reflect.Method` is the canonical victim, surfacing as the
+    // `@AliasFor ... is not meta-present` chain on Spring Boot startup).
+    let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => ctx.identity_hash_code(key),
+    };
+    h ^ (h >> 16)
 }
 
 /// Check if two keys are equal.
-fn map_keys_equal(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
         return true;
     }
@@ -1012,7 +1140,18 @@ fn map_keys_equal(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
             _ => false,
         };
     }
-    false
+    // S111r-bug-fix (peaceful-sammet): fall back to the user-defined
+    // `equals(Object)` so HashMap honours the equals/hashCode contract for
+    // arbitrary key types. See `map_hash_key` for the matching contract
+    // commentary and the Spring `AnnotationTypeMapping.aliasedBy` symptom.
+    let res = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))]);
+    if std::env::var("RUSTJVM_HM_TRACE").is_ok() {
+        eprintln!("[HM-EQ] invoke_virtual(equals) -> {:?}", res);
+    }
+    match res {
+        Ok(Some(Value::Int(v))) => v != 0,
+        _ => false,
+    }
 }
 
 /// Get the bucket index for a given hash and capacity.
@@ -1021,7 +1160,24 @@ fn map_bucket_index(hash: i32, capacity: i32) -> usize {
     ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
 }
 
-/// Allocate a HashMap$Node entry.
+/// Allocate a HashMap$Node entry using the legacy synthetic layout
+/// (slot 0 = key, slot 1 = value, slot 2 = hash, slot 3 = next).
+///
+/// We deliberately allocate with `ClassId::new(0)` instead of binding the
+/// node to the real-JDK `java/util/HashMap$Node` class. The JDK declares
+/// fields in order `hash:I, key:Object, value:Object, next:HashMap$Node`,
+/// so binding to the real class causes descriptor-aware field coercion
+/// (see `coerce_field_value_by_descriptor`) to interpret slot 0 as `int`
+/// and rewrite our `Object(key)` write as `Int(<pointer-bits>)`. The
+/// downstream `get_node_key` layout-sniff then sees an `Int` in slot 0,
+/// concludes the node uses the JDK layout, and reads slot 1 as the key —
+/// but slot 1 was set to the sentinel `Int(1)` (for HashSet-backed maps),
+/// surfacing as `Iterator.next()` returning `Int(1)` and a downstream
+/// `checkcast Map.Entry` against an `Int`.
+///
+/// Matches `native_map_put`'s direct `alloc_object(ClassId::new(0), ...)`
+/// at the insert path; reads via `get_node_key`/`get_node_value` keep
+/// their layout-sniff for nodes produced by either site.
 fn map_alloc_node(
     ctx: &mut dyn NativeContext,
     key: ObjectRef,
@@ -1029,7 +1185,7 @@ fn map_alloc_node(
     hash: i32,
     next: Option<ObjectRef>,
 ) -> ObjectRef {
-    let node = alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS);
+    let node = ctx.alloc_object(rustjvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
     ctx.set_field(node, NODE_FIELD_VALUE, value);
     ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
@@ -1076,12 +1232,36 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     if let Some(old_b) = old_buckets {
         for i in 0..(old_cap as usize) {
             let mut node_val = ctx.get_array_element(old_b, i);
+            let mut steps: usize = 0;
             while let Value::Object(Some(node)) = node_val {
+                steps += 1;
+                if steps > 1_000_000 {
+                    eprintln!(
+                        "[HM-RESIZE-GUARD] aborting old-chain walk at {} nodes (suspected cycle); bucket={}",
+                        steps, i
+                    );
+                    break;
+                }
                 let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
                     Value::Int(h) => h,
                     _ => 0,
                 };
                 let next = ctx.get_field(node, NODE_FIELD_NEXT);
+                // Self-cycle guard before we splice into the new bucket
+                if let Value::Object(Some(nx)) = next {
+                    if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
+                        eprintln!(
+                            "[HM-RESIZE-GUARD] self-cycle in old bucket {} step {}",
+                            i, steps
+                        );
+                        // Truncate: splice node alone, do not continue
+                        let new_idx = map_bucket_index(key_hash, new_cap);
+                        let existing = ctx.get_array_element(new_buckets, new_idx);
+                        ctx.set_field(node, NODE_FIELD_NEXT, existing);
+                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+                        break;
+                    }
+                }
 
                 // Insert into new bucket
                 let new_idx = map_bucket_index(key_hash, new_cap);
@@ -1095,12 +1275,61 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     }
 
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+    set_map_size(ctx, this, size);
+    // Mirror the bucket array to the JDK-resolved `table` slot when present
+    // (and different from slot 0). This is critical for AnnotationAttributes
+    // and other JDK-constructed maps where slot 0 may not be the `table`
+    // field — without this mirror, subsequent reads via `map_state` (which
+    // reads slot 0) would see the new buckets, but any JDK-bytecode path
+    // that reads `table` directly would see null. Also keeps the two
+    // storage locations in sync.
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(slot) = table_slot {
+        if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Object(Some(new_buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+    }
 }
 
 /// Collect all keys from a HashMap into a Vec.
+/// If `this` is a `java.util.Properties` whose `map` field (JDK 25 layout)
+/// points at a `ConcurrentHashMap`, return that CHM. Otherwise None.
+///
+/// JDK 25 changed `Properties` to back its entries with a private
+/// `ConcurrentHashMap<Object,Object> map` field instead of the inherited
+/// `Hashtable.table`. The synthetic-mode slot-0 `buckets` we populate on
+/// `Properties.load()` therefore looks empty to JDK-style readers, and any
+/// helper that walks slot 0 (`map_collect_keys` / `map_collect_entries` /
+/// etc.) reports zero entries. That made `new HashMap<>(props)` empty, which
+/// in turn made Kafka's `KafkaConfig$.populateSynonyms` drop every property
+/// and surface as `Missing required configuration "process.roles"`.
+fn properties_backing_chm(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let slot = ctx.resolve_field_index("java/util/Properties", "map")?;
+    if slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    let m = match ctx.get_field(this, slot) {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let cid = ctx.class_id_of_object(m);
+    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+    if cn == "java/util/concurrent/ConcurrentHashMap"
+        || cn.starts_with("java/util/concurrent/ConcurrentHashMap$")
+    {
+        Some(m)
+    } else {
+        None
+    }
+}
+
 fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    if let Some(chm) = properties_backing_chm(ctx, this) {
+        return chm_collect_all_keys(ctx, chm);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut keys = Vec::new();
     if let Some(b) = buckets {
@@ -1118,6 +1347,9 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 /// Collect all values from a HashMap into a Vec.
 fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    if let Some(chm) = properties_backing_chm(ctx, this) {
+        return chm_collect_all_values(ctx, chm);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut values = Vec::new();
     if let Some(b) = buckets {
@@ -1135,6 +1367,9 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 /// Collect all key-value pairs as (key, value) from a HashMap.
 fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    if let Some(chm) = properties_backing_chm(ctx, this) {
+        return chm_collect_all_entries(ctx, chm);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut entries = Vec::new();
     if let Some(b) = buckets {
@@ -1156,6 +1391,7 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_map_init);
     r.register(c, "<init>", "(I)V", native_map_init_capacity);
+    r.register(c, "<init>", "(Ljava/util/Map;)V", native_map_init_from_map);
     r.register(c, "size", "()I", native_map_size);
     r.register(c, "isEmpty", "()Z", native_map_is_empty);
     r.register(
@@ -1247,42 +1483,69 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 }
 
 pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // S111r27: Set JDK-compatible HashMap field layout so that JDK bytecode
-    // (which bypasses our registered natives for JDK classes) can correctly
-    // read and write HashMap state.
+    // S111r28 (peaceful-sammet bug fix): Restore legacy synthetic layout at
+    // absolute slots 0/1/2 (= buckets/size/capacity), which is what
+    // `native_map_put` / `native_map_get` / `native_map_size` etc. read and
+    // write. The previous S111r27 init wrote to absolute slots 0..5 thinking
+    // they were JDK fields (table/entrySet/size/modCount/threshold/loadFactor),
+    // but the real JDK class hierarchy puts AbstractMap.keySet at slot 0 and
+    // AbstractMap.values at slot 1 first — so absolute slots 0..5 are NOT the
+    // JDK HashMap own-fields. The result was that `native_map_put` saw
+    // `slot0 = Object(None)` (no buckets) and bailed out without inserting,
+    // which surfaced as `HashMap.size() == 0` / `HashSet` empty after every
+    // put, breaking SpringApplication.<init> ("Sources must not be empty").
     //
-    // JDK 25 HashMap instance field layout:
-    //   slot 0: Node<K,V>[] table        (null initially — JDK resize() creates it)
-    //   slot 1: Set<Entry<K,V>> entrySet (null)
-    //   slot 2: int size                 (0)
-    //   slot 3: int modCount             (0)
-    //   slot 4: int threshold            (0 — set by resize() based on loadFactor)
-    //   slot 5: float loadFactor         (0.75 — JDK DEFAULT_LOAD_FACTOR)
+    // Native HashMap path is the authoritative implementation (every
+    // observable Map method — put, get, size, isEmpty, containsKey, keySet,
+    // values, entrySet, toString, etc. — is registered as a native), so we
+    // can just use the legacy synthetic layout at slots 0/1/2. JDK bytecode
+    // for `HashMap.<method>` does not run because the natives shadow it.
     //
-    // Previous (legacy) init set slot 2 = 16 (capacity) which JDK treated as
-    // size=16, causing every putVal to trigger resize (threshold=0 since
-    // loadFactor was never set). This broke all getOrDefault/get lookups.
+    // We additionally write the JDK-named fields (`size`, `table`, etc.) by
+    // name when the class metadata is resolvable, so any JDK-bytecode caller
+    // that reaches into HashMap via direct getfield (rare but possible
+    // through reflection / private putVal entry points) sees consistent
+    // values. These writes go to the correct real-JDK slots regardless of
+    // how parent fields shift the absolute index.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // slot 0: table = null (JDK's resize() allocates it on first putVal)
-    ctx.set_field(this, 0, Value::Object(None));
-    // slot 1: entrySet = null
-    ctx.set_field(this, 1, Value::Object(None));
-    // slot 2: size = 0
-    ctx.set_field(this, 2, Value::Int(0));
-    // slot 3: modCount = 0
-    ctx.set_field(this, 3, Value::Int(0));
-    // slot 4: threshold = 0 (JDK resize() sets this to loadFactor * initialCapacity)
-    ctx.set_field(this, 4, Value::Int(0));
-    // slot 5: loadFactor = 0.75 (DEFAULT_LOAD_FACTOR) — critical for threshold computation
-    ctx.set_field(this, 5, Value::Float(0.75_f32));
+    // Legacy synthetic layout — what every other native HashMap op expects.
+    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    set_map_size(ctx, this, 0);
+    // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
+    // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
+    // `MAP_FIELD_CAPACITY` (absolute slot 2) is dangerous when the JDK class
+    // layout puts `table` at the same slot — JDK bytecode (e.g. `HashMap.resize()`)
+    // then runs `arraylength` on `Int(16)` and aborts with
+    //   `internal error: expected object reference, got int(16)`.
+    // The fix: never let the JDK `table` slot hold an Int. Write the bucket
+    // array to the JDK `table` slot when resolvable, and skip the legacy
+    // capacity Int write if it would clobber `table`. `map_state` already
+    // prefers the bucket array's length over `MAP_FIELD_CAPACITY`, so dropping
+    // the Int write is safe.
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(slot) = table_slot {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Object(Some(buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(MAP_DEFAULT_CAPACITY as i32));
+    }
 
-    // Also maintain legacy layout fields for our own native map operations
-    // (map_state reads from MAP_FIELD_BUCKETS=0, MAP_FIELD_SIZE=1, MAP_FIELD_CAPACITY=2).
-    // Since slot 0 now holds JDK's table (null initially), our map_state's
-    // layout-aware code path handles this: when table=null, size=0, cap=default.
+    // Best-effort JDK-named field population for bytecode readers. `size`
+    // was already mirrored by `set_map_size`; the rest are best-effort.
+    try_set_jdk_map_field(ctx, this, "modCount", Value::Int(0));
+    try_set_jdk_map_field(
+        ctx,
+        this,
+        "threshold",
+        Value::Int((MAP_DEFAULT_CAPACITY as i32 * 3) / 4),
+    );
+    try_set_jdk_map_field(ctx, this, "loadFactor", Value::Float(0.75_f32));
     Ok(None)
 }
 
@@ -1300,18 +1563,30 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         _ => MAP_DEFAULT_CAPACITY,
     };
-    // S111r27: Use JDK-compatible layout (same as native_map_init).
-    // JDK bytecode will call resize() on first putVal if table is null.
-    // Pre-allocating the table here avoids the initial resize overhead.
+    // S111r28: same legacy synthetic layout as `native_map_init`. See the
+    // longer comment there for the rationale.
     let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(this, 0, Value::Object(Some(buckets)));  // table
-    ctx.set_field(this, 1, Value::Object(None));           // entrySet = null
-    ctx.set_field(this, 2, Value::Int(0));                 // size = 0
-    ctx.set_field(this, 3, Value::Int(0));                 // modCount = 0
-    // threshold = loadFactor * cap = 0.75 * cap
-    let threshold = ((cap as f32) * 0.75_f32) as i32;
-    ctx.set_field(this, 4, Value::Int(threshold));         // threshold
-    ctx.set_field(this, 5, Value::Float(0.75_f32));        // loadFactor
+    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    set_map_size(ctx, this, 0);
+    // S111r29: see `native_map_init` for rationale. Mirror the bucket array
+    // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
+    // (or null), never an Int. Skip the legacy Int-capacity write when it
+    // would land on the same slot as JDK `table`.
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(slot) = table_slot {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Object(Some(buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    }
+
+    // Best-effort JDK-named field population for bytecode readers.
+    // `size` is mirrored by `set_map_size`.
+    try_set_jdk_map_field(ctx, this, "modCount", Value::Int(0));
+    try_set_jdk_map_field(ctx, this, "threshold", Value::Int((cap as i32 * 3) / 4));
+    try_set_jdk_map_field(ctx, this, "loadFactor", Value::Float(0.75_f32));
     Ok(None)
 }
 
@@ -1359,11 +1634,38 @@ pub fn native_map_to_string_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     native_map_to_string(ctx, args)
 }
 
+/// Detect if a receiver is a TreeMap (or subclass). The `java/util/Map`
+/// interface natives below use a HashMap-style field layout (buckets/size/
+/// capacity at slots 0/1/2) which conflicts with TreeMap's
+/// (data/size/comparator). Without this check, a `Map.put`/`get`/`size` call
+/// on a TreeMap receiver silently no-ops, leaving size=0 and
+/// dropping every entry. This blocked Keycloak FeatureOptions.<clinit>:
+/// FeaturePropertyMappers stores feature→mapper entries in a TreeMap, and
+/// when the JDK's TreeMap.keySpliteratorFor ran it traversed a null root
+/// because the put native had never reached `tm_put`.
+fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(this);
+    loop {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/TreeMap" => return true,
+            Some(n) if n == "java/util/HashMap" || n == "java/lang/Object" => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+}
+
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_size(ctx, args);
+    }
     let (_, size, _) = map_state(ctx, this);
     Ok(Some(Value::Int(size)))
 }
@@ -1373,6 +1675,9 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_is_empty(ctx, args);
+    }
     let (_, size, _) = map_state(ctx, this);
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
@@ -1382,6 +1687,59 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // S111r34: when the receiver is a LinkedHashMap (or subclass like
+    // `org/springframework/core/annotation/AnnotationAttributes`),
+    // delegate to `native_lhm_put` so that subsequent `LinkedHashMap.get`
+    // calls — which JDK25 overrides and we redirect to `native_lhm_get`
+    // (reads from the LHM overlay) — find the entries. Without this
+    // redirect, the put writes to slot-0-based storage which the LHM
+    // `get` native cannot see, and Spring's `AnnotationAttributes.get(...)`
+    // returns null for every key written via `TypeMappedAnnotation.asMap`.
+    // Surfaces as `IllegalArgumentException: Attribute 'type' not found
+    // in attributes for annotation [...ComponentScan$Filter]` in
+    // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`.
+    let cid = ctx.class_id_of_object(this);
+    if let Some(name) = ctx.class_name_of_id(cid) {
+        if name != "java/util/HashMap" {
+            // Walk parent chain to detect LinkedHashMap or TreeMap ancestry.
+            // Without the TreeMap branch, the `java/util/Map.put` interface
+            // override (registered as an abstract-method native) falls
+            // through to the HashMap-bucket code below for a TreeMap
+            // receiver. TreeMap's field 0 is `root` (a TreeMap.Entry),
+            // not a bucket array, so `map_state`/`map_resize` corrupt the
+            // object and every subsequent put is a silent no-op. Symptom:
+            // `new TreeMap().put(k,v)` leaves size=0 and get returns null,
+            // which broke Keycloak FeatureOptions.<clinit> (the JDK
+            // TreeMap.keySpliteratorFor NPE was downstream — actual data
+            // never reached the tree).
+            let mut cur = cid;
+            let mut is_lhm = false;
+            let mut is_tm = false;
+            while let Some(n) = ctx.class_name_of_id(cur) {
+                if n == "java/util/LinkedHashMap" {
+                    is_lhm = true;
+                    break;
+                }
+                if n == "java/util/TreeMap" {
+                    is_tm = true;
+                    break;
+                }
+                if n == "java/util/HashMap" || n == "java/lang/Object" {
+                    break;
+                }
+                match ctx.superclass_of(cur) {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+            if is_lhm {
+                return native_lhm_put(ctx, args);
+            }
+            if is_tm {
+                return native_tm_put(ctx, args);
+            }
+        }
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
@@ -1392,9 +1750,15 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
 
-    // Check for resize first
-    let (_, size, cap) = map_state(ctx, this);
-    if size + 1 > (cap * 3) / 4 {
+    // Check for resize first. Also initialize table when buckets is None
+    // (e.g. AnnotationAttributes constructed via JDK bytecode constructor —
+    // LinkedHashMap.<init>() leaves `table` null until first put, but our
+    // synthetic put native previously returned a silent no-op when buckets
+    // were None, dropping `type` from `@ComponentScan.Filter` AnnotationAttributes
+    // and surfacing as `IllegalArgumentException: Attribute 'type' not found`
+    // deep in Spring's bean factory).
+    let (initial_buckets, size, cap) = map_state(ctx, this);
+    if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
         map_resize(ctx, this);
     }
 
@@ -1407,8 +1771,23 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
 
-    // Walk chain looking for existing key (S111r27: layout-aware)
+    // Walk chain looking for existing key (S111r27: layout-aware).
+    // Safety: cap the chain walk to detect pathological cases (cycles or
+    // O(n^2) blowup from massive single-bucket pile-ups). Real chains
+    // should be O(log n) even with poor hashes; anything past 4096 is a
+    // strong signal of a cycle/corruption — break and let the insert
+    // proceed as if not found.
+    let mut walk_count: usize = 0;
+    const CHAIN_WALK_LIMIT: usize = 4096;
     while let Value::Object(Some(node)) = node_val {
+        walk_count += 1;
+        if walk_count > CHAIN_WALK_LIMIT {
+            eprintln!(
+                "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                walk_count, this, idx, cap
+            );
+            break;
+        }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             // Looking for a null-key node
@@ -1431,7 +1810,18 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(old_value));
             }
         }
-        node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+        let next = ctx.get_field(node, NODE_FIELD_NEXT);
+        // Self-cycle guard: if node.next == node, abort immediately.
+        if let Value::Object(Some(nx)) = next {
+            if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
+                eprintln!(
+                    "[HM-PUT-GUARD] self-cycle node detected at walk {}; map={:?} idx={}",
+                    walk_count, this, idx
+                );
+                break;
+            }
+        }
+        node_val = next;
     }
 
     // Key not found — insert at head of chain
@@ -1451,7 +1841,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         head_ref.map_or(Value::Object(None), |r| Value::Object(Some(r))),
     );
     ctx.set_array_element(buckets, idx, Value::Object(Some(new_node)));
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size + 1));
+    set_map_size(ctx, this, size + 1);
 
     Ok(Some(Value::Object(None))) // no old value
 }
@@ -1461,6 +1851,9 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_get(ctx, args);
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -1490,43 +1883,11 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
             if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
-                // Debug: log when ApplicationContextFactory key is found
-                if let Some(s) = ctx.read_string(key_ref.unwrap()) {
-                    if s.contains("ApplicationContext") {
-                        eprintln!("[MAP-GET-DBG] found key={}", s);
-                    }
-                }
                 let value = get_node_value(ctx, node);
                 return Ok(Some(value));
             }
         }
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
-    }
-
-    // Debug: log misses for ApplicationContextFactory
-    if let Some(k) = key_ref {
-        if let Some(s) = ctx.read_string(k) {
-            if s.contains("ApplicationContext") {
-                eprintln!("[MAP-GET-DBG] MISS key={} cap={} idx={}", s, cap, idx);
-                // Dump bucket contents for diagnosis
-                let mut n = ctx.get_array_element(buckets, idx);
-                while let Value::Object(Some(nd)) = n {
-                    let nk = get_node_key(ctx, nd);
-                    let nk_str = if let Value::Object(Some(nkr)) = nk {
-                        ctx.read_string(nkr).unwrap_or_else(|| "<non-string>".to_string())
-                    } else { format!("<non-obj {:?}>", nk) };
-                    eprintln!("[MAP-GET-DBG]   bucket[{}] key={}", idx, nk_str);
-                    n = ctx.get_field(nd, NODE_FIELD_NEXT);
-                }
-                // Also dump slot0..slot3 of node for raw layout inspection
-                let n0 = ctx.get_array_element(buckets, idx);
-                if let Value::Object(Some(nd)) = n0 {
-                    eprintln!("[MAP-GET-DBG]   node slots: s0={:?} s1={:?} s2={:?} s3={:?}",
-                        ctx.get_field(nd, 0), ctx.get_field(nd, 1),
-                        ctx.get_field(nd, 2), ctx.get_field(nd, 3));
-                }
-            }
-        }
     }
 
     Ok(Some(Value::Object(None)))
@@ -1555,7 +1916,12 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let head_val = ctx.get_array_element(buckets, idx);
 
     // Helper closure: check if node matches our key (S111r27: layout-aware)
-    let node_matches = |ctx: &dyn NativeContext, node: ObjectRef| -> bool {
+    fn node_matches_inner(
+        ctx: &mut dyn NativeContext,
+        node: ObjectRef,
+        is_null_key: bool,
+        key_ref: Option<ObjectRef>,
+    ) -> bool {
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             matches!(node_key_field, Value::Object(None))
@@ -1564,14 +1930,14 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         } else {
             false
         }
-    };
+    }
 
     // Check if the head node is the target
     if let Value::Object(Some(head)) = head_val {
-        if node_matches(ctx, head) {
+        if node_matches_inner(ctx, head, is_null_key, key_ref) {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
-            ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size - 1));
+            set_map_size(ctx, this, size - 1);
             let old_value = get_node_value(ctx, head);
             return Ok(Some(old_value));
         }
@@ -1581,10 +1947,10 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
 
         while let Value::Object(Some(curr)) = curr_val {
-            if node_matches(ctx, curr) {
+            if node_matches_inner(ctx, curr, is_null_key, key_ref) {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
-                ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size - 1));
+                set_map_size(ctx, this, size - 1);
                 let old_value = get_node_value(ctx, curr);
                 return Ok(Some(old_value));
             }
@@ -1597,9 +1963,53 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let result = native_map_get(ctx, args)?;
-    let found = !matches!(result, Some(Value::Object(None)));
-    Ok(Some(Value::Int(if found { 1 } else { 0 })))
+    // Round 72: must not conflate `containsKey` with `get(...) != null`.
+    // HashMap allows null values, so an entry with a null value must still
+    // report containsKey == true. Walk the bucket chain directly and check
+    // for node presence, mirroring `native_map_get` but returning a boolean
+    // on node match regardless of the stored value. (Kafka 4.2
+    // `ConfigDef.parse` puts `early.start.listeners` with a null default;
+    // `AbstractConfig.get` then calls `values.containsKey(...)` and would
+    // wrongly throw "Unknown configuration" if we returned false here.)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_contains_key(ctx, args);
+    }
+    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let (key_ref, hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(None) => (None, 0, true),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let (buckets, _, cap) = map_state(ctx, this);
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
+
+    let idx = map_bucket_index(hash, cap);
+    let mut node_val = ctx.get_array_element(buckets, idx);
+
+    while let Value::Object(Some(node)) = node_val {
+        let node_key_field = get_node_key(ctx, node);
+        if is_null_key {
+            if matches!(node_key_field, Value::Object(None)) {
+                return Ok(Some(Value::Int(1)));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+
+    Ok(Some(Value::Int(0)))
 }
 
 fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1628,7 +2038,7 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ctx.set_array_element(b, i, Value::Object(None));
         }
     }
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, this, 0);
     Ok(None)
 }
 
@@ -1637,15 +2047,18 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_key_set(ctx, args);
+    }
     let keys = map_collect_keys(ctx, this);
     // Build a HashSet from the keys
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing_map = alloc_backing_map(ctx);
     // Initialize the backing map
     let cap = std::cmp::max(keys.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
@@ -1664,7 +2077,7 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             let sentinel = Value::Int(1);
             let node = map_alloc_node(ctx, *k, sentinel, hash, head);
             ctx.set_array_element(b, idx, Value::Object(Some(node)));
-            ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(size + 1));
+            set_map_size(ctx, backing_map, size + 1);
         }
     }
 
@@ -1676,16 +2089,20 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_values(ctx, args);
+    }
     let values = map_collect_values(ctx, this);
     // Build an ArrayList from the values
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
     for (i, val) in values.iter().enumerate() {
         ctx.set_array_element(buf, i, *val);
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(values.len() as i32));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, values.len() as i32);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -1694,14 +2111,17 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_entry_set(ctx, args);
+    }
     let entries = map_collect_entries(ctx, this);
     // Build a HashSet of Map.Entry objects
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing_map = alloc_backing_map(ctx);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
@@ -1727,7 +2147,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let sentinel = Value::Int(1);
         let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
         ctx.set_array_element(b, idx, Value::Object(Some(node)));
-        ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(size + 1));
+        set_map_size(ctx, backing_map, size + 1);
     }
 
     Ok(Some(Value::Object(Some(set))))
@@ -1751,18 +2171,6 @@ fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // S111r27: debug — log ALL calls to detect if this native is bypassed
-    static GODCALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !GODCALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[GOD-DBG] getOrDefault native IS running");
-    }
-    if let Some(Value::Object(Some(k))) = args.get(1) {
-        if let Some(s) = ctx.read_string(*k) {
-            if s.contains("ApplicationContext") || s.contains("ContextFactory") {
-                eprintln!("[GOD-DBG] getOrDefault called key={}", s);
-            }
-        }
-    }
     let result = native_map_get(ctx, args)?;
     match result {
         Some(Value::Object(None)) => {
@@ -1795,7 +2203,23 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let entries = map_collect_entries(ctx, other);
+    // S111r24-fix: Source may be a LinkedHashMap whose entries live in the
+    // Rust-side `lhm_overlay`. Walk its insertion-order list first; only
+    // fall back to HashMap bucket scanning when there is no LHM head
+    // pointer registered for `other`.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    let lhm_head = lhm_get(ctx, other, "head", LHM_FIELD_HEAD);
+    if let Value::Object(Some(_)) = lhm_head {
+        let mut cur = lhm_head;
+        while let Value::Object(Some(node)) = cur {
+            let key = ctx.get_field(node, LHM_NODE_KEY);
+            let val = ctx.get_field(node, LHM_NODE_VALUE);
+            entries.push((key, val));
+            cur = ctx.get_field(node, LHM_NODE_AFTER);
+        }
+    } else {
+        entries = map_collect_entries(ctx, other);
+    }
     for (key, value) in entries {
         if let Value::Object(Some(k)) = key {
             // Call put on this map
@@ -2031,10 +2455,10 @@ pub fn make_hashset_with_elements(
     // Legacy fallback: synthetic 3-field (buckets, size, capacity) layout.
     // Used when real HashMap/Node classes aren't resolvable yet.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing_map = alloc_backing_map(ctx);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
@@ -2286,12 +2710,32 @@ fn native_hs_contains_all(
     Ok(Some(Value::Int(1)))
 }
 
+/// S111r28: Allocate the backing HashMap with enough field slots to cover
+/// every inherited / declared instance field of the real JDK
+/// `java.util.HashMap` class. The previous `alloc_synthetic("HashMap", 3)`
+/// produced a 3-slot object whose class metadata still claims 8 fields, so
+/// the descriptor-aware `set_field` coercion path mangled writes to the
+/// inherited `AbstractMap.values: Collection` field at slot 1 (where our
+/// `MAP_FIELD_SIZE` index lives) — `Int(0)` got rewritten as
+/// `Object(None)`, which broke the size accounting downstream.
+fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let cid = match ctx.ensure_class_initialized("java/util/HashMap") {
+        Ok(class_id) => class_id,
+        Err(_) => ctx
+            .class_id_by_name("java/util/HashMap")
+            .unwrap_or(ClassId::new(0)),
+    };
+    let total = ctx.class_num_total_fields(cid);
+    let n = std::cmp::max(total, MAP_NUM_FIELDS);
+    ctx.alloc_object(cid, n)
+}
+
 fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing = alloc_backing_map(ctx);
     // Initialize the backing HashMap
     let init_args = [Value::Object(Some(backing))];
     native_map_init(ctx, &init_args)?;
@@ -2308,7 +2752,7 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         .get(1)
         .copied()
         .unwrap_or(Value::Int(MAP_DEFAULT_CAPACITY as i32));
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing = alloc_backing_map(ctx);
     let init_args = [Value::Object(Some(backing)), cap];
     native_map_init_capacity(ctx, &init_args)?;
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
@@ -2410,13 +2854,18 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
-            eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
+            // (Quieted: previously eprintln. Enable via RUSTJVM_HS_ITR_DBG.)
+            if std::env::var("RUSTJVM_HS_ITR_DBG").is_ok() {
+                eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
+            }
             return Ok(Some(Value::Object(None)));
         }
     };
     // Collect keys into a snapshot array
     let keys = map_collect_keys(ctx, backing);
-    eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
+    if std::env::var("RUSTJVM_HS_ITR_DBG").is_ok() {
+        eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
+    }
     let keys_arr = alloc_ref_array(ctx, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(keys_arr, i, *k);
@@ -2475,6 +2924,25 @@ const AL_ITR_FIELD_LIST: usize = 0;
 const AL_ITR_FIELD_CURSOR: usize = 1;
 const AL_ITR_NUM_FIELDS: usize = 2;
 
+/// Resolve ArrayList$Itr field slots: returns (cursor_slot, list_slot, n_fields).
+/// Real-JDK layout: cursor (slot 0), lastRet (slot 1), expectedModCount (slot 2),
+/// this$0 (slot 3 — the enclosing ArrayList). Falls back to synthetic
+/// (list=0, cursor=1) when the real class isn't available.
+#[inline]
+fn al_itr_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
+    let cursor = ctx.resolve_field_index("java/util/ArrayList$Itr", "cursor");
+    let list = ctx.resolve_field_index("java/util/ArrayList$Itr", "this$0");
+    match (cursor, list) {
+        (Some(c), Some(l)) => {
+            let n = std::cmp::max(c, l) + 1;
+            // Account for lastRet/expectedModCount slots between cursor and this$0.
+            let n = std::cmp::max(n, 4);
+            (c, l, n)
+        }
+        _ => (AL_ITR_FIELD_CURSOR, AL_ITR_FIELD_LIST, AL_ITR_NUM_FIELDS),
+    }
+}
+
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
@@ -2515,14 +2983,12 @@ fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] native_al_itr_has_next called");
-    }
-    let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
+    let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
+    let cursor = match ctx.get_field(this, cursor_slot) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let list = match ctx.get_field(this, AL_ITR_FIELD_LIST) {
+    let list = match ctx.get_field(this, list_slot) {
         Value::Object(Some(l)) => l,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -2535,11 +3001,12 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cursor = match ctx.get_field(this, AL_ITR_FIELD_CURSOR) {
+    let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
+    let cursor = match ctx.get_field(this, cursor_slot) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let list = match ctx.get_field(this, AL_ITR_FIELD_LIST) {
+    let list = match ctx.get_field(this, list_slot) {
         Value::Object(Some(l)) => l,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -2552,7 +3019,7 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         None => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(data, cursor as usize);
-    ctx.set_field(this, AL_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
     Ok(Some(val))
 }
 
@@ -2695,23 +3162,25 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(a))) => *a,
         _ => {
             // Return empty list
-            let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+            let __al_n_fields = al_slots(ctx).2;
+            let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
             let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-            ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-            ctx.set_field(list, AL_FIELD_SIZE, Value::Int(0));
+            al_set_data(ctx, list, buf);
+            al_set_size(ctx, list, 0);
             return Ok(Some(Value::Object(Some(list))));
         }
     };
     let len = ctx.array_length(arr);
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(len, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
     for i in 0..len {
         let val = ctx.get_array_element(arr, i);
         ctx.set_array_element(buf, i, val);
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(len as i32));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, len as i32);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -3176,10 +3645,11 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let arr = alloc_ref_array(ctx, 0);
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(arr)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(0));
+    al_set_data(ctx, list, arr);
+    al_set_size(ctx, list, 0);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -3188,11 +3658,12 @@ fn native_collections_singleton_list(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.first().copied().unwrap_or(Value::Object(None));
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let arr = alloc_ref_array(ctx, 1);
     ctx.set_array_element(arr, 0, val);
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(arr)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(1));
+    al_set_data(ctx, list, arr);
+    al_set_size(ctx, list, 1);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -3230,7 +3701,8 @@ fn native_collections_unmodifiable_list(
     };
     let (data, size) = al_state(ctx, src);
     let len = size as usize;
-    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let new_arr = alloc_ref_array(ctx, len);
     if let Some(src_data) = data {
         for i in 0..len {
@@ -3238,8 +3710,8 @@ fn native_collections_unmodifiable_list(
             ctx.set_array_element(new_arr, i, val);
         }
     }
-    ctx.set_field(new_list, AL_FIELD_DATA, Value::Object(Some(new_arr)));
-    ctx.set_field(new_list, AL_FIELD_SIZE, Value::Int(size));
+    al_set_data(ctx, new_list, new_arr);
+    al_set_size(ctx, new_list, size);
     Ok(Some(Value::Object(Some(new_list))))
 }
 
@@ -3659,11 +4131,11 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Int(0))),
     };
 
-    let data = match ctx.get_field(this, AL_FIELD_DATA) {
+    let data = match ctx.get_field(this, al_slots(ctx).0) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let size = match ctx.get_field(this, AL_FIELD_SIZE) {
+    let size = match ctx.get_field(this, al_slots(ctx).1) {
         Value::Int(s) => s as usize,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -3689,7 +4161,7 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in keep.len()..size {
         ctx.set_array_element(data, i, Value::Object(None));
     }
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(keep.len() as i32));
+    al_set_size(ctx, this, keep.len() as i32);
 
     Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
@@ -3704,11 +4176,11 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
 
-    let data = match ctx.get_field(this, AL_FIELD_DATA) {
+    let data = match ctx.get_field(this, al_slots(ctx).0) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(None),
     };
-    let size = match ctx.get_field(this, AL_FIELD_SIZE) {
+    let size = match ctx.get_field(this, al_slots(ctx).1) {
         Value::Int(s) => s as usize,
         _ => return Ok(None),
     };
@@ -3745,19 +4217,6 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(Some(Value::Object(None))),
     };
-
-    // Debug: one-shot marker + targeted key log
-    static CIACALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !CIACALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[CIA-DBG] computeIfAbsent native IS running");
-    }
-    if let Value::Object(Some(k)) = key {
-        if let Some(s) = ctx.read_string(k) {
-            if s.contains("ApplicationContextFactory") || s.contains("ApplicationContext") || s.contains("springframework") {
-                eprintln!("[CIA-DBG] computeIfAbsent: key={}", s);
-            }
-        }
-    }
 
     // Check if key already present.
     let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
@@ -4008,38 +4467,40 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
 
 /// Helper: create an ArrayList from a slice of values.
 fn make_list_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(buf, i, *val);
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(elems.len() as i32));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, elems.len() as i32);
     Ok(Some(Value::Object(Some(list))))
 }
 
 /// Helper: create an ArrayList (returns ObjectRef, not MethodCallResult).
 fn make_list_of_raw(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(buf, i, *val);
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(elems.len() as i32));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, elems.len() as i32);
     list
 }
 
 /// Helper: create a HashSet from a slice of values.
 fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing_map = alloc_backing_map(ctx);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing_map, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing_map, 0);
     ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
@@ -4053,11 +4514,11 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
 
 /// Helper: create a HashMap from key-value pairs.
 fn make_map_of(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodCallResult {
-    let map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let map = alloc_backing_map(ctx);
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(map, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, map, 0);
     ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
     for (key, value) in pairs {
@@ -4177,8 +4638,40 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
 
 /// Extract elements from a Stream.
 fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    match ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-        Value::Object(Some(arr)) => {
+    // For our synthetic Stream object, field 0 holds an Object[] of elements.
+    // But some streams are real JDK ReferencePipeline instances (returned by
+    // e.g. Spring's MergedAnnotations.stream()). In those cases we can't peek
+    // at field 0 — fall through to materialize via Stream.toArray().
+    let class_id = ctx.class_id_of_object(stream);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_synthetic = class_name == "java/util/stream/Stream";
+    if is_synthetic {
+        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+            let len = ctx.array_length(arr);
+            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        }
+    }
+    // Non-synthetic streams (real JDK ReferencePipeline etc.) require an
+    // `invoke_virtual` call to materialize via `Stream.toArray()` — use
+    // `stream_elements_mut` from a context that has `&mut dyn NativeContext`.
+    Vec::new()
+}
+
+/// Mutable variant of stream_elements that can invoke virtual methods.
+fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    let class_id = ctx.class_id_of_object(stream);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_synthetic = class_name == "java/util/stream/Stream";
+    if is_synthetic {
+        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+            let len = ctx.array_length(arr);
+            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        }
+        return Vec::new();
+    }
+    // Real ReferencePipeline (or any JDK Stream impl): materialize via toArray.
+    match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
             let len = ctx.array_length(arr);
             (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
         }
@@ -4287,6 +4780,20 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_stream_to_array_gen,
+    );
+    // Same override on ReferencePipeline so real-JDK code that dispatches
+    // virtual on the concrete class also hits us.
+    r.register(
+        "java/util/stream/ReferencePipeline",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_stream_to_array_gen,
+    );
+    r.register(
+        c,
         "findFirst",
         "()Ljava/util/Optional;",
         native_stream_find_first,
@@ -4340,9 +4847,22 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         native_stream_max,
     );
 
-    // collect
+    // collect — register on both the Stream interface and JDK's
+    // ReferencePipeline concrete class. JDK code obtained via
+    // `MergedAnnotations.stream()` returns a real `ReferencePipeline`, so
+    // `invokeinterface Stream.collect` dispatches to `ReferencePipeline.collect`
+    // (a JDK method) rather than our `Stream.collect` native. The JDK
+    // implementation would then call `Collector.supplier/accumulator/finisher`
+    // on our synthetic tagged Collector, which has no such methods. Intercept
+    // `ReferencePipeline.collect` so our tagged-Collector dispatch always runs.
     r.register(
         c,
+        "collect",
+        "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+        native_stream_collect,
+    );
+    r.register(
+        "java/util/stream/ReferencePipeline",
         "collect",
         "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
         native_stream_collect,
@@ -4499,6 +5019,28 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let keys = map_collect_keys(ctx, backing);
     make_stream(ctx, &keys)
+}
+
+// TreeSet.stream() — snapshot of sorted elements (also serves TreeMap.keySet()
+// since native_tm_key_set returns a synthetic TreeSet). Real JDK's
+// TreeSet.spliterator() goes through TreeMap.keySpliteratorFor(), which requires
+// the JDK's `root`/`size` red-black tree fields populated by put(); our
+// synthetic layout does not provide those, so without this override the stream
+// is empty (observed: `m.keySet().stream().count()` returned 0 for a 3-entry
+// TreeMap, which broke Keycloak FeatureOptions.<clinit>).
+fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let elements: Vec<Value> = match data_opt {
+        Some(d) => (0..size as usize)
+            .map(|i| ctx.get_array_element(d, i))
+            .collect(),
+        None => Vec::new(),
+    };
+    make_stream(ctx, &elements)
 }
 
 // -- Intermediate operations --
@@ -4763,6 +5305,61 @@ fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// `Stream.toArray(IntFunction<A[]> generator)` — invoke the generator
+/// with the element count to produce a correctly-typed array, then copy
+/// elements into it.
+///
+/// Real-JDK code uses this for any `Stream.toArray(String[]::new)` chain,
+/// e.g. `Utils.enumOptions(SecurityProtocol.class)` in Kafka. Without
+/// this native override, dispatch falls into the real JDK
+/// `ReferencePipeline.toArray` which expects a real Spliterator-backed
+/// pipeline, not our synthetic field-0-array stream — silently
+/// returning a 0-length array. That made
+/// `ConfigDef.ValidString.in(...)` build an empty allow-list, and
+/// `ReplicationConfigs.<clinit>` threw
+/// `ConfigException: Invalid value PLAINTEXT for configuration
+/// security.inter.broker.protocol: String must be one of:`.
+fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let generator = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elements = stream_elements(ctx, this);
+    let len = elements.len();
+    // Try to use the generator's apply(int) to allocate a typed array.
+    let arr = match generator {
+        Value::Object(Some(g)) => {
+            let r = ctx.invoke_virtual(
+                g,
+                "apply",
+                "(I)Ljava/lang/Object;",
+                &[Value::Int(len as i32)],
+            );
+            match r {
+                Ok(Some(Value::Object(Some(a)))) => a,
+                _ => alloc_ref_array(ctx, len),
+            }
+        }
+        _ => alloc_ref_array(ctx, len),
+    };
+    // If generator returned a too-small array (or fallback Object[]),
+    // ensure it has enough slots.
+    let cap = ctx.array_length(arr);
+    let arr = if cap < len {
+        alloc_ref_array(ctx, len)
+    } else {
+        arr
+    };
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
 fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -5020,6 +5617,18 @@ const COLLECTOR_TAG_GROUPING_BY_SUPPLIER: i32 = 10;
 /// T2.3.19 — `Collectors.partitioningBy(Predicate,Collector)` with
 /// downstream collector applied to each partition.
 const COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM: i32 = 11;
+/// `Collectors.toMap(keyFn, valFn, mergeFn)` — ARG1=keyFn, ARG2=valFn,
+/// ARG3=BinaryOperator merge function applied on duplicate keys.
+const COLLECTOR_TAG_TO_MAP_MERGE: i32 = 12;
+/// `Collectors.collectingAndThen(downstream, finisher)` — ARG1=downstream
+/// Collector, ARG2=finisher Function applied to the downstream result.
+const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
+/// `Collectors.toCollection(Supplier)` — ARG1=Supplier producing the target
+/// Collection. Stream elements are added to the supplied Collection via
+/// `Collection.add(Object)`. Required by Spring Boot 4.x
+/// `AutoConfigurationImportSelector.AutoConfigurationGroup.selectImports` which
+/// collects entries into a user-supplied LinkedHashSet.
+const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/stream/Collectors";
@@ -5053,6 +5662,30 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "toMap",
         "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
         native_collectors_to_map,
+    );
+    r.register(
+        c,
+        "toMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;",
+        native_collectors_to_map_merge,
+    );
+    r.register(
+        c,
+        "toUnmodifiableMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+        native_collectors_to_map,
+    );
+    r.register(
+        c,
+        "toUnmodifiableMap",
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;",
+        native_collectors_to_map_merge,
+    );
+    r.register(
+        c,
+        "collectingAndThen",
+        "(Ljava/util/stream/Collector;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+        native_collectors_collecting_and_then,
     );
     r.register(
         c,
@@ -5104,6 +5737,44 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         native_collectors_partitioning_by_downstream,
     );
+    // toCollection(Supplier) — needed by Spring Boot 4.x
+    // AutoConfigurationImportSelector which collects into a user-supplied
+    // LinkedHashSet.
+    r.register(
+        c,
+        "toCollection",
+        "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;",
+        native_collectors_to_collection,
+    );
+    // Our synthetic Collector objects need a `characteristics()` method that
+    // returns a non-null Set — JDK stream internals (e.g.
+    // ReduceOps$3.getOpFlags) call `collector.characteristics().contains(UNORDERED)`,
+    // which NPEs if characteristics returns null. We return an empty HashSet so
+    // the stream treats the collector as ordered, matching Collectors.toList /
+    // toCollection semantics for the cases we synthesize.
+    r.register(
+        "java/util/stream/Collector",
+        "characteristics",
+        "()Ljava/util/Set;",
+        native_collector_characteristics,
+    );
+}
+
+fn native_collector_characteristics(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    make_set_of(ctx, &[])
+}
+
+fn native_collectors_to_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_COLLECTION);
+    let supplier = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, supplier);
+    Ok(Some(Value::Object(Some(c))))
 }
 
 fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
@@ -5128,6 +5799,32 @@ fn native_collectors_to_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
     ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map_merge(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_MERGE);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_collecting_and_then(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_COLLECTING_AND_THEN);
+    let downstream = args.first().copied().unwrap_or(Value::Object(None));
+    let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, downstream);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, finisher);
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -5220,7 +5917,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let elements = stream_elements(ctx, this);
+    let elements = stream_elements_mut(ctx, this);
     let tag = match ctx.get_field(collector, COLLECTOR_FIELD_TAG) {
         Value::Int(t) => t,
         _ => return Ok(Some(Value::Object(None))),
@@ -5229,6 +5926,35 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     match tag {
         COLLECTOR_TAG_TO_LIST => make_list_of(ctx, &elements),
         COLLECTOR_TAG_TO_SET => make_set_of(ctx, &elements),
+        COLLECTOR_TAG_TO_COLLECTION => {
+            // Invoke the supplier to materialize the target Collection, then
+            // add each stream element via Collection.add(Object). Fall back to
+            // a HashSet if the supplier is missing or fails.
+            let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+            let coll_obj = match supplier {
+                Value::Object(Some(s)) => {
+                    match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
+                        Ok(Some(Value::Object(Some(c)))) => Some(c),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match coll_obj {
+                Some(c) => {
+                    for elem in &elements {
+                        let _ = ctx.invoke_virtual(
+                            c,
+                            "add",
+                            "(Ljava/lang/Object;)Z",
+                            &[*elem],
+                        )?;
+                    }
+                    Ok(Some(Value::Object(Some(c))))
+                }
+                None => make_set_of(ctx, &elements),
+            }
+        }
         COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
         COLLECTOR_TAG_JOINING => {
             let mut parts = Vec::with_capacity(elements.len());
@@ -5282,6 +6008,99 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 pairs.push((k, v));
             }
             make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_TO_MAP_MERGE => {
+            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                Value::Object(Some(r)) => Some(r),
+                _ => None,
+            };
+            // Walk elements, merging duplicate keys via the BinaryOperator.
+            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                let k = ctx
+                    .invoke_virtual(
+                        key_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let v = ctx
+                    .invoke_virtual(
+                        val_fn,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                let mut idx = None;
+                for (i, (ek, _)) in pairs.iter().enumerate() {
+                    if values_equal(ctx, ek, &k) {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = idx {
+                    let existing = pairs[i].1;
+                    let merged = if let Some(mf) = merge_fn {
+                        ctx.invoke_virtual(
+                            mf,
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[existing, v],
+                        )?
+                        .unwrap_or(Value::Object(None))
+                    } else {
+                        v
+                    };
+                    pairs[i].1 = merged;
+                } else {
+                    pairs.push((k, v));
+                }
+            }
+            make_map_of(ctx, &pairs)
+        }
+        COLLECTOR_TAG_COLLECTING_AND_THEN => {
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+            let finisher = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Re-build a stream over the same elements and recursively collect
+            // through the downstream Collector, then apply finisher.apply().
+            let inner_stream =
+                alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+            let arr = alloc_ref_array(ctx, elements.len());
+            for (i, v) in elements.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(
+                inner_stream,
+                STREAM_FIELD_ELEMENTS,
+                Value::Object(Some(arr)),
+            );
+            let downstream_result = native_stream_collect(
+                ctx,
+                &[Value::Object(Some(inner_stream)), downstream],
+            )?
+            .unwrap_or(Value::Object(None));
+            let finished = ctx
+                .invoke_virtual(
+                    finisher,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[downstream_result],
+                )?
+                .unwrap_or(Value::Object(None));
+            Ok(Some(finished))
         }
         COLLECTOR_TAG_GROUPING_BY => {
             let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
@@ -6769,8 +7588,8 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => {
             // null or missing — just init empty
             let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-            ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
-            ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+            al_set_data(ctx, this, buf);
+            al_set_size(ctx, this, 0);
             return Ok(None);
         }
     };
@@ -6785,18 +7604,18 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
                 let val = ctx.get_array_element(arr, i);
                 ctx.set_array_element(buf, i, val);
             }
-            ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
-            ctx.set_field(this, AL_FIELD_SIZE, Value::Int(size));
+            al_set_data(ctx, this, buf);
+            al_set_size(ctx, this, size);
         } else {
             let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-            ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
-            ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+            al_set_data(ctx, this, buf);
+            al_set_size(ctx, this, 0);
         }
     } else {
         // Source might not be an ArrayList — init empty
         let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-        ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
-        ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+        al_set_data(ctx, this, buf);
+        al_set_size(ctx, this, 0);
     }
 
     Ok(None)
@@ -6812,10 +7631,10 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             // Init empty HashSet
-            let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+            let backing = alloc_backing_map(ctx);
             let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
             ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-            ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+            set_map_size(ctx, backing, 0);
             ctx.set_field(
                 backing,
                 MAP_FIELD_CAPACITY,
@@ -6827,22 +7646,28 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
 
     // Create backing HashMap for this set
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing = alloc_backing_map(ctx);
     let cap = MAP_DEFAULT_CAPACITY;
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing, 0);
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
 
-    // Try to read source as ArrayList
-    let (src_data, src_size) = al_state(ctx, source);
+    // Round 49 fix: route through `collect_collection_elements` so we
+    // honour every wrapper layout (ArrayList, Arrays$ArrayList,
+    // LinkedList, HashSet/LinkedHashSet, Collections$UnmodifiableList,
+    // …) — not just the synthetic ArrayList layout.  Previously
+    // `new LinkedHashSet(unmodifiableList)` (the dominant Spring Boot
+    // pattern in `AutoConfigurationImportSelector.removeDuplicates`,
+    // since `ImportCandidates.getCandidates()` returns
+    // `Collections.unmodifiableList(arrayList)`) silently produced an
+    // empty set — wiping every auto-configuration before filtering and
+    // surfacing as `MissingWebServerFactoryBeanException` at boot.
+    let elems = collect_collection_elements(ctx, source);
     let sentinel = Value::Int(1);
-    if let (Some(arr), size) = (src_data, src_size) {
-        for i in 0..size as usize {
-            let val = ctx.get_array_element(arr, i);
-            native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
-        }
+    for val in elems {
+        native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
     }
 
     Ok(None)
@@ -6860,7 +7685,7 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             // Init empty HashMap
             let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
             ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-            ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+            set_map_size(ctx, this, 0);
             ctx.set_field(
                 this,
                 MAP_FIELD_CAPACITY,
@@ -6874,11 +7699,27 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let cap = MAP_DEFAULT_CAPACITY;
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, this, 0);
     ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
-    // Copy entries from source
-    let entries = map_collect_entries(ctx, source);
+    // Copy entries from source.
+    // S111r24-fix: When source is a LinkedHashMap, its entries live in the
+    // Rust-side `lhm_overlay`, not in HashMap-style buckets. Walk the LHM
+    // insertion-order list first, falling back to HashMap bucket scanning
+    // for plain HashMaps / CHMs / etc.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    let lhm_head = lhm_get(ctx, source, "head", LHM_FIELD_HEAD);
+    if let Value::Object(Some(_)) = lhm_head {
+        let mut cur = lhm_head;
+        while let Value::Object(Some(node)) = cur {
+            let key = ctx.get_field(node, LHM_NODE_KEY);
+            let val = ctx.get_field(node, LHM_NODE_VALUE);
+            entries.push((key, val));
+            cur = ctx.get_field(node, LHM_NODE_AFTER);
+        }
+    } else {
+        entries = map_collect_entries(ctx, source);
+    }
     for (key, value) in entries {
         native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
     }
@@ -7037,7 +7878,27 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
     }
 }
 
+fn native_comparator_compare_method(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [this, a, b]
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let a = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let b = args.get(2).cloned().unwrap_or(Value::Object(None));
+    comparator_compare(ctx, this, a, b)
+}
+
 fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/util/Comparator$Native",
+        "compare",
+        "(Ljava/lang/Object;Ljava/lang/Object;)I",
+        native_comparator_compare_method,
+    );
     registry.register(
         "java/util/Comparator",
         "naturalOrder",
@@ -7909,6 +8770,38 @@ fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 // LinkedList = 3-field synthetic (field 0 = head Node, field 1 = tail Node, field 2 = Int size)
 // Node = 3-field synthetic (field 0 = prev Node, field 1 = next Node, field 2 = element value)
+//
+// As with LinkedHashMap, the synthetic slot indices alias real-JDK declared
+// fields once the real `java.util.LinkedList` class is loaded (real-JDK has
+// `size`, `first`, `last` after AbstractList's `modCount`). Storing state in
+// a per-object overlay map sidesteps the layout collision without altering
+// HashMap allocation/resolution. The instance node fields (`LL_NODE_*`) are
+// kept slot-based because `LinkedList$Node` is purely synthetic in our VM
+// (we never load the real class, since Node is private/inner and bytecode
+// doesn't `getfield` it directly).
+fn ll_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>>> =
+        std::sync::OnceLock::new();
+    OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+fn ll_get(this: ObjectRef, name: &'static str) -> Value {
+    ll_overlay()
+        .lock()
+        .unwrap()
+        .get(&(this.as_ptr() as usize))
+        .and_then(|m| m.get(name))
+        .copied()
+        .unwrap_or(Value::Object(None))
+}
+fn ll_set(this: ObjectRef, name: &'static str, v: Value) {
+    ll_overlay()
+        .lock()
+        .unwrap()
+        .entry(this.as_ptr() as usize)
+        .or_default()
+        .insert(name, v);
+}
+
 const LL_FIELD_HEAD: usize = 0;
 const LL_FIELD_TAIL: usize = 1;
 const LL_FIELD_SIZE: usize = 2;
@@ -7925,7 +8818,7 @@ fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
 }
 
 fn ll_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, LL_FIELD_SIZE) {
+    match ll_get(this, "size") {
         Value::Int(n) => n,
         _ => 0,
     }
@@ -7962,11 +8855,255 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     registry.register(c, "toString", "()Ljava/lang/String;", native_ll_to_string);
     registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ll_iterator);
+    // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
+    // fields via getfield; our overlay-based LL never writes those, so
+    // `List.sort` default-method path crashes with NoSuchElementException
+    // inside Spring's `processDeferredImportSelectors`. Override
+    // `listIterator()` / `listIterator(I)` to return a snapshot-array iterator
+    // with cursor + list_ref so `next`/`hasNext`/`set` work via our overlay.
+    registry.register(
+        c,
+        "listIterator",
+        "()Ljava/util/ListIterator;",
+        native_ll_list_iterator,
+    );
+    registry.register(
+        c,
+        "listIterator",
+        "(I)Ljava/util/ListIterator;",
+        native_ll_list_iterator_idx,
+    );
 
     // LinkedList$Itr
     let itr = "java/util/LinkedList$Itr";
     registry.register(itr, "hasNext", "()Z", native_ll_itr_has_next);
     registry.register(itr, "next", "()Ljava/lang/Object;", native_ll_itr_next);
+
+    // LinkedList$ListItr — synthetic 3-field overlay
+    //   field 0 = Object[] snapshot of list elements
+    //   field 1 = Int cursor (nextIndex)
+    //   field 2 = list ref (so set() can mutate the backing LinkedList node)
+    let lit = "java/util/LinkedList$ListItr";
+    registry.register(lit, "hasNext", "()Z", native_ll_listitr_has_next);
+    registry.register(lit, "next", "()Ljava/lang/Object;", native_ll_listitr_next);
+    registry.register(lit, "hasPrevious", "()Z", native_ll_listitr_has_previous);
+    registry.register(
+        lit,
+        "previous",
+        "()Ljava/lang/Object;",
+        native_ll_listitr_previous,
+    );
+    registry.register(lit, "nextIndex", "()I", native_ll_listitr_next_index);
+    registry.register(lit, "previousIndex", "()I", native_ll_listitr_previous_index);
+    registry.register(lit, "set", "(Ljava/lang/Object;)V", native_ll_listitr_set);
+    registry.register(lit, "remove", "()V", native_ll_listitr_remove_noop);
+    registry.register(lit, "add", "(Ljava/lang/Object;)V", native_ll_listitr_remove_noop);
+}
+
+fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    let size = ll_size(ctx, this) as usize;
+    let arr = alloc_ref_array(ctx, size);
+    let mut cur = match ll_get(this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let mut i = 0;
+    while let Some(node) = cur {
+        if i >= size {
+            break;
+        }
+        let elem = ctx.get_field(node, LL_NODE_ELEM);
+        ctx.set_array_element(arr, i, elem);
+        cur = match ctx.get_field(node, LL_NODE_NEXT) {
+            Value::Object(Some(n)) => Some(n),
+            _ => None,
+        };
+        i += 1;
+    }
+    arr
+}
+
+fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let arr = ll_snapshot_array(ctx, this);
+    let it = alloc_synthetic(ctx, "java/util/LinkedList$ListItr", 3);
+    ctx.set_field(it, 0, Value::Object(Some(arr)));
+    ctx.set_field(it, 1, Value::Int(0));
+    ctx.set_field(it, 2, Value::Object(Some(this)));
+    Ok(Some(Value::Object(Some(it))))
+}
+
+fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let arr = ll_snapshot_array(ctx, this);
+    let it = alloc_synthetic(ctx, "java/util/LinkedList$ListItr", 3);
+    ctx.set_field(it, 0, Value::Object(Some(arr)));
+    ctx.set_field(it, 1, Value::Int(idx.max(0)));
+    ctx.set_field(it, 2, Value::Object(Some(this)));
+    Ok(Some(Value::Object(Some(it))))
+}
+
+fn native_ll_listitr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr) as i32;
+    Ok(Some(Value::Int(if cursor < len { 1 } else { 0 })))
+}
+
+fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let len = ctx.array_length(arr) as i32;
+    if cursor >= len {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No more elements".to_string(),
+        }
+        .into());
+    }
+    let elem = ctx.get_array_element(arr, cursor as usize);
+    ctx.set_field(this, 1, Value::Int(cursor + 1));
+    Ok(Some(elem))
+}
+
+fn native_ll_listitr_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if cursor > 0 { 1 } else { 0 })))
+}
+
+fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No previous element".to_string(),
+            }
+            .into())
+        }
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) => r,
+        _ => {
+            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No previous element".to_string(),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if cursor <= 0 {
+        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            message: "No previous element".to_string(),
+        }
+        .into());
+    }
+    let elem = ctx.get_array_element(arr, (cursor - 1) as usize);
+    ctx.set_field(this, 1, Value::Int(cursor - 1));
+    Ok(Some(elem))
+}
+
+fn native_ll_listitr_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(cursor)))
+}
+
+fn native_ll_listitr_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(cursor - 1)))
+}
+
+fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Set the element at (cursor - 1) in both the snapshot array AND the
+    // backing LinkedList node, so `List.sort` actually sorts.
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let idx = cursor - 1;
+    if idx < 0 {
+        return Ok(None);
+    }
+    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+        ctx.set_array_element(arr, idx as usize, elem);
+    }
+    if let Value::Object(Some(list)) = ctx.get_field(this, 2) {
+        if let Some(node) = ll_node_at(ctx, list, idx) {
+            ctx.set_field(node, LL_NODE_ELEM, elem);
+        }
+    }
+    Ok(None)
+}
+
+fn native_ll_listitr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
 }
 
 fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7974,39 +9111,39 @@ fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(0));
+    ll_set(this, "head", Value::Object(None));
+    ll_set(this, "tail", Value::Object(None));
+    ll_set(this, "size", Value::Int(0));
     Ok(None)
 }
 
 fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(tail)) = ctx.get_field(this, LL_FIELD_TAIL) {
+    if let Value::Object(Some(tail)) = ll_get(this, "tail") {
         ctx.set_field(tail, LL_NODE_NEXT, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_PREV, Value::Object(Some(tail)));
-        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     } else {
         // Empty list
-        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
-        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 fn ll_link_first(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(head)) = ctx.get_field(this, LL_FIELD_HEAD) {
+    if let Value::Object(Some(head)) = ll_get(this, "head") {
         ctx.set_field(head, LL_NODE_PREV, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(head)));
-        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
     } else {
-        ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(node)));
-        ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 fn native_ll_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8047,7 +9184,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
     }
     if index < size / 2 {
         // Traverse from head
-        let mut cur = match ctx.get_field(this, LL_FIELD_HEAD) {
+        let mut cur = match ll_get(this, "head") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -8060,7 +9197,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
         Some(cur)
     } else {
         // Traverse from tail
-        let mut cur = match ctx.get_field(this, LL_FIELD_TAIL) {
+        let mut cur = match ll_get(this, "tail") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -8099,7 +9236,7 @@ fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
-    match ctx.get_field(this, LL_FIELD_HEAD) {
+    match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -8118,7 +9255,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    match ctx.get_field(this, LL_FIELD_TAIL) {
+    match ll_get(this, "tail") {
         Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, LL_NODE_ELEM))),
         _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -8128,7 +9265,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let head = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let head = match ll_get(this, "head") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -8138,19 +9275,19 @@ fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match next {
         Value::Object(Some(next_node)) => {
             ctx.set_field(next_node, LL_NODE_PREV, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(Some(next_node)));
+            ll_set(this, "head", Value::Object(Some(next_node)));
         }
         _ => {
-            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+            ll_set(this, "head", Value::Object(None));
+            ll_set(this, "tail", Value::Object(None));
         }
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size - 1));
+    ll_set(this, "size", Value::Int(size - 1));
     element
 }
 
 fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let tail = match ctx.get_field(this, LL_FIELD_TAIL) {
+    let tail = match ll_get(this, "tail") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -8160,14 +9297,14 @@ fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match prev {
         Value::Object(Some(prev_node)) => {
             ctx.set_field(prev_node, LL_NODE_NEXT, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(Some(prev_node)));
+            ll_set(this, "tail", Value::Object(Some(prev_node)));
         }
         _ => {
-            ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-            ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
+            ll_set(this, "head", Value::Object(None));
+            ll_set(this, "tail", Value::Object(None));
         }
     }
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(size - 1));
+    ll_set(this, "size", Value::Int(size - 1));
     element
 }
 
@@ -8235,7 +9372,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -8257,9 +9394,9 @@ fn native_ll_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ctx.set_field(this, LL_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_TAIL, Value::Object(None));
-    ctx.set_field(this, LL_FIELD_SIZE, Value::Int(0));
+    ll_set(this, "head", Value::Object(None));
+    ll_set(this, "tail", Value::Object(None));
+    ll_set(this, "size", Value::Int(0));
     Ok(None)
 }
 
@@ -8268,7 +9405,7 @@ fn native_ll_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    match ctx.get_field(this, LL_FIELD_HEAD) {
+    match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Ok(Some(Value::Object(None))),
     }
@@ -8295,7 +9432,7 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let size = ll_size(ctx, this) as usize;
     let arr = alloc_ref_array(ctx, size);
-    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -8322,7 +9459,7 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this) as usize;
     let mut parts = Vec::with_capacity(size);
-    let mut cur_opt = match ctx.get_field(this, LL_FIELD_HEAD) {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -8345,7 +9482,7 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let head = ctx.get_field(this, LL_FIELD_HEAD);
+    let head = ll_get(this, "head");
     let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 2);
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
@@ -8400,6 +9537,63 @@ const LHM_FIELD_CAPACITY: usize = 2;
 const LHM_FIELD_HEAD: usize = 3;
 const LHM_FIELD_TAIL: usize = 4;
 
+// Real-JDK LinkedHashMap inherits from HashMap, which has many declared fields
+// (`table`, `entrySet`, `size`, `modCount`, `threshold`, `loadFactor`) plus
+// AbstractMap (`keySet`, `values`) and LinkedHashMap's own (`head`, `tail`,
+// `accessOrder`, `putMode`). The synthetic 5-slot layout (buckets, size,
+// capacity, head, tail at indices 0..4) only matches a stub; against the real
+// JDK the indices line up with completely different fields, so writes to the
+// `LHM_FIELD_SIZE=1` slot land in `AbstractMap.values` (a Collection ref) and
+// reads of size find Object(None), producing `LinkedHashMap.size()==0` even
+// after multiple puts. (Fortunately the `buckets` slot also gets aliased to a
+// reference field, so the chain itself stays consistent for get/put — only
+// `size()` / `isEmpty()` / iteration short-circuit.)
+//
+// Spring 5.0's `LinkedMultiValueMap.addAll` calls
+// `targetMap.computeIfAbsent(key, lambda)` on a `LinkedHashMap` and then walks
+// `targetMap.entrySet()`; with the synthetic offsets, both the size-based
+// short-circuit in `Map.computeIfAbsent` and the iterator's emptiness check
+// see `size==0`, so the cache map ends up empty and `loadFactoryNames` returns
+// 0 — precisely the SportMe `ServletWebServerFactory` missing-bean failure.
+//
+// These helpers route to a side-table when the synthetic slot indices would
+// alias real-JDK declared fields. Storing LinkedHashMap state externally,
+// keyed by ObjectRef, sidesteps the layout-mismatch problem entirely without
+// touching the (other-agent-owned) HashMap allocation/resolution logic.
+//
+// We try a slot-based read/write first via the legacy `LHM_FIELD_*` indices,
+// because (a) prior callers and the JIT may have populated those slots in
+// stub-only configurations, and (b) it costs only one map lookup. When the
+// stored value clearly isn't the synthetic value we expected (e.g. `size`
+// reads back as Object(None) because slot 1 aliases AbstractMap.values), we
+// fall through to the side-table.
+//
+// IMPORTANT: this is a per-object overlay; iteration helpers continue to walk
+// the synthetic linked-list pointers, which now live in the side-table too.
+use std::sync::Mutex;
+use std::collections::HashMap as StdHashMap;
+fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<String, Value>>>> =
+        std::sync::OnceLock::new();
+    OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+fn lhm_overlay_key(this: ObjectRef) -> usize {
+    this.as_ptr() as usize
+}
+fn lhm_get(_ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
+    let m = lhm_overlay().lock().unwrap();
+    m.get(&lhm_overlay_key(this))
+        .and_then(|inner| inner.get(name))
+        .copied()
+        .unwrap_or(Value::Object(None))
+}
+fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
+    let mut m = lhm_overlay().lock().unwrap();
+    m.entry(lhm_overlay_key(this))
+        .or_default()
+        .insert(name.to_string(), v);
+}
+
 const LHM_NODE_KEY: usize = 0;
 const LHM_NODE_VALUE: usize = 1;
 const LHM_NODE_HASH: usize = 2;
@@ -8409,17 +9603,23 @@ const LHM_NODE_AFTER: usize = 5;
 const LHM_NODE_NUM_FIELDS: usize = 6;
 
 fn lhm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
-    let buckets = match ctx.get_field(this, LHM_FIELD_BUCKETS) {
+    let buckets = match lhm_get(ctx, this, "table", LHM_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
     };
-    let size = match ctx.get_field(this, LHM_FIELD_SIZE) {
+    let size = match lhm_get(ctx, this, "size", LHM_FIELD_SIZE) {
         Value::Int(s) => s,
         _ => 0,
     };
-    let cap = match ctx.get_field(this, LHM_FIELD_CAPACITY) {
-        Value::Int(c) => c,
-        _ => MAP_DEFAULT_CAPACITY as i32,
+    // Real-JDK HashMap has no explicit `capacity` field — derive from the
+    // bucket array length when present. Falls back to the synthetic slot if
+    // we couldn't get a buckets array (e.g. uninitialised stub).
+    let cap = match buckets {
+        Some(arr) => ctx.array_length(arr) as i32,
+        None => match lhm_get(ctx, this, "__capacity", LHM_FIELD_CAPACITY) {
+            Value::Int(c) => c,
+            _ => MAP_DEFAULT_CAPACITY as i32,
+        },
     };
     (buckets, size, cap)
 }
@@ -8436,15 +9636,15 @@ fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i
 }
 
 fn lhm_link_tail(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
-    let tail = ctx.get_field(this, LHM_FIELD_TAIL);
+    let tail = lhm_get(ctx, this, "tail", LHM_FIELD_TAIL);
     if let Value::Object(Some(t)) = tail {
         ctx.set_field(t, LHM_NODE_AFTER, Value::Object(Some(node)));
         ctx.set_field(node, LHM_NODE_BEFORE, Value::Object(Some(t)));
     } else {
         // Empty list — node becomes head
-        ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(Some(node)));
+        lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(Some(node)));
     }
-    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(Some(node)));
+    lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(Some(node)));
 }
 
 fn lhm_unlink(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
@@ -8455,13 +9655,13 @@ fn lhm_unlink(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
     if let Value::Object(Some(b)) = before {
         ctx.set_field(b, LHM_NODE_AFTER, after);
     } else {
-        ctx.set_field(this, LHM_FIELD_HEAD, after);
+        lhm_set(ctx, this, "head", LHM_FIELD_HEAD, after);
     }
     // Fix after's before
     if let Value::Object(Some(a)) = after {
         ctx.set_field(a, LHM_NODE_BEFORE, before);
     } else {
-        ctx.set_field(this, LHM_FIELD_TAIL, before);
+        lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, before);
     }
 }
 
@@ -8471,7 +9671,7 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let new_buckets = alloc_ref_array(ctx, new_cap);
 
     // Walk insertion-order list and rehash
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let hash = match ctx.get_field(node, LHM_NODE_HASH) {
             Value::Int(h) => h,
@@ -8492,12 +9692,12 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
 
-    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size));
-    ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
+    lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size));
+    lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
 }
 
-fn lhm_find_node(ctx: &dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
+fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
     let (buckets, _, cap) = lhm_state(ctx, this);
     let buckets = buckets?;
     let (hash, is_null) = match key {
@@ -8528,6 +9728,7 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register(c, "<init>", "()V", native_lhm_init);
     registry.register(c, "<init>", "(I)V", native_lhm_init_capacity);
+    registry.register(c, "<init>", "(Ljava/util/Map;)V", native_lhm_init_from_map);
     registry.register(c, "size", "()I", native_lhm_size);
     registry.register(c, "isEmpty", "()Z", native_lhm_is_empty);
     registry.register(
@@ -8584,15 +9785,61 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
         native_lhm_for_each,
     );
     registry.register(c, "putAll", "(Ljava/util/Map;)V", native_lhm_put_all);
+
+    // computeIfAbsent on LinkedHashMap must route through the LHM put/get
+    // natives (which use the overlay-backed slots), NOT through the HashMap
+    // versions inherited via dispatch — otherwise the put no-ops because
+    // HashMap's slot indices alias different real-JDK fields on a LHM object.
+    registry.register(
+        c,
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+        native_lhm_compute_if_absent,
+    );
+}
+
+fn native_lhm_compute_if_absent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let function = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // If the key is already present, return the existing value unchanged.
+    let existing = native_lhm_get(ctx, &[Value::Object(Some(this)), key])?;
+    if let Some(Value::Object(Some(_))) = existing {
+        return Ok(existing);
+    }
+
+    // Otherwise call function.apply(key) and store the (non-null) result.
+    let result = ctx.invoke_virtual(
+        function,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key],
+    )?;
+    let new_val = result.unwrap_or(Value::Object(None));
+    if let Value::Object(None) = new_val {
+        return Ok(Some(Value::Object(None)));
+    }
+    native_lhm_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
 }
 
 fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, LHM_FIELD_CAPACITY, Value::Int(cap as i32));
-    ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(None));
+    lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(0));
+    lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(cap as i32));
+    lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(None));
+    lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(None));
 }
 
 fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8614,6 +9861,27 @@ fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => MAP_DEFAULT_CAPACITY,
     };
     lhm_init_with_cap(ctx, this, cap);
+    Ok(None)
+}
+
+// S111r14: LinkedHashMap copy-constructor — see `native_map_init_from_map`
+// for the rationale. DateTimeFormatterBuilder.appendText reaches us via
+// `new LinkedHashMap<>(map)`.
+fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    lhm_init_with_cap(ctx, this, MAP_DEFAULT_CAPACITY);
+    let src = args.get(1).copied().unwrap_or(Value::Object(None));
+    // S111r24-fix: Route through `native_lhm_put_all` so insertion-order
+    // linkage (head/tail) is established for each copied entry. Calling
+    // `native_map_put_all` would invoke `native_map_put` which writes
+    // directly into HashMap-style bucket nodes without `lhm_link_tail`,
+    // leaving the LHM's insertion-order list empty and the entries
+    // invisible to `entrySet()`/`putAll(...)` consumers like Spring's
+    // `AnnotationAttributes(Map)` copy constructor.
+    native_lhm_put_all(ctx, &[Value::Object(Some(this)), src])?;
     Ok(None)
 }
 
@@ -8649,9 +9917,17 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Check for resize
-    let (_, size, cap) = lhm_state(ctx, this);
-    if size + 1 > (cap * 3) / 4 {
+    // Check for resize. Also initialize table when buckets is None
+    // (e.g. `org/springframework/core/annotation/AnnotationAttributes`
+    // constructed via Spring's `new AnnotationAttributes(annotationType, false)`
+    // — LinkedHashMap.<init>() runs as JDK bytecode and leaves our overlay
+    // empty until the first put. Without this init the put would silently
+    // no-op, dropping every key Spring writes via `TypeMappedAnnotation.asMap`
+    // and surfacing as `IllegalArgumentException: Attribute 'type' not found
+    // in attributes for annotation [...]ComponentScan$Filter` deep in
+    // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`).
+    let (initial_buckets, size, cap) = lhm_state(ctx, this);
+    if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
         lhm_resize(ctx, this);
     }
 
@@ -8682,7 +9958,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Link at tail of insertion-order list
     lhm_link_tail(ctx, this, new_node);
 
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size + 1));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size + 1));
     Ok(Some(Value::Object(None)))
 }
 
@@ -8746,7 +10022,7 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             // Unlink from insertion-order list
             lhm_unlink(ctx, this, node);
 
-            ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(size - 1));
+            lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size - 1));
             return Ok(Some(old_value));
         }
 
@@ -8777,7 +10053,7 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let val = ctx.get_field(node, LHM_NODE_VALUE);
         if values_equal(ctx, &val, &target) {
@@ -8795,16 +10071,16 @@ fn native_lhm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (_, _, cap) = lhm_state(ctx, this);
     let new_buckets = alloc_ref_array(ctx, cap as usize);
-    ctx.set_field(this, LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    ctx.set_field(this, LHM_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, LHM_FIELD_HEAD, Value::Object(None));
-    ctx.set_field(this, LHM_FIELD_TAIL, Value::Object(None));
+    lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(0));
+    lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(None));
+    lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(None));
     Ok(None)
 }
 
 fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut keys = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         keys.push(ctx.get_field(node, LHM_NODE_KEY));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
@@ -8814,7 +10090,7 @@ fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 fn lhm_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut vals = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         vals.push(ctx.get_field(node, LHM_NODE_VALUE));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
@@ -8846,7 +10122,7 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let mut entries = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
@@ -8865,7 +10141,7 @@ fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(Some(ctx.create_string("{}"))))),
     };
     let mut parts = Vec::new();
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
@@ -8915,7 +10191,7 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let mut cur = ctx.get_field(this, LHM_FIELD_HEAD);
+    let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
@@ -8940,10 +10216,17 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
 
-    // Collect entries from source map (walk either LHM insertion list or HashMap buckets)
+    // Collect entries from source map (walk either LHM insertion list or HashMap buckets).
+    // S111r24-fix: LHM keeps `head`/`tail`/`table` in the Rust-side overlay
+    // (`lhm_overlay`), NOT in Java field slots. Use `lhm_get` to retrieve
+    // them; `ctx.get_field(source, LHM_FIELD_HEAD)` always returns
+    // `Object(None)` for a real LHM allocated by our natives, which made
+    // `putAll` and `new LHM<>(map)` silently produce an empty map. This
+    // broke any downstream code that relied on copy-constructing a
+    // LinkedHashMap from another LinkedHashMap, e.g. Spring's
+    // `AnnotationAttributes(Map<String,Object>)`.
     let mut entries = Vec::new();
-    // Try LHM head first (5-field object)
-    let head = ctx.get_field(source, LHM_FIELD_HEAD);
+    let head = lhm_get(ctx, source, "head", LHM_FIELD_HEAD);
     if let Value::Object(Some(_)) = head {
         let mut cur = head;
         while let Value::Object(Some(node)) = cur {
@@ -8953,7 +10236,8 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             cur = ctx.get_field(node, LHM_NODE_AFTER);
         }
     } else {
-        // Fall back to HashMap bucket scan
+        // Fall back to HashMap bucket scan when source isn't an LHM (e.g.
+        // a plain HashMap, ConcurrentHashMap, etc.).
         let (buckets, _, cap) = map_state(ctx, source);
         if let Some(b) = buckets {
             for i in 0..(cap as usize) {
@@ -8965,6 +10249,10 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     nv = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
+        } else {
+            // Last resort: route through map_collect_entries which has
+            // additional logic for TreeMap / ConcurrentHashMap / Properties.
+            entries.extend(map_collect_entries(ctx, source));
         }
     }
 
@@ -10164,15 +11452,81 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
-    // Try ArrayList layout first (field 0 = Object[], field 1 = Int size)
+    // Round 49 fix: Collections$UnmodifiableCollection / $UnmodifiableList
+    // wrap their backing collection in field `c`.  Recurse into that to
+    // surface the wrapped list's elements — without this, callers like
+    // `new LinkedHashSet(unmodifiableList)` (Spring's
+    // `AutoConfigurationImportSelector.removeDuplicates`) silently see
+    // zero elements and the auto-configuration pipeline collapses.
+    let cid = ctx.class_id_of_object(coll);
+    if let Some(cls_name) = ctx.class_name_of_id(cid) {
+        if cls_name.starts_with("java/util/Collections$Unmodifiable")
+            || cls_name.starts_with("java/util/Collections$Synchronized")
+            || cls_name.starts_with("java/util/Collections$Checked")
+            || cls_name == "java/util/Collections$SingletonList"
+            || cls_name == "java/util/Collections$SingletonSet"
+        {
+            if let Value::Object(Some(inner)) = ctx.get_field_by_name(coll, "c") {
+                return collect_collection_elements(ctx, inner);
+            }
+            // SingletonList stores the element in field `element`.
+            if let Value::Object(Some(_)) = ctx.get_field_by_name(coll, "element") {
+                let v = ctx.get_field_by_name(coll, "element");
+                return vec![v];
+            }
+        }
+    }
+    // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
+    // field-index resolver so we honour the real-JDK layout
+    // (`modCount`/`elementData`/`size` slots from AbstractList/ArrayList) —
+    // not just the synthetic (0=data, 1=size) layout. Without this,
+    // `HashSet.addAll(arrayList)` silently sees zero elements when running
+    // against the real JDK, which is the canonical victim for Spring's
+    // `AnnotationTypeMapping.processAliases` populating `claimedAliases`
+    // and surfaces as the `@AliasFor ... is not meta-present` chain.
+    {
+        let (data_slot, size_slot, _) = al_slots(ctx);
+        let f_data = ctx.get_field(coll, data_slot);
+        let f_size = ctx.get_field(coll, size_slot);
+        if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                let len = ctx.array_length(arr);
+                if size >= 0 && len >= size as usize {
+                    let mut elems = Vec::with_capacity(size as usize);
+                    for i in 0..(size as usize) {
+                        elems.push(ctx.get_array_element(arr, i));
+                    }
+                    return elems;
+                }
+            }
+        }
+    }
+    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size)
     let f0 = ctx.get_field(coll, 0);
     let f1 = ctx.get_field(coll, 1);
     if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
-        // Check if field 0 is an array (ArrayList/Vector/Stack pattern)
-        let len = ctx.array_length(arr);
-        if len >= size as usize {
-            let mut elems = Vec::with_capacity(size as usize);
-            for i in 0..(size as usize) {
+        if ctx.heap_kind_of(arr) == ObjectKind::Array {
+            let len = ctx.array_length(arr);
+            if size >= 0 && len >= size as usize {
+                let mut elems = Vec::with_capacity(size as usize);
+                for i in 0..(size as usize) {
+                    elems.push(ctx.get_array_element(arr, i));
+                }
+                return elems;
+            }
+        }
+    }
+    // S111r-bug-fix: Arrays$ArrayList — single field `a` (Object[]), no size.
+    // `Arrays.asList(...)` is heavily used in JDK callers (and Spring uses
+    // it indirectly through `Collections.singletonList` / similar wrappers)
+    // and has a different layout than `java.util.ArrayList`.
+    if let Value::Object(Some(arr)) = f0 {
+        if ctx.heap_kind_of(arr) == ObjectKind::Array {
+            let len = ctx.array_length(arr);
+            // Heuristic: if this object has at most a couple of fields and
+            // field 0 is a ref-array, treat it as an array-backed wrapper.
+            let mut elems = Vec::with_capacity(len);
+            for i in 0..len {
                 elems.push(ctx.get_array_element(arr, i));
             }
             return elems;
@@ -10190,8 +11544,17 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             return elems;
         }
     }
-    // Try HashSet layout (field 0 = HashMap backing)
-    // For simplicity, try calling iterator
+    // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
+    // Walk the backing map's bucket nodes and collect keys.
+    if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
+        // Verify it actually is a HashMap-like (slot 0 = bucket array).
+        let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
+        if let Value::Object(Some(arr)) = s0 {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                return map_collect_keys(ctx, backing);
+            }
+        }
+    }
     Vec::new()
 }
 
@@ -10225,7 +11588,7 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             write_idx += 1;
         }
     }
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(write_idx as i32));
+    al_set_size(ctx, this, write_idx as i32);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -10258,7 +11621,7 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             modified = true;
         }
     }
-    ctx.set_field(this, AL_FIELD_SIZE, Value::Int(write_idx as i32));
+    al_set_size(ctx, this, write_idx as i32);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -10476,15 +11839,28 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
     }
 }
 
-/// Generic snapshot-based iterator: field 0 = Object[] snapshot, field 1 = Int cursor
+/// Generic snapshot-based iterator: field 0 = Object[] snapshot, field 1 = Int cursor.
+///
+/// Real-JDK fallback: this native is registered at the `java/util/Iterator`
+/// *interface* level (see `register_iterator_protocol_natives`) so it
+/// otherwise intercepts every real iterator (e.g. `ArrayList$Itr`, whose
+/// field 0 is an `int cursor`, not an `Object[]`). When field 0 isn't an
+/// array, dispatch to the receiver's concrete bytecode by name.
 fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(r)) => r,
-        _ => return Ok(Some(Value::Int(0))),
+        Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
+        _ => {
+            let cid = ctx.class_id_of_object(this);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cn.is_empty() || cn == "java/util/Iterator" || cn == "java/util/ListIterator" {
+                return Ok(Some(Value::Int(0)));
+            }
+            return ctx.invoke(&cn, "hasNext", "()Z", &[Value::Object(Some(this))]);
+        }
     };
     let cursor = match ctx.get_field(this, 1) {
         Value::Int(v) => v,
@@ -10499,13 +11875,19 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Real-JDK fallback: see `native_snapshot_itr_has_next` doc comment.
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(r)) => r,
+        Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
         _ => {
+            let cid = ctx.class_id_of_object(this);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if !cn.is_empty() && cn != "java/util/Iterator" && cn != "java/util/ListIterator" {
+                return ctx.invoke(&cn, "next", "()Ljava/lang/Object;", &[Value::Object(Some(this))]);
+            }
             return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
             }
-            .into())
+            .into());
         }
     };
     let cursor = match ctx.get_field(this, 1) {
@@ -11162,7 +12544,8 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (data_opt, size, _) = tm_state(ctx, this);
     // Return an ArrayList with values in order
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
     if let Some(data) = data_opt {
@@ -11171,8 +12554,8 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ctx.set_array_element(buf, i, v);
         }
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(size));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, size);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -11183,7 +12566,8 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let (data_opt, size, _) = tm_state(ctx, this);
     // Return an ArrayList of Map$Entry objects in sorted order
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
     if let Some(data) = data_opt {
@@ -11194,8 +12578,8 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             ctx.set_array_element(buf, i, Value::Object(Some(entry)));
         }
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(size));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, size);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -12353,6 +13737,7 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         native_ts_sub_set,
     );
     registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";
@@ -12433,7 +13818,7 @@ const CHM_DEFAULT_SEGMENTS: usize = 16;
 const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
 
 /// Compute hash for a key value (reuses map_hash_key for object keys).
-fn chm_key_hash(ctx: &dyn NativeContext, key: &Value) -> i32 {
+fn chm_key_hash(ctx: &mut dyn NativeContext, key: &Value) -> i32 {
     match key {
         Value::Object(Some(k)) => map_hash_key(ctx, *k),
         _ => 0,
@@ -12535,7 +13920,7 @@ fn chm_init_segments(
         let seg = ctx.alloc_object(ClassId::new(0), MAP_NUM_FIELDS);
         let buckets = alloc_ref_array(ctx, cap_per_segment);
         ctx.set_field(seg, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-        ctx.set_field(seg, MAP_FIELD_SIZE, Value::Int(0));
+        set_map_size(ctx, seg, 0);
         ctx.set_field(seg, MAP_FIELD_CAPACITY, Value::Int(cap_per_segment as i32));
         let _ = ctx.set_array_element(segments, i, Value::Object(Some(seg)));
     }
@@ -12667,6 +14052,12 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
         "newKeySet",
         "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
         native_chm_new_key_set,
+    );
+    r.register(
+        c,
+        "newKeySet",
+        "(I)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+        native_chm_new_key_set_cap,
     );
     r.register(
         c,
@@ -13146,11 +14537,11 @@ fn native_chm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let keys = chm_collect_all_keys(ctx, this);
     let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing = alloc_backing_map(ctx);
     let cap = (keys.len() * 2).max(MAP_DEFAULT_CAPACITY).next_power_of_two();
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing, 0);
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, 0, Value::Object(Some(backing)));
     let sentinel = Value::Object(Some(set)); // reuse set ref as sentinel value
@@ -13182,19 +14573,37 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let entries = chm_collect_all_entries(ctx, this);
-    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
-    let cap = (entries.len() * 2).max(MAP_DEFAULT_CAPACITY).next_power_of_two();
+    // Build a HashSet of Map.Entry objects. Each entry must be a real
+    // `java/util/Map$Entry` (not raw Object cid=0) so user-bytecode
+    // `checkcast Map$Entry` succeeds after iterating entrySet() — see
+    // Spring DefaultSingletonBeanRegistry.destroyBean iterating the
+    // dependentBeanMap (a ConcurrentHashMap) entrySet.
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let backing = alloc_backing_map(ctx);
+    let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing, 0);
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    for (key, value) in entries {
-        let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
-        ctx.set_field(entry, NODE_FIELD_KEY, key);
-        ctx.set_field(entry, NODE_FIELD_VALUE, value);
-        native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), Value::Object(Some(entry))])?;
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
+    for (key, value) in &entries {
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+        ctx.set_field(entry_obj, 0, *key);
+        ctx.set_field(entry_obj, 1, *value);
+
+        let hash = ctx.identity_hash_code(entry_obj);
+        let (b, size, c) = map_state(ctx, backing);
+        let b = b.unwrap();
+        let idx = map_bucket_index(hash, c);
+        let existing = ctx.get_array_element(b, idx);
+        let head = match existing {
+            Value::Object(obj_opt) => obj_opt,
+            _ => None,
+        };
+        let sentinel = Value::Int(1);
+        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        set_map_size(ctx, backing, size + 1);
     }
     Ok(Some(Value::Object(Some(set))))
 }
@@ -13375,10 +14784,10 @@ fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let backing = alloc_backing_map(ctx);
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing, MAP_FIELD_SIZE, Value::Int(0));
+    set_map_size(ctx, backing, 0);
     ctx.set_field(
         backing,
         MAP_FIELD_CAPACITY,
@@ -13386,6 +14795,14 @@ fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     );
     ctx.set_field(set, 0, Value::Object(Some(backing)));
     Ok(Some(Value::Object(Some(set))))
+}
+
+fn native_chm_new_key_set_cap(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Ignore capacity hint; behave identically to no-arg newKeySet().
+    // KeySetView's Java-side add() calls CHM.putVal which uses the native
+    // CHM's segment fields that we don't populate, so we must back this with
+    // our HashSet synthetic instead of letting a real KeySetView form.
+    native_chm_new_key_set(ctx, _args)
 }
 
 fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13813,11 +15230,66 @@ fn props_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef
     keys
 }
 
-/// propertyNames() -> returns an Enumeration-like iterator
-/// We return a snapshot ArrayList iterator (same as keySet iterator)
+/// propertyNames() -> returns a real Enumeration<Object> over the property keys.
+///
+/// Previously this delegated to `keySet`, which returns a `HashSet`. HashSet
+/// doesn't implement `Enumeration`, so callers like Kafka's
+/// `Utils.propsToMap` that invoke `hasMoreElements()` / `nextElement()` on
+/// the result fell through to the snapshot-iterator native's generic-Iterator
+/// fallback, which couldn't find a `hasNext` method on HashSet and silently
+/// returned 0 — yielding an empty enumeration and a Properties-derived map
+/// with zero entries. Kafka then reported `Missing required configuration
+/// "process.roles"` even though server.properties listed it.
+///
+/// Now we allocate the same 2-field snapshot object the Enumeration interface
+/// natives expect (field 0 = `Object[]` snapshot, field 1 = `int` cursor).
 fn native_props_property_names(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Just delegate to keySet which returns a HashSet, then get its iterator
-    native_map_key_set(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // JDK 25 `Properties` stores entries in a private `ConcurrentHashMap map`
+    // field, NOT in the inherited `Hashtable.table` array. Real-JDK
+    // `Properties.size()` / `propertyNames()` / `entrySet()` bytecode all
+    // route through `this.map`. Walk that map when present; fall back to the
+    // legacy slot-0 backing for synthetic Properties allocations.
+    let backing = match ctx.resolve_field_index("java/util/Properties", "map") {
+        Some(slot) if slot < ctx.object_num_fields(this) => match ctx.get_field(this, slot) {
+            Value::Object(Some(m)) => Some(m),
+            _ => None,
+        },
+        _ => None,
+    };
+    let keys = match backing {
+        Some(m) => {
+            // `Properties.map` is declared as `ConcurrentHashMap`. Use the
+            // CHM-segmented key collector — `map_collect_keys` walks slot 0
+            // as a plain Node[] and only finds the head segment objects on
+            // a real-JDK CHM, yielding the wrong key type.
+            let cid = ctx.class_id_of_object(m);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cn == "java/util/concurrent/ConcurrentHashMap"
+                || cn.starts_with("java/util/concurrent/ConcurrentHashMap$")
+            {
+                chm_collect_all_keys(ctx, m)
+            } else {
+                map_collect_keys(ctx, m)
+            }
+        }
+        None => map_collect_keys(ctx, this),
+    };
+    let arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    // Use our internal SnapshotEnumeration synthetic class so the
+    // snapshot-iterator natives (`hasMoreElements`/`nextElement` registered on
+    // this class name) win virtual dispatch. Field 0 = Object[] snapshot,
+    // field 1 = cursor.
+    let en = alloc_synthetic(ctx, "rustjvm/internal/SnapshotEnumeration", 2);
+    ctx.set_field(en, 0, Value::Object(Some(arr)));
+    ctx.set_field(en, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(en))))
 }
 
 /// stringPropertyNames() -> Set<String>
@@ -14020,6 +15492,22 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_snapshot_itr_next,
     );
+
+    // Snapshot Enumeration used by `Properties.propertyNames()` and similar
+    // call sites that need a real Enumeration over a fixed key list. We can't
+    // reuse `Collections$EmptyEnumeration` because its real-JDK bytecode for
+    // `hasMoreElements` is hardcoded to `iconst_0; ireturn` and wins concrete
+    // dispatch over the interface-level Enumeration native, so a non-empty
+    // snapshot built on EmptyEnumeration appears empty. Register concrete
+    // overrides on a dedicated synthetic class.
+    let sne = "rustjvm/internal/SnapshotEnumeration";
+    r.register(sne, "hasMoreElements", "()Z", native_snapshot_itr_has_next);
+    r.register(
+        sne,
+        "nextElement",
+        "()Ljava/lang/Object;",
+        native_snapshot_itr_next,
+    );
 }
 
 /// Identity — just returns the first argument (used for unmodifiable/synchronized wrappers)
@@ -14028,14 +15516,14 @@ fn native_collections_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
 }
 
 fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let inner_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
     Ok(Some(Value::Object(Some(set))))
@@ -14055,7 +15543,7 @@ fn native_collections_empty_iterator(
 fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().cloned().unwrap_or(Value::Object(None));
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let inner_map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
     // Add elem
@@ -14072,7 +15560,7 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().cloned().unwrap_or(Value::Object(None));
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
-    let map = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     native_map_put(ctx, &[Value::Object(Some(map)), key, val])?;
     Ok(Some(Value::Object(Some(map))))
@@ -14231,13 +15719,14 @@ fn native_collections_n_copies(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let arr = alloc_ref_array(ctx, n.max(0) as usize);
     for i in 0..n.max(0) as usize {
         ctx.set_array_element(arr, i, val);
     }
-    ctx.set_field(list, AL_FIELD_DATA, Value::Object(Some(arr)));
-    ctx.set_field(list, AL_FIELD_SIZE, Value::Int(n.max(0)));
+    al_set_data(ctx, list, arr);
+    al_set_size(ctx, list, n.max(0));
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -14900,12 +16389,28 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/ListIterator;",
         native_empty_iterator,
     );
+    // Bug fix: previously this allocated `Collections$EmptyIterator` as an
+    // Enumeration. EmptyIterator is an Iterator (only has hasNext/next/remove)
+    // and lacks hasMoreElements/nextElement, so any subsequent
+    // `Enumeration.hasMoreElements()` dispatch (e.g. from
+    // `BuiltinClassLoader$1.hasNext`) raised NoSuchMethodError. Allocate the
+    // correct `Collections$EmptyEnumeration` class so real-JDK bytecode
+    // (`hasMoreElements`/`nextElement` defined on EmptyEnumeration itself)
+    // resolves normally.
     r.register(
         colls,
         "emptyEnumeration",
         "()Ljava/util/Enumeration;",
-        native_empty_iterator,
+        native_empty_enumeration,
     );
+}
+
+fn native_empty_enumeration(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let arr = alloc_ref_array(ctx, 0);
+    let en = alloc_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 2);
+    ctx.set_field(en, 0, Value::Object(Some(arr)));
+    ctx.set_field(en, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(en))))
 }
 
 fn native_itr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -15008,8 +16513,19 @@ fn native_spliterator_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Synthetic-spliterator fast path: field 0 is a backing Object[]. If it
+    // isn't, this native is being invoked on a real-JDK Spliterator subclass
+    // whose field-0 is something else (e.g. an Iterator inside
+    // `ServiceLoaderUtil$ServiceLoaderSpliterator`). Returning Int(0) here
+    // would silently terminate the caller's stream — instead, signal "no
+    // synthetic state" by returning Int(0) only AFTER trying the JDK default
+    // method on the receiver class. The dispatcher in `invoke_on_class_shared_inner`
+    // now prefers default-method bytecode over this native when the receiver
+    // is a non-synthetic class, so reaching here typically means the
+    // receiver IS our synthetic shape; the array guard protects against
+    // edge cases where dispatch routes the wrong way.
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
         _ => return Ok(Some(Value::Int(0))),
     };
     let cursor = match ctx.get_field(this, 1) {
@@ -15042,9 +16558,38 @@ fn native_spliterator_for_each_remaining(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // Synthetic-spliterator fast path: field 0 is a backing Object[]. If it
+    // isn't, this native is being invoked on a real-JDK Spliterator subclass
+    // (e.g. log4j's `ServiceLoaderUtil$ServiceLoaderSpliterator`, where
+    // field 0 is an Iterator) — `array_length` on that would surface the
+    // ARRAY-LEN-GUARD warning and the rest of the stream pipeline collapses.
+    // Fall back to driving the subclass's own `tryAdvance` until exhausted.
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(None),
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+        _ => {
+            // Non-synthetic Spliterator subclass — drive its own tryAdvance
+            // (which now correctly dispatches to the JDK default-method
+            // bytecode for real-JDK subclasses, thanks to the
+            // SPLITERATOR-FALLTHROUGH change in `invoke_on_class_shared_inner`).
+            let mut iters: u64 = 0;
+            loop {
+                iters += 1;
+                if iters > 10_000_000 {
+                    break;
+                }
+                let r = ctx.invoke_virtual(
+                    this,
+                    "tryAdvance",
+                    "(Ljava/util/function/Consumer;)Z",
+                    &[Value::Object(Some(consumer))],
+                )?;
+                match r {
+                    Some(Value::Int(1)) => continue,
+                    _ => break,
+                }
+            }
+            return Ok(None);
+        }
     };
     let mut cursor = match ctx.get_field(this, 1) {
         Value::Int(v) => v as usize,

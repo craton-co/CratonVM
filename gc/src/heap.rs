@@ -894,8 +894,16 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             Value::Object(_) => value,
             // A primitive landing where a reference is declared is a verifier
             // violation; degrade to null rather than surface a bogus Value
-            // variant to native code.
-            Value::Int(0) | Value::Long(0) => Value::Object(None),
+            // variant to native code. S111r29: extend this to ALL Int/Long
+            // values (not just zero) — synthetic init paths historically wrote
+            // `Int(capacity)` to slots that the real-JDK class layout declares
+            // as references (e.g. `HashMap.table: [Ljava/util/HashMap$Node;`),
+            // which then aborted JDK bytecode `arraylength` with
+            //   `expected object reference, got int(N)`. Coercing the bogus
+            // primitive to null lets `HashMap.resize()`'s
+            //   `(oldTab == null) ? 0 : oldTab.length` branch handle the
+            // never-initialized case correctly.
+            Value::Int(_) | Value::Long(_) => Value::Object(None),
             // WP4.1 closer — under heavy AQS contention, the invoke-arg pop
             // boundary surfaces an untagged 64-bit raw-pointer slot as
             // `Value::Double` because `CompactValue::to_value()` decodes any

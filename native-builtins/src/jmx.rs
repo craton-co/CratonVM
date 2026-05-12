@@ -1577,7 +1577,32 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
         cls,
         "getAttribute",
         "(Ljavax/management/ObjectName;Ljava/lang/String;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            // WildFly `BootstrapImpl.internalBootstrap` calls
+            //   server.getAttribute(ObjectName("java.lang:type=OperatingSystem"),
+            //                       "MaxFileDescriptorCount")
+            // then `.toString()` + `Long.parseLong` — NPE if we return
+            // null. Return a String "8192" so parseLong succeeds and the
+            // fd-limit check is skipped (8192 >= 4096). For any other
+            // attribute, returning a generic non-null string lets
+            // `toString()` callers move on; callers that need a typed
+            // value will hit a ClassCastException which is in turn
+            // caught by the bootstrap's `Throwable` handler.
+            let attr_name = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let response: &str = match attr_name.as_str() {
+                "MaxFileDescriptorCount" | "OpenFileDescriptorCount"
+                | "TotalPhysicalMemorySize" | "FreePhysicalMemorySize"
+                | "TotalSwapSpaceSize" | "FreeSwapSpaceSize"
+                | "CommittedVirtualMemorySize" => "8192",
+                "ProcessCpuLoad" | "SystemCpuLoad" => "0.0",
+                "Name" | "Arch" | "Version" => "unknown",
+                _ => "0",
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(response)))))
+        },
     );
 }
 

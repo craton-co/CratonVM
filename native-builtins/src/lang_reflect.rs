@@ -645,6 +645,28 @@ pub(crate) fn native_method_get_exception_types(
     Ok(Some(ctx.get_field_by_name(this, "exceptionTypes")))
 }
 
+/// Constructor.getExceptionTypes — mirrors the Method native. CGLib's
+/// Enhancer.emitConstructors path (ReflectUtils.getExceptionTypes,
+/// Constructor.getExceptionTypes:293) NPEs if the `exceptionTypes` field
+/// is null. We populate the field in `create_constructor_object` and
+/// hand the cached array back here. If the field is somehow null
+/// (defensive — e.g. constructor objects synthesized via a path that
+/// bypasses `create_constructor_object`), return an empty Class[] so
+/// callers do not crash.
+pub(crate) fn native_constructor_get_exception_types(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field_by_name(this, "exceptionTypes") {
+        v @ Value::Object(Some(_)) => Ok(Some(v)),
+        _ => {
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        }
+    }
+}
+
 pub(crate) fn native_method_get_generic_exception_types(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1039,6 +1061,17 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "getExceptionTypes",
         "()[Ljava/lang/Class;",
         native_method_get_exception_types,
+    );
+    // CGLib Enhancer.emitConstructors -> ReflectUtils.getExceptionTypes ->
+    // Constructor.getExceptionTypes:293 — JDK Java code does
+    // `return exceptionTypes.clone();` and NPEs if the field is null.
+    // We populate the field in `create_constructor_object` (lang_class.rs)
+    // and bind this native so the read path is deterministic.
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getExceptionTypes",
+        "()[Ljava/lang/Class;",
+        native_constructor_get_exception_types,
     );
     registry.register(
         "java/lang/reflect/Method",

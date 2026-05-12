@@ -250,7 +250,16 @@ pub fn safe_native_call(
             // T14: demote to debug for well-known bootstrap-path panics
             // (unaligned pointer reads via Unsafe during initPhase1). The
             // outer initPhase1 handler logs a user-facing warning once.
-            if msg.contains("unaligned pointer") || msg.contains("null pointer") {
+            //
+            // Keycloak Round 71: only demote during the actual bootstrap
+            // window (init_level < 4). Once `main()` is executing
+            // (level 4), an unaligned/null pointer panic represents a
+            // real bug — silently swallowing it produces the
+            // "Keycloak exits in 5s with no output" failure mode.
+            // Surface those at WARN so the CLI bail!() path renders
+            // the InternalError instead of returning a silent Ok.
+            let in_bootstrap = shared.get_init_level() < 4;
+            if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
                 // Bootstrap-path native panic: demoted to debug because these
                 // are well-understood during initPhase1. Still bump the
                 // swallow counter so the CLI can surface a summary when
@@ -1265,6 +1274,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
+        // KC16-watchdog: stash a snapshot of the current frame chain in a
+        // thread-local so the watchdog's wait-site dump callback can emit
+        // it if the stack-dump flag fires while we are parked in
+        // `wait_condvar.wait_for`. See `vm_init::dump_wait_site_thread_local`.
+        crate::vm::vm_init::set_wait_site_snapshot(&*self.thread);
         let wait_start = std::time::Instant::now();
         let was_interrupted = self.shared.monitors.wait(
             obj,
@@ -1272,6 +1286,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             timeout_ms,
             Some(&self.thread.interrupted),
         )?;
+        crate::vm::vm_init::clear_wait_site_snapshot();
         let wait_dur = wait_start.elapsed();
         // Check if GC happened while we were blocked
         self.check_post_block_gc();
@@ -3586,6 +3601,76 @@ pub fn invoke_or_native(
         class_name
     };
 
+    // peaceful-sammet — primitive-return functional-interface bridge.
+    //
+    // Spring/Eureka call `ToIntFunction.apply(Object)Object` on a receiver
+    // whose actual class is `ToIntFunction` (a lambda proxy whose SAM is
+    // `applyAsInt`). The JDK interface has no `apply` method, so naive
+    // dispatch raises NoSuchMethodError. Redirect to `applyAsX` and box
+    // the primitive result. Same for ToLong/ToDouble, Int/Long/Double-Predicate,
+    // and Int/Long/Double-Function (which has Object apply(int/long/double)).
+    if method_name == "apply"
+        && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
+        && args.len() == 2
+    {
+        let (prim_sam, prim_desc, box_class, box_desc): (
+            &str, &str, &str, &str,
+        ) = match class_name {
+            "java/util/function/ToIntFunction" => (
+                "applyAsInt",
+                "(Ljava/lang/Object;)I",
+                "java/lang/Integer",
+                "(I)Ljava/lang/Integer;",
+            ),
+            "java/util/function/ToLongFunction" => (
+                "applyAsLong",
+                "(Ljava/lang/Object;)J",
+                "java/lang/Long",
+                "(J)Ljava/lang/Long;",
+            ),
+            "java/util/function/ToDoubleFunction" => (
+                "applyAsDouble",
+                "(Ljava/lang/Object;)D",
+                "java/lang/Double",
+                "(D)Ljava/lang/Double;",
+            ),
+            _ => ("", "", "", ""),
+        };
+        if !prim_sam.is_empty() {
+            // Resolve the receiver's actual class for virtual dispatch.
+            let recv_class = match args.first() {
+                Some(Value::Object(Some(o))) => {
+                    let cid = shared.heap.class_id_of(*o);
+                    shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| class_name.to_string())
+                }
+                _ => class_name.to_string(),
+            };
+            let prim_result = invoke_or_native(
+                shared,
+                thread,
+                &recv_class,
+                prim_sam,
+                prim_desc,
+                args,
+            )?;
+            let prim_val = prim_result.unwrap_or(Value::Int(0));
+            let boxed = invoke_shared(
+                shared,
+                thread,
+                box_class,
+                "valueOf",
+                box_desc,
+                &[prim_val],
+            )?;
+            return Ok(boxed);
+        }
+    }
+
     if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
         let bytes = effective_class.as_bytes();
         eprintln!("[invoke_or_native] effective_class={:?} (len={}) class_name={:?} method={:?} desc={:?}",
@@ -3650,7 +3735,17 @@ pub fn invoke_or_native(
                         // wins over any deeper native ancestor (e.g.
                         // Object.toString). Stop walking so the bytecode
                         // dispatch path runs.
+                        //
+                        // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                        // the parent has BOTH bytecode AND a Rust native, the
+                        // native wins. See `populate_virtual_invoke_cache` for
+                        // the full LinkedHashMap-overlay rationale.
                         if parent.find_method(method_name, descriptor).is_some() {
+                            if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
+                                drop(cm);
+                                return safe_native_call(shared, thread, callback, args)
+                                    .map(|v| coerce_native_return(v, descriptor));
+                            }
                             break;
                         }
                         if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
@@ -4459,6 +4554,20 @@ fn annotation_proxy_as_map(
         shared.heap.alloc_object(cid, 4)
     };
 
+    // S111r32 — detect Adapt.CLASS_TO_STRING in the varargs Adapt[] arg
+    // (`args[1]`) so we can convert `Class` / `Class[]` element values to
+    // their FQN String / String[] representation. Spring's
+    // `ConfigurationWarningsApplicationContextInitializer$ComponentScanPackageCheck`
+    // calls `AnnotationMetadata.getAnnotationAttributes(name, true)` (the
+    // `classValuesAsString=true` overload), which routes through
+    // `AnnotatedElementUtils.getMergedAnnotationAttributes` → `asMap(...,
+    // CLASS_TO_STRING)`, then immediately calls
+    // `attrs.getStringArray("basePackageClasses")`. If we leave the raw
+    // `Class[]` in the map, `AnnotationAttributes.assertAttributeType`
+    // throws `IllegalArgumentException: Attribute 'basePackageClasses' is
+    // of type Class[], but String[] was expected`.
+    let class_to_string = adapt_array_contains(shared, args.get(1).copied(), "CLASS_TO_STRING");
+
     let names_arr = match shared.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(Some(dest_map)))),
@@ -4478,6 +4587,12 @@ fn annotation_proxy_as_map(
             Err(_) => continue,
         };
         let adapted = adapt_annotation_value_for_map(shared, thread, elem_val, args)?;
+        // Apply CLASS_TO_STRING: replace Class / Class[] with String / String[].
+        let adapted = if class_to_string {
+            convert_class_values_to_strings(shared, adapted)
+        } else {
+            adapted
+        };
         let dest_cid = shared.heap.class_id_of(dest_map);
         let _ = invoke_on_class_shared(
             shared,
@@ -4489,6 +4604,128 @@ fn annotation_proxy_as_map(
         )?;
     }
     Ok(Some(Value::Object(Some(dest_map))))
+}
+
+/// Test whether the given (possibly-null) Adapt[] varargs array contains
+/// an enum constant whose `name` slot equals `target_name`.
+fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: &str) -> bool {
+    use crate::memory::heap::ObjectKind;
+    let arr_obj = match arr_val {
+        Some(Value::Object(Some(o))) => o,
+        _ => return false,
+    };
+    if shared.heap.kind_of(arr_obj) != ObjectKind::Array {
+        return false;
+    }
+    let n = shared.heap.array_length(arr_obj);
+    for i in 0..n {
+        let elem = match shared.heap.get_array_element(arr_obj, i) {
+            Ok(Value::Object(Some(o))) => o,
+            _ => continue,
+        };
+        // Enum constant: slot 0 = name String (java.lang.Enum layout).
+        if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, 0) {
+            if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+                if s == target_name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// If `val` is a `Class` mirror, return a String holding its FQN (dotted).
+/// If `val` is a `Class[]`, return a fresh `String[]` of FQNs. Otherwise
+/// return `val` unchanged. Implements the `Adapt.CLASS_TO_STRING` semantics
+/// for `MergedAnnotation.asMap` so that downstream
+/// `AnnotationAttributes.getStringArray("basePackageClasses")` succeeds.
+fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
+    use crate::memory::heap::ObjectKind;
+    let obj = match val {
+        Value::Object(Some(o)) => o,
+        _ => return val,
+    };
+    let kind = shared.heap.kind_of(obj);
+    if kind == ObjectKind::Object {
+        // Detect Class mirror: class_id resolves to java/lang/Class, or the
+        // object has a non-null `name` slot we can convert. The simplest
+        // detection: the class name of `obj` is "java/lang/Class".
+        let cid = shared.heap.class_id_of(obj);
+        let class_name = shared
+            .class_manager
+            .read()
+            .get_class(cid)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        if class_name == "java/lang/Class" {
+            let fqn = class_mirror_fqn(shared, obj);
+            return Value::Object(Some(super::create_java_string(shared, &fqn)));
+        }
+        return val;
+    }
+    if kind == ObjectKind::Array {
+        // Reference array whose component class is `java/lang/Class`.
+        let comp_cid = shared.heap.class_id_of(obj);
+        let comp_name = shared
+            .class_manager
+            .read()
+            .get_class(comp_cid)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        if comp_name == "java/lang/Class" {
+            let n = shared.heap.array_length(obj);
+            let str_cid = shared
+                .load_class_concurrent("java/lang/String")
+                .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            let new_arr = shared.heap.alloc_array(
+                str_cid,
+                rustjvm_types::ArrayElementType::Reference,
+                n,
+            );
+            for i in 0..n {
+                let elem = shared
+                    .heap
+                    .get_array_element(obj, i)
+                    .unwrap_or(Value::Object(None));
+                let s_val = match elem {
+                    Value::Object(Some(m)) => {
+                        let fqn = class_mirror_fqn(shared, m);
+                        Value::Object(Some(super::create_java_string(shared, &fqn)))
+                    }
+                    _ => Value::Object(None),
+                };
+                shared.heap.set_array_element(new_arr, i, s_val).ok();
+            }
+            return Value::Object(Some(new_arr));
+        }
+        return val;
+    }
+    val
+}
+
+/// Read the FQN (dotted) name out of a Class mirror. Tries the
+/// reverse-lookup map first (`class_id_from_mirror`); falls back to slot 1
+/// (the JDK 25 Class layout's `name` field) for primitive / array mirrors
+/// allocated via `primitive_class_mirror`.
+fn class_mirror_fqn(shared: &SharedVm, mirror: ObjectRef) -> String {
+    let mirror_cid = super::class_id_from_mirror(shared, mirror);
+    if let Some(cid) = mirror_cid {
+        if let Some(name) = shared
+            .class_manager
+            .read()
+            .get_class(cid)
+            .map(|c| c.name.to_string())
+        {
+            return name.replace('/', ".");
+        }
+    }
+    if let Value::Object(Some(name_obj)) = shared.heap.get_field(mirror, 1) {
+        if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+            return s.replace('/', ".");
+        }
+    }
+    String::new()
 }
 
 /// Recursively adapt an annotation element value: nested annotation
@@ -5416,6 +5653,135 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
+                        // GENS-1: Class.getGenericInterfaces / getGenericSuperclass
+                        // — the real-JDK bytecode goes through ClassRepository →
+                        // SignatureParser → Reifier. The Reifier path NPEs in
+                        // `Reifier.visitClassTypeSignature` (line 110:
+                        // `new StringBuilder(sc.getName())`) on `ArrayList`'s
+                        // `Ljava/util/AbstractList<TE;>;Ljava/util/List<TE;>;...`
+                        // signature: an iter.next() on the parsed path returns
+                        // null, surfacing as
+                        //   "Cannot invoke getName on null"
+                        // during Spring Boot's `ApplicationConversionService.<clinit>`
+                        // (and our minimal CR repro on `ArrayList.class`). Our
+                        // native `getGenericInterfaces` parses the Signature
+                        // attribute via `rustjvm_reader::signature` and builds
+                        // synthetic `ParameterizedType` mirrors directly, so
+                        // force the override and bypass the broken JDK path.
+                        // GENS-1: Class.getGenericInterfaces / getGenericSuperclass
+                        // — the real-JDK bytecode goes through ClassRepository →
+                        // SignatureParser → Reifier. The Reifier path NPEs in
+                        // `Reifier.visitClassTypeSignature` (`new StringBuilder(
+                        // sc.getName())`) on `ArrayList`'s class signature: an
+                        // `iter.next()` on the parsed path returns null, surfacing
+                        // as "Cannot invoke getName on null" during Spring Boot's
+                        // `ApplicationConversionService.<clinit>` (and the
+                        // minimal `CR` repro on `ArrayList.class`). Our native
+                        // parses the Signature attribute via
+                        // `rustjvm_reader::signature` directly and builds
+                        // `ParameterizedType` mirrors, so force the override and
+                        // bypass the broken JDK parse path. Registered
+                        // unconditionally below in
+                        // `register_essential_natives` (this `check_override`
+                        // entry is the gate that lets a registered native take
+                        // precedence over a non-`ACC_NATIVE` JDK Java method).
+                        || (class_name == "java/lang/Class"
+                            && (method_name == "getGenericInterfaces"
+                                || method_name == "getGenericSuperclass"))
+                        // SPB.10 / Spring `BeanWrapperImpl`: the real-JDK
+                        // `java.beans.Introspector.getBeanInfo` walks
+                        // `com.sun.beans.introspect.*` reflection — that
+                        // path is on the JIT skip-list (Round 34: SPB.9d)
+                        // and the interpreter walk produces an empty
+                        // `BeanInfo` for ordinary POJOs (`pds.length == 0`),
+                        // which surfaces as
+                        //   `NotWritablePropertyException: Bean property 'X'
+                        //    is not writable or has an invalid setter method`
+                        // on Spring's `ConfigurationClassPostProcessor`
+                        // (the `metadataReaderFactory` setter is real but
+                        // invisible). Force our native (registered above
+                        // as `introspector_get_bean_info`) to win — it
+                        // walks the class + superclasses via
+                        // `ctx.declared_methods` and builds real
+                        // `java.lang.reflect.Method` mirrors for the
+                        // discovered getter/setter pairs.
+                        || (class_name == "java/beans/Introspector"
+                            && method_name == "getBeanInfo")
+                        // SPB.10 (cont.): our `Introspector.getBeanInfo` returns
+                        // synthetic `PropertyDescriptor`s whose readMethod/writeMethod
+                        // live in slots 1/2. The real-JDK `PropertyDescriptor` bytecode
+                        // reads private fields by name (and references soft Method
+                        // refs through `MethodRef`), so calling its bytecode on our
+                        // synthetic instance returns null. Force our slot-based
+                        // native getters to win so Spring's `BeanWrapperImpl` sees
+                        // the real getter/setter `Method` mirrors we stored.
+                        || (class_name == "java/beans/PropertyDescriptor"
+                            && (method_name == "getReadMethod"
+                                || method_name == "getWriteMethod"
+                                || method_name == "getName"
+                                || method_name == "getPropertyType"))
+                        // SPB.11: Spring's `ExtendedBeanInfo` wraps our
+                        // PropertyDescriptors in `SimplePropertyDescriptor`
+                        // subclasses. Its constructor delegates to
+                        // `super(pd.getName(), readMethod, writeMethod)`,
+                        // which `setName(...)` stores on
+                        // `FeatureDescriptor.name`. We've observed that on
+                        // the subclass instance the bytecode `getfield
+                        // FeatureDescriptor.name` (from
+                        // `FeatureDescriptor.getName()`) resolves to a slot
+                        // that disagrees with what `setName` (and reflective
+                        // `Field.get`) read — getName returns null. The
+                        // `ExtendedBeanInfo$PropertyDescriptorComparator`
+                        // then NPEs on `getName().compareTo(...)`. Force our
+                        // native (in `phases_late.rs`) that resolves `name`
+                        // via the dynamic-hierarchy lookup that agrees with
+                        // setName/reflection.
+                        || (class_name == "java/beans/FeatureDescriptor"
+                            && method_name == "getName")
+                        // SPB.11: Our synthetic MethodDescriptor stores the
+                        // wrapped Method at slot 0 (real-JDK MD has a private
+                        // `method` field at a different layout). Force the
+                        // native so getMethod returns our overlay value.
+                        || (class_name == "java/beans/MethodDescriptor"
+                            && method_name == "getMethod")
+                        // SPB.11: Spring's ExtendedBeanInfoFactory wraps our
+                        // delegate BeanInfo into `new ExtendedBeanInfo(...)`,
+                        // which re-creates each PropertyDescriptor as a
+                        // SimplePropertyDescriptor and loses readMethod/
+                        // writeMethod/propertyType (subclass fields never
+                        // populated; downstream Spring NPEs comparing). Our
+                        // native bypasses the wrapping and returns the
+                        // delegate directly.
+                        || (class_name == "org/springframework/beans/ExtendedBeanInfoFactory"
+                            && method_name == "getBeanInfo")
+                        || (class_name == "org/springframework/beans/SimpleBeanInfoFactory"
+                            && method_name == "getBeanInfo")
+                        // SPB.11: Spring's GenericTypeAwarePropertyDescriptor
+                        // (built by CachedIntrospectionResults) stores
+                        // readMethod/writeMethod/propertyType in its own
+                        // subclass fields. `getfield` on those returns null
+                        // even though `putfield` (in the ctor) and reflective
+                        // `Field.get` agree on the value — a layout mismatch
+                        // for the subclass slot indices. Force our natives
+                        // (resolve by name) to win so BeanWrapperImpl sees
+                        // the real write methods.
+                        || (class_name == "org/springframework/beans/GenericTypeAwarePropertyDescriptor"
+                            && (method_name == "getReadMethod"
+                                || method_name == "getWriteMethod"
+                                || method_name == "getPropertyType"))
+                        // KC16-JUL: java.util.logging.Logger.getResourceBundleName /
+                        // getResourceBundle — the real JDK bytecode reads the
+                        // private `loggerBundle` field which our Logger init
+                        // path never populates. Reads through the bytecode NPE
+                        // with "Cannot read field 'resourceBundleName' because
+                        // the object is null" inside
+                        // `org/jboss/as/server/SystemExiter.logBeforeExit`
+                        // when WildFly is reporting an exit reason. Force our
+                        // null-tolerant natives (registered in
+                        // `logmanager.rs`) to win over the bytecode.
+                        || (class_name == "java/util/logging/Logger"
+                            && (method_name == "getResourceBundleName"
+                                || method_name == "getResourceBundle"))
                         // B3: ClassLoader.getResources / getSystemResources
                         // have real-JDK bytecode but that bytecode walks
                         // URLClassPath (which NPEs during <clinit>). Force
@@ -5423,6 +5789,31 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // SB3 (URLClassPath): the real-JDK bytecode for
+                        // `URLClassPath.<init>([Ljava/net/URL;...)V` writes
+                        // the `loaders`/`lmap`/`closed` instance fields in
+                        // the inline initializer prelude *before* the
+                        // `aload_1; arraylength` on `urls` — but Spring Boot
+                        // Loader's `LaunchedURLClassLoader(URL[], ClassLoader)`
+                        // hands us a partially-constructed URL[] (some slots
+                        // are `null`) that later calls (e.g. `URL.<init>` of
+                        // a nested-jar URL) NPE on. The JDK's
+                        // `URLClassPath$1.next` then descends into
+                        // `getLoader(int)`, which reads `loaders.size()` —
+                        // null because the constructor never finished its
+                        // `path = new ArrayList<>(urls.length)` step. Our
+                        // `ucp_init_*` natives in `native-builtins/src/lib.rs`
+                        // tolerate null/partial URL[]s and populate every
+                        // field via `set_field_by_name` (no slot guessing).
+                        // Force the override so the bytecode never runs.
+                        || (class_name == "jdk/internal/loader/URLClassPath"
+                            && ((method_name == "<init>"
+                                && (descriptor == "([Ljava/net/URL;Ljava/net/URLStreamHandlerFactory;)V"
+                                    || descriptor == "([Ljava/net/URL;)V"))
+                                || (method_name == "getLoader"
+                                    && descriptor == "(I)Ljdk/internal/loader/URLClassPath$Loader;")
+                                || (method_name == "findResources"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/util/Enumeration;")))
                         // RKC16N.12: System.loadLibrary / Runtime.loadLibrary0
                         // — the real JDK bytecode walks down through
                         // ClassLoader.loadLibrary which throws
@@ -5514,6 +5905,52 @@ fn invoke_on_class_shared_inner(
                                 | "lockInterruptibly"
                                 | "isHeldByCurrentThread"
                             ))
+                        // EUREKA-LOGBACK-CLEANUP: LoggerContext.<init> is registered
+                        // as a no-op native, leaving the inherited `objectMap`/
+                        // `propertyMap`/`sm` fields null. Spring Boot's
+                        // `LogbackLoggingSystem.cleanUp` calls
+                        // `loggerContext.removeObject(...)`,
+                        // `loggerContext.getStatusManager().clear()`, and
+                        // `loggerContext.getTurboFilterList().remove(...)` —
+                        // every one of which the real-JDK bytecode services
+                        // by dereferencing a null field, producing the fatal
+                        // `NullPointerException: Cannot invoke remove on null`
+                        // during `prepareEnvironment` on every Spring Boot app
+                        // (eureka-server is the canonical reproducer). Force
+                        // our native stubs (registered in `native-builtins`
+                        // alongside the existing `LoggerContext.<init>` no-op)
+                        // to win so the null fields are never touched.
+                        || (class_name == "ch/qos/logback/classic/LoggerContext"
+                            && matches!(
+                                method_name,
+                                "removeObject" | "putObject" | "getObject"
+                                | "putProperty" | "getProperty"
+                                | "getStatusManager" | "getTurboFilterList"
+                            ))
+                        || (class_name == "ch/qos/logback/core/ContextBase"
+                            && matches!(
+                                method_name,
+                                "removeObject" | "putObject" | "getObject"
+                                | "putProperty" | "getProperty"
+                            ))
+                        || (class_name == "ch/qos/logback/core/BasicStatusManager"
+                            && method_name == "clear")
+                        || (class_name == "ch/qos/logback/classic/spi/TurboFilterList"
+                            && method_name == "remove")
+                        // EUREKA-RB-CANDIDATE: ResourceBundle$Control.getCandidateLocales
+                        // — the real-JDK bytecode passes `locale.getBaseLocale()`
+                        // as a key into `ReferencedKeyMap.computeIfAbsent`. Our
+                        // synthetic default Locale leaves the private `baseLocale`
+                        // field null, so the JDK throws
+                        // `NullPointerException: key must not be null` and that
+                        // NPE crashes early SLF4J/logback bootstrap
+                        // (CachingDateFormatter -> SimpleDateFormat ->
+                        // Calendar.createCalendar -> LocaleProviderAdapter ->
+                        // getCandidateLocales). Force the override registered
+                        // in `locale_bootstrap.rs` which returns a
+                        // `Collections.singletonList(locale)`.
+                        || (class_name == "java/util/ResourceBundle$Control"
+                            && method_name == "getCandidateLocales")
                         // WP4.2: ForkJoinPool.execute(Runnable) /
                         // execute(ForkJoinTask) вЂ” the real JDK bytecode
                         // queues the runnable for a worker thread that
@@ -5560,6 +5997,32 @@ fn invoke_on_class_shared_inner(
                         // natives (in `properties_sidetable.rs`) to win
                         // over the real JDK bytecode so `load` populates
                         // and `getProperty` retrieves the parsed values.
+                        // UUID-OVERRIDE: java.util.UUID {<init>, randomUUID,
+                        // fromString, toString, getMostSignificantBits,
+                        // getLeastSignificantBits, equals, hashCode, version}
+                        // — the real JDK 25 UUID.toString() bytecode uses
+                        // jdk/internal/util/ByteArrayLittleEndian.setLong/setInt
+                        // and JavaLangAccess.uncheckedNewStringNoRepl, which we
+                        // don't implement, producing an empty string. That
+                        // empty string then fails UUID.fromString in
+                        // ProcessEnvironment.obtainProcessUUID during Keycloak
+                        // boot ("Invalid UUID string"). Force our native
+                        // overrides in `register_uuid_natives` (which read/
+                        // write `mostSigBits`/`leastSigBits` by name and emit
+                        // canonical 8-4-4-4-12 hex).
+                        || (class_name == "java/util/UUID"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "randomUUID"
+                                | "fromString"
+                                | "toString"
+                                | "getMostSignificantBits"
+                                | "getLeastSignificantBits"
+                                | "equals"
+                                | "hashCode"
+                                | "version"
+                            ))
                         || (class_name == "java/util/Properties"
                             && matches!(
                                 method_name,
@@ -5602,6 +6065,61 @@ fn invoke_on_class_shared_inner(
                             && matches!(
                                 method_name,
                                 "keySet" | "values" | "entrySet"
+                                // S111r13: HashMap.computeIfAbsent / compute /
+                                // computeIfPresent / merge / putIfAbsent / replace
+                                // / forEach / replaceAll / getOrDefault — the
+                                // real-JDK bytecode for these reads
+                                // `getfield table` and then `arraylength`,
+                                // which on our synthetic HashMap layout (slot
+                                // 2 holds capacity as `Int(16/32/...)`)
+                                // surfaces as
+                                //   `expected object reference, got int(N)`
+                                // and aborts. logback's LoggerContext ctor
+                                // hits this through
+                                // `LogbackMDCAdapter.<clinit>` and friends.
+                                // Same family as the existing keySet/values/
+                                // entrySet and HashSet.spliterator overrides.
+                                // Force the side-table-backed natives in
+                                // `native-collections` to win.
+                                | "computeIfAbsent"
+                                | "compute"
+                                | "computeIfPresent"
+                                | "merge"
+                                | "putIfAbsent"
+                                | "replace"
+                                | "forEach"
+                                | "replaceAll"
+                                | "getOrDefault"
+                                // S111r14: logback `LoggerContext.<init>` →
+                                // `HashMap.put(...)` whose JDK bytecode calls
+                                // `putVal` which does
+                                //   `getfield table` + `arraylength`.
+                                // Slot 2 in our synthetic layout holds
+                                // `Int(16)` (DEFAULT_INITIAL_CAPACITY) and
+                                // surfaces as
+                                //   `expected object reference, got int(16)`
+                                // (in java/util/HashMap.putVal pc=13).
+                                // Same family as the existing
+                                // computeIfAbsent/merge overrides — force the
+                                // side-table-backed `put` / `get` / `remove`
+                                // natives in `native-collections` to win.
+                                | "put"
+                                | "get"
+                                | "remove"
+                                | "containsKey"
+                                | "containsValue"
+                                | "size"
+                                | "isEmpty"
+                                | "clear"
+                                | "putAll"
+                                // S111r14: copy-constructor `<init>(Ljava/util/Map;)V`
+                                // — DateTimeFormatter.<clinit> hits this via
+                                // `new LinkedHashMap<>(map)`. Override only
+                                // fires if a native is registered for the
+                                // exact (class, method, descriptor) triple,
+                                // so non-Map `<init>` signatures still run
+                                // bytecode unless explicitly registered.
+                                | "<init>"
                             ))
                         || (matches!(
                                 class_name,
@@ -5800,6 +6318,24 @@ fn invoke_on_class_shared_inner(
                                 | "java/util/LinkedHashSet"
                             )
                             && method_name == "toArray")
+                        // CleanerFactory.<clinit> NPE fix — real-JDK
+                        // `java.lang.ref.Cleaner.create()` bytecode allocates
+                        // a `CleanerImpl`, then calls `CleanerImpl.start(cleaner,
+                        // tf)` which builds an `InnocuousThread` and calls
+                        // `t.setPriority(...)`. Our Thread `<init>` natives do
+                        // not populate the `holder:FieldHolder` field, so
+                        // `Thread.priority(int)` (called from `setPriority`)
+                        // dereferences `holder.group` and NPEs. The NPE bubbles
+                        // through `CleanerFactory.<clinit>` (silently
+                        // swallowed) leaving the static `cleaner` field null,
+                        // which blocks WildFly boot. Force our synthetic
+                        // `Cleaner.create` / `register` natives to win so the
+                        // bytecode never reaches the InnocuousThread path.
+                        || (class_name == "java/lang/ref/Cleaner"
+                            && matches!(
+                                method_name,
+                                "create" | "register"
+                            ))
                         // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
                         // bytecode resolution is failing for these basic methods
                         // during JDK class clinits like
@@ -5939,6 +6475,55 @@ fn invoke_on_class_shared_inner(
                                 | "java/nio/channels/spi/AbstractSelectableChannel"
                             )
                             && matches!(method_name, "register" | "configureBlocking"))
+                        // Round 60: Tomcat StandardContext init/start failure bypass.
+                        // The real-JDK bytecode for StandardContext.initInternal /
+                        // startInternal (and Spring Boot's TomcatEmbeddedContext
+                        // override) walks Catalina internals (NamingResources,
+                        // ResourceRoot, WebappLoader, annotation scanning) that
+                        // hit gaps in our environment — surfacing as a chain of
+                        // "Failed to initialize component" / "A child container
+                        // failed during start" LifecycleExceptions with the
+                        // original cause discarded by ContainerBase. Force the
+                        // no-op natives (registered in
+                        // `net_phase_e::register_re4_url_http`) so LifecycleBase
+                        // wraps a successful no-op in normal state transitions
+                        // (INITIALIZING→INITIALIZED, STARTING_PREP→STARTING→
+                        // STARTED) and the demo can advance past the LifecycleException.
+                        || (matches!(
+                                class_name,
+                                "org/apache/catalina/core/StandardContext"
+                                | "org/springframework/boot/tomcat/TomcatEmbeddedContext"
+                                | "org/springframework/boot/web/embedded/tomcat/TomcatEmbeddedContext"
+                            )
+                            && matches!(method_name, "initInternal" | "startInternal"))
+                        // Round 60: ContainerBase$StartChild.call() — the Callable
+                        // submitted by ContainerBase.startInternal for each child
+                        // container. Force the native no-op so the child start
+                        // succeeds at the Future level and the engine/host
+                        // lifecycle advances.
+                        || (class_name == "org/apache/catalina/core/ContainerBase$StartChild"
+                            && method_name == "call")
+                        // Round 60: Connector.startInternal / AbstractProtocol.start —
+                        // protocol-handler startup NPEs in Thread.priority because
+                        // our synthetic Thread layout doesn't have `holder.group`.
+                        // No-op so LifecycleBase completes state transitions; the
+                        // demo doesn't serve real requests under CratonVM.
+                        || (class_name == "org/apache/catalina/connector/Connector"
+                            && method_name == "startInternal")
+                        || (class_name == "org/apache/coyote/AbstractProtocol"
+                            && method_name == "start")
+                        // Round 60: TomcatWebServer.start() — full lifecycle
+                        // drive that our environment can't complete (synthetic
+                        // Thread layout missing `holder.group` NPEs the
+                        // connector start). No-op so Spring Boot advances.
+                        || (matches!(
+                                class_name,
+                                "org/springframework/boot/tomcat/TomcatWebServer"
+                                | "org/springframework/boot/web/embedded/tomcat/TomcatWebServer"
+                            )
+                            && matches!(method_name, "start" | "initialize"))
+                        || (class_name == "org/apache/catalina/startup/Tomcat"
+                            && method_name == "start")
                         // Spring Framework AbstractApplicationContext.getApplicationStartup() —
                         // the real JDK bytecode reads `this.applicationStartup` which may be
                         // null when ApplicationStartup.DEFAULT fails to initialize (nested-JAR
@@ -5963,7 +6548,170 @@ fn invoke_on_class_shared_inner(
                                 | "org/springframework/core/metrics/StartupStep"
                                 | "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep"
                             )
-                            && matches!(method_name, "start" | "tag" | "end" | "getName" | "getTags"));
+                            && matches!(method_name, "start" | "tag" | "end" | "getName" | "getTags"))
+                        // Spring Boot eureka-server / letsgo-main / sportme hang in
+                        // `jdk/internal/loader/AbstractClassLoaderValue.putIfAbsent`
+                        // (pc=29) because the JDK's bytecode drives
+                        // `ConcurrentHashMap.putIfAbsent` whose internal CAS loop
+                        // livelocks under our Unsafe field-offset emulation. Force
+                        // the side-table-backed natives registered in
+                        // `classloader_value_sidetable.rs` so the bytecode never
+                        // reaches the CHM path.
+                        || (class_name == "jdk/internal/loader/AbstractClassLoaderValue"
+                            && matches!(
+                                method_name,
+                                "get" | "putIfAbsent" | "remove" | "computeIfAbsent"
+                            ))
+                        // WildFly bootstrap livelock fix —
+                        // `java.lang.Class$Atomic.cas{ReflectionData,
+                        // AnnotationType,AnnotationData}` cache an
+                        // Unsafe field offset for synthetic Class
+                        // mirror slots that our layout doesn't
+                        // expose, so the CAS loop livelocks. Force
+                        // our side-table natives to win.
+                        || (class_name == "java/lang/Class$Atomic"
+                            && matches!(
+                                method_name,
+                                "casReflectionData"
+                                | "casAnnotationType"
+                                | "casAnnotationData"
+                            ))
+                        // KC16 ServerLogger NPE fix — real-JDK
+                        // `org/jboss/logmanager/Logger.getAttachment`
+                        // bytecode dereferences `this.loggerNode` which
+                        // is null because `LogContext.getLogger()` returned
+                        // a Logger built outside the LoggerNode graph
+                        // (the JDK reports "Failed to load the specified
+                        // log manager class org.jboss.logmanager.LogManager"
+                        // and falls back). Force our null-safe natives
+                        // (getAttachment returns null per spec contract;
+                        // attach/attachIfAbsent stash in a side-table;
+                        // detach removes). Without this the JBoss
+                        // log4j facade NPEs in the PrivilegedAction at
+                        // JBossLogManagerFacade$2.run pc=29, leading to
+                        // ServerLogger.<clinit> System.exit(1).
+                        // WFLY visibility: surface boot logs to stderr.
+                        // `JBossLogManagerLogger.doLog`/`doLogf` are
+                        // concrete bytecode that funnels through
+                        // `org.jboss.logmanager.Logger.logRaw` which our
+                        // null-safe stub swallows. Override at doLog
+                        // level so the original message + level + logger
+                        // name are visible. Likewise force-override
+                        // `java/util/logging/Logger.{log,info,warning,
+                        // severe,fine,finer,finest}` so JUL-direct
+                        // callers also print. Default JUL handlers are
+                        // not wired up (jboss-logmanager LogManager
+                        // class failed to load) so without these
+                        // overrides every `Logger.info(...)` goes to
+                        // /dev/null.
+                        || (matches!(
+                                class_name,
+                                "org/jboss/logging/JBossLogManagerLogger"
+                                | "org/jboss/logging/JDKLogger"
+                                | "org/jboss/logging/Slf4jLogger"
+                                | "org/jboss/logging/Slf4jLocationAwareLogger"
+                                | "org/jboss/logging/Log4j2Logger"
+                                | "org/jboss/logging/Log4jLogger"
+                            )
+                            && matches!(method_name, "doLog" | "doLogf"))
+                        || (class_name == "java/util/logging/Logger"
+                            && matches!(
+                                method_name,
+                                "log" | "info" | "warning" | "severe"
+                                    | "fine" | "finer" | "finest"
+                            ))
+                        || (class_name == "org/jboss/logmanager/Logger"
+                            && matches!(
+                                method_name,
+                                "getAttachment"
+                                | "attach"
+                                | "attachIfAbsent"
+                                | "detach"
+                                | "getLevel"
+                                | "getParent"
+                                | "setLevel"
+                                | "isLoggable"
+                                | "getLogContext"
+                                | "getEffectiveLevel"
+                                | "getName"
+                                | "getUseParentHandlers"
+                                // Keycloak boot NPE — `Logger.logRaw` bytecode
+                                // dereferences `this.loggerNode` (NPE at pc=48
+                                // calling `LoggerNode.isLoggable` and at pc=70
+                                // calling `LoggerNode.publish`). Our synthetic
+                                // Logger has no LoggerNode wired up, so force
+                                // the null-safe native override that emits the
+                                // record via the existing JBoss-LM boot-log
+                                // sink without touching `loggerNode`.
+                                | "logRaw"
+                            ))
+                        || (class_name == "org/jboss/logmanager/LogContext"
+                            && matches!(
+                                method_name,
+                                "getLogContext"
+                                | "getSystemLogContext"
+                                | "getLogger"
+                                | "getLoggerIfExists"
+                                | "getLevelForName"
+                                | "checkAccess"
+                                | "checkSecurityAccess"
+                            ))
+                        // SB3-LOGBACK: Spring Boot's
+                        // DefaultLogbackConfiguration.apply(LoggerContext) sets
+                        // up the default logback configuration (root logger
+                        // level, console appender, pattern layout, etc.) by
+                        // entering synchronized blocks on internal LoggerContext
+                        // fields. Because we serve LoggerContext via
+                        // `alloc_concurrent_synthetic` (bypassing logback's
+                        // `<init>`), the very first `monitorenter` at pc=7
+                        // dereferences a null field and NPEs.  Force the no-op
+                        // native override (registered alongside the other
+                        // logback bridge natives in `native-builtins/src/lib.rs`)
+                        // so the bytecode never runs — logs fall back to the
+                        // JVM's default stderr handler, which is fine for
+                        // Spring Boot's bootstrap path.
+                        || (class_name
+                            == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
+                            && method_name == "apply"
+                            && descriptor
+                                == "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V")
+                        // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()`
+                        // (Charset.java:610) enumerates `CharsetProvider` SPI and calls
+                        // `Charset.put` which dereferences a null name, NPEing during
+                        // `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. Force
+                        // our native (registered in `register_p61_charset`) that returns
+                        // a populated TreeMap with the standard charsets directly.
+                        || (class_name == "java/nio/charset/Charset"
+                            && method_name == "availableCharsets"
+                            && descriptor == "()Ljava/util/SortedMap;")
+                        // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
+                        // "No readable meta.properties files found." because
+                        // our HashMap layout makes the populated logDirProps
+                        // map look empty to AbstractMap.isEmpty()/size(). The
+                        // file is correctly read by Properties.load (134 bytes,
+                        // 4 entries parsed) and Loader.load successfully puts
+                        // the dir → MetaProperties mapping, but the read-back
+                        // returns size=0. Force the native no-op override so
+                        // KafkaRaftServer.initializeLogDirs can advance past
+                        // this check to the Copier/BootstrapDirectory phase.
+                        || (class_name == "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble"
+                            && method_name == "verify"
+                            && descriptor == "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V")
+                        // Round 63: org.jboss.staxmapper.IntVersion.toString()
+                        // — the real-JDK bytecode uses
+                        //   IntStream.of(segments).limit(n).mapToObj(Integer::toString)
+                        //     .collect(Collectors.joining("."))
+                        // Our IntStream/mapToObj/limit chain returns null at the
+                        // collect() call, NPEing inside
+                        // VersionedNamespace.createURN → StandaloneXmlSchemas.<init>
+                        // during WildFly boot. Our native (registered in lib.rs)
+                        // reads the int[] `segments` field directly and joins
+                        // with dots; force the override so the broken stream
+                        // path never runs.
+                        || (class_name == "org/jboss/staxmapper/IntVersion"
+                            && method_name == "toString"
+                            && (descriptor == "()Ljava/lang/String;"
+                                || descriptor == "(I)Ljava/lang/String;"));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
@@ -6070,15 +6818,67 @@ fn invoke_on_class_shared_inner(
 
                 // Check interfaces for default methods (e.g. Function$AndThen
                 // implements Function, so Function.andThen should be found).
+                //
+                // SPLITERATOR-FALLTHROUGH: When the receiver is a real-JDK
+                // subclass implementing an interface for which we have BOTH
+                // a registered native (e.g. `java/util/Spliterator.tryAdvance`
+                // registered for our synthetic Spliterator instances) AND the
+                // interface declares a default method (or any super-interface
+                // does), we MUST prefer the JDK default-method bytecode over
+                // our native: the native operates on synthetic field layouts
+                // (field 0 = backing array, field 1 = cursor) and silently
+                // returns false/0 when invoked on a real-JDK subclass like
+                // `ServiceLoaderUtil$ServiceLoaderSpliterator` whose field 0
+                // is an Iterator. This regressed log4j's
+                // `PropertySource$Util.<clinit>` (Stream.forEach over a
+                // ServiceLoader-driven Spliterator returned 0 elements,
+                // surfacing as IAE during WildFly boot).
                 {
                     let cm2 = shared.class_manager.read();
                     if let Some(class) = cm2.class_store.get(class_id) {
-                        let iface_names: Vec<String> = class
-                            .interfaces
-                            .iter()
-                            .filter_map(|&iid| cm2.class_store.get(iid).map(|c| c.name.to_string()))
-                            .collect();
+                        // Collect transitive interfaces (BFS over super-ifaces)
+                        // so we find default methods declared on a parent
+                        // interface even if the receiver implements only a
+                        // sub-interface.
+                        let mut iface_queue: Vec<ClassId> = class.interfaces.iter().copied().collect();
+                        let mut visited_ifaces: std::collections::HashSet<ClassId> = std::collections::HashSet::new();
+                        let mut iface_names: Vec<String> = Vec::new();
+                        let mut i = 0;
+                        while i < iface_queue.len() {
+                            let iid = iface_queue[i];
+                            i += 1;
+                            if !visited_ifaces.insert(iid) {
+                                continue;
+                            }
+                            if let Some(iface) = cm2.class_store.get(iid) {
+                                iface_names.push(iface.name.to_string());
+                                iface_queue.extend_from_slice(&iface.interfaces);
+                            }
+                        }
+                        // First pass: prefer a non-abstract default method on
+                        // any (super-)interface — running the JDK bytecode is
+                        // always safer than dispatching to a native shaped for
+                        // synthetic receivers.
+                        let mut default_iface: Option<ClassId> = None;
+                        for &iid in visited_ifaces.iter() {
+                            if let Some(iface) = cm2.class_store.get(iid) {
+                                if let Some(m) = iface.find_method(method_name, descriptor) {
+                                    if !m.is_abstract() {
+                                        default_iface = Some(iid);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(iid) = default_iface {
+                            drop(cm2);
+                            return invoke_on_class_shared(
+                                shared, thread, iid, method_name, descriptor, args,
+                            );
+                        }
                         drop(cm2);
+                        // Second pass: fall back to a native registered on
+                        // any interface name (legacy behavior).
                         for iface_name in &iface_names {
                             if let Some(callback) =
                                 shared.native_methods.find(iface_name, method_name, descriptor)
