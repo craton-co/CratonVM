@@ -880,6 +880,131 @@ fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+
+/// WildFly visibility: intercept
+/// `org/jboss/logging/JBossLogManagerLogger.doLog(Level,String fqcn,Object
+/// message,Object[] params,Throwable)` and emit the formatted line to
+/// stderr. WildFly's `Logger.info(...)` / `Logger.severe(...)` /
+/// `ServerLogger.WFLYSRV*` chain all funnel into `doLog`/`doLogf` before
+/// touching `org.jboss.logmanager.Logger.logRaw` (which our null-safe
+/// stub previously swallowed). By printing here we surface the boot
+/// progress without needing LogRecord field-offset guesses.
+fn native_jboss_logging_logger_do_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Layout: this, level, fqcn, message, params, throwable
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let message_obj = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
+    let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let level_name = level_obj
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| "INFO".to_string());
+    let message = message_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
+    eprintln!("{level_name} [{logger_name}] {message}");
+    if throwable_obj.is_some() {
+        eprintln!("    (with throwable)");
+    }
+    Ok(None)
+}
+
+/// Same as `do_log` but for the printf-style `doLogf(Level,String fqcn,
+/// String format,Object[] params,Throwable)`. We don't attempt actual
+/// printf substitution — emit the format string verbatim, which is
+/// sufficient to make boot progress visible.
+fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let format_obj = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
+    let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let level_name = level_obj
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| "INFO".to_string());
+    let format = format_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
+    eprintln!("{level_name} [{logger_name}] {format}");
+    if throwable_obj.is_some() {
+        eprintln!("    (with throwable)");
+    }
+    Ok(None)
+}
+
+/// Generic `java/util/logging/Logger.log(Level, String)` intercept so
+/// any JUL-direct caller (Hibernate, Mojarra, etc.) also surfaces.
+fn native_jul_logger_log_level_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let message_obj = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let level_name = level_obj
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| "INFO".to_string());
+    let message = message_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
+    eprintln!("{level_name} [{logger_name}] {message}");
+    Ok(None)
+}
+
+fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    log_simple(ctx, args, "INFO");
+    Ok(None)
+}
+fn native_jul_logger_warning(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    log_simple(ctx, args, "WARN");
+    Ok(None)
+}
+fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    log_simple(ctx, args, "ERROR");
+    Ok(None)
+}
+fn native_jul_logger_fine(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Suppress fine/finer/finest — too noisy and not useful for boot visibility.
+    Ok(None)
+}
+
+fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let message_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let message = message_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
+    eprintln!("{level} [{logger_name}] {message}");
+}
+
 fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
@@ -1147,6 +1272,53 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/LogRecord;)V",
         native_jboss_logger_log_raw,
     );
+
+    // ---------------- WFLY visibility: JBossLogManagerLogger.doLog / doLogf ----------------
+    // WildFly's boot logging goes:
+    //   org.jboss.as.server.ServerLogger.info("WFLYSRV0025: ...")
+    //     → org.jboss.logging.Logger.info(...)
+    //     → org.jboss.logging.JBossLogManagerLogger.doLog(Level,fqcn,msg,params,t)
+    //     → org.jboss.logmanager.Logger.logRaw(ExtLogRecord)  [null-safe stub]
+    // The logRaw stub never sees the original message string (LogRecord
+    // field offsets unknown). Intercepting `doLog`/`doLogf` directly
+    // gives us the message object as args[3], the level enum as args[1],
+    // and the logger name from `this.name`. Emit a formatted line to
+    // stderr so every WFLY* / JBAS* / Hibernate / Undertow log surface.
+    for cls in &[
+        "org/jboss/logging/JBossLogManagerLogger",
+        "org/jboss/logging/JDKLogger",
+        "org/jboss/logging/Slf4jLogger",
+        "org/jboss/logging/Slf4jLocationAwareLogger",
+        "org/jboss/logging/Log4j2Logger",
+        "org/jboss/logging/Log4jLogger",
+    ] {
+        registry.register(
+            cls,
+            "doLog",
+            "(Lorg/jboss/logging/Logger$Level;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
+            native_jboss_logging_logger_do_log,
+        );
+        registry.register(
+            cls,
+            "doLogf",
+            "(Lorg/jboss/logging/Logger$Level;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
+            native_jboss_logging_logger_do_logf,
+        );
+    }
+
+    // JUL convenience methods for callers that bypass jboss-logging.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+        native_jul_logger_log_level_msg,
+    );
+    registry.register(CLS_JUL_LOGGER, "info", "(Ljava/lang/String;)V", native_jul_logger_info);
+    registry.register(CLS_JUL_LOGGER, "warning", "(Ljava/lang/String;)V", native_jul_logger_warning);
+    registry.register(CLS_JUL_LOGGER, "severe", "(Ljava/lang/String;)V", native_jul_logger_severe);
+    registry.register(CLS_JUL_LOGGER, "fine", "(Ljava/lang/String;)V", native_jul_logger_fine);
+    registry.register(CLS_JUL_LOGGER, "finer", "(Ljava/lang/String;)V", native_jul_logger_fine);
+    registry.register(CLS_JUL_LOGGER, "finest", "(Ljava/lang/String;)V", native_jul_logger_fine);
 
     // ---------------- KC16: org.jboss.logmanager.LogContext overrides ----------------
     registry.register(

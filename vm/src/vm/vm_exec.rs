@@ -6590,6 +6590,36 @@ fn invoke_on_class_shared_inner(
                         // log4j facade NPEs in the PrivilegedAction at
                         // JBossLogManagerFacade$2.run pc=29, leading to
                         // ServerLogger.<clinit> System.exit(1).
+                        // WFLY visibility: surface boot logs to stderr.
+                        // `JBossLogManagerLogger.doLog`/`doLogf` are
+                        // concrete bytecode that funnels through
+                        // `org.jboss.logmanager.Logger.logRaw` which our
+                        // null-safe stub swallows. Override at doLog
+                        // level so the original message + level + logger
+                        // name are visible. Likewise force-override
+                        // `java/util/logging/Logger.{log,info,warning,
+                        // severe,fine,finer,finest}` so JUL-direct
+                        // callers also print. Default JUL handlers are
+                        // not wired up (jboss-logmanager LogManager
+                        // class failed to load) so without these
+                        // overrides every `Logger.info(...)` goes to
+                        // /dev/null.
+                        || (matches!(
+                                class_name,
+                                "org/jboss/logging/JBossLogManagerLogger"
+                                | "org/jboss/logging/JDKLogger"
+                                | "org/jboss/logging/Slf4jLogger"
+                                | "org/jboss/logging/Slf4jLocationAwareLogger"
+                                | "org/jboss/logging/Log4j2Logger"
+                                | "org/jboss/logging/Log4jLogger"
+                            )
+                            && matches!(method_name, "doLog" | "doLogf"))
+                        || (class_name == "java/util/logging/Logger"
+                            && matches!(
+                                method_name,
+                                "log" | "info" | "warning" | "severe"
+                                    | "fine" | "finer" | "finest"
+                            ))
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
                                 method_name,
