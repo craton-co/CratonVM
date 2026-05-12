@@ -4178,6 +4178,34 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- smallrye-config KeyStoreConfigSourceFactory.getConfigSources ---
+    // CratonVM divergence: In real Quarkus, the @ConfigMapping interface
+    // io.smallrye.config.source.keystore.KeyStoreConfig is auto-registered with
+    // the SmallRyeConfig instance via build-time discovery/reflection.  Under
+    // CratonVM that registration path is not active, so the factory's call to
+    // SmallRyeConfig.getConfigMapping(KeyStoreConfig.class) throws
+    // NoSuchElementException("SRCFG00027: Could not find a mapping for
+    // io.smallrye.config.source.keystore.KeyStoreConfig"), aborting Keycloak
+    // 26 boot during Configuration.getConfig().  Keycloak's default config
+    // does not use keystore-backed config sources, so returning an empty
+    // Iterable here is semantically equivalent to having no configured
+    // keystores.  Short-circuit at getConfigSources so we never hit the
+    // mapping lookup in getKeyStoreConfig.
+    r.register(
+        "io/smallrye/config/source/keystore/KeyStoreConfigSourceFactory",
+        "getConfigSources",
+        "(Lio/smallrye/config/ConfigSourceContext;)Ljava/lang/Iterable;",
+        |ctx, _args| {
+            use rustjvm_types::ArrayElementType;
+            let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(0));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+
     // --- Files extras ---
     r.register(
         files,

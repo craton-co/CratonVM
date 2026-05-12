@@ -827,16 +827,55 @@ const CTX_FIELD_CONTROLLER_ID: usize = 0;
 const CTX_NUM_SLOTS: usize = 1;
 
 /// Helper to allocate a Java `ServiceName` object wrapping an
-/// `Arc<ServiceName>` via its canonical String.  Field 0 is unused
-/// (could later be populated with the segments array); field 1 holds
-/// the canonical String so `getCanonicalName()` can return it directly.
-fn alloc_java_service_name(
+/// `Arc<ServiceName>` via its canonical String.
+///
+/// In **real-JDK mode** the loaded `org.jboss.msc.service.ServiceName`
+/// class declares four instance fields in this order:
+///   0. `name`         : `String`  (the leaf segment)
+///   1. `canonicalName`: `String`  (the dotted full name; written via the
+///                                  `canonicalNameUpdater` AtomicRef CAS)
+///   2. `parent`       : `ServiceName`
+///   3. `hashCode`     : `int`     (cached, computed in the ctor)
+///
+/// Real Java bytecode (e.g. `ServiceName.equals(ServiceName)` at
+/// `ServiceName.java:230`) reads both `name` (slot 0) and `hashCode`
+/// (slot 3). When we leave `name` at its default null, the `equals`
+/// fast path triggers `null.equals(o.name)` → `NullPointerException:
+/// Cannot invoke equals on null`. WildFly's
+/// `ConsoleAvailabilityService.addService` is the first caller that
+/// trips this because it compares two synthesised
+/// `getCapabilityServiceName()` results inside
+/// `ServiceBuilderImpl.assertNotInstanceId`.
+///
+/// The fix populates the `name` field with the leaf segment (the part
+/// after the last `.`) and seeds `hashCode` with the canonical name's
+/// hash, so JDK equals/hashCode behave consistently across all of our
+/// synthetic mirrors. Fields are addressed by name so this stays
+/// correct regardless of the loaded class's exact field layout.
+pub(crate) fn alloc_java_service_name(
     ctx: &mut dyn NativeContext,
     name: &Arc<ServiceName>,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceName", 2);
-    let canonical = ctx.create_string(name.canonical());
-    ctx.set_field(obj, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
+    let canonical_text = name.canonical();
+    let canonical = ctx.create_string(canonical_text);
+    // canonicalName is updated via an AtomicReferenceFieldUpdater in the
+    // JDK ctor; using `set_field_by_name` is safe — it writes the same
+    // slot the updater would CAS into.
+    ctx.set_field_by_name(obj, "canonicalName", Value::Object(Some(canonical)));
+    // Leaf segment for the `name` field. Use the whole canonical text if
+    // there are no dots (matches the JDK ctor for a top-level
+    // ServiceName.of(String)).
+    let leaf = canonical_text.rsplit('.').next().unwrap_or(canonical_text);
+    let leaf_str = ctx.create_string(leaf);
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(leaf_str)));
+    // Stable, deterministic hash that matches our equals contract on
+    // synthetic mirrors. The exact value does not need to mirror the
+    // JDK's `calculateHashCode` — `ServiceName.equals` compares both
+    // sides' `hashCode` fields, so as long as two mirrors of the same
+    // canonical name produce the same value we're good.
+    let h: i32 = canonical_text.bytes().fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
+    ctx.set_field_by_name(obj, "hashCode", Value::Int(h));
     obj
 }
 

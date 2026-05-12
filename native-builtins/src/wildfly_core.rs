@@ -851,10 +851,9 @@ fn native_services_deployment_unit_name(
         _ => String::new(),
     };
     let sn = wildfly_deployment_unit_name(&name);
-    // We return a synthetic ServiceName mirror via the MSC-side layout.
-    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceName", 2);
-    let canonical = ctx.create_string(sn.canonical());
-    ctx.set_field(obj, 1, Value::Object(Some(canonical)));
+    // R80: must populate `name` + `hashCode` (not just `canonicalName`) so
+    // JDK `ServiceName.equals` does not NPE on `this.name == null`.
+    let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -888,9 +887,7 @@ fn native_deployment_unit_get_service_name(
                 _ => String::new(),
             };
             let sn = wildfly_deployment_unit_name(&name);
-            let obj = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceName", 2);
-            let canonical = ctx.create_string(sn.canonical());
-            ctx.set_field(obj, 1, Value::Object(Some(canonical)));
+            let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
             Ok(Some(Value::Object(Some(obj))))
         }
     }
