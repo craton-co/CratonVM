@@ -24350,6 +24350,19 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
 
+    // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
+    // JCE provider list via java.security.Provider.checkInitialized, which
+    // throws IllegalStateException in our environment because the security
+    // provider isn't initialized at Profile.configure time. We have no
+    // Kerberos support anyway, so return false unconditionally and let
+    // Profile.configure() advance past the KerberosJdkProvider check.
+    registry.register(
+        "org/keycloak/common/util/KerberosJdkProvider",
+        "isKerberosAvailable",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
     // No-op log methods (covers the most common arities that JCL /
     // commons-logging / direct-SLF4J callers use). The synthetic-jdk
     // `register_slf4j_natives` overrides several of these with

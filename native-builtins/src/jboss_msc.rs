@@ -1187,6 +1187,21 @@ fn native_service_container_shutdown(
     Ok(None)
 }
 
+/// R63 (WildFly): `org/jboss/msc/service/Lockable.acquireWrite()/acquireRead()`
+/// uses a hand-rolled AQS-style wait loop that calls `Object.wait()` when the
+/// lock is contended. CratonVM's interpreter is effectively single-threaded for
+/// MSC boot — the MSC ContainerExecutor runs tasks inline on the main thread —
+/// so a recursive task path can re-enter `acquireWrite` while the bit is already
+/// set. There is no other thread to call `notify()`, so `Object.wait()` blocks
+/// forever. Since all "concurrent" task execution happens on one thread, locking
+/// is unnecessary: shim acquire/release to no-ops so MSC boot proceeds.
+fn native_lockable_lock_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
 /// R63 (WildFly): `DelegatingBasicLogger.isTraceEnabled()` returns
 /// `this.log.isTraceEnabled()`, but in our synthetic-logger fixups
 /// for ServiceLogger/ElytronMessages the `log` field is null. The
@@ -1468,6 +1483,13 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "()Lorg/jboss/msc/service/ServiceController$State;",
         native_service_controller_get_state,
     );
+
+    // R63 WildFly: Lockable acquire/release shims (see native_lockable_lock_noop).
+    let lockable = "org/jboss/msc/service/Lockable";
+    r.register(lockable, "acquireWrite", "()V", native_lockable_lock_noop);
+    r.register(lockable, "acquireRead", "()V", native_lockable_lock_noop);
+    r.register(lockable, "releaseWrite", "()V", native_lockable_lock_noop);
+    r.register(lockable, "releaseRead", "()V", native_lockable_lock_noop);
 
     let start_ctx = "org/jboss/msc/service/StartContext";
     r.register(
