@@ -415,6 +415,80 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     registry.register(m, "getClassLoader", "()Ljava/lang/ClassLoader;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
+
+    // ── Round 63: WildFly `WildFlySecurityManager` <clinit> NPE ────────────
+    //
+    // `org.wildfly.security.manager._private.JDKSpecific.getCallerClass(int n)`
+    // is the per-JDK shim WildFly uses to find the call-site that triggered
+    // a permission check. Its real-JDK body is roughly:
+    //
+    //   static Class<?> getCallerClass(int n) {
+    //       return getStackWalker()
+    //           .walk(s -> s.skip(n).findFirst())
+    //           .get()
+    //           .getDeclaringClass();
+    //   }
+    //
+    // Two CratonVM-side weaknesses combine to produce
+    // `NullPointerException: Cannot invoke getDeclaringClass on null`:
+    //   1. Our synthetic StackWalker stream sometimes hands back an empty
+    //      Optional when `skip(n)` overshoots the available frames.
+    //   2. The downstream `Optional.get()` on the synthetic Optional then
+    //      yields null rather than NoSuchElementException.
+    //
+    // WildFlySecurityManager's `<clinit>` block calls `getCallerClass(2)` to
+    // seed a class reference — the result is only used to allow/deny the
+    // *initial* security-domain context. A spec-safe fallback is to return
+    // the @CallerSensitive caller class via our existing stack-trace
+    // capture, falling back to `java.lang.Object` (the JDK universally-
+    // permitted base) when no Java frame is available.
+    //
+    // The same shim ships in `org.jboss.modules.JDKSpecific` (JBoss
+    // Modules' own copy with the identical signature) — register both so
+    // future loader paths don't trip on the same null deref.
+    fn native_jdkspecific_get_caller_class(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let depth = match args.first() {
+            Some(Value::Int(d)) => *d as i64,
+            _ => 0,
+        };
+        let frames = ctx.capture_stack_trace(0);
+        // Frames are bottom-up (main at [0], innermost top at [len-1]).
+        // The native frame itself isn't recorded, so frames[len-1] is the
+        // @CallerSensitive method that invoked us. WildFly's `n` counts
+        // outward from that point: n=0 → its own frame, n=1 → its caller.
+        let target = if !frames.is_empty() {
+            let len = frames.len() as i64;
+            let idx = (len - 1 - depth).max(0) as usize;
+            frames.get(idx).cloned()
+        } else {
+            None
+        };
+        let class_name = target
+            .map(|f| f.class_name.replace('.', "/"))
+            .unwrap_or_else(|| "java/lang/Object".to_string());
+        let cid = ctx
+            .ensure_class_initialized(&class_name)
+            .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))
+            .unwrap_or(rustjvm_types::ClassId::new(0));
+        let mirror = ctx.get_class_mirror(cid);
+        Ok(Some(Value::Object(Some(mirror))))
+    }
+
+    registry.register(
+        "org/wildfly/security/manager/_private/JDKSpecific",
+        "getCallerClass",
+        "(I)Ljava/lang/Class;",
+        native_jdkspecific_get_caller_class,
+    );
+    registry.register(
+        "org/jboss/modules/JDKSpecific",
+        "getCallerClass",
+        "(I)Ljava/lang/Class;",
+        native_jdkspecific_get_caller_class,
+    );
 }
 
 #[cfg(test)]
