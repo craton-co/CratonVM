@@ -3710,7 +3710,12 @@ fn alloc_calendar(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(cal, CAL_FIELD_MINUTE, Value::Int(0));
     ctx.set_field(cal, CAL_FIELD_SECOND, Value::Int(0));
     ctx.set_field(cal, CAL_FIELD_MILLIS, Value::Int(0));
-    ctx.set_field(cal, CAL_FIELD_TIMEZONE, Value::Object(None));
+    // Initialize with default timezone (UTC) to avoid NPE in SimpleDateFormat.initializeDefaultCentury
+    let zone = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", TZ_NUM_FIELDS);
+    let id = ctx.create_string("UTC");
+    ctx.set_field(zone, TZ_FIELD_ID, Value::Object(Some(id)));
+    ctx.set_field(zone, TZ_FIELD_OFFSET, Value::Int(0));
+    ctx.set_field(cal, CAL_FIELD_TIMEZONE, Value::Object(Some(zone)));
     cal
 }
 
