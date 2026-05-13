@@ -295,6 +295,17 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // without additional intercepts.
     let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(obj, "packages", Value::Object(Some(packages_map)));
+    // `ClassLoader.setDefaultAssertionStatus` uses `synchronized (assertionLock)`.
+    // Real JDK ctors assign `this.assertionLock = new Object()`; synthetic
+    // allocation skips that, so Surefire's forked booter NPEs on monitorenter.
+    let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let _ = ctx.invoke_special(
+        "java/lang/Object",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(lock))],
+    );
+    ctx.set_field_by_name(obj, "assertionLock", Value::Object(Some(lock)));
     obj
 }
 

@@ -177,6 +177,41 @@ pub struct ManifestInfo {
 }
 
 impl ManifestInfo {
+    /// Fold the JAR manifest **main section** into logical lines per the JAR
+    /// specification: any physical line beginning with a single leading space
+    /// continues the previous line (the line break and continuation marker space
+    /// are removed; the remainder is appended verbatim).
+    ///
+    /// This matters for long `Class-Path` headers (Surefire booter jars split
+    /// across many 72-byte lines). The previous `replace("\\n ", "")` approach
+    /// incorrectly deleted the continuation marker without appending the
+    /// continuation text, corrupting classpath entries.
+    fn fold_main_section_lines(text: &str) -> Vec<String> {
+        let text = text.replace('\r', "");
+        let mut folded: Vec<String> = Vec::new();
+        let mut buf = String::new();
+        for line in text.split('\n') {
+            if line.is_empty() {
+                if !buf.is_empty() {
+                    folded.push(std::mem::take(&mut buf));
+                }
+                break;
+            }
+            if line.starts_with(' ') && !buf.is_empty() {
+                buf.push_str(&line[1..]);
+            } else {
+                if !buf.is_empty() {
+                    folded.push(std::mem::take(&mut buf));
+                }
+                buf.push_str(line);
+            }
+        }
+        if !buf.is_empty() {
+            folded.push(buf);
+        }
+        folded
+    }
+
     fn decode_manifest_classpath_entry(entry: &str, jar_dir: &Path) -> PathBuf {
         let raw = entry.trim();
         // JAR manifests may carry file URLs (e.g. surefire booter jars emit
@@ -224,15 +259,16 @@ impl ManifestInfo {
     pub fn parse(data: &[u8]) -> Self {
         let text = String::from_utf8_lossy(data);
         let mut info = ManifestInfo::default();
-        // MANIFEST.MF uses continuation lines (start with single space),
-        // so we first join them.
-        let joined = text.replace("\r\n ", "").replace("\n ", "");
+        // MANIFEST.MF continuation lines (leading space after a newline) are
+        // folded into logical lines before key/value parsing — see
+        // [`Self::fold_main_section_lines`].
+        let joined_lines = Self::fold_main_section_lines(&text);
         // Per the JAR spec the file is split into sections by blank lines;
         // only the *main* section (the leading section before the first
         // blank line) carries the manifest-wide attributes that
         // `Package.getImplementationVersion()` etc. consult. Per-entry
         // sections after the first blank are skipped.
-        for line in joined.lines() {
+        for line in joined_lines.iter() {
             if line.is_empty() {
                 break;
             }
@@ -2617,6 +2653,60 @@ mod tests {
         assert_eq!(cp.len(), 2);
         assert!(cp[0].replace('\\', "/").ends_with("/tmp/boot/lib/a.jar"));
         assert!(cp[1].replace('\\', "/").ends_with("/tmp/boot/../shared/b.jar"));
+    }
+
+    #[test]
+    fn manifest_classpath_continuation_lines_preserve_entries() {
+        // 72-column style split: first line ends with a space before the break;
+        // continuation line begins with one marker space then the next path.
+        let raw = concat!(
+            "Manifest-Version: 1.0\n",
+            "Class-Path: file:/C:/repo/lib/one.jar \n",
+            " file:/C:/repo/lib/two.jar\n",
+            "\n"
+        );
+        let info = ManifestInfo::parse(raw.as_bytes());
+        let cp = info.resolve_class_path(Path::new("C:/tmp/booter.jar"));
+        assert_eq!(cp.len(), 2, "expected two jars, got {:?}", cp);
+        assert!(cp[0].replace('\\', "/").contains("/repo/lib/one.jar"));
+        assert!(cp[1].replace('\\', "/").contains("/repo/lib/two.jar"));
+    }
+
+    #[test]
+    fn manifest_classpath_mid_token_continuation() {
+        let raw = concat!(
+            "Class-Path: file:/C:/repo/lib/prefix-\n",
+            " suffix.jar\n",
+            "\n"
+        );
+        let info = ManifestInfo::parse(raw.as_bytes());
+        let cp = info.resolve_class_path(Path::new("C:/tmp/booter.jar"));
+        assert_eq!(cp.len(), 1);
+        assert!(cp[0].replace('\\', "/").contains("prefix-suffix.jar"));
+    }
+
+    /// Optional fixture: copy a Surefire booter `META-INF/MANIFEST.MF` to
+    /// `CratonVM/target/booter-extract/MANIFEST.MF` to validate folding on a
+    /// real multi-kilobyte Class-Path header.
+    #[test]
+    fn manifest_parse_optional_surefire_booter_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/booter-extract/META-INF/MANIFEST.MF");
+        if !path.exists() {
+            return;
+        }
+        let data = std::fs::read(&path).expect("read fixture");
+        let info = ManifestInfo::parse(&data);
+        let cp = info.class_path.expect("Class-Path");
+        assert!(
+            cp.contains("junit-platform-launcher-1.10.1.jar"),
+            "merged Class-Path should include junit launcher; len={}",
+            cp.len()
+        );
+        assert!(
+            !cp.contains(".././"),
+            "malformed .././ segment after fold: {cp:?}"
+        );
     }
 
     // -- Multi-release JAR tests --

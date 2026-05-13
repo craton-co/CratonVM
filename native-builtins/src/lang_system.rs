@@ -1316,29 +1316,20 @@ pub(crate) fn native_system_init_phase1(
     // got the empty-string fallback in the native and `nextLine()`/`nextInt()`
     // immediately threw `NoSuchElementException: no more elements`.
     {
-        // S110 — wire System.in to OS stdin. The real FileInputStream layout
-        // has slot 0 typed `Ljava/io/FileDescriptor;` (a reference); writing
-        // `Value::Int(0)` (= stdin fd id 0) into that slot via `set_field`
-        // hits the descriptor-aware coercion in `gc::heap` which rewrites
-        // `Int(0)` as `Object(None)` — defeating the whole point.
-        //
-        // Two-slot encoding gets around it without touching the heap:
-        //   * slot 0 stays a reference slot (coerced to `Object(None)`,
-        //     which is fine — readers ignore it and check slot 1)
-        //   * slot 1 holds the fd id as `Value::Int(fd + 1)` so the value is
-        //     never zero (zero would also be coerced if slot 1 turns out
-        //     to be a reference).
-        //
-        // The Scanner native at `native-io/src/lib.rs::native_scanner_init_inputstream`
-        // mirrors this: it checks slot 1 for `Int(n)` with `n > 0`, treats
-        // `n - 1` as the fd id, and falls through to the existing
-        // ByteArrayInputStream / fd-based detection paths.
-        let fis_class_id = ctx.ensure_class_initialized("java/io/FileInputStream")?;
-        let num_fields = ctx.class_num_total_fields(fis_class_id).max(2);
-        let in_obj = ctx.alloc_object(fis_class_id, num_fields);
-        // Stdin fd id is 0; encode as `Int(1)` so `coerce_field_value_by_descriptor`
-        // does not collapse it to `Object(None)` on the way into the slot.
-        ctx.set_field(in_obj, 1, Value::Int(1));
+        // Reuse a pinned stdin object if `GETSTATIC System.in` / `ensure_system_stdin_object`
+        // materialised it before `initPhase1` (Surefire fork bootstrap).
+        let in_obj = if let Some(o) = ctx.get_system_stream("in") {
+            o
+        } else {
+            let fis_class_id = ctx.ensure_class_initialized("java/io/FileInputStream")?;
+            let num_fields = ctx.class_num_total_fields(fis_class_id).max(2);
+            let new_in = ctx.alloc_object(fis_class_id, num_fields);
+            // Stdin fd id is 0; encode as `Int(1)` so `coerce_field_value_by_descriptor`
+            // does not collapse it to `Object(None)` on the way into the slot.
+            ctx.set_field(new_in, 1, Value::Int(1));
+            ctx.cache_system_stdin(new_in);
+            new_in
+        };
         ctx.set_static_field_by_name(
             "java/lang/System",
             "in",

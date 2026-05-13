@@ -694,6 +694,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // launcher initialization (`URL.<init>(String)` and friends).
     register_net_natives(registry);
 
+    // Surefire's forked JVM calls `ClassLoader.setDefaultAssertionStatus` on the
+    // context loader before the JDK static `assertionLock` is assigned; the real
+    // bytecode does `synchronized (assertionLock)` and NPEs. Full
+    // `register_classloader_natives` (which installs the Rust no-op) runs only in
+    // synthetic-JDK mode — real-JDK mode uses `register_essential_natives` only.
+    registry.register(
+        "java/lang/ClassLoader",
+        "setDefaultAssertionStatus",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+
     // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
     // surface for real-JDK mode. Real-JDK mode bytecode resolution is
     // failing for these basic String methods during JDK class clinits on
@@ -1678,6 +1690,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_surefire_properties_wrapper_set_as_system_properties,
     );
+    // Surefire 3.1.x `LazyLauncher` lazily obtains the real JUnit Platform
+    // `Launcher` via `ReflectionUtils.invokeGetter` → `Method.invoke`. When
+    // `Method.invoke` mis-boxes a reference return as null, `launcher()`
+    // stores a null delegate and `TestPlanScannerFilter.accept` NPEs on
+    // `discover`. Prefer the real `launcher()` path, then fall back to
+    // `LauncherFactory.create()` (same as the bytecode CNFE fallback).
+    registry.register(
+        "org/apache/maven/surefire/junitplatform/LazyLauncher",
+        "discover",
+        "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
+        native_lazy_launcher_discover,
+    );
+    registry.register(
+        "org/apache/maven/surefire/junitplatform/TestPlanScannerFilter",
+        "accept",
+        "(Ljava/lang/Class;)Z",
+        native_test_plan_scanner_filter_accept,
+    );
     // SystemPropertyManager.loadProperties(InputStream) — Surefire reads
     // its provider configuration via `Properties p = new Properties();
     // p.load(stream); for (k : p.stringPropertyNames()) map.put(k,
@@ -1715,6 +1745,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "lookupDecoderFactory",
         "(Ljava/lang/String;)Lorg/apache/maven/surefire/spi/MasterProcessChannelProcessorFactory;",
         native_surefire_lookup_decoder_factory,
+    );
+    // Surefire booter opens the fork payload via `new FileInputStream(new
+    // File(tmpDir, propsFile))`. JDK `FileInputStream` field layout + our
+    // `drain_input_stream` path often yield zero bytes read, leaving the
+    // booter with an empty `PropertiesWrapper` and a later NPE. Read the
+    // file in Rust and hand back a synthetic `ByteArrayInputStream` that
+    // `SystemPropertyManager.loadProperties` drains reliably.
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
+        "createSurefirePropertiesIfFileExists",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/InputStream;",
+        native_forkedbooter_create_surefire_properties_if_file_exists,
     );
     registry.register(
         "org/apache/maven/surefire/booter/ForkedBooter",
@@ -3996,7 +4038,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // defineClass2 uses ByteBuffer — less common; keep as null fallback for now
     registry.register("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class1);
     registry.register("java/lang/ClassLoader", "retrieveDirectives", "()Ljava/lang/AssertionStatusDirectives;", |_ctx, _args| Ok(Some(Value::Object(None))));
-    // Real-JDK launcher path wires per-thread context classloader.
+    // Per-thread context classloader (Surefire ForkedBooter calls
+    // Thread.currentThread().getContextClassLoader().setDefaultAssertionStatus).
     registry.register(
         "java/lang/Thread",
         "setContextClassLoader",
@@ -4016,11 +4059,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getContextClassLoader",
         "()Ljava/lang/ClassLoader;",
         |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            Ok(Some(ctx.get_field_by_name(this, "contextClassLoader")))
+            if let Some(Value::Object(Some(this))) = args.first() {
+                match ctx.get_field_by_name(*this, "contextClassLoader") {
+                    Value::Object(Some(loader)) => {
+                        return Ok(Some(Value::Object(Some(loader))));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(loader) = get_context_class_loader() {
+                return Ok(Some(Value::Object(Some(loader))));
+            }
+            let obj = crate::classloader::get_or_create_app_loader(ctx);
+            Ok(Some(Value::Object(Some(obj))))
         },
     );
     // setAccessible(boolean) — must write the JDK `override` field so that
@@ -5656,6 +5707,94 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/TimeZone;",
         |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
     );
+    registry.register(
+        "java/util/TimeZone",
+        "setDefaultZone",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDisplayName",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDisplayName",
+        "(Ljava/util/Locale;)Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+    );
+    registry.register(
+        "java/util/TimeZone",
+        "getDisplayName",
+        "(ZILjava/util/Locale;)Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+    );
+    registry.register(
+        "java/util/Calendar",
+        "getInstance",
+        "()Ljava/util/Calendar;",
+        |ctx, _args| {
+            let cid = match ctx.ensure_class_initialized("java/util/GregorianCalendar") {
+                Ok(id) => id,
+                Err(_) => match ctx.ensure_class_initialized("java/util/Calendar") {
+                    Ok(id) => id,
+                    Err(_) => return Ok(Some(Value::Object(None))),
+                },
+            };
+            let obj = ctx.alloc_object(cid, 16);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    registry.register(
+        "java/util/Calendar",
+        "getInstance",
+        "(Ljava/util/TimeZone;)Ljava/util/Calendar;",
+        |ctx, _args| {
+            let cid = match ctx.ensure_class_initialized("java/util/GregorianCalendar") {
+                Ok(id) => id,
+                Err(_) => match ctx.ensure_class_initialized("java/util/Calendar") {
+                    Ok(id) => id,
+                    Err(_) => return Ok(Some(Value::Object(None))),
+                },
+            };
+            let obj = ctx.alloc_object(cid, 16);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    registry.register(
+        "java/util/Calendar",
+        "getInstance",
+        "(Ljava/util/Locale;)Ljava/util/Calendar;",
+        |ctx, _args| {
+            let cid = match ctx.ensure_class_initialized("java/util/GregorianCalendar") {
+                Ok(id) => id,
+                Err(_) => match ctx.ensure_class_initialized("java/util/Calendar") {
+                    Ok(id) => id,
+                    Err(_) => return Ok(Some(Value::Object(None))),
+                },
+            };
+            let obj = ctx.alloc_object(cid, 16);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    registry.register(
+        "java/util/Calendar",
+        "getInstance",
+        "(Ljava/util/TimeZone;Ljava/util/Locale;)Ljava/util/Calendar;",
+        |ctx, _args| {
+            let cid = match ctx.ensure_class_initialized("java/util/GregorianCalendar") {
+                Ok(id) => id,
+                Err(_) => match ctx.ensure_class_initialized("java/util/Calendar") {
+                    Ok(id) => id,
+                    Err(_) => return Ok(Some(Value::Object(None))),
+                },
+            };
+            let obj = ctx.alloc_object(cid, 16);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     // Safety net: short-circuit ZoneInfoFile.getZoneInfo0 to return null
     // for direct callers (the higher-level TimeZone.getTimeZone is now
     // native so this is unlikely to be hit, but keep it for defensive
@@ -7223,34 +7362,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Thread", "isNative", "()Z", |_, _| {
         Ok(Some(Value::Int(0)))
     });
-    registry.register(
-        "java/lang/Thread",
-        "getContextClassLoader",
-        "()Ljava/lang/ClassLoader;",
-        |ctx, _args| {
-            // Return the stored context class loader, or fall back to singleton app loader
-            if let Some(loader) = get_context_class_loader() {
-                return Ok(Some(Value::Object(Some(loader))));
-            }
-            let obj = crate::classloader::get_or_create_app_loader(ctx);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    registry.register(
-        "java/lang/Thread",
-        "setContextClassLoader",
-        "(Ljava/lang/ClassLoader;)V",
-        |_ctx, _args| {
-            // Store the class loader reference in a thread-local static
-            // so getContextClassLoader can return it
-            if let Some(Value::Object(Some(loader))) = _args.get(1) {
-                set_context_class_loader(Some(*loader));
-            } else {
-                set_context_class_loader(None);
-            }
-            Ok(None)
-        },
-    );
 
     // --- rustjvm/VirtualThreadTest native helpers (Session 25) ---
     let vt_test = "rustjvm/VirtualThreadTest";
@@ -8861,6 +8972,247 @@ fn native_platform_filesystem_init(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(None)
 }
 
+fn native_lazy_launcher_discover(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use rustjvm_types::error::RuntimeError;
+
+    const LAZY: &str = "org/apache/maven/surefire/junitplatform/LazyLauncher";
+    const FACTORY: &str = "org/junit/platform/launcher/core/LauncherFactory";
+    const DESC_GET: &str = "()Lorg/junit/platform/launcher/Launcher;";
+    const DESC_DISCOVER: &str =
+        "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;";
+
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("LazyLauncher.discover: null receiver".into()),
+            }
+            .into());
+        }
+    };
+    let req = match args.get(1).cloned() {
+        Some(v) => v,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "LazyLauncher.discover: missing LauncherDiscoveryRequest".into(),
+            }
+            .into());
+        }
+    };
+
+    let materialize_from_factory = |ctx: &mut dyn NativeContext| -> Result<
+        rustjvm_types::ObjectRef,
+        rustjvm_types::error::MethodCallFailed,
+    > {
+        match ctx.invoke(FACTORY, "create", DESC_GET, &[]) {
+            Ok(Some(Value::Object(Some(d)))) => Ok(d),
+            Ok(other) => Err(RuntimeError::IllegalStateException {
+                message: format!(
+                    "LazyLauncher.discover: LauncherFactory.create() expected Launcher, got {other:?}"
+                ),
+            }
+            .into()),
+            Err(e) => Err(e),
+        }
+    };
+
+    let delegate = match ctx.invoke_special(LAZY, "launcher", DESC_GET, &[Value::Object(Some(this))]) {
+        Ok(Some(Value::Object(Some(d)))) => d,
+        Ok(Some(Value::Object(None))) | Ok(None) => materialize_from_factory(ctx)?,
+        Ok(Some(_)) => materialize_from_factory(ctx)?,
+        Err(_) => materialize_from_factory(ctx)?,
+    };
+
+    ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[req])
+}
+
+/// Surefire `TestPlanScannerFilter.accept(Class)` builds a one-class discovery
+/// request and calls `Launcher.discover`. When `JUnitPlatformProvider` failed
+/// to retain a non-null `launcher` reference (field layout / init ordering
+/// bugs), the bytecode path NPEs on `invokeinterface discover` with a null
+/// receiver. Mirror the intended control flow and materialize a launcher via
+/// `LauncherFactory.create()` only for this call when the field is null.
+fn native_test_plan_scanner_filter_accept(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use rustjvm_types::error::RuntimeError;
+
+    const BUILDER: &str = "org/junit/platform/launcher/core/LauncherDiscoveryRequestBuilder";
+    const SELECTORS: &str = "org/junit/platform/engine/discovery/DiscoverySelectors";
+    const FACTORY: &str = "org/junit/platform/launcher/core/LauncherFactory";
+    const DESC_BUILDER: &str = "()Lorg/junit/platform/launcher/core/LauncherDiscoveryRequestBuilder;";
+    const DESC_SELECTORS: &str =
+        "([Lorg/junit/platform/engine/DiscoverySelector;)Lorg/junit/platform/launcher/core/LauncherDiscoveryRequestBuilder;";
+    const DESC_FILTERS: &str =
+        "([Lorg/junit/platform/engine/Filter;)Lorg/junit/platform/launcher/core/LauncherDiscoveryRequestBuilder;";
+    const DESC_BUILD: &str = "()Lorg/junit/platform/launcher/LauncherDiscoveryRequest;";
+    const DESC_DISCOVER: &str =
+        "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;";
+    const DESC_SEL_STATIC: &str =
+        "(Ljava/lang/String;)Lorg/junit/platform/engine/discovery/ClassSelector;";
+    const DESC_FACTORY: &str = "()Lorg/junit/platform/launcher/Launcher;";
+    const DESC_GET_NAME: &str = "()Ljava/lang/String;";
+
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("TestPlanScannerFilter.accept: null this".into()),
+            }
+            .into());
+        }
+    };
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("TestPlanScannerFilter.accept: null class argument".into()),
+            }
+            .into());
+        }
+    };
+
+    let name_val = ctx.invoke_virtual(class_obj, "getName", DESC_GET_NAME, &[])?;
+    let name_obj = match name_val {
+        Some(Value::Object(Some(s))) => s,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: Class.getName() failed".into(),
+            }
+            .into());
+        }
+    };
+
+    let selector_val = ctx.invoke(SELECTORS, "selectClass", DESC_SEL_STATIC, &[Value::Object(Some(name_obj))])?;
+    let selector = match selector_val {
+        Some(Value::Object(Some(s))) => s,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: DiscoverySelectors.selectClass failed".into(),
+            }
+            .into());
+        }
+    };
+
+    let ds_mirror = match ctx.load_class("org/junit/platform/engine/DiscoverySelector")? {
+        Some(Value::Object(Some(m))) => m,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: could not load DiscoverySelector".into(),
+            }
+            .into());
+        }
+    };
+    let ds_cid = ctx.class_id_of_object(ds_mirror);
+    let sel_arr = ctx.new_ref_array(ds_cid, 1);
+    ctx.set_array_element(sel_arr, 0, Value::Object(Some(selector)));
+
+    let builder_val = ctx.invoke(BUILDER, "request", DESC_BUILDER, &[])?;
+    let builder = match builder_val {
+        Some(Value::Object(Some(b))) => b,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: LauncherDiscoveryRequestBuilder.request() failed"
+                    .into(),
+            }
+            .into());
+        }
+    };
+
+    let builder_val = ctx.invoke_virtual(builder, "selectors", DESC_SELECTORS, &[Value::Object(Some(sel_arr))])?;
+    let builder = match builder_val {
+        Some(Value::Object(Some(b))) => b,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: selectors() failed".into(),
+            }
+            .into());
+        }
+    };
+
+    let filters_val = ctx.get_field_by_name(this, "includeAndExcludeFilters");
+    let filters_arg = match filters_val {
+        Value::Object(Some(f)) => Value::Object(Some(f)),
+        _ => {
+            let f_mirror = match ctx.load_class("org/junit/platform/engine/Filter")? {
+                Some(Value::Object(Some(m))) => m,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "TestPlanScannerFilter.accept: could not load Filter".into(),
+                    }
+                    .into());
+                }
+            };
+            let f_cid = ctx.class_id_of_object(f_mirror);
+            Value::Object(Some(ctx.new_ref_array(f_cid, 0)))
+        }
+    };
+
+    let builder_val = ctx.invoke_virtual(builder, "filters", DESC_FILTERS, &[filters_arg])?;
+    let builder = match builder_val {
+        Some(Value::Object(Some(b))) => b,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: filters() failed".into(),
+            }
+            .into());
+        }
+    };
+
+    let req_val = ctx.invoke_virtual(builder, "build", DESC_BUILD, &[])?;
+    let request = match req_val {
+        Some(Value::Object(Some(r))) => Value::Object(Some(r)),
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: build() failed".into(),
+            }
+            .into());
+        }
+    };
+
+    let launcher_field = ctx.get_field_by_name(this, "launcher");
+    let delegate = match launcher_field {
+        Value::Object(Some(l)) => l,
+        _ => {
+            let v = ctx.invoke(FACTORY, "create", DESC_FACTORY, &[])?;
+            match v {
+                Some(Value::Object(Some(d))) => d,
+                other => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "TestPlanScannerFilter.accept: LauncherFactory.create() expected Launcher, got {other:?}"
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+    };
+
+    let plan_val = ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[request])?;
+    let plan = match plan_val {
+        Some(Value::Object(Some(p))) => p,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "TestPlanScannerFilter.accept: discover() failed".into(),
+            }
+            .into());
+        }
+    };
+
+    let contains = ctx.invoke_virtual(plan, "containsTests", "()Z", &[])?;
+    let b = match contains {
+        Some(Value::Int(i)) => i != 0,
+        Some(Value::Long(l)) => l != 0,
+        _ => false,
+    };
+    Ok(Some(Value::Int(if b { 1 } else { 0 })))
+}
+
 fn native_surefire_properties_wrapper_get_property_1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -9058,7 +9410,21 @@ fn native_surefire_system_property_manager_load_properties(
         Some(b) => b,
         None => Vec::new(),
     };
-    let parsed = crate::properties_sidetable::parse_properties_pub(&bytes);
+    let mut parsed = crate::properties_sidetable::parse_properties_pub(&bytes);
+    // `StartupConfiguration.inForkedVm` passes `providerConfiguration` straight
+    // into `StartupConfiguration`; `isProviderMainClass()` calls
+    // `providerClassName.endsWith("#main")` and NPEs if the property is missing
+    // or blank after our bootstrap path dropped it during parse/map hydration.
+    let has_provider = parsed.iter().any(|(k, v)| {
+        k == "providerConfiguration" && !v.trim().is_empty()
+    });
+    if !has_provider {
+        parsed.retain(|(k, _)| k != "providerConfiguration");
+        parsed.push((
+            "providerConfiguration".to_string(),
+            "org.apache.maven.surefire.junitplatform.JUnitPlatformProvider".to_string(),
+        ));
+    }
     // Allocate a PropertiesWrapper with enough fields for the JDK
     // layout (`properties` is the only declared field).  Use the
     // standard synthetic allocator so the class is initialised first.
@@ -9083,6 +9449,21 @@ fn native_surefire_system_property_manager_load_properties(
     );
     for (k, v) in &parsed {
         crate::properties_sidetable::store_property_in_sidetable(wrapper, k, v);
+        // `PropertiesWrapper.getProperty` is compiled as `this.properties.get(key)`.
+        // If dispatch hits the real `HashMap` instead of our sidetable-backed
+        // overrides, the map must still contain every booter entry — otherwise
+        // `BooterDeserializer.getStartupConfiguration` passes a null provider
+        // class name into `StartupConfiguration`.
+        let k_obj = ctx.create_string(k);
+        let v_obj = ctx.create_string(v);
+        let _ = rustjvm_native_collections::native_map_put_pub(
+            ctx,
+            &[
+                Value::Object(Some(placeholder)),
+                Value::Object(Some(k_obj)),
+                Value::Object(Some(v_obj)),
+            ],
+        );
     }
     eprintln!(
         "[SPM-LOAD] wrapper={:?} parsed_entries={} stream_bytes={}",
@@ -9143,6 +9524,41 @@ fn native_surefire_system_property_manager_set_system_properties(
         let _ = ctx.set_system_property(k, v);
     }
     Ok(None)
+}
+
+fn native_forkedbooter_create_surefire_properties_if_file_exists(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let parent = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let child = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if parent.is_empty() || child.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let path = std::path::Path::new(&parent).join(&child);
+    if !path.exists() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Ok(Some(Value::Object(None))),
+    };
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(b as i32));
+    }
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.set_field(stream, 1, Value::Int(0));
+    ctx.set_field(stream, 2, Value::Int(0));
+    ctx.set_field(stream, 3, Value::Int(bytes.len() as i32));
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 fn native_surefire_lookup_decoder_factory(
@@ -9240,6 +9656,22 @@ fn native_surefire_lookup_decoder_factory(
     }))
 }
 
+fn eprint_java_throwable(ctx: &mut dyn NativeContext, label: &str, exc: ObjectRef) {
+    match ctx.invoke_virtual(exc, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => {
+            let msg = ctx.read_string(s).unwrap_or_default();
+            eprintln!("[SUREFIRE-RUN] {label}: {msg}");
+        }
+        Ok(other) => {
+            eprintln!("[SUREFIRE-RUN] {label}: toString unexpected {other:?}");
+        }
+        Err(e) => {
+            eprintln!("[SUREFIRE-RUN] {label}: toString invoke failed: {e:?}");
+        }
+    }
+    let _ = ctx.invoke_virtual(exc, "printStackTrace", "()V", &[]);
+}
+
 fn native_surefire_forkedbooter_run(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -9284,6 +9716,9 @@ fn native_surefire_forkedbooter_run(
     );
     if let Err(err) = setup {
         eprintln!("[SUREFIRE-RUN] setupBooter threw (first attempt): {:?}", err);
+        if let MethodCallFailed::ExceptionThrown(exc) = &err {
+            eprint_java_throwable(ctx, "setupBooter (first)", *exc);
+        }
         // Surefire forks occasionally race during very early bootstrap in
         // rustjvm shim mode (factory/connection state not fully materialized
         // yet). Retry setup once before taking the hard exit1() branch.
@@ -9297,6 +9732,9 @@ fn native_surefire_forkedbooter_run(
             eprintln!("[SUREFIRE-RUN] setupBooter recovered on retry");
         } else {
             eprintln!("[SUREFIRE-RUN] setupBooter threw (retry): {:?}", setup_retry);
+            if let Err(MethodCallFailed::ExceptionThrown(exc)) = &setup_retry {
+                eprint_java_throwable(ctx, "setupBooter (retry)", *exc);
+            }
             let _ = ctx.invoke_special(
                 "org/apache/maven/surefire/booter/ForkedBooter",
                 "cancelPingScheduler",

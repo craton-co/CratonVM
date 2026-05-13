@@ -4,6 +4,9 @@ use rustjvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};
 use rustjvm_types::{ClassId, ObjectRef, Value};
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use crate::obj_arg;
 use crate::lang_math::alloc_wrapper;
 use crate::alloc_concurrent_synthetic;
@@ -2976,10 +2979,120 @@ pub(crate) fn read_method_descriptor(
 ) -> Option<String> {
     let class_id = ctx.class_id_of_object(method_obj);
     let base = method_extra_base(ctx, class_id);
-    match ctx.get_field(method_obj, base + METHOD_EXTRA_OFFSET_DESC) {
+    let idx = base.saturating_add(METHOD_EXTRA_OFFSET_DESC);
+    if ctx.object_num_fields(method_obj) <= idx {
+        return None;
+    }
+    match ctx.get_field(method_obj, idx) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     }
+}
+
+/// Single type token for a `java.lang.Class` mirror (`java/lang/String` →
+/// `Ljava/lang/String;`, `[I` → `[I`, primitives → `I`/`J`/…).
+fn mirror_to_jvm_descriptor_token(ctx: &dyn NativeContext, mirror: ObjectRef) -> String {
+    let name = mirror_class_name(ctx, mirror).unwrap_or_default();
+    if name.is_empty() {
+        return "Ljava/lang/Object;".to_string();
+    }
+    match name.as_str() {
+        "void" => "V".to_string(),
+        "int" => "I".to_string(),
+        "long" => "J".to_string(),
+        "float" => "F".to_string(),
+        "double" => "D".to_string(),
+        "boolean" => "Z".to_string(),
+        "byte" => "B".to_string(),
+        "char" => "C".to_string(),
+        "short" => "S".to_string(),
+        s if s.starts_with('[') => s.to_string(),
+        s => format!("L{s};"),
+    }
+}
+
+/// Real JDK `java.lang.reflect.Method` instances do not populate our extra
+/// descriptor slot (`METHOD_EXTRA_OFFSET_DESC`). Without a descriptor,
+/// `Method.invoke` used to assume `()V` when `returnType` could not be read,
+/// and [`box_value`] turned every reference return into `null` — breaking
+/// Surefire's `LazyLauncher` (`getLauncher()` → null). Missing `returnType`
+/// now falls back to `Ljava/lang/Object;` while still honouring
+/// `parameterTypes`.
+fn compose_method_descriptor_from_type_fields(
+    ctx: &dyn NativeContext,
+    method_obj: ObjectRef,
+) -> String {
+    // When `returnType` is missing (layout mismatch on some `Method`
+    // mirrors), returning an empty string made `parse_descriptor_param_and_return`
+    // treat the return as `void`, so `Method.invoke` boxed real reference
+    // results as `null` — Surefire `LazyLauncher` then kept a null delegate
+    // (`Cannot invoke discover on null`). Default missing return to
+    // `java.lang.Object` (still correct for `void`: the invoke path returns
+    // `None` before boxing).
+    let ret_token = match ctx.get_field_by_name(method_obj, "returnType") {
+        Value::Object(Some(m)) => mirror_to_jvm_descriptor_token(ctx, m),
+        _ => "Ljava/lang/Object;".to_string(),
+    };
+
+    let params_arr = match ctx.get_field_by_name(method_obj, "parameterTypes") {
+        Value::Object(Some(arr)) => arr,
+        _ => return format!("(){ret_token}"),
+    };
+    let len = ctx.array_length(params_arr);
+    let mut out = String::with_capacity(8 + len * 16);
+    out.push('(');
+    for i in 0..len {
+        if let Value::Object(Some(pm)) = ctx.get_array_element(params_arr, i) {
+            out.push_str(&mirror_to_jvm_descriptor_token(ctx, pm));
+        }
+    }
+    out.push(')');
+    out.push_str(&ret_token);
+    out
+}
+
+/// Descriptor for `Method.invoke`: RustJVM extra slot if present and
+/// well-formed; otherwise reconstruct from JDK `Executable` fields.
+///
+/// C6/Surefire: `method_extra_base` uses `max(LEGACY_FLOOR, class field
+/// count)`. For real `java.lang.reflect.Method` instances the extra slot
+/// index can still land **inside** the JDK instance layout (below the true
+/// tail). That slot may hold an unrelated reference (e.g. `signature`) that
+/// `read_string` turns into garbage — **not** starting with `(`. We must
+/// not treat that as a JVM method descriptor or `Method.invoke` boxes
+/// reference returns as `null` (wrong `()V` shape).
+pub(crate) fn method_descriptor_for_invoke(
+    ctx: &dyn NativeContext,
+    method_obj: ObjectRef,
+) -> String {
+    fn looks_like_jvm_method_descriptor(d: &str) -> bool {
+        let d = d.trim();
+        let close = match (d.as_bytes().first(), d.find(')')) {
+            (Some(b'('), Some(c)) => c,
+            _ => return false,
+        };
+        // Must have at least one return-type token after ')'.
+        close + 1 < d.len()
+    }
+
+    let composed = compose_method_descriptor_from_type_fields(ctx, method_obj);
+
+    if let Some(d) = read_method_descriptor(ctx, method_obj) {
+        if looks_like_jvm_method_descriptor(&d) {
+            let (slot_params, slot_ret) = parse_descriptor_param_and_return(d.trim());
+            let (comp_params, comp_ret) = parse_descriptor_param_and_return(&composed);
+            // Only trust the RustJVM extra-slot descriptor when it agrees with
+            // the Executable mirrors (`parameterTypes` / `returnType`). If the
+            // slot lands on an unrelated `String` (C6), it can look like a
+            // valid JVM descriptor but disagree — e.g. bogus `()V` while the
+            // method returns `Launcher` (Surefire `LazyLauncher` NPE).
+            if slot_params.len() != comp_params.len() || slot_ret != comp_ret {
+                return composed;
+            }
+            return d.trim().to_string();
+        }
+    }
+    composed
 }
 
 /// Read the RustJVM-specific cached parameter count extra slot.
@@ -3174,7 +3287,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     }
 
     // Get descriptor — stored in RustJVM extra slot (not a real JDK field).
-    let descriptor = read_method_descriptor(ctx, this).unwrap_or_default();
+    let descriptor = method_descriptor_for_invoke(ctx, this);
 
     // Parse parameter types from descriptor
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&descriptor);
@@ -3286,6 +3399,27 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
             }
         }
     };
+
+    if std::env::var_os("RUSTJVM_DIAG_METHOD_INVOKE_NULL").is_some() {
+        let void_ret = ret_desc == "V" || ret_desc.is_empty();
+        if !void_ret {
+            match &result {
+                None => {
+                    eprintln!(
+                        "[Method.invoke] non-void return mapped to None: {}.{}{}",
+                        class_name, method_name, descriptor
+                    );
+                }
+                Some(Value::Object(None)) => {
+                    eprintln!(
+                        "[Method.invoke] non-void return null reference: {}.{}{}",
+                        class_name, method_name, descriptor
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 
     // Box the return value
     match result {
@@ -4017,6 +4151,57 @@ pub(crate) fn native_class_get_declared_method(
 // java.lang.reflect.Constructor — object layout and natives
 // ---------------------------------------------------------------------------
 
+/// Stable metadata for `java.lang.reflect.Constructor` mirrors created by
+/// `create_constructor_object`.
+///
+/// RustJVM stores the raw descriptor / parameter count / accessible flag in
+/// heap slots *after* `class_num_total_fields(java/lang/reflect/Constructor)`.
+/// When `ClassManager::upgrade_synthetic_class` replaces the stub with the real
+/// JDK class, `num_total_fields` grows (Wave 3-B: `max(old, new)`), so the
+/// absolute indices used at **allocation time** no longer match the indices
+/// computed at **read time** — `read_constructor_descriptor` returns `None`,
+/// `Constructor.newInstance` falls back to `()V`, and only `Object.<init>` runs
+/// (Surefire: `JUnitPlatformProvider.launcher` stays null →
+/// `TestPlanScannerFilter` NPE on `discover`).
+///
+/// The side table is keyed by the mirror object's identity (`ObjectRef` bits);
+/// forked Surefire VMs are short-lived so we do not hook GC for eviction.
+#[derive(Clone)]
+struct ConstructorMirrorSideMeta {
+    descriptor: String,
+    param_count: i32,
+    accessible: bool,
+}
+
+fn constructor_mirror_side_table() -> &'static Mutex<HashMap<usize, ConstructorMirrorSideMeta>> {
+    static TABLE: OnceLock<Mutex<HashMap<usize, ConstructorMirrorSideMeta>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_constructor_mirror_side(
+    obj: ObjectRef,
+    descriptor: &str,
+    param_count: i32,
+    accessible: bool,
+) {
+    let key = obj.as_ptr() as usize;
+    let mut g = constructor_mirror_side_table().lock().unwrap_or_else(|p| p.into_inner());
+    g.insert(
+        key,
+        ConstructorMirrorSideMeta {
+            descriptor: descriptor.to_string(),
+            param_count,
+            accessible,
+        },
+    );
+}
+
+fn peek_constructor_mirror_side(obj: ObjectRef) -> Option<ConstructorMirrorSideMeta> {
+    let key = obj.as_ptr() as usize;
+    let g = constructor_mirror_side_table().lock().unwrap_or_else(|p| p.into_inner());
+    g.get(&key).cloned()
+}
+
 /// Number of "extra" slots appended after the JDK Constructor layout to
 /// hold RustJVM-specific metadata (not present on real JDK Constructor):
 ///   +0 → String (raw descriptor, e.g. "(I)V")
@@ -4116,6 +4301,8 @@ pub(crate) fn create_constructor_object(
         Value::Int(0),
     );
 
+    register_constructor_mirror_side(obj, &meta.descriptor, param_descs.len() as i32, false);
+
     obj
 }
 
@@ -4123,6 +4310,9 @@ pub(crate) fn read_constructor_descriptor(
     ctx: &dyn NativeContext,
     ctor_obj: rustjvm_types::ObjectRef,
 ) -> Option<String> {
+    if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
+        return Some(m.descriptor);
+    }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
     match ctx.get_field(ctor_obj, base + CONSTRUCTOR_EXTRA_OFFSET_DESC) {
@@ -4131,10 +4321,97 @@ pub(crate) fn read_constructor_descriptor(
     }
 }
 
+/// Build an `<init>` descriptor `(…)V` from the JDK `Constructor.parameterTypes`
+/// mirrors. Used when the RustJVM extra-slot descriptor is unreadable (C6 —
+/// `class_num_total_fields` grew after stub→real upgrade); falling back to
+/// `()V` would run only `Object.<init>` and leave subclass fields unset
+/// (Surefire fork: `JUnitPlatformProvider.launcher == null`).
+fn compose_init_descriptor_from_parameter_types(
+    ctx: &dyn NativeContext,
+    ctor_obj: rustjvm_types::ObjectRef,
+) -> String {
+    let params_arr = match ctx.get_field_by_name(ctor_obj, "parameterTypes") {
+        Value::Object(Some(arr)) => arr,
+        _ => return "()V".to_string(),
+    };
+    let len = ctx.array_length(params_arr);
+    let mut out = String::with_capacity(4 + len.saturating_mul(16));
+    out.push('(');
+    for i in 0..len {
+        if let Value::Object(Some(pm)) = ctx.get_array_element(params_arr, i) {
+            out.push_str(&mirror_to_jvm_descriptor_token(ctx, pm));
+        }
+    }
+    out.push(')');
+    out.push('V');
+    out
+}
+
+/// Descriptor for `Constructor.newInstance`: extra slot / side table when
+/// trustworthy; otherwise reconstruct from `parameterTypes` (never guess
+/// `()V` alone — see `compose_init_descriptor_from_parameter_types`).
+fn constructor_descriptor_for_new_instance(
+    ctx: &dyn NativeContext,
+    ctor_obj: rustjvm_types::ObjectRef,
+) -> String {
+    fn looks_like_init_descriptor(d: &str) -> bool {
+        let d = d.trim();
+        d.starts_with('(') && d.ends_with(")V") && d.len() > 3
+    }
+
+    /// When `parameterTypes` cannot be read (JDK field layout mismatch),
+    /// `compose_init_descriptor_from_parameter_types` yields `()V`. If the
+    /// declaring class exposes exactly **one** public `<init>`, that must be
+    /// the target of `Class.getConstructor` / Surefire's `instantiateOneArg`
+    /// (e.g. `JUnitPlatformProvider(ProviderParameters)`).
+    fn unique_public_init_descriptor(ctx: &dyn NativeContext, class_id: ClassId) -> Option<String> {
+        let methods = ctx.declared_methods(class_id);
+        let mut found: Option<String> = None;
+        for m in &methods {
+            if m.name != "<init>" || (m.access_flags & 0x0001) == 0 {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(m.descriptor.clone());
+        }
+        found
+    }
+
+    let composed = compose_init_descriptor_from_parameter_types(ctx, ctor_obj);
+
+    if let Some(d) = read_constructor_descriptor(ctx, ctor_obj) {
+        let dtrim = d.trim();
+        if looks_like_init_descriptor(dtrim) {
+            let (slot_params, _) = parse_descriptor_param_and_return(dtrim);
+            let (comp_params, _) = parse_descriptor_param_and_return(&composed);
+            if slot_params.len() == comp_params.len() {
+                return dtrim.to_string();
+            }
+        }
+    }
+
+    if composed == "()V" {
+        if let Value::Object(Some(dm)) = ctx.get_field_by_name(ctor_obj, "clazz") {
+            if let Some(cid) = mirror_class_id(ctx, dm) {
+                if let Some(d) = unique_public_init_descriptor(ctx, cid) {
+                    return d;
+                }
+            }
+        }
+    }
+
+    composed
+}
+
 fn read_constructor_param_count(
     ctx: &dyn NativeContext,
     ctor_obj: rustjvm_types::ObjectRef,
 ) -> i32 {
+    if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
+        return m.param_count;
+    }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
     match ctx.get_field(ctor_obj, base + CONSTRUCTOR_EXTRA_OFFSET_PARAM_COUNT) {
@@ -4147,6 +4424,9 @@ fn read_constructor_accessible(
     ctx: &dyn NativeContext,
     ctor_obj: rustjvm_types::ObjectRef,
 ) -> bool {
+    if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
+        return m.accessible;
+    }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
     match ctx.get_field(ctor_obj, base + CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE) {
@@ -4160,6 +4440,13 @@ pub(crate) fn write_constructor_accessible(
     ctor_obj: rustjvm_types::ObjectRef,
     value: bool,
 ) {
+    let key = ctor_obj.as_ptr() as usize;
+    {
+        let mut g = constructor_mirror_side_table().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(m) = g.get_mut(&key) {
+            m.accessible = value;
+        }
+    }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
     ctx.set_field(
@@ -4274,8 +4561,10 @@ pub(crate) fn native_constructor_new_instance(
         .into());
     }
 
-    // Descriptor is stashed in the RustJVM extra slot (C6).
-    let descriptor = read_constructor_descriptor(ctx, this).unwrap_or_else(|| "()V".to_string());
+    // Descriptor: extra slot / side table, or rebuild from `parameterTypes`
+    // (C6 / Surefire fork — never default to bare `()V`; see
+    // `constructor_descriptor_for_new_instance`).
+    let descriptor = constructor_descriptor_for_new_instance(ctx, this);
 
     // Reject abstract classes / interfaces before allocating — matches
     // `java.lang.reflect.Constructor.newInstance` which throws
@@ -5765,8 +6054,10 @@ pub(crate) fn method_class_name_desc(
         Value::Object(Some(s)) => ctx.read_string(s)?,
         _ => return None,
     };
-    // Descriptor is stashed in our RustJVM extra slot (C6: not a real JDK field).
-    let desc = read_method_descriptor(ctx, method_obj)?;
+    let desc = method_descriptor_for_invoke(ctx, method_obj);
+    if desc.is_empty() {
+        return None;
+    }
     Some((class_id, name, desc))
 }
 

@@ -310,6 +310,10 @@ pub struct SharedVm {
     /// Synthetic System.err PrintStream object.
     pub system_err: RwLock<Option<ObjectRef>>,
 
+    /// Canonical stdin `FileInputStream` for `System.in` (Surefire pipe bootstrap
+    /// reads `System.in` before `System.initPhase1` completes; must be non-null).
+    pub system_in: RwLock<Option<ObjectRef>>,
+
     /// Cached "main" `java.lang.ThreadGroup` object used by every
     /// VM-created `Thread` as `holder.group`.  Lazily created the first
     /// time `NativeContextImpl::current_thread_object` builds a Thread
@@ -1716,6 +1720,7 @@ impl SharedVm {
             class_mirrors_reverse: RwLock::new(FxHashMap::default()),
             system_out: RwLock::new(None),
             system_err: RwLock::new(None),
+            system_in: RwLock::new(None),
             main_thread_group: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
             lambda_proxies: RwLock::new(FxHashMap::default()),

@@ -14,6 +14,12 @@ readme = "../README.md"
 name = "rustjvm"
 path = "src/main.rs"
 
+# Same launcher as `rustjvm`; built as `java.exe` so Maven Surefire's
+# `<jvm>` / `-Djvm=` validation (path must end with `java` / `java.exe`) accepts it.
+[[bin]]
+name = "java"
+path = "src/main.rs"
+
 [features]
 default = []
 synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]

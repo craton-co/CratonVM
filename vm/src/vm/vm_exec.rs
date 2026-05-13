@@ -1026,8 +1026,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         match name {
             "out" => *self.shared.system_out.read(),
             "err" => *self.shared.system_err.read(),
+            "in" => *self.shared.system_in.read(),
             _ => None,
         }
+    }
+
+    fn cache_system_stdin(&mut self, stream: ObjectRef) {
+        *self.shared.system_in.write() = Some(stream);
     }
 
     fn get_system_property(&self, key: &str) -> Option<String> {
@@ -3601,6 +3606,20 @@ pub fn invoke_or_native(
         class_name
     };
 
+    // Forked Surefire calls `ClassLoader.setDefaultAssertionStatus` very early on
+    // the context loader (`AppClassLoader` / `BuiltinClassLoader`). Inline-cache
+    // promotion can still land on JDK bytecode for `java/lang/ClassLoader` when
+    // `assertionLock` is not yet assigned, so `synchronized (assertionLock)` throws
+    // NPE. The built-in Rust override is a correct no-op — always prefer it.
+    if method_name == "setDefaultAssertionStatus" && descriptor == "(Z)V" {
+        if let Some(callback) =
+            shared.native_methods.find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // peaceful-sammet — primitive-return functional-interface bridge.
     //
     // Spring/Eureka call `ToIntFunction.apply(Object)Object` on a receiver
@@ -5738,6 +5757,25 @@ fn invoke_on_class_shared_inner(
                         // setName/reflection.
                         || (class_name == "java/beans/FeatureDescriptor"
                             && method_name == "getName")
+                        // WP2.2 / Surefire LazyLauncher: real JDK `Method.invoke` is
+                        // Java bytecode (`MethodAccessor` → `DirectMethodHandleAccessor`).
+                        // We register `native_method_invoke` for primitive-aware unboxing
+                        // and descriptor reconstruction from `Executable` fields. Without
+                        // an allow-list entry here, `check_override` stays false for this
+                        // concrete method, the JDK body runs instead of our native, and
+                        // reflective helpers like Surefire's `ReflectionUtils.invokeGetter`
+                        // can observe incorrect `null` returns (JUnitPlatformProvider NPE:
+                        // "Cannot invoke discover on null").
+                        || (class_name == "java/lang/reflect/Method"
+                            && method_name == "invoke"
+                            && descriptor
+                                == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")
+                        // Same rationale as `Method.invoke`: `Constructor.newInstance` is
+                        // bytecode-backed on the JDK; our native performs layout-aware
+                        // allocation and strict arg coercion.
+                        || (class_name == "java/lang/reflect/Constructor"
+                            && method_name == "newInstance"
+                            && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;")
                         // SPB.11: Our synthetic MethodDescriptor stores the
                         // wrapped Method at slot 0 (real-JDK MD has a private
                         // `method` field at a different layout). Force the

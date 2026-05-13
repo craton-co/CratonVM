@@ -30,6 +30,30 @@ pub fn padded_bytecode(code: &[u8]) -> Arc<[u8]> {
     Arc::from(padded.into_boxed_slice())
 }
 
+/// JVM slots required to hold `args` as the initial local variable array
+/// (category-2 types occupy two consecutive slots).
+#[inline]
+fn invoke_arg_slot_count(args: &[Value]) -> usize {
+    let mut n = 0usize;
+    for a in args {
+        n += if a.is_category2() { 2 } else { 1 };
+    }
+    n
+}
+
+/// `Code.max_locals` must be at least this many slots for the parameters the
+/// verifier expects, but some classfiles in the wild are wrong. If declared
+/// `max_locals` is too small, `copy_args_to_locals` would silently drop tail
+/// arguments and callees would see `null`/uninitialized locals (e.g. Surefire
+/// `JUnitPlatformProvider.<init>(ProviderParameters,Launcher)` with `launcher`
+/// never stored).
+#[inline]
+fn effective_max_locals(declared: u16, args: &[Value]) -> u16 {
+    let needed = invoke_arg_slot_count(args);
+    let needed_u16 = u16::try_from(needed).unwrap_or(u16::MAX);
+    declared.max(needed_u16)
+}
+
 /// Cold-path frame metadata: either owned Arcs or a shared CachedBytecodeMethod.
 /// For cached calls, storing a single Arc<CachedBytecodeMethod> avoids cloning
 /// 5 separate Arc fields per call (class_name, method_name, descriptor, source_file,
@@ -95,7 +119,9 @@ pub struct Frame {
     /// Maximum operand stack depth (from Code attribute).
     pub max_stack: u16,
 
-    /// Maximum local variable count (from Code attribute).
+    /// Local variable slot count for this frame: at least the `Code.max_locals`
+    /// value from the class file and at least the slots required by the actual
+    /// invocation arguments (defensive clamp; see `effective_max_locals`).
     pub max_locals: u16,
 
     /// Cold-path metadata (method name, descriptor, exception table, etc.).
@@ -116,27 +142,29 @@ pub struct Frame {
     pub is_jdk_class: bool,
 }
 
-fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<u64>, Vec<u8>) {
-    let n = max_locals as usize;
+fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<u64>, Vec<u8>, u16) {
+    let eff = effective_max_locals(max_locals, args);
+    let n = eff as usize;
     let mut vals = vec![0u64; n];
     let mut tags = vec![VTAG_UNINIT; n];
     copy_args_to_locals(&mut vals, &mut tags, args);
-    (vals, tags)
+    (vals, tags, eff)
 }
 
 fn init_locals_pooled(
     max_locals: u16,
     args: &[Value],
     pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
-) -> (Vec<u64>, Vec<u8>) {
-    let n = max_locals as usize;
+) -> (Vec<u64>, Vec<u8>, u16) {
+    let eff = effective_max_locals(max_locals, args);
+    let n = eff as usize;
     let (mut vals, mut tags) = pool.pop().unwrap_or_default();
     vals.clear();
     vals.resize(n, 0u64);
     tags.clear();
     tags.resize(n, VTAG_UNINIT);
     copy_args_to_locals(&mut vals, &mut tags, args);
-    (vals, tags)
+    (vals, tags, eff)
 }
 
 fn copy_args_to_locals(vals: &mut [u64], tags: &mut [u8], args: &[Value]) {
@@ -229,7 +257,7 @@ impl Frame {
         max_locals: u16,
         args: &[Value],
     ) -> Self {
-        let (local_vals, local_tags) = init_locals(max_locals, args);
+        let (local_vals, local_tags, eff_max_locals) = init_locals(max_locals, args);
         let is_jdk = class_name.starts_with("java/")
             || class_name.starts_with("jdk/")
             || class_name.starts_with("sun/")
@@ -243,7 +271,7 @@ impl Frame {
             stack: ValueStack::new((max_stack as usize).max(16) + 8),
             code: padded_bytecode(&code),
             max_stack,
-            max_locals,
+            max_locals: eff_max_locals,
             inner: FrameInner::Owned {
                 class_name: Arc::from(class_name.as_str()),
                 method_name: Arc::from(method_name.as_str()),
@@ -271,7 +299,7 @@ impl Frame {
         max_locals: u16,
         args: &[Value],
     ) -> Self {
-        let (local_vals, local_tags) = init_locals(max_locals, args);
+        let (local_vals, local_tags, eff_max_locals) = init_locals(max_locals, args);
         let is_jdk = class_name.starts_with("java/")
             || class_name.starts_with("jdk/")
             || class_name.starts_with("sun/")
@@ -285,7 +313,7 @@ impl Frame {
             stack: ValueStack::new((max_stack as usize).max(16) + 8),
             code,
             max_stack,
-            max_locals,
+            max_locals: eff_max_locals,
             inner: FrameInner::Owned {
                 class_name,
                 method_name,
@@ -315,7 +343,8 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let (local_vals, local_tags) = init_locals_pooled(max_locals, args, locals_pool);
+        let (local_vals, local_tags, eff_max_locals) =
+            init_locals_pooled(max_locals, args, locals_pool);
         let padded_max = (max_stack as usize).max(16) + 8;
         let stack = if let Some((vals, tags)) = stacks_pool.pop() {
             ValueStack::from_pooled(vals, tags, padded_max)
@@ -335,7 +364,7 @@ impl Frame {
             stack,
             code,
             max_stack,
-            max_locals,
+            max_locals: eff_max_locals,
             inner: FrameInner::Owned {
                 class_name,
                 method_name,
@@ -358,7 +387,8 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let (local_vals, local_tags) = init_locals_pooled(cached.max_locals, args, locals_pool);
+        let (local_vals, local_tags, eff_max_locals) =
+            init_locals_pooled(cached.max_locals, args, locals_pool);
         let padded_max = (cached.max_stack as usize).max(16) + 8;
         let stack = if let Some((vals, tags)) = stacks_pool.pop() {
             ValueStack::from_pooled(vals, tags, padded_max)
@@ -368,7 +398,6 @@ impl Frame {
         let class_id = cached.declaring_class_id;
         let code = cached.code.clone();
         let max_stack = cached.max_stack;
-        let max_locals = cached.max_locals;
         let is_jdk = cached.class_name.starts_with("java/")
             || cached.class_name.starts_with("jdk/")
             || cached.class_name.starts_with("sun/")
@@ -382,7 +411,7 @@ impl Frame {
             stack,
             code,
             max_stack,
-            max_locals,
+            max_locals: eff_max_locals,
             inner: FrameInner::Cached(cached),
             backward_count: 0,
             monitor_on_exit: None,
@@ -411,7 +440,8 @@ impl Frame {
         self.backward_count = 0;
         self.code = code;
         self.max_stack = max_stack;
-        self.max_locals = max_locals;
+        let eff_max_locals = effective_max_locals(max_locals, args);
+        self.max_locals = eff_max_locals;
         // Update is_jdk_class for correct fast/slow path dispatch
         self.is_jdk_class = class_name.starts_with("java/")
             || class_name.starts_with("jdk/")
@@ -426,7 +456,7 @@ impl Frame {
             exception_table,
         };
         // Reset locals
-        let n = max_locals as usize;
+        let n = eff_max_locals as usize;
         self.local_vals.clear();
         self.local_vals.resize(n, 0u64);
         self.local_tags.clear();
@@ -763,6 +793,51 @@ mod tests {
         assert_eq!(frame.get_local(0).as_int(), Some(42));
         assert_eq!(frame.get_local(1).as_long(), Some(100));
         // Slot 2 is the second half of the long → Uninitialized
+    }
+
+    /// If `Code.max_locals` is smaller than the invocation argument slots,
+    /// the frame must still receive every argument (Surefire-style bad metadata).
+    #[test]
+    fn frame_expands_locals_when_declared_max_smaller_than_invoke_args() {
+        let args = [Value::Int(10), Value::Int(20), Value::Int(30)];
+        let frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            4,
+            2,
+            &args,
+        );
+        assert_eq!(frame.max_locals, 3);
+        assert_eq!(frame.locals_len(), 3);
+        assert_eq!(frame.get_local(0).as_int(), Some(10));
+        assert_eq!(frame.get_local(1).as_int(), Some(20));
+        assert_eq!(frame.get_local(2).as_int(), Some(30));
+    }
+
+    #[test]
+    fn frame_expands_locals_for_category2_when_declared_too_small() {
+        let args = [Value::Long(0x1122_3344_5566_7788)];
+        let frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            4,
+            1,
+            &args,
+        );
+        assert_eq!(frame.max_locals, 2);
+        assert_eq!(frame.locals_len(), 2);
+        assert_eq!(frame.get_local(0).as_long(), Some(0x1122_3344_5566_7788));
+        assert_eq!(frame.get_local(1), Value::Uninitialized);
     }
 
     #[test]

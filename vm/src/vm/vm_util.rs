@@ -6,8 +6,41 @@ use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::Value;
 use rustjvm_types::ArrayElementType;
+use rustjvm_types::ObjectRef;
 
 use super::SharedVm;
+
+/// Lazily allocate and cache the canonical `System.in` `FileInputStream` (stdin fd 0).
+///
+/// Surefire's `LegacyMasterProcessChannelProcessorFactory` calls
+/// `Channels.newBufferedChannel(System.in)` during `ForkedBooter.setupBooter`
+/// **before** `System.initPhase1` has run far enough for the static field to
+/// be populated. `GETSTATIC System.in` must therefore never observe null.
+pub fn ensure_system_stdin_object(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(r) = *shared.system_in.read() {
+        return Ok(r);
+    }
+    let mut guard = shared.system_in.write();
+    if let Some(r) = *guard {
+        return Ok(r);
+    }
+    let fis_class_id = shared.load_class_concurrent("java/io/FileInputStream")?;
+    ensure_class_initialized_shared(shared, thread, fis_class_id)?;
+    let num_fields = {
+        let cm = shared.class_manager.read();
+        cm.get_class(fis_class_id)
+            .map(|c| c.num_total_fields.max(2))
+            .unwrap_or(2)
+    };
+    let in_obj = shared.heap.alloc_object(fis_class_id, num_fields);
+    // Slot 1 holds fd+1 encoding (see `native_system_init_phase1` S110 comment).
+    shared.heap.set_field(in_obj, 1, Value::Int(1));
+    *guard = Some(in_obj);
+    Ok(in_obj)
+}
 
 // ---------------------------------------------------------------------------
 // Free functions: class initialization
@@ -309,12 +342,14 @@ fn initialize_class_shared(
             .map(|c| c.name.clone());
         if class_name.as_deref() == Some("java/lang/System") {
             let (out_ref, err_ref) = shared.ensure_system_streams();
-            // Find the static field indices for "out" and "err"
+            let in_ref = ensure_system_stdin_object(shared, thread)?;
+            // Find the static field indices for "out", "err", and "in"
             let field_indices = {
                 let cm = shared.class_manager.read();
                 if let Some(class) = cm.get_class(class_id) {
                     let mut out_idx = None;
                     let mut err_idx = None;
+                    let mut in_idx = None;
                     let mut static_idx = 0usize;
                     for field in &class.fields {
                         if field.is_static() {
@@ -322,13 +357,15 @@ fn initialize_class_shared(
                                 out_idx = Some(static_idx);
                             } else if &*field.name == "err" {
                                 err_idx = Some(static_idx);
+                            } else if &*field.name == "in" {
+                                in_idx = Some(static_idx);
                             }
                             static_idx += 1;
                         }
                     }
-                    (out_idx, err_idx)
+                    (out_idx, err_idx, in_idx)
                 } else {
-                    (None, None)
+                    (None, None, None)
                 }
             };
             if let Some(out_idx) = field_indices.0 {
@@ -336,6 +373,9 @@ fn initialize_class_shared(
             }
             if let Some(err_idx) = field_indices.1 {
                 super::set_static_shared(shared, class_id, err_idx, Value::Object(Some(err_ref)));
+            }
+            if let Some(in_idx) = field_indices.2 {
+                super::set_static_shared(shared, class_id, in_idx, Value::Object(Some(in_ref)));
             }
         }
     }

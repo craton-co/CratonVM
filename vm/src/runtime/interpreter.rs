@@ -68,9 +68,9 @@ use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactValue, ObjectRef, Value};
 use crate::vm::{
-    create_java_string, ensure_class_initialized_shared, get_or_create_class_mirror,
-    get_static_shared, invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string,
-    set_static_shared, SharedVm,
+    create_java_string, ensure_class_initialized_shared, ensure_system_stdin_object,
+    get_or_create_class_mirror, get_static_shared, invoke_on_class_shared, invoke_or_native,
+    invoke_shared, read_java_string, set_static_shared, SharedVm,
 };
 
 // ---------------------------------------------------------------------------
@@ -5439,9 +5439,8 @@ fn execute_instruction(
             // that isn't fully bootable yet. To allow real JDK classes
             // to call `System.out.println`, we intercept the getstatic
             // on the three standard streams and return our pre-built
-            // synthetic PrintStream objects. This matches HotSpot's
-            // own bootstrap approach where System.out is set by the VM
-            // before <clinit> runs.
+            // synthetic PrintStream objects. `System.in` uses the same
+            // early pinning strategy via [`ensure_system_stdin_object`].
             let field_name_for_intercept = {
                 let cm = shared.class_manager.read();
                 cm.get_class(field.declaring_class_id)
@@ -5466,6 +5465,11 @@ fn execute_instruction(
                         .stack
                         .push(Value::Object(Some(stream)))?;
                     // Skip the normal getstatic path — we've already pushed.
+                } else if fname == "in" {
+                    let stdin = ensure_system_stdin_object(shared, thread)?;
+                    thread.frames[frame_idx]
+                        .stack
+                        .push(Value::Object(Some(stdin)))?;
                 } else {
                     // Normal getstatic for other System fields
                     ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
@@ -8004,6 +8008,23 @@ fn execute_invoke(
         }
     }
 
+    // Same rationale as `invoke_or_native`: Surefire's fork calls
+    // `ClassLoader.setDefaultAssertionStatus` before `assertionLock` is
+    // assigned; `try_stackless_invoke` would run JDK bytecode and NPE on
+    // `monitorenter`. Prefer the no-op Rust override registered on
+    // `java/lang/ClassLoader`.
+    if method_name.as_ref() == "setDefaultAssertionStatus" && method_descriptor.as_ref() == "(Z)V"
+    {
+        if let Some(callback) = shared.native_methods.find(
+            "java/lang/ClassLoader",
+            method_name.as_ref(),
+            method_descriptor.as_ref(),
+        ) {
+            let _ = crate::vm::safe_native_call(shared, thread, callback, &args)?;
+            return Ok(CachedCallResult::Handled);
+        }
+    }
+
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -8873,6 +8894,65 @@ pub(crate) fn try_lambda_dispatch(
     }
 }
 
+/// Surefire's fork calls `ClassLoader.setDefaultAssertionStatus` before the JDK
+/// static `assertionLock` is assigned; the real bytecode does
+/// `synchronized (assertionLock)` and NPEs. Monomorphic inline caches and the
+/// vtable fast path can push that bytecode without visiting `execute_invoke`, so
+/// any site about to run this body must consult the Rust no-op first.
+#[inline]
+fn intercept_classloader_set_default_assertion_status(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    method_name: &str,
+    method_descriptor: &str,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if method_name != "setDefaultAssertionStatus" || method_descriptor != "(Z)V" {
+        return None;
+    }
+    let cb = shared.native_methods.find(
+        "java/lang/ClassLoader",
+        "setDefaultAssertionStatus",
+        "(Z)V",
+    )?;
+    Some(
+        crate::vm::safe_native_call(shared, thread, cb, args)
+            .map(|_| CachedCallResult::Handled),
+    )
+}
+
+/// Surefire `LazyLauncher` implements `Launcher`. Some dispatch paths key the
+/// lookup by the constant-pool interface (`org/junit/platform/launcher/Launcher`)
+/// while the Rust override is registered on the concrete class. When the heap
+/// receiver is actually `LazyLauncher`, return that native so we never execute
+/// the JDK `discover` body (null delegate → `Cannot invoke discover on null`).
+#[inline]
+fn surefire_lazy_launcher_discover_native(
+    shared: &SharedVm,
+    method_name: &str,
+    descriptor: &str,
+    recv_obj: ObjectRef,
+) -> Option<rustjvm_native_api::NativeCallback> {
+    const DESC_DISCOVER: &str =
+        "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;";
+    const LAZY: &str = "org/apache/maven/surefire/junitplatform/LazyLauncher";
+    if method_name != "discover" || descriptor != DESC_DISCOVER {
+        return None;
+    }
+    let cb = shared.native_methods.find(LAZY, "discover", DESC_DISCOVER)?;
+    let cid = shared.heap.class_id_of(recv_obj);
+    let cm = shared.class_manager.read();
+    let ok = cm
+        .get_class(cid)
+        .map(|c| c.name.as_ref() == LAZY)
+        .unwrap_or(false);
+    drop(cm);
+    if !ok {
+        return None;
+    }
+    Some(cb)
+}
+
 /// Stackless invoke: resolve a method and either call native (Handled) or push
 /// a bytecode frame (FramePushed).  Returns `CacheMiss` for exotic cases that
 /// cannot be handled stacklessly (signature-polymorphic, JNI, etc.), in which
@@ -8911,6 +8991,68 @@ fn try_stackless_invoke(
     // with `expected int on stack, got ref(...)`.
     let ret_type = crate::jit::return_type(descriptor);
 
+    // `BuiltinClassLoader` / `AppClassLoader` may declare their own
+    // `setDefaultAssertionStatus` bytecode; `try_stackless_invoke`'s normal
+    // rule ("receiver bytecode wins, skip ancestor-native walk") would then
+    // run the JDK body and NPE on `synchronized (assertionLock)` during early
+    // Surefire fork. The Rust override on `java/lang/ClassLoader` is always
+    // the intended semantics here.
+    if method_name == "setDefaultAssertionStatus" && descriptor == "(Z)V" {
+        if let Some(callback) =
+            shared.native_methods.find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            let result = safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+            }
+            return Ok(CachedCallResult::Handled);
+        }
+    }
+
+    // WP2.2 / Surefire: `try_stackless_invoke` does `native_methods.find(class_name, …)`
+    // first, then — when `walk_native_hierarchy` is false (invokevirtual fast path) —
+    // skips the superclass walk if the **receiver's class** already declares bytecode
+    // for the method. `java.lang.reflect.Method` has real JDK bytecode for `invoke`,
+    // so `has_own_bytecode` is true, the `or_else` returns None, and we never consult
+    // `java/lang/reflect/Method` in the registry. Force the registered
+    // `native_method_invoke` (same triple as essentials) so reflection works.
+    if method_name == "invoke"
+        && descriptor == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+    {
+        if let Some(callback) = shared.native_methods.find(
+            "java/lang/reflect/Method",
+            method_name,
+            descriptor,
+        ) {
+            let result = safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+            }
+            return Ok(CachedCallResult::Handled);
+        }
+    }
+    if method_name == "newInstance" && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;" {
+        if let Some(callback) = shared.native_methods.find(
+            "java/lang/reflect/Constructor",
+            method_name,
+            descriptor,
+        ) {
+            let result = safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+            }
+            return Ok(CachedCallResult::Handled);
+        }
+    }
 
     // 1. Check native override first (same priority as invoke_or_native).
     //    Walk the superclass chain if:
@@ -8921,7 +9063,13 @@ fn try_stackless_invoke(
     //      priority (e.g. URI.toString() must NOT be short-circuited by
     //      Object.toString() native). If it doesn't (e.g. RunnerClassLoader.getParent()),
     //      walking finds the parent's native (ClassLoader.getParent native).
-    let native_cb = shared.native_methods.find(class_name, method_name, descriptor)
+    let native_cb = match args.first() {
+        Some(Value::Object(Some(obj))) => {
+            surefire_lazy_launcher_discover_native(shared, method_name, descriptor, *obj)
+        }
+        _ => None,
+    }
+    .or_else(|| shared.native_methods.find(class_name, method_name, descriptor))
         .or_else(|| {
             if method_name == "<init>" { return None; }
             // For virtual calls, skip hierarchy walk if the class has its own bytecode
@@ -11501,6 +11649,17 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
+            if surefire_lazy_launcher_discover_native(
+                shared,
+                &method_name,
+                &method_descriptor,
+                receiver_obj,
+            )
+            .is_some()
+            {
+                drop(cm);
+                return Ok(CachedCallResult::CacheMiss);
+            }
             if shared
                 .native_methods
                 .find(rcv_name, &method_name, &method_descriptor)
@@ -11607,6 +11766,16 @@ fn execute_invokevirtual_vtable_fast(
         &args_vec
     };
 
+    if let Some(res) = intercept_classloader_set_default_assertion_status(
+        shared,
+        thread,
+        entry_cached.method_name.as_ref(),
+        entry_cached.method_descriptor.as_ref(),
+        args_slice,
+    ) {
+        return res;
+    }
+
     let monitor_obj: Option<ObjectRef> = if entry_cached.is_synchronized {
         // Non-static virtual — receiver owns the monitor.
         match args_slice.first() {
@@ -11664,6 +11833,50 @@ fn execute_invokevirtual_vtable_fast(
         .put(caller_class_id, cp_index, false, target);
 
     Ok(CachedCallResult::FramePushed)
+}
+
+/// WP2.2 — `Method.invoke` / `Constructor.newInstance` are bytecode in the JDK
+/// classfiles but have Rust overrides for correct primitive boxing. The
+/// monomorphic invoke cache can still hold [`CachedInvokeTarget::VirtualBytecode`]
+/// if populate missed the native; the fast path must not execute JDK bodies
+/// (they bypass `try_stackless_invoke` — e.g. Surefire `LazyLauncher` NPE).
+#[inline]
+fn native_override_for_cached_reflect_invoke(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<rustjvm_native_api::NativeCallback> {
+    match (class_name, method_name, descriptor) {
+        (
+            "java/lang/reflect/Method",
+            "invoke",
+            "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+        ) => shared.native_methods.find(
+            "java/lang/reflect/Method",
+            "invoke",
+            "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+        ),
+        (
+            "java/lang/reflect/Constructor",
+            "newInstance",
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+        ) => shared.native_methods.find(
+            "java/lang/reflect/Constructor",
+            "newInstance",
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+        ),
+        (
+            "org/apache/maven/surefire/junitplatform/LazyLauncher",
+            "discover",
+            "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
+        ) => shared.native_methods.find(
+            "org/apache/maven/surefire/junitplatform/LazyLauncher",
+            "discover",
+            "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
+        ),
+        _ => None,
+    }
 }
 
 /// Fast invokevirtual/invokeinterface/invokespecial using monomorphic inline cache
@@ -11741,6 +11954,58 @@ fn execute_invokevirtual_cached(
                         args_vec.reverse();
                         &args_vec
                     };
+
+                    if let Some(res) = intercept_classloader_set_default_assertion_status(
+                        shared,
+                        thread,
+                        cached.method_name.as_ref(),
+                        cached.method_descriptor.as_ref(),
+                        args_slice,
+                    ) {
+                        return res;
+                    }
+
+                    if let Some(callback) = surefire_lazy_launcher_discover_native(
+                        shared,
+                        cached.method_name.as_ref(),
+                        cached.method_descriptor.as_ref(),
+                        obj_ref,
+                    ) {
+                        let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                        let _ring_idx =
+                            rustjvm_native_api::native_ring::record_enter(callback as usize);
+                        let cb_result = callback(&mut ctx, args_slice);
+                        rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                        let result = cb_result?;
+                        if let Some(value) = result {
+                            push_invoke_return_value(
+                                &mut thread.frames[frame_idx].stack,
+                                value,
+                            )?;
+                        }
+                        return Ok(CachedCallResult::Handled);
+                    }
+
+                    if let Some(callback) = native_override_for_cached_reflect_invoke(
+                        shared,
+                        cached.class_name.as_ref(),
+                        cached.method_name.as_ref(),
+                        cached.method_descriptor.as_ref(),
+                    ) {
+                        let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                        let _ring_idx =
+                            rustjvm_native_api::native_ring::record_enter(callback as usize);
+                        let cb_result = callback(&mut ctx, args_slice);
+                        rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                        let result = cb_result?;
+                        if let Some(value) = result {
+                            push_invoke_return_value(
+                                &mut thread.frames[frame_idx].stack,
+                                value,
+                            )?;
+                        }
+                        return Ok(CachedCallResult::Handled);
+                    }
 
                     // Acquire monitor for synchronized methods
                     let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
@@ -11878,6 +12143,16 @@ fn execute_invokevirtual_cached(
                 args_vec.reverse();
                 &args_vec
             };
+
+            if let Some(res) = intercept_classloader_set_default_assertion_status(
+                shared,
+                thread,
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+                args_slice,
+            ) {
+                return res;
+            }
 
             // T10.7 — refill per-thread pool from the shared VecPool if empty.
             thread.refill_pools_from_shared(
@@ -12187,6 +12462,35 @@ fn populate_virtual_invoke_cache(
                 return;
             }
         }
+    }
+
+    // WP2.2 / Surefire — never promote `VirtualBytecode` for `Method.invoke` or
+    // `Constructor.newInstance`; the monomorphic fast path skips
+    // `try_stackless_invoke` and would execute JDK bytecode instead of the
+    // Rust overrides registered in `register_essential_natives`.
+    let declaring_for_reflect = store
+        .get(declaring_id)
+        .map(|c| &*c.name)
+        .unwrap_or("");
+    if let Some(callback) = native_override_for_cached_reflect_invoke(
+        shared,
+        declaring_for_reflect,
+        method_name.as_ref(),
+        descriptor.as_ref(),
+    ) {
+        let gate = RedefineGate::snapshot(
+            cm.class_redefine_generation_handle(receiver_class_id),
+        );
+        drop(cm);
+        let target = CachedInvokeTarget::VirtualNative {
+            receiver_class_id,
+            callback,
+            num_params: num_params as u16,
+            gate,
+        };
+        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+        thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+        return;
     }
 
     let Some(code_attr) = method.code() else {

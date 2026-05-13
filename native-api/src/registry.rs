@@ -199,6 +199,10 @@ pub trait NativeContext {
     /// Get a system stream object (stdout or stderr).
     fn get_system_stream(&self, name: &str) -> Option<ObjectRef>;
 
+    /// Pin the canonical `System.in` object on the VM so natives and `GETSTATIC`
+    /// agree after `initPhase1` allocates it. Default: no-op.
+    fn cache_system_stdin(&mut self, _stream: ObjectRef) {}
+
     /// Get a system property by key.
     fn get_system_property(&self, key: &str) -> Option<String>;
 
