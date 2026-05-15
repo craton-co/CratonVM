@@ -3080,6 +3080,12 @@ pub(crate) fn register_enum_set_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "of",
+        "(Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
+        native_es_of_three,
+    );
+    r.register(
+        c,
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/EnumSet;",
         native_es_copy_of,
@@ -3140,9 +3146,51 @@ fn native_es_of_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(es))))
 }
 
-fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Build a real JDK `EnumSet` via `noneOf(first.getClass())` + `add` for each
+/// non-null element. Returns `None` when `java.util.EnumSet` is synthetic or
+/// any invoke step fails (caller falls back to the 2-field bridge).
+fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) -> Option<ObjectRef> {
+    if ctx.is_class_synthetic_stub("java/util/EnumSet") {
+        return None;
+    }
+    let first = elems.first().copied()?;
+    let Value::Object(Some(en1)) = first else {
+        return None;
+    };
+    let enum_class = match ctx.invoke_virtual(en1, "getClass", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return None,
+    };
+    let set = match ctx.invoke(
+        "java/util/EnumSet",
+        "noneOf",
+        "(Ljava/lang/Class;)Ljava/util/EnumSet;",
+        &[Value::Object(Some(enum_class))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return None,
+    };
+    for elem in elems {
+        if let Value::Object(Some(_)) = *elem {
+            if ctx
+                .invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[*elem])
+                .is_err()
+            {
+                return None;
+            }
+        }
+    }
+    Some(set)
+}
+
+/// `EnumSet.of(E, E)` — same linkage gap as the 3-arg overload on some JDK
+/// loads; mirror the `noneOf` + `add` bridge used by [`native_es_of_three`].
+pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[e1, e2]) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
     let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
@@ -3150,6 +3198,32 @@ fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     ctx.set_field(backing, 0, Value::Object(Some(arr)));
     ctx.set_field(backing, 1, Value::Int(2));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
+    Ok(Some(Value::Object(Some(es))))
+}
+
+/// `EnumSet.of(E, E, E)` — Spring Boot 2.7+ calls this overload during
+/// `SpringApplication` static init. Prefer a real JDK `EnumSet` built via
+/// `noneOf(first.getClass())` + `add` when `java.util.EnumSet` is loaded from
+/// classfiles; fall back to the same 2-field synthetic bridge as `of(E,E)`.
+pub(crate) fn native_es_of_three(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[e1, e2, e3]) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+
+    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+    ctx.set_array_element(arr, 0, e1);
+    ctx.set_array_element(arr, 1, e2);
+    ctx.set_array_element(arr, 2, e3);
+    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    ctx.set_field(backing, 0, Value::Object(Some(arr)));
+    ctx.set_field(backing, 1, Value::Int(3));
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -5784,23 +5858,29 @@ fn tu_nanos_per(ordinal: i32) -> i64 {
 
 pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/concurrent/TimeUnit";
-    // <clinit>: initialise the 7 static enum constants (static fields 0..6)
+    // <clinit>: initialise the 7 static enum constants. Real JDK `TimeUnit`
+    // declares many static `long` scalars before/after the enum refs; writing
+    // by slot index `0..6` misplaces values so `GETSTATIC MINUTES` still reads
+    // null. Resolve each constant by name (static-only index) and set
+    // `java.lang.Enum.ordinal` on each instance for natives / mixed paths.
     r.register(c, "<clinit>", "()V", |ctx, _args| {
-        if let Some(cid) = ctx.class_id_by_name("java/util/concurrent/TimeUnit") {
-            let names = [
-                "NANOSECONDS",
-                "MICROSECONDS",
-                "MILLISECONDS",
-                "SECONDS",
-                "MINUTES",
-                "HOURS",
-                "DAYS",
-            ];
-            for (i, _name) in names.iter().enumerate() {
-                let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-                ctx.set_field(tu, 0, Value::Int(i as i32));
-                ctx.set_static_field(cid, i, Value::Object(Some(tu)));
-            }
+        const NAMES: [&str; 7] = [
+            "NANOSECONDS",
+            "MICROSECONDS",
+            "MILLISECONDS",
+            "SECONDS",
+            "MINUTES",
+            "HOURS",
+            "DAYS",
+        ];
+        for (i, name) in NAMES.iter().enumerate() {
+            let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            ctx.set_field_by_name(tu, "ordinal", Value::Int(i as i32));
+            ctx.set_static_field_by_name(
+                "java/util/concurrent/TimeUnit",
+                name,
+                Value::Object(Some(tu)),
+            );
         }
         Ok(None)
     });
@@ -5824,7 +5904,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
                 _ => 3,
             };
             let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(tu, 0, Value::Int(ordinal));
+            ctx.set_field_by_name(tu, "ordinal", Value::Int(ordinal));
             Ok(Some(Value::Object(Some(tu))))
         },
     );
@@ -5836,7 +5916,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 7);
             for i in 0..7 {
                 let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-                ctx.set_field(tu, 0, Value::Int(i));
+                ctx.set_field_by_name(tu, "ordinal", Value::Int(i));
                 ctx.set_array_element(arr, i as usize, Value::Object(Some(tu)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -5853,13 +5933,19 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let su = obj_arg(args, 2)?;
-            let to = match ctx.get_field(this, 0) {
+            let to = match ctx.get_field_by_name(this, "ordinal") {
                 Value::Int(v) => v,
-                _ => 3,
+                _ => match ctx.get_field(this, 0) {
+                    Value::Int(v) => v,
+                    _ => 3,
+                },
             };
-            let so = match ctx.get_field(su, 0) {
+            let so = match ctx.get_field_by_name(su, "ordinal") {
                 Value::Int(v) => v,
-                _ => 3,
+                _ => match ctx.get_field(su, 0) {
+                    Value::Int(v) => v,
+                    _ => 3,
+                },
             };
             Ok(Some(Value::Long(dur * tu_nanos_per(so) / tu_nanos_per(to))))
         },
@@ -9500,6 +9586,9 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 "Signature" => &["SHA256withRSA", "SHA384withRSA", "SHA512withRSA", "SHA256withECDSA"],
                 "KeyPairGenerator" => &["RSA", "EC", "DSA"],
                 "KeyGenerator" => &["AES", "DESede", "HmacSHA256"],
+                // Tomcat `SessionIdGeneratorBase.<clinit>` — must be non-empty or
+                // `IllegalStateException` ("SecureRandom algorithm set not available").
+                "SecureRandom" => &["NativePRNGNonBlocking", "NativePRNGBlocking", "SHA1PRNG", "Windows-PRNG"],
                 _ => &[],
             };
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);

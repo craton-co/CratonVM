@@ -33,6 +33,22 @@ pub fn update_all_roots(
         frame.stack.update_object_refs(pointer_map);
     }
 
+    for obj_ref in &mut thread.native_pin_roots {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+
+    if let Some(ref mut obj_ref) = thread.native_pending_return {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+
     // 2. Static fields
     {
         let mut statics = shared.statics.write();

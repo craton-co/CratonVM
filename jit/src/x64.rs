@@ -1591,8 +1591,9 @@ fn analyze_escapes(code: &[u8], code_len: usize) -> std::collections::HashSet<us
 #[derive(Clone, Debug)]
 struct ScalarReplacedObject {
     num_fields: usize,
-    /// Frame offset of field 0: `[RBP - field_base_offset]`.
-    /// Field i is at `[RBP - (field_base_offset + i*8)]`.
+    /// Frame offset of field slot 0: `[RBP - field_base_offset]`.
+    /// Field `i` starts at `[RBP - (field_base_offset + i * SLOT_SIZE)]`, matching
+    /// heap object layout (`HEADER_SIZE + i * SLOT_SIZE` from `jit_getfield`).
     field_base_offset: i32,
 }
 
@@ -1604,7 +1605,8 @@ struct ScalarReplacementPlan {
     field_ops: HashMap<usize, usize>,
     /// invokespecial PCs whose `<init>()V` call should be skipped.
     init_skips: std::collections::HashSet<usize>,
-    /// Total frame slots consumed by all scalar-replaced fields.
+    /// Total 8-byte frame slots reserved for scalar-replaced fields
+    /// (`num_fields * (SLOT_SIZE / 8)` per object).
     total_slots: usize,
 }
 
@@ -1641,7 +1643,7 @@ fn plan_scalar_replacement(
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
                 objects.insert(new_pc, ScalarReplacedObject { num_fields, field_base_offset });
-                total_slots += num_fields;
+                total_slots += num_fields * (SLOT_SIZE / 8);
             }
         }
     }
@@ -1931,7 +1933,7 @@ fn plan_scalar_replacement(
                     num_fields: obj.num_fields,
                     field_base_offset,
                 });
-                final_total += obj.num_fields;
+                final_total += obj.num_fields * (SLOT_SIZE / 8);
             }
         }
     }
@@ -9163,7 +9165,8 @@ impl Compiler {
                             .unwrap_or((pc, 0, b'I'));
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
-                        let field_off = sr_obj.field_base_offset + (field_index as i32) * 8; // Cast: x86-64 immediate encoding
+                        let field_off = sr_obj.field_base_offset
+                            + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
                         pc += 3;
@@ -9188,15 +9191,22 @@ impl Compiler {
                 0xb5 => {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced putfield: store value directly to frame slot
-                        let (_, field_index, _) = self.field_info.iter()
+                        let (_, field_index, _type_tag) = self.field_info.iter()
                             .find(|(p, _, _)| *p == pc).copied()
                             .unwrap_or((pc, 0, b'I'));
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
-                        let field_off = sr_obj.field_base_offset + (field_index as i32) * 8; // Cast: x86-64 immediate encoding
+                        let field_off = sr_obj.field_base_offset
+                            + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                         self.load_slot_to_reg(RAX, val_slot);
                         self.emit_store_local(field_off, RAX);
+                        // Each scalar field reserves SLOT_SIZE bytes (see `new` zero-init). Always
+                        // clear the high qword so category-1 values and refs never leave garbage in
+                        // the second word — mismatches here showed up as Windows AVs under Spring
+                        // with JIT on (SportMe / insurance) while interpreter-only runs continued.
+                        self.emit_xor_reg_self(RAX);
+                        self.emit_store_local(field_off + 8, RAX);
                         pc += 3;
                     } else {
                         self.flush_scratch_registers();
@@ -9895,8 +9905,10 @@ impl Compiler {
                         // Scalar-replaced: zero-initialize field slots in the frame
                         self.emit_xor_reg_self(RAX);
                         for i in 0..sr_obj.num_fields {
-                            let field_off = sr_obj.field_base_offset + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                            let field_off = sr_obj.field_base_offset
+                                + (i as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                             self.emit_store_local(field_off, RAX);
+                            self.emit_store_local(field_off + 8, RAX);
                         }
                         // Push a dummy zero "object reference" — never dereferenced
                         self.push_from_rax();
@@ -10442,8 +10454,14 @@ pub fn compile(
     // Scalar replacement: plan frame-local storage for non-escaping object fields
     let num_hoists = hoist_info.len();
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
+    let empty_non_escaping = std::collections::HashSet::new();
+    let non_escaping_for_sr = if std::env::var_os("RUSTJVM_DISABLE_SCALAR_REPLACEMENT").is_some() {
+        &empty_non_escaping
+    } else {
+        &non_escaping_new
+    };
     let sr_plan = plan_scalar_replacement(
-        code, code_len, &non_escaping_new, &new_info, &invoke_info, scalar_base,
+        code, code_len, non_escaping_for_sr, &new_info, &invoke_info, scalar_base,
     );
     let num_scalar_slots = sr_plan.total_slots;
 
@@ -16786,7 +16804,8 @@ mod tests {
         assert!(plan.init_skips.contains(&4), "invokespecial at PC=4 should be skipped");
         assert!(plan.field_ops.contains_key(&10), "putfield at PC=10 should be scalar");
         assert!(plan.field_ops.contains_key(&14), "getfield at PC=14 should be scalar");
-        assert_eq!(plan.total_slots, 2);
+        // Two heap fields × two 8-byte words per `Value` slot (`SLOT_SIZE` = 16).
+        assert_eq!(plan.total_slots, 4);
     }
 
     #[test]

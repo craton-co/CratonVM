@@ -466,6 +466,14 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "java/math/BigInteger") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // Spring Boot `JarFileArchive` static init uses `EnumSet.of` /
+                // `Set.of` on `PosixFilePermission.*`. A GETSTATIC/PUTSTATIC static
+                // index mismatch can leave the enum constants null even after a
+                // nominally successful `<clinit>` — mirror the BigInteger success
+                // hook and backfill the nine constants from the real class layout.
+                if matches!(&*class_name_for_jfr, "java/nio/file/attribute/PosixFilePermission") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // R15 (WildFly): some real-JDK / WildFly classes complete
                 // <clinit> normally yet leave a critical static field null
                 // because the metafactory-driven Stream/IntFunction lambda
@@ -565,14 +573,12 @@ fn initialize_class_shared(
                         || class_name_for_jfr.starts_with("io/quarkus/")
                         || class_name_for_jfr.starts_with("org/wildfly/")
                         || class_name_for_jfr.starts_with("io/smallrye/")
-                        // Spring Boot launcher classes (loader package) — e.g.
-                        // JarFileArchive.<clinit> references PosixFilePermission
-                        // on all platforms including Windows where POSIX perms
-                        // are unavailable. The launcher's <clinit> failure is
-                        // safely ignorable: our native overrides for
-                        // getClassPathArchivesIterator / getMainClass bypass
-                        // the archive-traversal logic entirely.
-                        || class_name_for_jfr.starts_with("org/springframework/boot/loader/")
+                        // Spring Boot launcher classes (loader package). Do not
+                        // swallow `JarFileArchive*` <clinit> failures: partial init
+                        // (e.g. bad `PosixFilePermissions.asFileAttribute`) surfaces
+                        // later as `ClassCastException` in `Launcher.createClassLoader`.
+                        || (class_name_for_jfr.starts_with("org/springframework/boot/loader/")
+                            && !class_name_for_jfr.contains("JarFileArchive"))
                         // SLF4J/logback impl classes whose <clinit> wires up an
                         // entire logging backend (logback Joran XML config,
                         // ContextSelectorStaticBinder, status printer, etc.)
@@ -1259,6 +1265,62 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     }
                 }
             }
+            // WildFly / JBoss Modules: `MAIN_METHOD_TYPE = MethodType.methodType(...)`
+            // is a static *field initializer* that runs before the `<clinit>` block
+            // assigns `BOOT_MODULE_LOADER = new AtomicReference<>()`. If the
+            // MethodType initializer throws (common on partial `MethodHandles`
+            // support), `BOOT_MODULE_LOADER` stays null and
+            // `Module.initBootModuleLoader` dies on `BOOT_MODULE_LOADER.set(...)`.
+            let mut boot_loader_static_idx: Option<usize> = None;
+            {
+                let cm = shared.class_manager.read();
+                if let Some(cls) = cm.get_class(class_id) {
+                    let mut static_idx = 0usize;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == "BOOT_MODULE_LOADER" {
+                                boot_loader_static_idx = Some(static_idx);
+                                break;
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                }
+            }
+            if let Some(idx) = boot_loader_static_idx {
+                // Do not gate on `get_static_shared`: missing storage maps to
+                // `Int(0)` (see `vm_object::get_static_shared`), and a partial
+                // `<clinit>` may leave garbage. After a swallowed failure we
+                // always publish a fresh empty `AtomicReference`.
+                match shared.load_class_concurrent("java/util/concurrent/atomic/AtomicReference") {
+                    Ok(ar_id) => {
+                    if let Some(ar_obj) = shared.heap.try_alloc_object(ar_id, 1) {
+                        super::vm_object::set_static_shared(
+                            shared,
+                            class_id,
+                            idx,
+                            Value::Object(Some(ar_obj)),
+                        );
+                        tracing::warn!(
+                            "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER — try_alloc_object(AtomicReference) failed"
+                        );
+                    }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER — failed to load AtomicReference: {e:?}"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER — static field not found in class metadata"
+                );
+            }
         }
         "java/util/logging/LogManager" => {
             // LogManager.manager must be non-null for getLogManager()
@@ -1528,6 +1590,155 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 tracing::warn!(
                     "Post-clinit fixup: BigInteger fixup skipped — signum/mag field indices not resolved"
                 );
+            }
+        }
+        // Spring Boot nested-JAR loaders: `PosixFilePermission.OWNER_READ` etc.
+        // must be non-null for `EnumSet.of` / `Set.of` in `JarFileArchive.<clinit>`.
+        // When static slots stay null after `<clinit>`, allocate real enum-shaped
+        // instances on the loaded `PosixFilePermission` class (jrt-backed).
+        "java/nio/file/attribute/PosixFilePermission" => {
+            const NAMES: &[&str] = &[
+                "OWNER_READ",
+                "OWNER_WRITE",
+                "OWNER_EXECUTE",
+                "GROUP_READ",
+                "GROUP_WRITE",
+                "GROUP_EXECUTE",
+                "OTHERS_READ",
+                "OTHERS_WRITE",
+                "OTHERS_EXECUTE",
+            ];
+            let read_static_named = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut static_idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            drop(cm);
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, static_idx,
+                            ));
+                        }
+                        static_idx += 1;
+                    }
+                }
+                None
+            };
+            if matches!(
+                read_static_named("OWNER_READ"),
+                Some(Value::Object(Some(_)))
+            ) {
+                return;
+            }
+            let ord_idx = {
+                let cm = shared.class_manager.read();
+                let store = &cm.class_store;
+                let mut current_id = Some(class_id);
+                let mut found = None;
+                while let Some(cid) = current_id {
+                    if let Some(class) = store.get(cid) {
+                        let mut instance_offset = 0;
+                        for field in &class.fields {
+                            if field.is_static() {
+                                continue;
+                            }
+                            if &*field.name == "ordinal" {
+                                found = Some(class.first_field_index + instance_offset);
+                                break;
+                            }
+                            instance_offset += 1;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                    current_id = store.get(cid).and_then(|c| c.superclass);
+                }
+                found
+            };
+            let name_idx = {
+                let cm = shared.class_manager.read();
+                let store = &cm.class_store;
+                let mut current_id = Some(class_id);
+                let mut found = None;
+                while let Some(cid) = current_id {
+                    if let Some(class) = store.get(cid) {
+                        let mut instance_offset = 0;
+                        for field in &class.fields {
+                            if field.is_static() {
+                                continue;
+                            }
+                            if &*field.name == "name" {
+                                found = Some(class.first_field_index + instance_offset);
+                                break;
+                            }
+                            instance_offset += 1;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                    current_id = store.get(cid).and_then(|c| c.superclass);
+                }
+                found
+            };
+            let num_fields = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id).map(|c| c.num_total_fields).unwrap_or(0)
+            };
+            let (Some(ord_idx), Some(name_idx)) = (ord_idx, name_idx) else {
+                tracing::warn!(
+                    "Post-clinit fixup: PosixFilePermission skipped — ordinal/name field indices not resolved"
+                );
+                return;
+            };
+            let mut filled = 0usize;
+            for (ord, &name) in NAMES.iter().enumerate() {
+                if matches!(
+                    read_static_named(name),
+                    Some(Value::Object(Some(_)))
+                ) {
+                    continue;
+                }
+                let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) else {
+                    continue;
+                };
+                shared
+                    .heap
+                    .set_field(obj, ord_idx, Value::Int(ord as i32));
+                let nm = super::vm_object::create_java_string(shared, name);
+                shared
+                    .heap
+                    .set_field(obj, name_idx, Value::Object(Some(nm)));
+                if set_static_by_name(name, Value::Object(Some(obj))) {
+                    filled += 1;
+                }
+            }
+            if filled > 0 {
+                tracing::warn!(
+                    "Post-clinit fixup: PosixFilePermission backfilled {filled}/{} enum statics",
+                    NAMES.len()
+                );
+            }
+            // `EnumSet` / `Class.getEnumConstants` read the synthetic `$VALUES`
+            // array. Without it, `EnumSet.of(OWNER_READ, ...)` throws CCE
+            // ("not an enum") even when the named static fields are populated.
+            if let Some(values_arr) = shared.heap.try_alloc_array(
+                class_id,
+                ArrayElementType::Reference,
+                NAMES.len(),
+            ) {
+                for (i, &name) in NAMES.iter().enumerate() {
+                    if let Some(Value::Object(Some(o))) = read_static_named(name) {
+                        let _ = shared
+                            .heap
+                            .set_array_element(values_arr, i, Value::Object(Some(o)));
+                    }
+                }
+                if !set_static_by_name("$VALUES", Value::Object(Some(values_arr))) {
+                    let _ = set_static_by_name("ENUM$VALUES", Value::Object(Some(values_arr)));
+                }
             }
         }
         // KC16 RKC16N.14 — `java/math/BigDecimal.<clinit>` may itself swallow

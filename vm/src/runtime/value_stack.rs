@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::error::RuntimeError;
-use crate::types::{CompactTag, CompactValue, ObjectRef, Value};
+use crate::memory::VmHeap;
+use crate::types::{jlong_bits_as_aligned_object_ptr, CompactTag, CompactValue, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Diagnostic instrumentation (K1 stack-tag mismatch hunt).
@@ -523,8 +524,17 @@ impl ValueStack {
 
     // ── GC scanning and pointer update helpers ─────────────────────────
 
-    /// Collect all non-null Object references from the stack for GC root scanning.
-    pub fn scan_object_refs(&self, roots: &mut Vec<ObjectRef>) {
+    /// Collect all non-null object references from the stack for GC root scanning.
+    ///
+    /// Mirrors [`crate::runtime::frame::Frame::scan_local_objects`]:
+    /// - NaN-boxed object slots (`CompactValue::is_object`).
+    /// - [`CompactTag::Long`] slots (raw `i64` bits, including NaN-tag collisions)
+    ///   where [`jlong_bits_as_aligned_object_ptr`] matches the JNI `jobject`-as-`jlong`
+    ///   contract.
+    /// - Untagged raw slots ([`CompactTag::Double`] in the compact encoding — ambiguous
+    ///   JVM long vs double): only values that pass `heap.is_object_address` are rooted,
+    ///   so numeric longs and ordinary doubles are not mistaken for references.
+    pub fn scan_object_refs(&self, roots: &mut Vec<ObjectRef>, heap: &VmHeap) {
         for i in 0..self.len {
             let cv = self.slots[i];
             if cv.is_object() {
@@ -535,11 +545,28 @@ impl ValueStack {
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
+            } else if cv.tag() == CompactTag::Long {
+                if let Some(p) = jlong_bits_as_aligned_object_ptr(cv.to_bits()) {
+                    // SAFETY: same `jobject`-as-`jlong` contract as frame locals.
+                    roots.push(unsafe { ObjectRef::from_raw(p as *mut u8) });
+                }
+            } else if cv.tag() == CompactTag::Double {
+                // Untagged raw bits: JVM long or IEEE double — validate heap object.
+                if let Some(p) = jlong_bits_as_aligned_object_ptr(cv.to_bits()) {
+                    if let Some(r) = heap.is_object_address(p) {
+                        roots.push(r);
+                    }
+                }
             }
         }
     }
 
-    /// Update Object references after GC using the pointer map.
+    /// Update object references after GC using the pointer map.
+    ///
+    /// Symmetric to [`crate::runtime::frame::Frame::update_local_refs`]: updates
+    /// tagged object payloads, `CompactTag::Long` slots carrying aligned pointers,
+    /// and untagged raw slots whose bits match [`jlong_bits_as_aligned_object_ptr`]
+    /// and appear in `pointer_map`.
     pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>) {
         for i in 0..self.len {
             let cv = self.slots[i];
@@ -547,6 +574,13 @@ impl ValueStack {
                 if let Some(old_ptr) = cv.as_object_ptr() {
                     if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
                         self.slots[i].update_object_ptr(new_addr as u64);
+                    }
+                }
+            } else if matches!(cv.tag(), CompactTag::Long | CompactTag::Double) {
+                let bits = cv.to_bits();
+                if let Some(old_ptr) = jlong_bits_as_aligned_object_ptr(bits) {
+                    if let Some(&new_addr) = pointer_map.get(&old_ptr) {
+                        self.slots[i] = CompactValue::long(new_addr as i64);
                     }
                 }
             }
@@ -1192,7 +1226,11 @@ mod tests {
         stack.push(Value::Object(None)).unwrap();
 
         let mut roots = Vec::new();
-        stack.scan_object_refs(&mut roots);
+        let heap = crate::memory::vm_heap::VmHeap::new(
+            crate::memory::vm_heap::GcBackend::Generational,
+            1024 * 1024,
+        );
+        stack.scan_object_refs(&mut roots, &heap);
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].as_ptr() as u64, 0x1000);
     }
@@ -1264,5 +1302,52 @@ mod tests {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr() as u64, new_ptr),
             other => panic!("expected Object, got {other:?}"),
         }
+    }
+
+    /// `jobject` surfaced as raw `jlong` / `Value::Long` sits in an untagged
+    /// stack slot; GC must still see it when it points at a real object header.
+    #[test]
+    fn t10_gc_scan_roots_jlong_bits_when_heap_validates() {
+        use crate::classloading::ClassId;
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as usize;
+
+        let mut stack = ValueStack::new(4);
+        stack.push_compact(CompactValue::long(addr as i64));
+
+        let mut roots = Vec::new();
+        stack.scan_object_refs(&mut roots, &heap);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].as_ptr() as usize, addr);
+    }
+
+    #[test]
+    fn t10_gc_scan_skips_aligned_integer_long_not_in_heap() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let mut stack = ValueStack::new(2);
+        stack.push_compact(CompactValue::long(8));
+
+        let mut roots = Vec::new();
+        stack.scan_object_refs(&mut roots, &heap);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn t10_gc_update_object_refs_rewrites_jlong_shaped_stack_slot() {
+        let mut stack = ValueStack::new(4);
+        let old_ptr: usize = 0x1000;
+        let new_ptr: usize = 0x2000;
+        stack.push_compact(CompactValue::long(old_ptr as i64));
+
+        let mut map = HashMap::new();
+        map.insert(old_ptr, new_ptr);
+        stack.update_object_refs(&map);
+
+        assert_eq!(stack.pop_long().unwrap(), new_ptr as i64);
     }
 }

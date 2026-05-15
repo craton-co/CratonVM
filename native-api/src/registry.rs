@@ -130,6 +130,14 @@ pub trait NativeContext {
     /// Get the class id of a heap object.
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;
 
+    /// True when the named class is loaded as a synthetic stub (no real
+    /// `.class` bytes). Used to branch native helpers that must mirror JDK
+    /// behaviour without registering natives that would override real JDK
+    /// bytecode once the stub upgrades.
+    fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
+        false
+    }
+
     /// Capture the current Java call stack for a throwable's `fillInStackTrace`.
     /// Returns a unique key for later retrieval.
     fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;

@@ -221,6 +221,26 @@ pub fn is_object_tag(tag: u8) -> bool {
     tag == VTAG_OBJECT
 }
 
+/// Raw bits stored in a local/stack cell tagged [`VTAG_LONG`] that should be
+/// treated as a non-null object pointer for GC rooting and pointer remapping.
+///
+/// JNI and internal bridges sometimes surface `jobject` handles as raw `i64`
+/// (`Value::Long`). When those bits are written into a reference local without
+/// widening to [`VTAG_OBJECT`], they must still be traced like
+/// `coerce_value_for_return(..., b'L')` does on the read path: **non-zero** and
+/// **8-byte aligned** (`usize` object pointers are always aligned in this VM).
+///
+/// Returns `None` for patterns that `coerce_value_for_return` maps to `null`.
+#[inline(always)]
+pub fn jlong_bits_as_aligned_object_ptr(bits: u64) -> Option<usize> {
+    let p = bits as usize;
+    if p != 0 && p % 8 == 0 {
+        Some(p)
+    } else {
+        None
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -252,6 +272,14 @@ mod tests {
     fn value_long_is_category2() {
         let v = Value::Long(100);
         assert!(v.is_category2());
+    }
+
+    #[test]
+    fn jlong_bits_as_aligned_object_ptr_matches_coerce_contract() {
+        assert_eq!(jlong_bits_as_aligned_object_ptr(0), None);
+        assert_eq!(jlong_bits_as_aligned_object_ptr(4), None);
+        assert_eq!(jlong_bits_as_aligned_object_ptr(0x1000), Some(0x1000));
+        assert_eq!(jlong_bits_as_aligned_object_ptr(0x1008), Some(0x1008));
     }
 
     #[test]

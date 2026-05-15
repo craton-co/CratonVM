@@ -11529,6 +11529,24 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         p59_spring_boot_jar_archive_get_class_path_urls,
     );
 
+    // Spring Boot 3.2+ repackaged launcher: `ExecutableArchiveLauncher` overrides
+    // `createClassLoader(Collection)` and can CCE in `toArray` / typed iteration
+    // under CratonVM. Register the bypass on every concrete launcher leaf as
+    // well as the abstract base (same `check_override` shadowing issue as SB2).
+    let sb3_launch_classes: &[&str] = &[
+        "org/springframework/boot/loader/launch/ExecutableArchiveLauncher",
+        "org/springframework/boot/loader/launch/JarLauncher",
+        "org/springframework/boot/loader/launch/WarLauncher",
+    ];
+    for cls in sb3_launch_classes {
+        r.register(
+            cls,
+            "createClassLoader",
+            "(Ljava/util/Collection;)Ljava/lang/ClassLoader;",
+            sb3_executable_archive_launcher_create_class_loader_collection,
+        );
+    }
+
     // -------------------------------------------------------------------
     // Spring Boot 2.x fat-jar launcher overrides.
     //
@@ -11585,6 +11603,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         },
     );
 
+    r.register(
+        launcher_base,
+        "createClassLoader",
+        "(Ljava/util/Iterator;)Ljava/lang/ClassLoader;",
+        sb2_launcher_create_class_loader_bypass_archive_walk,
+    );
+    r.register(
+        launcher_base,
+        "createClassLoader",
+        "(Ljava/util/List;)Ljava/lang/ClassLoader;",
+        sb2_launcher_create_class_loader_bypass_archive_walk,
+    );
+
     for cls in eal_classes {
         // Also register createArchive on each concrete launcher class so the
         // check_override path (which walks the class itself first) finds it.
@@ -11632,6 +11663,18 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "getClassPathArchivesIterator",
             "()Ljava/util/Iterator;",
             sb2_launcher_get_class_path_archives_iterator,
+        );
+        r.register(
+            cls,
+            "createClassLoader",
+            "(Ljava/util/Iterator;)Ljava/lang/ClassLoader;",
+            sb2_launcher_create_class_loader_bypass_archive_walk,
+        );
+        r.register(
+            cls,
+            "createClassLoader",
+            "(Ljava/util/List;)Ljava/lang/ClassLoader;",
+            sb2_launcher_create_class_loader_bypass_archive_walk,
         );
         // getClassPathIndex(Archive) — returns null so no layered-JAR
         // classpath index is loaded (correct for non-layered Spring Boot 2 JARs).
@@ -12050,6 +12093,31 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     )))))
 }
 
+/// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s
+/// (SB3 `JarFileArchive` / launcher classpath scan).
+fn p59_fat_jar_boot_inf_nested_url_values(ctx: &mut dyn NativeContext, jar_path: &str) -> Vec<Value> {
+    let mut urls: Vec<Value> = Vec::new();
+    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
+    let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
+    urls.push(Value::Object(Some(p59_alloc_url(ctx, &classes_url_str))));
+    if !jar_path.is_empty() {
+        if let Ok(file) = std::fs::File::open(jar_path) {
+            if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                for i in 0..archive.len() {
+                    if let Ok(entry) = archive.by_index(i) {
+                        let name = entry.name().to_string();
+                        if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
+                            let url_str = format!("jar:nested:/{jar_uri_path}/!{name}!/");
+                            urls.push(Value::Object(Some(p59_alloc_url(ctx, &url_str))));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    urls
+}
+
 /// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
 /// the central directory, build URL set for `BOOT-INF/classes/` (always
 /// included) plus every `BOOT-INF/lib/*.jar` entry.
@@ -12084,35 +12152,7 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}", jar_path);
     }
 
-    // Collect all BOOT-INF/lib/*.jar entry names from the central directory.
-    let mut urls: Vec<Value> = Vec::new();
-
-    // Always include BOOT-INF/classes/ as the first classpath URL.
-    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
-    let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
-    let classes_url = p59_alloc_url(ctx, &classes_url_str);
-    urls.push(Value::Object(Some(classes_url)));
-
-    if !jar_path.is_empty() {
-        if let Ok(file) = std::fs::File::open(&jar_path) {
-            if let Ok(mut archive) = zip::ZipArchive::new(file) {
-                for i in 0..archive.len() {
-                    if let Ok(entry) = archive.by_index(i) {
-                        let name = entry.name().to_string();
-                        if name.starts_with("BOOT-INF/lib/")
-                            && name.ends_with(".jar")
-                        {
-                            let url_str = format!(
-                                "jar:nested:/{jar_uri_path}/!{name}!/"
-                            );
-                            let url = p59_alloc_url(ctx, &url_str);
-                            urls.push(Value::Object(Some(url)));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let urls = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
 
     if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls", urls.len());
@@ -12132,6 +12172,40 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(urls.len() as i32));
     Ok(Some(Value::Object(Some(list))))
+}
+
+/// Spring Boot 3 `ExecutableArchiveLauncher.createClassLoader(Collection)`:
+/// real bytecode does `urls.toArray(new URL[0])` and can `ClassCastException`
+/// when collection iteration / typed `toArray` does not match CratonVM's
+/// mixed real-JDK + synthetic collection layout. Rebuild the nested-jar
+/// `URL[]` from the fat-jar path (same scan as [`p59_fat_jar_boot_inf_nested_url_values`])
+/// and `invokespecial` the private `Launcher.createClassLoader(URL[])` on
+/// the real SB3 launcher type.
+fn sb3_executable_archive_launcher_create_class_loader_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cid = ctx.class_id_of_object(this);
+    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+    let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
+    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        eprintln!(
+            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
+            cn, jar_path
+        );
+    }
+    let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
+    let url_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, url_values.len());
+    for (i, v) in url_values.iter().enumerate() {
+        ctx.set_array_element(url_arr, i, *v);
+    }
+    ctx.invoke_special(
+        "org/springframework/boot/loader/launch/Launcher",
+        "createClassLoader",
+        "([Ljava/net/URL;)Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(this)), Value::Object(Some(url_arr))],
+    )
 }
 
 /// Resolve the on-disk fat-jar path of a Spring Boot 2 launcher instance.
@@ -12304,6 +12378,43 @@ fn sb2_launcher_get_class_path_archives_iterator(
         eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries", archives.len());
     }
     Ok(Some(Value::Object(Some(itr))))
+}
+
+/// Spring Boot 2 `Launcher.createClassLoader(Iterator<Archive>)` — bypass the
+/// real bytecode loop that does `Iterator.next` + `checkcast Archive`. Mixed
+/// CratonVM dispatch can leave the wrong reference on the stack so the cast
+/// throws `ClassCastException` before `LaunchedURLClassLoader` is created.
+/// Rebuild the `URL[]` from the same fat-jar scan as [`sb2_launcher_build_archive_list`]
+/// and delegate to `createClassLoader([Ljava/net/URL;)`.
+///
+/// Also registered for `createClassLoader(List)` (Spring Boot 2.0.x — e.g.
+/// SportMe) which uses the same iterator+checkcast loop over `List.iterator()`.
+fn sb2_launcher_create_class_loader_bypass_archive_walk(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let _ = args.get(1); // ignored — rebuilt from the launcher mirror
+    let archives = sb2_launcher_build_archive_list(ctx, this);
+    let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives.len());
+    for arch_val in archives {
+        let Value::Object(Some(arch_obj)) = arch_val else {
+            continue;
+        };
+        if let Value::Object(Some(url)) = ctx.get_field(arch_obj, 1) {
+            urls.push(url);
+        }
+    }
+    let url_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    for (i, u) in urls.iter().enumerate() {
+        ctx.set_array_element(url_arr, i, Value::Object(Some(*u)));
+    }
+    ctx.invoke(
+        "org/springframework/boot/loader/Launcher",
+        "createClassLoader",
+        "([Ljava/net/URL;)Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(this)), Value::Object(Some(url_arr))],
+    )
 }
 
 /// Allocate a 13-field synthetic URL with `protocol`, `host`, `port`, `file`,
@@ -31883,6 +31994,56 @@ pub(crate) fn register_phase70_natives(registry: &mut NativeMethodRegistry) {
 // java.nio.file.attribute extensions — PosixFilePermission, FileTime, UserPrincipal
 // =============================================================================
 
+fn posix_file_permission_stub_clinit(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    const P: &str = "java/nio/file/attribute/PosixFilePermission";
+    if !ctx.is_class_synthetic_stub(P) {
+        return Ok(None);
+    }
+    let Some(cid) = ctx.class_id_by_name(P) else {
+        return Ok(None);
+    };
+    if let Some(slot) = ctx.static_field_index_by_name(cid, "OWNER_READ") {
+        if matches!(ctx.get_static_field(cid, slot), Value::Object(Some(_))) {
+            return Ok(None);
+        }
+    }
+    const NAMES: &[&str] = &[
+        "OWNER_READ",
+        "OWNER_WRITE",
+        "OWNER_EXECUTE",
+        "GROUP_READ",
+        "GROUP_WRITE",
+        "GROUP_EXECUTE",
+        "OTHERS_READ",
+        "OTHERS_WRITE",
+        "OTHERS_EXECUTE",
+    ];
+    let _ = ctx.ensure_class_initialized("java/lang/Enum");
+    let ord_idx = ctx.resolve_field_index(P, "ordinal").unwrap_or(0);
+    let name_idx = ctx.resolve_field_index(P, "name").unwrap_or(1);
+    let nfields = ctx.class_num_total_fields(cid).max(2);
+    for (ord, &name) in NAMES.iter().enumerate() {
+        let obj = ctx.alloc_object(cid, nfields);
+        ctx.set_field(obj, ord_idx, Value::Int(ord as i32));
+        let name_obj = ctx.create_string(name);
+        ctx.set_field(obj, name_idx, Value::Object(Some(name_obj)));
+        ctx.set_static_field_by_name(P, name, Value::Object(Some(obj)));
+    }
+    Ok(None)
+}
+
+pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodRegistry) {
+    r.register(
+        "java/nio/file/attribute/PosixFilePermission",
+        "<clinit>",
+        "()V",
+        posix_file_permission_stub_clinit,
+    );
+}
+
 pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     // FileTime = 1-field (millis=0 Long)
     let ft = "java/nio/file/attribute/FileTime";
@@ -32119,12 +32280,18 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(set))))
         },
     );
+    // Spring Boot 3 `JarFileArchive.<clinit>` uses this in a `FileAttribute[]`;
+    // null is valid. Bridges NSM when the method is missing from the resolved
+    // class table, without inventing a synthetic `java/**` FileAttribute type.
     r.register(
         pfps,
         "asFileAttribute",
         "(Ljava/util/Set;)Ljava/nio/file/attribute/FileAttribute;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // `asFileAttribute` — when real JDK bytecode is present, it builds an
+    // anonymous `FileAttribute`; the native above is a fallback only.
+    register_posix_file_permission_stub_clinit(r);
 }
 
 // =============================================================================
@@ -40699,90 +40866,3 @@ mod t10_manifest_input_stream_tests {
     }
 }
 
-// =============================================================================
-// Spring Framework ApplicationStartup / StartupStep no-op natives
-//
-// Spring Boot 2.x / Spring Framework 5.3.x: `AbstractApplicationContext`
-// has a field `applicationStartup = ApplicationStartup.DEFAULT`. The DEFAULT
-// constant is set by the interface's clinit (`new DefaultApplicationStartup()`).
-// When `DefaultApplicationStartup` can't be loaded from nested JARs (because
-// the classloader isn't fully wired yet), the interface clinit fails and
-// DEFAULT stays null. This causes an NPE at
-//   `AnnotationConfigApplicationContext.<init>` line 68:
-//   `this.getApplicationStartup().start("spring.context.annotated-bean-reader.create")`
-//
-// Fix: provide native overrides for `getApplicationStartup()` and the
-// `ApplicationStartup.start(String)` / `StartupStep` methods so they
-// return cheap synthetic no-op objects instead of requiring the real classes.
-// =============================================================================
-
-/// Register no-op natives for Spring's ApplicationStartup / StartupStep.
-/// The StartupStep synthetic object uses 1 field (slot 0 = parent StartupStep ref, unused).
-pub fn register_spring_application_startup_natives(r: &mut NativeMethodRegistry) {
-    let abs_ctx = "org/springframework/context/support/AbstractApplicationContext";
-    let app_startup = "org/springframework/core/metrics/ApplicationStartup";
-    let startup_step = "org/springframework/core/metrics/StartupStep";
-    let default_startup = "org/springframework/core/metrics/DefaultApplicationStartup";
-    let default_step = "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep";
-
-    // AbstractApplicationContext.getApplicationStartup() — always return a
-    // synthetic no-op ApplicationStartup so downstream .start(...) never NPEs.
-    r.register(
-        abs_ctx,
-        "getApplicationStartup",
-        "()Lorg/springframework/core/metrics/ApplicationStartup;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "org/springframework/core/metrics/DefaultApplicationStartup", 1);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // ApplicationStartup.start(String) → no-op StartupStep
-    for cls in &[app_startup, default_startup] {
-        r.register(
-            cls,
-            "start",
-            "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-            |ctx, _args| {
-                let step = alloc_concurrent_synthetic(ctx, "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep", 1);
-                Ok(Some(Value::Object(Some(step))))
-            },
-        );
-    }
-
-    // StartupStep.tag(String, String) → return this (chaining)
-    for cls in &[startup_step, default_step] {
-        r.register(
-            cls,
-            "tag",
-            "(Ljava/lang/String;Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
-        );
-        // StartupStep.tag(String, Supplier) → return this (chaining)
-        r.register(
-            cls,
-            "tag",
-            "(Ljava/lang/String;Ljava/util/function/Supplier;)Lorg/springframework/core/metrics/StartupStep;",
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
-        );
-        // StartupStep.end() → void
-        r.register(cls, "end", "()V", |_ctx, _args| Ok(None));
-        // StartupStep.getName() → empty string
-        r.register(cls, "getName", "()Ljava/lang/String;", |ctx, _args| {
-            Ok(Some(Value::Object(Some(ctx.create_string("")))))
-        });
-        // StartupStep.getTags() → empty Iterable
-        r.register(
-            cls,
-            "getTags",
-            "()Ljava/lang/Iterable;",
-            |ctx, _args| {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
-                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                ctx.set_field(list, 0, Value::Object(Some(arr)));
-                ctx.set_field(list, 1, Value::Int(0));
-                Ok(Some(Value::Object(Some(list))))
-            },
-        );
-    }
-}

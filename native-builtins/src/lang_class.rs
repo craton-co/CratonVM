@@ -1401,9 +1401,12 @@ pub(crate) fn descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str
         "V" => ctx.primitive_class_mirror("void"),
         s if s.starts_with('L') && s.ends_with(';') => {
             let class_name = &s[1..s.len() - 1];
-            match ctx.ensure_class_initialized(class_name) {
-                Ok(class_id) => ctx.get_class_mirror(class_id),
-                Err(_) => synthetic_class_mirror(ctx, class_name),
+            if let Some(class_id) = ctx.class_id_by_name(class_name) {
+                return ctx.get_class_mirror(class_id);
+            }
+            match ctx.load_class(class_name) {
+                Ok(Some(Value::Object(Some(mirror)))) => mirror,
+                _ => synthetic_class_mirror(ctx, class_name),
             }
         }
         s if s.starts_with('[') => {
@@ -1415,9 +1418,12 @@ pub(crate) fn descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str
             // match the user's `int[].class` and `getDeclaredMethod`
             // throws NSME. Falls back to a synthetic mirror only if the
             // class manager refuses to register the array class.
-            match ctx.ensure_class_initialized(s) {
-                Ok(class_id) => ctx.get_class_mirror(class_id),
-                Err(_) => synthetic_class_mirror(ctx, s),
+            if let Some(class_id) = ctx.class_id_by_name(s) {
+                return ctx.get_class_mirror(class_id);
+            }
+            match ctx.load_class(s) {
+                Ok(Some(Value::Object(Some(mirror)))) => mirror,
+                _ => synthetic_class_mirror(ctx, s),
             }
         }
         _ => {
@@ -1852,10 +1858,34 @@ pub(crate) fn wrap_as_invocation_target_exception(
         other => return other,
     };
 
+    // When `InvocationTargetException` is still a synthetic JDK stub (no
+    // real `<init>` bytecode), allocate and wire the `target` field without
+    // going through `invoke` — the stub's Throwable-shaped native `<init>`
+    // list does not model JDK 7+ `InvocationTargetException(Throwable)`.
+    let target_class = "java/lang/reflect/InvocationTargetException";
+    if ctx.is_class_synthetic_stub(target_class) {
+        let new_result = ctx.new_object(target_class);
+        let wrapper = match new_result {
+            Ok(Some(Value::Object(Some(obj)))) => obj,
+            _ => return MethodCallFailed::ExceptionThrown(original),
+        };
+        let _ = ctx.invoke_special(
+            "java/lang/ReflectiveOperationException",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(wrapper))],
+        );
+        let _ = ctx.set_field_by_name(
+            wrapper,
+            "target",
+            Value::Object(Some(original)),
+        );
+        return MethodCallFailed::ExceptionThrown(wrapper);
+    }
+
     // Attempt to allocate and initialise
     // `java.lang.reflect.InvocationTargetException(Throwable)`. If any step
     // fails, fall back to the original exception rather than masking it.
-    let target_class = "java/lang/reflect/InvocationTargetException";
     let new_result = ctx.new_object(target_class);
     let wrapper = match new_result {
         Ok(Some(Value::Object(Some(obj)))) => obj,

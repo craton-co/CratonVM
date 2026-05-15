@@ -1,0 +1,9 @@
+﻿2026-05-13T22:05:25.203767Z  WARN rustjvm_vm::runtime::diagnostics: B6: silent-swallow тАФ error suppressed to keep VM running site=<clinit> category=non-critical-exception detail=class=org/jboss/modules/Module exc=java/lang/NullPointerException
+2026-05-13T22:05:25.203811Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 0] at org/jboss/modules/Main.main (Main.java:337) bci=1219
+2026-05-13T22:05:25.203815Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 1] at org/jboss/modules/Module.<clinit> (Module.java:77) bci=22
+2026-05-13T22:05:25.203826Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPaths backfilled with empty String[]
+2026-05-13T22:05:25.203830Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPackages backfilled with empty String[]
+2026-05-13T22:05:25.203846Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
+2026-05-13T22:05:25.605550Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/security/Permissions.add(Ljava/security/Permission;)V"
+Error in thread "main" linkage error: no such method: java/security/Permissions.add(Ljava/security/Permission;)V
+

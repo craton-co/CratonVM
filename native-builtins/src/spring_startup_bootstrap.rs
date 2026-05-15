@@ -116,10 +116,18 @@ fn step_get_parent_id(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 }
 
 fn step_get_tags(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Return empty iterable — callers use this only for diagnostics.
-    // Return a synthetic empty ArrayList.
-    let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 4);
-    // ArrayList.size = 0 already (default int field)
+    // Empty `ArrayList` — match real-JDK field slots (modCount may occupy slot 0).
+    let data_slot = ctx
+        .resolve_field_index("java/util/ArrayList", "elementData")
+        .unwrap_or(0);
+    let size_slot = ctx
+        .resolve_field_index("java/util/ArrayList", "size")
+        .unwrap_or(1);
+    let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+    let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    ctx.set_field(list, data_slot, Value::Object(Some(arr)));
+    ctx.set_field(list, size_slot, Value::Int(0));
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -300,6 +308,59 @@ fn env_resolve_placeholders(
 const DLBF: &str = "org/springframework/beans/factory/support/DefaultListableBeanFactory";
 const GENERIC_CTX: &str = "org/springframework/context/support/GenericApplicationContext";
 
+const BPP_LIST: &str =
+    "org/springframework/beans/factory/support/AbstractBeanFactory$BeanPostProcessorCacheAwareList";
+
+/// `AbstractBeanFactory.beanPostProcessors` must be a non-null
+/// `BeanPostProcessorCacheAwareList` — Spring casts it to that concrete type.
+///
+/// Non-static member classes (JVMS §4.7.6 / JLS §8.8) take a synthetic first
+/// constructor parameter, the enclosing instance; the compiler stores it in
+/// `this$0`.  If bytecode `new`/`invokespecial` ran with a broken argument
+/// binding, we can see the correct runtime class with a **null** `this$0`.
+/// The old logic returned early whenever the class name matched, so those
+/// lists were never repaired and `addBeanProcessor` NPE'd on the outer ref.
+fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: ObjectRef) {
+    const INNER_INIT: &str =
+        "(Lorg/springframework/beans/factory/support/AbstractBeanFactory;)V";
+
+    let cur = ctx.get_field_by_name(bean_factory, "beanPostProcessors");
+    if let Value::Object(Some(obj)) = cur {
+        let cid = ctx.class_id_of_object(obj);
+        if ctx.class_name_of_id(cid).as_deref() == Some(BPP_LIST) {
+            let needs_outer = match ctx.get_field_by_name(obj, "this$0") {
+                Value::Object(Some(o)) => o != bean_factory,
+                _ => true,
+            };
+            if !needs_outer {
+                return;
+            }
+            // Wrong or missing enclosing factory — patch in place so we keep
+            // any list state and fix the NPE Spring hits in addBeanProcessor.
+            ctx.set_field_by_name(obj, "this$0", Value::Object(Some(bean_factory)));
+            return;
+        }
+    }
+
+    if let Ok(Some(Value::Object(Some(list)))) = ctx.new_object(BPP_LIST) {
+        let args = &[
+            Value::Object(Some(list)),
+            Value::Object(Some(bean_factory)),
+        ];
+        let inited = ctx
+            .invoke_special(BPP_LIST, "<init>", INNER_INIT, args)
+            .is_ok()
+            || ctx.invoke(BPP_LIST, "<init>", INNER_INIT, args).is_ok();
+        if inited {
+            ctx.set_field_by_name(
+                bean_factory,
+                "beanPostProcessors",
+                Value::Object(Some(list)),
+            );
+        }
+    }
+}
+
 fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
@@ -347,6 +408,7 @@ fn get_bean_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let bf = get_or_create_bean_factory(ctx, receiver);
+    ensure_bean_post_processors_list(ctx, bf);
     Ok(Some(Value::Object(Some(bf))))
 }
 

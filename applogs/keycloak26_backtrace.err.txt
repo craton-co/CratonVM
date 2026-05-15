@@ -1,0 +1,28 @@
+[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+2026-05-13T18:07:27.090002Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+thread 'main-vm' panicked at types\src\value.rs:71:13:
+ObjectRef::from_raw called with unaligned pointer: 0x5b20554
+stack backtrace:
+   0: std::backtrace_rs::backtrace::win64::trace
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\..\..\backtrace\src\backtrace\win64.rs:85
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\..\..\backtrace\src\backtrace\mod.rs:66
+   2: std::backtrace::Backtrace::create
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\backtrace.rs:331
+   3: std::backtrace::Backtrace::capture
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\backtrace.rs:296
+   4: java::main
+   5: std::panicking::panic_with_hook
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\panicking.rs:833
+   6: std::panicking::panic_handler::closure$0
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\panicking.rs:698
+   7: std::sys::backtrace::__rust_end_short_backtrace<std::panicking::panic_handler::closure_env$0,never$>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\sys\backtrace.rs:182
+   8: std::panicking::panic_handler
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\panicking.rs:689
+   9: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\panicking.rs:80
+  10: rustjvm_types::value::ObjectRef::from_raw
+  11: rustjvm_vm::jit::helpers::jit_invoke_dispatch
+
+2026-05-13T18:07:27.319339Z  WARN rustjvm::panic: panic: ObjectRef::from_raw called with unaligned pointer: 0x5b20554 file="types\\src\\value.rs" line=71 column=13 thread="main-vm"

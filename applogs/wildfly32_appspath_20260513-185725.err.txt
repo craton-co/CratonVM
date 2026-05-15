@@ -1,0 +1,9 @@
+﻿2026-05-13T21:57:26.408180Z  WARN rustjvm_vm::runtime::diagnostics: B6: silent-swallow тАФ error suppressed to keep VM running site=<clinit> category=non-critical-exception detail=class=org/jboss/modules/Module exc=java/lang/NullPointerException
+2026-05-13T21:57:26.408249Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 0] at org/jboss/modules/Main.main (Main.java:337) bci=1219
+2026-05-13T21:57:26.408257Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 1] at org/jboss/modules/Module.<clinit> (Module.java:77) bci=22
+2026-05-13T21:57:26.408275Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPaths backfilled with empty String[]
+2026-05-13T21:57:26.408282Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPackages backfilled with empty String[]
+2026-05-13T21:57:26.408309Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
+2026-05-13T21:57:27.001652Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/Integer.parseInt(Ljava/lang/String;)I"
+Error in thread "main" linkage error: no such method: java/lang/Integer.parseInt(Ljava/lang/String;)I
+

@@ -23,7 +23,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 1. Thread frames — scan locals and operand stacks (SoA layout)
     for frame in thread.frames.iter() {
         frame.scan_local_objects(&mut roots);
-        frame.stack.scan_object_refs(&mut roots);
+        frame.stack.scan_object_refs(&mut roots, &shared.heap);
     }
 
     // 2. Static fields — all classes
@@ -51,6 +51,18 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         if let Value::Object(Some(obj_ref)) = val {
             roots.push(*obj_ref);
         }
+    }
+
+    // 4b. Native invoke pins — object args popped off the operand stack for
+    //     `safe_native_call` (see `JvmThread::native_pin_roots`).
+    for obj_ref in &thread.native_pin_roots {
+        roots.push(*obj_ref);
+    }
+
+    // 4c. Native return in flight — object result after `safe_native_call`
+    //     returns but before the interpreter pushes it onto the operand stack.
+    if let Some(obj_ref) = thread.native_pending_return {
+        roots.push(obj_ref);
     }
 
     // 5. Interned string pool — all interned String objects

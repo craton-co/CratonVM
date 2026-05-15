@@ -1,0 +1,4 @@
+﻿WILDFLY_RC=0
+WILDFLY_OUT=c:\craton\CratonVM\applogs\wildfly32_wfbuild2_20260513-195820.out.txt
+WILDFLY_ERR=c:\craton\CratonVM\applogs\wildfly32_wfbuild2_20260513-195820.err.txt
+TS=20260513-195820

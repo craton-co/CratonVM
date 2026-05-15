@@ -214,6 +214,18 @@ pub struct JvmThread {
     /// Updated at safepoints and before blocking operations.
     pub root_snapshot: Arc<parking_lot::Mutex<Vec<ObjectRef>>>,
 
+    /// GC roots for `Value::Object` arguments popped from the operand stack into a
+    /// Rust `Vec` while a registered native runs (`safe_native_call`). Those refs
+    /// are no longer on the Java stack until the callee returns, so without this
+    /// list a safepoint GC can collect them mid-native (Letsgo AV after CCE
+    /// `enhance` returns the original `Class`).
+    pub native_pin_roots: Vec<ObjectRef>,
+
+    /// Object return value from the last `safe_native_call` that returned
+    /// `Ok(Some(Value::Object(..)))`, kept alive until the interpreter pushes it
+    /// onto the operand stack (cross-thread GC window after the call returns).
+    pub native_pending_return: Option<ObjectRef>,
+
     /// Thread-local invoke cache — maps (caller_class, cp_index) to resolved targets.
     /// No locking needed since each thread owns its cache.
     pub invoke_cache: InvokeCache,
@@ -304,6 +316,8 @@ impl JvmThread {
             java_thread_obj: None,
             park_state: Arc::new(ParkState::new()),
             root_snapshot: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            native_pin_roots: Vec::new(),
+            native_pending_return: None,
             invoke_cache: InvokeCache::new(),
             kind: ThreadKind::Platform,
             pin_count: 0,

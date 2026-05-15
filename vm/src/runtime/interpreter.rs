@@ -68,9 +68,10 @@ use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactValue, ObjectRef, Value};
 use crate::vm::{
-    create_java_string, ensure_class_initialized_shared, ensure_system_stdin_object,
-    get_or_create_class_mirror, get_static_shared, invoke_on_class_shared, invoke_or_native,
-    invoke_shared, read_java_string, set_static_shared, SharedVm,
+    coerce_value_for_return, create_java_string, ensure_class_initialized_shared,
+    ensure_system_stdin_object, get_or_create_class_mirror, get_static_shared,
+    invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string, set_static_shared,
+    SharedVm,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,7 +98,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // Retire TLAB before GC — its memory is in from-space
         thread.tlab.retire();
         // Update our root snapshot before requesting STW
-        update_root_snapshot(thread);
+        update_root_snapshot(shared, thread);
 
         // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
         let alive_count = u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX);
@@ -215,7 +216,7 @@ pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
 }
 
 fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
-    update_root_snapshot(thread);
+    update_root_snapshot(shared, thread);
 
     let alive_count = shared.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
@@ -253,7 +254,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
 pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // Retire TLAB before GC
     thread.tlab.retire();
-    update_root_snapshot(thread);
+    update_root_snapshot(shared, thread);
 
     // Snapshot finalizable object addresses so the GC can resurrect dead ones
     let fin_addrs: Vec<usize> = {
@@ -758,12 +759,16 @@ fn gc_alloc_array(
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
 /// Called at safepoints and before blocking operations.
-fn update_root_snapshot(thread: &JvmThread) {
+pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
     let mut snapshot = thread.root_snapshot.lock();
     snapshot.clear();
     for frame in &thread.frames {
         frame.scan_local_objects(&mut snapshot);
-        frame.stack.scan_object_refs(&mut snapshot);
+        frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
+    }
+    snapshot.extend(thread.native_pin_roots.iter().copied());
+    if let Some(r) = thread.native_pending_return {
+        snapshot.push(r);
     }
 }
 
@@ -776,7 +781,7 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
     if shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
         // Update root snapshot before pausing
-        update_root_snapshot(thread);
+        update_root_snapshot(shared, thread);
 
         // Arrive at barrier and wait for GC to complete
         let pointer_map = shared.gc_barrier.arrive_and_wait(thread.thread_id);
@@ -2437,47 +2442,53 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // aload_0..3
                 0x2a => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(0));
+                    let v = coerce_value_for_return(frame.get_local_unchecked(0), b'L');
+                    frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2b => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(1));
+                    let v = coerce_value_for_return(frame.get_local_unchecked(1), b'L');
+                    frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2c => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(2));
+                    let v = coerce_value_for_return(frame.get_local_unchecked(2), b'L');
+                    frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2d => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(3));
+                    let v = coerce_value_for_return(frame.get_local_unchecked(3), b'L');
+                    frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // astore_0..3
+                // astore_0..3 — mirror slow-path `Instruction::Astore`: JNI may
+                // leave a jobject as `Value::Long`; storing it raw corrupts ref
+                // locals (Letsgo AV after `ConfigurationClassEnhancer.enhance`).
                 0x4b => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(0, v);
+                    frame.set_local_unchecked(0, coerce_value_for_return(v, b'L'));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4c => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(1, v);
+                    frame.set_local_unchecked(1, coerce_value_for_return(v, b'L'));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4d => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(2, v);
+                    frame.set_local_unchecked(2, coerce_value_for_return(v, b'L'));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4e => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(3, v);
+                    frame.set_local_unchecked(3, coerce_value_for_return(v, b'L'));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -2794,6 +2805,16 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
                     let value = frame.stack.pop_unchecked();
+                    // areturn (0xb0): mirror slow-path `Instruction::Areturn` — JNI
+                    // / bridges can leave a jobject as `Value::Long` on the stack;
+                    // fast-path frames (non-JDK packages) must still normalize
+                    // before pushing to the caller or returning from the outer VM.
+                    let value = if opcode == 0xb0 {
+                        let ret = crate::jit::return_type(frame.method_descriptor());
+                        coerce_value_for_return(value, ret)
+                    } else {
+                        value
+                    };
                     if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
                         let cn = frame.class_name();
                         let mn = frame.method_name();
@@ -3588,9 +3609,11 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // iload (0x15), fload (0x17), aload (0x19)
                 0x15 | 0x17 | 0x19 => {
-                    frame
-                        .stack
-                        .push_unchecked(frame.get_local_unchecked(b1 as usize)); // Cast: bytecode operand decoding
+                    let mut v = frame.get_local_unchecked(b1 as usize); // Cast: bytecode operand decoding
+                    if opcode == 0x19 {
+                        v = coerce_value_for_return(v, b'L');
+                    }
+                    frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 2;
                     continue;
                 }
@@ -3602,10 +3625,20 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 2;
                     continue;
                 }
-                // istore (0x36), fstore (0x38), astore (0x3a)
-                0x36 | 0x38 | 0x3a => {
+                // istore (0x36), fstore (0x38)
+                0x36 | 0x38 => {
                     let v = frame.stack.pop_unchecked();
                     frame.set_local_unchecked(b1 as usize, v); // Cast: bytecode operand decoding
+                    frame.pc = saved_pc + 2;
+                    continue;
+                }
+                // astore (0x3a) — reference local; coerce jlong jobject handles.
+                0x3a => {
+                    let v = frame.stack.pop_unchecked();
+                    frame.set_local_unchecked(
+                        b1 as usize, // Cast: bytecode operand decoding
+                        coerce_value_for_return(v, b'L'),
+                    );
                     frame.pc = saved_pc + 2;
                     continue;
                 }
@@ -3725,7 +3758,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // aastore (0x53) — needs SATB pre-barrier + write barrier
                 0x53 => {
-                    let value = frame.stack.pop_unchecked();
+                    let value =
+                        coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
                     let idx_val = frame.stack.pop_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
                     if let (Value::Object(Some(arr_ref)), Value::Int(index)) = (arr_val, idx_val) {
@@ -4056,6 +4090,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             Ok(InstructionResult::Return(value)) => {
                 // Slow-path return — check for stackless frames
                 if frame_idx > initial_frame_idx {
+                    let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
+                    let value = value.map(|v| {
+                        if ret == b'V' {
+                            v
+                        } else {
+                            coerce_value_for_return(v, ret)
+                        }
+                    });
                     pop_and_recycle_frame(shared, thread);
                     frame_idx -= 1;
                     if let Some(v) = value {
@@ -4677,8 +4719,16 @@ fn execute_instruction(
             thread.frames[frame_idx].stack.push_compact(cv);
         }
         Instruction::Aload(idx) => {
-            let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact(cv);
+            // Mirror `Instruction::Astore` / fast-path `aload`: JNI may leave a
+            // jobject in a reference local as `VTAG_LONG`; `push_compact` would
+            // keep raw bits and the next `if_acmpeq` / `invokevirtual` can AV
+            // (Letsgo after `ConfigurationClassEnhancer.enhance` in
+            // `ConfigurationClassPostProcessor.enhanceConfigurationClasses`).
+            let v = coerce_value_for_return(
+                thread.frames[frame_idx].get_local(*idx),
+                b'L',
+            );
+            thread.frames[frame_idx].stack.push(v)?;
         }
 
         // -- Array loads --
@@ -4705,11 +4755,20 @@ fn execute_instruction(
         }
 
         // -- Stores (T10.9.D direct CompactValue path) --
-        Instruction::Istore(idx) | Instruction::Fstore(idx) | Instruction::Astore(idx) => {
+        Instruction::Istore(idx) | Instruction::Fstore(idx) => {
             // Direct compact round-trip — tag on the stack slot is preserved
             // through compact_to_local_slot.
             let cv = thread.frames[frame_idx].stack.pop_compact();
             thread.frames[frame_idx].set_local_compact(*idx, cv);
+        }
+        // `astore` must NOT use the raw compact round-trip: JNI / invoke
+        // bridges can leave a jobject as `Value::Long`; storing that as
+        // VTAG_LONG corrupts reference locals (Spring slow-path after CCE;
+        // fast path `astore_*` / `0x3a` already use `coerce_value_for_return`).
+        Instruction::Astore(idx) => {
+            let v = thread.frames[frame_idx].stack.pop()?;
+            let coerced = coerce_value_for_return(v, b'L');
+            thread.frames[frame_idx].set_local(*idx, coerced);
         }
         Instruction::Lstore(idx) => {
             // JVM spec: lstore always consumes a Long (category-2).
@@ -4731,7 +4790,9 @@ fn execute_instruction(
         // -- Array stores --
         Instruction::Aastore => {
             // Reference array store — needs write barrier for generational GC
-            let value = thread.frames[frame_idx].stack.pop()?;
+            // Mirror fast-path 0x53: JNI / invoke bridges may leave jobject bits as
+            // `Value::Long` on the stack; Spring (`is_jdk_class`) uses this slow path.
+            let value = coerce_value_for_return(thread.frames[frame_idx].stack.pop()?, b'L');
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
@@ -5401,6 +5462,8 @@ fn execute_instruction(
         }
         Instruction::Areturn => {
             let v = thread.frames[frame_idx].stack.pop()?;
+            let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
+            let v = coerce_value_for_return(v, ret);
             let rv = Some(v);
             fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
             return Ok(InstructionResult::Return(rv));
@@ -5748,7 +5811,15 @@ fn execute_instruction(
                     };
                     Value::Double(dv)
                 }
-                _ => thread.frames[frame_idx].stack.pop()?,
+                _ => {
+                    let v = thread.frames[frame_idx].stack.pop()?;
+                    // Same jobject-as-Long contract as `astore` / `coerce_value_for_return`
+                    // in vm_exec: invoke returns can sit on the stack as compact long bits.
+                    match desc_byte {
+                        Some(d @ (b'L' | b'[')) => coerce_value_for_return(v, d),
+                        _ => v,
+                    }
+                }
             };
             let field_name = resolve_field_name(shared, current_class_id, *index);
             let obj_ref = pop_object_ref_ctx(
@@ -7532,6 +7603,10 @@ fn pop_static_field_value(
             };
             Ok(Value::Double(dv))
         }
+        Some(d @ (b'L' | b'[')) => {
+            let v = stack.pop()?;
+            Ok(coerce_value_for_return(v, d))
+        }
         _ => Ok(stack.pop()?),
     }
 }
@@ -7577,6 +7652,76 @@ fn push_invoke_return_value(
     }
 }
 
+/// JNI-style handles sometimes surface as `Value::Long` on the operand stack.
+/// When popping `invoke*` arguments, coerce reference-typed parameters (and
+/// the receiver) so downstream bytecode and natives see `Value::Object`.
+#[inline]
+fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
+    let b = param_desc.as_bytes().first().copied().unwrap_or(b'L');
+    match b {
+        b'L' | b'[' => coerce_value_for_return(v, b),
+        _ => v,
+    }
+}
+
+/// Pop `invokevirtual` / `invokespecial` / `invokeinterface` arguments from
+/// the operand stack (slow-path order) and apply `coerce_invoke_arg_for_descriptor`
+/// so cached fast paths match `execute_invoke`.
+fn pop_coerced_invoke_args_virtual(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    cp_index: u16,
+    frame_idx: usize,
+    thread: &mut JvmThread,
+) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
+    let (_class_name, _method_name, method_descriptor, num_params) =
+        resolve_method_ref(shared, caller_class_id, cp_index)?;
+    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    let mut tmp: Vec<Value> = Vec::with_capacity(num_params + 1);
+    for _ in 0..num_params {
+        tmp.push(thread.frames[frame_idx].stack.pop()?);
+    }
+    tmp.push(thread.frames[frame_idx].stack.pop()?);
+    tmp.reverse();
+    let mut args = Vec::with_capacity(num_params + 1);
+    args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", tmp[0]));
+    for i in 0..num_params {
+        let pd = param_descs
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("Ljava/lang/Object;");
+        args.push(coerce_invoke_arg_for_descriptor(pd, tmp[i + 1]));
+    }
+    Ok((args, method_descriptor))
+}
+
+/// Pop `invokestatic` arguments (no receiver) with the same JNI handle fix.
+fn pop_coerced_invoke_args_static(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    cp_index: u16,
+    frame_idx: usize,
+    thread: &mut JvmThread,
+) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
+    let (_class_name, _method_name, method_descriptor, num_params) =
+        resolve_method_ref(shared, caller_class_id, cp_index)?;
+    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    let mut tmp: Vec<Value> = Vec::with_capacity(num_params);
+    for _ in 0..num_params {
+        tmp.push(thread.frames[frame_idx].stack.pop()?);
+    }
+    tmp.reverse();
+    let mut args = Vec::with_capacity(num_params);
+    for (i, v) in tmp.into_iter().enumerate() {
+        let pd = param_descs
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("Ljava/lang/Object;");
+        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+    }
+    Ok((args, method_descriptor))
+}
+
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
 // ---------------------------------------------------------------------------
@@ -7595,12 +7740,22 @@ fn execute_invoke(
 
     let total_args = num_params + 1;
 
-    let mut args = Vec::with_capacity(total_args);
+    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    let mut tmp: Vec<Value> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        args.push(thread.frames[frame_idx].stack.pop()?);
+        tmp.push(thread.frames[frame_idx].stack.pop()?);
     }
-    args.push(thread.frames[frame_idx].stack.pop()?); // receiver
-    args.reverse();
+    tmp.push(thread.frames[frame_idx].stack.pop()?); // receiver
+    tmp.reverse();
+    let mut args = Vec::with_capacity(total_args);
+    args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", tmp[0]));
+    for i in 0..num_params {
+        let pd = param_descs
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("Ljava/lang/Object;");
+        args.push(coerce_invoke_arg_for_descriptor(pd, tmp[i + 1]));
+    }
 
     // Check for lambda proxy dispatch
     if !is_special {
@@ -7615,6 +7770,8 @@ fn execute_invoke(
                 &args[1..],
             )? {
                 if let Some(value) = result {
+                    let ret = crate::jit::return_type(&method_descriptor);
+                    let value = coerce_value_for_return(value, ret);
                     // T18.K4 — tag-exact push for J/D lambda return values.
                     push_invoke_return_value(
                         &mut thread.frames[frame_idx].stack,
@@ -7705,12 +7862,26 @@ fn execute_invoke(
                             std::ptr::read(obj_ref.as_ptr() as *const [u8; 16])
                         };
                         if header_bytes == [0u8; 16] {
-                            tracing::warn!(
-                                "Stale pointer detected in invokevirtual receiver \
-                                 (ptr={:p}, all-zero header) — falling back to CP class {}",
-                                obj_ref.as_ptr(),
-                                &*method_class_name,
-                            );
+                            // WildFly / JBoss Modules often hits this path on
+                            // `ClassLoader`-typed invokevirtual sites when a
+                            // receiver lost its header but CP resolution is
+                            // already `java/lang/ClassLoader`; the CP fallback
+                            // succeeds and a WARN was mostly noise.
+                            if method_class_name.as_ref() == "java/lang/ClassLoader" {
+                                tracing::debug!(
+                                    "Stale pointer detected in invokevirtual receiver \
+                                     (ptr={:p}, all-zero header) — falling back to CP class {}",
+                                    obj_ref.as_ptr(),
+                                    &*method_class_name,
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "Stale pointer detected in invokevirtual receiver \
+                                     (ptr={:p}, all-zero header) — falling back to CP class {}",
+                                    obj_ref.as_ptr(),
+                                    &*method_class_name,
+                                );
+                            }
                             method_class_name.clone()
                         } else {
                             // S111r8: cid=0 with non-zero header means a
@@ -7951,10 +8122,12 @@ fn execute_invoke(
                     }
                     _ => value, // Object return type — no unboxing
                 };
+                let ret = crate::jit::return_type(&method_descriptor);
+                let pushed = coerce_value_for_return(unboxed, ret);
                 // T18.K4 — tag-exact push for J/D proxy return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
-                    unboxed,
+                    pushed,
                 )?;
             }
             return Ok(CachedCallResult::Handled);
@@ -7998,31 +8171,28 @@ fn execute_invoke(
                     }
                     _ => value,
                 };
+                let ret = crate::jit::return_type(&method_descriptor);
+                let pushed = coerce_value_for_return(unboxed, ret);
                 // T18.K4 — tag-exact push for J/D annotation-proxy return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
-                    unboxed,
+                    pushed,
                 )?;
             }
             return Ok(CachedCallResult::Handled);
         }
     }
 
-    // Same rationale as `invoke_or_native`: Surefire's fork calls
-    // `ClassLoader.setDefaultAssertionStatus` before `assertionLock` is
-    // assigned; `try_stackless_invoke` would run JDK bytecode and NPE on
-    // `monitorenter`. Prefer the no-op Rust override registered on
-    // `java/lang/ClassLoader`.
-    if method_name.as_ref() == "setDefaultAssertionStatus" && method_descriptor.as_ref() == "(Z)V"
-    {
-        if let Some(callback) = shared.native_methods.find(
-            "java/lang/ClassLoader",
-            method_name.as_ref(),
-            method_descriptor.as_ref(),
-        ) {
-            let _ = crate::vm::safe_native_call(shared, thread, callback, &args)?;
-            return Ok(CachedCallResult::Handled);
-        }
+    if let Some(res) = intercept_force_registered_native(
+        shared,
+        thread,
+        frame_idx,
+        &invoke_class,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        &args,
+    ) {
+        return res;
     }
 
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
@@ -8063,6 +8233,12 @@ fn execute_invoke(
     )?;
 
     if let Some(value) = result {
+        let ret = crate::jit::return_type(&method_descriptor);
+        let value = if ret != b'V' {
+            coerce_value_for_return(value, ret)
+        } else {
+            value
+        };
         // T18.K4 — tag-exact push for J/D fallback invoke return values.
         push_invoke_return_value(
             &mut thread.frames[frame_idx].stack,
@@ -8894,6 +9070,94 @@ pub(crate) fn try_lambda_dispatch(
     }
 }
 
+/// Invoke a cached native callback with [`safe_native_call`] (pins jobject
+/// args / return values across safepoint GC) and push any result.
+#[inline]
+fn invoke_cached_native_callback(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: rustjvm_native_api::NativeCallback,
+    args: &[Value],
+    method_descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+    let result = crate::vm::safe_native_call(shared, thread, callback, args);
+    rustjvm_native_api::native_ring::record_exit(_ring_idx);
+    let result = result?;
+    if let Some(value) = result {
+        let ret = crate::jit::return_type(method_descriptor);
+        let value = if ret != b'V' {
+            coerce_value_for_return(value, ret)
+        } else {
+            value
+        };
+        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+        crate::vm::native_return_pushed_to_stack(shared, thread);
+    }
+    Ok(())
+}
+
+/// Registered Rust natives that must win over real-JDK bytecode on the same
+/// declaring class (inline-cache / vtable fast paths skip `execute_invoke`).
+#[inline]
+fn force_native_over_real_jdk_bytecode(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, method_descriptor),
+        ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            | ("java/net/URL", "getHost", "()Ljava/lang/String;")
+            | (
+                "java/net/URL",
+                "setURLStreamHandlerFactory",
+                "(Ljava/net/URLStreamHandlerFactory;)V"
+            )
+    ) || (class_name == "java/net/URL"
+        && matches!(method_name, "getAuthority" | "getHostAddress"))
+        || (matches!(
+            class_name,
+            "java/net/InetAddress" | "java/net/Inet4Address" | "java/net/Inet6Address"
+        ) && matches!(
+            method_name,
+            "getHostName" | "getCanonicalHostName" | "getHostAddress"
+        ))
+}
+
+/// Dispatch a force-native override via `safe_native_call`, pushing any return
+/// value onto the caller operand stack.
+#[inline]
+fn intercept_force_registered_native(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find(class_name, method_name, method_descriptor)?;
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
 /// Surefire's fork calls `ClassLoader.setDefaultAssertionStatus` before the JDK
 /// static `assertionLock` is assigned; the real bytecode does
 /// `synchronized (assertionLock)` and NPEs. Monomorphic inline caches and the
@@ -8968,7 +9232,7 @@ fn try_stackless_invoke(
     walk_native_hierarchy: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     use crate::runtime::frame::padded_bytecode;
-    use crate::vm::{coerce_value_for_return, safe_native_call};
+    use crate::vm::{coerce_value_for_return, native_return_pushed_to_stack, safe_native_call};
 
     // T15: Array types (`[LFoo;`, `[I`, etc.) inherit their method
     // dispatch from `java.lang.Object` (JVMS §4.4.1).  Treat any invoke
@@ -8991,25 +9255,18 @@ fn try_stackless_invoke(
     // with `expected int on stack, got ref(...)`.
     let ret_type = crate::jit::return_type(descriptor);
 
-    // `BuiltinClassLoader` / `AppClassLoader` may declare their own
-    // `setDefaultAssertionStatus` bytecode; `try_stackless_invoke`'s normal
-    // rule ("receiver bytecode wins, skip ancestor-native walk") would then
-    // run the JDK body and NPE on `synchronized (assertionLock)` during early
-    // Surefire fork. The Rust override on `java/lang/ClassLoader` is always
-    // the intended semantics here.
-    if method_name == "setDefaultAssertionStatus" && descriptor == "(Z)V" {
-        if let Some(callback) =
-            shared.native_methods.find("java/lang/ClassLoader", method_name, descriptor)
-        {
-            let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    coerce_value_for_return(value, ret_type),
-                )?;
-            }
-            return Ok(CachedCallResult::Handled);
-        }
+    // Registered natives that must beat real-JDK bytecode on the declaring
+    // class (URL.getHost DNS loop, ClassLoader assertion lock NPE, etc.).
+    if let Some(res) = intercept_force_registered_native(
+        shared,
+        thread,
+        frame_idx,
+        class_name,
+        method_name,
+        descriptor,
+        args,
+    ) {
+        return res;
     }
 
     // WP2.2 / Surefire: `try_stackless_invoke` does `native_methods.find(class_name, …)`
@@ -9033,6 +9290,7 @@ fn try_stackless_invoke(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
                 )?;
+                native_return_pushed_to_stack(shared, thread);
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -9049,6 +9307,7 @@ fn try_stackless_invoke(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
                 )?;
+                native_return_pushed_to_stack(shared, thread);
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -9115,6 +9374,21 @@ fn try_stackless_invoke(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
             )?;
+            native_return_pushed_to_stack(shared, thread);
+        }
+        if std::env::var_os("RUSTJVM_DBG_RESUME_PC").is_some() && method_name == "enhance" {
+            let f = &thread.frames[frame_idx];
+            let pc = f.pc;
+            let b = f.code.get(pc).copied().unwrap_or(0);
+            tracing::error!(
+                target: "rustjvm_vm::dbg_resume_pc",
+                "[RUSTJVM_DBG_RESUME_PC] after stackless native enhance: caller {}.{}\n\
+                 caller_pc={} next_bytecode=0x{:02x}",
+                f.class_name(),
+                f.method_name(),
+                pc,
+                b
+            );
         }
         return Ok(CachedCallResult::Handled);
     }
@@ -9166,6 +9440,7 @@ fn try_stackless_invoke(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
                 )?;
+                native_return_pushed_to_stack(shared, thread);
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -9202,6 +9477,7 @@ fn try_stackless_invoke(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
             )?;
+            native_return_pushed_to_stack(shared, thread);
         }
         return Ok(CachedCallResult::Handled);
     }
@@ -9415,11 +9691,20 @@ fn execute_invokestatic(
         ensure_class_initialized_shared(shared, thread, target_class_id)?;
     }
 
-    let mut args = Vec::with_capacity(num_params);
+    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    let mut tmp: Vec<Value> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        args.push(thread.frames[frame_idx].stack.pop()?);
+        tmp.push(thread.frames[frame_idx].stack.pop()?);
     }
-    args.reverse();
+    tmp.reverse();
+    let mut args = Vec::with_capacity(num_params);
+    for (i, v) in tmp.into_iter().enumerate() {
+        let pd = param_descs
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("Ljava/lang/Object;");
+        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+    }
 
     // Try stackless frame push for bytecode methods
     // For invokestatic, walk the native hierarchy to find inherited natives.
@@ -9447,6 +9732,12 @@ fn execute_invokestatic(
         &args,
     )?;
     if let Some(value) = result {
+        let ret = crate::jit::return_type(&method_descriptor);
+        let value = if ret != b'V' {
+            coerce_value_for_return(value, ret)
+        } else {
+            value
+        };
         // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
         push_invoke_return_value(
             &mut thread.frames[frame_idx].stack,
@@ -9633,26 +9924,24 @@ fn execute_invokestatic_cached(
     match target {
         CachedInvokeTarget::Native {
             callback,
-            num_params,
+            num_params: _,
             gate: _,
         } => {
-            let mut args = Vec::with_capacity(num_params as usize); // Widening: parameter count conversion
-            for _ in 0..num_params {
-                args.push(thread.frames[frame_idx].stack.pop()?);
-            }
-            args.reverse();
-            let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-            let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
-            let cb_result = callback(&mut ctx, &args);
-            rustjvm_native_api::native_ring::record_exit(_ring_idx);
-            let result = cb_result?;
-            if let Some(value) = result {
-                // T18.K4 — tag-exact push for J/D native invokestatic return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    value,
-                )?;
-            }
+            let (args, method_descriptor) = pop_coerced_invoke_args_static(
+                shared,
+                caller_class_id,
+                cp_index,
+                frame_idx,
+                thread,
+            )?;
+            invoke_cached_native_callback(
+                shared,
+                thread,
+                frame_idx,
+                callback,
+                &args,
+                &method_descriptor,
+            )?;
             Ok(CachedCallResult::Handled)
         }
         CachedInvokeTarget::Jit {
@@ -11971,18 +12260,14 @@ fn execute_invokevirtual_cached(
                         cached.method_descriptor.as_ref(),
                         obj_ref,
                     ) {
-                        let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                        let _ring_idx =
-                            rustjvm_native_api::native_ring::record_enter(callback as usize);
-                        let cb_result = callback(&mut ctx, args_slice);
-                        rustjvm_native_api::native_ring::record_exit(_ring_idx);
-                        let result = cb_result?;
-                        if let Some(value) = result {
-                            push_invoke_return_value(
-                                &mut thread.frames[frame_idx].stack,
-                                value,
-                            )?;
-                        }
+                        invoke_cached_native_callback(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            args_slice,
+                            cached.method_descriptor.as_ref(),
+                        )?;
                         return Ok(CachedCallResult::Handled);
                     }
 
@@ -11992,18 +12277,14 @@ fn execute_invokevirtual_cached(
                         cached.method_name.as_ref(),
                         cached.method_descriptor.as_ref(),
                     ) {
-                        let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                        let _ring_idx =
-                            rustjvm_native_api::native_ring::record_enter(callback as usize);
-                        let cb_result = callback(&mut ctx, args_slice);
-                        rustjvm_native_api::native_ring::record_exit(_ring_idx);
-                        let result = cb_result?;
-                        if let Some(value) = result {
-                            push_invoke_return_value(
-                                &mut thread.frames[frame_idx].stack,
-                                value,
-                            )?;
-                        }
+                        invoke_cached_native_callback(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            args_slice,
+                            cached.method_descriptor.as_ref(),
+                        )?;
                         return Ok(CachedCallResult::Handled);
                     }
 
@@ -12089,24 +12370,21 @@ fn execute_invokevirtual_cached(
                         }
                     }
 
-                    let total_args = num_params_usize + 1;
-                    let mut args = Vec::with_capacity(total_args);
-                    for _ in 0..total_args {
-                        args.push(thread.frames[frame_idx].stack.pop()?);
-                    }
-                    args.reverse();
-                    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                    let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
-                    let cb_result = callback(&mut ctx, &args);
-                    rustjvm_native_api::native_ring::record_exit(_ring_idx);
-                    let result = cb_result?;
-                    if let Some(value) = result {
-                        // T18.K4 — tag-exact push for J/D native virtual return values.
-                        push_invoke_return_value(
-                            &mut thread.frames[frame_idx].stack,
-                            value,
-                        )?;
-                    }
+                    let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
+                        shared,
+                        caller_class_id,
+                        cp_index,
+                        frame_idx,
+                        thread,
+                    )?;
+                    invoke_cached_native_callback(
+                        shared,
+                        thread,
+                        frame_idx,
+                        callback,
+                        &args,
+                        &method_descriptor,
+                    )?;
                     Ok(CachedCallResult::Handled)
                 }
                 Value::Object(None) => {
@@ -12178,24 +12456,21 @@ fn execute_invokevirtual_cached(
             num_params,
             gate: _,
         } => {
-            let total_args = num_params as usize + 1; // Widening: parameter count conversion
-            let mut args = Vec::with_capacity(total_args);
-            for _ in 0..total_args {
-                args.push(thread.frames[frame_idx].stack.pop()?);
-            }
-            args.reverse();
-            let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-            let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
-            let cb_result = callback(&mut ctx, &args);
-            rustjvm_native_api::native_ring::record_exit(_ring_idx);
-            let result = cb_result?;
-            if let Some(value) = result {
-                // T18.K4 — tag-exact push for J/D native virtual fallback return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    value,
-                )?;
-            }
+            let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
+                shared,
+                caller_class_id,
+                cp_index,
+                frame_idx,
+                thread,
+            )?;
+            invoke_cached_native_callback(
+                shared,
+                thread,
+                frame_idx,
+                callback,
+                &args,
+                &method_descriptor,
+            )?;
             Ok(CachedCallResult::Handled)
         }
         // JIT entries don't apply to virtual dispatch
@@ -12421,7 +12696,11 @@ fn populate_virtual_invoke_cache(
             .get(declaring_id)
             .map(|c| &*c.name)
             .unwrap_or("");
-        let force = matches!(
+        let force = force_native_over_real_jdk_bytecode(
+            declaring_name,
+            &method_name,
+            &descriptor,
+        ) || (matches!(
             declaring_name,
             "java/util/HashMap"
             | "java/util/LinkedHashMap"
@@ -12440,7 +12719,7 @@ fn populate_virtual_invoke_cache(
             | "containsKey" | "containsValue"
             | "size" | "isEmpty" | "clear"
             | "<init>"
-        );
+        ));
         if force {
             if let Some(callback) =
                 shared
@@ -12720,19 +12999,26 @@ fn branch_target(saved_pc: usize, offset: i16) -> usize {
 /// Exposed as `pub` for testing from vm.rs.
 pub fn test_refs_equal(a: &Value, b: &Value) -> bool { refs_equal(a, b) }
 
+#[inline]
+fn value_as_object_ptr(v: &Value) -> Option<*mut u8> {
+    match v {
+        Value::Object(Some(o)) => Some(o.as_ptr()),
+        Value::Long(bits) => crate::types::jlong_bits_as_aligned_object_ptr(*bits as u64)
+            .map(|p| p as *mut u8),
+        _ => None,
+    }
+}
+
 fn refs_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        // Both null references — equal per JVM spec §6.5 if_acmpeq
-        (Value::Object(None), Value::Object(None)) => true,
-        // Both non-null — identity comparison (same heap pointer)
-        (Value::Object(Some(a)), Value::Object(Some(b))) => a.as_ptr() == b.as_ptr(),
-        // One null, one non-null — explicitly not equal
-        (Value::Object(None), Value::Object(Some(_)))
-        | (Value::Object(Some(_)), Value::Object(None)) => false,
-        // Legacy: autoboxed integer identity (e.g., Integer cache -128..127)
-        (Value::Int(a), Value::Int(b)) => a == b,
-        // Int(0) can represent null in some internal autoboxed contexts
-        (Value::Int(0), Value::Object(None)) | (Value::Object(None), Value::Int(0)) => true,
+    match (value_as_object_ptr(a), value_as_object_ptr(b)) {
+        (Some(pa), Some(pb)) => pa == pb,
+        (None, None) => match (a, b) {
+            (Value::Object(None), Value::Object(None)) => true,
+            (Value::Int(va), Value::Int(vb)) => va == vb,
+            (Value::Int(0), Value::Object(None)) | (Value::Object(None), Value::Int(0)) => true,
+            (Value::Long(0), Value::Object(None)) | (Value::Object(None), Value::Long(0)) => true,
+            _ => false,
+        },
         _ => false,
     }
 }

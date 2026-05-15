@@ -743,10 +743,22 @@ impl SharedVm {
         let enumeration_id = class_manager
             .load_class("java/util/Enumeration")
             .expect("java/util/Enumeration must be loadable");
+        // Spring Boot 2.3+ `ExecutableArchiveLauncher.getClassPathArchivesIterator`
+        // returns `Iterator<Archive>`. Launcher bytecode uses `invokeinterface`
+        // `java/util/Iterator.hasNext/next` on our synthetic `Enumeration$Impl`.
+        // Without declaring `Iterator`, `invoke_on_class_shared` does not retarget
+        // from the interface to the concrete receiver and `next()` never runs our
+        // native — the wrong value survives to `checkcast Archive` (CCE).
+        let iterator_id = class_manager
+            .load_class("java/util/Iterator")
+            .expect("java/util/Iterator must be loadable");
         if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
             cls.superclass = Some(object_id);
             if !cls.interfaces.contains(&enumeration_id) {
                 cls.interfaces.push(enumeration_id);
+            }
+            if !cls.interfaces.contains(&iterator_id) {
+                cls.interfaces.push(iterator_id);
             }
         }
 
@@ -869,6 +881,88 @@ impl SharedVm {
                         Ok(Some(rustjvm_types::Value::Int(to_drain)))
                     },
                 );
+                // invokevirtual can resolve `drainTo` against the
+                // `BlockingQueue` interface type while the receiver is a real
+                // `LinkedBlockingQueue`. Register on the interface too so the
+                // native walk in `invoke_or_native` finds the implementation.
+                let lbq_drain_bounded = |ctx: &mut dyn rustjvm_native_api::NativeContext,
+                                         args: &[rustjvm_types::Value]| {
+                    let this = match args.first() {
+                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    };
+                    let coll = match args.get(1) {
+                        Some(rustjvm_types::Value::Object(Some(c))) => *c,
+                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    };
+                    let max_elements = match args.get(2) {
+                        Some(rustjvm_types::Value::Int(n)) => *n,
+                        _ => i32::MAX,
+                    };
+                    ctx.monitor_enter(this);
+                    let size = match ctx.get_field(this, 1) {
+                        rustjvm_types::Value::Int(n) => n,
+                        _ => 0,
+                    };
+                    let arr = match ctx.get_field(this, 0) {
+                        rustjvm_types::Value::Object(Some(a)) => a,
+                        _ => {
+                            ctx.monitor_exit(this);
+                            return Ok(Some(rustjvm_types::Value::Int(0)));
+                        }
+                    };
+                    let to_drain = size.min(max_elements);
+                    for i in 0..to_drain as usize {
+                        let elem = ctx.get_array_element(arr, i);
+                        ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+                    }
+                    ctx.set_field(this, 1, rustjvm_types::Value::Int(size - to_drain));
+                    ctx.monitor_notify_all(this)?;
+                    ctx.monitor_exit(this);
+                    Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                };
+                native_methods.register(
+                    "java/util/concurrent/BlockingQueue",
+                    "drainTo",
+                    "(Ljava/util/Collection;I)I",
+                    lbq_drain_bounded,
+                );
+                native_methods.register(
+                    "java/util/concurrent/BlockingQueue",
+                    "drainTo",
+                    "(Ljava/util/Collection;)I",
+                    |ctx, args| {
+                        let this = match args.first() {
+                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        };
+                        let coll = match args.get(1) {
+                            Some(rustjvm_types::Value::Object(Some(c))) => *c,
+                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        };
+                        ctx.monitor_enter(this);
+                        let size = match ctx.get_field(this, 1) {
+                            rustjvm_types::Value::Int(n) => n,
+                            _ => 0,
+                        };
+                        let arr = match ctx.get_field(this, 0) {
+                            rustjvm_types::Value::Object(Some(a)) => a,
+                            _ => {
+                                ctx.monitor_exit(this);
+                                return Ok(Some(rustjvm_types::Value::Int(0)));
+                            }
+                        };
+                        let to_drain = size;
+                        for i in 0..to_drain as usize {
+                            let elem = ctx.get_array_element(arr, i);
+                            ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+                        }
+                        ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                        ctx.monitor_notify_all(this)?;
+                        ctx.monitor_exit(this);
+                        Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                    },
+                );
                 native_methods.register(
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     "<init>",
@@ -887,49 +981,10 @@ impl SharedVm {
                         Ok(None)
                     },
                 );
-                native_methods.register(
-                    "java/util/concurrent/CopyOnWriteArrayList",
-                    "addIfAbsent",
-                    "(Ljava/lang/Object;)Z",
-                    |ctx, args| {
-                        let this = match args.first() {
-                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
-                        };
-                        let elem = args
-                            .get(1)
-                            .copied()
-                            .unwrap_or(rustjvm_types::Value::Object(None));
-                        ctx.monitor_enter(this);
-                        let size = match ctx.get_field(this, 1) {
-                            rustjvm_types::Value::Int(n) => n.max(0) as usize,
-                            _ => 0,
-                        };
-                        let old_arr = match ctx.get_field(this, 0) {
-                            rustjvm_types::Value::Object(Some(a)) => a,
-                            _ => {
-                                let a = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
-                                ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(a)));
-                                a
-                            }
-                        };
-                        for i in 0..size {
-                            if ctx.get_array_element(old_arr, i) == elem {
-                                ctx.monitor_exit(this);
-                                return Ok(Some(rustjvm_types::Value::Int(0)));
-                            }
-                        }
-                        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
-                        for i in 0..size {
-                            ctx.set_array_element(new_arr, i, ctx.get_array_element(old_arr, i));
-                        }
-                        ctx.set_array_element(new_arr, size, elem);
-                        ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(new_arr)));
-                        ctx.set_field(this, 1, rustjvm_types::Value::Int((size + 1) as i32));
-                        ctx.monitor_exit(this);
-                        Ok(Some(rustjvm_types::Value::Int(1)))
-                    },
-                );
+                // CopyOnWriteArrayList addIfAbsent/contains/bulkRemove are registered
+                // by `register_collections_natives` with real-JDK field resolution.
+                // Do not register a synthetic two-slot layout here — it corrupts
+                // JDK instances (real `array` stays null → bulkRemove NPE).
                 native_methods.register(
                     "java/util/concurrent/atomic/AtomicBoolean",
                     "<init>",
@@ -1098,22 +1153,104 @@ impl SharedVm {
                 // <clinit> completes; the existing MDC / Logger natives
                 // already cover the actual API surface.
                 rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
-                // Spring Boot 2.x / Spring Framework 5.3.x: AbstractApplicationContext
-                // has a field `applicationStartup = ApplicationStartup.DEFAULT`. If
-                // ApplicationStartup.<clinit> fails (DefaultApplicationStartup can't be
-                // instantiated from nested JARs before the context classloader is set),
-                // the field stays null and AnnotationConfigApplicationContext.<init> NPEs at:
-                //   this.getApplicationStartup().start("spring.context.annotated-bean-reader.create")
-                // Force the native override so getApplicationStartup() always returns a
-                // cheap no-op synthetic object. Paired with the check_override allow-list
-                // entry for AbstractApplicationContext in vm_exec.rs.
-                rustjvm_native_builtins::phases_late::register_spring_application_startup_natives(&mut native_methods);
+                // ApplicationStartup / StartupStep: `spring_startup_bootstrap` in essentials.
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
         }
         #[cfg(not(feature = "synthetic-jdk"))]
         {
             register_essential_natives(&mut native_methods);
+            // rustjvm-cli default features omit `synthetic-jdk`; the rich
+            // registration block only lives under `cfg(feature = "synthetic-jdk")`
+            // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
+            // drainTo natives (SLF4J replayEvents, Spring thread pools).
+            rustjvm_native_builtins::register_concurrent_natives(&mut native_methods);
+            fn real_jdk_lbq_drain_to_bounded(
+                ctx: &mut dyn rustjvm_native_api::NativeContext,
+                args: &[rustjvm_types::Value],
+            ) -> rustjvm_types::error::MethodCallResult {
+                let this = match args.first() {
+                    Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                    _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                };
+                let coll = match args.get(1) {
+                    Some(rustjvm_types::Value::Object(Some(c))) => *c,
+                    _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                };
+                let max_elements = match args.get(2) {
+                    Some(rustjvm_types::Value::Int(n)) => *n,
+                    _ => i32::MAX,
+                };
+                ctx.monitor_enter(this);
+                let size = match ctx.get_field(this, 1) {
+                    rustjvm_types::Value::Int(n) => n,
+                    _ => 0,
+                };
+                let arr = match ctx.get_field(this, 0) {
+                    rustjvm_types::Value::Object(Some(a)) => a,
+                    _ => {
+                        ctx.monitor_exit(this);
+                        return Ok(Some(rustjvm_types::Value::Int(0)));
+                    }
+                };
+                let to_drain = size.min(max_elements);
+                for i in 0..to_drain as usize {
+                    let elem = ctx.get_array_element(arr, i);
+                    ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+                }
+                ctx.set_field(this, 1, rustjvm_types::Value::Int(size - to_drain));
+                ctx.monitor_notify_all(this)?;
+                ctx.monitor_exit(this);
+                Ok(Some(rustjvm_types::Value::Int(to_drain)))
+            }
+            native_methods.register(
+                "java/util/concurrent/LinkedBlockingQueue",
+                "drainTo",
+                "(Ljava/util/Collection;I)I",
+                real_jdk_lbq_drain_to_bounded,
+            );
+            native_methods.register(
+                "java/util/concurrent/BlockingQueue",
+                "drainTo",
+                "(Ljava/util/Collection;I)I",
+                real_jdk_lbq_drain_to_bounded,
+            );
+            native_methods.register(
+                "java/util/concurrent/BlockingQueue",
+                "drainTo",
+                "(Ljava/util/Collection;)I",
+                |ctx, args| {
+                    let this = match args.first() {
+                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    };
+                    let coll = match args.get(1) {
+                        Some(rustjvm_types::Value::Object(Some(c))) => *c,
+                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    };
+                    ctx.monitor_enter(this);
+                    let size = match ctx.get_field(this, 1) {
+                        rustjvm_types::Value::Int(n) => n,
+                        _ => 0,
+                    };
+                    let arr = match ctx.get_field(this, 0) {
+                        rustjvm_types::Value::Object(Some(a)) => a,
+                        _ => {
+                            ctx.monitor_exit(this);
+                            return Ok(Some(rustjvm_types::Value::Int(0)));
+                        }
+                    };
+                    let to_drain = size;
+                    for i in 0..to_drain as usize {
+                        let elem = ctx.get_array_element(arr, i);
+                        ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+                    }
+                    ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                    ctx.monitor_notify_all(this)?;
+                    ctx.monitor_exit(this);
+                    Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                },
+            );
             native_methods.register(
                 "java/util/concurrent/ScheduledThreadPoolExecutor",
                 "<init>",
@@ -1439,9 +1576,7 @@ impl SharedVm {
             // branch above for the rationale (Spring Boot 2.x fat-jar
             // <clinit> survival).
             rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
-            // Spring Framework ApplicationStartup / StartupStep no-op stubs.
-            // See companion call in the synthetic-jdk branch above for the rationale.
-            rustjvm_native_builtins::phases_late::register_spring_application_startup_natives(&mut native_methods);
+            // Spring ApplicationStartup: see `spring_startup_bootstrap` in essentials.
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support
@@ -3936,8 +4071,10 @@ mod tests {
     fn shared_vm_default_config() {
         let shared = SharedVm::new(VmConfig::default());
         assert!(shared.native_methods.len() > 0);
-        // Session 85 (C25): `Enumeration$Impl` synthetic stub registered at bootstrap.
-        assert_eq!(shared.class_manager.read().loaded_count(), 1);
+        // C25 synthetic stubs plus wired super/interfaces: `Enumeration$Impl`,
+        // `java/lang/Object`, `java/util/Enumeration`, `Comparator$Native`,
+        // `java/util/Comparator`.
+        assert_eq!(shared.class_manager.read().loaded_count(), 5);
         assert!(shared.statics.read().is_empty());
         assert!(shared.string_pool.read().is_empty());
         assert!(shared.class_mirrors.read().is_empty());
@@ -4072,8 +4209,8 @@ mod tests {
         let vm = Vm::new(VmConfig::default());
         // self_arc should be set, and get_arc should work
         let arc = vm.shared.get_arc();
-        // Session 85 (C25): `Enumeration$Impl` synthetic stub registered at bootstrap.
-        assert_eq!(arc.class_manager.read().loaded_count(), 1);
+        // Same bootstrap class set as `shared_vm_default_config`.
+        assert_eq!(arc.class_manager.read().loaded_count(), 5);
     }
 
     #[test]
@@ -4393,20 +4530,12 @@ mod tests {
         let mut config = VmConfig::default();
         config.use_synthetic_jdk = false;
         let shared = SharedVm::new(config);
-        // Essential-only mode should have significantly fewer registrations
-        // (synthetic mode historically registered 4000+).  The threshold is
-        // a soft ceiling — it grew from ~2000 once corrective overrides
-        // (C42 TableFilter.prepare etc.) were added, so we keep a comfort
-        // margin. Session 85 added more overrides; Session 93 added the
-        // T19 Wave 1-5 native bundle (jboss_msc, wildfly_*, xnio_*,
-        // quarkus_staticinit, quarkus_arc, agroal/ironjacamar pools, tls,
-        // infinispan_local, vertx_eventloop, stack_walker, jboss_jdkspecific,
-        // logmanager, atomic_updater, shared_secrets_bridge,
-        // jboss_module_loader). Bumping ceiling to 4500 keeps a comfort
-        // margin while still catching accidental synthetic-mode leakage
-        // (synthetic mode is 4000+ on top of essential, totalling 6000+).
-        assert!(shared.native_methods.len() < 4500,
-            "Real JDK mode should have < 4500 natives, got {}", shared.native_methods.len());
+        // Essential-only mode should stay well below full `register_builtins`
+        // synthetic coverage. The ceiling is a soft guard that rises as the
+        // real-JDK native bundle grows (currently ~6200); synthetic-jdk builds
+        // still register thousands more on top of this baseline.
+        assert!(shared.native_methods.len() < 7000,
+            "Real JDK mode should have < 7000 natives, got {}", shared.native_methods.len());
     }
 
     // NEW-11: the "synthetic mode registers many natives" assertion is

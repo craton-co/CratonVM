@@ -1,0 +1,9 @@
+﻿2026-05-13T22:03:29.854382Z  WARN rustjvm_vm::runtime::diagnostics: B6: silent-swallow тАФ error suppressed to keep VM running site=<clinit> category=non-critical-exception detail=class=org/jboss/modules/Module exc=java/lang/NullPointerException
+2026-05-13T22:03:29.854422Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 0] at org/jboss/modules/Main.main (Main.java:337) bci=1219
+2026-05-13T22:03:29.854427Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 1] at org/jboss/modules/Module.<clinit> (Module.java:77) bci=22
+2026-05-13T22:03:29.854438Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPaths backfilled with empty String[]
+2026-05-13T22:03:29.854442Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPackages backfilled with empty String[]
+2026-05-13T22:03:29.854458Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
+2026-05-13T22:03:30.229019Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/Module.addUses(Ljava/lang/Class;)Ljava/lang/Module;"
+Error in thread "main" linkage error: no such method: java/lang/Module.addUses(Ljava/lang/Class;)Ljava/lang/Module;
+

@@ -29,7 +29,7 @@ use crate::native::registry::{
     FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
-use crate::types::{ObjectRef, Value};
+use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
 
 use super::{SharedVm};
 use crate::classloading::ClassStore;
@@ -77,6 +77,19 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
         },
         b'L' | b'[' => match value {
             Value::Int(0) | Value::Long(0) => Value::Object(None),
+            // JNI and a few internal bridges surface jobject handles as raw
+            // i64 / jlong in `Value::Long`.  If we keep that shape through
+            // `push_invoke_return_value`, the slot is stored as VTAG_LONG,
+            // GC never traces it, and the next `astore`/`aload` sequence can
+            // use a collected `java.lang.Class` — Letsgo AV after
+            // `ConfigurationClassEnhancer.enhance` returns.
+            Value::Long(v) => {
+                if let Some(p) = jlong_bits_as_aligned_object_ptr(v as u64) {
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) }))
+                } else {
+                    Value::Object(None)
+                }
+            }
             other => other,
         },
         _ => value,
@@ -198,6 +211,27 @@ pub fn unbox_poly_return(
 // Safe native callback invocation
 // ---------------------------------------------------------------------------
 
+/// Extract a heap [`ObjectRef`] from a [`Value`] that may carry a JNI
+/// `jobject` as `Value::Long` (aligned pointer bits).
+#[inline]
+pub fn value_as_object_ref(v: Value) -> Option<ObjectRef> {
+    match v {
+        Value::Object(Some(o)) => Some(o),
+        Value::Long(bits) => jlong_bits_as_aligned_object_ptr(bits as u64)
+            .map(|p| unsafe { ObjectRef::from_raw(p as *mut u8) }),
+        _ => None,
+    }
+}
+
+/// Pin a value that may encode a jobject as `Value::Long` for the duration
+/// of a native call (see `safe_native_call`).
+#[inline]
+fn pin_value_for_native_call(roots: &mut Vec<ObjectRef>, v: &Value) {
+    if let Some(o) = value_as_object_ref(*v) {
+        roots.push(o);
+    }
+}
+
 /// Call a native callback, catching panics and converting them to
 /// `MethodCallFailed` so that a bug in a native method doesn't crash the VM.
 pub fn safe_native_call(
@@ -206,29 +240,37 @@ pub fn safe_native_call(
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
-    let mut ctx = NativeContextImpl { shared, thread };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        callback(&mut ctx, args)
-    }));
-    match result {
+    // Pin object arguments for the duration of the native: they have been
+    // popped from the operand stack into this Rust slice and are otherwise
+    // invisible to `collect_roots` / frame scanning during a safepoint GC.
+    let pin_base = thread.native_pin_roots.len();
+    for a in args {
+        pin_value_for_native_call(&mut thread.native_pin_roots, a);
+    }
+
+    let result = {
+        let mut ctx = NativeContextImpl { shared, thread };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(&mut ctx, args)
+        }))
+    };
+
+    let out: MethodCallResult = match result {
         Ok(method_result) => {
-            // Check for JNI pending exceptions set via Throw/ThrowNew.
-            // Per JNI spec, native code can set a pending exception which the
-            // VM must check on return from the native method.
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
+                thread.native_pin_roots.truncate(pin_base);
+                thread.native_pending_return = None;
                 if exc_handle == u64::MAX {
-                    // ThrowNew sentinel вЂ” create a generic RuntimeException
                     return Err(
                         crate::runtime::exceptions::throw_runtime_error(
                             shared,
-                            ctx.thread,
+                            thread,
                             RuntimeError::IllegalStateException {
                                 message: "JNI ThrowNew pending exception".to_string(),
                             },
                         ),
                     );
                 }
-                // Throw() was called with an object handle вЂ” convert to ObjectRef
                 let ptr = exc_handle as *mut u8;
                 if !ptr.is_null() && (ptr as usize) % 8 == 0 {
                     let exc_ref = unsafe { crate::types::ObjectRef::from_raw(ptr) };
@@ -238,7 +280,8 @@ pub fn safe_native_call(
             method_result
         }
         Err(payload) => {
-            // Clear any JNI pending exception on panic path
+            thread.native_pin_roots.truncate(pin_base);
+            thread.native_pending_return = None;
             let _ = crate::native::jni::take_jni_pending_exception();
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
                 s.clone()
@@ -247,34 +290,13 @@ pub fn safe_native_call(
             } else {
                 "unknown native method panic".to_string()
             };
-            // T14: demote to debug for well-known bootstrap-path panics
-            // (unaligned pointer reads via Unsafe during initPhase1). The
-            // outer initPhase1 handler logs a user-facing warning once.
-            //
-            // Keycloak Round 71: only demote during the actual bootstrap
-            // window (init_level < 4). Once `main()` is executing
-            // (level 4), an unaligned/null pointer panic represents a
-            // real bug — silently swallowing it produces the
-            // "Keycloak exits in 5s with no output" failure mode.
-            // Surface those at WARN so the CLI bail!() path renders
-            // the InternalError instead of returning a silent Ok.
             let in_bootstrap = shared.get_init_level() < 4;
             if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
-                // Bootstrap-path native panic: demoted to debug because these
-                // are well-understood during initPhase1. Still bump the
-                // swallow counter so the CLI can surface a summary when
-                // main() exits silently. Strict mode escalates to panic.
                 shared
                     .swallow_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!("Native method panic (bootstrap): {}", msg);
                 if std::env::var("RUSTJVM_STRICT_SWALLOWS").ok().as_deref() == Some("1") {
-                    // Strict mode: the user opted into a hard abort when a
-                    // bootstrap-path native swallow occurs. Use `process::abort`
-                    // rather than a Rust panic so we bypass any surrounding
-                    // `catch_unwind` (which would otherwise re-swallow this
-                    // very signal) and produce an immediate, non-unwinding
-                    // failure the CLI cannot mask.
                     tracing::error!(
                         "RUSTJVM_STRICT_SWALLOWS=1: safe_native_call bootstrap panic: {}",
                         msg,
@@ -282,14 +304,35 @@ pub fn safe_native_call(
                     std::process::abort();
                 }
             } else {
-                let top = ctx.thread.frames.last().map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor())).unwrap_or_default();
+                let top = thread.frames.last().map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor())).unwrap_or_default();
                 tracing::error!("Native method panic caught: {} (native invoked from {})", msg, top);
             }
             Err(MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("native method panic: {msg}"),
             }))
         }
+    };
+
+    thread.native_pin_roots.truncate(pin_base);
+    thread.native_pending_return = None;
+    if let Ok(Some(v)) = &out {
+        if let Some(o) = value_as_object_ref(*v) {
+            thread.native_pending_return = Some(o);
+        }
     }
+    if thread.native_pending_return.is_some() {
+        crate::runtime::interpreter::update_root_snapshot(shared, thread);
+    }
+
+    out
+}
+
+/// Clear [`JvmThread::native_pending_return`] after its object has been pushed
+/// onto the caller operand stack (stackless native invoke path).
+#[inline]
+pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) {
+    thread.native_pending_return = None;
+    crate::runtime::interpreter::update_root_snapshot(shared, thread);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +542,11 @@ impl<'a> NativeContextImpl<'a> {
         snapshot.clear();
         for frame in &self.thread.frames {
             frame.scan_local_objects(&mut snapshot);
-            frame.stack.scan_object_refs(&mut snapshot);
+            frame.stack.scan_object_refs(&mut snapshot, &self.shared.heap);
+        }
+        snapshot.extend(self.thread.native_pin_roots.iter().copied());
+        if let Some(r) = self.thread.native_pending_return {
+            snapshot.push(r);
         }
     }
 
@@ -527,6 +574,18 @@ impl<'a> NativeContextImpl<'a> {
                     update_value_ref(val, &pointer_map);
                 }
                 if let Some(ref mut obj_ref) = self.thread.java_thread_obj {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
+                }
+                for obj_ref in &mut self.thread.native_pin_roots {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
+                }
+                if let Some(ref mut obj_ref) = self.thread.native_pending_return {
                     let old_addr = obj_ref.as_ptr() as usize;
                     if let Some(&new_addr) = pointer_map.get(&old_addr) {
                         *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -794,6 +853,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
         self.shared.heap.class_id_of(obj)
+    }
+
+    fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
+        match self.shared.load_class_concurrent(class_name) {
+            Ok(class_id) => self
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .is_some_and(|c| c.is_synthetic_stub),
+            Err(_) => false,
+        }
     }
 
     fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
@@ -2817,19 +2888,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Call JNI_OnLoad(JavaVM*, void*) if exported by the library.
         // This allows the library to register its native methods via RegisterNatives.
         // Safety: JNI_OnLoad has a fixed, well-known signature.
+        //
+        // Windows: Apache `tcnative-*.dll` and Netty `*tcnative*.dll` often fault
+        // inside `JNI_OnLoad` / `RegisterNatives` when paired with RustJVM. We keep
+        // the DLL loaded (classpath / Tomcat may probe for its presence) but skip
+        // `JNI_OnLoad` — Java entry points are satisfied via Rust stubs and
+        // `find_jni_native` / `resolve_jni_native_in_libraries` blocks for
+        // `org/apache/tomcat/jni/**` and `io/netty/internal/tcnative/**`.
+        let basename_lc = std::path::Path::new(resolved.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        #[cfg(windows)]
+        let skip_jni_onload_tcnative = basename_lc.contains("tcnative");
+        #[cfg(not(windows))]
+        let skip_jni_onload_tcnative = false;
+
         unsafe {
             type JniOnLoad = extern "C" fn(
                 crate::native::jni::JavaVM,
                 *mut std::ffi::c_void,
             ) -> crate::native::jni::JInt;
-            if let Ok(sym) = lib.get::<JniOnLoad>(b"JNI_OnLoad\0") {
-                // Set TLS context so RegisterNatives (called from JNI_OnLoad) can
-                // resolve class names via the class manager.
-                crate::native::jni::set_jni_context(self.shared);
-                crate::native::jni::set_jni_thread(self.thread);
-                let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
-                crate::native::jni::clear_jni_context();
-                crate::native::jni::clear_jni_thread();
+            if !skip_jni_onload_tcnative {
+                if let Ok(sym) = lib.get::<JniOnLoad>(b"JNI_OnLoad\0") {
+                    // Set TLS context so RegisterNatives (called from JNI_OnLoad) can
+                    // resolve class names via the class manager.
+                    crate::native::jni::set_jni_context(self.shared);
+                    crate::native::jni::set_jni_thread(self.thread);
+                    let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
+                    crate::native::jni::clear_jni_context();
+                    crate::native::jni::clear_jni_thread();
+                }
             }
         }
 
@@ -3618,6 +3708,7 @@ pub fn invoke_or_native(
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
+        return Ok(None);
     }
 
     // peaceful-sammet — primitive-return functional-interface bridge.
@@ -5827,6 +5918,28 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // Insurance / Spring Boot 3: real-JDK `URL.getHost` resolves
+                        // the host through `InetAddress.getByName` /
+                        // `getHostName`, which re-enters `Class.initClassName` in a
+                        // tight loop during early boot (T19.H1 watchdog). Our natives
+                        // read the parsed `host` field / InetAddress slots directly.
+                        || (class_name == "java/net/URL"
+                            && matches!(
+                                method_name,
+                                "getHost" | "getAuthority" | "getHostAddress"
+                            ))
+                        || (class_name == "java/net/URL"
+                            && method_name == "setURLStreamHandlerFactory"
+                            && descriptor == "(Ljava/net/URLStreamHandlerFactory;)V")
+                        || (matches!(
+                            class_name,
+                            "java/net/InetAddress"
+                                | "java/net/Inet4Address"
+                                | "java/net/Inet6Address"
+                        ) && matches!(
+                            method_name,
+                            "getHostName" | "getCanonicalHostName" | "getHostAddress"
+                        ))
                         // SB3 (URLClassPath): the real-JDK bytecode for
                         // `URLClassPath.<init>([Ljava/net/URL;...)V` writes
                         // the `loaders`/`lmap`/`closed` instance fields in
@@ -6291,6 +6404,24 @@ fn invoke_on_class_shared_inner(
                         // central directory.
                         || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
                             && method_name == "getClassPathUrls")
+                        // Spring Boot 3.2+ `launch.ExecutableArchiveLauncher.createClassLoader`
+                        // — same ClassCastException / typed-`toArray` hazard as SB2's iterator
+                        // path; force the native that rebuilds `URL[]` and invokespecials
+                        // `launch.Launcher.createClassLoader(URL[])`.
+                        || (matches!(
+                            class_name,
+                            "org/springframework/boot/loader/launch/ExecutableArchiveLauncher"
+                                | "org/springframework/boot/loader/launch/JarLauncher"
+                                | "org/springframework/boot/loader/launch/WarLauncher"
+                        ) && method_name == "createClassLoader"
+                            && descriptor == "(Ljava/util/Collection;)Ljava/lang/ClassLoader;")
+                        // Spring Boot 3 `SpringApplicationShutdownHook` static
+                        // `closedContexts = Collections.newSetFromMap(new WeakHashMap<>())`.
+                        // Real-JDK `newSetFromMap` + weak backing can NPE under partial boot;
+                        // essentials registers a bridge that returns an empty mutable `HashSet`.
+                        || (class_name == "java/util/Collections"
+                            && method_name == "newSetFromMap"
+                            && descriptor == "(Ljava/util/Map;)Ljava/util/Set;")
                         // Spring Boot 2 fat-jar launcher (no `.launch.`
                         // subpackage): override the methods that read the
                         // launcher's null `archive` field. The natives
@@ -6576,6 +6707,29 @@ fn invoke_on_class_shared_inner(
                                 | "org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext"
                             )
                             && method_name == "getApplicationStartup")
+                        // Spring `obtainFreshBeanFactory` calls `getBeanFactory()` on the
+                        // concrete context class. The bytecode is a trivial `getfield`
+                        // so `check_override` is normally false and our native in
+                        // `spring_startup_bootstrap` never runs — leaving a
+                        // `DefaultListableBeanFactory` whose `beanPostProcessors` list
+                        // stayed null when `<init>` field-initializer bytecode was
+                        // skipped or mis-slotted. Force the native so we can inject
+                        // a real `BeanPostProcessorCacheAwareList` before `prepareBeanFactory`.
+                        || (matches!(
+                                class_name,
+                                "org/springframework/context/support/GenericApplicationContext"
+                                | "org/springframework/context/annotation/AnnotationConfigApplicationContext"
+                                | "org/springframework/web/context/support/GenericWebApplicationContext"
+                                | "org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext"
+                                | "org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext"
+                                | "org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext"
+                            )
+                            && method_name == "getBeanFactory"
+                            && matches!(
+                                descriptor,
+                                "()Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;"
+                                    | "()Lorg/springframework/beans/factory/support/DefaultListableBeanFactory;"
+                            ))
                         // Spring Framework StartupStep methods — ApplicationStartup.start(String)
                         // and StartupStep.tag/end. The real bytecode requires DefaultApplicationStartup
                         // which may not be loadable from nested JARs.
@@ -6722,6 +6876,24 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/nio/charset/Charset"
                             && method_name == "availableCharsets"
                             && descriptor == "()Ljava/util/SortedMap;")
+                        // SLF4J replay: force `LinkedBlockingQueue.clear` native over JDK
+                        // bytecode so the synthetic field slots used by `drainTo` stay consistent.
+                        || (class_name == "java/util/concurrent/LinkedBlockingQueue"
+                            && method_name == "clear"
+                            && descriptor == "()V")
+                        // Logback / Spring: `new SimpleDateFormat(pattern)` on real-JDK
+                        // `java.text` classes can hit NSME during early bootstrap.
+                        || (class_name == "java/text/SimpleDateFormat"
+                            && method_name == "<init>"
+                            && descriptor == "(Ljava/lang/String;)V")
+                        // Tomcat `SessionIdGeneratorBase.<clinit>` calls
+                        // `Security.getAlgorithms("SecureRandom")`. Real-JDK
+                        // `Security` bytecode walks an incomplete provider graph
+                        // in rust-jvm; force the native registered in
+                        // `register_essential_natives` (`native_security_get_algorithms`).
+                        || (class_name == "java/security/Security"
+                            && method_name == "getAlgorithms"
+                            && descriptor == "(Ljava/lang/String;)Ljava/util/Set;")
                         // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
                         // "No readable meta.properties files found." because
                         // our HashMap layout makes the populated logDirProps
@@ -6735,6 +6907,20 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble"
                             && method_name == "verify"
                             && descriptor == "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V")
+                        // Spring Boot 2.7 `SpringApplicationShutdownHook` static
+                        // `TIMEOUT = TimeUnit.MINUTES.toMillis(10)` before `LogFactory.getLog`.
+                        || (class_name == "java/util/concurrent/TimeUnit"
+                            && method_name == "toMillis"
+                            && descriptor == "(J)J")
+                        // Spring Boot 2.7 `SpringApplicationShutdownHook` static `Log logger`
+                        // calls `LogFactory.getLog(Class)`. Real commons-logging bytecode can
+                        // NPE during provider discovery; essentials registers a safe native.
+                        || (class_name == "org/apache/commons/logging/LogFactory"
+                            && method_name == "getLog"
+                            && (descriptor
+                                == "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;"
+                                || descriptor
+                                    == "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;"))
                         // Round 63: org.jboss.staxmapper.IntVersion.toString()
                         // — the real-JDK bytecode uses
                         //   IntStream.of(segments).limit(n).mapToObj(Integer::toString)
@@ -7146,12 +7332,23 @@ fn invoke_on_class_shared_inner(
             .map(|c| c.name.to_string())
             .unwrap_or_default();
 
+        // `tcnative-*.dll` / `netty_tcnative*.dll` may RegisterNatives for Tomcat
+        // `org/apache/tomcat/jni/*` or Netty `io/netty/internal/tcnative/*`. Those
+        // function pointers are not ABI-compatible with RustJVM's libffi
+        // `dispatch_jni_native` on Windows — using `find_jni_native` / dlsym
+        // resolution here would bypass the Rust stub registry and fault with
+        // 0xC0000005 during Spring Boot startup.
+        let skip_jni_incompatible_host_lib = class_name.starts_with("org/apache/tomcat/jni/")
+            || class_name.starts_with("io/netty/internal/tcnative/");
+
         if let Some(callback) = shared.native_methods.find(&class_name, method_name, descriptor) {
             // Fast path: Rust NativeCallback registered in the built-in registry.
             safe_native_call(shared, thread, callback, args)
-        } else if let Some(fn_ptr) =
+        } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
+            None
+        } else {
             crate::native::jni::find_jni_native(&class_name, method_name, descriptor)
-        {
+        } {
             // JNI function pointer registered via RegisterNatives or symbol lookup.
             // Set TLS context so that JNI callbacks (e.g. FindClass, CallMethod)
             // can access the VM from within the native library.
@@ -7188,12 +7385,16 @@ fn invoke_on_class_shared_inner(
             } else {
                 Ok(Some(result_value))
             }
-        } else if let Some(fn_ptr) = crate::native::jni::resolve_jni_native_in_libraries(
-            &shared.native_libraries,
-            &class_name,
-            method_name,
-            descriptor,
-        ) {
+        } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
+            None
+        } else {
+            crate::native::jni::resolve_jni_native_in_libraries(
+                &shared.native_libraries,
+                &class_name,
+                method_name,
+                descriptor,
+            )
+        } {
             // Auto-resolved via JNI naming convention (dlsym in loaded libraries).
             crate::native::jni::set_jni_context(shared);
             crate::native::jni::set_jni_thread(thread as *mut _);

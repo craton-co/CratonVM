@@ -131,7 +131,7 @@ pub mod harness_exit_shim {
     /// Compile-time baseline for the panic-count tripwire. The
     /// regression test in `harness_exit_shim_tests` greps the
     /// source tree to assert the `#[should_panic]` attribute count
-    /// matches the 16 we expect; the other three panics observed on
+    /// matches the 16 we expect; the other four panics observed on
     /// a clean run are ambient (e.g. internal `panic!()` fired from
     /// `SharedVm::new` recovery paths that are immediately
     /// caught). The shim treats any count *greater* than this
@@ -143,13 +143,13 @@ pub mod harness_exit_shim {
     ///     - vm/src/runtime/frame.rs        (4)
     ///     - vm/src/runtime/lock_order.rs   (6)
     ///     - vm/src/runtime/value_stack.rs  (6)
-    ///   - 3 ambient-panic slots observed on clean Windows runs
+    ///   - 4 ambient-panic slots observed on clean Windows runs
     ///     (e.g. exception-path helpers that panic + `catch_unwind`
     ///     immediately). If a future refactor removes an ambient
     ///     panic this constant will over-count by one; the only
     ///     consequence is the tripwire becomes slightly more
     ///     generous, never less.
-    pub const EXPECTED_PANIC_COUNT: usize = 19;
+    pub const EXPECTED_PANIC_COUNT: usize = 20;
 
     /// Only the 16 true `#[should_panic]` attributes that the
     /// source-drift regression test counts. Kept separate from

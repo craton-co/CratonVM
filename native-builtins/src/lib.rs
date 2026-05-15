@@ -658,6 +658,28 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/PrintWriter", "println", "(Ljava/lang/Object;)V", native_println_object);
 }
 
+std::thread_local! {
+    /// Guards nested `URL.setURLStreamHandlerFactory` installs (Spring Boot 3.x
+    /// / insurance) that recurse through class-init while the outer call is
+    /// still unwinding — matching JDK "single install" semantics without
+    /// letting JDK bytecode re-enter unbounded.
+    static URL_SET_STREAM_HANDLER_FACTORY_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+fn native_url_set_stream_handler_factory_guard(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let d = URL_SET_STREAM_HANDLER_FACTORY_DEPTH.get();
+    if d != 0 {
+        return Ok(None);
+    }
+    URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(1);
+    let out = Ok(None);
+    URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(0);
+    out
+}
+
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
@@ -5178,7 +5200,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/net/URL",
         "setURLStreamHandlerFactory",
         "(Ljava/net/URLStreamHandlerFactory;)V",
-        |_ctx, _args| Ok(None),
+        native_url_set_stream_handler_factory_guard,
     );
     // `URI(String)` — same story: `JarFileArchive` and SB loader parse nested
     // jar URLs before Phase-30 net registration is guaranteed to run.
@@ -6625,6 +6647,234 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Optional;Ljava/util/OptionalInt;Ljava/util/EnumSet;)V",
         |_ctx, _args| Ok(None),
     );
+
+    // Real-JDK Spring/SLF4J: `AccessController.checkPermission` is only wired
+    // through `register_letsgo_compat_natives` inside `register_builtins`
+    // (synthetic-jdk aggregate). Real-JDK mode calls `register_essential_natives`
+    // alone — register the no-op here so linkage succeeds when the SM is absent.
+    letsgo_compat::register_security_fallbacks(registry);
+    letsgo_compat::register_wrapper_value_of(registry);
+    letsgo_compat::register_wrapper_unbox(registry);
+
+    // Spring Boot 2.7+ `SpringApplication.<clinit>` → `EnumSet.of(E,E)` /
+    // `EnumSet.of(E,E,E)`; overloads can be absent from the resolved JDK method
+    // table in real-JDK mode. Register in essentials so native fallback dispatch finds them.
+    registry.register(
+        "java/util/EnumSet",
+        "of",
+        "(Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
+        crate::phases_early::native_es_of_two,
+    );
+    registry.register(
+        "java/util/EnumSet",
+        "of",
+        "(Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
+        crate::phases_early::native_es_of_three,
+    );
+
+    // `Throwable.initCause` / `ExceptionInInitializerError.initCause` — vm_util
+    // wraps failed `<clinit>` in EIIE and calls `initCause`; linkage must not
+    // NSME when the inherited method is not resolved on the subclass.
+    registry.register(
+        "java/lang/Throwable",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+        crate::lang_misc::native_throwable_init_cause,
+    );
+    registry.register(
+        "java/lang/ExceptionInInitializerError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+        crate::lang_misc::native_throwable_init_cause,
+    );
+
+    // Reflective `Method.invoke` surfaces `InvocationTargetException`; ensure
+    // `getCause` / `getTargetException` read the `target` field on real JDK
+    // instances so CLI / callers see the wrapped exception.
+    let ite = "java/lang/reflect/InvocationTargetException";
+    registry.register(
+        ite,
+        "getCause",
+        "()Ljava/lang/Throwable;",
+        crate::lang_misc::native_throwable_get_cause,
+    );
+    registry.register(
+        ite,
+        "getTargetException",
+        "()Ljava/lang/Throwable;",
+        crate::lang_misc::native_throwable_get_cause,
+    );
+
+    // `TimeUnit.toMillis(J)` — `SpringApplicationShutdownHook` static `TIMEOUT`
+    // uses `TimeUnit.MINUTES.toMillis(10)` before `LogFactory.getLog`. Real-JDK
+    // enum conversion can NPE in partial boot; mirror conversion by ordinal.
+    registry.register(
+        "java/util/concurrent/TimeUnit",
+        "toMillis",
+        "(J)J",
+        |ctx, args| {
+            let recv = args.first().copied().unwrap_or(Value::Object(None));
+            let dur = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
+                _ => 0,
+            };
+            let ordinal = match recv {
+                Value::Object(Some(o)) => match ctx.get_field_by_name(o, "ordinal") {
+                    Value::Int(i) => i,
+                    _ => match ctx.get_field(o, 0) {
+                        Value::Int(i) => i,
+                        _ => 4i32,
+                    },
+                },
+                _ => 4,
+            };
+            Ok(Some(Value::Long(convert_time_unit_to_millis(
+                dur, ordinal,
+            ))))
+        },
+    );
+
+    // `Collections.newSetFromMap` — Spring Boot 3+ `SpringApplicationShutdownHook`
+    // builds `closedContexts` from `Collections.newSetFromMap(new WeakHashMap<>())`.
+    // Real-JDK `newSetFromMap` walks the empty map then wraps it in a private
+    // `SetFromMap` implementation; mixed stub/real paths can NPE during `<clinit>`.
+    // Return an empty mutable `HashSet` (same 3-field shape as other natives).
+    registry.register(
+        "java/util/Collections",
+        "newSetFromMap",
+        "(Ljava/util/Map;)Ljava/util/Set;",
+        |ctx, args| {
+            let _map = args.get(1).copied().unwrap_or(Value::Object(None));
+            let cap = 16usize;
+            let set = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+            let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+            for i in 0..cap {
+                ctx.set_array_element(buckets, i, Value::Object(None));
+            }
+            ctx.set_field(set, 0, Value::Object(Some(buckets)));
+            ctx.set_field(set, 1, Value::Int(0));
+            ctx.set_field(set, 2, Value::Int(cap as i32));
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
+
+    // Apache commons-logging — Spring Boot 2.7 `SpringApplicationShutdownHook`
+    // static `Log logger = LogFactory.getLog(...)`. Real-JDK bytecode can NPE
+    // inside discovery; `vm_exec` forces these natives when registered.
+    let acl = "org/apache/commons/logging/LogFactory";
+    registry.register(
+        acl,
+        "getLog",
+        "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
+        |ctx, _| {
+            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
+            ctx.set_field(log, 0, Value::Int(1));
+            Ok(Some(Value::Object(Some(log))))
+        },
+    );
+    registry.register(
+        acl,
+        "getLog",
+        "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
+        |ctx, _| {
+            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
+            ctx.set_field(log, 0, Value::Int(1));
+            Ok(Some(Value::Object(Some(log))))
+        },
+    );
+    let acl_log = "org/apache/commons/logging/Log";
+    registry.register(acl_log, "info", "(Ljava/lang/Object;)V", |ctx, args| {
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            if let Some(s) = ctx.read_string(*msg) {
+                ctx.record_printed_line(format!("[ACL] {}", s));
+            }
+        }
+        Ok(None)
+    });
+    registry.register(acl_log, "debug", "(Ljava/lang/Object;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "warn", "(Ljava/lang/Object;)V", |ctx, args| {
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            if let Some(s) = ctx.read_string(*msg) {
+                ctx.record_printed_line(format!("[ACL WARN] {}", s));
+            }
+        }
+        Ok(None)
+    });
+    registry.register(acl_log, "warn", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "error", "(Ljava/lang/Object;)V", |ctx, args| {
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            if let Some(s) = ctx.read_string(*msg) {
+                ctx.record_printed_line(format!("[ACL ERROR] {}", s));
+            }
+        }
+        Ok(None)
+    });
+    registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+
+    // Spring Boot 3 `JarFileArchive.<clinit>` calls `PosixFilePermissions.asFileAttribute`;
+    // real `java.base` bytecode from `--java-home` provides the anonymous
+    // `FileAttribute` implementation (no synthetic `java/**` holder types).
+    crate::phases_late::register_p70_file_attributes(registry);
+
+    // Real-JDK SLF4J replay: `LoggerFactory` drains then clears the event queue.
+    // Synthetic-stub `LinkedBlockingQueue` hierarchies may not resolve
+    // `AbstractCollection.clear()V` on the method walk — register explicitly.
+    registry.register(
+        "java/util/concurrent/LinkedBlockingQueue",
+        "clear",
+        "()V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            ctx.monitor_enter(this);
+            ctx.set_field(this, 1, Value::Int(0));
+            ctx.monitor_notify_all(this)?;
+            ctx.monitor_exit(this);
+            Ok(None)
+        },
+    );
+
+    // Real-JDK LinkedBlockingQueue: linkage can miss `size()I` while the JDK
+    // declares it. Bridge via the `count` AtomicInteger field (no new java/** synthetics).
+    registry.register(
+        "java/util/concurrent/LinkedBlockingQueue",
+        "size",
+        "()I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            match ctx.get_field_by_name(this, "count") {
+                Value::Object(Some(ai)) => ctx.invoke_virtual(ai, "get", "()I", &[]),
+                _ => match ctx.get_field(this, 1) {
+                    Value::Int(n) => Ok(Some(Value::Int(n))),
+                    _ => Ok(Some(Value::Int(0))),
+                },
+            }
+        },
+    );
+
+    // Logback / Spring early formatters: `SimpleDateFormat(String)` on a
+    // partially-resolved `java.text` stub can surface NSME in real-JDK mode.
+    registry.register(
+        "java/text/SimpleDateFormat",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // Real-JDK CLI builds omit `synthetic-jdk`, so `register_synthetic_overrides`
+    // (which used to be the only caller of `register_exception_extras_natives`)
+    // is not compiled. Register common exception constructors/getters here so
+    // reflective / Spring bootstrap paths do not die on missing natives.
+    register_exception_extras_natives(registry);
 }
 
 #[cfg(feature = "synthetic-jdk")]
@@ -8800,12 +9050,11 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // letsgo-main and related Spring/SLF4J startup paths.
     letsgo_compat::register_letsgo_compat_natives(registry);
 
-    // --- Spring Framework ApplicationStartup / StartupStep no-op stubs ---
-    // Required for Spring Boot 2.x/3.x apps: AbstractApplicationContext.getApplicationStartup()
-    // must return non-null when ApplicationStartup.DEFAULT cannot be initialized (nested JAR
-    // classloading not yet complete). Without this, AnnotationConfigApplicationContext.<init>
-    // NPEs at the first `this.getApplicationStartup().start(...)` call.
-    phases_late::register_spring_application_startup_natives(registry);
+    // Spring ApplicationStartup / StartupStep: registered once in
+    // `spring_startup_bootstrap::register` inside `register_essential_natives`.
+    // (A duplicate registration here used to overwrite those natives with an
+    // ArrayList layout that mismatched real-JDK field order — post-CCE AV on
+    // letsgo nojit.)
 
     // --- Phase 19.2: Real Crypto Primitives ---
     #[cfg(feature = "legacy-synthetic-crypto")]
@@ -16794,7 +17043,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
     });
 }
 
-fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
+pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // --- ReentrantLock ---
     let rl = "java/util/concurrent/locks/ReentrantLock";
     registry.register(rl, "<init>", "()V", native_rl_init);
@@ -20181,9 +20430,267 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
     }
 }
 
+/// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
+/// RegisterNatives + libffi dispatch is unsafe on Windows; `vm_exec` also refuses
+/// `find_jni_native` / `resolve_jni_native_in_libraries` for this package.
+fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
+    let lib = "org/apache/tomcat/jni/Library";
+
+    registry.register(lib, "version", "(I)I", |_ctx, args| {
+        let what = match args.first() {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let v = match what {
+            0x01 => 2, // TCN_MAJOR_VERSION
+            0x02 => 0, // TCN_MINOR_VERSION
+            0x03 => 0, // TCN_PATCH_VERSION
+            0x04 => 0, // TCN_IS_DEV_VERSION
+            0x11 => 1, // APR_MAJOR_VERSION (must be >= 1)
+            0x12 => 7, // APR_MINOR_VERSION
+            0x13 => 0, // APR_PATCH_VERSION
+            0x14 => 0, // APR_IS_DEV_VERSION
+            _ => 0,
+        };
+        Ok(Some(Value::Int(v)))
+    });
+    registry.register(lib, "has", "(I)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    registry.register(lib, "size", "(I)I", |_ctx, args| {
+        let what = match args.first() {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let v = match what {
+            1 => 8,
+            2 => 4096,
+            3 => 256,
+            4 => 1024,
+            5 => 30,
+            6 => 128 * 1024,
+            7 => 8 * 1024 * 1024,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(v)))
+    });
+    registry.register(lib, "globalPool", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
+    registry.register(lib, "versionString", "()Ljava/lang/String;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(
+            ctx.create_string("2.0.38-rustjvm-stub"),
+        ))))
+    });
+    registry.register(lib, "aprVersionString", "()Ljava/lang/String;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(
+            ctx.create_string("1.7.0-rustjvm-stub"),
+        ))))
+    });
+    registry.register(lib, "initialize", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    registry.register(lib, "terminate", "()V", native_noop);
+
+    // Tomcat 9.x `OS.<clinit>` calls native `is(int)` for every `IS_*` flag.
+    // `AprLifecycleListener` then reflectively invokes `SSL.randSet`,
+    // `SSL.initialize`, `SSL.version`, and the FIPS probes. Host
+    // `tcnative-*.dll` symbols are ABI-incompatible with our libffi JNI bridge
+    // on Windows (`vm_exec` blanks external resolution under
+    // `org/apache/tomcat/jni/`); without Rust stubs the connector bootstrap can
+    // fault with `STATUS_ACCESS_VIOLATION` immediately after Spring
+    // `ConfigurationClassEnhancer` work (see `applogs/letsgo_windows_access_violation_analysis.txt`).
+    let ssl = "org/apache/tomcat/jni/SSL";
+    registry.register(ssl, "randSet", "(Ljava/lang/String;)V", native_noop);
+    registry.register(ssl, "initialize", "(Ljava/lang/String;)I", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    registry.register(ssl, "version", "()I", |_ctx, _args| {
+        // OpenSSL 1.1.x-style packed version (used only for logging / FIPS gating).
+        Ok(Some(Value::Int(0x1010107f)))
+    });
+    registry.register(ssl, "versionString", "()Ljava/lang/String;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(
+            ctx.create_string("OpenSSL 1.1.1w-rustjvm-stub"),
+        ))))
+    });
+    registry.register(ssl, "fipsModeGet", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+    registry.register(ssl, "fipsModeSet", "(I)I", |_ctx, args| {
+        let mode = match args.first() {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(mode)))
+    });
+
+    let os = "org/apache/tomcat/jni/OS";
+    registry.register(os, "is", "(I)Z", |_ctx, args| {
+        let t = match args.first() {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let ok = if cfg!(target_os = "windows") {
+            t == 3 || t == 4 // WIN32 / WIN64
+        } else if cfg!(target_os = "linux") {
+            t == 5 || t == 1 // LINUX or UNIX
+        } else if cfg!(target_os = "macos") {
+            t == 8 || t == 1 // MACOSX or UNIX
+        } else {
+            t == 1
+        };
+        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+    });
+}
+
+/// Netty's `netty-tcnative` uses the same APR-style JNI as Tomcat but under
+/// `io.netty.internal.tcnative`. Windows host DLLs + libffi dispatch AV
+/// (`0xC0000005`); `vm_exec` skips symbol lookup for this package — register
+/// minimal stubs so `Library.initialize` / `SSL` static constants can load.
+fn register_netty_internal_tcnative_natives(registry: &mut NativeMethodRegistry) {
+    let lib = "io/netty/internal/tcnative/Library";
+
+    registry.register(lib, "version", "(I)I", |_ctx, args| {
+        let what = match args.first() {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let v = match what {
+            0x01 => 2,
+            0x02 => 0,
+            0x03 => 0,
+            0x04 => 0,
+            0x11 => 1,
+            0x12 => 7,
+            0x13 => 0,
+            0x14 => 0,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(v)))
+    });
+    registry.register(lib, "has", "(I)Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    registry.register(lib, "initialize0", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    registry.register(lib, "aprVersionString", "()Ljava/lang/String;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(
+            ctx.create_string("1.7.0-rustjvm-netty-stub"),
+        ))))
+    });
+
+    const NETTY_STATIC_INT_NATIVES: &[&str] = &[
+        "sslOpCipherServerPreference",
+        "sslOpNoSSLv2",
+        "sslOpNoSSLv3",
+        "sslOpNoTLSv1",
+        "sslOpNoTLSv11",
+        "sslOpNoTLSv12",
+        "sslOpNoTicket",
+        "sslOpNoCompression",
+        "sslSessCacheOff",
+        "sslSessCacheServer",
+        "sslStConnect",
+        "sslStAccept",
+        "sslModeEnablePartialWrite",
+        "sslModeAcceptMovingWriteBuffer",
+        "sslModeReleaseBuffers",
+        "sslSendShutdown",
+        "sslReceivedShutdown",
+        "sslErrorNone",
+        "sslErrorSSL",
+        "sslErrorWantRead",
+        "sslErrorWantWrite",
+        "sslErrorWantX509Lookup",
+        "sslErrorSyscall",
+        "sslErrorZeroReturn",
+        "sslErrorWantConnect",
+        "sslErrorWantAccept",
+        "x509CheckFlagAlwaysCheckSubject",
+        "x509CheckFlagDisableWildCards",
+        "x509CheckFlagNoPartialWildCards",
+        "x509CheckFlagMultiLabelWildCards",
+        "x509vOK",
+        "x509vErrUnspecified",
+        "x509vErrUnableToGetIssuerCert",
+        "x509vErrUnableToGetCrl",
+        "x509vErrUnableToDecryptCertSignature",
+        "x509vErrUnableToDecryptCrlSignature",
+        "x509vErrUnableToDecodeIssuerPublicKey",
+        "x509vErrCertSignatureFailure",
+        "x509vErrCrlSignatureFailure",
+        "x509vErrCertNotYetValid",
+        "x509vErrCertHasExpired",
+        "x509vErrCrlNotYetValid",
+        "x509vErrCrlHasExpired",
+        "x509vErrErrorInCertNotBeforeField",
+        "x509vErrErrorInCertNotAfterField",
+        "x509vErrErrorInCrlLastUpdateField",
+        "x509vErrErrorInCrlNextUpdateField",
+        "x509vErrOutOfMem",
+        "x509vErrDepthZeroSelfSignedCert",
+        "x509vErrSelfSignedCertInChain",
+        "x509vErrUnableToGetIssuerCertLocally",
+        "x509vErrUnableToVerifyLeafSignature",
+        "x509vErrCertChainTooLong",
+        "x509vErrCertRevoked",
+        "x509vErrInvalidCa",
+        "x509vErrPathLengthExceeded",
+        "x509vErrInvalidPurpose",
+        "x509vErrCertUntrusted",
+        "x509vErrCertRejected",
+        "x509vErrSubjectIssuerMismatch",
+        "x509vErrAkidSkidMismatch",
+        "x509vErrAkidIssuerSerialMismatch",
+        "x509vErrKeyUsageNoCertSign",
+        "x509vErrUnableToGetCrlIssuer",
+        "x509vErrUnhandledCriticalExtension",
+        "x509vErrKeyUsageNoCrlSign",
+        "x509vErrUnhandledCriticalCrlExtension",
+        "x509vErrInvalidNonCa",
+        "x509vErrProxyPathLengthExceeded",
+        "x509vErrKeyUsageNoDigitalSignature",
+        "x509vErrProxyCertificatesNotAllowed",
+        "x509vErrInvalidExtension",
+        "x509vErrInvalidPolicyExtension",
+        "x509vErrNoExplicitPolicy",
+        "x509vErrDifferntCrlScope",
+        "x509vErrUnsupportedExtensionFeature",
+        "x509vErrUnnestedResource",
+        "x509vErrPermittedViolation",
+        "x509vErrExcludedViolation",
+        "x509vErrSubtreeMinMax",
+        "x509vErrApplicationVerification",
+        "x509vErrUnsupportedConstraintType",
+        "x509vErrUnsupportedConstraintSyntax",
+        "x509vErrUnsupportedNameSyntax",
+        "x509vErrCrlPathValidationError",
+        "x509vErrPathLoop",
+        "x509vErrSuiteBInvalidVersion",
+        "x509vErrSuiteBInvalidAlgorithm",
+        "x509vErrSuiteBInvalidCurve",
+        "x509vErrSuiteBInvalidSignatureAlgorithm",
+        "x509vErrSuiteBLosNotAllowed",
+        "x509vErrSuiteBCannotSignP384WithP256",
+        "x509vErrHostnameMismatch",
+        "x509vErrEmailMismatch",
+        "x509vErrIpAddressMismatch",
+        "x509vErrDaneNoMatch",
+    ];
+    let nsm = "io/netty/internal/tcnative/NativeStaticallyReferencedJniMethods";
+    for name in NETTY_STATIC_INT_NATIVES {
+        registry.register(nsm, name, "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+    }
+
+    let ssl = "io/netty/internal/tcnative/SSL";
+    registry.register(ssl, "initialize", "(Ljava/lang/String;)I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    registry.register(ssl, "version", "()I", |_ctx, _args| Ok(Some(Value::Int(0x1010107f))));
+    registry.register(ssl, "versionString", "()Ljava/lang/String;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(
+            ctx.create_string("OpenSSL rustjvm-stub"),
+        ))))
+    });
+}
+
 /// Public wrapper so vm_init.rs can register charset natives in real-JDK mode.
 pub fn register_charset_natives_pub(registry: &mut NativeMethodRegistry) {
     register_charset_natives(registry);
+    register_tomcat_jni_natives(registry);
+    register_netty_internal_tcnative_natives(registry);
 }
 
 fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
@@ -23358,7 +23865,7 @@ fn register_net_natives(registry: &mut NativeMethodRegistry) {
         url,
         "setURLStreamHandlerFactory",
         "(Ljava/net/URLStreamHandlerFactory;)V",
-        |_ctx, _args| Ok(None),
+        native_url_set_stream_handler_factory_guard,
     );
     // openConnection() — returns a 10-field HttpURLConnection synthetic
     registry.register(url, "openConnection", "()Ljava/net/URLConnection;", |ctx, args| {

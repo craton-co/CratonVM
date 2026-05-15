@@ -110,6 +110,66 @@ unsafe fn jit_thread_mut() -> Option<&'static mut JvmThread> {
     }
 }
 
+/// Call a JIT-compiled Java method entry with the VM's extern "C" ABI.
+///
+/// `entry` must be a live code pointer from [`try_jit_compile_callee`] /
+/// `CompiledMethod::entry_ptr`. `args_slice` is the raw `i64` array the JIT
+/// stub passes (receiver + parameters in JVM order).
+#[inline]
+unsafe fn call_jit_compiled_method_entry(
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> i64 {
+    let n = args_slice.len();
+    if needs_ctx {
+        match n {
+            0 => {
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr)
+            }
+            1 => {
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr, args_slice[0])
+            }
+            2 => {
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr, args_slice[0], args_slice[1])
+            }
+            3 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
+            }
+            _ => 0,
+        }
+    } else {
+        match n {
+            0 => {
+                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
+                f()
+            }
+            1 => {
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0])
+            }
+            2 => {
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0], args_slice[1])
+            }
+            3 => {
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0], args_slice[1], args_slice[2])
+            }
+            4 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
+            }
+            _ => 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: extract heap from SharedVm pointer
 // ---------------------------------------------------------------------------
@@ -1367,13 +1427,15 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // Try the cached compiled entry pointer (true inline cache hit)
         let entry = mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Acquire);
         if entry != 0 {
-            // Direct call to cached compiled method — skip all resolution.
-            // The cached entry is a function pointer with the same signature as
-            // jit_invoke_dispatch: (vm_ptr, info_ptr, args_ptr, num_args) -> i64.
-            // We can call it directly since it was resolved for this exact method.
-            let cached_fn: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                std::mem::transmute(entry as usize);
-            return cached_fn(vm_ptr, info_ptr, args_ptr, num_args);
+            // Direct call to the compiled callee — same ABI as `jit_invoke_dispatch`
+            // uses after a JIT-cache hit (receiver + params in `args_slice`, optional
+            // leading `vm_ptr` when `cached_needs_context` is true).  **Do not** pass
+            // `(vm_ptr, info_ptr, args_ptr, num_args)` here; that was a mis-invocation
+            // that corrupts the stack and surfaces as Windows AV / Linux SIGSEGV.
+            let needs_ctx = mic
+                .cached_needs_context
+                .load(std::sync::atomic::Ordering::Acquire);
+            return call_jit_compiled_method_entry(entry as usize, needs_ctx, vm_ptr, args_slice);
         }
 
         // Entry not cached yet — use cached class name for fast dispatch.
@@ -1396,12 +1458,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         full_args.push(Value::Object(Some(receiver_ref)));
         full_args.extend_from_slice(&method_args);
 
-        // Try to compile callee for next time (populate cached_entry_ptr)
-        if let Some((entry_ptr, _needs_ctx)) =
-            try_compile_callee(vm, info)
-        {
+        // Try to compile callee for next time (populate cached_entry_ptr + needs_ctx)
+        if let Some((entry_ptr, needs_ctx)) = try_compile_callee(vm, info) {
             mic.cached_entry_ptr
                 .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
+            mic.cached_needs_context
+                .store(needs_ctx, std::sync::atomic::Ordering::Release);
         }
 
         let invoke_res = crate::vm::invoke_or_native(
@@ -1464,12 +1526,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     };
 
     // Try to compile callee for cached entry
-    let entry_ptr = try_compile_callee(vm, info)
-        .map(|(ptr, _)| ptr as u64)
-        .unwrap_or(0);
+    let (entry_ptr, needs_ctx) = match try_compile_callee(vm, info) {
+        Some((ptr, nc)) => (ptr as u64, nc),
+        None => (0, false),
+    };
 
-    // Update all MIC fields atomically
-    mic.update(receiver_cid, &class_name, entry_ptr, false);
+    // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
+    mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
     let method_args: Vec<Value> = values[1..].to_vec();
     let mut full_args = Vec::with_capacity(1 + method_args.len());

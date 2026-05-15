@@ -1,0 +1,9 @@
+﻿2026-05-13T22:00:36.875478Z  WARN rustjvm_vm::runtime::diagnostics: B6: silent-swallow тАФ error suppressed to keep VM running site=<clinit> category=non-critical-exception detail=class=org/jboss/modules/Module exc=java/lang/NullPointerException
+2026-05-13T22:00:36.875523Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 0] at org/jboss/modules/Main.main (Main.java:337) bci=1219
+2026-05-13T22:00:36.875528Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 1] at org/jboss/modules/Module.<clinit> (Module.java:77) bci=22
+2026-05-13T22:00:36.875539Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPaths backfilled with empty String[]
+2026-05-13T22:00:36.875542Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPackages backfilled with empty String[]
+2026-05-13T22:00:36.875563Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
+2026-05-13T22:01:34.541673Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/ThreadLocal.withInitial(Ljava/util/function/Supplier;)Ljava/lang/ThreadLocal;"
+Error in thread "main" linkage error: no such method: java/lang/ThreadLocal.withInitial(Ljava/util/function/Supplier;)Ljava/lang/ThreadLocal;
+

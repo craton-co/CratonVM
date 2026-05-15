@@ -21,8 +21,9 @@ pub use heap_types::{
 };
 pub use compact_value::{CompactTag, CompactValue};
 pub use value::{
-    decode_value, encode_value, is_object_tag, ObjectRef, Value, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT,
-    VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
+    decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr, ObjectRef, Value,
+    VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR,
+    VTAG_UNINIT,
 };
 
 #[cfg(test)]

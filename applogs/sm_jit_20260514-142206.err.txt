@@ -1,0 +1,3 @@
+2026-05-14T17:22:08.059828Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/Boolean.valueOf(Z)Ljava/lang/Boolean;"
+2026-05-14T17:22:08.062975Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/util/concurrent/LinkedBlockingQueue.drainTo(Ljava/util/Collection;I)I"
+Error in thread "main" linkage error: no such method: java/util/concurrent/LinkedBlockingQueue.drainTo(Ljava/util/Collection;I)I

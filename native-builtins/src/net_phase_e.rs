@@ -2327,9 +2327,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "enhance",
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
         |_ctx, args| {
+            // invokevirtual: args[0] = receiver (ConfigurationClassEnhancer), args[1] =
+            // config Class, args[2] = ClassLoader. Returning args.first() was the receiver
+            // mis-typed as Class → AbstractBeanDefinition.getBeanClassName CCE.
             let cls = match args.get(1).cloned() {
                 Some(v) => v,
                 None => return Err(iae("ConfigurationClassEnhancer.enhance: missing class arg")),
+            };
+            // JNI / invoke bridges may pass the config Class as `Value::Long`;
+            // return a proper reference so the caller's `astore`/`if_acmpeq`
+            // sequence does not retain an unrooted jlong handle (Letsgo AV).
+            let cls = match cls {
+                rustjvm_types::Value::Long(bits) => {
+                    if let Some(p) =
+                        rustjvm_types::jlong_bits_as_aligned_object_ptr(bits as u64)
+                    {
+                        rustjvm_types::Value::Object(Some(unsafe {
+                            rustjvm_types::ObjectRef::from_raw(p as *mut u8)
+                        }))
+                    } else {
+                        rustjvm_types::Value::Object(None)
+                    }
+                }
+                other => other,
             };
             eprintln!("[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)");
             Ok(Some(cls))

@@ -1,0 +1,198 @@
+﻿rustjvm.exe : [rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+C:\Users\Victor\AppData\Local\Temp\ps-script-57d48844-1565-4db9-b883-ba62beca5230.ps1:89 знак:1
++ & $RJ --java-home $JH -jar $in *>&1 | Out-File -Encoding utf8 "$ap\ru ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([rustjvm] stack...bort after 120s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-14T22:42:29.853834Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: PosixFilePermission backfilled 9/9 enum s
+tatics
+[GRES-DBG] getResources(META-INF/spring.factories) -> 6 URLs
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=255
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=413
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=5943
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=161
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3303
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=123
+2026-05-14T22:42:30.998846Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN 
+populated (5/5)
+[GRES-DBG] getResources(META-INF/spring.factories) -> 6 URLs
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib
+/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=255
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=413
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=5943
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=161
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3303
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/c:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOO
+T-INF/lib/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=123
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+ :: Spring Boot ::                (v3.2.0)
+
+=== T19.H1 watchdog: deadline of 120s elapsed; requesting thread stack dumps ===
+=== T19.H1 watchdog: 0 thread(s) dumped; aborting process ===
+=== T19.H1 watchdog: no Java threads responded тАФ main thread is in native (Rust) code. pid=41684. Attach a native deb
+ugger before the 3s post-dump grace ends to capture the hang site (Windows: `cdb -p 41684` then `~* k`; Linux: `gdb -p 
+41684` then `thread apply all bt`). ===
+--- T19.H1 watchdog native backtrace (watchdog thread; FYI only) ---
+   0: std::backtrace_rs::backtrace::win64::trace
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\..\..\backtrace\src\backtrace\win64.rs:
+85
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\..\..\backtrace\src\backtrace\mod.rs:66
+   2: std::backtrace::Backtrace::create
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\backtrace.rs:331
+   3: std::backtrace::Backtrace::force_capture
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\backtrace.rs:312
+   4: std::sys::backtrace::__rust_begin_short_backtrace
+   5: <&T as core::fmt::Debug>::fmt
+   6: std::sys::thread::windows::impl$0::new::thread_start
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\std\src\sys\thread\windows.rs:58
+   7: BaseThreadInitThunk
+   8: RtlUserThreadStart
+
+--- end native backtrace ---
+--- native-call ring buffer (last 64 entries, oldest first) ---
+  [00] tid=2956187803482896525 1ms java/lang/reflect/Constructor.newInstance([Ljava/lang/Object;)Ljava/lang/Object;
+  [01] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [02] tid=2956187803482896525 0ms java/lang/System.currentTimeMillis()J
+  [03] tid=2956187803482896525 0ms java/lang/String.valueOf(Ljava/lang/Object;)Ljava/lang/String;
+  [04] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [05] tid=2956187803482896525 0ms java/lang/System.currentTimeMillis()J
+  [06] tid=2956187803482896525 0ms ch/qos/logback/core/ContextBase.getStatusManager()Lch/qos/logback/core/status/Status
+Manager;
+  [07] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [08] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [09] tid=2956187803482896525 0ms java/lang/System.currentTimeMillis()J
+  [10] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [11] tid=2956187803482896525 0ms java/lang/Enum.<init>(Ljava/lang/String;I)V
+  [12] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [13] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [14] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [15] tid=2956187803482896525 0ms java/lang/System.currentTimeMillis()J
+  [16] tid=2956187803482896525 0ms java/lang/Class.initClassName()Ljava/lang/String;
+  [17] tid=2956187803482896525 0ms java/lang/String.valueOf(Ljava/lang/Object;)Ljava/lang/String;
+  [18] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [19] tid=2956187803482896525 0ms java/lang/System.currentTimeMillis()J
+  [20] tid=2956187803482896525 0ms ch/qos/logback/core/ContextBase.getStatusManager()Lch/qos/logback/core/status/Status
+Manager;
+  [21] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [22] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [23] tid=2956187803482896525 0ms java/time/ZoneId.systemDefault()Ljava/time/ZoneId;
+  [24] tid=2956187803482896525 0ms java/util/Locale.getDefault()Ljava/util/Locale;
+  [25] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [26] tid=2956187803482896525 0ms java/util/concurrent/atomic/AtomicReference.<init>(Ljava/lang/Object;)V
+  [27] tid=2956187803482896525 0ms ch/qos/logback/core/ContextBase.getStatusManager()Lch/qos/logback/core/status/Status
+Manager;
+  [28] tid=2956187803482896525 0ms java/util/ArrayList.iterator()Ljava/util/Iterator;
+  [29] tid=2956187803482896525 0ms java/util/ArrayList$Itr.hasNext()Z
+  [30] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [31] tid=2956187803482896525 0ms java/util/concurrent/ConcurrentHashMap.<init>()V
+  [32] tid=2956187803482896525 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [33] tid=2956187803482896525 0ms java/util/ArrayList.isEmpty()Z
+  [34] tid=2956187803482896525 0ms java/util/ArrayList.size()I
+  [35] tid=2956187803482896525 0ms java/util/ArrayList$Itr.hasNext()Z
+  [36] tid=2956187803482896525 0ms java/util/logging/LogManager.getLogManager()Ljava/util/logging/LogManager;
+  [37] tid=2956187803482896525 0ms java/util/logging/LogManager.getLogger(Ljava/lang/String;)Ljava/util/logging/Logger;
+  [38] tid=1706601116446062122 0ms java/lang/Enum.<init>(Ljava/lang/String;I)V
+  [39] tid=1706601116446062122 0ms java/lang/Enum.<init>(Ljava/lang/String;I)V
+  [40] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [41] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [42] tid=1706601116446062122 0ms java/lang/Math.min(JJ)J
+  [43] tid=1706601116446062122 0ms java/util/concurrent/atomic/AtomicLong.<init>(J)V
+  [44] tid=1706601116446062122 0ms java/util/concurrent/ConcurrentHashMap.<init>(IFI)V
+  [45] tid=1706601116446062122 0ms java/util/concurrent/locks/ReentrantLock.<init>()V
+  [46] tid=1706601116446062122 0ms java/util/concurrent/atomic/AtomicLong.<init>()V
+  [47] tid=1706601116446062122 0ms java/util/concurrent/atomic/AtomicReference.<init>(Ljava/lang/Object;)V
+  [48] tid=1706601116446062122 0ms java/util/concurrent/atomic/AtomicReferenceArray.<init>(I)V
+  [49] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [50] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [51] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [52] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [53] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [54] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [55] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [56] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [57] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [58] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [59] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [60] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [61] tid=1706601116446062122 0ms java/lang/ClassLoader.setDefaultAssertionStatus(Z)V
+  [62] tid=1706601116446062122 0ms java/lang/Object.hashCode()I
+  [63] tid=1706601116446062122 3ms java/util/regex/Pattern.compile(Ljava/lang/String;)Ljava/util/regex/Pattern;
+--- end native-call ring buffer ---

@@ -330,6 +330,9 @@ pub struct Class {
     /// Synthetic stubs have zero methods and rely entirely on native registrations.
     /// When a real `.class` file is available, this is `false` and bytecode methods
     /// take precedence over native registrations in dispatch.
+    ///
+    /// Do not use this path for types the JDK or application exposes as real classfiles;
+    /// see `docs/jvm-no-synthetic-stubs.md`.
     pub is_synthetic_stub: bool,
 
     /// `true` if this class (or an ancestor) overrides `Object.finalize()`.

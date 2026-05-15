@@ -36,11 +36,11 @@ fn register_bench_class(
 
     let mut cm = shared.class_manager.write();
     let id = cm.class_store.next_id();
-    let class_name = name.to_string();
+    let class_name: Arc<str> = Arc::from(name);
     cm.class_store.add(Class {
         id,
         loader_id: ClassLoaderId::Application,
-        name: class_name.clone(),
+        name: Arc::clone(&class_name),
         source_file: None,
         version: ClassFileVersion::JAVA_8,
         state: ClassState::Initialized, initializing_thread: None,
@@ -310,8 +310,8 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
                 &shared,
                 "HelloWorld",
                 vec![rustjvm_reader::method::ClassFileMethod {
-                    name: "main".to_string(),
-                    descriptor: "()I".to_string(),
+                    name: "main".into(),
+                    descriptor: "()I".into(),
                     access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                     attributes: vec![Attribute::Code(CodeAttribute {
                         max_stack: 1,
@@ -410,8 +410,8 @@ fn bench_interpreter_counting_loop(c: &mut Criterion) {
             &shared,
             &class_name,
             vec![rustjvm_reader::method::ClassFileMethod {
-                name: "count".to_string(),
-                descriptor: "()I".to_string(),
+                name: "count".into(),
+                descriptor: "()I".into(),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
@@ -445,8 +445,8 @@ fn bench_interpreter_fibonacci(c: &mut Criterion) {
         &shared,
         "bench/Fibonacci",
         vec![rustjvm_reader::method::ClassFileMethod {
-            name: "fib".to_string(),
-            descriptor: "(I)I".to_string(),
+            name: "fib".into(),
+            descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 3,
@@ -483,8 +483,8 @@ fn bench_shootout_nbody(c: &mut Criterion) {
         &shared,
         "bench/NBody",
         vec![rustjvm_reader::method::ClassFileMethod {
-            name: "nbodyLoop".to_string(),
-            descriptor: "(I)I".to_string(),
+            name: "nbodyLoop".into(),
+            descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 3,
@@ -521,8 +521,8 @@ fn bench_shootout_binary_trees(c: &mut Criterion) {
         &shared,
         "bench/BinaryTrees",
         vec![rustjvm_reader::method::ClassFileMethod {
-            name: "treeSum".to_string(),
-            descriptor: "(I)I".to_string(),
+            name: "treeSum".into(),
+            descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 3,
@@ -711,8 +711,8 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
         &shared,
         "bench/ScimarkSOR",
         vec![rustjvm_reader::method::ClassFileMethod {
-            name: "sor".to_string(),
-            descriptor: "(II)I".to_string(),
+            name: "sor".into(),
+            descriptor: "(II)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 4,
@@ -767,8 +767,8 @@ fn bench_dacapo_avrora_sim(c: &mut Criterion) {
         &shared,
         "bench/AvroraSim",
         vec![rustjvm_reader::method::ClassFileMethod {
-            name: "simulate".to_string(),
-            descriptor: "()I".to_string(),
+            name: "simulate".into(),
+            descriptor: "()I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 2,

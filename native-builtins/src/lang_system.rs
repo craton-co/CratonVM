@@ -576,6 +576,19 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "()J",
         native_runtime_free_memory,
     );
+    // JDK 9+ / WildFly: `Runtime.version()` and `Runtime.Version.feature()`.
+    registry.register(
+        "java/lang/Runtime",
+        "version",
+        "()Ljava/lang/Runtime$Version;",
+        native_runtime_version,
+    );
+    registry.register(
+        "java/lang/Runtime$Version",
+        "feature",
+        "()I",
+        native_runtime_version_feature,
+    );
     registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
         Ok(None)
@@ -670,6 +683,40 @@ pub(crate) fn native_runtime_total_memory(_ctx: &mut dyn NativeContext, _args: &
 
 pub(crate) fn native_runtime_free_memory(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
+}
+
+/// `Runtime.version()` — returns a `java.lang.Runtime$Version` instance.
+/// WildFly / JBoss Modules reads `Runtime.version().feature()` during bootstrap.
+pub(crate) fn native_runtime_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let cid = ctx.ensure_class_initialized("java/lang/Runtime$Version")?;
+    let mut n = ctx.class_num_total_fields(cid);
+    if n == 0 {
+        n = 4;
+    }
+    let obj = ctx.alloc_object(cid, n);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// `Runtime.Version.feature()` — major Java specification version (e.g. 25).
+pub(crate) fn native_runtime_version_feature(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let v = ctx
+        .get_system_property("java.specification.version")
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .or_else(|| {
+            ctx.get_system_property("java.version").and_then(|s| {
+                let t = s.trim();
+                if let Some(rest) = t.strip_prefix("1.") {
+                    rest.split('.').next()?.parse().ok()
+                } else {
+                    t.split('.').next()?.parse().ok()
+                }
+            })
+        })
+        .unwrap_or(25);
+    Ok(Some(Value::Int(v)))
 }
 
 pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

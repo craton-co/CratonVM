@@ -1,0 +1,15 @@
+2026-05-14T17:38:42.928056Z  WARN rustjvm_vm::vm::vm_util: <clinit> failed вЂ” wrapping in ExceptionInInitializerError class=org/springframework/boot/SpringApplicationShutdownHook cause=java/lang/NullPointerException 
+2026-05-14T17:38:42.929424Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 0] at org/springframework/boot/loader/MainMethodRunner.run (MainMethodRunner.java:49) bci=49
+2026-05-14T17:38:42.930343Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 1] at com/digsol/main/MainServiceApplication.main (MainServiceApplication.java:12) bci=3
+2026-05-14T17:38:42.931088Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 2] at org/springframework/boot/SpringApplication.<clinit> (SpringApplication.java:180) bci=8
+2026-05-14T17:38:42.931644Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 3] at org/springframework/boot/SpringApplicationShutdownHook.<clinit> (SpringApplicationShutdownHook.java:52) bci=6
+2026-05-14T17:38:42.932021Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/ExceptionInInitializerError.fillInStackTrace(I)Ljava/lang/Throwable;"
+2026-05-14T17:38:42.932244Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/ExceptionInInitializerError.initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;"
+2026-05-14T17:38:42.932449Z  WARN rustjvm_vm::vm::vm_util: <clinit> failed вЂ” wrapping in ExceptionInInitializerError class=org/springframework/boot/SpringApplication cause=java/lang/ExceptionInInitializerError 
+2026-05-14T17:38:42.932621Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE] no captured frames for hash=1261 — falling back to live thread.frames
+2026-05-14T17:38:42.932785Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-LIVE 1] at com/digsol/main/MainServiceApplication.main pc=6
+2026-05-14T17:38:42.932952Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-LIVE 0] at org/springframework/boot/loader/MainMethodRunner.run pc=52
+2026-05-14T17:38:42.933161Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/ExceptionInInitializerError.fillInStackTrace(I)Ljava/lang/Throwable;"
+2026-05-14T17:38:42.933560Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/ExceptionInInitializerError.initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;"
+2026-05-14T17:38:42.933880Z  WARN rustjvm_vm::vm::vm_exec: Missing native method in real-JDK mode method=java/lang/reflect/InvocationTargetException.<init>(Ljava/lang/Throwable;)V
+Exception in thread "main" java/lang/ExceptionInInitializerError

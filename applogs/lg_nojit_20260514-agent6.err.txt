@@ -1,0 +1,9 @@
+[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+2026-05-14T00:02:05.013230Z  WARN rustjvm_vm::runtime::diagnostics: B6: silent-swallow — error suppressed to keep VM running site=<clinit> category=non-critical-exception detail=class=org/springframework/boot/loader/archive/JarFileArchive exc=java/lang/NoSuchFieldError
+2026-05-14T00:02:05.014491Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 0] at org/springframework/boot/loader/JarLauncher.main (JarLauncher.java:65) bci=4
+2026-05-14T00:02:05.015390Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 1] at org/springframework/boot/loader/JarLauncher.<init> (JarLauncher.java:42) bci=1
+2026-05-14T00:02:05.016128Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 2] at org/springframework/boot/loader/ExecutableArchiveLauncher.<init> (ExecutableArchiveLauncher.java:53) bci=6
+2026-05-14T00:02:05.016421Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 3] at org/springframework/boot/loader/archive/JarFileArchive.<clinit> (JarFileArchive.java:56) bci=7
+Exception in thread "main" java/lang/ClassCastException
+	at org/springframework/boot/loader/Launcher.launch(Launcher.java:55)
+	at org/springframework/boot/loader/ExecutableArchiveLauncher.createClassLoader(ExecutableArchiveLauncher.java:109)

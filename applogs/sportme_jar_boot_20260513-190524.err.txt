@@ -1,0 +1,4 @@
+﻿Exception in thread "main" java/lang/ClassCastException
+	at org/springframework/boot/loader/Launcher.launch(Launcher.java:49)
+	at org/springframework/boot/loader/Launcher.createClassLoader(Launcher.java:64)
+

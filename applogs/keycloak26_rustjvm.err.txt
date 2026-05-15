@@ -1,0 +1,6 @@
+[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+2026-05-13T18:07:01.272473Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+thread 'main-vm' panicked at types\src\value.rs:71:13:
+ObjectRef::from_raw called with unaligned pointer: 0x990554
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+2026-05-13T18:07:01.423826Z  WARN rustjvm::panic: panic: ObjectRef::from_raw called with unaligned pointer: 0x990554 file="types\\src\\value.rs" line=71 column=13 thread="main-vm"

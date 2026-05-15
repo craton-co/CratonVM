@@ -6,6 +6,11 @@
 //! 3. Recursively loads superclasses and interfaces
 //! 4. Stores them in a `ClassStore` indexed by `ClassId`
 //! 5. Provides lookup by name and id
+//!
+//! **Synthetic bootstrap:** `ClassManager::ensure_synthetic_class` registers minimal classes with
+//! `crate::class::Class::is_synthetic_stub` set — a legacy shortcut when no real classfile exists.
+//! Project policy is to prefer real JDK/app `.class` bytes and shrink synthetic paths over time; see
+//! `docs/jvm-no-synthetic-stubs.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -691,6 +696,8 @@ impl ClassManager {
     /// Used by the VM bootstrap to create shim classes (e.g.
     /// `java/io/PrintStream` for System.out) that dispatch through
     /// native registrations rather than real JDK bytecode.
+    ///
+    /// Prefer real `.class` files for application-visible types; see `docs/jvm-no-synthetic-stubs.md`.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         if let Some(id) = self.get_loaded_class_id(name) {
             // Already loaded — check if it's a real class with more fields.
@@ -3355,7 +3362,16 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/lang/NoSuchFieldError"
         | "java/lang/NoSuchMethodError"
         | "java/lang/IllegalAccessError"
-        | "java/lang/AbstractMethodError" => "java/lang/LinkageError",
+        | "java/lang/AbstractMethodError"
+        | "java/lang/ExceptionInInitializerError"
+        | "java/lang/BootstrapMethodError" => "java/lang/LinkageError",
+
+        // java.lang.reflect (JDK hierarchy for reflective wrappers)
+        "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
+        "java/lang/reflect/InvocationTargetException" => "java/lang/reflect/ReflectiveOperationException",
+
+        // java.nio.file.attribute — enum PosixFilePermission extends Enum
+        "java/nio/file/attribute/PosixFilePermission" => "java/lang/Enum",
 
         // Number type hierarchy
         "java/lang/Integer" | "java/lang/Long" | "java/lang/Short" | "java/lang/Byte"
@@ -4192,6 +4208,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "com/sun/net/httpserver/HttpContext" => instance_fields(2),
         // Headers = 1 (delegate HashMap)
         "com/sun/net/httpserver/Headers" => instance_fields(1),
+
+        // Spring Boot 3 JarFileArchive.<clinit> reads PosixFilePermission.OWNER_* statics.
+        // When the JDK image is unavailable we fall back to a synthetic stub; declare
+        // the enum constants so GETSTATIC resolves, and wire values from a native <clinit>
+        // (see `register_posix_file_permission_stub_clinit` in native-builtins).
+        "java/nio/file/attribute/PosixFilePermission" => {
+            let mk = |n: &'static str| ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: rustjvm_types::intern_arc(n),
+                descriptor: rustjvm_types::intern_arc("Ljava/nio/file/attribute/PosixFilePermission;"),
+                attributes: vec![],
+            };
+            vec![
+                mk("OWNER_READ"),
+                mk("OWNER_WRITE"),
+                mk("OWNER_EXECUTE"),
+                mk("GROUP_READ"),
+                mk("GROUP_WRITE"),
+                mk("GROUP_EXECUTE"),
+                mk("OTHERS_READ"),
+                mk("OTHERS_WRITE"),
+                mk("OTHERS_EXECUTE"),
+            ]
+        },
 
         // ---- T19.5: sun.nio.ch.Net TCP cluster ----
         // Layouts shared with `native-io::net::register_sun_nio_ch_net`.
@@ -5203,6 +5245,14 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             mk_ctor("(Ljava/lang/Throwable;)V"),
             mk_ctor("(Ljava/lang/String;Ljava/lang/Throwable;)V"),
         ]);
+    }
+    if name == "java/nio/file/attribute/PosixFilePermission" {
+        out.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::STATIC | MethodAccessFlags::NATIVE,
+            name: rustjvm_types::intern_arc("<clinit>"),
+            descriptor: rustjvm_types::intern_arc("()V"),
+            attributes: vec![],
+        });
     }
     if name == "java/io/InputStreamReader" {
         out.extend([

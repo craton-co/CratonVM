@@ -1,0 +1,25 @@
+﻿{
+    "generated_at":  "2026-05-14T23:28:28Z",
+    "rustjvm_bin":  "c:\\craton\\CratonVM\\target\\wf-build2\\release\\rustjvm.exe",
+    "rustjvm_rev":  "74007a8",
+    "wildfly_home":  "C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly",
+    "jboss_modules":  "C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly/jboss-modules.jar",
+    "server_config":  "standalone.xml",
+    "argv":  [
+                 "-Dprogram.name=standalone.bat",
+                 "-Djboss.home.dir=C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly",
+                 "-Dorg.jboss.boot.log.file=C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly/standalone/log/server.log",
+                 "-Dlogging.configuration=file:C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly/standalone/configuration/logging.properties",
+                 "-Djava.util.logging.manager=org.jboss.logmanager.LogManager",
+                 "-Djboss.modules.system.pkgs=org.jboss.byteman",
+                 "-Dfile.encoding=UTF-8",
+                 "--jar",
+                 "C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly/jboss-modules.jar",
+                 "-mp",
+                 "C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly/modules",
+                 "org.jboss.as.standalone",
+                 "--server-config=standalone.xml"
+             ],
+    "rc":  0,
+    "timeout_sec":  90
+}

@@ -1,0 +1,14 @@
+--- STDOUT ---
+
+--- STDERR ---
+[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+2026-05-14T20:14:51.697360Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/util/EnumSet.of(Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;"
+2026-05-14T20:14:51.770099Z  WARN rustjvm_vm::vm::vm_util: <clinit> failed вЂ” wrapping in ExceptionInInitializerError class=org/springframework/boot/SpringApplicationShutdownHook cause=java/lang/NullPointerException 
+2026-05-14T20:14:51.771364Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 0] at org/springframework/boot/loader/MainMethodRunner.run (MainMethodRunner.java:49) bci=49
+2026-05-14T20:14:51.771570Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 1] at com/digsol/main/MainServiceApplication.main (MainServiceApplication.java:12) bci=3
+2026-05-14T20:14:51.771780Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 2] at org/springframework/boot/SpringApplication.<clinit> (SpringApplication.java:180) bci=8
+2026-05-14T20:14:51.771995Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 3] at org/springframework/boot/SpringApplicationShutdownHook.<clinit> (SpringApplicationShutdownHook.java:52) bci=6
+2026-05-14T20:14:51.772626Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/ExceptionInInitializerError.initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;"
+Exception in thread "main" java/lang/reflect/InvocationTargetException
+
+--- EXIT 1 ---

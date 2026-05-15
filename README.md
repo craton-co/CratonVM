@@ -205,6 +205,8 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for future plans and the performance road
 
 ## Contributing
 
+**Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/jvm-no-synthetic-stubs.md](docs/jvm-no-synthetic-stubs.md).
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 
 ## License

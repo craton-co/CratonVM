@@ -1244,6 +1244,11 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // org.jboss.logmanager.LogManager" and falls back to a plain
     // `Logger`. See `vm_exec.rs` `check_override` for the dispatch
     // override that selects these natives over the real bytecode.
+    // If you still see the JDK line "Failed to load the specified log
+    // manager class org.jboss.logmanager.LogManager", ensure
+    // `jboss-logmanager` is visible on the same classpath / layer as
+    // `-Djava.util.logging.manager=org.jboss.logmanager.LogManager`
+    // (WildFly ships it under `modules/`).
     registry.register(
         "org/jboss/logmanager/Logger",
         "getAttachment",

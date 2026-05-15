@@ -1,0 +1,204 @@
+﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+2026-05-15T02:37:27.297813Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: PosixFilePermission backfilled 9/9 enum statics
+[GRES-DBG] getResources(META-INF/spring.factories) -> 11 URLs
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=6069
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3375
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=1677
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=2032
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=871
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=510
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=91
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=136
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=255
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=319
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=111
+[GRES-DBG] getResources(META-INF/spring.factories) -> 11 URLs
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-2.7.12.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=6069
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3375
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-context-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=1677
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-commons-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=2032
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-netflix-eureka-client-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=871
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-cloud-loadbalancer-3.1.8.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=510
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-beans-5.3.27.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=91
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=136
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=255
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=319
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-2.7.12.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=111
+2026-05-15T02:37:28.492027Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[GRES-DBG] getResources(META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports) -> 2 URLs
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-2.7.12.jar!/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/letsgo/letsgo-main/target/letsgo-main-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-actuator-autoconfigure-2.7.12.jar!/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=12 local_idx=2 popped=Object(Some(ObjectRef { ptr: 0x50051230 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=20 local_idx=3 popped=Object(Some(ObjectRef { ptr: 0x505b6508 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=28 local_idx=4 popped=Object(Some(ObjectRef { ptr: 0x505b8fb0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x502cebb0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x502ad218 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x502ced50 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x502ad838 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x502ceef0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x502ade58 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x502cefb8 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x502ae478 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x502cf158 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x502aea98 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x502cf218 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x502af0b8 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x503cebf8 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x50377ee0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(Some(ObjectRef { ptr: 0x5042c080 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=93 local_idx=12 popped=Object(Some(ObjectRef { ptr: 0x50377ee0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=102 local_idx=10 popped=Object(Some(ObjectRef { ptr: 0x50378340 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=111 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=136 local_idx=12 popped=Object(Some(ObjectRef { ptr: 0x50377ee0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x50012ab0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x503d8f08 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=50 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x505b31e0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=60 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x5059fcf8 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=72 local_idx=9 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=75 local_idx=10 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=78 local_idx=11 popped=Object(None)
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=388 local_idx=4 popped=Object(Some(ObjectRef { ptr: 0x505b7e98 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=401 local_idx=5 popped=Object(Some(ObjectRef { ptr: 0x505ba028 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=423 local_idx=6 popped=Object(Some(ObjectRef { ptr: 0x505b9df0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=435 local_idx=7 popped=Object(Some(ObjectRef { ptr: 0x50377ee0 }))
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=453 local_idx=8 popped=Object(Some(ObjectRef { ptr: 0x4ffc7970 }))
+[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)
+2026-05-15T02:37:30.935355Z ERROR rustjvm_vm::dbg_resume_pc: [RUSTJVM_DBG_RESUME_PC] after stackless native enhance: caller org/springframework/context/annotation/ConfigurationClassPostProcessor.enhanceConfigurationClasses
+caller_pc=464 next_bytecode=0x3a
+[RUSTJVM_DBG_ASTORE] enhanceConfigurationClasses pc=466 local_idx=9 popped=Object(Some(ObjectRef { ptr: 0x4ffc7970 }))
+

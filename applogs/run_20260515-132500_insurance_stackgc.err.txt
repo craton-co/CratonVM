@@ -1,0 +1,84 @@
+﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
+2026-05-15T13:25:02.808685Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: PosixFilePermission backfilled 9/9 enum statics
+[GRES-DBG] getResources(META-INF/spring.factories) -> 6 URLs
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=255
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=413
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=5943
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=161
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3303
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=123
+2026-05-15T13:25:03.948971Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[GRES-DBG] getResources(META-INF/spring.factories) -> 6 URLs
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-jpa-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=255
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-data-commons-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=413
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=5943
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-aop-6.1.1.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=161
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=3303
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[OSTR-DBG] URL.openStream: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-jarmode-layertools-3.2.0.jar!/META-INF/spring.factories
+[OSTR-DBG] URL.openStream bytes=123
+[GRES-DBG] getResources(META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports) -> 4 URLs
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/spring-boot-autoconfigure-3.2.0.jar!/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/springdoc-openapi-starter-webmvc-ui-2.2.0.jar!/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/springdoc-openapi-starter-webmvc-api-2.2.0.jar!/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+[GRES-DBG]   url: jar:file:/C:/craton/CratonVM/apps/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar!/BOOT-INF/lib/springdoc-openapi-starter-common-2.2.0.jar!/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[URLRES-DBG] UrlResource.getInputStream intercepted
+[URLRES-DBG] UrlResource.getInputStream -> openStream
+[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)
+

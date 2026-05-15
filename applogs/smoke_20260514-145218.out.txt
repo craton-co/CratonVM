@@ -1,0 +1,109 @@
+﻿RustJVM ╨а┬а╨Т┬а╨а┬а╨▓╨В┬а╨а┬а╨Т┬а╨а╨Ж╨атАЪ╨бтДв╨а┬а╨атАа╨а┬а╨▓╨В╤Щ╨а╨О╨б╤Щ A Java Virtual Machine implemented in Rust.
+
+Executes Java programs by loading and interpreting `.class` files.
+
+Usage: rustjvm [OPTIONS] <CLASS_NAME> [ARGS]... rustjvm [OPTIONS] --jar <FILE.jar> [ARGS]...
+
+Usage: rustjvm.exe [OPTIONS] [CLASS_NAME] [ARGS]...
+
+Arguments:
+  [CLASS_NAME]
+          The fully qualified class name to execute (e.g., com.example.Main)
+
+  [ARGS]...
+          Arguments passed to the Java program's main method
+
+Options:
+      --jar <FILE>
+          Execute a JAR file. The main class is read from META-INF/MANIFEST.MF. When -jar is used, the -cp/-classpath flag is ignored; the classpath comes from the JAR itself and its manifest Class-Path attribute
+
+  -c, --classpath <CLASSPATH>
+          Classpath: directories and JAR files to search for classes
+
+      --Xmx <SIZE>
+          Maximum heap size (e.g., 256m, 1g)
+
+      --verbose:class
+          Print verbose class loading information
+
+      --verbose:gc
+          Print verbose GC information
+
+      --Xbootclasspath <PATH>
+          Boot classpath (overrides JAVA_HOME auto-discovery)
+
+      --java-home <PATH>
+          JAVA_HOME path for automatic boot/ext classpath discovery
+
+      --noverify
+          Skip bytecode verification (like -noverify / -Xverify:none)
+
+      --Xverify <MODE>
+          Bytecode verification policy (-Xverify:none|remote|all). `none` skips verification entirely (equivalent to --noverify). `remote` (HotSpot default) verifies non-boot classes only. `all` verifies boot classes too
+
+      --XX:SharedArchiveFile <PATH>
+          CDS shared archive file path (-XX:SharedArchiveFile=path)
+
+      --Xshare <MODE>
+          CDS sharing mode (-Xshare:off/on/auto/dump)
+          
+          [default: off]
+
+      --synthetic-jdk
+          Force synthetic JDK mode (Rust stubs instead of real JDK bytecode). When omitted and JAVA_HOME is set, real JDK classes are loaded
+
+      --XX:AOTMode <MODE>
+          AOT compilation mode (-XX:AOTMode=off/training/production)
+          
+          [default: off]
+
+      --XX:AOTCache <PATH>
+          AOT cache file path (-XX:AOTCache=path). Used as input in production mode and as output in training mode (unless AOTCacheOutput is set)
+
+      --XX:AOTCacheOutput <PATH>
+          AOT cache output path (-XX:AOTCacheOutput=path). Overrides AOTCache for writing in training mode
+
+      --XX:AuditMissingNatives
+          Audit missing native methods: log all ACC_NATIVE methods that were invoked but had no Rust implementation. Printed on VM shutdown
+
+      --dump-missing-natives <FILE>
+          NEW-10: dump the missing-natives audit log to the given JSON file on VM shutdown. Implies `--XX:AuditMissingNatives`. The output schema is `{ "missing_natives": [{class, name, descriptor, sample_call_site}...] }` with entries sorted so the file is diff-stable against a committed baseline
+
+      --dump-missing-natives-grouped <FILE>
+          T2.1.3: dump the missing-natives audit log to the given JSON file, grouped by JDK module. Implies `--XX:AuditMissingNatives`. Schema: `{ "version": 1, "modules": { "java.base": [...], "other": [...] } }`. Entries and module keys are sorted for byte-stable output, so the file is suitable for committing as a census baseline
+
+      --jdwp-port <PORT>
+          Enable JDWP debug server on the given port (e.g., 5005). Equivalent to -agentlib:jdwp=transport=dt_socket,server=y,address=PORT
+
+      --jdwp-suspend
+          Suspend VM at startup waiting for debugger to attach (requires --jdwp-port)
+
+      --module-path <PATH>
+          Module path: directories and modular JARs to search for modules. Format: path1;path2 (Windows) or path1:path2 (Unix)
+
+      --add-reads <MODULE=TARGET>
+          Add a read edge between modules. Format: `reader_module=target_module[,target_module2,...]`. Can be specified multiple times
+
+      --add-exports <MODULE/PKG=TARGET>
+          Export a package from a module to another module (or ALL-UNNAMED). Format: `module/package=target_module`. Can be specified multiple times
+
+      --add-opens <MODULE/PKG=TARGET>
+          Open a package for deep reflection from a module to another module. Format: `module/package=target_module`. Can be specified multiple times
+
+      --add-modules <MODULE>
+          Additional root modules to resolve beyond the initial module. Can be specified multiple times.  `ALL-MODULE-PATH` resolves all modules found on the module path
+
+      --XX:-UseContainerSupport
+          Disable container/cgroup support (-XX:-UseContainerSupport). When set, the JVM ignores cgroup memory/CPU limits
+
+      --Xlog <SPEC>
+          Unified logging spec (-Xlog:tag[+tag]*[=level][:output[:decorators]]). Example: --Xlog gc*=info:stdout:time,level,tags
+
+      --stack-dump-on-timeout <SECONDS>
+          T19.H1 ╨а┬а╨Т┬а╨а┬а╨▓╨В┬а╨а┬а╨Т┬а╨а╨Ж╨атАЪ╨бтДв╨а┬а╨атАа╨а┬а╨▓╨В╤Щ╨а╨О╨б╤Щ if set, spawn a watchdog thread that, after `SECONDS`, signals every interpreter thread to dump its frame chain to stderr and then calls `std::process::abort()`. Used to diagnose silent-hang bootstraps (Keycloak, WildFly, Quarkus). The flag is honoured on a best-effort basis ╨а┬а╨Т┬а╨а┬а╨▓╨В┬а╨а┬а╨Т┬а╨а╨Ж╨атАЪ╨бтДв╨а┬а╨атАа╨а┬а╨▓╨В╤Щ╨а╨О╨б╤Щ threads stuck inside Rust native code will not dump (the watchdog still aborts with a reduced-information banner in that case)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

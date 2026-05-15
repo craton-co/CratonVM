@@ -2,7 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rustjvm_vm::error::MethodCallFailed;
 use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{create_java_string, Vm};
+use rustjvm_vm::vm::{
+    create_java_string, invoke_on_class_shared, invoke_on_class_shared_no_retarget, Vm,
+};
 use rustjvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
@@ -323,6 +325,17 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             continue;
         }
         if a == "--" {
+            past_separator = true;
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        // JBoss Modules / WildFly use `-mp <modules dir>` after `-jar
+        // jboss-modules.jar`. clap parses `-mp` as the short-flag cluster
+        // `-m` + `-p`, which errors ("unexpected argument '-m'"). Mirror an
+        // explicit `--` so everything from `-mp` onward becomes program args.
+        if a == "-mp" {
+            out.push("--".into());
             past_separator = true;
             out.push(args[i].clone());
             i += 1;
@@ -1389,7 +1402,7 @@ fn run() -> Result<()> {
                 // in its own `target` field and its `getCause()` override
                 // returns that Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ so the heap-level `cause` is null/self while
                 // the real cause lives in `target`. Probe both.
-                let next_cause = {
+                let mut next_cause = {
                     let mut next = None;
                     if let Some(i) = cause_idx {
                         if let Value::Object(Some(c)) = vm.shared.heap.get_field(cur, i) {
@@ -1405,6 +1418,51 @@ fn run() -> Result<()> {
                     }
                     next
                 };
+                if next_cause.is_none() && cname == "java/lang/reflect/InvocationTargetException" {
+                    let ite_decl = vm
+                        .shared
+                        .class_manager
+                        .read()
+                        .get_loaded_class_id("java/lang/reflect/InvocationTargetException");
+                    for (meth, desc) in [
+                        ("getTargetException", "()Ljava/lang/Throwable;"),
+                        ("getCause", "()Ljava/lang/Throwable;"),
+                    ] {
+                        if next_cause.is_some() {
+                            break;
+                        }
+                        let invoke_res = if let Some(ite_cid) = ite_decl {
+                            invoke_on_class_shared_no_retarget(
+                                &vm.shared,
+                                &mut vm.main_thread,
+                                ite_cid,
+                                meth,
+                                desc,
+                                &[Value::Object(Some(cur))],
+                            )
+                        } else {
+                            invoke_on_class_shared(
+                                &vm.shared,
+                                &mut vm.main_thread,
+                                cid,
+                                meth,
+                                desc,
+                                &[Value::Object(Some(cur))],
+                            )
+                        };
+                        match invoke_res {
+                            Ok(Some(Value::Object(Some(t)))) if t != cur => {
+                                next_cause = Some(t);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                lines.push(format!(
+                                    "[rustjvm-cli] InvocationTargetException.{meth}() failed: {e:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 if let Some(c) = next_cause {
                     cur = c;
                     prefix = "Caused by:";
@@ -1412,6 +1470,32 @@ fn run() -> Result<()> {
                 }
                 let _ = depth;
                 break;
+            }
+            let had_caused_by = lines.iter().any(|l| l.starts_with("Caused by:"));
+            if !had_caused_by
+                && lines
+                    .iter()
+                    .any(|l| l.contains("java/lang/reflect/InvocationTargetException"))
+            {
+                if let Some(frames) = vm.throwable_stack_for(exc_ref) {
+                    if !frames.is_empty() {
+                        lines.push(
+                            "[rustjvm-cli] Throwable stack (fillInStackTrace) for InvocationTargetException:"
+                                .to_string(),
+                        );
+                        for frame in frames.iter().take(24) {
+                            let location = match (frame.file.as_deref(), frame.line) {
+                                (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                (Some(f), _) if !f.is_empty() => f.to_string(),
+                                _ => "Unknown Source".to_string(),
+                            };
+                            lines.push(format!(
+                                "\tat {}.{}({})",
+                                frame.class, frame.method, location
+                            ));
+                        }
+                    }
+                }
             }
             bail!("{}", lines.join("\n"));
         }

@@ -9,8 +9,9 @@
 //! when the feature is enabled. The crate still compiles for backward compatibility
 //! but is not called in the default (real JDK) build path.
 
+use rustjvm_types::ArrayElementType;
 use rustjvm_types::ClassId;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectKind, ObjectRef, Value};
 
@@ -17909,6 +17910,18 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         native_cowal_contains,
     );
+    r.register(
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "bulkRemove",
+        "(Ljava/util/function/Predicate;)Z",
+        native_cowal_bulk_remove_predicate,
+    );
+    r.register(
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+        native_cowal_add_all,
+    );
 
     let cf = "java/util/concurrent/CompletableFuture";
 
@@ -18130,11 +18143,76 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     r.register(ra, "invoke", "()Ljava/lang/Object;", native_ra_invoke);
 }
 
+const COWAL_CLASS: &str = "java/util/concurrent/CopyOnWriteArrayList";
+
+/// Real JDK `CopyOnWriteArrayList` uses named `lock` + `array`. Legacy
+/// synthetic stubs mirrored `ArrayList` with slot 0 = backing `Object[]`,
+/// slot 1 = `int` size.
+fn cowal_ensure_lock_and_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock") {
+        if matches!(ctx.get_field(this, ls), Value::Object(None)) {
+            if let Ok(Some(Value::Object(Some(lo)))) = ctx.new_object("java/lang/Object") {
+                let _ = ctx.invoke_special(
+                    "java/lang/Object",
+                    "<init>",
+                    "()V",
+                    &[Value::Object(Some(lo))],
+                );
+                ctx.set_field(this, ls, Value::Object(Some(lo)));
+            }
+        }
+    }
+    if let Some(slot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
+        if matches!(ctx.get_field(this, slot), Value::Object(None)) {
+            let a = ctx.new_array(ArrayElementType::Reference, 0);
+            ctx.set_field(this, slot, Value::Object(Some(a)));
+        }
+    } else if matches!(ctx.get_field(this, 0), Value::Object(None)) {
+        let a = ctx.new_array(ArrayElementType::Reference, 0);
+        ctx.set_field(this, 0, Value::Object(Some(a)));
+        ctx.set_field(this, 1, Value::Int(0));
+    }
+    Ok(None)
+}
+
+fn cowal_read_snapshot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, usize)> {
+    if let Some(slot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
+        let arr = match ctx.get_field(this, slot) {
+            Value::Object(Some(a)) => a,
+            Value::Object(None) => return None,
+            _ => return None,
+        };
+        let len = ctx.array_length(arr);
+        Some((arr, len))
+    } else {
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return None,
+        };
+        let sz = match ctx.get_field(this, 1) {
+            Value::Int(n) => n.max(0) as usize,
+            _ => ctx.array_length(arr),
+        };
+        Some((arr, sz))
+    }
+}
+
+fn cowal_bump_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    if let Some(ms) = ctx.resolve_field_index("java/util/AbstractList", "modCount") {
+        let cur = match ctx.get_field(this, ms) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
+    }
+}
+
 fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    cowal_ensure_lock_and_array(ctx, this)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let present = ctx.invoke_virtual(this, "contains", "(Ljava/lang/Object;)Z", &[elem])?;
     if matches!(present, Some(Value::Int(v)) if v != 0) {
@@ -18149,19 +18227,191 @@ fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    cowal_ensure_lock_and_array(ctx, this)?;
     let needle = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(n) => n.max(0) as usize,
-        _ => 0,
-    };
-    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-        for i in 0..size {
+    if let Some((arr, len)) = cowal_read_snapshot(ctx, this) {
+        for i in 0..len {
             if ctx.get_array_element(arr, i) == needle {
                 return Ok(Some(Value::Int(1)));
             }
         }
     }
     Ok(Some(Value::Int(0)))
+}
+
+fn native_cowal_bulk_remove_predicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+        Value::Object(Some(p)) => p,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("CopyOnWriteArrayList.bulkRemove predicate is null".to_string()),
+            }
+            .into());
+        }
+    };
+
+    cowal_ensure_lock_and_array(ctx, this)?;
+
+    let lock_obj: Option<ObjectRef> = if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock") {
+        match ctx.get_field(this, ls) {
+            Value::Object(Some(lo)) => {
+                ctx.monitor_enter(lo);
+                Some(lo)
+            }
+            _ => {
+                ctx.monitor_enter(this);
+                None
+            }
+        }
+    } else {
+        ctx.monitor_enter(this);
+        None
+    };
+
+    let exit_mon = |ctx: &mut dyn NativeContext, lock_obj: Option<ObjectRef>, this: ObjectRef| {
+        if let Some(lo) = lock_obj {
+            ctx.monitor_exit(lo);
+        } else {
+            ctx.monitor_exit(this);
+        }
+    };
+
+    let Some((arr, n)) = cowal_read_snapshot(ctx, this) else {
+        exit_mon(ctx, lock_obj, this);
+        return Ok(Some(Value::Int(0)));
+    };
+
+    let mut survivors: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        let elem = ctx.get_array_element(arr, i);
+        let remove = match ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[elem]) {
+            Ok(Some(Value::Int(1))) => true,
+            _ => false,
+        };
+        if !remove {
+            survivors.push(elem);
+        }
+    }
+
+    if survivors.len() == n {
+        exit_mon(ctx, lock_obj, this);
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let new_arr = ctx.new_array(ArrayElementType::Reference, survivors.len());
+    for (i, v) in survivors.iter().enumerate() {
+        ctx.set_array_element(new_arr, i, *v);
+    }
+
+    if let Some(aslot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
+        ctx.set_field(this, aslot, Value::Object(Some(new_arr)));
+        cowal_bump_mod_count(ctx, this);
+    } else {
+        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+        ctx.set_field(this, 1, Value::Int(survivors.len() as i32));
+    }
+
+    exit_mon(ctx, lock_obj, this);
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+        Value::Object(Some(c)) => c,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("CopyOnWriteArrayList.addAll on null collection".to_string()),
+            }
+            .into());
+        }
+    };
+    cowal_ensure_lock_and_array(ctx, this)?;
+
+    let Some(aslot) = ctx.resolve_field_index(COWAL_CLASS, "array") else {
+        // Synthetic two-field layout: fall back to repeated `add` (legacy).
+        let arr_obj = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let n = ctx.array_length(arr_obj);
+        let mut any_added = 0i32;
+        for i in 0..n {
+            let elem = ctx.get_array_element(arr_obj, i);
+            if matches!(
+                ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem]),
+                Ok(Some(Value::Int(1)))
+            ) {
+                any_added = 1;
+            }
+        }
+        return Ok(Some(Value::Int(any_added)));
+    };
+
+    let lock_slot = ctx.resolve_field_index(COWAL_CLASS, "lock");
+    let lock_obj: Option<ObjectRef> = if let Some(ls) = lock_slot {
+        match ctx.get_field(this, ls) {
+            Value::Object(Some(lo)) => {
+                ctx.monitor_enter(lo);
+                Some(lo)
+            }
+            _ => {
+                ctx.monitor_enter(this);
+                None
+            }
+        }
+    } else {
+        ctx.monitor_enter(this);
+        None
+    };
+
+    let exit_mon = |ctx: &mut dyn NativeContext, lock_obj: Option<ObjectRef>, this: ObjectRef| {
+        if let Some(lo) = lock_obj {
+            ctx.monitor_exit(lo);
+        } else {
+            ctx.monitor_exit(this);
+        }
+    };
+
+    let cs = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => {
+            exit_mon(ctx, lock_obj, this);
+            return Ok(Some(Value::Int(0)));
+        }
+    };
+    let add_n = ctx.array_length(cs);
+    if add_n == 0 {
+        exit_mon(ctx, lock_obj, this);
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let base = match ctx.get_field(this, aslot) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            exit_mon(ctx, lock_obj, this);
+            return Ok(Some(Value::Int(0)));
+        }
+    };
+    let base_n = ctx.array_length(base);
+    let out = ctx.new_array(ArrayElementType::Reference, base_n + add_n);
+    for i in 0..base_n {
+        ctx.set_array_element(out, i, ctx.get_array_element(base, i));
+    }
+    for i in 0..add_n {
+        ctx.set_array_element(out, base_n + i, ctx.get_array_element(cs, i));
+    }
+    ctx.set_field(this, aslot, Value::Object(Some(out)));
+    cowal_bump_mod_count(ctx, this);
+    exit_mon(ctx, lock_obj, this);
+    Ok(Some(Value::Int(1)))
 }
 
 fn native_stpe_set_keep_alive_time(

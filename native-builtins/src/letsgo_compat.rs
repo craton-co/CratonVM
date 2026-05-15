@@ -10,8 +10,11 @@
 //! files so the broader compatibility surface stays auditable.
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::ArrayElementType;
 use rustjvm_types::{ObjectRef, Value};
 use rustjvm_types::error::MethodCallResult;
+
+use crate::alloc_concurrent_synthetic;
 
 /// Allocate a wrapper object with class name `cls` (e.g. `java/lang/Integer`).
 fn alloc_letsgo_wrapper(ctx: &mut dyn NativeContext, cls: &str) -> Option<ObjectRef> {
@@ -421,7 +424,7 @@ fn register_atomic_reference_compat(r: &mut NativeMethodRegistry) {
 /// resolve `booleanValue/intValue/etc.`, we fall through to NSME.
 /// Provide layout-safe getters that read the boxed primitive from
 /// `field 0` (matching our wrapper convention).
-fn register_wrapper_unbox(r: &mut NativeMethodRegistry) {
+pub fn register_wrapper_unbox(r: &mut NativeMethodRegistry) {
     r.register("java/lang/Boolean", "booleanValue", "()Z", unbox_int_field);
     r.register("java/lang/Byte", "byteValue", "()B", unbox_int_field);
     r.register("java/lang/Short", "shortValue", "()S", unbox_int_field);
@@ -536,7 +539,7 @@ fn box_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 /// `Wrapper.valueOf(prim)` for every boxing static. Layout matches our
 /// wrapper convention (`field 0 = primitive value`).
-fn register_wrapper_value_of(r: &mut NativeMethodRegistry) {
+pub fn register_wrapper_value_of(r: &mut NativeMethodRegistry) {
     r.register("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", box_integer);
     r.register("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;", box_short);
     r.register("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;", box_byte);
@@ -554,12 +557,76 @@ fn no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 /// `AccessController.checkPermission` — no-op (no SecurityManager
 /// installed).  Matches HotSpot's behaviour since JDK 9 when the
 /// SecurityManager has been removed.
-fn register_security_fallbacks(r: &mut NativeMethodRegistry) {
+pub fn register_security_fallbacks(r: &mut NativeMethodRegistry) {
     r.register(
         "java/security/AccessController",
         "checkPermission",
         "(Ljava/security/Permission;)V",
         no_op,
+    );
+    // Real-JDK mode never runs `register_builtins` → `phases_early` JCA block,
+    // but Tomcat `SessionIdGeneratorBase.<clinit>` needs a non-empty
+    // `Security.getAlgorithms("SecureRandom")`. `vm_exec` can force native
+    // dispatch only when this registration exists (see Security.getAlgorithms
+    // allow-list there).
+    r.register(
+        "java/security/Security",
+        "getAlgorithms",
+        "(Ljava/lang/String;)Ljava/util/Set;",
+        |ctx, args| {
+            let type_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let algos: &[&str] = match type_name.as_str() {
+                "MessageDigest" => &["MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512"],
+                "Cipher" => {
+                    &[
+                        "AES",
+                        "AES/CBC/PKCS5Padding",
+                        "AES/CBC/NoPadding",
+                        "AES/ECB/PKCS5Padding",
+                        "AES/GCM/NoPadding",
+                    ]
+                }
+                "Mac" => {
+                    &[
+                        "HmacSHA1",
+                        "HmacSHA256",
+                        "HmacSHA384",
+                        "HmacSHA512",
+                        "HmacMD5",
+                    ]
+                }
+                "Signature" => {
+                    &[
+                        "SHA256withRSA",
+                        "SHA384withRSA",
+                        "SHA512withRSA",
+                        "SHA256withECDSA",
+                    ]
+                }
+                "KeyPairGenerator" => &["RSA", "EC", "DSA"],
+                "KeyGenerator" => &["AES", "DESede", "HmacSHA256"],
+                "SecureRandom" => {
+                    &[
+                        "NativePRNGNonBlocking",
+                        "NativePRNGBlocking",
+                        "SHA1PRNG",
+                        "Windows-PRNG",
+                    ]
+                }
+                _ => &[],
+            };
+            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+            let arr = ctx.new_array(ArrayElementType::Reference, algos.len());
+            for (i, &algo) in algos.iter().enumerate() {
+                let s = ctx.create_string(algo);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
+            ctx.set_field(set, 0, Value::Object(Some(arr)));
+            Ok(Some(Value::Object(Some(set))))
+        },
     );
 }
 
