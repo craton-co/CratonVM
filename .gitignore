@@ -9,7 +9,9 @@ target/
 *.iml
 apps/
 .smoke-cache/
-
+**/*.jar
+**/*.tar.gz
+apps/**/*.tar.gz
 
 # NOTE: .class files in test_classes/ and demo/ are intentional test fixtures
 # and should remain checked in. Do not add a blanket *.class ignore.
@@ -43,3 +45,10 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Application logs
+applogs/
+
+# Root executables
+*.exe
+!dist/*.exe
