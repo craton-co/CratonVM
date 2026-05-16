@@ -7263,7 +7263,13 @@ fn invoke_on_class_shared_inner(
                                 | "getResourceLoaders"))
                         || (class_name == "org/jboss/modules/ModuleLoader"
                             && matches!(method_name,
-                                "preloadModule" | "findLoadedModuleLocal"))
+                                "preloadModule" | "findLoadedModuleLocal"
+                                | "installMBeanServer" | "installMBeanServerDirect"))
+                        || (class_name == "org/jboss/modules/Module"
+                            && matches!(method_name,
+                                "installMBeanServer" | "setModuleLogger"
+                                | "getCallerModuleLoader" | "forClass"
+                                | "loadClassFromCallerModuleLoader"))
                         || (class_name == "org/jboss/modules/ModuleSpec"
                             && method_name == "getDependencies")
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns

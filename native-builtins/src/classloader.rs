@@ -588,26 +588,33 @@ const CLASS_FILE_MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
 // a cglib proxy, return `null` from the native and let the Java caller
 // observe an NPE / LinkageError — which IS recoverable, unlike a SEGV.
 //
-// Also obey the environment knob `RUSTJVM_BAN_CGLIB=1`: when set, ALL
-// cglib-shaped defineClass calls are short-circuited regardless of the
-// loader path. Default behaviour (env unset) still short-circuits — the
-// env is documented so operators can flip it off if they ever need to
-// experiment with the cglib path again.
+// Pattern matching is STRICT: only actual cglib-generated proxy classes
+// trigger the short-circuit. Frameworks like Quarkus/ASM use similar
+// naming conventions in unrelated libraries, so we require the full
+// `$$EnhancerByCGLIB$$` token (not just a `ByCGLIB$$` substring) or a
+// hit under the `net/sf/cglib/proxy/` subpackage.
 // ---------------------------------------------------------------------------
 
 /// Returns true when `name` (in JVM internal form, slashes not dots,
 /// may be empty) looks like a cglib-generated proxy.
+///
+/// STRICT matching: we require the full marker token (`$$EnhancerByCGLIB$$`
+/// or `$$FastClassByCGLIB$$`) or a prefix under `net/sf/cglib/proxy/`. A
+/// looser `ByCGLIB$$` substring match would misfire on Quarkus/ASM-emitted
+/// classes that happen to contain the substring (e.g. classes in libraries
+/// named similarly) and route them through the placeholder path — which
+/// returns `java/lang/Object` and causes downstream layout mismatches.
 fn is_cglib_proxy_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    // CGLIB proxy classes contain the literal `$$EnhancerByCGLIB$$`,
-    // `$$FastClassByCGLIB$$`, `$$KeyFactoryByCGLIB$$` etc. anywhere in
-    // the FQN. Library classes themselves live under `net/sf/cglib/`.
-    name.contains("ByCGLIB$$")
-        || name.contains("$$EnhancerByCGLIB")
-        || name.contains("$$FastClassByCGLIB")
-        || name.starts_with("net/sf/cglib/")
+    // Real cglib proxies are emitted with the canonical marker tokens
+    // `$$EnhancerByCGLIB$$<hash>`, `$$FastClassByCGLIB$$<hash>`, etc.
+    // Library classes themselves live under `net/sf/cglib/proxy/`.
+    name.contains("$$EnhancerByCGLIB$$")
+        || name.contains("$$FastClassByCGLIB$$")
+        || name.contains("$$KeyFactoryByCGLIB$$")
+        || name.starts_with("net/sf/cglib/proxy/")
 }
 
 /// Best-effort scan of the class-file `this_class` CONSTANT_Class index
@@ -617,8 +624,18 @@ fn is_cglib_proxy_name(name: &str) -> bool {
 /// empty string if parsing fails. Defensive — anything unexpected
 /// returns "" so the caller falls back to its existing path.
 fn sniff_class_file_this_name(bytes: &[u8]) -> String {
+    // Defensive parser: EVERY byte read is bounds-checked, every index
+    // into the synthesised offsets/tags vecs is validated, and any
+    // anomaly returns the empty string. This function MUST NOT panic
+    // or read OOB on truncated / malformed / adversarial input — it
+    // runs inside every `defineClass*` native and a fault here would
+    // SEGV the entire VM.
+    //
     // Minimum size sanity: magic(4) + minor(2) + major(2) + cp_count(2) = 10
-    if bytes.len() < 10 || bytes[0..4] != CLASS_FILE_MAGIC {
+    if bytes.len() < 10 {
+        return String::new();
+    }
+    if bytes[0..4] != CLASS_FILE_MAGIC {
         return String::new();
     }
     let cp_count = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
@@ -633,54 +650,97 @@ fn sniff_class_file_this_name(bytes: &[u8]) -> String {
     let mut p: usize = 10;
     let mut i: usize = 1;
     while i < cp_count {
+        // Need at least one byte for the tag.
         if p >= bytes.len() {
             return String::new();
         }
         let tag = bytes[p];
+        // i is always < cp_count here (loop guard) so direct indexing is safe.
         offsets[i] = p;
         tags[i] = tag;
-        p += 1;
-        // Advance per tag spec.
+        p = match p.checked_add(1) {
+            Some(v) => v,
+            None => return String::new(),
+        };
+        // Advance per tag spec. Every match arm bounds-checks its own reads.
         let entry_len: usize = match tag {
             1 => {
                 // CONSTANT_Utf8: u2 length + bytes
-                if p + 2 > bytes.len() { return String::new(); }
-                let l = u16::from_be_bytes([bytes[p], bytes[p+1]]) as usize;
-                2 + l
+                if p.checked_add(2).map_or(true, |e| e > bytes.len()) {
+                    return String::new();
+                }
+                let l = u16::from_be_bytes([bytes[p], bytes[p + 1]]) as usize;
+                // Ensure the full Utf8 payload (length prefix + bytes) is in range.
+                let total = match 2usize.checked_add(l) {
+                    Some(v) => v,
+                    None => return String::new(),
+                };
+                if p.checked_add(total).map_or(true, |e| e > bytes.len()) {
+                    return String::new();
+                }
+                total
             }
             3 | 4 => 4,                       // Integer / Float
-            5 | 6 => { i += 1; 8 }            // Long / Double take 2 slots
+            5 | 6 => {                         // Long / Double take 2 slots
+                // Advance i by an extra slot (the JVM CP spec quirk).
+                if i.checked_add(1).map_or(true, |v| v >= cp_count) {
+                    return String::new();
+                }
+                i += 1;
+                8
+            }
             7 | 8 | 16 | 19 | 20 => 2,        // Class / String / MethodType / Module / Package
             9 | 10 | 11 | 12 | 17 | 18 => 4,  // FieldRef / MethodRef / IfaceMethodRef / NameAndType / Dynamic / InvokeDynamic
             15 => 3,                          // MethodHandle
             _ => return String::new(),        // unknown tag -> bail
         };
-        p += entry_len;
+        // Bounds-check the advance: tags 3/4/7/8/9/10/11/12/15/16/17/18/19/20
+        // only validated `p` for their tag-byte read, so verify the
+        // post-advance position too.
+        match p.checked_add(entry_len) {
+            Some(v) if v <= bytes.len() => { p = v; }
+            _ => return String::new(),
+        }
         i += 1;
     }
     // After CP: access_flags(2) + this_class(2)
-    if p + 4 > bytes.len() {
+    if p.checked_add(4).map_or(true, |e| e > bytes.len()) {
         return String::new();
     }
-    let this_class_idx = u16::from_be_bytes([bytes[p+2], bytes[p+3]]) as usize;
-    if this_class_idx == 0 || this_class_idx >= cp_count || tags[this_class_idx] != 7 {
+    let this_class_idx = u16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as usize;
+    if this_class_idx == 0 || this_class_idx >= cp_count {
+        return String::new();
+    }
+    // Vec access bounded by the cp_count check above.
+    if tags[this_class_idx] != 7 {
         return String::new();
     }
     let cls_entry = offsets[this_class_idx];
-    if cls_entry + 3 > bytes.len() {
+    // CONSTANT_Class entry: tag(1) + name_index(2) = 3 bytes total.
+    if cls_entry.checked_add(3).map_or(true, |e| e > bytes.len()) {
         return String::new();
     }
-    let name_idx = u16::from_be_bytes([bytes[cls_entry+1], bytes[cls_entry+2]]) as usize;
-    if name_idx == 0 || name_idx >= cp_count || tags[name_idx] != 1 {
+    let name_idx = u16::from_be_bytes([bytes[cls_entry + 1], bytes[cls_entry + 2]]) as usize;
+    if name_idx == 0 || name_idx >= cp_count {
+        return String::new();
+    }
+    if tags[name_idx] != 1 {
         return String::new();
     }
     let utf_off = offsets[name_idx];
-    if utf_off + 3 > bytes.len() {
+    // CONSTANT_Utf8 entry header: tag(1) + length(2) = 3 bytes before payload.
+    if utf_off.checked_add(3).map_or(true, |e| e > bytes.len()) {
         return String::new();
     }
-    let utf_len = u16::from_be_bytes([bytes[utf_off+1], bytes[utf_off+2]]) as usize;
-    let start = utf_off + 3;
-    let end = start + utf_len;
+    let utf_len = u16::from_be_bytes([bytes[utf_off + 1], bytes[utf_off + 2]]) as usize;
+    let start = match utf_off.checked_add(3) {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    let end = match start.checked_add(utf_len) {
+        Some(v) => v,
+        None => return String::new(),
+    };
     if end > bytes.len() {
         return String::new();
     }
@@ -720,7 +780,9 @@ fn cglib_guard_value(
         );
         return Some(cglib_placeholder_mirror(ctx));
     }
-    // Fallback: name arg null/empty — sniff the bytecode.
+    // Fallback: name arg null/empty — sniff the bytecode for this_class.
+    // The sniff function is fully bounds-checked and returns "" on any
+    // malformed input, so it cannot SEGV or panic on adversarial bytes.
     if !bytes.is_empty() {
         let sniffed = sniff_class_file_this_name(bytes);
         if is_cglib_proxy_name(&sniffed) {
@@ -731,19 +793,12 @@ fn cglib_guard_value(
             return Some(cglib_placeholder_mirror(ctx));
         }
     }
-    // Universal ban knob.
-    if std::env::var("RUSTJVM_BAN_CGLIB").as_deref() == Ok("1") && !bytes.is_empty() {
-        // Last-resort scan: search the byte slice for the marker. cglib
-        // proxy class files embed the proxy class name as a UTF8 CP
-        // entry, so a substring match is reliable.
-        let needle = b"ByCGLIB$$";
-        if bytes.windows(needle.len()).any(|w| w == needle) {
-            tracing::warn!(
-                "[cglib-shim] RUSTJVM_BAN_CGLIB=1: rejecting cglib-shaped bytecode"
-            );
-            return Some(cglib_placeholder_mirror(ctx));
-        }
-    }
+    // NOTE: a previous version performed a raw-bytes `windows()` scan for
+    // the substring `"ByCGLIB$$"` under `RUSTJVM_BAN_CGLIB=1`. That scan
+    // was removed: it false-positived on Quarkus/ASM-emitted classes
+    // whose constant pool happened to contain a similar substring, and
+    // returning `java/lang/Object` for those classes caused downstream
+    // layout-mismatch SEGVs (notably observed on keycloak startup).
     None
 }
 
