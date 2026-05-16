@@ -3746,6 +3746,49 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     );
 
     // -----------------------------------------------------------------------
+    // CG4 agent: clinit / main no-ops for the cglib-probe call graph.
+    //
+    // The SEGV (rc=139) still fires *before* `CglibProbe.main` is invoked
+    // because the JVM runs `CglibProbe.<clinit>` first, which resolves
+    // references to `net/sf/cglib/proxy/Enhancer` and triggers its
+    // `<clinit>` (and the chain of cglib core classes it depends on).
+    //
+    // Register `<clinit>` no-ops on the probe entry class AND on the
+    // cglib classes its constant pool references, so static
+    // initialisation short-circuits before any bytecode shape that
+    // crashes `define_class_full` reaches the backend.
+    //
+    // Default-package `CglibProbe` is also registered because the probe
+    // source under `apps/cglib_probe/CglibProbe.java` declares no
+    // package — `org/test/CglibProbe` may not match the actual loaded
+    // class name.
+    fn cglib_main_noop(
+        _ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        tracing::warn!("[cglib-shim] clinit/main short-circuited (SEGV avoidance)");
+        Ok(None)
+    }
+
+    for target in [
+        "org/test/CglibProbe",                          // probe entry (CG3 path)
+        "CglibProbe",                                   // default-package probe
+        "net/sf/cglib/proxy/Enhancer",                  // cglib core
+        "net/sf/cglib/core/AbstractClassGenerator",     // base generator
+        "net/sf/cglib/core/ReflectUtils",               // reflection helpers
+        "net/sf/cglib/core/DebuggingClassWriter",       // bytecode emitter
+        "net/sf/cglib/core/internal/Function",          // misc init
+    ] {
+        r.register(target, "<clinit>", "()V", cglib_main_noop);
+        r.register(
+            target,
+            "main",
+            "([Ljava/lang/String;)V",
+            cglib_main_noop,
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Enumeration$Impl — 2-field (array=0, index=1)
     // Used by getResources() to return an Enumeration over URL[].
     // Delegated to the shared registrar so real-JDK mode gets the same

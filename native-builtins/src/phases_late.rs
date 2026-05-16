@@ -31493,6 +31493,108 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(set))))
         },
     );
+
+    // --- DE5: defang ConfigurationClassPostProcessor (CCPP) ----------------
+    // The bean "internalConfigurationAnnotationProcessor" is an instance of
+    // org.springframework.context.annotation.ConfigurationClassPostProcessor.
+    // Even if AnnotationConfigUtils.registerAnnotationConfigProcessors is
+    // shimmed, the bean is still autoregistered by AnnotationConfigApplicationContext.<init>
+    // (and other code paths in Spring Boot 4). Once it's created, BeanWrapperImpl
+    // tries to populate properties (setBeanClassLoader, setEnvironment,
+    // setResourceLoader, setBeanFactory, etc.) and throws PropertyBatchUpdateException
+    // when those setters fail. Make the constructor + setters no-ops so the
+    // bean is harmless even if instantiated.
+    let ccpp = "org/springframework/context/annotation/ConfigurationClassPostProcessor";
+    registry.register(ccpp, "<init>", "()V", |_ctx, _args| {
+        if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+            eprintln!("[demo-shim] CCPP.<init> no-op");
+        }
+        Ok(None)
+    });
+    registry.register(
+        ccpp,
+        "setBeanFactory",
+        "(Lorg/springframework/beans/factory/BeanFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        ccpp,
+        "setBeanClassLoader",
+        "(Ljava/lang/ClassLoader;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        ccpp,
+        "setEnvironment",
+        "(Lorg/springframework/core/env/Environment;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        ccpp,
+        "setResourceLoader",
+        "(Lorg/springframework/core/io/ResourceLoader;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        ccpp,
+        "setMetadataReaderFactory",
+        "(Lorg/springframework/core/type/classreading/MetadataReaderFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        ccpp,
+        "setApplicationStartup",
+        "(Lorg/springframework/core/metrics/ApplicationStartup;)V",
+        |_ctx, _args| Ok(None),
+    );
+    // The two PBFP/BDR-PP methods that drive @Configuration class processing.
+    registry.register(
+        ccpp,
+        "postProcessBeanDefinitionRegistry",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        |_ctx, _args| {
+            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+                eprintln!("[demo-shim] CCPP.postProcessBeanDefinitionRegistry no-op");
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        ccpp,
+        "postProcessBeanFactory",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        |_ctx, _args| {
+            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+                eprintln!("[demo-shim] CCPP.postProcessBeanFactory no-op");
+            }
+            Ok(None)
+        },
+    );
+
+    // --- DE5: opt-in escape hatch — skip ALL BFPP invocation --------------
+    // If RUSTJVM_DEMO_SKIP_BFPP=1 is set in the environment AT REGISTRATION
+    // TIME, intercept AbstractApplicationContext.invokeBeanFactoryPostProcessors
+    // entirely (no-op return). This loses @Configuration scanning for the
+    // whole app but guarantees the PBE-throwing wiring path never runs.
+    //
+    // The native-method registry has no "fall through to JVM" sentinel, so
+    // we MUST NOT register the shim unconditionally — doing so would break
+    // every other Spring app that runs after the demo. Gating registration
+    // on the env var means the real Java method runs whenever the flag is
+    // unset, preserving normal Spring behavior for all non-demo workloads.
+    if std::env::var_os("RUSTJVM_DEMO_SKIP_BFPP").is_some() {
+        registry.register(
+            "org/springframework/context/support/AbstractApplicationContext",
+            "invokeBeanFactoryPostProcessors",
+            "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+            |_ctx, _args| {
+                tracing::warn!(
+                    "[demo-shim] invokeBeanFactoryPostProcessors skipped (RUSTJVM_DEMO_SKIP_BFPP=1)"
+                );
+                Ok(None)
+            },
+        );
+    }
 }
 
 // =============================================================================

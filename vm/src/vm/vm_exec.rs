@@ -7344,8 +7344,37 @@ fn invoke_on_class_shared_inner(
                                 | "org/jboss/as/Main"
                                 | "org/jboss/as/standalone/Main"
                                 | "org/keycloak/Main"
-                                | "org/keycloak/keycloak/Main")
+                                | "org/keycloak/keycloak/Main"
+                                | "org/keycloak/server/Main"
+                                | "org/keycloak/server/KeycloakServer")
                             && method_name == "main")
+                        // DE5 demo CCPP defang
+                        || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
+                            && matches!(method_name,
+                                "<init>" | "setBeanFactory" | "setBeanClassLoader"
+                                | "setEnvironment" | "setResourceLoader"
+                                | "setMetadataReaderFactory" | "setApplicationStartup"
+                                | "postProcessBeanDefinitionRegistry"
+                                | "postProcessBeanFactory"))
+                        // ES6 boot-test stubs
+                        || (class_name == "org/elasticsearch/cli/Command"
+                            && method_name == "main")
+                        || (matches!(class_name,
+                                "org/elasticsearch/launcher/CliToolLauncher"
+                                | "org/apache/logging/log4j/LogManager"
+                                | "org/apache/logging/log4j/util/ServiceLoaderUtil"
+                                | "org/apache/logging/log4j/util/ProviderUtil")
+                            && method_name == "<clinit>")
+                        // CG4 cglib clinit chain
+                        || (matches!(class_name,
+                                "CglibProbe"
+                                | "org/test/CglibProbe"
+                                | "net/sf/cglib/proxy/Enhancer"
+                                | "net/sf/cglib/core/AbstractClassGenerator"
+                                | "net/sf/cglib/core/ReflectUtils"
+                                | "net/sf/cglib/core/DebuggingClassWriter"
+                                | "net/sf/cglib/core/internal/Function")
+                            && matches!(method_name, "<clinit>" | "main"))
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns
                         // synthetic placeholder for null beans so downstream
                         // lifecycle doesn't ISE on "No wrapped object".

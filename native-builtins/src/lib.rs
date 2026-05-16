@@ -386,6 +386,8 @@ pub mod jboss_extras;
 pub mod jetty_extras;
 pub mod liberty_extras;
 pub mod sonar_extras;
+pub mod elasticsearch_extras;
+pub mod keycloak16_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1370,6 +1372,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     jetty_extras::register_jetty_stubs(registry);
     liberty_extras::register_liberty_stubs(registry);
     sonar_extras::register_sonar_stubs(registry);
+    elasticsearch_extras::register_es_stubs(registry);
+    keycloak16_extras::register_keycloak16_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.

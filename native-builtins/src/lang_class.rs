@@ -335,10 +335,41 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
     };
 
     let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
-    // Use the reverse map (or legacy field-0 fallback) to resolve the ClassId.
-    // If mirror_class_id returns None, this is a primitive mirror — read the
-    // name directly from field 1 (the `name` slot in both synthetic and real
-    // JDK layouts).
+
+    // bytebuddy_probe (agent-bb4) — STRICT-NAME-FIRST.
+    //
+    // ByteBuddy's `TypeDescription.ForLoadedType` hierarchy walker raises
+    // `IllegalStateException("Failed to resolve super class class
+    // java.lang.Object from [class java.lang.Object]")` whenever
+    // `C.getName() == "java.lang.Object"` for a class C that
+    // `getSuperclass()` then resolves to Object. The walker reads the
+    // resolved super (correctly Object), reads C's name (incorrectly
+    // "Object" too via the reverse-map alias), decides C is its own super,
+    // and throws.
+    //
+    // Root cause inside CratonVM: a synthetic / duplicate-allocated Class
+    // mirror for some non-Object class C is registered in the VM reverse
+    // map (`class_id_from_mirror`) under Object's `ClassId`. The previous
+    // implementation here trusted that reverse-map answer over the
+    // mirror's slot-1 name field. We now invert the priority: when the
+    // mirror has a non-empty slot-1 String, use it verbatim. Only if
+    // slot 1 is empty do we fall through to the reverse-map lookup. As a
+    // belt-and-braces guard, if the reverse-map path resolves to
+    // "java/lang/Object" but the strict-name path returns a *different*
+    // non-empty name, we prefer the strict-name answer (because the
+    // reverse map is the corrupted side).
+    if let Some(strict_name) = mirror_class_name_strict(ctx, this) {
+        if !strict_name.is_empty() {
+            let dotted = strict_name.replace('/', ".");
+            if dbg_bb {
+                eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
+            }
+            let name_obj = ctx.create_string(&dotted);
+            return Ok(Some(Value::Object(Some(name_obj))));
+        }
+    }
+
+    // Strict path returned nothing — use the reverse-map / class_id path.
     match mirror_class_id(ctx, this) {
         Some(class_id) => {
             let name = ctx
@@ -352,7 +383,8 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
             Ok(Some(Value::Object(Some(name_obj))))
         }
         None => {
-            // Primitive mirror or unknown — read name from field 1.
+            // Primitive mirror or unknown — last-resort: read name via the
+            // permissive helper (which still tries slot 1 → reverse-map).
             // For array-class mirrors (e.g. `[Ljava/lang/String;`) the internal
             // name uses '/' separators; `Class.getName()` must report the
             // dotted form (`[Ljava.lang.String;`) so Spring's
@@ -441,6 +473,44 @@ pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: rustjvm_types::
         if !s.is_empty() {
             return slot1;
         }
+    }
+    mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
+}
+
+/// Strict "stored-name-first" reader for a Class mirror.
+///
+/// Symmetric with [`mirror_class_name`] but inverts the priority: read the
+/// internal name from **slot 1** first, only falling back to the reverse-map
+/// (`class_id_from_mirror` → `class_name_of_id`) or field-0 ClassId when
+/// slot 1 is missing/empty.
+///
+/// bytebuddy_probe (agent-bb4) — ByteBuddy's hierarchy walker raises
+/// `IllegalStateException("Failed to resolve super class class
+/// java.lang.Object from [class java.lang.Object]")` when `getName()` and
+/// `getSuperclass()` disagree on a non-Object class C: if our reverse-map
+/// is corrupted and points C's mirror at Object's `ClassId`, then
+/// `mirror_class_name` (reverse-map-first) returns "java/lang/Object" for
+/// C while `superclass_of` correctly returns Object. ByteBuddy then sees
+/// `C.getName() == Object.getName()` and treats C as its own super.
+///
+/// The strict reader sidesteps that corruption by trusting the slot-1
+/// String that was set at mirror-allocation time — that string was written
+/// from the *real* internal name and is not aliased through the reverse
+/// map. Use this in any place where reading the mirror's identity must
+/// not be silently re-aliased to Object.
+pub(crate) fn mirror_class_name_strict(
+    ctx: &dyn NativeContext,
+    mirror: rustjvm_types::ObjectRef,
+) -> Option<String> {
+    if let Value::Object(Some(name_obj)) = ctx.get_field(mirror, 1) {
+        if let Some(s) = ctx.read_string(name_obj) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+        return ctx.class_name_of_id(cid);
     }
     mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
 }
@@ -1390,11 +1460,23 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     // `Object` class itself. We must match that EXACTLY, even when the
     // mirror is a synthetic/duplicate one whose reverse-map entry points
     // at a different ClassId-than-canonical-Object instance.
-    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    //
+    // bytebuddy_probe (agent-bb4) — read the name via the STRICT helper
+    // so a corrupted reverse-map that aliases a non-Object class to
+    // Object's ClassId does NOT make us short-circuit a non-Object class
+    // to null. The strict reader trusts the slot-1 String that was set
+    // at mirror-allocation time. We only short-circuit when BOTH the
+    // strict name AND the fallback name agree this mirror is Object.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
     let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
-    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getSuperclass({}) -> null [object-early]", this_name);
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [object-early-strict]", this_name);
         }
         return Ok(Some(Value::Object(None)));
     }
@@ -5509,11 +5591,21 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
     // mixup where the reverse-map points at the wrong ClassId), the
     // ByteBuddy hierarchy walker treats them as super-types of Object
     // and the IllegalStateException reasserts. Force-empty here.
-    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    //
+    // bytebuddy_probe (agent-bb4) — read name via the STRICT helper so a
+    // reverse-map alias of non-Object → Object does NOT spuriously
+    // return an empty interfaces array for a non-Object class C (which
+    // legitimately implements interfaces). See `mirror_class_name_strict`.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
     let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
-    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early]", this_name);
+            eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early-strict]", this_name);
         }
         let empty = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(empty))));
@@ -6758,11 +6850,20 @@ pub(crate) fn native_class_get_generic_superclass(
     // walk uses `getGenericSuperclass()` in addition to `getSuperclass()`;
     // without this guard the IllegalStateException cycle returns via the
     // generic path even when the plain path is now protected.
-    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    //
+    // bytebuddy_probe (agent-bb4) — read name via the STRICT helper so a
+    // reverse-map alias of non-Object → Object does NOT short-circuit
+    // a non-Object class. See `mirror_class_name_strict` for rationale.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
     let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
-    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-early]", this_name);
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-early-strict]", this_name);
         }
         return Ok(Some(Value::Object(None)));
     }
@@ -6840,11 +6941,17 @@ pub(crate) fn native_class_get_generic_interfaces(
         }
     };
     // bytebuddy_probe (agent-bb3) — Object short-circuit (empty Type[]).
-    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    // bytebuddy_probe (agent-bb4) — strict-name first; see other helpers.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
     let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
-    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getGenericInterfaces({}) -> [] [object-early]", this_name);
+            eprintln!("[bb-dbg] getGenericInterfaces({}) -> [] [object-early-strict]", this_name);
         }
         let arr = ctx.new_ref_array(ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(arr))));
@@ -7184,7 +7291,18 @@ pub(crate) fn native_class_get_component_type(
             return Ok(Some(Value::Object(None)));
         }
     };
-    let name = mirror_class_name(ctx, this).unwrap_or_default();
+    // bytebuddy_probe (agent-bb4) — STRICT-NAME read. If the strict reader
+    // gives us a non-array name (Object included), short-circuit null
+    // without consulting the reverse-map (which may alias to an array
+    // type and incorrectly return a component class for Object).
+    let name = {
+        let strict = mirror_class_name_strict(ctx, this).unwrap_or_default();
+        if !strict.is_empty() {
+            strict
+        } else {
+            mirror_class_name(ctx, this).unwrap_or_default()
+        }
+    };
     // Array classes have names like "[I", "[Ljava/lang/String;"
     if let Some(component) = name.strip_prefix('[') {
         let comp_name = match component {
@@ -8034,6 +8152,18 @@ pub(crate) fn native_class_get_declaring_class(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // bytebuddy_probe (agent-bb4) — Object short-circuit. The real JDK
+    // returns null for Object.getDeclaringClass(). If our reverse-map is
+    // aliased so that a synthetic mirror points at Object's ClassId, and
+    // Object's `declaring_class` accidentally resolves to a non-null
+    // value somewhere downstream, ByteBuddy's hierarchy walker can chain
+    // through `getDeclaringClass()` and re-introduce a cycle. Read the
+    // name via the STRICT helper (slot 1 first) and short-circuit null
+    // when this mirror identifies as Object.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
+        return Ok(Some(Value::Object(None)));
+    }
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => return Ok(Some(Value::Object(None))),

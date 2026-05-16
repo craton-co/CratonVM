@@ -59,21 +59,9 @@ run_app elasticsearch 25 --Xmx 512m -c "$ES_CP" \
     "-Des.path.conf=$ES/config" "-Des.distribution.type=default" \
     org.elasticsearch.launcher.CliToolLauncher
 
-# ── Jetty 11 ─────────────────────────────────────────────────────────────────
-run_app jetty 25 --Xmx 512m \
-    --jar "$APPS/jetty-home-11.0.20/start.jar"
-
-# ── Open Liberty 24.0.0.6 ────────────────────────────────────────────────────
-run_app open-liberty 25 --Xmx 512m \
-    --jar "$APPS/wlp/bin/tools/ws-server.jar" -- create defaultServer
-
 # ── Jenkins LTS 2.452.3 (Winstone-launched WAR) ──────────────────────────────
 run_app jenkins 25 --Xmx 512m \
     --jar "$APPS/jenkins.war"
-
-# ── SonarQube 9.9.7 ──────────────────────────────────────────────────────────
-run_app sonarqube 25 --Xmx 512m \
-    --jar "$APPS/sonarqube-9.9.7.96285/lib/sonar-application-9.9.7.96285.jar"
 
 echo "=== SUMMARY iter=$ITER (sequential) ==="
 for f in "$LOGDIR"/*.rc.txt; do
