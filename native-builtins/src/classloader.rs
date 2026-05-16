@@ -715,18 +715,55 @@ fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => array_len,
     };
 
-    // Bounds validation: ensure offset + length doesn't exceed array
-    if offset > array_len || length > array_len - offset {
+    // Bounds validation: ensure offset + length doesn't exceed array.
+    // Use checked_add so a pathological (offset=usize::MAX, length=N)
+    // pair cannot wrap around into an in-range value.
+    if offset
+        .checked_add(length)
+        .map_or(true, |end| end > array_len)
+    {
+        tracing::warn!(
+            "[define_class] bounds violation: offset={offset} length={length} \
+             array_len={array_len} (name={name_str})"
+        );
         return Ok(Some(Value::Object(None)));
     }
 
-    // Read bytes from the array
-    let mut class_bytes = Vec::with_capacity(length);
-    for i in 0..length {
-        match ctx.get_array_element(byte_array, offset + i) {
-            Value::Int(b) => class_bytes.push(b as u8),
-            _ => class_bytes.push(0),
+    // Read bytes from the array.
+    //
+    // Defensive: wrap the copy loop in `catch_unwind` so a panic inside
+    // `get_array_element` (e.g. cglib emitting a large bytecode buffer
+    // that hits a stale array layout) does NOT propagate to SIGABRT.
+    // `AssertUnwindSafe` is required because `ctx` is `&mut`; the loop
+    // performs read-only access on a separate array object so unwinding
+    // does not leave shared state observably partial.
+    let class_bytes_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bytes = Vec::with_capacity(length);
+        for i in 0..length {
+            match ctx.get_array_element(byte_array, offset + i) {
+                Value::Int(b) => bytes.push(b as u8),
+                _ => bytes.push(0),
+            }
         }
+        bytes
+    }));
+    let class_bytes = match class_bytes_result {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::error!(
+                "[define_class] panic while reading byte array for {name_str}; aborting"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+
+    // Pre-validate the class file header so that obviously-bad bytes
+    // never reach `define_class_full` (cheap CAFEBABE magic check).
+    if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
+        tracing::warn!(
+            "[define_class] invalid magic for {name_str}; rejecting"
+        );
+        return Ok(Some(Value::Object(None)));
     }
 
     // cglib SEGV guard: short-circuit proxy classes BEFORE handing the
@@ -758,7 +795,22 @@ fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         code_source_url: pd_url,
         ..Default::default()
     };
-    match ctx.define_class_full(&name_str, &class_bytes, loader_id, opts) {
+    // Wrap the backend call in `catch_unwind` so a panic inside
+    // `define_class_full` (e.g. malformed bytecode that defeats the
+    // verifier's bounds-checks) returns null instead of SIGABRT.
+    let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.define_class_full(&name_str, &class_bytes, loader_id, opts)
+    }));
+    let define_result = match define_result {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                "[define_class] panic inside define_class_full for {name_str}; aborting"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    match define_result {
         Ok(cid) => {
             let count = match ctx.get_field(this, CL_CLASSES_LOADED) {
                 Value::Int(n) => n,
@@ -843,6 +895,13 @@ fn read_nonneg_int(args: &[Value], idx: usize) -> Option<usize> {
 /// Read a `[B` (byte array) into a `Vec<u8>` honoring `[off, off+len)`.
 /// Returns `Err(message)` if bounds are invalid (will surface as
 /// `IndexOutOfBoundsException` to Java).
+///
+/// Defensive: rejects any access whose `offset+length` would overflow or
+/// exceed the array length BEFORE the copy loop runs. Wraps the copy
+/// loop itself in `catch_unwind` so a panic inside `get_array_element`
+/// (e.g. due to a corrupt array object on the cglib path) returns an
+/// `Err` instead of unwinding to SIGABRT. cglib emits 10-50 KB bytecode
+/// buffers, so OOB-style SEGVs were observed before this hardening.
 fn read_byte_array_slice(
     ctx: &dyn NativeContext,
     array: ObjectRef,
@@ -850,20 +909,45 @@ fn read_byte_array_slice(
     len: usize,
 ) -> Result<Vec<u8>, String> {
     let cap = ctx.array_length(array);
-    if off > cap {
-        return Err(format!("offset {off} > array length {cap}"));
-    }
-    if len > cap - off {
-        return Err(format!("offset+length ({}) > array length {cap}", off + len));
-    }
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        match ctx.get_array_element(array, off + i) {
-            Value::Int(b) => out.push((b & 0xFF) as u8),
-            _ => out.push(0),
+    // Strict overflow-safe bound: off+len must fit in `cap`.
+    match off.checked_add(len) {
+        Some(end) if end <= cap => {}
+        Some(end) => {
+            return Err(format!(
+                "offset+length ({end}) > array length {cap} (off={off}, len={len})"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "offset+length overflow (off={off}, len={len})"
+            ));
         }
     }
-    Ok(out)
+    let ctx_ref: &dyn NativeContext = ctx;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            // Re-assert bounds inside the loop in case `cap` was racy.
+            // (NativeContext is single-threaded today, but the cost is
+            // negligible vs a SEGV on a stale array length.)
+            debug_assert!(off + i < cap);
+            match ctx_ref.get_array_element(array, off + i) {
+                Value::Int(b) => out.push((b & 0xFF) as u8),
+                _ => out.push(0),
+            }
+        }
+        out
+    }));
+    match result {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            tracing::error!(
+                "[define_class] panic while reading byte array \
+                 (off={off}, len={len}, cap={cap}) — aborting"
+            );
+            Err("panic while reading byte array".to_string())
+        }
+    }
 }
 
 /// Decode an optional `ProtectionDomain` arg into a `code_source_url`
@@ -953,14 +1037,29 @@ fn read_byte_buffer_slice(
         // the buffer's `limit` as an upper bound for safety.
         let max_len = (limit - absolute_off).min(cap - absolute_off);
         let actual_len = len.min(max_len);
-        let mut out = Vec::with_capacity(actual_len);
-        for i in 0..actual_len {
-            match ctx.get_array_element(array, absolute_off + i) {
-                Value::Int(b) => out.push((b & 0xFF) as u8),
-                _ => out.push(0),
+        // Defensive: wrap the copy loop in `catch_unwind` so a panic
+        // inside `get_array_element` returns Err instead of SIGABRT.
+        let ctx_ref: &dyn NativeContext = ctx;
+        let copy_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = Vec::with_capacity(actual_len);
+            for i in 0..actual_len {
+                match ctx_ref.get_array_element(array, absolute_off + i) {
+                    Value::Int(b) => out.push((b & 0xFF) as u8),
+                    _ => out.push(0),
+                }
             }
-        }
-        return Ok(out);
+            out
+        }));
+        return match copy_result {
+            Ok(out) => Ok(out),
+            Err(_) => {
+                tracing::error!(
+                    "[define_class] panic while reading ByteBuffer \
+                     (abs_off={absolute_off}, len={actual_len}, cap={cap}) — aborting"
+                );
+                Err("panic while reading ByteBuffer".to_string())
+            }
+        };
     }
 
     // Direct-buffer fallback: capacity slot still tells us how many
@@ -1008,14 +1107,40 @@ fn define_class_via_full(
 ) -> MethodCallResult {
     use rustjvm_types::error::{LinkageError, RuntimeError};
 
-    if bytes.len() < 4 || bytes[0..4] != CLASS_FILE_MAGIC {
+    // Pre-validate the class file header: at least 8 bytes (magic +
+    // minor + major) and CAFEBABE magic must be present, otherwise the
+    // backend parser may dereference garbage past the buffer end.
+    if bytes.len() < 8 || bytes[0..4] != CLASS_FILE_MAGIC {
+        tracing::warn!(
+            "[define_class] invalid magic for {name}; rejecting"
+        );
         return Err(RuntimeError::IllegalArgumentException {
             message: "defineClass: not a valid class file (bad magic)".into(),
         }
         .into());
     }
 
-    match ctx.define_class_full(name, &bytes, loader_id, opts) {
+    // Wrap the backend call in `catch_unwind` so a panic inside
+    // `define_class_full` (verifier OOB, ASM-emitted bytecode that
+    // defeats our class file parser, etc.) returns a clean
+    // ClassFormatError instead of unwinding to SIGABRT.
+    let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.define_class_full(name, &bytes, loader_id, opts)
+    }));
+    let define_result = match define_result {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                "[define_class] panic inside define_class_full for {name}; aborting"
+            );
+            return Err(LinkageError::ClassFormatError {
+                class_name: name.to_string(),
+                message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
+            }
+            .into());
+        }
+    };
+    match define_result {
         Ok(cid) => {
             let mirror = ctx.get_class_mirror(cid);
             // Stash classData (defineClass0 path) on the side-table.
@@ -1398,7 +1523,11 @@ fn unsafe_define_class_defensive(
     }
 
     // Bounds: offset+length must fit inside the array.
-    if offset > array_len || length > array_len.saturating_sub(offset) {
+    // checked_add prevents wrap-around on pathological inputs.
+    if offset
+        .checked_add(length)
+        .map_or(true, |end| end > array_len)
+    {
         tracing::warn!(
             "Unsafe.defineClass: offset/length out of bounds \
              (off={offset}, len={length}, array={array_len}) — returning null"
@@ -1416,18 +1545,35 @@ fn unsafe_define_class_defensive(
     };
 
     // Copy bytes defensively. Any out-of-band element read returns 0 byte.
-    let mut class_bytes = Vec::with_capacity(length);
-    for i in 0..length {
-        match ctx.get_array_element(byte_array, offset + i) {
-            Value::Int(b) => class_bytes.push(b as u8),
-            _ => class_bytes.push(0),
+    // Wrap in `catch_unwind` so a panic during the copy (corrupt array
+    // header, GC-moved object on the cglib path) returns null instead
+    // of SIGABRT.
+    let class_bytes_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bytes = Vec::with_capacity(length);
+        for i in 0..length {
+            match ctx.get_array_element(byte_array, offset + i) {
+                Value::Int(b) => bytes.push(b as u8),
+                _ => bytes.push(0),
+            }
         }
-    }
+        bytes
+    }));
+    let class_bytes = match class_bytes_result {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::error!(
+                "Unsafe.defineClass({name_str}): panic while reading byte array; \
+                 returning null"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
+    };
 
     // Sanity check magic before handing to backend — `define_class_full`
     // already checks this, but doing it here keeps the warn log clear
-    // about WHO rejected the bytecode.
-    if class_bytes.len() < 4 || class_bytes[0..4] != CLASS_FILE_MAGIC {
+    // about WHO rejected the bytecode. Require at least 8 bytes
+    // (magic + minor + major) so the backend never reads past EOF.
+    if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!(
             "Unsafe.defineClass({name_str}): bad magic — returning null"
         );
@@ -1467,7 +1613,23 @@ fn unsafe_define_class_defensive(
         code_source_url: pd_url,
         ..Default::default()
     };
-    match ctx.define_class_full(&name_str, &class_bytes, loader_id, opts) {
+    // catch_unwind: malformed cglib bytes (10-50 KB) can crash the
+    // backend parser. Translate panic → null so the Java caller sees
+    // an NPE (recoverable) instead of process exit.
+    let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.define_class_full(&name_str, &class_bytes, loader_id, opts)
+    }));
+    let define_result = match define_result {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                "Unsafe.defineClass({name_str}): panic inside define_class_full; \
+                 returning null"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    match define_result {
         Ok(cid) => {
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
@@ -1620,8 +1782,21 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     } else if ctx.find_resource(resource_name).is_some() {
         format!("classpath:{name}")
     } else {
+        let dbg_all = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        if dbg_all {
+            eprintln!("[GRES-DBG] getResource({}) -> NULL (no urls, no bytes)", resource_name);
+        }
         return Ok(Some(Value::Object(None)));
     };
+
+    let dbg_all = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    if dbg_all {
+        eprintln!("[GRES-DBG] getResource({}) -> {}", resource_name, url_str);
+    }
 
     tracing::debug!(
         target: "rustjvm_vm::runtime::resources",
@@ -1676,8 +1851,20 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
 
-    // S111r23-DBG: log spring.factories URL enumeration to diagnose factory loading
-    if resource_name == "META-INF/spring.factories" || resource_name.contains("META-INF/spring/") {
+    // ES2-DBG: env-gated tracing for getResources probe + the original
+    // spring.factories trace path is subsumed by the env-gated emitter so
+    // a single switch covers both diagnostics surfaces.
+    //
+    // Set `RUSTJVM_DBG_GETRESOURCES=1` to dump every invocation's
+    // (resource, count, urls) triple. We also keep the legacy
+    // spring-specific trace as a no-op fall-through condition because some
+    // older debug runs rely on it being always-on.
+    let dbg_all = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let is_spring_legacy_probe = resource_name == "META-INF/spring.factories"
+        || resource_name.contains("META-INF/spring/");
+    if dbg_all || is_spring_legacy_probe {
         eprintln!("[GRES-DBG] getResources({}) -> {} URLs", resource_name, urls.len());
         for u in &urls {
             eprintln!("[GRES-DBG]   url: {}", u);
@@ -2262,24 +2449,48 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
     };
     let length = ctx.array_length(byte_array);
-    let mut class_bytes = Vec::with_capacity(length);
-    for i in 0..length {
-        match ctx.get_array_element(byte_array, i) {
-            Value::Int(b) => class_bytes.push(b as u8),
-            _ => class_bytes.push(0),
+    // Defensive: catch any panic inside the copy loop so a corrupt
+    // byte[] from a cglib path returns an IAE instead of SIGABRT.
+    let class_bytes_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bytes = Vec::with_capacity(length);
+        for i in 0..length {
+            match ctx.get_array_element(byte_array, i) {
+                Value::Int(b) => bytes.push(b as u8),
+                _ => bytes.push(0),
+            }
         }
-    }
-    // Validate magic number
-    if class_bytes.len() < 4 || class_bytes[0..4] != CLASS_FILE_MAGIC {
+        bytes
+    }));
+    let class_bytes = match class_bytes_result {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::error!(
+                "Lookup.defineClass: panic while reading byte array (len={length}); \
+                 raising IllegalArgumentException"
+            );
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Lookup.defineClass: panic while reading byte array".into(),
+            }
+            .into());
+        }
+    };
+
+    // Validate magic + minimal length (8 bytes = magic + minor + major).
+    if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         return Err(RuntimeError::IllegalArgumentException {
             message: "Lookup.defineClass: not a valid class file (bad magic)".into(),
         }
         .into());
     }
 
+    // Sniff the class file's own `this_class` name so the cglib guard
+    // can match on `$$EnhancerByCGLIB$$` even when the caller passes
+    // no explicit name. Empty / parse-fail → empty string (guard noop).
+    let sniffed_name = extract_this_class_name(&class_bytes).unwrap_or_default();
+
     // cglib SEGV guard — Lookup.defineClass is another entry point
     // that ASM-emitted proxies may use on modern JDK targets.
-    if let Some(v) = cglib_guard_value(ctx, "", &class_bytes) {
+    if let Some(v) = cglib_guard_value(ctx, &sniffed_name, &class_bytes) {
         return Ok(Some(v));
     }
 
@@ -2288,7 +2499,24 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // empty name so the backend skips its name-mismatch check (the
     // class file's `this_class` is authoritative here per JEP 274).
     let opts = rustjvm_native_api::DefineClassFull::default();
-    match ctx.define_class_full("", &class_bytes, 0, opts) {
+    // catch_unwind: backend may panic on malformed bytecode.
+    let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.define_class_full("", &class_bytes, 0, opts)
+    }));
+    let define_result = match define_result {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                "Lookup.defineClass: panic inside define_class_full; \
+                 raising IllegalArgumentException"
+            );
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Lookup.defineClass: panic inside backend".into(),
+            }
+            .into());
+        }
+    };
+    match define_result {
         Ok(cid) => {
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
@@ -2453,16 +2681,35 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
 
     let length = ctx.array_length(byte_array);
-    let mut class_bytes = Vec::with_capacity(length);
-    for i in 0..length {
-        match ctx.get_array_element(byte_array, i) {
-            Value::Int(b) => class_bytes.push(b as u8),
-            _ => class_bytes.push(0),
+    // Defensive: catch any panic inside the copy loop so a corrupt
+    // byte[] (cglib emits 10-50 KB bytecode buffers via ASM) returns
+    // an IAE instead of SIGABRT.
+    let class_bytes_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bytes = Vec::with_capacity(length);
+        for i in 0..length {
+            match ctx.get_array_element(byte_array, i) {
+                Value::Int(b) => bytes.push(b as u8),
+                _ => bytes.push(0),
+            }
         }
-    }
+        bytes
+    }));
+    let class_bytes = match class_bytes_result {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::error!(
+                "defineHiddenClass: panic while reading byte array (len={length}); \
+                 raising IllegalArgumentException"
+            );
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "defineHiddenClass: panic while reading byte array".into(),
+            }
+            .into());
+        }
+    };
 
-    // --- 2. Validate the class file magic. ---
-    if class_bytes.len() < 4 || class_bytes[0..4] != CLASS_FILE_MAGIC {
+    // --- 2. Validate the class file magic + minimal header length. ---
+    if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         return Err(RuntimeError::IllegalArgumentException {
             message: "defineHiddenClass: not a valid class file (bad magic)".into(),
         }
@@ -2543,7 +2790,24 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
 
-    let cid = match ctx.define_class_full(&hidden_name, &class_bytes, 0, opts) {
+    // catch_unwind: backend may panic on malformed bytecode.
+    let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.define_class_full(&hidden_name, &class_bytes, 0, opts)
+    }));
+    let define_result = match define_result {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                "defineHiddenClass({hidden_name}): panic inside define_class_full; \
+                 raising IllegalArgumentException"
+            );
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("defineHiddenClass({hidden_name}): panic inside backend"),
+            }
+            .into());
+        }
+    };
+    let cid = match define_result {
         Ok(cid) => cid,
         Err(msg) => {
             // initialize=true failures surface as ExceptionInInitializerError-flavored

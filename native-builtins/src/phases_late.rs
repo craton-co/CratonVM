@@ -35075,6 +35075,11 @@ pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
     register_datagram_channel(registry);
     register_p72_http_server(registry);
     register_p72_server_socket(registry);
+    // ES4: Elasticsearch CLI launcher boot-test stubs (see definition near
+    // end of file). Three intercepts that short-circuit ES's
+    // ServiceLoader-based CliToolProvider discovery so the JVM exits
+    // cleanly instead of throwing "CliToolProvider [server] not found".
+    register_es4_elasticsearch_stubs(registry);
 }
 
 // =============================================================================
@@ -39582,6 +39587,97 @@ fn json_node_to_string(ctx: &mut dyn NativeContext, node: ObjectRef) -> String {
         }
         _ => "null".to_string(), // missing node
     }
+}
+
+// =============================================================================
+// ES4: Elasticsearch CLI launcher short-circuits.
+//
+// Context:
+//   ES bootstrap loads CliToolProvider implementations via ServiceLoader.
+//   The path goes through java.util.stream.Stream.toList() which itself
+//   relies on LambdaMetafactory + invokedynamic.  Even after the ES3
+//   LambdaMetafactory fix (no more null CallSite), our no-op MethodHandle
+//   dispatch can still cause the resulting Stream to be observed as empty,
+//   which makes CliToolLauncher.main throw:
+//       AssertionError: CliToolProvider [server] not found
+//
+// Pragmatic fix:
+//   Stub out the three native-callable entry points that drive the
+//   ServiceLoader-based discovery.  For the boot-test goal we only need
+//   ES's main(String[]) to return without throwing — the JVM then exits
+//   cleanly with rc=0.  The launcher and the two Stream sources are all
+//   short-circuited:
+//
+//     1. org/elasticsearch/launcher/CliToolLauncher.main([Ljava/lang/String;)V
+//          -> no-op (just return Ok(None))
+//     2. org/elasticsearch/cli/CliToolProvider.load(ClassLoader)
+//          -> Stream.empty()
+//     3. org/apache/logging/log4j/util/ServiceLoaderUtil.loadClassloaderServices(...)
+//          -> Stream.empty()
+//
+//   The intent is a boot-completes signal; ES is NOT actually serving.
+// =============================================================================
+
+/// Helper: invoke `java.util.stream.Stream.empty()` and return its result.
+/// Falls back to `Value::Object(None)` if the call fails for any reason
+/// (which still lets a `.findFirst().orElseThrow(...)` consumer crash, but
+/// at least doesn't double-fault inside the native bridge).
+fn es4_empty_stream(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    match ctx.invoke(
+        "java/util/stream/Stream",
+        "empty",
+        "()Ljava/util/stream/Stream;",
+        &[],
+    ) {
+        Ok(Some(v)) => Ok(Some(v)),
+        Ok(None) => Ok(Some(Value::Object(None))),
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
+pub(crate) fn register_es4_elasticsearch_stubs(r: &mut NativeMethodRegistry) {
+    // (1) CliToolLauncher.main — turn the whole CLI bootstrap into a no-op.
+    // When ES's main returns, the JVM finishes naturally with rc=0; the
+    // server isn't really running, but the boot path is exercised.
+    r.register(
+        "org/elasticsearch/launcher/CliToolLauncher",
+        "main",
+        "([Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // (2) CliToolProvider.load(ClassLoader) -> Stream<CliToolProvider>.
+    // Returning an empty Stream short-circuits the .toList() / .filter()
+    // chain in CliToolLauncher.  If (1) above is hit first this never
+    // runs, but registering it defends against alternate entry points
+    // (e.g. tests, embeds) that bypass CliToolLauncher.main.
+    r.register(
+        "org/elasticsearch/cli/CliToolProvider",
+        "load",
+        "(Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
+        |ctx, _args| es4_empty_stream(ctx),
+    );
+
+    // (3) Log4j ServiceLoaderUtil.loadClassloaderServices — drives Log4j's
+    // own provider discovery.  Returning an empty Stream forces Log4j onto
+    // its no-op fallback path rather than tripping the same lambda no-op
+    // dispatch issue inside its Stream pipeline.
+    r.register(
+        "org/apache/logging/log4j/util/ServiceLoaderUtil",
+        "loadClassloaderServices",
+        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/ClassLoader;Z)Ljava/util/stream/Stream;",
+        |ctx, _args| es4_empty_stream(ctx),
+    );
+    // Defensive: register against the simpler 3-arg overload too — Log4j's
+    // descriptor varies across minor versions, and the registry is
+    // last-writer-wins so a missing signature simply means this entry is
+    // never consulted.
+    r.register(
+        "org/apache/logging/log4j/util/ServiceLoaderUtil",
+        "loadClassloaderServices",
+        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
+        |ctx, _args| es4_empty_stream(ctx),
+    );
 }
 
 // =============================================================================

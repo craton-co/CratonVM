@@ -1517,6 +1517,23 @@ impl ClassPath {
         if name.contains("..") || name.contains('\0') || name.contains('\\') {
             return Vec::new();
         }
+        // ES2-DBG: env-gated tracing for the classpath resource walk.
+        // `RUSTJVM_DBG_GETRESOURCES=1` emits per-entry hit/miss for every
+        // call. Each `ClassPath` instance (bootstrap / extension /
+        // application) calls this independently, so a real probe prints
+        // one block per loader — useful for spotting whether a specific
+        // jar is missing from the application classpath entirely vs
+        // simply lacking the resource.
+        let dbg = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        if dbg {
+            eprintln!(
+                "[GRES-DBG] find_all_resource_urls({}) — scanning {} entries",
+                name,
+                self.entries.len()
+            );
+        }
         let mut urls = Vec::new();
         for entry in &self.entries {
             match entry {
@@ -1543,6 +1560,14 @@ impl ClassPath {
                     } else {
                         Self::find_in_archive(archive, name).is_some()
                     };
+                    if dbg {
+                        eprintln!(
+                            "[GRES-DBG]   jar {} mr={} -> {}",
+                            path.display(),
+                            multi_release,
+                            if found { "HIT" } else { "miss" }
+                        );
+                    }
                     if found {
                         let abs = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                         let p = abs.to_string_lossy().replace('\\', "/");
@@ -1609,6 +1634,13 @@ impl ClassPath {
                     }
                 }
             }
+        }
+        if dbg {
+            eprintln!(
+                "[GRES-DBG] find_all_resource_urls({}) -> {} URLs",
+                name,
+                urls.len()
+            );
         }
         urls
     }
@@ -3585,6 +3617,125 @@ Implementation-Version: 999.999\n";
         assert!(urls1[0].contains("alpha.jar"));
         assert!(urls1[1].contains("mu.jar"));
         assert!(urls1[2].contains("zeta.jar"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── ES2 multi-jar SPI enumeration (Elasticsearch parity) ───────────
+    //
+    // Elasticsearch's launcher script passes every jar EXPLICITLY (not
+    // via `lib/*` wildcard). Only one of those 60+ jars holds the
+    // `META-INF/services/org.elasticsearch.cli.CliToolProvider` SPI
+    // descriptor. The other 59 must be walked without producing false
+    // positives or short-circuiting the search after the first miss.
+    //
+    // Regression target: an earlier version of `find_all_resource_urls`
+    // could short-circuit on `find_in_archive` returning Err (vs Ok(None)),
+    // which would cause the walk to abort silently after the first jar
+    // that lacked the entry. The current code returns Ok-or-None for
+    // every entry and continues, but a unit test pins the contract.
+
+    /// Build N empty jars + 1 jar that holds the SPI descriptor. All N+1
+    /// must be walked by `find_all_resource_urls`, and exactly ONE URL
+    /// must come back — the one from the lone jar that has the entry.
+    /// Mirrors the Elasticsearch `-cp <60 explicit jars>` shape.
+    #[test]
+    fn explicit_multi_jar_classpath_finds_lone_spi_provider() {
+        let dir = std::env::temp_dir().join("rustjvm_es2_multi_jar_spi");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 19 empty jars (just an empty MANIFEST.MF) + 1 jar with the SPI.
+        let mut cp_entries: Vec<String> = Vec::new();
+        for i in 0..19 {
+            let p = dir.join(format!("empty-{i}.jar"));
+            let f = fs::File::create(&p).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+            zip.write_all(b"Manifest-Version: 1.0\n").unwrap();
+            zip.finish().unwrap();
+            cp_entries.push(p.to_string_lossy().into_owned());
+        }
+        // The lone provider jar — modelled after server-cli-8.15.5.jar.
+        let provider = dir.join("server-cli-x.y.z.jar");
+        {
+            let f = fs::File::create(&provider).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file(
+                "META-INF/services/org.elasticsearch.cli.CliToolProvider",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(b"org.elasticsearch.server.cli.ServerCliProvider\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        cp_entries.push(provider.to_string_lossy().into_owned());
+
+        let cp = ClassPath::new(&cp_entries);
+        assert_eq!(
+            cp.entry_count(),
+            20,
+            "every explicitly-listed jar must register as a classpath entry"
+        );
+        let urls = cp.find_all_resource_urls(
+            "META-INF/services/org.elasticsearch.cli.CliToolProvider",
+        );
+        assert_eq!(
+            urls.len(),
+            1,
+            "exactly one jar holds the SPI descriptor; walk must not \
+             short-circuit on the first miss. Got urls={urls:?}",
+        );
+        assert!(
+            urls[0].contains("server-cli-x.y.z.jar"),
+            "the lone hit must point at the provider jar, got {}",
+            urls[0]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same multi-jar walk with `find_all_resource_bytes` — the Rust
+    /// helper path used by service_loader.rs that bypasses URL stream
+    /// handling. Must produce exactly one byte block matching the SPI
+    /// content.
+    #[test]
+    fn explicit_multi_jar_classpath_finds_lone_spi_bytes() {
+        let dir = std::env::temp_dir().join("rustjvm_es2_multi_jar_spi_bytes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut cp_entries: Vec<String> = Vec::new();
+        for i in 0..9 {
+            let p = dir.join(format!("nothing-{i}.jar"));
+            let f = fs::File::create(&p).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("README", opts).unwrap();
+            zip.write_all(b"nothing here\n").unwrap();
+            zip.finish().unwrap();
+            cp_entries.push(p.to_string_lossy().into_owned());
+        }
+        let provider = dir.join("provider.jar");
+        {
+            let f = fs::File::create(&provider).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("META-INF/services/foo.Bar", opts).unwrap();
+            zip.write_all(b"foo.BarImpl\n").unwrap();
+            zip.finish().unwrap();
+        }
+        cp_entries.push(provider.to_string_lossy().into_owned());
+
+        let cp = ClassPath::new(&cp_entries);
+        let bytes = cp.find_all_resource_bytes("META-INF/services/foo.Bar");
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], b"foo.BarImpl\n");
         let _ = fs::remove_dir_all(&dir);
     }
 }

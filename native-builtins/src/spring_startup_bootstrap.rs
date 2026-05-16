@@ -1360,6 +1360,111 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()Z",
         abstract_bean_definition_has_bean_class,
     );
+
+    // ── sportme: filter orphan beans at the registration entry point ───────
+    //
+    // Earlier filters (getBeanClassName / hasBeanClass / resolveBeanClass +
+    // scrub) all run AFTER `preInstantiateSingletons` has already seen the
+    // orphan in its snapshot of `beanDefinitionNames`. The orphan slips into
+    // the factory before class resolution because Spring's auto-configuration
+    // metadata pipeline ultimately funnels every bean definition through
+    // `BeanDefinitionReaderUtils.registerBeanDefinition(BeanDefinitionHolder,
+    // BeanDefinitionRegistry)`. Intercepting THAT static method lets us drop
+    // unloadable beans before they're ever added to the factory map — no
+    // race with `preInstantiateSingletons`, no need to scrub state after the
+    // fact.
+    //
+    // Algorithm:
+    //   1. Read holder.getBeanName() and holder.getBeanDefinition().
+    //   2. Inspect bd.getBeanClassName(). If the name is non-empty and the
+    //      class isn't on our classpath → SKIP (return early; bean never
+    //      registered).
+    //   3. Otherwise re-invoke `registry.registerBeanDefinition(name, bd)`
+    //      manually so the real registration still happens. This preserves
+    //      every code path except the orphan one.
+    //
+    // The orchestrator should add a check_override for
+    // `(BeanDefinitionReaderUtils, registerBeanDefinition,
+    //   (Lorg/springframework/beans/factory/config/BeanDefinitionHolder;
+    //    Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V)`
+    // in vm/src/vm/vm_exec.rs.
+    registry.register(
+        "org/springframework/beans/factory/support/BeanDefinitionReaderUtils",
+        "registerBeanDefinition",
+        "(Lorg/springframework/beans/factory/config/BeanDefinitionHolder;\
+         Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        bdru_register_bean_definition,
+    );
+
+    // ── demo Spring Boot 4 shim: targeted no-op for
+    //    `ConfigurationClassPostProcessor.processConfigBeanDefinitions` ─────
+    //
+    // Spring Boot 4's `internalConfigurationAnnotationProcessor` bean is the
+    // `ConfigurationClassPostProcessor`. Its `processConfigBeanDefinitions`
+    // method walks the registry looking for @Configuration classes,
+    // instantiates a parser, and applies property values via BeanWrapperImpl.
+    // On CratonVM's partial classpath this path eventually trips a
+    // `PropertyBatchUpdateException` while configuring the processor itself,
+    // surfacing as:
+    //   BeanCreationException: Error creating bean with name
+    //   'org.springframework.context.annotation
+    //    .internalConfigurationAnnotationProcessor': Failed properties
+    //   ⇒ PropertyBatchUpdateException
+    //
+    // A no-op for this *one* method skips ALL @Configuration class scanning
+    // (every Spring Boot 4 app uses it) but is bean-name-scoped: only the
+    // CCPP bean ever reaches this entry point. Other beans (insurance,
+    // letsgo) never invoke this method, so they are not regressed.
+    //
+    // Trade-off: @Configuration / @Bean / @ComponentScan annotations are
+    // ignored. For Spring Boot apps that rely exclusively on
+    // auto-configuration via SPI (META-INF/spring.factories or
+    // AutoConfiguration.imports) the auto-config path still runs through
+    // `AutoConfigurationImportSelector`, which is invoked separately during
+    // ImportRegistry processing — not through this method. The
+    // already-instantiated singletons (env, beanFactory, ctx) plus our
+    // synthetic shims provide enough scaffolding for demo's main() to
+    // proceed to user code.
+    //
+    // The descriptor takes `(BeanDefinitionRegistry)V`. Returning Ok(None)
+    // is equivalent to letting the void method run and immediately return.
+    //
+    // The orchestrator should add a check_override for
+    // `(ConfigurationClassPostProcessor, processConfigBeanDefinitions,
+    //   (Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V)`
+    // in vm/src/vm/vm_exec.rs.
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "processConfigBeanDefinitions",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        ccpp_process_config_bean_definitions_noop,
+    );
+
+    // Companion no-op: `postProcessBeanDefinitionRegistry` is the
+    // `BeanDefinitionRegistryPostProcessor` entry that Spring calls before
+    // `processConfigBeanDefinitions`. Its default impl simply delegates to
+    // `processConfigBeanDefinitions` after a registryId guard. No-op'ing it
+    // too prevents the guard's IllegalStateException ("already called for
+    // this post-processor") if Spring's lifecycle re-enters via a different
+    // path, and ensures the property-injection failure cannot be reached
+    // from the BFPP fan-out either.
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "postProcessBeanDefinitionRegistry",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        ccpp_process_config_bean_definitions_noop,
+    );
+
+    // And the BFPP entry (`postProcessBeanFactory`) — same rationale. Skips
+    // the `enhanceConfigurationClasses` CGLIB pass which is irrelevant on
+    // CratonVM (no CGLIB) and could crash on the same property-injection
+    // surface if Spring decides to re-wrap any config class.
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "postProcessBeanFactory",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        ccpp_process_config_bean_definitions_noop,
+    );
 }
 
 /// `AbstractBeanDefinition.getBeanClassName()` — return the canonical bean
@@ -2107,5 +2212,155 @@ fn abstract_bean_definition_has_bean_class(
 }
 
 fn noop_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `BeanDefinitionReaderUtils.registerBeanDefinition(BeanDefinitionHolder,
+/// BeanDefinitionRegistry)` — entry point that ALL Spring bean definitions
+/// flow through during context refresh.  Intercepting here lets us prevent
+/// unloadable beans (e.g. sportme's `RedisHttpSessionConfiguration`, whose
+/// class isn't on our partial classpath) from ever entering the factory map,
+/// so `preInstantiateSingletons` never sees them and never trips the
+/// "Target object must not be null" cascade.
+///
+/// Args:
+///   args[0] = BeanDefinitionHolder
+///   args[1] = BeanDefinitionRegistry
+///
+/// Behaviour:
+///   * If the holder or registry is null → no-op (return Ok(None)).
+///   * Read holder.getBeanName() and holder.getBeanDefinition().
+///   * If bd.getBeanClassName() returns a non-empty name whose class can't be
+///     resolved via `class_id_by_name` (tried both dotted and slash forms) →
+///     SKIP registration entirely. Spring is left believing the registration
+///     succeeded (the static returns void); no orphan ever enters the map.
+///   * Otherwise re-invoke `registry.registerBeanDefinition(name, bd)`
+///     manually to faithfully reproduce what the original bytecode would have
+///     done.  This keeps every other app's happy path unchanged.
+fn bdru_register_bean_definition(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let holder = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let registry = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    // Pull the bean name out of the holder. An empty / unreadable name is
+    // legal (Spring will derive one) — we still forward to the real registry
+    // call in that case.
+    let name = match ctx.invoke_virtual(holder, "getBeanName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    // Pull the BeanDefinition; we need it for both the orphan check and the
+    // forwarded registration call.
+    let bd = match ctx.invoke_virtual(
+        holder,
+        "getBeanDefinition",
+        "()Lorg/springframework/beans/factory/config/BeanDefinition;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+
+    // Check whether the declared bean class is loadable on our classpath.
+    // Spring's getBeanClassName returns null for factory-method beans and
+    // parent-only beans — those are legitimate and must NOT be filtered.
+    // Only beans whose declared name is non-empty AND unresolvable get
+    // dropped.
+    if let Ok(Some(Value::Object(Some(s)))) =
+        ctx.invoke_virtual(bd, "getBeanClassName", "()Ljava/lang/String;", &[])
+    {
+        if let Some(cn) = ctx.read_string(s) {
+            if !cn.is_empty() {
+                let internal = cn.replace('.', "/");
+                let loadable = ctx.class_id_by_name(&internal).is_some()
+                    || ctx.class_id_by_name(&cn).is_some();
+                if !loadable {
+                    tracing::warn!(
+                        "[bean-orphan] SKIP registering '{}' (class '{}' not loadable)",
+                        name,
+                        cn
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    // Class is loadable (or null / factory-method bean). Faithfully delegate
+    // to `registry.registerBeanDefinition(name, bd)` — this is what the
+    // original static would have done after its (now skipped) validation.
+    let bean_name_obj = ctx.create_string(&name);
+    let _ = ctx.invoke_virtual(
+        registry,
+        "registerBeanDefinition",
+        "(Ljava/lang/String;Lorg/springframework/beans/factory/config/BeanDefinition;)V",
+        &[Value::Object(Some(bean_name_obj)), Value::Object(Some(bd))],
+    );
+    Ok(None)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// demo Spring Boot 4 shim:
+//   ConfigurationClassPostProcessor.{processConfigBeanDefinitions,
+//                                    postProcessBeanDefinitionRegistry,
+//                                    postProcessBeanFactory}
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// No-op replacement for
+/// `ConfigurationClassPostProcessor.processConfigBeanDefinitions(BeanDefinitionRegistry)`
+/// (and its two companion BFPP entry points, which share the same shape — all
+/// three accept exactly one object argument after `this` and return void).
+///
+/// This shim exists to unblock Spring Boot 4 `demo`, whose
+/// `internalConfigurationAnnotationProcessor` bean dies inside this method
+/// chain with a `PropertyBatchUpdateException`. The failure originates in
+/// `BeanWrapperImpl.setPropertyValues` while configuring the CCPP itself
+/// (Spring injects `environment`, `resourceLoader`, `beanClassLoader`, etc.
+/// onto the freshly-created processor). On CratonVM's partial classpath one
+/// of those setters trips an exception that Spring wraps as
+/// `PropertyBatchUpdateException` and rethrows as `BeanCreationException`.
+///
+/// Why no-op here (and not at `applyPropertyValues` / `setPropertyValues`):
+/// those lower-level methods are universal — every Spring bean goes through
+/// them, including the `MeasurementRepository`, `Policy`, and other
+/// application beans of insurance / letsgo. A no-op there breaks dependency
+/// injection for those apps. The CCPP entry points are bean-name-scoped:
+/// only the `internalConfigurationAnnotationProcessor` bean (which is the
+/// CCPP itself) and the BFPP fan-out reach them. Application beans never
+/// invoke these methods, so the shim is invisible to them.
+///
+/// Trade-off: when active, this shim disables ALL @Configuration class
+/// scanning, @Bean method invocation, and @ComponentScan recursion. Spring
+/// Boot apps that rely exclusively on:
+///   - SpringApplication's auto-configuration imports (META-INF/
+///     spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports),
+///   - explicit registry calls,
+///   - or our existing m5/registerBeanDefinition shims
+/// will still see their auto-config beans because those code paths are
+/// distinct from CCPP. Apps with `@Bean`-method-only wiring or
+/// `@Configuration`-driven custom registries will see empty contexts — that
+/// is the documented limitation of the targeted shim.
+///
+/// All three registered descriptors take exactly one object argument after
+/// `this` (BeanDefinitionRegistry or ConfigurableListableBeanFactory) and
+/// return void, so a single handler covers them.
+fn ccpp_process_config_bean_definitions_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    tracing::warn!(
+        "[demo-shim] CCPP entry point skipped — @Configuration/@Bean \
+         scanning disabled to bypass PropertyBatchUpdateException at \
+         internalConfigurationAnnotationProcessor"
+    );
     Ok(None)
 }

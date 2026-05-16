@@ -2124,13 +2124,150 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     );
 
     // LambdaMetafactory (static method stubs for bootstrap)
+    //
+    // These shims are hit when application code REFLECTIVELY invokes
+    // `LambdaMetafactory.metafactory(...)` (the `invokedynamic` opcode itself
+    // is short-circuited in `vm/src/runtime/invokedynamic.rs` and never calls
+    // this path). Notable reflective callers include:
+    //
+    //   * log4j 2.x `ServiceLoaderUtil.loadClassloaderServices` — builds a
+    //     `CallSite` via `metafactory(...)` then calls `cs.getTarget()` and
+    //     `.invoke()` to materialise a `Stream<Provider>`.
+    //   * Elasticsearch's CLI bootstrap goes through the same SPI helper.
+    //
+    // Returning `null` here makes the caller NPE inside `CallSite.getTarget()`
+    // ("Cannot invoke getTarget on null"). Worse, the NPE is rethrown out of
+    // the SPI loop so the ServiceLoader silently produces zero providers —
+    // which is what makes Elasticsearch report
+    // `CliToolProvider [server] not found, available names are []`.
+    //
+    // We can't faithfully reproduce the metafactory's lambda-proxy synthesis
+    // here (the bytecode-level path needs the BSM static-args, not the
+    // reflective arg list). What we CAN do is hand back a non-null
+    // ConstantCallSite whose target is a no-op MethodHandle. When the caller
+    // subsequently invokes the SAM, the no-op MH dispatches via
+    // `mh_dispatch`, which returns null for an unknown target — exactly what
+    // log4j/ES interpret as "no service provider", and crucially avoids the
+    // upstream NPE.
     let lmf = "java/lang/invoke/LambdaMetafactory";
     r.register(lmf, "metafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;",
-        |_ctx, _args| Ok(Some(Value::Object(None))));
+        |ctx, args| {
+            // args layout (with implicit `null` receiver slot 0 for statics
+            // when called via Class.getMethod().invoke() — but the standard
+            // native ABI in this codebase passes static args from slot 0):
+            //   args[0] = Lookup caller
+            //   args[1] = String invokedName
+            //   args[2] = MethodType invokedType (factory signature)
+            //   args[3] = MethodType samMethodType
+            //   args[4] = MethodHandle implMethod
+            //   args[5] = MethodType instantiatedMethodType
+            //
+            // If args[4] (implMethod) is a real MH allocated by one of our
+            // `Lookup.find*` shims we re-use it directly; otherwise we
+            // synthesise a no-op MH so the CallSite's target is still
+            // non-null.
+            let invoked_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let target_mh = match args.get(4) {
+                Some(Value::Object(Some(m))) => *m,
+                _ => {
+                    tracing::warn!(
+                        "LambdaMetafactory.metafactory: implMethod arg is null \
+                         (invokedName='{}') — returning ConstantCallSite with no-op MH",
+                        invoked_name
+                    );
+                    // Synthesise a no-op MH. mh_dispatch on a MH with an
+                    // empty class returns Value::Object(None), which is the
+                    // benign "no service provider" outcome.
+                    alloc_method_handle(
+                        ctx,
+                        "java/lang/invoke/LambdaMetafactory$NoOp",
+                        if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
+                        "()Ljava/lang/Object;",
+                        MH_KIND_STATIC,
+                    )
+                }
+            };
+            // Propagate the invokedType (factory signature) onto the MH's
+            // `type` field — some downstream JDK code reads `mh.type()` for
+            // arity validation before calling invokeExact.
+            if let Some(Value::Object(Some(mt))) = args.get(2) {
+                ctx.set_field_by_name(target_mh, "type", Value::Object(Some(*mt)));
+            }
+            // Allocate a ConstantCallSite with the target MH at slot 0
+            // (matches the synthetic layout used by `register_p60_callsite`).
+            let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+            ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
+            // Some JDK code reads `target` by name as well.
+            ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
+            Ok(Some(Value::Object(Some(ccs))))
+        });
     r.register(lmf, "altMetafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
-        |_ctx, _args| Ok(Some(Value::Object(None))));
+        |ctx, args| {
+            // `altMetafactory` packs (samMethodType, implMethod, instantiated,
+            // flags, ...) into args[3]: Object[]. Extract implMethod if
+            // present at index 1 of that array; otherwise fall back to a
+            // synthetic no-op MH.
+            let invoked_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let target_mh = match args.get(3) {
+                Some(Value::Object(Some(arr))) if ctx.array_length(*arr) > 1 => {
+                    match ctx.get_array_element(*arr, 1) {
+                        Value::Object(Some(m)) => m,
+                        _ => {
+                            tracing::warn!(
+                                "LambdaMetafactory.altMetafactory: implMethod (bsm_args[1]) is null \
+                                 (invokedName='{}') — using no-op MH",
+                                invoked_name
+                            );
+                            alloc_method_handle(
+                                ctx,
+                                "java/lang/invoke/LambdaMetafactory$NoOp",
+                                if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
+                                "()Ljava/lang/Object;",
+                                MH_KIND_STATIC,
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        "LambdaMetafactory.altMetafactory: bsm_args array is null/empty \
+                         (invokedName='{}') — using no-op MH",
+                        invoked_name
+                    );
+                    alloc_method_handle(
+                        ctx,
+                        "java/lang/invoke/LambdaMetafactory$NoOp",
+                        if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
+                        "()Ljava/lang/Object;",
+                        MH_KIND_STATIC,
+                    )
+                }
+            };
+            if let Some(Value::Object(Some(mt))) = args.get(2) {
+                ctx.set_field_by_name(target_mh, "type", Value::Object(Some(*mt)));
+            }
+            let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+            ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
+            ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
+            Ok(Some(Value::Object(Some(ccs))))
+        });
+
+    // NB: an earlier draft added a short-circuit for
+    // `org/apache/logging/log4j/util/ServiceLoaderUtil.loadClassloaderServices`
+    // that returned an empty Stream. The metafactory fix above is enough
+    // to suppress the NPE chain by itself, and short-circuiting the SPI
+    // would also mask any real provider discovery that succeeds via the
+    // normal path. If the metafactory fix proves insufficient, re-add the
+    // short-circuit at this point (returning a synthetic empty Stream
+    // object with field 0 = null array, field 1 = Int(0)).
 
     // StringConcatFactory — already registered in Phase 58 with full implementation
 }

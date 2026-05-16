@@ -1364,6 +1364,33 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+
+    // bytebuddy_probe (agent-bb2) — Object/array/primitive name short-circuits
+    // BEFORE the class_id lookup. ByteBuddy's `TypeDescription.ForLoadedType`
+    // hierarchy walk calls `Class.getSuperclass()` repeatedly; if our shim
+    // ever returns Object's own mirror as the superclass of Object (a cycle),
+    // ByteBuddy throws `IllegalStateException("Failed to resolve super class
+    // class java.lang.Object from [class java.lang.Object]")`. The real JDK
+    // returns `null` here for: interfaces, primitive types, void, and the
+    // `Object` class itself. We must match that EXACTLY, even when the
+    // mirror is a synthetic/duplicate one whose reverse-map entry points
+    // at a different ClassId-than-canonical-Object instance.
+    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+        return Ok(Some(Value::Object(None)));
+    }
+    // Per JLS 10.8 / `Class.getSuperclass()` spec: arrays report `Object`
+    // as their superclass (not the component type's superclass, not null).
+    // Handle this explicitly so a synthetic array mirror without a real
+    // ClassId still returns the correct answer.
+    if this_name.starts_with('[') {
+        if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+            let mirror = ctx.get_class_mirror(obj_id);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => return Ok(Some(Value::Object(None))),
@@ -1389,6 +1416,32 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     }
     match ctx.superclass_of(class_id) {
         Some(parent_id) => {
+            // bytebuddy_probe (agent-bb2) cycle guard — if the class
+            // manager ever reports a class as its OWN superclass (a stale
+            // reload, a double-registration, or a legacy
+            // `super_class = self_index` constant-pool entry), refuse to
+            // propagate the cycle. ByteBuddy's hierarchy walk detects it
+            // anyway and throws `IllegalStateException`; returning null
+            // here matches what `Class.getSuperclass()` does for Object
+            // and lets the walk terminate cleanly.
+            if parent_id == class_id {
+                return Ok(Some(Value::Object(None)));
+            }
+            // Defensive: if the resolved parent's name is `java/lang/Object`
+            // and we ourselves ARE `java/lang/Object` under a different
+            // ClassId (canonical-vs-synthetic mirror split), return null.
+            // The string compare above already handles the common case;
+            // this catches the reverse-map-only path where slot-1 name was
+            // empty / corrupted.
+            if let Some(parent_name) = ctx.class_name_of_id(parent_id) {
+                if parent_name == "java/lang/Object"
+                    && (this_name.is_empty()
+                        || this_name == "java/lang/Object"
+                        || this_name == "java.lang.Object")
+                {
+                    return Ok(Some(Value::Object(None)));
+                }
+            }
             let mirror = ctx.get_class_mirror(parent_id);
             Ok(Some(Value::Object(Some(mirror))))
         }

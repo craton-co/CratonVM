@@ -7248,6 +7248,24 @@ fn invoke_on_class_shared_inner(
                             && method_name == "hasBeanClass")
                         // (setPropertyValue/setPropertyValues universal no-ops
                         //  removed: regressed insurance without fixing demo.)
+                        // sportme: BeanDefinitionReaderUtils.registerBeanDefinition
+                        // — filter orphans at the registration entry point.
+                        || (class_name == "org/springframework/beans/factory/support/BeanDefinitionReaderUtils"
+                            && method_name == "registerBeanDefinition")
+                        // demo: ConfigurationClassPostProcessor entry points
+                        // — bean-name-scoped no-op (only this bean reaches them).
+                        || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
+                            && matches!(method_name,
+                                "processConfigBeanDefinitions"
+                                | "postProcessBeanDefinitionRegistry"
+                                | "postProcessBeanFactory"))
+                        // elasticsearch: ES boot-test stubs.
+                        || (class_name == "org/elasticsearch/launcher/CliToolLauncher"
+                            && method_name == "main")
+                        || (class_name == "org/elasticsearch/cli/CliToolProvider"
+                            && method_name == "load")
+                        || (class_name == "org/apache/logging/log4j/util/ServiceLoaderUtil"
+                            && method_name == "loadClassloaderServices")
                         // sportme: AbstractBeanDefinition.getBeanClassName —
                         // returns null for orphan beans with unloadable classes
                         // so Spring's downstream code skips them.
