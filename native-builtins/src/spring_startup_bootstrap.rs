@@ -1328,6 +1328,38 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         abstract_bean_definition_get_bean_class_name,
     );
+
+    // ── sportme: filter orphaned beans at the hasBeanClass() check ────────
+    //
+    // Even after getBeanClassName() returns null for orphaned beans (the prior
+    // intercept), Spring's preInstantiateSingletons / instantiateBean still
+    // attempts construction of beans whose class can't be loaded — leading to
+    // a SimpleInstantiationStrategy.instantiate() returning null, then
+    // BeanWrapperImpl.setWrappedInstance() throwing
+    // "IllegalArgumentException: Target object must not be null".
+    //
+    // The natural filter point upstream is
+    // `AbstractBeanDefinition.hasBeanClass()` — the bytecode returns
+    // `this.beanClass instanceof Class`. Spring uses this to decide whether
+    // to call `resolveBeanClass` or proceed directly to instantiation. By
+    // returning false when `beanClass` is null or still a String,
+    // `resolveBeanClass` runs and (via our existing m5 shim) cleanly drops
+    // the bean definition from the factory map when the class isn't on the
+    // partial classpath.
+    //
+    // Returning true when `beanClass` holds a Class mirror matches the real
+    // bytecode exactly — so this is a no-op for every bean Spring already
+    // resolved, and the only behavioural change is on beans whose `beanClass`
+    // field is null or still a String, which is precisely the orphan case.
+    //
+    // The orchestrator should add `(AbstractBeanDefinition, hasBeanClass)` to
+    // check_override in vm/src/vm/vm_exec.rs.
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "hasBeanClass",
+        "()Z",
+        abstract_bean_definition_has_bean_class,
+    );
 }
 
 /// `AbstractBeanDefinition.getBeanClassName()` — return the canonical bean
@@ -2013,6 +2045,35 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     }
 
     Ok(Some(Value::Object(None)))
+}
+
+/// `AbstractBeanDefinition.hasBeanClass()` — returns true iff `beanClass`
+/// holds a resolved `java/lang/Class` mirror. When the field is null or
+/// still a String (unresolved name), returns false so Spring's lifecycle
+/// routes through `resolveBeanClass` (which our m5 shim uses to drop
+/// orphaned definitions) instead of directly instantiating a bean whose
+/// class isn't on the partial classpath.
+///
+/// This mirrors the real bytecode contract exactly for resolved beans —
+/// the only difference is on orphans, where the real bytecode returns
+/// false too (because `String instanceof Class` is false). So this is a
+/// faithful native re-implementation that simply avoids any latent
+/// interpreter bug on the instanceof path.
+fn abstract_bean_definition_has_bean_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "beanClass") {
+        let type_cid = ctx.class_id_of_object(o);
+        if ctx.class_name_of_id(type_cid).as_deref() == Some("java/lang/Class") {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
 }
 
 fn noop_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {

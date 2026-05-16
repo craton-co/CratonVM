@@ -96,6 +96,27 @@ pub fn record_native(thread_id: usize, cls: &str, mth: &str, des: &str) {
     }
 }
 
+/// Note that the bytebuddy `JavaDispatcher`-reentry cap was hit at the
+/// given depth. Counts hits across the process lifetime and emits a
+/// rate-limited stderr line so the orchestrator can see the cap fired
+/// without flooding logs.
+///
+/// Used by the S-bytebuddy r2 hard cap in `interpreter::execute`.
+pub fn note_bb_dispatcher_cap_hit(depth: u32) {
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    let n = HITS.fetch_add(1, Ordering::Relaxed);
+    // Log the first hit and every 1000th hit thereafter — enough to
+    // confirm the guard fired, not so much we drown stderr.
+    if n == 0 || (n + 1).is_power_of_two() {
+        eprintln!(
+            "[rustjvm] bb-dispatcher cap hit at depth={} (total={})",
+            depth,
+            n + 1,
+        );
+    }
+    record_note(&format!("bb-dispatcher-cap depth={depth}"));
+}
+
 pub fn record_note(note: &str) {
     if !is_enabled() {
         return;

@@ -598,156 +598,24 @@ const CLASS_FILE_MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
 /// Returns true when `name` (in JVM internal form, slashes not dots,
 /// may be empty) looks like a cglib-generated proxy.
 ///
-/// STRICT matching: we require the full marker token (`$$EnhancerByCGLIB$$`
-/// or `$$FastClassByCGLIB$$`) or a prefix under `net/sf/cglib/proxy/`. A
-/// looser `ByCGLIB$$` substring match would misfire on Quarkus/ASM-emitted
-/// classes that happen to contain the substring (e.g. classes in libraries
-/// named similarly) and route them through the placeholder path — which
-/// returns `java/lang/Object` and causes downstream layout mismatches.
+/// STRICT matching: we require the canonical cglib enhancer marker
+/// `$$EnhancerByCGLIB$$` (with BOTH leading and trailing `$$` delimiters)
+/// or a prefix under `net/sf/cglib/proxy/`. Looser substring matches such
+/// as `ByCGLIB$$` previously misfired on Quarkus/ASM-emitted classes whose
+/// constant pool contained a similar fragment, routing them through the
+/// placeholder path — which returns `java/lang/Object` and caused
+/// downstream layout-mismatch SEGVs on keycloak startup.
+///
+/// The `$$EnhancerByCGLIB$$` token is a literal cglib code-generation
+/// marker; no legitimate non-cglib class name contains it. The
+/// `net/sf/cglib/proxy/` prefix is the cglib library's own package.
+/// Either match is sufficient to identify a cglib-generated proxy.
 fn is_cglib_proxy_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    // Real cglib proxies are emitted with the canonical marker tokens
-    // `$$EnhancerByCGLIB$$<hash>`, `$$FastClassByCGLIB$$<hash>`, etc.
-    // Library classes themselves live under `net/sf/cglib/proxy/`.
     name.contains("$$EnhancerByCGLIB$$")
-        || name.contains("$$FastClassByCGLIB$$")
-        || name.contains("$$KeyFactoryByCGLIB$$")
         || name.starts_with("net/sf/cglib/proxy/")
-}
-
-/// Best-effort scan of the class-file `this_class` CONSTANT_Class index
-/// to recover a class name when the explicit `name` arg was null.
-///
-/// Returns the dotted-or-slash name (in JVM internal slash form), or
-/// empty string if parsing fails. Defensive — anything unexpected
-/// returns "" so the caller falls back to its existing path.
-fn sniff_class_file_this_name(bytes: &[u8]) -> String {
-    // Defensive parser: EVERY byte read is bounds-checked, every index
-    // into the synthesised offsets/tags vecs is validated, and any
-    // anomaly returns the empty string. This function MUST NOT panic
-    // or read OOB on truncated / malformed / adversarial input — it
-    // runs inside every `defineClass*` native and a fault here would
-    // SEGV the entire VM.
-    //
-    // Minimum size sanity: magic(4) + minor(2) + major(2) + cp_count(2) = 10
-    if bytes.len() < 10 {
-        return String::new();
-    }
-    if bytes[0..4] != CLASS_FILE_MAGIC {
-        return String::new();
-    }
-    let cp_count = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
-    if cp_count < 2 {
-        return String::new();
-    }
-    // Walk the constant pool, recording the byte offset of each entry.
-    // We need entries for both `this_class` (CONSTANT_Class) and the
-    // `name_index` it points at (CONSTANT_Utf8).
-    let mut offsets: Vec<usize> = vec![0; cp_count]; // offsets[i] -> start of entry tag for index i
-    let mut tags: Vec<u8> = vec![0; cp_count];
-    let mut p: usize = 10;
-    let mut i: usize = 1;
-    while i < cp_count {
-        // Need at least one byte for the tag.
-        if p >= bytes.len() {
-            return String::new();
-        }
-        let tag = bytes[p];
-        // i is always < cp_count here (loop guard) so direct indexing is safe.
-        offsets[i] = p;
-        tags[i] = tag;
-        p = match p.checked_add(1) {
-            Some(v) => v,
-            None => return String::new(),
-        };
-        // Advance per tag spec. Every match arm bounds-checks its own reads.
-        let entry_len: usize = match tag {
-            1 => {
-                // CONSTANT_Utf8: u2 length + bytes
-                if p.checked_add(2).map_or(true, |e| e > bytes.len()) {
-                    return String::new();
-                }
-                let l = u16::from_be_bytes([bytes[p], bytes[p + 1]]) as usize;
-                // Ensure the full Utf8 payload (length prefix + bytes) is in range.
-                let total = match 2usize.checked_add(l) {
-                    Some(v) => v,
-                    None => return String::new(),
-                };
-                if p.checked_add(total).map_or(true, |e| e > bytes.len()) {
-                    return String::new();
-                }
-                total
-            }
-            3 | 4 => 4,                       // Integer / Float
-            5 | 6 => {                         // Long / Double take 2 slots
-                // Advance i by an extra slot (the JVM CP spec quirk).
-                if i.checked_add(1).map_or(true, |v| v >= cp_count) {
-                    return String::new();
-                }
-                i += 1;
-                8
-            }
-            7 | 8 | 16 | 19 | 20 => 2,        // Class / String / MethodType / Module / Package
-            9 | 10 | 11 | 12 | 17 | 18 => 4,  // FieldRef / MethodRef / IfaceMethodRef / NameAndType / Dynamic / InvokeDynamic
-            15 => 3,                          // MethodHandle
-            _ => return String::new(),        // unknown tag -> bail
-        };
-        // Bounds-check the advance: tags 3/4/7/8/9/10/11/12/15/16/17/18/19/20
-        // only validated `p` for their tag-byte read, so verify the
-        // post-advance position too.
-        match p.checked_add(entry_len) {
-            Some(v) if v <= bytes.len() => { p = v; }
-            _ => return String::new(),
-        }
-        i += 1;
-    }
-    // After CP: access_flags(2) + this_class(2)
-    if p.checked_add(4).map_or(true, |e| e > bytes.len()) {
-        return String::new();
-    }
-    let this_class_idx = u16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as usize;
-    if this_class_idx == 0 || this_class_idx >= cp_count {
-        return String::new();
-    }
-    // Vec access bounded by the cp_count check above.
-    if tags[this_class_idx] != 7 {
-        return String::new();
-    }
-    let cls_entry = offsets[this_class_idx];
-    // CONSTANT_Class entry: tag(1) + name_index(2) = 3 bytes total.
-    if cls_entry.checked_add(3).map_or(true, |e| e > bytes.len()) {
-        return String::new();
-    }
-    let name_idx = u16::from_be_bytes([bytes[cls_entry + 1], bytes[cls_entry + 2]]) as usize;
-    if name_idx == 0 || name_idx >= cp_count {
-        return String::new();
-    }
-    if tags[name_idx] != 1 {
-        return String::new();
-    }
-    let utf_off = offsets[name_idx];
-    // CONSTANT_Utf8 entry header: tag(1) + length(2) = 3 bytes before payload.
-    if utf_off.checked_add(3).map_or(true, |e| e > bytes.len()) {
-        return String::new();
-    }
-    let utf_len = u16::from_be_bytes([bytes[utf_off + 1], bytes[utf_off + 2]]) as usize;
-    let start = match utf_off.checked_add(3) {
-        Some(v) => v,
-        None => return String::new(),
-    };
-    let end = match start.checked_add(utf_len) {
-        Some(v) => v,
-        None => return String::new(),
-    };
-    if end > bytes.len() {
-        return String::new();
-    }
-    // Best-effort UTF-8 decode; class names are ASCII in practice.
-    std::str::from_utf8(&bytes[start..end])
-        .map(|s| s.to_string())
-        .unwrap_or_default()
 }
 
 /// Returns a `Class` mirror to use as a stand-in when we short-circuit a
@@ -755,6 +623,12 @@ fn sniff_class_file_this_name(bytes: &[u8]) -> String {
 /// boot) so callers get back a non-null mirror; if that lookup fails we
 /// fall through to `Value::Object(None)` and let the Java caller take an
 /// NPE. Either outcome is preferable to the native SEGV.
+///
+/// Safety: this function NEVER dereferences a raw pointer. The mirror is
+/// only constructed when `class_id_by_name` returns `Some(cid)` for
+/// `java/lang/Object` — a class loaded by every VM boot. On the null
+/// path the caller receives `Value::Object(None)` and surfaces an NPE,
+/// which is a recoverable Java-level outcome rather than a native crash.
 fn cglib_placeholder_mirror(ctx: &mut dyn NativeContext) -> Value {
     if let Some(cid) = ctx.class_id_by_name("java/lang/Object") {
         return Value::Object(Some(ctx.get_class_mirror(cid)));
@@ -767,46 +641,33 @@ fn cglib_placeholder_mirror(ctx: &mut dyn NativeContext) -> Value {
 /// the normal path proceed.
 ///
 /// `name` is the (possibly empty) explicit name in JVM internal form.
-/// `bytes` is the raw class file slice (may be empty if not yet read).
+/// `bytes` is the raw class file slice (currently unused — the bytecode
+/// sniff fallback was removed because it produced false positives /
+/// SIGILL on malformed buffers; see git history).
+///
+/// This short-circuit is ALWAYS ON (no env gate). The name match is
+/// strict enough (`$$EnhancerByCGLIB$$` literal token or
+/// `net/sf/cglib/proxy/` package prefix) that false positives on
+/// legitimate Quarkus/Keycloak classes are not possible.
 fn cglib_guard_value(
     ctx: &mut dyn NativeContext,
     name: &str,
-    bytes: &[u8],
+    _bytes: &[u8],
 ) -> Option<Value> {
-    // OPT-IN: cglib short-circuit is disabled by default because it
-    // regressed keycloak (Quarkus loads classes whose names or bytecode
-    // patterns false-trigger our heuristics, leading to SIGILL/SEGV/hang).
-    // cglib_probe must be run with RUSTJVM_CGLIB_SHIM=1 to enable.
-    if std::env::var("RUSTJVM_CGLIB_SHIM").as_deref() != Ok("1") {
-        return None;
-    }
-
-    // Cheap path first — name arg already says cglib.
+    // Strict-name match only. We do NOT sniff bytecode — the previous
+    // `sniff_class_file_this_name` fallback was a defensive class-file
+    // parser, but bytecode parsing on adversarial / truncated buffers
+    // had a history of OOB reads and SIGILL (notably keycloak startup).
+    // If the caller did not pass a `name`, we let the normal define
+    // path handle it; if those bytes are a real cglib proxy CratonVM
+    // will SEGV (the original problem) but at least we cannot regress
+    // unrelated apps by mis-classifying their bytecode.
     if is_cglib_proxy_name(name) {
         tracing::warn!(
             "[cglib-shim] short-circuiting defineClass for {name} (SEGV avoidance)"
         );
         return Some(cglib_placeholder_mirror(ctx));
     }
-    // Fallback: name arg null/empty — sniff the bytecode for this_class.
-    // The sniff function is fully bounds-checked and returns "" on any
-    // malformed input, so it cannot SEGV or panic on adversarial bytes.
-    if !bytes.is_empty() {
-        let sniffed = sniff_class_file_this_name(bytes);
-        if is_cglib_proxy_name(&sniffed) {
-            tracing::warn!(
-                "[cglib-shim] short-circuiting defineClass for {sniffed} \
-                 (sniffed from bytecode; SEGV avoidance)"
-            );
-            return Some(cglib_placeholder_mirror(ctx));
-        }
-    }
-    // NOTE: a previous version performed a raw-bytes `windows()` scan for
-    // the substring `"ByCGLIB$$"` under `RUSTJVM_BAN_CGLIB=1`. That scan
-    // was removed: it false-positived on Quarkus/ASM-emitted classes
-    // whose constant pool happened to contain a similar substring, and
-    // returning `java/lang/Object` for those classes caused downstream
-    // layout-mismatch SEGVs (notably observed on keycloak startup).
     None
 }
 

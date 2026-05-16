@@ -843,6 +843,34 @@ pub(crate) fn native_loader_load_module(
         register_resource_roots(ctx, &physical_jars);
     }
 
+    // RKC19/WF39 — Brute-force fallback for the WildFly bootstrap entry points.
+    //
+    // The previous BFS in `collect_physical_main_dir_jars` *should* descend
+    // from `org.jboss.as.standalone` into its `org.jboss.as.server` dep and
+    // pick up `wildfly-server-*.jar`.  But that walk silently misses modules
+    // when `ensure_resolved` returns None (e.g. the dep references a layer
+    // path that didn't make it into our cached `module_path_root`) and we've
+    // observed the WildFly 39 boot path produce
+    // `NoSuchMethodException: org/jboss/as/server/Main.main`, which means
+    // `Class.forName("org.jboss.as.server.Main", false, mcl)` couldn't find
+    // the class on the dynamic classpath.
+    //
+    // Belt-and-braces: when loading any of the well-known WildFly bootstrap
+    // modules, additionally walk **every** `.jar` under
+    // `<root>/system/layers/<layer>/` and register them on the dynamic
+    // classpath.  This guarantees that the `wildfly-server-*.jar` reaches
+    // the application class loader regardless of any gap in our BFS.
+    //
+    // The walk runs at most ONCE per `(root, module_name)` pair (tracked in
+    // `BRUTE_FORCED_ROOTS`) and is capped at `MAX_BRUTE_FORCE_JARS` so a
+    // pathological deep tree cannot stall startup.
+    if is_brute_force_trigger(&name) {
+        let brute_jars = brute_force_collect_layered_jars(&roots, &name);
+        if !brute_jars.is_empty() {
+            register_resource_roots(ctx, &brute_jars);
+        }
+    }
+
     // Insert into cache, but check for race-loser.
     let mut cache = module_cache().lock();
     if let Some(existing) = cache.get(&name) {
@@ -1087,6 +1115,161 @@ fn collect_physical_main_dir_jars(start_module: &str) -> Vec<PathBuf> {
         }
     }
     jars
+}
+
+/// Set of `(root, module)` pairs that have already had a brute-force layered
+/// jar scan run against them.  Each pair is scanned at most once per VM
+/// lifetime to keep `loadModule` calls cheap after the first hit.
+static BRUTE_FORCED_ROOTS: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+fn brute_forced_roots() -> &'static Mutex<std::collections::HashSet<String>> {
+    BRUTE_FORCED_ROOTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_brute_forced_roots_for_test() {
+    if let Some(c) = BRUTE_FORCED_ROOTS.get() {
+        c.lock().clear();
+    }
+}
+
+/// Cap on the number of jars the brute-force walk will register.  WildFly 39
+/// ships ~1100 jars across all base-layer modules; 8192 gives ample headroom
+/// without risking unbounded scans for hostile module trees.
+const MAX_BRUTE_FORCE_JARS: usize = 8192;
+
+/// Bound on the recursion depth of the directory walk.  JBoss module dirs
+/// are flat (`<root>/system/layers/base/<dotted>/main/`) — depth 16 already
+/// covers anything legitimate while preventing symlink loops from running
+/// the walker away.
+const MAX_BRUTE_FORCE_DEPTH: usize = 16;
+
+/// Which module names trigger the brute-force layered jar walk.
+///
+/// These are the WildFly bootstrap entry points whose `<main-class>` lives
+/// in a transitive dep that the BFS walker may miss when the dep graph is
+/// composed across layers / add-ons.  When loading any of these modules we
+/// pay the one-shot cost of a full layered scan to guarantee the
+/// application class loader can find the entry-point's `main` method.
+fn is_brute_force_trigger(name: &str) -> bool {
+    matches!(
+        name,
+        "org.jboss.as.standalone"
+            | "org.jboss.as.server"
+            | "org.jboss.as.host-controller"
+            | "org.jboss.as.process-controller"
+            | "org.jboss.modules"
+    )
+}
+
+/// RKC19/WF39 — walk every `<root>/system/layers/*/` (and `<root>/system/add-ons/*/`)
+/// directory recursively, collecting all `.jar` files we find.
+///
+/// This is the brute-force fallback path: even when our BFS in
+/// `collect_physical_main_dir_jars` misses a transitive dep (because the
+/// dep cache returned None for an in-layer module we haven't seen yet),
+/// this walk forces every layered jar onto the dynamic classpath.
+///
+/// Per-root, per-trigger-module deduplication ensures the walk only runs
+/// once even when `loadModule` is invoked repeatedly for `org.jboss.as.standalone`.
+///
+/// Walks are bounded:
+/// - `MAX_BRUTE_FORCE_JARS` jars total per call
+/// - `MAX_BRUTE_FORCE_DEPTH` levels of directory nesting
+///
+/// Returns absolute paths of jar files (the caller passes them through
+/// `register_resource_roots` which dedupes against already-registered jars).
+fn brute_force_collect_layered_jars(
+    roots: &[PathBuf],
+    module_name: &str,
+) -> Vec<PathBuf> {
+    let mut jars: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let key = format!("{}|{}", root.to_string_lossy(), module_name);
+        {
+            let mut seen = brute_forced_roots().lock();
+            if !seen.insert(key) {
+                // Already scanned this (root, module) pair.
+                continue;
+            }
+        }
+        // Scan the canonical layered locations.  `system/layers/<layer>/` is
+        // the standard tree; `system/add-ons/<addon>/` mirrors the same shape
+        // for optional add-ons (e.g. WildFly's appclient add-on).
+        let layers_dir = root.join("system").join("layers");
+        if layers_dir.is_dir() {
+            collect_layer_subtree(&layers_dir, &mut jars);
+        }
+        let addons_dir = root.join("system").join("add-ons");
+        if addons_dir.is_dir() {
+            collect_layer_subtree(&addons_dir, &mut jars);
+        }
+        if jars.len() >= MAX_BRUTE_FORCE_JARS {
+            break;
+        }
+    }
+    jars
+}
+
+/// Helper for `brute_force_collect_layered_jars`: for each entry under
+/// `parent` (each entry is a *layer* or *add-on* name) recursively walk
+/// the subtree, pushing any `.jar` file we encounter into `out`.
+fn collect_layer_subtree(parent: &Path, out: &mut Vec<PathBuf>) {
+    let layer_dirs = match std::fs::read_dir(parent) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for layer_entry in layer_dirs.flatten() {
+        let layer_path = layer_entry.path();
+        if !layer_path.is_dir() {
+            continue;
+        }
+        recursive_collect_jars(&layer_path, 0, out);
+        if out.len() >= MAX_BRUTE_FORCE_JARS {
+            return;
+        }
+    }
+}
+
+/// Depth-limited recursive `.jar` collector.  Stops descending past
+/// `MAX_BRUTE_FORCE_DEPTH` levels or once `out.len()` hits the global cap.
+fn recursive_collect_jars(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth >= MAX_BRUTE_FORCE_DEPTH || out.len() >= MAX_BRUTE_FORCE_JARS {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_BRUTE_FORCE_JARS {
+            return;
+        }
+        let path = entry.path();
+        // `metadata()` (not `is_dir()`) avoids following symlinks twice.
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            // Skip symlinks defensively — they're the classic vector for
+            // walker loops on Windows junctions and Unix bind mounts.
+            continue;
+        }
+        if ft.is_dir() {
+            recursive_collect_jars(&path, depth + 1, out);
+        } else if ft.is_file() {
+            let is_jar = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("jar"))
+                .unwrap_or(false);
+            if is_jar {
+                out.push(path);
+            }
+        }
+    }
 }
 
 /// Search `roots` (filesystem dirs and JARs) for `entry_path` (a slash-

@@ -47,11 +47,17 @@ use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
 /// permissive (treat unknown classes as `java/lang/Object` subclasses, not
 /// interfaces) — matching HotSpot's "subclass of nothing else" tolerance
 /// for unresolved references during Pass 3.
+///
+/// Gated by `RUSTJVM_AUDIT_VERIFY=1` at the call site; `dead_code` is
+/// permitted because the adapter is unused when the gate is off (the
+/// regression-safe default).
+#[allow(dead_code)]
 struct ClassStoreHierarchy<'a> {
     class_store: &'a ClassStore,
     loaded_classes: &'a FxHashMap<(ClassLoaderId, String), ClassId>,
 }
 
+#[allow(dead_code)]
 impl<'a> ClassStoreHierarchy<'a> {
     fn lookup(&self, name: &str) -> Option<ClassId> {
         for loader_id in &[
@@ -1940,58 +1946,68 @@ impl ClassManager {
             .map_or(false, |parent| parent.has_finalizer);
         class.has_finalizer = self_declares || parent_has;
 
-        // Audit-fix #1 (CRITICAL): run the JVMS §5.4.1 Pass 2 / Pass 3
-        // verifier before the class is registered. Previously
-        // `define_class_with_options` recorded `skip_verification` in a
-        // side set but NEVER actually invoked the verifier, so every
-        // caller of `Unsafe.defineClass` / `MethodHandles.Lookup
-        // .defineClass` got a structurally valid but unverified class.
+        // Audit-fix #1 (REGRESSION SOURCE — env-gated, default OFF):
         //
-        // Skip cases (each matches HotSpot's policy):
-        //   - `options.skip_verification` — trusted runtime-generated
-        //     classes (CGLIB, ByteBuddy, JDK Proxy, hidden classes) that
-        //     emit bytecode our worklist verifier cannot model. The
-        //     caller asserted trust by setting the flag.
-        //   - CDS-cached bytes — already verified at archive-creation
-        //     time; re-verifying would be redundant.
-        //   - Synthetic stubs — created in-memory with empty bodies, no
-        //     bytecode to verify (real-bytecode upgrade path runs
-        //     verification on the replacement).
+        // The audit-fix branch wired `define_class_with_options` to run
+        // the JVMS §5.4.1 Pass 2 / Pass 3 verifier (`verify_class`,
+        // which calls `verify_class_bytecode` → the worklist /
+        // StackMapTable type-state algorithm) on every non-JDK class
+        // load. The pre-audit codebase ran ZERO verification on this
+        // path; the verifier was reached only via explicit callers.
         //
-        // On failure the class is dropped (never reaches the store /
-        // loaded_classes map) and the caller receives a typed
-        // `VmError::Linkage(LinkageError::VerifyError { .. })`.
-        // JDK classes (java/, jdk/, sun/, com/sun/) are pre-verified by
-        // javac/jlink at jrt build time. Re-verifying them here is
-        // expensive AND incorrect — our `verify_abstract_method_implementation`
-        // and friends use a simplified `find_method_recursive` that misses
-        // miranda methods and other JVM-spec corner cases, falsely rejecting
-        // legitimate JDK classes (Hashtable.size, Boolean.describeConstable,
-        // File.compareTo, …). Skip verification for the boot classpath,
-        // matching HotSpot's `-Xverify:remote` default.
-        let is_jdk_class = name.starts_with("java/")
-            || name.starts_with("jdk/")
-            || name.starts_with("sun/")
-            || name.starts_with("com/sun/");
-        if !options.skip_verification
-            && !is_jdk_class
-            && !self.cds_class_cache.contains_key(name)
-            && !class.is_synthetic_stub
-            && class.state != ClassState::Verified
-        {
-            let hierarchy = ClassStoreHierarchy {
-                class_store: &self.class_store,
-                loaded_classes: &self.loaded_classes,
-            };
-            if let Err(verify_err) = crate::verifier::verify_class(
-                &class,
-                &self.class_store,
-                &hierarchy,
-            ) {
-                // Verifier rejected the bytecode. Drop the guard set
-                // entry so retry attempts are not erroneously blocked.
-                self.loading_guard.remove(name);
-                return Err(VmError::Linkage(verify_err));
+        // Re-enabling unconditional verification broke keycloak
+        // (SIGILL / hang at `org/keycloak/common/Profile` lambda
+        // initialization → `FeatureOptions.getFeatureValues`) and risks
+        // similar regressions across Quarkus / Spring / Netty apps that
+        // load thousands of synthetic lambdas, proxies, and hidden
+        // classes whose bytecode our worklist verifier does not yet
+        // model correctly. The orchestrator separately rolled back
+        // `verify_abstract_method_implementation` inside
+        // `verify_class_structure`, but the heavier Pass 3 type-state
+        // walk dispatched here was still the dominant fault path.
+        //
+        // Restore pre-audit behavior by default. Set
+        // `RUSTJVM_AUDIT_VERIFY=1` to opt back in once the worklist
+        // verifier matches JVMS §5.4.3.3 method resolution and handles
+        // miranda / invokedynamic / lambda metafactory shapes. The new
+        // adapter (`ClassStoreHierarchy`) and the call below are
+        // preserved verbatim under the env gate so the audit work is
+        // not lost.
+        let audit_verify_enabled = std::env::var("RUSTJVM_AUDIT_VERIFY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if audit_verify_enabled {
+            // Skip cases (each matches HotSpot's policy):
+            //   - `options.skip_verification` — trusted runtime-generated
+            //     classes (CGLIB, ByteBuddy, JDK Proxy, hidden classes).
+            //   - CDS-cached bytes — already verified at archive-creation.
+            //   - Synthetic stubs — created in-memory with empty bodies.
+            //   - JDK classes (java/, jdk/, sun/, com/sun/) — pre-verified
+            //     by javac/jlink.
+            let is_jdk_class = name.starts_with("java/")
+                || name.starts_with("jdk/")
+                || name.starts_with("sun/")
+                || name.starts_with("com/sun/");
+            if !options.skip_verification
+                && !is_jdk_class
+                && !self.cds_class_cache.contains_key(name)
+                && !class.is_synthetic_stub
+                && class.state != ClassState::Verified
+            {
+                let hierarchy = ClassStoreHierarchy {
+                    class_store: &self.class_store,
+                    loaded_classes: &self.loaded_classes,
+                };
+                if let Err(verify_err) = crate::verifier::verify_class(
+                    &class,
+                    &self.class_store,
+                    &hierarchy,
+                ) {
+                    // Verifier rejected the bytecode. Drop the guard set
+                    // entry so retry attempts are not erroneously blocked.
+                    self.loading_guard.remove(name);
+                    return Err(VmError::Linkage(verify_err));
+                }
             }
         }
 

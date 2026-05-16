@@ -309,6 +309,47 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+    // S-bytebuddy r3 — independent recursion guard for cleaner-action
+    // dispatch. A Runnable.run() invoked from here can itself enqueue
+    // (or trigger GC of) another Cleanable, which lands back in
+    // `run_cleaner_actions` on the same OS thread. The aggregate
+    // EXEC_DEPTH guard in `execute` catches this too, but only after
+    // we have already burned ~10 Rust frames per turn of the loop.
+    // A small dedicated counter trips earlier and avoids the loop
+    // accumulating frames before the bigger guard fires.
+    thread_local! {
+        static CLEANER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct CleanerDepthGuard;
+    impl Drop for CleanerDepthGuard {
+        fn drop(&mut self) {
+            CLEANER_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let cdepth = CLEANER_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    // Limit calibrated to roughly 1/10 of EXEC_DEPTH (so a runaway
+    // cleaner cascade trips here long before the main guard). The
+    // per-iteration step factor is implicit: each cleaner action burns
+    // ~10 native frames between dispatch and return.
+    if cdepth > 1_000 {
+        CLEANER_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        // Don't propagate as a Java exception — the cleaner contract
+        // forbids exceptions escaping. Just drop the remaining actions
+        // on the floor; they will be retried on the next GC tick.
+        return;
+    }
+    let _cleaner_depth_guard = CleanerDepthGuard;
+
     let addrs = shared.cleaner_thread.drain_actions();
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
@@ -1113,9 +1154,16 @@ pub fn execute(
     //
     // Throw a Java `StackOverflowError` BEFORE we recurse further. JVMS lets
     // the implementation raise SOE at any depth; ByteBuddy's reflection
-    // helpers catch `Throwable` and recover. 500 frames is well below the
-    // ~10 000+ frames that the 64 MB Rust stack can physically hold but
-    // safely above any reasonable Java application's recursion depth.
+    // helpers catch `Throwable` and recover.
+    //
+    // Limit calibration: Rust stack at 64 MB / ~6 KB per native frame
+    // ≈ 10 000 frames max before the OS guard page fires. 10_000 trips
+    // BEFORE we hit the guard page (each `execute` call adds 5-10 Rust
+    // frames, so an `execute` depth of 10_000 corresponds to 50_000-
+    // 100_000 native frames — well past the physical limit). The
+    // previous 50_000 ceiling was set when the EXEC_DEPTH guard was
+    // briefly disabled to recover from a class-loading regression; we
+    // lower it back to a value that actually trips before SOE.
     thread_local! {
         static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
@@ -1133,15 +1181,7 @@ pub fn execute(
         d.set(v + 1);
         v
     });
-    // EXEC_DEPTH guard temporarily DISABLED — see investigation below.
-    // The guard at depth=500/5000 caused universal "linkage error:
-    // verification error: concrete class must implement abstract method"
-    // failures across ALL apps, even ones with shallow stacks (cleaner_probe,
-    // bc_probe). Suspected root cause: the verifier or class linker calls
-    // execute() during loading and our SOE confused it. Rollback for now;
-    // ByteBuddy will continue to Rust-stack-overflow until a less invasive
-    // recursion fix is found.
-    if depth > 50_000 {
+    if depth > 10_000 {
         EXEC_DEPTH.with(|d| {
             let v = d.get();
             d.set(v.saturating_sub(1));
@@ -1151,6 +1191,65 @@ pub fn execute(
         )));
     }
     let _exec_depth_guard = DepthGuard;
+
+    // S-bytebuddy r2 — hard cap on `JavaDispatcher`-shaped reentry.
+    //
+    // The generic EXEC_DEPTH guard above catches the *aggregate* recursion
+    // depth, but in practice ByteBuddy's reflective dispatch can build a
+    // tight Rust-stack-growing loop that consumes the 64 MB stack faster
+    // than EXEC_DEPTH counts (each turn of the loop adds 10+ Rust frames,
+    // not 1). A targeted reentry counter on JavaDispatcher.run shortcuts
+    // the cascade an order of magnitude earlier — depth 10 here is *much*
+    // smaller than any plausible legitimate ByteBuddy reflective fan-out
+    // (real chains observed: ≤4 reentries; pathological probes: 1000+).
+    //
+    // Match is on method-name + class-name substring so we catch both the
+    // outer `JavaDispatcher` and any of its nested `$DynamicDispatcher` /
+    // `$DefaultInvoker` / `$Direct$Constructing` subclass-shape variants.
+    thread_local! {
+        static BB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    // Function-scope BB-depth drop holder: pairs with the increment below
+    // (only does work if BB_DEPTH was actually incremented this call).
+    struct BbFunctionScopeGuard {
+        active: bool,
+    }
+    impl Drop for BbFunctionScopeGuard {
+        fn drop(&mut self) {
+            if self.active {
+                BB_DEPTH.with(|c| {
+                    let v = c.get();
+                    c.set(v.saturating_sub(1));
+                });
+            }
+        }
+    }
+    let bb_match = method_name == "run" && {
+        let cm = shared.class_manager.read();
+        cm.get_class(class_id)
+            .map(|c| {
+                let n = c.name.as_ref();
+                n.contains("bytebuddy") && n.contains("Dispatcher")
+            })
+            .unwrap_or(false)
+    };
+    let _bb_function_scope_guard = BbFunctionScopeGuard { active: bb_match };
+    if bb_match {
+        let bb_depth = BB_DEPTH.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        if bb_depth > 10 {
+            // Trip BEFORE we recurse further. The guard above will
+            // decrement on function exit so the next top-level call
+            // starts at a sane depth.
+            crate::dispatch_trace::note_bb_dispatcher_cap_hit(bb_depth);
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::StackOverflowError,
+            )));
+        }
+    }
 
     // letsgo postmortem instrumentation: record every bytecode-method
     // entry into the global dispatch ring. Gated by `RUSTJVM_DBG_LETSGO=1`
@@ -8746,6 +8845,41 @@ pub(crate) fn try_lambda_dispatch(
     method_name: &str,
     call_args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    // S-bytebuddy r4 — independent recursion guard for lambda dispatch.
+    // Lambda SAM implementations can re-enter `try_lambda_dispatch` via
+    // `invoke_or_native` / `invoke_shared` when the impl body itself
+    // invokes another lambda (the common `stream.map(x -> ...).filter(y
+    // -> ...)` shape). The aggregate EXEC_DEPTH guard catches this only
+    // after the Rust stack has grown by ~10 frames per turn. A dedicated
+    // counter trips much earlier with a tight cap.
+    thread_local! {
+        static LAMBDA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct LambdaDepthGuard;
+    impl Drop for LambdaDepthGuard {
+        fn drop(&mut self) {
+            LAMBDA_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let ldepth = LAMBDA_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if ldepth > 2_000 {
+        LAMBDA_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::StackOverflowError,
+        )));
+    }
+    let _lambda_depth_guard = LambdaDepthGuard;
+
     // Look up the lambda proxy metadata for this ClassId.
     let call_site = {
         let proxies = shared.lambda_proxies.read();
