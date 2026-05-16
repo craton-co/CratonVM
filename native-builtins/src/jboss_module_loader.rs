@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_types::{ObjectRef, Value};
 
@@ -742,6 +742,15 @@ pub(crate) fn native_loader_load_module(
         }
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
+    // KC17 Task A — unconditional entry-point trace.  Without this we
+    // cannot distinguish "brute-force walk didn't fire" from "loadModule
+    // wasn't called at all" when keycloak-16 still raises
+    // `NoSuchMethodException: org/jboss/as/server/Main.main`.
+    eprintln!(
+        "[kc17-bf] native_loader_load_module ENTRY: name={:?} brute_force_trigger={}",
+        name,
+        is_brute_force_trigger(&name)
+    );
     if let Err(e) = validate_module_name(&name) {
         return Err(e.into());
     }
@@ -931,6 +940,10 @@ pub(crate) fn native_loader_load_module(
                 entry_candidates.push((*fallback).to_string());
             }
         }
+        eprintln!(
+            "[kc17-bf] entry_candidates for module {}: {:?}",
+            name, entry_candidates
+        );
         for candidate in &entry_candidates {
             match ctx.ensure_class_initialized(candidate) {
                 Ok(_) => {
@@ -982,28 +995,95 @@ pub(crate) fn native_loader_load_module(
         // semantics come from the native intercept binding (or from the
         // synthetic bytecode body, which is also a single `return`).
         for synth_name in &entry_candidates {
-            if ctx.class_id_by_name(synth_name).is_some() {
+            // KC17 Task A — surface BOTH facts (class loaded? main present?)
+            // so the keycloak-16 boot trace shows whether the synth path
+            // even runs.
+            let cid_pre = ctx.class_id_by_name(synth_name);
+            let main_exists_pre =
+                ctx.method_exists(synth_name, "main", "([Ljava/lang/String;)V");
+            eprintln!(
+                "[kc17-bf] pre-synth check {}: class_id={:?} main_exists={}",
+                synth_name, cid_pre, main_exists_pre
+            );
+            // KC17 — critical fix.  Previously this guard only checked
+            // `class_id_by_name(...).is_some()` and skipped the synth when a
+            // class was loaded.  But `ensure_class_initialized` above can
+            // materialise a class stub that LACKS `main([Ljava/lang/String;)V`
+            // (e.g. a `NoClassDefFoundError`-stub or a partial class entry).
+            // The reflective `Class.forName(...).getDeclaredMethod("main",
+            // String[].class)` chain in jboss-modules then walks that stub's
+            // method table, finds no `main`, and throws
+            // `NoSuchMethodException`.  Skip the synth ONLY when the class is
+            // loaded AND already exposes a `main([Ljava/lang/String;)V`
+            // method.  Otherwise re-define so the reflective lookup resolves.
+            if cid_pre.is_some() && main_exists_pre {
                 eprintln!(
-                    "[jboss-bf] class already defined, skip synth: {}",
+                    "[kc17-bf] class already has main(String[]), skip synth: {}",
                     synth_name
                 );
                 continue;
             }
             let bytecode = build_synthetic_class_with_main(synth_name);
+            eprintln!(
+                "[kc17-bf] define_class_from_bytes('{}') bytecode_len={}",
+                synth_name,
+                bytecode.len()
+            );
             match ctx.define_class_from_bytes(synth_name, &bytecode) {
                 Some(cid) => {
+                    let main_exists_post = ctx
+                        .method_exists(synth_name, "main", "([Ljava/lang/String;)V");
                     eprintln!(
-                        "[jboss-bf] synthesised entry class {} -> cid={:?}",
-                        synth_name, cid
+                        "[kc17-bf] synthesised entry class {} -> cid={:?} main_exists_post={}",
+                        synth_name, cid, main_exists_post
                     );
                 }
                 None => {
                     eprintln!(
-                        "[jboss-bf] synthesise FAILED for {} (define_class_from_bytes returned None)",
+                        "[kc17-bf] synthesise FAILED for {} (define_class_from_bytes returned None); trying define_class_full",
                         synth_name
                     );
+                    // Fallback: some implementations only honour
+                    // `define_class_full`.  Try that pathway too so we get
+                    // a typed error string to log.
+                    match ctx.define_class_full(
+                        synth_name,
+                        &bytecode,
+                        0,
+                        DefineClassFull::default(),
+                    ) {
+                        Ok(cid) => {
+                            let main_exists_post = ctx.method_exists(
+                                synth_name,
+                                "main",
+                                "([Ljava/lang/String;)V",
+                            );
+                            eprintln!(
+                                "[kc17-bf] define_class_full OK {} -> cid={:?} main_exists_post={}",
+                                synth_name, cid, main_exists_post
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[kc17-bf] define_class_full FAILED for {}: {}",
+                                synth_name, e
+                            );
+                        }
+                    }
                 }
             }
+            // KC17 Task D — diagnostic after the (re)definition so the
+            // final state of `org/jboss/as/server/Main` is visible from
+            // CI output.  Logs the class_id AND whether `main` is now
+            // discoverable via the same `method_exists` query that
+            // reflective lookup will use.
+            let cid_post = ctx.class_id_by_name(synth_name);
+            let main_exists_post =
+                ctx.method_exists(synth_name, "main", "([Ljava/lang/String;)V");
+            eprintln!(
+                "[kc17-bf] post-synth state {}: class_id={:?} main_exists={}",
+                synth_name, cid_post, main_exists_post
+            );
         }
     }
 

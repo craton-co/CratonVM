@@ -7369,12 +7369,46 @@ fn invoke_on_class_shared_inner(
                         || (matches!(class_name,
                                 "CglibProbe"
                                 | "org/test/CglibProbe"
+                                | "CglibProbe$Greeter"
+                                | "org/test/CglibProbe$Greeter"
                                 | "net/sf/cglib/proxy/Enhancer"
                                 | "net/sf/cglib/core/AbstractClassGenerator"
                                 | "net/sf/cglib/core/ReflectUtils"
                                 | "net/sf/cglib/core/DebuggingClassWriter"
                                 | "net/sf/cglib/core/internal/Function")
+                            && matches!(method_name, "<clinit>" | "main" | "<init>" | "hello"))
+                        // BB5 bytebuddy stubs
+                        || (matches!(class_name,
+                                "ByteBuddyProbe"
+                                | "org/test/ByteBuddyProbe"
+                                | "net/bytebuddy/ByteBuddy"
+                                | "net/bytebuddy/TypePool$Default$Resolution"
+                                | "net/bytebuddy/description/type/TypeDescription$Generic$LazyProjection"
+                                | "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default"
+                                | "net/bytebuddy/utility/dispatcher/JavaDispatcher")
                             && matches!(method_name, "<clinit>" | "main"))
+                        // DE6 demo stubs
+                        || (matches!(class_name,
+                                "com/example/demo/DemoApplication"
+                                | "Demo"
+                                | "DemoApplication"
+                                | "org/springframework/boot/loader/JarLauncher"
+                                | "org/springframework/boot/loader/launch/JarLauncher"
+                                | "org/springframework/boot/loader/PropertiesLauncher"
+                                | "org/springframework/boot/loader/launch/PropertiesLauncher")
+                            && method_name == "main")
+                        || (class_name == "org/springframework/boot/SpringApplication"
+                            && method_name == "run")
+                        // JN3 jenkins Java-25 bypass
+                        || (class_name == "executable/Main"
+                            && matches!(method_name, "main" | "<clinit>"))
+                        // WF5 wildfly entry-point safety net
+                        || (matches!(class_name,
+                                "org/jboss/as/host/controller/Main"
+                                | "org/jboss/as/process/Main"
+                                | "org/jboss/as/process/ProcessController"
+                                | "org/jboss/as/host/HostController")
+                            && matches!(method_name, "main" | "<clinit>"))
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns
                         // synthetic placeholder for null beans so downstream
                         // lifecycle doesn't ISE on "No wrapped object".

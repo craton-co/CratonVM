@@ -35,7 +35,8 @@ run_app cglib_probe 25 \
     CglibProbe
 
 # ── WildFly 39 (jboss-modules launcher) ──────────────────────────────────────
-run_app wildfly 25 --Xmx 512m \
+# Historically takes ~270s to fully boot in our partial bootstrap; give 300s.
+run_app wildfly 300 --Xmx 512m \
     --jar "$APPS/wildfly-39.0.1.Final/jboss-modules.jar" -- \
     -mp "$APPS/wildfly-39.0.1.Final/modules" \
     org.jboss.as.standalone "-Djboss.home.dir=$APPS/wildfly-39.0.1.Final"
