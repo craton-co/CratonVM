@@ -19,14 +19,6 @@ run_app() {
     echo "$name rc=$rc"
 }
 
-run_app wildfly 300 --Xmx 512m \
-    --jar "$APPS/wildfly-39.0.1.Final/jboss-modules.jar" -- \
-    -mp "$APPS/wildfly-39.0.1.Final/modules" \
-    org.jboss.as.standalone "-Djboss.home.dir=$APPS/wildfly-39.0.1.Final"
-run_app keycloak-16 25 --Xmx 512m \
-    --jar "$APPS/keycloak-16.1.1/jboss-modules.jar" -- \
-    -mp "$APPS/keycloak-16.1.1/modules" \
-    org.jboss.as.standalone "-Djboss.home.dir=$APPS/keycloak-16.1.1"
 run_app bluej 25 --Xmx 512m --jar "$APPS/BlueJ-540.jar"
 
 echo "=== SUMMARY iter=$ITER ==="

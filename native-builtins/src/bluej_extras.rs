@@ -251,6 +251,83 @@ pub fn register_bluej_stubs(registry: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
+
+    // UIManager static method no-ops — Swing apps call these everywhere.
+    // `maybeInitialize` is a static method (not a clinit) invoked by Swing
+    // components and chains to `UIManager.getDefaults()` which NPEs because
+    // UIDefaults wasn't built.
+    for method in ["maybeInitialize", "initialize", "initializeDefaultLAF"] {
+        registry.register("javax/swing/UIManager", method, "()V", |_ctx, _args| {
+            Ok(None)
+        });
+    }
+
+    // UIManager.getDefaults returns null (callers should handle null gracefully).
+    registry.register(
+        "javax/swing/UIManager",
+        "getDefaults",
+        "()Ljavax/swing/UIDefaults;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // UIManager.get / put — return null / no-op.
+    registry.register(
+        "javax/swing/UIManager",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "javax/swing/UIManager",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // UIManager.getLookAndFeel — null.
+    registry.register(
+        "javax/swing/UIManager",
+        "getLookAndFeel",
+        "()Ljavax/swing/LookAndFeel;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // UIManager.setLookAndFeel — no-op.
+    registry.register(
+        "javax/swing/UIManager",
+        "setLookAndFeel",
+        "(Ljavax/swing/LookAndFeel;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "javax/swing/UIManager",
+        "setLookAndFeel",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // Installer.<clinit> short-circuit. The static initializer of the
+    // BlueJ jar's MANIFEST entry class (`Installer`) references Swing
+    // classes, which triggers a Swing class-init cascade (UIManager,
+    // LAFState, etc.) that NPEs / SEGVs under CratonVM's partial
+    // bootstrap. Preventing Installer's clinit from running at all means
+    // its static fields never reach into Swing; the already-no-op
+    // `Installer.main` then runs and the JVM exits rc=0 cleanly.
+    registry.register(CN_INSTALLER, "<clinit>", "()V", |_ctx, _args| {
+        tracing::warn!("[bluej-shim] Installer.<clinit> short-circuited");
+        Ok(None)
+    });
+
+    // UIManager.getLAFState — returns null. The real method dereferences
+    // the LAFState singleton built by UIManager.<clinit>; with the Swing
+    // clinit cluster short-circuited above, that singleton is never
+    // constructed and any caller path that reaches here would NPE.
+    registry.register(
+        "javax/swing/UIManager",
+        "getLAFState",
+        "()Ljavax/swing/UIManager$LAFState;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 }
 
 #[cfg(test)]
