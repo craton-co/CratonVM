@@ -2511,3 +2511,732 @@ RustJVM is **100% production-ready** when:
 10. **Phase Z complete** — every deprecated-for-removal API is gone or properly shimmed.
 
 At that point RustJVM can replace HotSpot as the JVM for any Java 25 application.
+
+---
+
+# Per-Crate Code Audit — 2026-05-16
+
+A workspace-wide code review run as 16 parallel agents (one per crate). Findings are organized by crate and tagged: **(0)** code review, **(1)** vulnerabilities, **(2)** stubs/unimplemented, **(3)** performance, **(4)** tests.
+
+Cross-cutting summary at the end.
+
+---
+
+## reader
+
+### (0) Code review
+- `class_reader.rs:36-45` — `validate_count` is effectively dead: every `MAX_*` cap equals `u16::MAX`, which a `u16` count can never exceed.
+- `class_reader_error.rs:34` — `UnknownAttribute` variant is unused (unknown attrs flow through `Attribute::Unknown`).
+- `class_reader.rs:488` — `let _base_pc = base_pc;` no-op marker left for "future offset validation".
+- `class_reader.rs:825-893` — `read_target_info` returns `Vec<u8>` raw bytes that are immediately re-encoded byte-by-byte downstream; the right model is a typed enum once verification lands.
+- `class_reader.rs:707-714` — `name.to_string()` when the value already lives as `Arc<str>` in the CP.
+- `instruction.rs:239-262` — `*pc + 1`, `*pc + 3` arithmetic can overflow `usize` on adversarial input.
+
+### (1) Vulnerabilities
+- **`tableswitch` OOM (`instruction.rs:464-487`)** — `count = (high - low + 1) as usize` is bounded only by `i32::MAX`; `Vec::with_capacity(count)` allocates ~16 GB on crafted bytecode. Cap against remaining `code.len()`.
+- **`lookupswitch` OOM (`instruction.rs:496-519`)** — same shape: `Vec::with_capacity(npairs)` with `npairs <= i32::MAX`. Bound by `(code.len() - next) / 8`.
+- **`buffer.rs:36-104`** — every `read_*` does `position + N > len`, which can wrap. Pattern should be `len - position >= N`.
+- **Unknown attribute / StackMapTable body copy (`class_reader.rs:459, 709`)** — up to 4 GB allocated verbatim into a `Vec` on huge files; bounded by buffer remaining but no policy cap.
+- **`class_reader.rs:483-485`** — `EnclosingMethod`, `NestHost`, `ModuleMainClass`, `ConstantValue` don't validate the attribute_length matches the fixed payload size; a malformed file desyncs parsing.
+- **`jimage.rs:687-688`** — `start as usize..end as usize` on `u64` indices truncates on 32-bit targets before bound-check; add `start <= usize::MAX` guard.
+
+### (2) Stubs / Unimplemented
+- `attribute.rs:31-32, 262-268` — `StackMapTable { entries: Vec<u8> }` raw bytes, parsed-but-not-wired into the `Attribute` enum.
+- `TypeAnnotation::target_info: Vec<u8>` deferred until verification (Phase 3 marker).
+- `jimage.rs:188-189, 669-671` — `Compressed` resources error out instead of decompressing.
+
+### (3) Performance
+- `class_reader.rs:395-720` — `read_attributes` dispatch is a 30-arm `match` on `&str`; use `Arc<str>` pointer identity or pre-interned `AttributeId` enum.
+- `read_bytes(length)?.to_vec()` at lines 459, 709, 926 — every Code body / StackMapTable / Unknown attribute copies the entire payload; switch the source slice to `Arc<[u8]>` for zero-copy.
+- `jimage.rs:687` — `resources[...].to_vec()` copies every class file out of jimage per lookup; thousands of class loads at boot duplicate the entire boot module.
+- `intern.rs:35-36` — `StringPool` keeps both `HashSet<&'static str>` and `HashMap<&'static str, Arc<str>>` over the same keys; consolidate.
+- `signature.rs:152, 165` — `String::from_utf8_lossy(...).into_owned()` allocates on ASCII data; signatures are already validated UTF-8.
+
+### (4) Tests
+- **No fuzz harness** for `read_class` — anecdotal truncated/invalid-magic tests only.
+- **No OOM tests** for `tableswitch` / `lookupswitch` paths flagged above.
+- **No malformed Code attribute** tests (`code_length=0`, `code_length > attribute_length - header`, `end_pc < start_pc` in exception table).
+- **`Record` / `PermittedSubclasses` / `NestMembers` / `LoadableDescriptors`** parsed but not end-to-end tested against real class files.
+- `tests/wp1_7_attrs.rs` silently no-ops if the fixture is missing — failure mode is invisible in CI.
+
+---
+
+## types
+
+### (0) Code review
+- `value.rs:11` — `Value` enum size invariant (16 bytes) is asserted in a *different* crate (`jit/src/lib.rs`); move the `static_assert` into `types`.
+- `value.rs:150` — `Value::as_object` returns `Option<Option<ObjectRef>>` — confusing nested-Option API. Split into `as_object_ref` + `is_object_or_null`.
+- `value.rs:60` — `ObjectRef::from_raw` panics on null/unaligned; add `try_from_raw`.
+- `heap_types.rs:113` — `ObjectHeader` exposes `_padding`, `_gc_reserved`, `forwarding_ptr` as `pub`. Mutating these bypasses GC invariants.
+- `compact_value.rs:219` — `CompactValue::tag()` returns `Double` for `Long`; documented footgun.
+- `error.rs:171` — `RuntimeError` has 30+ variants — borderline oversized. Carve out `JavaIoError`.
+
+### (1) Vulnerabilities
+- **47-bit pointer truncation in `CompactValue::object` (`compact_value.rs:179`)** — silently masks pointers in release; only `debug_assert` in debug. Breaks on AArch64 52-bit VA, x86-64 5-level paging (57-bit), and `MAP_FIXED` allocations above `0x0000_7FFF_FFFF_FFFF`. Real portability hazard. Gate with `cfg` and use checked constructor.
+- **`Send + Sync` on `ObjectRef` (`value.rs:103`)** — assumes single-threaded model; comment says so but the impl ships unconditionally.
+- **`decode_value` (`value.rs:198-211`)** — silently degrades unaligned/null `VTAG_OBJECT` to `Object(None)`; hides real bugs writing non-ref bits through a ref accessor.
+- **`NANBOX_BITS` (`compact_value.rs:42`)** — no `cfg(target_pointer_width = "64")` gate; builds and silently misbehaves on 32-bit.
+
+### (2) Stubs / Unimplemented
+- `RuntimeError::NotImplemented` (`error.rs:256`) used as a fallback variant — proliferates and is misused as "internal error" downstream.
+- `value.rs:37` — doc-comment marker "will be replaced with a proper GC-managed pointer in Phase 6".
+
+### (3) Performance
+- `intern.rs:30` — `StringPool` single `Mutex` is contended in multi-threaded class loading; shard or use `DashMap`/`RwLock`.
+- `error.rs:179` — many variants carry `String` payloads, allocating on the success-of-error path. Use `Cow<'static, str>` or `Arc<str>` (the interner is already a dep!).
+- `Value::Object(Option<ObjectRef>)` adds a discriminant for null since the raw pointer has no niche; flatten by using a sentinel.
+
+### (4) Tests
+- Strong coverage of `MIN/MAX`, `-0.0`, NaN, alignment edges, array overflow.
+- **No test for `CompactValue::object` with pointers > 47 bits** — release-mode silent truncation is uncovered.
+- **No offset-asserts on `ObjectHeader`** for `class_id`, `kind`, `element_type`, `forwarding_ptr` — JIT-consumed fields can silently drift.
+- **No test verifies the canonical NaN bit pattern** is actually produced (only `is_nan()` is checked).
+- `intern_arc` cross-mode concurrency test missing.
+
+---
+
+## native-api
+
+### (0) Code review
+- **Trait bloat**: `NativeContext` (`registry.rs:104-1236`) is a god-trait with 100+ methods spanning threading, JPMS, FFI, JFR, reflection, modules, classloading, GC, scoped values. Split into focused sub-traits.
+- **Default impls drift fail-open**: `is_package_exported_unqualified` defaults `true` (`registry.rs:1072`), `check_deep_reflection_access` defaults `Ok(())` (`registry.rs:1181`). Security-relevant fallbacks must fail-closed.
+- **Dead imports**: `HashMap` unused in `registry.rs:6`, `ffi.rs:7`, `fd_table.rs:5`.
+
+### (1) Vulnerabilities
+- **Hash-collision panic on `register` (`registry.rs:1330-1335`)** — would abort the VM. Promote to per-key `Vec` chaining.
+- **Raw `*mut u8` exposure**: `allocate_native_memory` returns raw pointers (`registry.rs:791`), `find_native_symbol -> Option<usize>` (`registry.rs:801`). No use-after-free guard at the API layer.
+- **`NativeAllocation: Send + Sync` claimed at `ffi.rs:32-33`** under the assumption every caller wraps in a `Mutex`. Fragile.
+- **`init_level` mutex `.expect()` (`init_level.rs:77, 91, 93`)** panics on poison during bootstrap; use `into_inner` recovery.
+- **`poll_ready` non-atomic blocking-mode toggle (`fd_table.rs:741-800`)** — concurrent reader on the same socket can observe non-blocking state.
+- **`tcp_accept` TOCTOU (`fd_table.rs:678`)** — drops read-lock before re-acquiring write-lock.
+
+### (2) Stubs / Unimplemented
+- `redefine_class` default returns `Err("not implemented")` (`registry.rs:1011`).
+- `class_num_total_fields` default returns 0 (`registry.rs:275`) — docstring warns this causes OOB.
+
+### (3) Performance
+- **Native dispatch lock-traffic**: every call goes through `record_enter` + `record_exit` on a process-global `parking_lot::Mutex` ring. Under heavy native traffic (`Unsafe` hot loop) this is global serialization. Move to per-thread ring or atomic ring with relaxed ordering.
+- `name_map` (`native_ring.rs:46`) uses `Mutex` despite being read-only post-startup; switch to `OnceLock<FxHashMap>` after registration.
+- `find` fallback descriptor variants allocate 1-4 `String`s per miss (`registry.rs:1363-1400`).
+- `FileDescriptorTable` outer `RwLock` + per-entry `Mutex` (`fd_table.rs:55`) — switch to `DashMap` or `ArcSwap<FxHashMap>`.
+- `available()` (`fd_table.rs:333-355`) does three `seek` syscalls; use `metadata().len() - stream_position()`.
+
+### (4) Tests
+- **No tests for `alias_class`** (`registry.rs:1424`) parsing logic.
+- **No tests for the descriptor-fallback path in `find`** (`registry.rs:1363-1400`).
+- **`native_ring.rs` has no tests** despite 64-entry ring with wraparound and ordering invariants.
+- **No tests** for `TlsStream`, `UdpSocket`, `TcpStream`, `TcpListener`, `Pipe*`, `Child*Pipe`, `clone_file`, `pread_at`/`pwrite_at`, `poll_ready` — networking and subprocess paths entirely uncovered at unit level.
+
+---
+
+## native-collections
+
+> **Status**: Crate is `#[deprecated]` (Session 15) and gated behind `synthetic-jdk` feature in `Cargo.toml:14`. Still compiles and ships unconditionally. The "Definition of Done" already requires deleting this — the findings below are urgency-ordering for that removal.
+
+### (0) Code review
+- **One 19 576-line `lib.rs`**. No submodules.
+- `lib.rs:95` — orphan duplicate function body collapsed under a `///` line that makes it look like documentation. Dead/confusing.
+- Stray `eprintln!` debug spam in hot paths: `lib.rs:1150` (`[HM-EQ]` — even runs `std::env::var` per key compare), `1240`, `1254`, `1786`, `1818`, `2860`, `2868`.
+- `unbox_wrapper` (`lib.rs:187`) treats ANY object with one primitive field as a wrapper — user classes with a single `int` field are silently unboxed during HashMap key compare.
+- Vector methods (`native_vec_*`) delegate to ArrayList code with no monitor, violating Vector's synchronization contract.
+
+### (1) Vulnerabilities
+- **OOB returns null instead of throwing** — `native_al_get` (`:500`), `native_al_set` (`:522`), `native_al_add_at` (`:561`). Comments admit "IndexOutOfBoundsException (simplified)".
+- **No `ConcurrentModificationException` anywhere** — grep returns zero matches. Fail-fast iterators are absent.
+- **Hash collision DoS** — `map_hash_key` (`:1086`) is unsalted; `CHAIN_WALK_LIMIT = 4096` (`:1782`) silently drops dedup checks beyond 4096 collisions, allowing duplicate-key inserts.
+- **Capacity-doubling without overflow guards** — `pq_ensure_capacity` (`:10759`), `ad_ensure_capacity` (`:10302`), `tm_ensure_capacity` (`:12022`), `ts_ensure_capacity` (`:12091`).
+- **`al_ensure_capacity` (`:330`)** — silently returns the OLD buffer when cap exceeded, dropping `add()` writes with no `OutOfMemoryError`.
+- **CHM lock leak on inner errors** — `native_chm_put` (`:14337`), `_remove` (`:14354`), `_put_if_absent` (`:14375`) skip `monitor_exit` on `Err`.
+- **`native_lbq_take_blocking` (`:16053-16068`)** — spins 10 000 times then **returns null**, violating `BlockingQueue.take` contract.
+- **LinkedHashMap overlay keyed by raw pointer** (`:9574-9595`) — process-global `Mutex<HashMap<usize, ...>>` keyed on `this.as_ptr() as usize`. Stale entries leak into new objects when GC reuses addresses.
+
+### (2) Stubs / Unimplemented
+- HashMap missing `<init>(I, F)` (capacity, loadFactor) constructor (`:1390-1395`).
+- `map_resize` "cannot grow further" at `MAP_MAX_CAPACITY` silently keeps inserting into an over-loaded table (`:1226-1228`).
+- No `TODO`/`unimplemented!()` markers — code "completes" silently with `Ok(Some(Value::Object(None)))` where Java would throw (`:493, :497, :517, :551, :555, :585, :1751`).
+
+### (3) Performance
+- **TreeMap.put / TreeSet.add are O(n)** — `tm_insert_at` and `tm_remove_at` shift the whole flat array (`:12042, :12055`). Named "TreeMap"; implemented as sorted vector.
+- **LinkedBlockingQueue.poll shifts the entire array left on every dequeue** (`:16090-16092`). Should be linked list or ring buffer.
+- ArrayList iteration uses `ctx.get_array_element` in a Rust loop (`:594-597, :619-623, :1234-1273`). Expose a bulk-copy intrinsic on `NativeContext`.
+- No capacity hint propagation; `addAll` / `init_from_map` rehashes repeatedly.
+
+### (4) Tests
+- ~60 `#[test]`s but almost all are **registry-presence checks** (`r.find(c, "put", ...).is_some()`) — they verify method strings are registered but exercise zero behaviour.
+- **No JDK-semantics tests** for: null keys/values in HashMap, CME on iterator after add/remove, IOOBE on `List.get(-1)`, ClassCastException in TreeMap with incomparable keys, identity-vs-equals contract.
+
+---
+
+## native-io
+
+### (0) Code review
+- `lib.rs` is **12 960 lines** of god-module.
+- **Parallel registries for the same kernel resource** — `dgram_registry` (`datagram.rs:57`) vs existing `udp_registry`; `aio_registry` (`async_socket.rs:59`) vs `tcp_registry` (`socket_channel.rs:93`). Bytecode crossing the two APIs sees diverging fd state.
+- Silent option no-ops in `apply_option` (`socket_channel.rs:890`, `net.rs:577`) — SO_REUSEADDR, SO_RCVBUF, SO_SNDBUF, SO_KEEPALIVE silently `Ok(())`.
+- `random_access_file.rs:188` — `O_SYNC`/`O_DSYNC` silently dropped via `_ = (O_SYNC, O_DSYNC);`. Java spec requires durable writes for `"rws"`/`"rwd"`.
+- 487 `unwrap()`/`expect()` across the crate.
+
+### (1) Vulnerabilities (multiple serious)
+- **Naive path-traversal check (`lib.rs:96`)** — rejects `foo..bar.txt` while bypassable via UNC `\\server\share` or post-validation `\\?\C:\..\target`.
+- **Path validation is globally toggleable** (`set_path_validation_enabled`, `lib.rs:70`) — any in-process code disables it for everyone.
+- **RandomAccessFile bypasses path validation** (`random_access_file.rs:190`); same for `zip_real_jar.rs:128`.
+- **Zip-slip not handled** — `zip_real_jar.rs` uses `f.name()` as-is (`:229, :346, :428`).
+- **Process spawn accepts arbitrary `program`/`args`/`current_dir`** with no validation (`process.rs:154, 170`).
+- **TOCTOU**: `validate_path` canonicalizes (`lib.rs:105`) then returns a string; subsequent `File::open` re-resolves — symlink swap escapes the check.
+- **Unbounded allocations keyed on attacker-controlled `len`** — `net.rs:486, 527`, `socket_channel.rs:830`, `random_access_file.rs:245`, `process.rs:345, 454`, `zip_real_jar.rs:364`. A peer sending multi-GiB `len` triggers immediate OOM.
+- **Raw native pointer trust** — `net.rs:507-509, 530-531` `copy_nonoverlapping` to/from `addr` taken from Java `Long` with only `addr != 0` check. Java-side overflow or forged DirectByteBuffer address corrupts arbitrary process memory. Same in `async_socket.rs:911-913`, `socket_channel.rs:417-419, 453-455`.
+- **`pipe.rs:47-58`** — `closed` flag is non-atomic; concurrent close races leak/double-close OS handles.
+
+### (2) Stubs / Unimplemented
+- `net.rs:338` — `net_listen` no-op (accept-queue backlog ignored).
+- `net.rs:579-580` — SO_KEEPALIVE ignored.
+- `socket_channel.rs:893-895` — four TCP options accepted but no-op.
+- `file_channel.rs:282-289` — `maxDirectTransferSize0` returns constant; Windows `TransmitFile` not wired.
+- `direct_buffer.rs:42` — Cleaner integration "best-effort"; not driven by the GC.
+- `nio_native.rs:7` module docstring acknowledges its functions "work only as long as" callers don't observe.
+
+### (3) Performance
+- **Sync-blocking I/O on the user thread** — `bind`, `accept`, `connect`, `read`, `write` (`net.rs:321, 371, 419, 496, 538`). One global per-fd `RwLock` around `net_sockets()` means one slow client blocks every other Net op needing the write lock.
+- **No buffered I/O** — `read0`/`write0` go straight to the kernel; combined with byte-per-syscall in `random_access_file.rs:206-211, 266`, this is **syscall-per-byte** on the slow path.
+- `socket_channel.rs:863` — `buffer_read_bytes` copies the whole `ByteBuffer` into a `Vec<u8>` even for direct buffers.
+- `async_socket.rs:33` — worker pool uses `Mutex<VecDeque>` + `Condvar`; thundering-herd on every notification.
+- `random_access_file.rs:54` — global `Mutex<HashMap>` serializes **all** RAF ops process-wide.
+- `direct_buffer.rs:65` — 256 MiB hard cap on direct memory hardcoded; not wired to `-XX:MaxDirectMemorySize`.
+
+### (4) Tests
+- **No `tests/` directory**.
+- Path-validation tests only cover `/etc/../passwd`, null-byte, and the toggle. **Missing**: Windows `\\?\C:\..`, UNC, `%2e%2e`, legitimate `..` substrings (false positives), symlink TOCTOU.
+- **No tests for zip-slip rejection, malformed zip, or large-entry behavior** in `zip_real_jar.rs`.
+- **Windows-specific FS quirks** uncovered: trailing-dot, reserved names (`CON`, `PRN`), long paths > 260, case-insensitive collisions.
+- **No fuzz / property tests** anywhere in `native-io/src/`.
+
+---
+
+## native-builtins
+
+> Crate is enormous (`lib.rs` 34 736 lines, `phases_late.rs` 21 000+, `lang_class.rs` 10 839). Far exceeds its name — pulls in `rusqlite`, `zip`, `rustls`, `p12`, `libffi`. **Splitting recommended.**
+
+### (0) Code review
+- **`lang_system.rs:117`** — `arraycopy` same-array check uses pointer equality on `ObjectRef`. Works only because of ObjectRef's wrapping shape; will silently break if ObjectRef ever has multiple representations.
+- **`arraycopy` ArrayStoreException semantics wrong** (`lang_system.rs:40-133`) — no per-element type check; reference-array writes succeed silently regardless of component type.
+- **`lang_misc.rs:1001`** — registered `<init>()V` for 34 exception classes as `native_noop_with_this`, omitting the `write_throwable_cause(this, this)` that the proper helper does. `initCause` afterwards behaves asymmetrically vs the `(String)` constructor.
+- **`security_manager.rs:148, 187`** — when no policy file is loaded, `policy_allows` returns `true` (allow-all). Real JDK with SM installed denies most operations.
+
+### (1) Vulnerabilities
+- **Arena `read::<N>` bug (`lib.rs:13139-13148`)** — returns from offset 0, ignoring offset semantics. Every `get_byte(addr)` returns the same byte regardless of where in the arena `addr` was allocated. **Real correctness bug** for any caller computing `base + i*sizeof(T)` (e.g. `java.nio.Bits`).
+- **Arena `write` (`lib.rs:13150-13158`)** silently extends the arena beyond the originally requested size, breaking the buffer-overflow safety contract.
+- **Arena allocation race (`lib.rs:13083-13092`)** — `next_addr` lock released before `inner.write()` lock taken; saturating `next_addr` at `i64::MAX` causes all subsequent allocations to alias the same address.
+- **`unsafe_natives.rs:399-403, 498-504`** — `Unsafe.defineClass` / `defineAnonymousClass` set `skip_verification: true`. Gate behind a hardening flag.
+- **`panama.rs:23-47`** — `validated_fn_ptr` does null-and-alignment-check then `transmute_copy` to call arbitrary native code. If a JVM-side allocator hands an attacker-controlled address to a downcall, this is an arbitrary-code-execution primitive.
+- **`String.toLowerCase`/`toUpperCase`** (`lang_string.rs:1851, 1862`) uses Rust default case mapping; Turkish locale (`İ`/`ı`) diverges from JDK.
+
+### (2) Stubs / Unimplemented
+- `Unsafe.park` ignores `blocker` (`unsafe_natives.rs:89-108`) — `LockSupport.getBlocker` returns stale.
+- `Unsafe.invokeCleaner` does not actually free the buffer (`unsafe_natives.rs:126-148`) — DirectByteBuffer memory leaks per process.
+- `graalvm_compat.rs` has **99** `Ok(None)` returns — almost entirely stubs.
+- `vector_api.rs` (`jdk.incubator.vector`) — 56 `Ok(None)` patterns.
+
+### (3) Performance
+- **`arraycopy` is per-element through `NativeContext`** (`lang_system.rs:118-130`) — no bulk copy. For large primitive arrays this is the single biggest perf win in the crate.
+- `lang_string.rs:1564-1611` — `StringBuilder.indexOf` allocates `String::from_utf16_lossy` per call, then `find`, then `encode_utf16().count()`. Twice the string size allocated per call.
+- `lib.rs:13062-13165` — arena `HashMap<i64, Arena>` under `RwLock`; every `get_byte` takes the read lock. `java.nio.Bits` hot path serializes.
+- `lang_misc.rs:484-499` — `Throwable.addSuppressed` is O(N^2) — allocates a new array per call.
+
+### (4) Tests
+- 1 215 `#[test]` occurrences across 32 files — heavy unit-test density.
+- **Missing corner cases**: NaN handling for `Math.min/max` (Rust's `min`/`max` is impl-defined for NaN; JDK requires NaN propagation), surrogate-pair handling for `String.codePointAt`/`toLowerCase` on `İ`/`ı`, `Integer.MIN_VALUE` overflow in `absExact`/`negateExact`, `String.format` locale edges, `arraycopy` ArrayStoreException scenarios.
+- **`lang_class.rs` (10 839 lines)** has 158 `unwrap`/`panic` markers — many reflection helpers look unguarded.
+
+---
+
+## native-awt
+
+### (0) Code review
+- 91 native bindings registered (`natives.rs:21-31`), but ~42 (>45%) are pure no-op closures returning `void_ok()`. The entire Graphics2D family (`natives.rs:305-339`) never reaches `SoftwareRenderer` or `Graphics2DContext`.
+- `cocoa.rs:355-413` mixes `objc2-app-kit` typed APIs with raw `msg_send![class!("CGImage"), ...]` — but `CGImage` is a CF C function, not an Obj-C class; `class!("CGImage")` is null and **the blit silently no-ops on macOS**.
+- `cocoa.rs:519-546` (`rasterize_text`) explicitly returns an all-zero pixel buffer.
+- `Win32Backend::measure_text` (`win32.rs:565-578`) uses a hard-coded `0.6 * font_size` heuristic, ignoring the cached `DirectWriteRenderer` (the cached `dwrite` field at `win32.rs:117` is dead code).
+
+### (1) Vulnerabilities
+- `x11.rs:438-453` — casts `&[u32]` to `&[u8]` for `put_image` without checking the X server's `image_byte_order`; pixels swap channels on big-endian servers.
+- `image.rs:107-114` — `assert!` in `index()`; `natives.rs:370-381` casts negative coords to `u32`. A buggy Java caller panics the VM via `BufferedImage.getRGB`.
+- `win32.rs:765-775` — clipboard reader does manual null-terminator scan with no upper bound. Malformed clipboard payload missing a terminator walks unmapped memory.
+- `cocoa.rs:364-370` — passes raw `pixels.as_ptr()` into `CGDataProvider` with null `releaseData` callback while the `Vec<u32>` is on the Rust stack — lifetime is undefined.
+- `clipboard_set_text` (`win32.rs:797-806`) leaks `hmem` on `OpenClipboard` failure or ignored `SetClipboardData` result.
+
+### (2) Stubs (substantial)
+- Every Graphics2D drawing native is a no-op.
+- `drawString` no-op; `FontMetrics` uses crude `len() * size * 0.55` (wrong for non-ASCII).
+- `Frame::toFront`/`toBack`/`setIconImage`/`setMenuBar` no-ops.
+- `Clipboard` top-level natives no-op even though Win32/Cocoa backends implement them.
+- `JFileChooser` always returns CANCEL; `JOptionPane` only logs.
+- `EventQueue::getNextEvent` discards the event; `peekEvent` always null.
+- X11 clipboard stubbed; X11/Win32 file dialogs stubbed; Cocoa `rasterize_text` returns blank bitmap.
+
+### (3) Performance
+- `SoftwareRenderer::fill_rect_raw` (`renderer.rs:433-441`) — per-pixel `put_pixel` even for identity transforms. `slice::fill` per row would be ~20x faster.
+- `blit_image`/`blit_image_scaled` (`renderer.rs:662-706`) — scalar loops; no SIMD or row memcpy fast-path even when src/dst formats match.
+- Win32 `blit_buffer` (`win32.rs:421-499`) — `CreateDIBSection`/`DeleteObject` every paint; converts ARGB→BGRA pixel-by-pixel.
+- `rasterize_text` (`win32.rs:597-744`) allocates a fresh `IDWriteFactory` + `HFONT` + `DIBSection` per call.
+- `EDT::invoke_and_wait` uses 100 us sleep-poll (`edt.rs:150`) instead of the `Condvar` it allocates and immediately drops.
+
+### (4) Tests
+- 198 unit tests; **no `tests/` integration directory**.
+- Renderer has solid headless coverage (32 tests); image module has 19.
+- **`natives.rs` has exactly 1 test** — asserts `count >= 50` only. None of the 91 registered closures are exercised, so the no-op stubs above are invisible to CI.
+- **Zero pixel-equality / golden-image tests** — no end-to-end "render a `JButton` and compare hash" coverage.
+- **Platform backends (`win32.rs`, `x11.rs`, `cocoa.rs`) have no tests at all**, not even compile-time smoke tests with a mock `PlatformBackend`.
+
+---
+
+## jit-api
+
+### (0) Code review
+- **`JitRuntimeHelpersBuilder` is unused dead code** — `vm/src/jit/helpers.rs:1916` constructs `JitRuntimeHelpers` via a direct struct literal; the builder (`lib.rs:191-296`) is only exercised by in-crate tests.
+- **Stringly-typed builder API** — `Builder::set(&mut self, name: &str, addr: usize)` (`lib.rs:239-278`) accepts arbitrary strings and silently logs to stderr on typos. No compile-time safety, side-effecting on misuse.
+- **Triple duplication**: the 32-field list appears in the struct, `all_pointers`, `field_names`, `Builder::new`, and `Builder::set` (5 places). Adding a helper requires touching all five.
+- **Missing `#[non_exhaustive]`** on `JitRuntimeHelpers`, `CachedBytecodeMethod`, `LoweringError`.
+
+### (1) Vulnerabilities
+- **`usize`-typed function pointers with no type safety** — every field is `pub usize` representing a raw code address dereferenced as `extern "C"` with different signatures (`lib.rs:42-85`). A wrong-field-name `set()` (silently logged) wires the wrong signature with no compile-time check.
+- **`validate()` only checks non-zero** (`lib.rs:94-97`) — does not catch wrong-pointer-in-right-slot. Docstring mentions alignment but no impl.
+
+### (2) Stubs / Unimplemented
+- None. Closest is the `eprintln!("...unknown field...")` silent-degrade path.
+
+### (3) Performance
+- `null_pointers` and `validate` both allocate `Vec<&'static str>` for what should be a scalar bool.
+- `Arc<dyn GpuLowering>` indirection (`gpu_lowering.rs:3-7`) when there is exactly one implementor today.
+
+### (4) Tests
+- **No tests for `gpu_lowering.rs` at all** — `LoweringError` `Display` impl is untested.
+- `test_helpers_all_fields_distinct` (`lib.rs:480-501`) iterates only **29** of 32 fields — stale; `uncommon_trap`, `math_fma_double`, `math_fma_float` are missing.
+- Builder tests assert raw magic numbers (`assert_eq!(nulls.len(), 32)`) instead of computing against `field_names().len()`.
+- **No contract test**: "every name in `field_names()` is accepted by `Builder::set()`" is not asserted, so a typo in `set` would silently no-op.
+
+---
+
+## jit
+
+> The roadmap calls out "JIT crashes on FP math" and "JIT miscompilation on complex control flow". Both are confirmed below.
+
+### (0) Code review
+- **Monolithic `x64.rs` — 17 643 lines**. `compile()` is one giant match (`~6985-10800`); split per-opcode-family.
+- **Two parallel pipelines** — template-style emitter (`x64.rs`) and Sea-of-Nodes IR (`ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`). The IR is shadowed; `ir::ir_compatible` (`ir.rs:1012-1020`) rejects anything with field/invoke/typecheck/new — essentially every realistic method.
+- **"No panic in release" discipline is undermined** by `assert!` in `ExecutableBuffer::emit_byte` (`lib.rs:201-211, 230-234`), `expect(...)` in OSR trampoline (`lib.rs:854`), `process::abort()` on `make_executable` failure (`lib.rs:288-303`).
+- **`regalloc.rs` silently caps locals at 64** (`:319, 381, 399`); methods with >64 locals (legal up to 65535) get incorrect interference. No assertion or bail.
+- `ir.rs:537, 559` — phis hard-typed `IrType::Int` for all locals/stack; would miscompile float/double/reference phis if the IR were widened.
+- `ir.rs:950-1006` — `find_branch_targets` ignores `ifnull`/`ifnonnull` (0xc6/0xc7), `goto_w` (0xc8), `tableswitch`/`lookupswitch` — silently mis-detects merges.
+
+### (1) Vulnerabilities (multiple JVM-safety holes)
+- **GC root miscoverage (high severity)** — `oop_maps` is documented as "not yet populated" (`lib.rs:438-441, 472, 500`); fallback is conservative stack scan. Combined with `stack_oop_marks` tracked at compile-time but no emitted entries, a moving GC can miss real references or treat ints as oops.
+- **Deopt sentinel collides with valid values (high severity)** — `i64::MIN` returned as the deopt marker in RAX (`x64.rs:2951, 6644-6725`). A legitimate `long` method returning `Long.MIN_VALUE`, or a `double` returning `-0.0` (bit pattern `0x8000_0000_0000_0000`), is indistinguishable from "deoptimize". Use an out-of-band channel.
+- **W^X races and unchecked patching** — `patch_i32`/`patch_byte` (`lib.rs:254-268`) write to `self.ptr` without checking buffer state. `make_writable`/`make_executable` are non-atomic and not page-aligned-explicit. Apple-Silicon path (`platform.rs:222-240`) uses `mprotect`, but `MAP_JIT` pages require `pthread_jit_write_protect_np` with the `com.apple.security.cs.allow-jit` entitlement — current impl will fail or kill the process.
+- **OSR trampoline is non-reentrant** (`lib.rs:740-873`) — bakes `frame_locals.as_ptr()` as absolute `i64` immediate into a fresh executable buffer per invocation, then drops both. One mmap per OSR (DoS-able by hammering a hot loop); unsafe under unwinding.
+- **No stack-overflow check in prologue** — zero hits for `stack_check`/`guard_page`. Deep recursion crashes with raw SIGSEGV instead of `StackOverflowError`.
+- **Integer overflow in switch decoding** — `(high - low + 1).max(0) as usize` (`x64.rs:8923`, `regalloc.rs:57, 125`) — `max(0)` is applied AFTER `i32` wrap; a crafted classfile makes the JIT allocate huge `Vec`s or skip targets.
+- **No exception-table support** — `athrow` bails (`lib.rs:3373-3387`); implicit NPE/AIOOBE from JIT'd code must unwind through interpreter frames, but no unwind info is set up.
+
+### (2) Stubs / Unimplemented
+- **`frem`/`drem` (0x72, 0x73)** — scanner-accepted (`x64.rs:1771-1772`) but no codegen arm between `irem` and `ineg` (~8243). Falls to default and crashes/no-ops. **Root cause for "JIT crashes on FP math."**
+- `emit_float_binop` (`x64.rs:6747`) always materializes both operands via GPR, contradicting the doc comment promising XMM-resident optimization.
+- "26 rounds" optimization claim is not borne out — only `fold_constants + algebraic_simplify + gvn + eliminate_dead_nodes` run in a 8-iteration loop (`ir_optimize.rs:14-26`); other passes are single-pass. Total ~7 distinct passes.
+- IR builder bails on any unsupported opcode (`ir.rs:938-939`) — entire `invoke*`, `getfield`/`putfield`, `new`, `anewarray`, `monitor*`, `athrow` universe unsupported.
+
+### (3) Performance
+- Template emitter does one stack push/pop per opcode through frame slots; `pop_to_rax`/`push_from_rax` everywhere incurs many memory round-trips a proper regalloc would elide.
+- IR pipeline is gated to a tiny subset — wasted effort.
+- `canonicalize_stack` (`x64.rs:3315-3333`) flushes everything to memory at every merge; phi emission would be cheaper.
+- OSR trampoline allocates a fresh mprotected page per OSR entry; shared dispatching trampoline keyed on (target_addr, locals_ptr) would amortize.
+- No code/IR caching: every `compile()` rebuilds the IR and reruns analyses from scratch.
+
+### (4) Tests
+- FP unit tests are simple "load arg, op, return" patterns only. **No tests** for: FP loops with phis, FP arrays, `frem`/`drem` (zero hits), NaN propagation through long chains.
+- **Only 2 OSR tests**; no OSR-with-FP, no OSR-with-deopt, no OSR-into-inlined-frame.
+- 49 `deopt.rs` test markers but they test the *data structures*, not end-to-end JIT → interpreter through a real deopt point.
+- **No differential testing** — grep for `differential` returns no matches.
+- **No fuzzing** for bytecode scanner or codegen.
+- **`regalloc` 64-local truncation is not tested** — no method with >64 locals.
+
+### Top correctness blockers
+1. `frem`/`drem` codegen missing (`x64.rs:1771` + missing arm near 8243).
+2. IR back-edge merging in `add_merge_predecessor` after `activate_merge` already ran (`ir.rs:485-570`).
+3. Branch-target stack canonicalization is silently skipped when depths disagree (`x64.rs:7012-7017`) — root-cause candidate for "JIT miscompilation on complex control flow."
+4. `i64::MIN` deopt sentinel collision (`x64.rs:6721-6725`).
+5. Silent 64-local truncation in regalloc (`regalloc.rs:319, 381, 399`).
+6. Missing oop-map emission (`lib.rs:438-441`) — GC correctness hole.
+
+---
+
+## jit-cuda
+
+### (0) Code review
+- Clean module boundary: `lib.rs:11-14` explicitly forbids cudarc/libcuda references and JVM heap access — pure PTX-text emission. Good discipline.
+- `emit.rs:571-573` — `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` collapsed into a single arm that always errors downstream; the merging is dead code.
+- `emit.rs:710-715` — `fload`/`dload` delegate to `lload`; works because `Reg` carries its own `RegKind`, but the helper-name overlap is fragile.
+
+### (1) Vulnerabilities
+- No `unsafe`, no FFI. PTX text uses controlled formatters; user-controlled data flows only through `mangle()` (`lowering.rs:194-210`) with `[A-Za-z0-9_]` allowlist.
+- Direct `self.bytes[pc + 1]` indexing in `emit.rs` (e.g. `:391, 404, 548-549`) relies on `instr_size` correctness for memory safety on malformed `.class`. Defense in depth: prefer `.get(...).ok_or(...)`.
+
+### (2) Stubs / Unimplemented (real bug + scope notes)
+- **`frem`/`drem` emit `"rem.f32"` / `"rem.f64"` mnemonics (`emit.rs:813-817, 826-830`) — PTX has no such mnemonics; ptxas will reject any kernel that hits this path. Real bug.**
+- Analyzer accepts ~210 opcodes; lowering implements ~96 concrete behaviours. Roughly 30+ analyzer-accepted opcodes will still hit `UnsupportedNode` at `emit.rs:660-665` (`*cmp*`, exotic dups, branches outside the canonical loop guard).
+- Loop recognizer accepts at most one backward branch (`loop_recog.rs:62-73`) — no nested loops, no multi-loop methods.
+- Only static methods, primitive scalars + primitive arrays. No `Object[]`, no objects, no boxed types, no string ops, no fields, no method calls, no allocation, no try/catch, no switch.
+
+### (3) Performance
+- Per-thread `st.global.*` to `ret_ptr` for scalar returns (`emit.rs:1221-1235`) — every thread writes the same value. ptxas may CSE but bandwidth-wasteful for large N.
+- Bounds-check reloads `pN_len` per array access (`emit.rs:293-298`) instead of hoisting once.
+- `RegPool` allocates a register per literal (`emit.rs:300-301, 367-368`); kernel text grows.
+- Memory/launch/streams concerns live in `cuda-bridge` and `vm/runtime/gpu_marshal.rs`, not here.
+
+### (4) Tests
+- ~25 tests; **ptxas round-trip is `#[ignore]`** (`lowering.rs:401-422`) — default `cargo test` doesn't need CUDA. Good for CI.
+- **End-to-end Java → PTX → numerical-result tests missing** — ptxas test verifies syntax only; no kernel execution against a JVM reference.
+- No tests for `UnsupportedReturnType`, `JsrRet`, `Monitor`, `HasExceptionHandlers`, `NoCode`, `BadDescriptor`, `UnknownOpcode`.
+- No lowering test for `frem`/`drem` — the broken `rem.f32` mnemonic would be caught immediately.
+- `straight_line_method_lowers_without_loop` (`lowering.rs:457-469`) violates the "no synthetic bytecode" rule it claims to follow.
+
+---
+
+## cuda-bridge
+
+### (0) Code review
+- `backend_cuda.rs:103-152` — argument binding splits args into 5 type-specific `Vec`s with 5 cursor indices; could be one walk over a single `Vec<KernelArg>`.
+- `lib.rs:174-205` — `DeviceBuffer` exposes `len()`/`is_empty()` but no `Drop` impl or comment confirming `CudaSlice` cleans up.
+- `lib.rs:107-115` — README example (`README.md:33`) calls `module.launch(...)` which does not exist. README is out of sync.
+- `backend_cuda.rs:31-37` — `probe()` hard-codes `ordinal: 0`. Misleading "all devices" name.
+- `DeviceCaps` (`lib.rs:39-45`) is **not** `#[non_exhaustive]` — adding fields breaks pattern matches.
+
+### (1) Vulnerabilities
+- **`backend_cuda.rs:122-124, 147-150`** — `KernelArg::DevicePtr(u64)` passed via `builder.arg(&ptr)` as plain `u64`, bypassing cudarc's `CUdeviceptr` type. May misalign on cudarc 0.13's `DeviceRepr` for `u64`.
+- **`backend_cuda.rs:212-216`** — `device_ptr()` discards the `_record` returned by `CudaSlice::device_ptr`. In cudarc 0.13 this record is a sync handle ensuring the pointer remains valid relative to stream ordering. Dropping it may cause use-after-free / stream race if the buffer is freed while a kernel using the bare `u64` is still queued.
+- **`backend_cuda.rs:153-157`** — `unsafe { builder.launch(...) }` with no safety comment; arg/PTX mismatch is UB.
+- No mapping from `CUresult` codes to typed `DeviceError` variants — every cudarc error stringifies into `DeviceError::Driver(String)`. `Memcpy`/`Launch` variants exist but are never produced.
+
+### (2) Stubs / Unimplemented
+- No `todo!()`/`unimplemented!()`/`FIXME` in non-test code. `backend_stub.rs` is a deliberate `NoDriver` stub.
+
+### (3) Performance
+- `HashMap<String, CudaFunction>` keyed by `String` (`backend_cuda.rs:60`); every `launch_raw` does a string-hash lookup. Return a typed handle from `from_ptx` so callers skip the lookup.
+- No PTX module caching across calls — recompile/link per `from_ptx`.
+- Only `ctx.default_stream()` used — no async overlap of memcpy + compute.
+- No host-pinned memory API — pageable host memory roughly halves PCIe bandwidth versus pinned buffers.
+- Per-launch allocations of 5 `Vec`s (`backend_cuda.rs:103-152`); use `SmallVec`/`ArrayVec`.
+
+### (4) Tests
+- No `tests/` directory; only inline tests gated `#[cfg(all(test, not(feature = "cuda")))]`.
+- Stub-mode coverage solid, but **`DeviceModule::from_ptx`, `DeviceBuffer::{uninit,zeros,from_host,to_host}`** are not asserted to return `NoDriver` in stub mode.
+- **`gpu-it` feature is declared but no `#[cfg(feature = "gpu-it")]` tests exist** — feature is dead.
+- No `Send`/`Sync` static-assert tests for `DeviceContext`/`DeviceBuffer`.
+
+---
+
+## classloading
+
+### (0) Code review
+- **`define_class_with_options` skips verification entirely** (`class_manager.rs:1309-1944`). It records `skip_verification` in a side set (`:1892`) but **never invokes `verifier::verify_class` or `bytecode_verifier::verify_bytecode`**. Any caller of `define_class` (`Unsafe.defineClass`, `MethodHandles.Lookup.defineClass`) gets a structurally valid but unverified class.
+- `bootstrap → extension → application` delegation is **hard-coded** (`class_manager.rs:1281-1302`); `ClassFinder` trait has no `parent` link, no `loadClass` analogue.
+- 48 `unwrap()` calls in `class_manager.rs` (some test, several production).
+- Error propagation in `class_path.rs` uniformly swallowed into `tracing::debug!` (`:378, 384, 395, 466-468, 606-614`). A bad JAR via `-cp` produces zero diagnostics on stderr.
+
+### (1) Vulnerabilities
+- **Zip-bomb vector**: every read path preallocates `Vec::with_capacity(entry.size() as usize)` (`class_path.rs:477, 551, 562, 594, 990, 1635, 1718`). `size` is attacker-controlled — a JAR declaring `size = u64::MAX` triggers a multi-gigabyte allocation **before** any read. **No** `max_uncompressed_size` cap, no streaming limit, no ratio check.
+- **Zip-slip mitigation incomplete** — when *extracting fat-JAR entries* (`extract_fat_jar_entries`, `:541-574`), entry names go into `entries_cache` verbatim. No validation against `..`, absolute paths, NUL bytes. Same for `load_jmod` (`:1715-1724`) and `extract_jar_signer_blocks` (`:973-997`). In-memory only, so no on-disk write, but resource-namespace poisoning is possible.
+- **Multi-release shadow attack** (`class_path.rs:343-355`) — walks `META-INF/versions/{N}/...` from 25 down to 9 **regardless of the running JVM's release** and **regardless of whether the manifest declares `Multi-Release: true` for the specific class**. A JAR's `versions/25/java/lang/String.class` shadows the base entry.
+- **No JAR signature verification** — `extract_jar_signer_blocks` reads `.RSA`/`.DSA`/`.EC` blocks as opaque bytes and attaches them to `CodeSource`. No manifest-digest verification, no `.SF` parsing, no PKCS#7, no cert-chain validation. Signed JARs are trusted on filename alone.
+- **Symlink-traversal check is fail-open** — on `canonicalize` failure the check is silently skipped and the read proceeds (`class_path.rs:725-738`).
+- NUL-byte / backslash check inconsistent across `find_class_source_path` / `find_class_code_source_info` (`:834, 912`) vs the resource paths.
+
+### (2) Stubs / Unimplemented
+- No `TODO`/`FIXME`/`unimplemented!()` markers.
+- **Classloader hierarchy is the roadmap blocker.** `ClassFinder` has no parent link, no Java-side `ClassLoader` reference, no `findLoadedClass`/`defineClass` round-trip. Delegation is hard-coded in 3 lines. Custom Java-side loaders cannot participate.
+- **Module-system enforcement** is name-keying only — `scan_module_infos` collects every `module-info.class`, but `loadClass` does not consult module-readability or package-visibility.
+- PKCS#7 / cert-chain decoding explicitly punted (`class_path.rs:898-904`).
+
+### (3) Performance
+- Manifest re-read per JAR after the fat-JAR probe (`class_path.rs:435` + `448-450`).
+- `probe_fat_jar_structure` iterates only `0..archive.len().min(100)` (`:489-499`) — false-negatives on JARs where interesting entries are at index > 100.
+- `find_in_archive` takes the archive `Mutex` per class load (`:1629-1643`) — no parallel class loading from a single JAR.
+- `find_in_multi_release_archive` does up to **17 `by_name` probes per class lookup** (`:347-352`); cache versioned-name set or test `META-INF/versions/` existence first.
+- `find_class_code_source_info` re-canonicalizes the JAR path and re-scans signature blocks on every call (`:936-941, :973-997`).
+- `cds_class_cache` (`class_manager.rs:502`) is a byte cache, not a parsed-class cache; parsed `Class` is the expensive object.
+
+### (4) Tests
+- 5 test files / 59 `#[test]`s — all annotation, define/redefine, nest-host paths. **None test JAR/JMOD/jimage loading.**
+- **No tests** for: multi-release JAR resolution, malformed JARs (truncated central directory, zip-slip filenames, zip-bomb sizes, encrypted entries, ZIP64), conflicting class definitions across two JARs, user-defined classloader behaviour, signed JAR verification, JMOD with corrupted ZIP, jimage corruption.
+- Inline tests in `class_path.rs` cover Spring Boot fat-JAR happy path and 4 path-traversal cases. The crate's primary attack surface has no security-boundary coverage.
+
+---
+
+## gc
+
+> Roadmap notes "GC 23x slower on allocation-heavy workloads (Binary Trees, real-world object creation)". The root cause is identified below.
+
+### (0) Code review
+- **Cheney scan duplicated 6+ times**: `gen_heap.rs:1071-1390` repeats the same ref-array / Value-slot walk **four times** (Phase 2, Phase 2b, Phase 2.5b promoted scan, `collect_with_finalizers`). Near-identical copies in `gc.rs:137-204`, `gc.rs:328-438`, `old_gen.rs:369-415`, `concurrent_mark.rs:347-385`. Bug fixes must land in 6+ places.
+- `heap.rs:780-792` and `gen_heap.rs:1800-1811` use `process::abort()` for OOM — kills the entire VM with no Java-side `OutOfMemoryError`. `try_alloc_*` plumbing exists but the panicking wrappers are still on hot paths.
+- `gen_heap.rs:520-602` — `get_field` silently returns `Value::Object(None)` on `index >= num_slots`; `set_field` silently drops. Masks layout-mismatch bugs.
+- `gen_heap.rs:608-626` — `volatile_lock: Mutex<()>` serializes **every volatile read/write on the entire heap**. Replace with striped lock keyed on `obj_ref >> 3 & N-1`.
+- `reference.rs:125-145` `remove_timeout` and `heap.rs:982-996` `wait_for_gpu_critical` use `yield_now()` spin instead of `Condvar`.
+- `numa.rs`, `zgc.rs`, `metaspace.rs`, `class_unloading.rs` — large modules with no inbound call sites from the active heap path; appear to be dead.
+
+### (1) Vulnerabilities
+- Cheney scan reads `Value` via `std::ptr::read` (16 bytes) without checking the tag (`gc.rs:182`, `gen_heap.rs:1137`); a torn `Value::Object` during volatile access on another code path makes the GC follow a garbage pointer.
+- Write barrier (`gen_heap.rs:836-858`) reads target object header without holding any lock; safe only during STW. On a real concurrent GC this is a data race.
+- **Integer overflow in heap accounting** — `HEADER_SIZE + num_fields * SLOT_SIZE` uses unchecked `*` (`gen_heap.rs:243-244, 269, 334`). The `try_alloc_*` variants exist but the panicking versions allow attacker-controlled `num_fields` from a malformed class file to cause UB.
+- Forwarding pointer race (`gen_heap.rs:1969-1984`) — installs `forwarding_ptr` in OLD header **after** the new copy is made; a parallel marker (concurrent GC) reading in between sees a non-forwarded object and scans stale fields.
+
+### (2) Stubs / Unimplemented
+- **ZGC (`zgc.rs`)** — colored pointers + barriers implemented but `lib.rs:38` does not re-export anything; not wired into `VmHeap`. Effectively dead.
+- **NUMA (`numa.rs`)** — not exported. Dead.
+- **`class_unloading.rs`** — not exported. Dead.
+- **Concurrent marking** wired into `GenerationalHeap` (via `enable_concurrent_gc`) but `collect_garbage_inner` only runs the STW Cheney path. The "concurrent" machinery is built but not driven.
+- **Reference processing**: Soft/Weak/Phantom/Finalizer implemented in `reference.rs` but **Soft and Weak processing is not invoked from the minor-GC path**.
+- **Finalizer queue for G1** (`vm_heap.rs:440-446`) returns empty `Vec::new()` for dead finalizers — silent finalizer skip.
+
+### (3) Performance — root cause of the 23x regression
+1. **`gen_heap::alloc_object` / `alloc_array` never consults a TLAB** (`gen_heap.rs:1750-1764`). Every single object hits the global `young_from` mutex. TLABs exist (`tlab.rs`) and the refill API is wired (`gen_heap.rs:1780-1792`) but the allocation API bypasses them entirely. **This alone explains a >10x slowdown** vs HotSpot's per-thread bump pointer.
+2. Per-object zero-fill (`gen_heap.rs:1759`) — would be redundant if TLAB pre-zeroed the slab.
+3. Write barrier (`gen_heap.rs:836-858`) locks the **global** `card_table.lock()` on every reference store. The thread-local card buffer (`card_table.rs:175-196`) exists but is unused.
+4. **`pointer_map: HashMap<usize, usize>`** (`gen_heap.rs:983`, `gc.rs:117`) uses default SipHasher and grows from empty each GC. For Binary Trees (~100k live objects per GC) this is ~3 ms wasted per cycle. `rustc-hash` is already a dependency — use `FxHashMap`.
+5. **O(N^2) promoted scan**: `gen_heap.rs:1164-1170, 1327-1332` allocates a fresh `Vec` and iterates `pointer_map.values()` doing `old_gen.contains` per entry, per loop iteration.
+6. **`HashSet<usize>` for `scanned_promoted`** (`:1082`) — use the `GC_FLAG_MARKED` header bit instead of a side set.
+7. STW duration: `scan_dirty_cards` (`:2002-2057`) walks the **entire** old gen for every dirty card; worst-case ~10 ms for a 128 MB old gen with a single dirty card.
+
+### (4) Tests
+- **No allocation-storm benchmarks.** Zero `criterion` config; no `[[bench]]` in `Cargo.toml`. The 23x regression is invisible to the test suite.
+- **No multi-threaded GC tests.** All `collect_garbage` tests single-threaded; no concurrent alloc + GC.
+- **No long-running soak tests.** Max ~5 GC cycles in any test.
+- **No fragmentation regression test for `OldGen`.**
+- **No write-barrier completeness test** — only one card-dirty assertion exists.
+- TLAB tests are extensive at the unit level but **never tested against a real `GenerationalHeap` allocation flow** — consistent with the integration gap (TLABs aren't wired in).
+- No `proptest`/`loom` race detection.
+
+### Highest-impact fixes for the 23x regression
+1. Wire TLABs into `GenerationalHeap::alloc_object`/`alloc_array` fast path.
+2. Switch `pointer_map`/`scanned_promoted` to `FxHashMap`/`FxHashSet`.
+3. Use a marker bit instead of `HashSet<usize>` for promoted tracking.
+4. Activate the thread-local card buffer; drain at safepoint.
+5. Add a `criterion` benchmark suite and gate PRs on it.
+
+---
+
+## vm
+
+### (0) Code review
+- **`vm/src/vm.rs` is 62 969 lines with 1 566 functions** in one file. `runtime/interpreter.rs` is 14 300; `vm/vm_exec.rs` 8 051; `vm/vm_init.rs` 7 603. Split is required.
+- **Two-path interpreter dispatch** (`runtime/interpreter.rs:2148`) — fast `match` vs slow `Instruction::decode`, gated by `is_jdk_class` (`frame.rs:256-262`). The substring-match against `"springframework"` at `frame.rs:261` to disable the fast path for Spring bytecode is a striking smell.
+- **`interpreter::execute`** (`interpreter.rs:1040`) is ~1 100 lines that reads `RUSTJVM_BD_DEBUG`/`RUSTJVM_IAE_TRACE` env vars on every call.
+- **Bring-up scaffolding never deleted** — `eprintln!` for "S111r*", "C29 trace", "WF-NPE-TRACE", "SUREFIRE-NPE-TRACE", "Round 34" across `exceptions.rs:194-275`, `vm.rs` (x61), `vm_init.rs` (x68). Production hot paths walk the full frame chain on every NPE/IAE.
+- **Wrong error variants**: stack underflow / overflow in `value_stack.rs:240-308` use `RuntimeError::NotImplemented { feature: "operand stack overflow" }`, which maps to `MethodCallFailed::InternalError` and bypasses Java `catch` handlers.
+
+### (1) Vulnerabilities
+- **`as i32` truncation in AIOOBE** (`interpreter.rs:4750-4753`) — cast through `usize` and back wraps for arrays of length ≥ 2^31.
+- **Monitor diagnostic strings allocated unconditionally on hot path** (`interpreter.rs:6388-6420`) — `class_name().to_string()` + `method_name().to_string()` + `format!(...)` before every monitor acquire, plus `Instant::now()` and a `flight_recorder.lock()` per contended enter. DoS-amplifier under heavy `synchronized` traffic.
+- **GC barrier has no timeout** (`gc_barrier.rs:82-87`) — `wait_for_all` blocks on `Condvar::wait` with no deadline. Any peer thread failing to reach safepoint deadlocks the initiator.
+- **`MonitorTable` keys monitors by raw `obj_ref.as_ptr() as usize`** (`monitor.rs:354`); relies on `remap_after_gc` to re-key (`:516`). The rekey holds `monitors.lock()` across the entire drain, blocking **every** monitor op for the duration of GC.
+- **Production `.unwrap()`** in `coerce_arg`/`coerce_return` (`interpreter.rs:8359, 8364, 8426, 8432`) — `is_primitive_desc("")` is `false` so they're technically sound, but the CI gate (`interpreter.rs:13363`) is supposed to forbid `.unwrap()` and these survived.
+- `pop_unchecked`/`push_unchecked` panic on miscount (`value_stack.rs:217, 319`) — any future fast-path extension hitting real JDK code panics the VM thread.
+
+### (2) Stubs / Unimplemented
+- The hot files (`interpreter.rs`/`vm_exec.rs`) are CI-gated against `unimplemented!`/`todo!`/`panic!`. True stubs are in: `runtime/offload.rs` (7), `runtime/gpu_marshal.rs` (8), `runtime/lockfree_resolve.rs` (3), `threading/varhandle.rs`, `threading/event_loop.rs`.
+- `RuntimeError::NotImplemented` overloaded as fallback exception class — used for missing classes *and* stack underflow/overflow.
+- `Jsr`/`Ret` handle only the one `ReturnAddress(u32)` tag; verifier mismatch throws opaque `InternalError`.
+
+### (3) Performance
+- **Hot-path env-var lookups** — 32 in interpreter alone (`interpreter.rs:1048, 1053, 1345, ...`). Every method entry pays for `getenv` syscalls. Cache at VM init into `Once<bool>` or feature-gate.
+- **`eprintln!` and full frame walks in `throw_runtime_error`** (`exceptions.rs:194-275`) — every NPE construction walks 15-40 stack frames + `class_manager.read()` per frame, even when no env var is set (empty `for` loop still pays iteration cost).
+- **Monitor enter records JFR + `Instant::now()` every time** (`interpreter.rs:6394-6411`) — move the >1 ms threshold check before the system-time fetch.
+- **Recursive interpreter** — every `invoke*` opcode recurses through `invoke_on_class_shared → execute → execute_frame` on the host stack. The `max_stack_depth=1024` cap exists to match Rust's stack budget; **this is the root cause of "java.util.stream stack-overflow"** in the roadmap.
+- **Two encode/decode round-trips per `Aload`** (`interpreter.rs:4721-4732`) — `get_local → Value → coerce_value_for_return → push(Value)`.
+- `MonitorTable::get_or_create` (`monitor.rs:353`) takes a global `Mutex` per `monitorenter` — sharded map would reduce contention.
+
+### (4) Tests
+- **`tests/interpreter_tests.rs`** has 362 `#[test]`s; **all conditional on `class_files_available()`** (`:33-41`) and silently `return` if `javac` is missing. CI must guarantee `javac` or coverage drops to zero — **silent skip is invisible in CI today**.
+- Exception-table handler tests (nested try/catch, multi-catch, finally-with-return) exist but skip with same `javac` gate.
+- 23 unit tests in `threading/monitor.rs`; **Java-level `synchronized`/`wait`/`notify` tests** are absent from the dedicated tests directory.
+- **No threading correctness stress test** — no concurrent `monitorenter` from many OS threads, no GC-during-monitor-rekey, no `GcBarrier::wait_for_all` timeout test.
+- `tests/differential.rs` exists but no cross-product over the opcode space.
+
+### Top priorities
+1. Split `vm/src/vm.rs` — actively impedes any work in the crate.
+2. Purge `eprintln!`, `RUSTJVM_*_TRACE`, and dead-trace frame walks from the NPE/IAE construction path.
+3. Fix `RuntimeError::NotImplemented` misuse for stack under/overflow.
+4. Add a timeout to `GcBarrier::wait_for_all`.
+5. Complete the iterative-interpreter refactor so streams stop blowing the Rust stack.
+6. Make `javac` missing a CI failure, not a silent skip.
+
+---
+
+## vm-cli
+
+### (0) Code review
+- **2 071-line single `main.rs`** — arg struct, three pre-clap rewriters, watchdog, exception renderer, panic hook all in one file. `run()` alone is ~1 100 lines.
+- **clap usage anti-pattern**: half the JVM CLI surface (`-D`, `-XX:+`, `-XX:-`, `-XX:Foo=`, `-agentlib:`, `-javaagent:`, `-classpath`, `-cp`, `-jar`, `-mp`) is stripped or rewritten before clap parses. `--help` is misleading.
+- **Mojibake corruption throughout doc comments** at `main.rs:11, 164, 268, 463, 811, 822, 870, 876` — em-dashes round-tripped through Windows-1251. Line 11 is the `#[command(about)]` source, so `--help` output ships the corruption.
+- Magic numbers without constants: default watchdog `120` (`:910`), grace `3` (`:941`), `64 * 1024 * 1024` stack size (`:1733`), cause-chain depth `8` (`:1332`).
+
+### (1) Vulnerabilities
+- **No path validation on user-supplied file paths** — `--XX:SharedArchiveFile`, `--XX:AOTCache`, `--XX:AOTCacheOutput`, `--dump-missing-natives*`, `--Xbootclasspath`, `--java-home`, `--jar`, `-XX:HeapDumpPath=` are read/written verbatim with no canonicalization or working-directory confinement.
+- **`CLASSPATH` env var unconditionally honored** (`:653`) with no log line.
+- **`RUSTJVM_DEFAULT_WATCHDOG_SEC` / `RUSTJVM_DISABLE_DEFAULT_WATCHDOG`** read with no validation — malicious env can disable the only hang protection.
+- **JAR manifest `Class-Path` entries appended without validation** (`:614`) — malicious JAR can pull arbitrary relative paths into the classpath. (Matches `java`; document as trust boundary.)
+- System property keys/values have no length limit (`:436-447`).
+
+### (2) Stubs / Missing
+- No `TODO`/`FIXME`/`unimplemented!()` in this crate.
+- **Missing `java` flags vs HotSpot**: `-Xms`, `-Xss`, `-Xrs`, `-Xint`, `-Xcomp`, `-Xbatch`, `-Xfuture`, `-server`/`-client`, bare `-version`, `--enable-preview`, `--enable-native-access`, `--source`, `-ea`/`-da`/`-esa`/`-dsa`, `-XX:+UseG1GC` and GC selection, `-XX:MaxMetaspaceSize`, `-XX:MaxDirectMemorySize`, `-XX:ReservedCodeCacheSize`, `-verbose:jni`, `-?` short, `@argfile` (JEP 343).
+
+### (3) Performance
+- **No `--version` fast path.** `main.rs:1600` unconditionally installs panic hook, spawns 64 MB stack thread, initializes `tracing_subscriber`, preparses argv three times before clap can detect `--version`. Peek argv[1] first.
+- **Default 64 MB stack** allocated for every invocation including `--help` (`:1733`).
+- **Three sequential argv copies** in preparse (`:354, 412, 475`).
+- Watchdog thread spawned unconditionally for `--help`/`--version`/HelloWorld (`:915-1043`).
+
+### (4) Tests
+- Inline `#[cfg(test)]` covers `parse_size`, `validate_class_name`, `extract_system_properties`, `normalize_java_launcher_argv`, `extract_hotspot_flags`, `expand_aggregate_jars`.
+- **No subprocess / `assert_cmd` integration tests.** The dual-binary aliasing (`rustjvm` + `java`) is untested.
+- **No tests for the `run()` orchestration** — exception renderer (300 LOC), watchdog (200 LOC), `-jar` Quarkus classpath synthesis, JDWP wiring, JPMS flag forwarding, HotSpot agent option splitting, `--` separator handling, AOT/CDS mode mapping, init-level transitions — **all untested**.
+- No fuzz on the three preparse rewriters.
+
+---
+
+## jfr
+
+### (0) Code review
+- **`parking_lot` is in `Cargo.toml:13` but never used.** Dead dependency.
+- **No concurrency at all.** `FlightRecorder::record_event` (`recording.rs:196`) takes `&mut self`. The dual `record_event` / `record_event_arc` API + `Arc::try_unwrap` dance at `recording.rs:106` is performance theater — `try_unwrap` always succeeds because there is no cross-thread sharing.
+- Unused `HashMap`/`HashSet` imports at `recording.rs:1`, `repository.rs:1`, `stream.rs:11` (FxHash variants are used in non-test code).
+- **Ring-buffer `type_index` correctness fragility** in `repository.rs:42` — depends on `swap_remove` ordering; not exercised by the test pushing 4 same-type events into capacity 2.
+- **Massive duplication in `builtin.rs`** — 35+ near-identical `emit_*_event` helpers (`:810-2200`). A macro would reduce ~1 400 lines to ~200.
+
+### (1) Vulnerabilities
+- **Unbounded growth on string fields** — `EventValue::String(Arc<str>)` with no length cap. Long `monitor_class`, `path`, `commandLine`, `message` from `emit_java_exception_throw_event` (`builtin.rs:1630`) sit in the ring until eviction.
+- **`max_size` / `max_age` settings ignored** — stored on `RecordingSettings` but enforced nowhere. Only limit is hard-coded `100_000` in `EventRepository::default()`.
+- **Log-injection via event names** — event-type names written verbatim into JFR metadata (`dump.rs:233-235`); `EventTypeRegistry::register` is `pub`, so external callers can inject any string. No control-char/length validation.
+- **`u64 as i64` truncation** at `dump.rs:174-176` — `start_time`, `duration`, `thread_id` silently wrap negative for values ≥ 2^63.
+
+### (2) Stubs / Unimplemented
+- No `TODO`/`unimplemented!()` markers, but **JFR format conformance is stubbed**:
+  - `build_metadata_section` (`dump.rs:209`) explicitly states *"Real JFR metadata uses a complex XML-like structure stored in binary. We use a simplified but compatible format"* — the metadata is **not loadable by `jfr print` / JMC / `jdk.jfr.consumer.RecordingFile`**. Calling this "JFR v2.0 binary format" in the file header is misleading.
+  - `build_checkpoint_section` (`dump.rs:281`) writes a checkpoint with **zero constant pools**. Real JFR uses constant pools heavily for strings, thread names, stack traces, class info. Every string is inlined per-event.
+  - **No stack trace support** anywhere: `EventInstance` has no `stack_trace_id` field. `has_stacktrace: true` event types (`builtin.rs:206, 261, 290, ...`) cannot actually carry a stack trace.
+- **48 builtin event types registered**, only ~35 have emit helpers; **13 registered but never emitted** (`jdk.ObjectAllocationSample`, `jdk.NativeMethodSample`, `jdk.ExceptionStatistics`, `jdk.ModuleRequire`, `jdk.ModuleExport`, `jdk.PhysicalMemory`, `jdk.ContainerCPUUsage`, `jdk.ContainerMemoryUsage`, `jdk.SystemProcess`, `jdk.InitialEnvironmentVariable`, `jdk.GCReferenceStatistics`).
+- **Major JFR event types missing**: `jdk.NativeLibrary`, `jdk.JVMInformation`, `jdk.OSInformation`, `jdk.CPUInformation`, `jdk.G1HeapSummary`, `jdk.ZAllocationStall`, `jdk.SecurityProperty`, `jdk.TLSHandshake`. No `jdk.ActiveSetting` per-type settings.
+
+### (3) Performance
+- **Per-event allocation explosion in builtins** — every emit builds a `Vec<EventValue>` (~80–200 bytes), `Arc::from(&str)` for each string field, then clones into the repository. At 100k events/sec this is a serious allocator hot path.
+- **No string-pool interner** — `monitorClass`, `objectClass`, `method`, `path` repeated across millions of events but re-allocated.
+- **`find_by_name` on every emit** — String hash lookup per call site. Cache `EventTypeId`.
+- **`events_by_type` allocates a `Vec` per call** (`repository.rs:97`). Return an iterator.
+- **`stream::next_event`** uses `repo.iter().nth(rel)` in a `while` loop — O(n^2) (`stream.rs:214`).
+
+### (4) Tests
+- **No emit→parse round-trip for the dumped file** for all event types. `dump.rs` tests verify header bytes only.
+- **No JDK conformance tests** — nothing verifies the file is loadable by `jfr print` or `RecordingFile`. Given the metadata is stubbed, the answer is "it isn't", but no test asserts either way.
+- **No tests for `max_size` / `max_age` enforcement** — because the features don't exist.
+- **No tests for concurrent emission** — appropriate since the crate isn't thread-safe, but the constraint isn't enforced via `static_assert_not_impl_any!(FlightRecorder: Sync)`.
+- **No fuzz / malformed-input tests** for `read_events` or `read_jfr_header`.
+- ~150 tests but skewed toward trivial getter/setter/Debug-derive checks.
+
+---
+
+# Cross-Cutting Themes
+
+The 16 reviews surface recurring patterns. Treat these as workstreams that cut across crates:
+
+### Theme C-1 — "Silently degrade" instead of "throw"
+Multiple crates default to returning `Option::None`/empty/`Ok` where Java semantics require an exception:
+- `native-collections` `native_al_get`/`set`/`add_at` return null on OOB instead of `IndexOutOfBoundsException`.
+- `gen_heap` `get_field`/`set_field` silently drop on layout mismatch.
+- `native-api` `NativeContext` defaults fail-open on security-relevant predicates.
+- `reader` `decode_value` silently degrades unaligned `VTAG_OBJECT` to `Object(None)`.
+- `jfr` `Builder::set` silently `eprintln!`s on typos.
+- **Action**: introduce a `policy: strict | lenient` mode and default to `strict` in tests.
+
+### Theme C-2 — Unbounded allocations on attacker-controlled length
+Found in `reader` (`tableswitch`/`lookupswitch`, unknown attributes), `classloading` (zip-bomb across 7 sites), `native-io` (7 sites), `jfr` (event strings), and `gc` (`HEADER_SIZE + num_fields * SLOT_SIZE` overflow).
+- **Action**: workspace-wide `safe_alloc::checked_with_capacity(len, max)` helper; replace every `Vec::with_capacity(attacker_value)` with a clamped or rejecting variant.
+
+### Theme C-3 — Hot-path lock traffic
+- `gc`: global `card_table` mutex per reference store; global `young_from` mutex per allocation; global volatile mutex per volatile op.
+- `vm`: global `MonitorTable::get_or_create` mutex per `monitorenter`.
+- `native-api`: process-global `parking_lot::Mutex` ring on every native call.
+- `native-builtins`: arena `HashMap<i64, Arena>` under `RwLock`; every `Unsafe.get_byte` takes a read lock.
+- `native-io`: process-global RAF mutex; outer RwLock + per-entry Mutex on FD table.
+- `native-collections`: process-global LHM overlay mutex.
+- **Action**: sharded maps, per-thread buffers, atomic rings.
+
+### Theme C-4 — Hot-path environment-variable reads & `eprintln!` debug
+- `vm/runtime/interpreter.rs`: 32 env-var reads in the main loop.
+- `vm/runtime/exceptions.rs:194-275`: every NPE construction walks 15-40 frames + `class_manager.read()` per frame, even when no env var is set.
+- `native-collections`: `[HM-EQ]` `std::env::var` on every HashMap key comparison.
+- `vm/src/vm.rs`, `vm/vm_init.rs`: 60+ each of `RUSTJVM_*_TRACE` / `eprintln!` blocks.
+- **Action**: one-shot init reading all env vars into a global config; feature-flag debug scaffolding; remove dead trace blocks.
+
+### Theme C-5 — Hot-path `String` allocations & string-keyed lookups
+- `jit-api`: stringly-typed builder.
+- `jit-cuda`: `HashMap<String, CudaFunction>` for kernel lookup.
+- `reader`: 30-arm `match` on `&str` for attribute names; many `.to_string()` of CP entries already held as `Arc<str>`.
+- `native-builtins`: `StringBuilder.indexOf` allocates twice the string size per call.
+- `vm`: monitor diagnostic strings allocated unconditionally per `monitorenter`.
+- **Action**: pre-interned IDs at registration / attribute parse; `Arc<str>` everywhere CP-derived; `Cow<'static, str>` in error payloads.
+
+### Theme C-6 — Tests prove registration but not behaviour
+- `native-collections`: 60 tests, almost all `r.find(c, "put", ...).is_some()`.
+- `native-awt`: 1 test for `natives.rs`, asserts count ≥ 50.
+- `jit-api`: tests assert raw magic-number counts of fields rather than computing from `field_names().len()`.
+- **Action**: enforce "registration ⇒ behavioural test" via a per-crate coverage gate.
+
+### Theme C-7 — JVM safety holes in the JIT/GC interface
+- `jit`: `oop_maps` not emitted; conservative stack scan is the only fallback.
+- `jit`: `i64::MIN` deopt sentinel collides with valid values.
+- `gc`: forwarding-pointer race installs forwarding after the copy, exposing a window where a concurrent marker scans stale fields.
+- `vm`: monitor table rekeyed under a global lock that blocks every monitor op during GC.
+- **Action**: a Phase dedicated to GC-JIT safety (oop maps, deopt sentinel out-of-band, atomic forwarding install).
+
+### Theme C-8 — Verification is recordkeeping, not gating
+- `classloading::define_class_with_options` records `skip_verification` in a side set but **never calls the verifier**. Any caller of `Unsafe.defineClass` / `MethodHandles.Lookup.defineClass` gets unverified bytecode.
+- `native-builtins` Unsafe paths explicitly `skip_verification: true`.
+- `native-io` path validation is globally toggleable from any code in the process.
+- **Action**: gating must happen at the chokepoint, not by convention.
+
+### Theme C-9 — Recursive interpreter blocks stream-heavy workloads
+- `vm`: roadmap calls out `java.util.stream` stack-overflow; interpreter still recurses through Rust frames per `invoke*` despite the `Iterative Interpreter Refactor` test (`vm_init.rs:7908-7935`).
+- **Action**: finish Phase 16.1 (Iterative Interpreter) — already on the roadmap above.
+
+### Theme C-10 — Single-file giants block refactoring
+- `vm/src/vm.rs` (62 969 lines), `runtime/interpreter.rs` (14 300), `jit/src/x64.rs` (17 643), `native-collections/src/lib.rs` (19 576), `native-builtins/src/lib.rs` (34 736), `native-io/src/lib.rs` (12 960), `classloading/src/class_path.rs` (3 152), `vm-cli/src/main.rs` (2 071).
+- **Action**: split before any meaningful work proceeds; these files dwarf the diff radius and produce merge-conflict storms.
+
+---
+
+# Roll-up: Top 15 Workstream-Sized Items
+
+Ordered by user-visible impact:
+
+1. **TLAB wiring in `gc::GenerationalHeap::alloc_object`/`alloc_array`** + thread-local card buffer. Addresses 23x allocation regression.
+2. **Iterative interpreter (Phase 16.1)** — unblocks `java.util.stream` workloads.
+3. **JIT `frem`/`drem` codegen + IR back-edge merge fix + branch-target stack canonicalization** — Phase 16.2/16.3 root-causes.
+4. **JIT oop-map emission + deopt sentinel out-of-band** — JVM-safety holes.
+5. **Classloader hierarchy (`ClassFinder` parent link, `loadClass` protocol)** — unblocks WAR/multi-JAR apps.
+6. **Verifier invocation in `define_class_with_options`** — close the unverified-class hole.
+7. **Workspace `safe_alloc` helper** + wire to `reader::tableswitch`/`lookupswitch`, `classloading` zip paths (zip-bomb cap), `native-io` length-prefixed reads, `jfr` event strings.
+8. **`gc` write-barrier path** — replace global `card_table` mutex with thread-local card buffer drained at safepoint.
+9. **`native-builtins` arena `read::<N>` offset bug fix + `arraycopy` bulk intrinsic + ArrayStoreException semantics**.
+10. **Remove `native-collections` (`synthetic-jdk` feature)** — already on Definition-of-Done.
+11. **Split `vm/src/vm.rs` (62 969 lines)** and `jit/src/x64.rs` (17 643 lines) into submodules.
+12. **Purge `RUSTJVM_*_TRACE`/`eprintln!` from `vm/runtime/exceptions.rs` + `vm.rs` + `vm_init.rs`** — hot-path cleanup.
+13. **JFR JDK-tool conformance pass** — current dialect is unreadable by `jfr print`/JMC; fix `build_metadata_section` and add constant pools.
+14. **`CompactValue` 47-bit pointer cfg-gate** — silent corruption on non-x86_64 / 5-level paging.
+15. **`GcBarrier::wait_for_all` deadline + `MonitorTable` shardable rekey** — current paths deadlock the VM under safepoint failure or GC.
+
+---
+
+# Audit metadata
+
+- **Run date**: 2026-05-16
+- **Method**: 16 parallel agents (one per crate); 5 on Opus (reader, types, native-api, jit-api, cuda-bridge), 11 on Sonnet (re-launched after first batch hit the Opus daily quota mid-run). Findings cross-checked against file/line references; quotes preserved verbatim.
+- **Scope**: source in `<repo>/<crate>/{src,tests}` and `Cargo.toml` only. Did not attempt builds, runs, or external benchmarks during the audit.
