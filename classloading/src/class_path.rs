@@ -960,6 +960,21 @@ impl ClassPath {
         }
 
         let relative_path = format!("{}.class", class_name);
+        // Executable WAR / Spring-Boot WAR support: when a class is requested
+        // by its binary name, also probe the common archive-internal class
+        // roots used by web/fat-jar containers. Jenkins's WAR is an
+        // *executable* WAR with its Main-Class at the archive root
+        // (`executable/Main.class`), not under `WEB-INF/classes/`; other
+        // WARs put application classes under `WEB-INF/classes/`; Spring
+        // Boot fat JARs use `BOOT-INF/classes/`. We try root first (the
+        // canonical location for ordinary JARs) and only fall back to
+        // the prefixed variants — this is a no-op for plain JARs because
+        // those prefixed entries simply don't exist.
+        let archive_candidates: [String; 3] = [
+            relative_path.clone(),
+            format!("WEB-INF/classes/{}", relative_path),
+            format!("BOOT-INF/classes/{}", relative_path),
+        ];
 
         for entry in &self.entries {
             match entry {
@@ -1012,14 +1027,16 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
-                    let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path)
-                    } else {
-                        Self::find_in_archive(archive, &relative_path)
-                    };
-                    if let Some(data) = found {
-                        debug!("Found class {class_name} in JAR");
-                        return Ok(data);
+                    for candidate in &archive_candidates {
+                        let found = if *multi_release {
+                            Self::find_in_multi_release_archive(archive, versions_cache, candidate)
+                        } else {
+                            Self::find_in_archive(archive, candidate)
+                        };
+                        if let Some(data) = found {
+                            debug!("Found class {class_name} in JAR (entry: {candidate})");
+                            return Ok(data);
+                        }
                     }
                 }
                 ClassPathEntry::NestedDirectory { entries_cache, .. } => {
@@ -1029,9 +1046,14 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::NestedJar { archive, nested_path, .. } => {
-                    if let Some(data) = Self::find_in_archive(archive, &relative_path) {
-                        debug!("Found class {class_name} in nested JAR {nested_path}");
-                        return Ok(data);
+                    for candidate in &archive_candidates {
+                        if let Some(data) = Self::find_in_archive(archive, candidate) {
+                            debug!(
+                                "Found class {class_name} in nested JAR {nested_path} \
+                                 (entry: {candidate})"
+                            );
+                            return Ok(data);
+                        }
                     }
                 }
                 ClassPathEntry::JmodFile { path, classes_cache, .. } => {

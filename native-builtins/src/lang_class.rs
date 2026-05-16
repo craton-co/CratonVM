@@ -334,6 +334,7 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
         _ => return Ok(Some(Value::Object(None))),
     };
 
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
     // Use the reverse map (or legacy field-0 fallback) to resolve the ClassId.
     // If mirror_class_id returns None, this is a primitive mirror — read the
     // name directly from field 1 (the `name` slot in both synthetic and real
@@ -344,6 +345,9 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
                 .class_name_of_id(class_id)
                 .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
             let dotted_name = name.replace('/', ".");
+            if dbg_bb {
+                eprintln!("[bb-dbg] getName(id={}) -> {:?}", class_id.as_u32(), dotted_name);
+            }
             let name_obj = ctx.create_string(&dotted_name);
             Ok(Some(Value::Object(Some(name_obj))))
         }
@@ -358,9 +362,15 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
             // replace is a no-op for them.
             if let Some(prim_name) = mirror_class_name(ctx, this) {
                 let dotted_name = prim_name.replace('/', ".");
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getName(no-id) -> {:?}", dotted_name);
+                }
                 let name_obj = ctx.create_string(&dotted_name);
                 Ok(Some(Value::Object(Some(name_obj))))
             } else {
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getName(no-id, no-name) -> null");
+                }
                 Ok(Some(Value::Object(None)))
             }
         }
@@ -1362,10 +1372,15 @@ pub(crate) fn native_class_is_primitive(ctx: &mut dyn NativeContext, args: &[Val
 pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            if std::env::var("RUSTJVM_DBG_BB").is_ok() {
+                eprintln!("[bb-dbg] getSuperclass(<null>) -> null");
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
 
-    // bytebuddy_probe (agent-bb2) — Object/array/primitive name short-circuits
+    // bytebuddy_probe (agent-bb3) — Object/array/primitive name short-circuits
     // BEFORE the class_id lookup. ByteBuddy's `TypeDescription.ForLoadedType`
     // hierarchy walk calls `Class.getSuperclass()` repeatedly; if our shim
     // ever returns Object's own mirror as the superclass of Object (a cycle),
@@ -1376,7 +1391,11 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     // mirror is a synthetic/duplicate one whose reverse-map entry points
     // at a different ClassId-than-canonical-Object instance.
     let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
     if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [object-early]", this_name);
+        }
         return Ok(Some(Value::Object(None)));
     }
     // Per JLS 10.8 / `Class.getSuperclass()` spec: arrays report `Object`
@@ -1386,15 +1405,40 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     if this_name.starts_with('[') {
         if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
             let mirror = ctx.get_class_mirror(obj_id);
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> java/lang/Object [array]", this_name);
+            }
             return Ok(Some(Value::Object(Some(mirror))));
+        }
+        if dbg_bb {
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [array no-obj-id]", this_name);
         }
         return Ok(Some(Value::Object(None)));
     }
 
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> null [no-class-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    // bytebuddy_probe (agent-bb3) — second-line defence: even after name
+    // resolution above, if the resolved ClassId IS Object's canonical id,
+    // bail out null. This catches the case where `mirror_class_name`
+    // returned something empty/unexpected but the reverse-map still points
+    // at Object (e.g. a synthetic mirror whose slot-1 name is null but
+    // whose `class_id_from_mirror` resolves to Object).
+    if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+        if class_id == obj_id {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> null [object-by-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    }
     // Per JLS 8.1.4 / `Class.getSuperclass()` spec: returns `null` if this
     // Class represents an interface, the Object class, a primitive type,
     // or void.
@@ -1412,6 +1456,9 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     //
     // Real JDK 25 returns `null` here for interfaces — we must match.
     if ctx.is_interface_class(class_id) {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [interface]", this_name);
+        }
         return Ok(Some(Value::Object(None)));
     }
     match ctx.superclass_of(class_id) {
@@ -1425,6 +1472,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
             // here matches what `Class.getSuperclass()` does for Object
             // and lets the walk terminate cleanly.
             if parent_id == class_id {
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getSuperclass({}) -> null [self-cycle id={}]",
+                        this_name, class_id.as_u32());
+                }
                 return Ok(Some(Value::Object(None)));
             }
             // Defensive: if the resolved parent's name is `java/lang/Object`
@@ -1439,13 +1490,26 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
                         || this_name == "java/lang/Object"
                         || this_name == "java.lang.Object")
                 {
+                    if dbg_bb {
+                        eprintln!("[bb-dbg] getSuperclass({}) -> null [parent=Object name-split]",
+                            this_name);
+                    }
                     return Ok(Some(Value::Object(None)));
                 }
             }
             let mirror = ctx.get_class_mirror(parent_id);
+            if dbg_bb {
+                let parent_name = ctx.class_name_of_id(parent_id).unwrap_or_default();
+                eprintln!("[bb-dbg] getSuperclass({}) -> {}", this_name, parent_name);
+            }
             Ok(Some(Value::Object(Some(mirror))))
         }
-        None => Ok(Some(Value::Object(None))),
+        None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> null [no-super]", this_name);
+            }
+            Ok(Some(Value::Object(None)))
+        }
     }
 }
 
@@ -5439,15 +5503,41 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
         }
     }
 
+    // bytebuddy_probe (agent-bb3) — Object short-circuit. Real JDK returns
+    // an empty Class[] for java/lang/Object. If our class manager ever
+    // hands back interfaces for Object (e.g. due to a synthetic-mirror
+    // mixup where the reverse-map points at the wrong ClassId), the
+    // ByteBuddy hierarchy walker treats them as super-types of Object
+    // and the IllegalStateException reasserts. Force-empty here.
+    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early]", this_name);
+        }
+        let empty = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        return Ok(Some(Value::Object(Some(empty))));
+    }
+
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getInterfaces({}) -> [] [no-class-id]", this_name);
+            }
             let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
 
     let iface_ids = ctx.class_interfaces(class_id);
+    if dbg_bb {
+        let names: Vec<String> = iface_ids
+            .iter()
+            .map(|id| ctx.class_name_of_id(*id).unwrap_or_default())
+            .collect();
+        eprintln!("[bb-dbg] getInterfaces({}) -> {:?}", this_name, names);
+    }
     let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), iface_ids.len());
     for (i, iface_id) in iface_ids.iter().enumerate() {
         let mirror = ctx.get_class_mirror(*iface_id);
@@ -6663,25 +6753,76 @@ pub(crate) fn native_class_get_generic_superclass(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // bytebuddy_probe (agent-bb3) — apply the SAME Object/interface/array
+    // short-circuits as native_class_get_superclass. ByteBuddy's hierarchy
+    // walk uses `getGenericSuperclass()` in addition to `getSuperclass()`;
+    // without this guard the IllegalStateException cycle returns via the
+    // generic path even when the plain path is now protected.
+    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-early]", this_name);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [no-class-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    // Second-line Object guard via ClassId.
+    if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+        if class_id == obj_id {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-by-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    }
+    // Interfaces and arrays both report null for getGenericSuperclass per JLS.
+    if ctx.is_interface_class(class_id) {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [interface]", this_name);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     // If class has a Signature attribute, parse it for the generic superclass
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
             let val = crate::generics::type_sig_to_java(ctx, &class_sig.super_class);
             // If signature resolution succeeded, return it
             if !matches!(val, Value::Object(None)) {
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getGenericSuperclass({}) -> <signature>", this_name);
+                }
                 return Ok(Some(val));
             }
         }
     }
     // Fallback: return the raw superclass as a Class mirror
     if let Some(super_id) = ctx.superclass_of(class_id) {
+        // Self-cycle guard — symmetric with native_class_get_superclass.
+        if super_id == class_id {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [self-cycle]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
         let mirror = ctx.get_class_mirror(super_id);
+        if dbg_bb {
+            let parent_name = ctx.class_name_of_id(super_id).unwrap_or_default();
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> {}", this_name, parent_name);
+        }
         Ok(Some(Value::Object(Some(mirror))))
     } else {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [no-super]", this_name);
+        }
         Ok(Some(Value::Object(None)))
     }
 }
@@ -6698,6 +6839,16 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    // bytebuddy_probe (agent-bb3) — Object short-circuit (empty Type[]).
+    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if this_name == "java/lang/Object" || this_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericInterfaces({}) -> [] [object-early]", this_name);
+        }
+        let arr = ctx.new_ref_array(ClassId::new(0), 0);
+        return Ok(Some(Value::Object(Some(arr))));
+    }
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {

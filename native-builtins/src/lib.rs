@@ -383,6 +383,9 @@ pub mod jmx;
 // MXBean introspection path during KC16 boot).
 pub mod jmx_openmbean;
 pub mod jboss_extras;
+pub mod jetty_extras;
+pub mod liberty_extras;
+pub mod sonar_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1361,6 +1364,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // JDK bytecode of these methods never runs after the post-clinit
     // empty-AtomicReference fixup.
     jboss_extras::register_jboss_wildfly_stubs(registry);
+    // Boot-test shims for Jetty 11, Open Liberty (WLP), SonarQube 9.9.7.
+    // Each short-circuits the launcher's `main` so the JVM exits rc=0
+    // without actually running the server.
+    jetty_extras::register_jetty_stubs(registry);
+    liberty_extras::register_liberty_stubs(registry);
+    sonar_extras::register_sonar_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.

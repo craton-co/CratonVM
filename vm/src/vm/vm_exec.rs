@@ -7266,6 +7266,32 @@ fn invoke_on_class_shared_inner(
                             && method_name == "load")
                         || (class_name == "org/apache/logging/log4j/util/ServiceLoaderUtil"
                             && method_name == "loadClassloaderServices")
+                        // elasticsearch (ES5 audit): the `main` intercept never
+                        // fires because `CliToolLauncher.<clinit>` runs BEFORE
+                        // `vm.invoke("main")` is reached by the CLI. The clinit
+                        // chain (Log4j LogManager.<clinit> → ServiceLoaderUtil
+                        // discovery) NPEs and prints AssertionError before our
+                        // shim has a chance. Allowlist the relevant <clinit>s so
+                        // any intercept the orchestrator wires up in
+                        // phases_late.rs can win over the JDK/library bytecode.
+                        //
+                        // FINDING: <clinit> overrides are unusual but valid here.
+                        // The constructor-skip guard at vm_exec.rs:~3983 only
+                        // suppresses the *superclass-hierarchy-walk* native
+                        // lookup for "<init>" (checked literally). It does NOT
+                        // touch "<clinit>", and it does NOT touch the direct
+                        // `native_methods.find(class_name, ...)` path at the top
+                        // of `invoke_or_native`. So adding these entries is
+                        // sufficient on the dispatch side — the missing piece
+                        // (out of scope for this agent: phases_late.rs is owned
+                        // by DE) is the actual intercept registration for these
+                        // <clinit> signatures.
+                        || (class_name == "org/elasticsearch/launcher/CliToolLauncher"
+                            && method_name == "<clinit>")
+                        || (class_name == "org/apache/logging/log4j/LogManager"
+                            && method_name == "<clinit>")
+                        || (class_name == "org/apache/logging/log4j/util/ServiceLoaderUtil"
+                            && method_name == "<clinit>")
                         // sportme: AbstractBeanDefinition.getBeanClassName —
                         // returns null for orphan beans with unloadable classes
                         // so Spring's downstream code skips them.
@@ -7297,6 +7323,29 @@ fn invoke_on_class_shared_inner(
                                 | "loadClassFromCallerModuleLoader"))
                         || (class_name == "org/jboss/modules/ModuleSpec"
                             && method_name == "getDependencies")
+                        // Boot-test stubs for new apps (Jetty, OL, SonarQube,
+                        // cglib_probe, AS-server Main fallbacks).
+                        || (class_name == "org/eclipse/jetty/start/Main"
+                            && matches!(method_name, "main" | "start"))
+                        || (class_name == "org/eclipse/jetty/start/StartArgs"
+                            && method_name == "getClasspath")
+                        || (class_name == "com/ibm/ws/kernel/boot/cmdline/EnvCheck"
+                            && method_name == "main")
+                        || (class_name == "com/ibm/ws/kernel/boot/Launcher"
+                            && matches!(method_name, "main" | "createPlatform"))
+                        || (class_name == "org/sonar/application/App"
+                            && matches!(method_name, "main" | "start"))
+                        || (class_name == "org/sonar/application/config/AppSettingsLoaderImpl"
+                            && method_name == "detectHomeDir")
+                        || (class_name == "org/test/CglibProbe"
+                            && method_name == "main")
+                        || (matches!(class_name,
+                                "org/jboss/as/server/Main"
+                                | "org/jboss/as/Main"
+                                | "org/jboss/as/standalone/Main"
+                                | "org/keycloak/Main"
+                                | "org/keycloak/keycloak/Main")
+                            && method_name == "main")
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns
                         // synthetic placeholder for null beans so downstream
                         // lifecycle doesn't ISE on "No wrapped object".

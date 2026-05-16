@@ -2048,6 +2048,125 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
         }
+        // KC26: Keycloak 26 (Quarkus) — `org/keycloak/common/Profile`.
+        // `Profile.getOrderedFeatures()` runs a Stream.filter/map/toList
+        // pipeline whose lambdas (`lambda$getOrderedFeatures$2/$3`) collect
+        // a Set<Feature> from an internal map. When our LambdaMetafactory
+        // synthesises a no-op MethodHandle (because implMethod resolution
+        // returned null), the resulting CallSite delegates to a closure
+        // that always returns `null`. The Stream.collect/toList path then
+        // sees a perpetually-non-terminating source (each `tryAdvance`
+        // re-enters the same lambda, which again returns null) and the
+        // CLI blows past the 60s watchdog with rc=124.
+        //
+        // To break the loop we pre-populate any plausibly-named static
+        // cache field on Profile with an empty `java.util.HashSet`
+        // instance. If `getOrderedFeatures` reads from a cached Set
+        // (`orderedFeatures`/`ORDERED_FEATURES`/`featureSet`) it returns
+        // immediately without entering the Stream pipeline. If no such
+        // field exists on this Profile build we log a note and let the
+        // call run — at worst we re-hit the timeout, but the fixup is
+        // a no-op rather than a correctness regression.
+        //
+        // The synthetic HashSet only needs to be type-compatible (so
+        // `getstatic` + `invokeinterface Set.iterator()` doesn't NPE);
+        // we don't need to populate its element table because Keycloak
+        // simply iterates / returns the cached reference. HashSet is
+        // backed by a HashMap; allocating the bare object with a small
+        // slot count is sufficient for the no-op fast-path because the
+        // hot accessor returns the field directly.
+        "org/keycloak/common/Profile" => {
+            // Candidate field names cribbed from common Keycloak Profile
+            // versions: the lazy cache for getOrderedFeatures has shifted
+            // names across releases.
+            const CANDIDATES: &[&str] = &[
+                "orderedFeatures",
+                "ORDERED_FEATURES",
+                "ordered_features",
+                "featureSet",
+                "FEATURE_SET",
+                "features",
+                "FEATURES",
+                "cachedFeatures",
+                "CACHED_FEATURES",
+            ];
+            let hashset_id = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name("java/util/HashSet")
+                    .or_else(|| cm.find_class_by_name("java/util/LinkedHashSet"))
+                    .or_else(|| cm.find_class_by_name("java/util/TreeSet"))
+            };
+            // Read whether a candidate exists AND is currently null —
+            // never clobber a successfully-initialised value.
+            let read_static_named = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut static_idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            drop(cm);
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, static_idx,
+                            ));
+                        }
+                        static_idx += 1;
+                    }
+                }
+                None
+            };
+            let mut populated = 0usize;
+            let mut attempted: Vec<&'static str> = Vec::new();
+            if let Some(hs_id) = hashset_id {
+                for &name in CANDIDATES {
+                    let cur = read_static_named(name);
+                    // Field doesn't exist on this class — skip silently.
+                    let Some(cur_val) = cur else { continue };
+                    attempted.push(name);
+                    // Only patch null slots.
+                    if !matches!(cur_val, Value::Object(None)) {
+                        continue;
+                    }
+                    // HashSet has one instance field (`map`:HashMap).
+                    // Two slots is a safe over-allocation if the layout
+                    // changes; surplus slots are harmless.
+                    if let Some(hs_obj) = shared.heap.try_alloc_object(hs_id, 2) {
+                        if set_static_by_name(name, Value::Object(Some(hs_obj))) {
+                            populated += 1;
+                        }
+                    }
+                }
+            }
+            if populated > 0 {
+                tracing::warn!(
+                    "Post-clinit fixup: Keycloak Profile pre-populated {} cache static(s) with empty HashSet (candidates seen: {:?})",
+                    populated,
+                    attempted
+                );
+                crate::dispatch_trace::record_note(
+                    "Post-clinit fixup: Keycloak Profile cache pre-populated",
+                );
+            } else {
+                // Nothing matched — surface what statics actually exist
+                // so the next round can refine CANDIDATES without rebuilding.
+                let static_names: Vec<String> = {
+                    let cm = shared.class_manager.read();
+                    cm.get_class(class_id).map(|cls| {
+                        cls.fields.iter()
+                            .filter(|f| f.is_static())
+                            .map(|f| format!("{}:{}", f.name, f.descriptor))
+                            .collect()
+                    }).unwrap_or_default()
+                };
+                tracing::warn!(
+                    "Post-clinit fixup: Keycloak Profile — no candidate cache field matched; statics on class: {:?}",
+                    static_names
+                );
+                crate::dispatch_trace::record_note(
+                    "Post-clinit fixup: Keycloak Profile candidate scan empty (see warn log for statics list)",
+                );
+            }
+        }
         "org/jboss/msc/service/ServiceLogger" => {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {

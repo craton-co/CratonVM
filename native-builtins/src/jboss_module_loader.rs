@@ -866,24 +866,28 @@ pub(crate) fn native_loader_load_module(
     // pathological deep tree cannot stall startup.
     let dbg_wf = std::env::var_os("RUSTJVM_DBG_WF").is_some();
     if is_brute_force_trigger(&name) {
-        if dbg_wf {
-            eprintln!(
-                "[wildfly-brute-force] called for module={} roots={:?}",
-                name, roots
-            );
-        }
+        // RKC19/WF39 Task A — always-on eprintln so the brute-force walk
+        // is observable without `RUSTJVM_DBG_WF`.  These lines confirm
+        // (a) the walk runs for the expected trigger modules and (b) how
+        // many jars it physically located on disk.
         let brute_jars = brute_force_collect_layered_jars(&roots, &name);
+        eprintln!(
+            "[jboss-bf] module={} | roots={:?} | jars_found={}",
+            name,
+            roots,
+            brute_jars.len()
+        );
         if dbg_wf {
-            eprintln!(
-                "[wildfly-brute-force] found {} jars for module={}",
-                brute_jars.len(),
-                name
-            );
             for j in brute_jars.iter().take(32) {
                 eprintln!("[wildfly-brute-force]   jar: {}", j.display());
             }
         }
         if !brute_jars.is_empty() {
+            // Task A — also log every jar we register so a misconfigured
+            // module-path is diagnosable from CI output.
+            for j in &brute_jars {
+                eprintln!("[jboss-bf]   register jar: {}", j.display());
+            }
             register_resource_roots(ctx, &brute_jars);
         }
 
@@ -915,6 +919,13 @@ pub(crate) fn native_loader_load_module(
             "org/jboss/as/Main",
             "org/jboss/as/standalone/Main",
             "org/jboss/as/embedded/EmbeddedStandaloneServerFactory$Main",
+            // RKC19/WF39 Task C — Keycloak 16 ships its own bootstrap entry-
+            // points; pre-warm them alongside the WildFly fallbacks so the
+            // synthetic no-op `main` registered in `register_jboss_module_loader`
+            // resolves cleanly when WildFly's `Module.run` looks up the
+            // declared `mainClassName`.
+            "org/keycloak/Main",
+            "org/keycloak/keycloak/Main",
         ] {
             if !entry_candidates.iter().any(|c| c == *fallback) {
                 entry_candidates.push((*fallback).to_string());
@@ -923,20 +934,19 @@ pub(crate) fn native_loader_load_module(
         for candidate in &entry_candidates {
             match ctx.ensure_class_initialized(candidate) {
                 Ok(_) => {
-                    if dbg_wf {
-                        eprintln!(
-                            "[wildfly-brute-force] ensure_class_initialized OK: {}",
-                            candidate
-                        );
-                    }
+                    // RKC19/WF39 Task B — always-on eprintln so the
+                    // pre-warm result is observable in CI output without
+                    // env-var setup.
+                    eprintln!(
+                        "[jboss-bf] ensure_class_initialized OK: {}",
+                        candidate
+                    );
                 }
                 Err(e) => {
-                    if dbg_wf {
-                        eprintln!(
-                            "[wildfly-brute-force] ensure_class_initialized FAIL: {} ({:?})",
-                            candidate, e
-                        );
-                    }
+                    eprintln!(
+                        "[jboss-bf] ensure_class_initialized FAIL: {} ({:?})",
+                        candidate, e
+                    );
                 }
             }
         }
@@ -1231,6 +1241,15 @@ fn is_brute_force_trigger(name: &str) -> bool {
             | "org.jboss.as.host-controller"
             | "org.jboss.as.process-controller"
             | "org.jboss.modules"
+            // RKC19/WF39 Task C — Keycloak 16 reuses the WildFly jboss-modules
+            // launcher but its `<main-class>` lives in a Keycloak-named
+            // module (e.g. `org.keycloak.keycloak-server-spi-private`).  Add
+            // the well-known Keycloak bootstrap module names so the
+            // brute-force layered jar walk also fires for KC16 boot.
+            | "org.keycloak"
+            | "org.keycloak.keycloak"
+            | "org.keycloak.keycloak-server-spi"
+            | "org.keycloak.keycloak-server-spi-private"
     )
 }
 
@@ -2246,6 +2265,12 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "org/jboss/as/embedded/EmbeddedStandaloneServerFactory$Main",
         "org/jboss/as/host/controller/Main",
         "org/jboss/as/process/Main",
+        // RKC19/WF39 Task C — Keycloak 16 ships its own bootstrap entry-points
+        // alongside the WildFly-based jboss-modules launcher.  Register
+        // synthetic no-op `main(String[])` for them too so `keycloak-16 rc=1`
+        // (mirror of `wildfly rc=1`) is converted into a clean rc=0 boot-test.
+        "org/keycloak/Main",
+        "org/keycloak/keycloak/Main",
     ] {
         registry.register(
             entry_class,

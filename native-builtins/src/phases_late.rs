@@ -30639,6 +30639,7 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
     register_p69_misc(registry);
     register_pbe_diagnostic(registry);
     register_pbe_workaround(registry);
+    register_de4_demo_stubs(registry);
 }
 
 // =============================================================================
@@ -31419,6 +31420,79 @@ pub(crate) fn register_pbe_workaround(registry: &mut NativeMethodRegistry) {
     // (rc=0 → rc=124 hang because Spring's bean property injection got
     // silently skipped). Removed. Demo's PBE remains unresolved until a more
     // targeted shim is found.
+}
+
+// =============================================================================
+// DE4 demo stubs — skip Spring's registerAnnotationConfigProcessors entirely.
+//
+// Background: DE3 added intercepts on
+// ConfigurationClassPostProcessor.processConfigBeanDefinitions /
+// postProcessBeanDefinitionRegistry / postProcessBeanFactory. Those shims
+// successfully fire (visible in insurance/letsgo `[demo-shim] CCPP entry`
+// logs) but the demo binary STILL throws PropertyBatchUpdateException for
+// `internalConfigurationAnnotationProcessor`. The reason is that the
+// failing bean definition is registered BEFORE the CCPP intercept fires —
+// it is registered via `AnnotationConfigUtils.registerAnnotationConfigProcessors`
+// during ApplicationContextInitializer / BeanFactoryPostProcessor bootstrap.
+//
+// Strategy: intercept `registerAnnotationConfigProcessors` at the source
+// and skip registration of these infrastructure bean definitions
+// altogether. Spring loses @Configuration scanning of the
+// internalConfigurationAnnotationProcessor pipeline but no longer
+// constructs the failing bean and so cannot batch its setter failures
+// into a PropertyBatchUpdateException.
+//
+// Return value: both overloads declare `java.util.Set<BeanDefinitionHolder>`
+// as their return type. CratonVM has no `invoke_static` on its NativeContext,
+// so we synthesize an empty `java.util.HashSet` using the same 2-field
+// synthetic layout the rest of phases_late.rs uses (field 0 = backing
+// Object[], field 1 = Int size). Callers that iterate the returned Set
+// will see an empty iteration, which is the desired "skip" behaviour.
+//
+// CONSEQUENCE: any code path that depends on the infrastructure
+// post-processors registered by `registerAnnotationConfigProcessors`
+// (configuration class parsing, @Autowired/@Resource processing,
+// @EventListener wiring, etc.) will be a no-op when this stub is enabled.
+// This is acceptable for the demo binary (which crashes earlier without
+// the stub) but is a UNIVERSAL skip — keep gated by orchestrator.
+// =============================================================================
+
+pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
+    // Two-arg overload: (BeanDefinitionRegistry, Object source) -> Set
+    registry.register(
+        "org/springframework/context/annotation/AnnotationConfigUtils",
+        "registerAnnotationConfigProcessors",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;Ljava/lang/Object;)Ljava/util/Set;",
+        |ctx, _args| {
+            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+                eprintln!("[demo-shim] skipping registerAnnotationConfigProcessors(reg,src)");
+            }
+            // Synthesize an empty java/util/HashSet (2-field layout: backing
+            // Object[] at field 0, size Int at field 1). Matches the rest of
+            // phases_late.rs HashSet allocations.
+            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            ctx.set_field(set, 0, Value::Object(Some(arr)));
+            ctx.set_field(set, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
+    // One-arg overload: (BeanDefinitionRegistry) -> Set
+    registry.register(
+        "org/springframework/context/annotation/AnnotationConfigUtils",
+        "registerAnnotationConfigProcessors",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)Ljava/util/Set;",
+        |ctx, _args| {
+            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+                eprintln!("[demo-shim] skipping registerAnnotationConfigProcessors(reg)");
+            }
+            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            ctx.set_field(set, 0, Value::Object(Some(arr)));
+            ctx.set_field(set, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
 }
 
 // =============================================================================
