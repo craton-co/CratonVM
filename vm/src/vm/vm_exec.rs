@@ -7241,6 +7241,31 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
                             && method_name == "getBeanClass")
                         // (Assert.notNull shim removed — caused hangs.)
+                        // sportme: AbstractBeanDefinition.getBeanClassName —
+                        // returns null for orphan beans with unloadable classes
+                        // so Spring's downstream code skips them.
+                        || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
+                            && method_name == "getBeanClassName")
+                        // demo: ConfigurationClassPostProcessor setters that
+                        // would otherwise throw Assert.notNull mid-boot.
+                        || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
+                            && matches!(method_name,
+                                "setMetadataReaderFactory"
+                                | "setEnvironment"
+                                | "setResourceLoader"
+                                | "setBeanClassLoader"))
+                        // wildfly: Module/ModuleLoader/ModuleSpec deeper shims.
+                        || (class_name == "org/jboss/modules/Module"
+                            && matches!(method_name,
+                                "getDependencies"
+                                | "getPaths"
+                                | "getExportedPaths"
+                                | "getResourceLoaders"))
+                        || (class_name == "org/jboss/modules/ModuleLoader"
+                            && matches!(method_name,
+                                "preloadModule" | "findLoadedModuleLocal"))
+                        || (class_name == "org/jboss/modules/ModuleSpec"
+                            && method_name == "getDependencies")
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns
                         // synthetic placeholder for null beans so downstream
                         // lifecycle doesn't ISE on "No wrapped object".

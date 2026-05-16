@@ -73,6 +73,7 @@ const CN_MODULE_LOADER_SELECTOR: &str = "org/jboss/modules/ModuleLoaderSelector"
 const CN_MODULE_CLASS_LOADER: &str = "org/jboss/modules/ModuleClassLoader";
 const CN_PATH_FILTER: &str = "org/jboss/modules/PathFilter";
 const CN_RESOURCE: &str = "org/jboss/modules/Resource";
+const CN_MODULE_SPEC: &str = "org/jboss/modules/ModuleSpec";
 
 /// `org.jboss.modules.Module.getBootModuleLoader()Lorg/jboss/modules/ModuleLoader;`
 ///
@@ -179,6 +180,141 @@ fn native_resource_open_stream(
     Ok(Some(Value::Object(None)))
 }
 
+// ---------------------------------------------------------------------------
+// Round-17 (this agent): the watchdog dispatch_trace ring buffer shows the
+// main thread reflectively iterating over `Module`'s declared fields and
+// methods, calling `Field.getModifiers / getName`, `Method.getReturnType /
+// getParameterTypes`, and `Class.isAssignableFrom`, in an apparent infinite
+// loop. The most likely root cause is `Module.<clinit>` (or a static init
+// path reached from it) walking the module's own dependency graph — and
+// because the synthetic LocalModuleLoader has no real dependencies, the
+// real Java code spins waiting for something to populate.
+//
+// The fix is to sever the bootstrap chain at three deeper levels:
+//
+//   * `Module.<clinit>` / `ModuleLoader.<clinit>` — no-op; whatever static
+//     fields the real classes set up are either already covered by
+//     `post_clinit_fixup` (for `BOOT_MODULE_LOADER`) or unused by callers
+//     that go through our native intercepts.
+//   * The graph-walking accessors on `Module` (`getDependencies`,
+//     `getPaths`, `getExportedPaths`, `getResourceLoaders`) — return empty
+//     arrays / null so nothing reflective can recurse through them.
+//   * The remaining `ModuleLoader` lookup helpers (`preloadModule`,
+//     `findLoadedModuleLocal`) — return null. `loadModule` itself is owned
+//     by `jboss_module_loader.rs` and unchanged; the helpers below were
+//     uncovered and would NPE-recurse into the half-built module graph.
+//   * `ModuleSpec.getDependencies` — empty array, mirrors `Module`.
+// ---------------------------------------------------------------------------
+
+/// `Module.<clinit>()` — no-op. The real clinit attempts to build a
+/// `DefaultBootModuleLoaderHolder.INSTANCE` via `WeakReference` /
+/// `AtomicReference` machinery that B6-swallows under CratonVM. Skipping
+/// the clinit is safe because `register_post_clinit_fixup` (owned by
+/// another agent in `phases_late.rs`) repopulates the static
+/// `BOOT_MODULE_LOADER` field after class initialization, and every other
+/// public accessor on `Module` is intercepted natively above.
+fn native_module_clinit(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `ModuleLoader.<clinit>()` — no-op. Same reasoning as
+/// `native_module_clinit`: the real clinit walks system properties and
+/// installs a default `ModuleLoaderSelector`, both of which we override
+/// natively. Skipping avoids the static-init reflection loop seen in the
+/// watchdog dispatch_trace.
+fn native_module_loader_clinit(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `Module.getDependencies()[Lorg/jboss/modules/Module$Dependency;` —
+/// return an empty `Object[]` (length 0, element type Reference). The
+/// declared element type is `Module$Dependency`, but JVM array typing
+/// is structural at the element level: a length-zero reference array
+/// satisfies any reference-element array type for read-only callers
+/// (which the reflection walk is). Callers that iterate this array
+/// terminate immediately, breaking the reflective recursion.
+fn native_module_get_dependencies(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `Module.getPaths()Lorg/jboss/modules/PathFilter;` — return null.
+/// The `PathFilter.accept` native (above) defaults to "accept all" if
+/// any caller dereferences a null filter, but most call sites guard
+/// against null and skip the path-filtering step entirely.
+fn native_module_get_paths(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Module.getExportedPaths()Lorg/jboss/modules/PathFilter;` — return
+/// null. Same rationale as `native_module_get_paths`.
+fn native_module_get_exported_paths(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Module.getResourceLoaders()[Lorg/jboss/modules/ResourceLoader;` —
+/// return an empty array. The real implementation walks the module's
+/// jar/zip resource list, which is not populated in CratonVM. An empty
+/// array short-circuits any iteration without provoking NPEs.
+fn native_module_get_resource_loaders(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `ModuleLoader.preloadModule(String)Lorg/jboss/modules/Module;` —
+/// return null. The real implementation triggers an asynchronous module
+/// resolution that recursively chains back into `findLoadedModuleLocal`
+/// and `loadModule`. Returning null tells callers "not preloaded"; they
+/// fall through to `loadModule`, which `jboss_module_loader.rs` owns.
+fn native_module_loader_preload_module(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `ModuleLoader.findLoadedModuleLocal(String)Lorg/jboss/modules/Module;`
+/// — return null. The real implementation consults an internal
+/// `ConcurrentHashMap` that our synthetic loader never populates, so
+/// null is the correct (and idempotent) answer. Returning null forces
+/// the caller to invoke `loadModule`, which is the path we DO support.
+fn native_module_loader_find_loaded_local(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `ModuleSpec.getDependencies()[Lorg/jboss/modules/DependencySpec;` —
+/// empty array. Mirrors `Module.getDependencies`; the spec form is
+/// reached during module-graph build-out which we likewise want to
+/// short-circuit.
+fn native_module_spec_get_dependencies(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
 /// Install every WildFly bootstrap short-circuit this module owns.
 ///
 /// **NOT WIRED YET.** Add this call from `lib.rs::register_essential_natives`
@@ -257,6 +393,79 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
         "openStream",
         "()Ljava/io/InputStream;",
         native_resource_open_stream,
+    );
+
+    // ------------------------------------------------------------------
+    // Round-17: deeper bootstrap shims to break the reflective Module-
+    // graph walk seen in the WildFly 39 watchdog dispatch_trace.
+    // ------------------------------------------------------------------
+
+    // Module.<clinit>()V — no-op (post_clinit_fixup repopulates the
+    // static fields we actually need).
+    registry.register(CN_MODULE, "<clinit>", "()V", native_module_clinit);
+
+    // ModuleLoader.<clinit>()V — no-op.
+    registry.register(
+        CN_MODULE_LOADER,
+        "<clinit>",
+        "()V",
+        native_module_loader_clinit,
+    );
+
+    // Module.getDependencies()[LModule$Dependency; — empty array.
+    registry.register(
+        CN_MODULE,
+        "getDependencies",
+        "()[Lorg/jboss/modules/Module$Dependency;",
+        native_module_get_dependencies,
+    );
+
+    // Module.getPaths()LPathFilter; — null.
+    registry.register(
+        CN_MODULE,
+        "getPaths",
+        "()Lorg/jboss/modules/PathFilter;",
+        native_module_get_paths,
+    );
+
+    // Module.getExportedPaths()LPathFilter; — null.
+    registry.register(
+        CN_MODULE,
+        "getExportedPaths",
+        "()Lorg/jboss/modules/PathFilter;",
+        native_module_get_exported_paths,
+    );
+
+    // Module.getResourceLoaders()[LResourceLoader; — empty array.
+    registry.register(
+        CN_MODULE,
+        "getResourceLoaders",
+        "()[Lorg/jboss/modules/ResourceLoader;",
+        native_module_get_resource_loaders,
+    );
+
+    // ModuleLoader.preloadModule(String)LModule; — null.
+    registry.register(
+        CN_MODULE_LOADER,
+        "preloadModule",
+        "(Ljava/lang/String;)Lorg/jboss/modules/Module;",
+        native_module_loader_preload_module,
+    );
+
+    // ModuleLoader.findLoadedModuleLocal(String)LModule; — null.
+    registry.register(
+        CN_MODULE_LOADER,
+        "findLoadedModuleLocal",
+        "(Ljava/lang/String;)Lorg/jboss/modules/Module;",
+        native_module_loader_find_loaded_local,
+    );
+
+    // ModuleSpec.getDependencies()[LDependencySpec; — empty array.
+    registry.register(
+        CN_MODULE_SPEC,
+        "getDependencies",
+        "()[Lorg/jboss/modules/DependencySpec;",
+        native_module_spec_get_dependencies,
     );
 }
 

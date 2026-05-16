@@ -1961,7 +1961,20 @@ impl ClassManager {
         // On failure the class is dropped (never reaches the store /
         // loaded_classes map) and the caller receives a typed
         // `VmError::Linkage(LinkageError::VerifyError { .. })`.
+        // JDK classes (java/, jdk/, sun/, com/sun/) are pre-verified by
+        // javac/jlink at jrt build time. Re-verifying them here is
+        // expensive AND incorrect — our `verify_abstract_method_implementation`
+        // and friends use a simplified `find_method_recursive` that misses
+        // miranda methods and other JVM-spec corner cases, falsely rejecting
+        // legitimate JDK classes (Hashtable.size, Boolean.describeConstable,
+        // File.compareTo, …). Skip verification for the boot classpath,
+        // matching HotSpot's `-Xverify:remote` default.
+        let is_jdk_class = name.starts_with("java/")
+            || name.starts_with("jdk/")
+            || name.starts_with("sun/")
+            || name.starts_with("com/sun/");
         if !options.skip_verification
+            && !is_jdk_class
             && !self.cds_class_cache.contains_key(name)
             && !class.is_synthetic_stub
             && class.state != ClassState::Verified

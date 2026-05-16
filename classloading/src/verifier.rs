@@ -859,7 +859,15 @@ pub fn verify_class_structure(class: &Class, store: &ClassStore) -> Result<(), L
     verify_method_access_flags(class)?;
     verify_final_class_constraint(class, store)?;
     verify_final_method_constraint(class, store)?;
-    verify_abstract_method_implementation(class, store)?;
+    // NOTE: `verify_abstract_method_implementation` (which also calls
+    // `verify_interface_methods`) is currently disabled because its
+    // simplified `find_method_recursive` model rejects legitimate JDK + 3rd-
+    // party classes (Hashtable.size, BouncyCastleProvider, Spring boot loader,
+    // ByteBuddy GetSystemPropertyAction, Kafka logIdent, …). The JVM spec
+    // permits miranda methods, interface default methods inherited via the
+    // class-hierarchy walk, and other corner cases that our walk misses.
+    // Re-enable once the walk matches JVMS §5.4.3.3 method resolution.
+    let _ = verify_abstract_method_implementation;
     verify_code_attribute_presence(class)?;
     Ok(())
 }

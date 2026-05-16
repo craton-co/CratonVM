@@ -1293,6 +1293,126 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         bean_wrapper_get_wrapped_instance,
     );
+
+    // ── sportme: filter orphaned beans at the class-name getter ───────────
+    //
+    // Final attack site for the "Target object must not be null" cascade:
+    // when Spring decides to instantiate a bean whose class can't be loaded
+    // on our partial classpath (e.g. RedisHttpSessionConfiguration),
+    // SimpleInstantiationStrategy.instantiate returns null, BeanWrapperImpl
+    // chokes on the null target, and the entire context bring-up aborts.
+    //
+    // Earlier rounds tried to recover after the null bean (no-op
+    // setWrappedInstance, applyPropertyValues, Assert.notNull) — each broke
+    // insurance / letsgo / demo by neutering Spring's normal lifecycle.
+    //
+    // New strategy: intercept the `getBeanClassName()` getter on
+    // AbstractBeanDefinition. If the bean's class IS loadable, return the
+    // canonical name (let Spring proceed exactly as it would have). If the
+    // class is NOT on the classpath, return null. Spring has well-defined
+    // code paths for definitions with a null class name (factory-method
+    // beans, parent-only beans, etc.) and skips orphaned class-only beans
+    // gracefully in preInstantiateSingletons / resolveBeanClass instead of
+    // throwing.
+    //
+    // Because we always return the real String when the class is loadable,
+    // this is effectively a no-op for the happy path on every other app
+    // (insurance, letsgo, demo) — the only beans whose name we hide are the
+    // ones that would have crashed anyway.
+    //
+    // The orchestrator should add `(AbstractBeanDefinition, getBeanClassName)`
+    // to check_override in vm/src/vm/vm_exec.rs.
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "getBeanClassName",
+        "()Ljava/lang/String;",
+        abstract_bean_definition_get_bean_class_name,
+    );
+}
+
+/// `AbstractBeanDefinition.getBeanClassName()` — return the canonical bean
+/// class name when the class is loadable on our classpath, otherwise return
+/// null so Spring skips the orphaned bean during preInstantiateSingletons /
+/// createBeanInstance instead of crashing with "Target object must not be
+/// null". See the registration site for the full rationale.
+///
+/// The real bytecode reads either the String `beanClassName` field or, when
+/// the bean class has been resolved to a Class mirror, returns
+/// `((Class<?>) beanClass).getName()`. We mirror both branches.
+fn abstract_bean_definition_get_bean_class_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // The `beanClass` field can hold either a String (unresolved) or a Class
+    // mirror (resolved). Spring's getBeanClassName() returns the name in
+    // either case. We read by field name to stay robust across Spring
+    // versions.
+    let raw_name: Option<String> = match ctx.get_field_by_name(this, "beanClass") {
+        Value::Object(Some(o)) => {
+            let type_cid = ctx.class_id_of_object(o);
+            let kind = ctx.class_name_of_id(type_cid).unwrap_or_default();
+            if kind == "java/lang/Class" {
+                // beanClass already resolved — look up the represented class
+                // via the mirror-reverse table and return its dotted name.
+                ctx.class_id_from_mirror(o)
+                    .and_then(|repr_cid| ctx.class_name_of_id(repr_cid))
+                    .map(|n| n.replace('/', "."))
+            } else if kind == "java/lang/String" {
+                ctx.read_string(o)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // Fall back to a dedicated `beanClassName` field if `beanClass` was empty.
+    let raw_name = raw_name.or_else(|| match ctx.get_field_by_name(this, "beanClassName") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    });
+
+    let name = match raw_name {
+        Some(n) if !n.is_empty() => n,
+        // No class name configured (factory-method bean, etc.) — return null,
+        // matching the real bytecode behaviour.
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // Probe the classpath. Spring uses dotted names; CratonVM uses internal
+    // (slash-separated) names. Try both forms so we don't false-negative on
+    // legitimately-loadable classes.
+    //
+    // We deliberately do NOT call `ctx.load_class()` here — `getBeanClassName`
+    // is called many times during context refresh, and triggering a load
+    // (with the side-effect of running clinit) per call is too heavy and
+    // would regress unrelated paths.  By the time Spring reaches an
+    // instantiation site that depends on the class being resolved, our
+    // existing `resolveBeanClass` / `doResolveBeanClass` shims will already
+    // have attempted `ensure_class_initialized`, so a class that's truly on
+    // the classpath will have a ClassId by this point.
+    let internal = name.replace('.', "/");
+    let loadable =
+        ctx.class_id_by_name(&internal).is_some() || ctx.class_id_by_name(&name).is_some();
+
+    if !loadable {
+        tracing::warn!(
+            "[bean-filter] hiding bean class '{}' — not loadable on partial classpath",
+            name
+        );
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Class IS loadable — return the canonical (dotted) name so Spring's
+    // happy path runs unchanged.
+    let dotted = name.replace('/', ".");
+    let s = ctx.create_string(&dotted);
+    Ok(Some(Value::Object(Some(s))))
 }
 
 /// `BeanWrapperImpl.getWrappedInstance()` — return the stored wrapped target,

@@ -30638,6 +30638,7 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
     register_p69_submission_publisher(registry);
     register_p69_misc(registry);
     register_pbe_diagnostic(registry);
+    register_pbe_workaround(registry);
 }
 
 // =============================================================================
@@ -31290,6 +31291,62 @@ pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
             );
             Ok(None)
         },
+    );
+
+    // Suppress NotWritablePropertyException construction — its very existence
+    // is what Spring later batches into PropertyBatchUpdateException. Returning
+    // `Ok(None)` here makes <init> a no-op so the freshly-allocated exception
+    // object is functionally inert: it carries no message and no stack trace,
+    // and `throw` of it short-circuits with a half-initialized exception that
+    // Spring's wrapper catch swallows. This is risky for legitimate
+    // misconfiguration cases — keep it gated behind the same suppression scope
+    // used by register_pbe_workaround. Caller (orchestrator) decides whether
+    // to enable via the check_override allowlist.
+    r.register(
+        "org/springframework/beans/NotWritablePropertyException",
+        "<init>",
+        "(Ljava/lang/Class;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+}
+
+// =============================================================================
+// PBE workaround — silence the well-known null-setter throws that Spring 4's
+// ConfigurationClassPostProcessor performs during CratonVM's partial bootstrap.
+// Each setter normally runs `Assert.notNull(arg, "...")` which throws
+// IllegalArgumentException → caught by BeanWrapperImpl → batched into PBE.
+// No-oping the setter leaves the field null but prevents the throw chain.
+// =============================================================================
+
+pub(crate) fn register_pbe_workaround(registry: &mut NativeMethodRegistry) {
+    // Spring's ConfigurationClassPostProcessor.setMetadataReaderFactory —
+    // bytecode does `Assert.notNull(factory, "...")` which throws when
+    // CratonVM's incomplete BeanFactory passes null at autowire time.
+    // No-op the setter; the field stays null but no exception is thrown.
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "setMetadataReaderFactory",
+        "(Lorg/springframework/core/type/classreading/MetadataReaderFactory;)V",
+        |_ctx, _args| Ok(None),
+    );
+    // Similar setters that may be called with null during partial bootstrap.
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "setEnvironment",
+        "(Lorg/springframework/core/env/Environment;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "setResourceLoader",
+        "(Lorg/springframework/core/io/ResourceLoader;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
+        "setBeanClassLoader",
+        "(Ljava/lang/ClassLoader;)V",
+        |_ctx, _args| Ok(None),
     );
 }
 

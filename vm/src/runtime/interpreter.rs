@@ -1097,6 +1097,61 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // S-bytebuddy r1 — Rust-side recursion guard.
+    //
+    // ByteBuddy's `JavaDispatcher.run()` performs deep reflection via
+    // `Method.invoke`, whose bytecode dispatches back into this `execute`
+    // function. The Java-level frame counter (`thread.frames`) is checked at
+    // each push (see `max_stack_depth` guard below), BUT a `Method.invoke`
+    // chain that re-enters `execute` re-invokes this Rust function on the
+    // native call stack BEFORE the Java frame is pushed. That recursion is
+    // not bounded by `max_stack_depth`. Result: under a deep ByteBuddy
+    // reflection cascade, the Rust call stack blows past the OS guard page
+    // (even at the 64 MB main-vm setting) and the process aborts with the
+    // Rust stack-overflow handler (rc=127, SIGABRT) — bypassing any Java
+    // try/catch.
+    //
+    // Throw a Java `StackOverflowError` BEFORE we recurse further. JVMS lets
+    // the implementation raise SOE at any depth; ByteBuddy's reflection
+    // helpers catch `Throwable` and recover. 500 frames is well below the
+    // ~10 000+ frames that the 64 MB Rust stack can physically hold but
+    // safely above any reasonable Java application's recursion depth.
+    thread_local! {
+        static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            EXEC_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    // EXEC_DEPTH guard temporarily DISABLED — see investigation below.
+    // The guard at depth=500/5000 caused universal "linkage error:
+    // verification error: concrete class must implement abstract method"
+    // failures across ALL apps, even ones with shallow stacks (cleaner_probe,
+    // bc_probe). Suspected root cause: the verifier or class linker calls
+    // execute() during loading and our SOE confused it. Rollback for now;
+    // ByteBuddy will continue to Rust-stack-overflow until a less invasive
+    // recursion fix is found.
+    if depth > 50_000 {
+        EXEC_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::StackOverflowError,
+        )));
+    }
+    let _exec_depth_guard = DepthGuard;
+
     // letsgo postmortem instrumentation: record every bytecode-method
     // entry into the global dispatch ring. Gated by `RUSTJVM_DBG_LETSGO=1`
     // (cheap atomic-bool check on the disabled path).
