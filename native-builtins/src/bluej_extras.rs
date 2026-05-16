@@ -170,6 +170,35 @@ pub fn register_bluej_stubs(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/awt/AWTKeyStroke;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+
+    // AppContext.getAppContext: static accessor that NPEs because the
+    // main AppContext singleton is never constructed (the clinit above
+    // is a no-op). Return null so callers see a clean null reference.
+    registry.register(
+        "sun/awt/AppContext",
+        "getAppContext",
+        "()Lsun/awt/AppContext;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // Toolkit.getDefaultToolkit: often the next AWT thing BlueJ touches
+    // once AppContext returns null. Real impl would try to build a
+    // platform toolkit and NPE under CratonVM's partial bootstrap.
+    registry.register(
+        "java/awt/Toolkit",
+        "getDefaultToolkit",
+        "()Ljava/awt/Toolkit;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // EventQueue.invokeLater: Swing apps queue their main UI dispatch
+    // here. With the GUI short-circuited, swallow the Runnable.
+    registry.register(
+        "java/awt/EventQueue",
+        "invokeLater",
+        "(Ljava/lang/Runnable;)V",
+        |_ctx, _args| Ok(None),
+    );
 }
 
 #[cfg(test)]

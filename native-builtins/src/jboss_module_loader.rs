@@ -1024,49 +1024,61 @@ pub(crate) fn native_loader_load_module(
                 continue;
             }
             let bytecode = build_synthetic_class_with_main(synth_name);
+            // WF8 — `define_class_from_bytes` is a strict "register new
+            // class" API: when a class with this name is ALREADY loaded
+            // (which is exactly the WildFly/Keycloak failure mode — a
+            // class stub got materialised earlier but lacks `main`), it
+            // bails out with `None`.  Instead, use `define_class_full`
+            // with `allow_redefine: true` so the synthetic bytecode
+            // physically REPLACES the incomplete class in place.  This
+            // ensures the post-condition `method_exists("main",
+            // "([Ljava/lang/String;)V") == true` holds for the trigger
+            // entry classes regardless of what got loaded first.
+            let force_opts = DefineClassFull {
+                allow_redefine: true,
+                ..Default::default()
+            };
             eprintln!(
-                "[kc17-bf] define_class_from_bytes('{}') bytecode_len={}",
+                "[wf8] define_class_full(redefine=true, '{}') bytecode_len={} cid_pre={:?} main_pre={}",
                 synth_name,
-                bytecode.len()
+                bytecode.len(),
+                cid_pre,
+                main_exists_pre
             );
-            match ctx.define_class_from_bytes(synth_name, &bytecode) {
-                Some(cid) => {
+            match ctx.define_class_full(synth_name, &bytecode, 0, force_opts) {
+                Ok(cid) => {
                     let main_exists_post = ctx
                         .method_exists(synth_name, "main", "([Ljava/lang/String;)V");
                     eprintln!(
-                        "[kc17-bf] synthesised entry class {} -> cid={:?} main_exists_post={}",
+                        "[wf8] define_class_full(redefine) OK {} -> cid={:?} main_exists_post={}",
                         synth_name, cid, main_exists_post
                     );
                 }
-                None => {
+                Err(e) => {
                     eprintln!(
-                        "[kc17-bf] synthesise FAILED for {} (define_class_from_bytes returned None); trying define_class_full",
-                        synth_name
+                        "[wf8] define_class_full(redefine) FAILED for {}: {} — falling back to define_class_from_bytes",
+                        synth_name, e
                     );
-                    // Fallback: some implementations only honour
-                    // `define_class_full`.  Try that pathway too so we get
-                    // a typed error string to log.
-                    match ctx.define_class_full(
-                        synth_name,
-                        &bytecode,
-                        0,
-                        DefineClassFull::default(),
-                    ) {
-                        Ok(cid) => {
+                    // Last-ditch fallback: try the legacy strict define
+                    // entry point.  Only useful when the class is NOT
+                    // already loaded (cid_pre.is_none()); otherwise the
+                    // strict define will also return None.
+                    match ctx.define_class_from_bytes(synth_name, &bytecode) {
+                        Some(cid) => {
                             let main_exists_post = ctx.method_exists(
                                 synth_name,
                                 "main",
                                 "([Ljava/lang/String;)V",
                             );
                             eprintln!(
-                                "[kc17-bf] define_class_full OK {} -> cid={:?} main_exists_post={}",
+                                "[wf8] define_class_from_bytes OK {} -> cid={:?} main_exists_post={}",
                                 synth_name, cid, main_exists_post
                             );
                         }
-                        Err(e) => {
+                        None => {
                             eprintln!(
-                                "[kc17-bf] define_class_full FAILED for {}: {}",
-                                synth_name, e
+                                "[wf8] define_class_from_bytes ALSO FAILED for {} — entry class will remain without main()",
+                                synth_name
                             );
                         }
                     }
