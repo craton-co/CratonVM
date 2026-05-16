@@ -404,6 +404,11 @@ pub mod activemq_extras;
 pub mod felix_extras;
 pub mod glassfish_extras;
 pub mod gradle_extras;
+pub mod hbase_extras;
+pub mod ignite_extras;
+pub mod hazelcast_extras;
+pub mod spark_extras;
+pub mod flink_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1406,6 +1411,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     felix_extras::register_felix_stubs(registry);
     glassfish_extras::register_glassfish_stubs(registry);
     gradle_extras::register_gradle_stubs(registry);
+    hbase_extras::register_hbase_stubs(registry);
+    ignite_extras::register_ignite_stubs(registry);
+    hazelcast_extras::register_hazelcast_stubs(registry);
+    spark_extras::register_spark_stubs(registry);
+    flink_extras::register_flink_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.

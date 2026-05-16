@@ -7421,6 +7421,20 @@ fn invoke_on_class_shared_inner(
                                 | "org/gradle/launcher/Main"
                                 | "org/gradle/launcher/bootstrap/EntryPoint")
                             && matches!(method_name, "main" | "<clinit>"))
+                        // batch2: hbase, ignite, hazelcast, spark, flink
+                        || (matches!(class_name,
+                                "org/apache/hadoop/hbase/util/VersionInfo"
+                                | "org/apache/hadoop/hbase/HMaster"
+                                | "org/apache/hadoop/hbase/HBCK2"
+                                | "org/apache/hadoop/hbase/util/HBaseFsck"
+                                | "org/apache/ignite/startup/cmdline/CommandLineStartup"
+                                | "org/apache/ignite/Ignition"
+                                | "com/hazelcast/core/server/HazelcastMemberStarter"
+                                | "org/apache/spark/deploy/SparkSubmit"
+                                | "org/apache/spark/launcher/Main"
+                                | "org/apache/flink/client/cli/CliFrontend"
+                                | "org/apache/flink/runtime/entrypoint/StandaloneSessionClusterEntrypoint")
+                            && matches!(method_name, "main" | "<clinit>"))
                         // r36 boot-test stubs (BlueJ, jEdit, Arduino, Cassandra, Neo4j, Solr, cglib)
                         || (matches!(class_name,
                                 "Installer"

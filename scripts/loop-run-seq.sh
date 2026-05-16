@@ -19,30 +19,32 @@ run_app() {
     echo "$name rc=$rc"
 }
 
-# ── Batch 1: Maven, Gradle, ActiveMQ, Felix, TomEE, GlassFish ─────────────────
-MVN_CP=$(find "$APPS/apache-maven-3.9.9/boot" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
-run_app maven 25 --Xmx 256m -c "$MVN_CP" \
-    "-Dmaven.home=$APPS/apache-maven-3.9.9" \
-    "-Dclassworlds.conf=$APPS/apache-maven-3.9.9/bin/m2.conf" \
-    org.codehaus.plexus.classworlds.launcher.Launcher
+# ── Batch 2: HBase, Ignite, Hazelcast, Spark, Flink ────────────────────────
+HB="$APPS/hbase-2.5.10"
+HBCP=$(find "$HB/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app hbase 25 --Xmx 512m -c "$HBCP" \
+    "-Dhbase.home.dir=$HB" \
+    org.apache.hadoop.hbase.util.VersionInfo
 
-GRADLE_CP=$(find "$APPS/gradle-8.10.2/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
-run_app gradle 25 --Xmx 256m -c "$GRADLE_CP" org.gradle.launcher.GradleMain
+IG="$APPS/apache-ignite-2.16.0-bin"
+IGCP=$(find "$IG/libs" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app ignite 25 --Xmx 512m -c "$IGCP" \
+    "-DIGNITE_HOME=$IG" \
+    org.apache.ignite.startup.cmdline.CommandLineStartup
 
-run_app activemq 25 --Xmx 256m \
-    --jar "$APPS/apache-activemq-6.1.4/bin/activemq.jar"
+run_app hazelcast 25 --Xmx 512m \
+    --jar "$APPS/hazelcast.jar"
 
-run_app felix 25 --Xmx 256m \
-    --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
+SP="$APPS/spark-3.5.1-bin-hadoop3"
+SPCP=$(find "$SP/jars" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app spark 25 --Xmx 512m -c "$SPCP" \
+    org.apache.spark.deploy.SparkSubmit
 
-TC="$APPS/apache-tomee-plus-9.1.3"
-TCCP="$TC/bin/bootstrap.jar;$TC/bin/tomcat-juli.jar"
-run_app tomee 25 --Xmx 512m -c "$TCCP" \
-    "-Dcatalina.home=$TC" "-Dcatalina.base=$TC" \
-    org.apache.catalina.startup.Bootstrap version
-
-run_app glassfish 25 --Xmx 512m \
-    --jar "$APPS/glassfish7/glassfish/modules/glassfish.jar"
+FL="$APPS/flink-1.18.1"
+FLCP=$(find "$FL/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app flink 25 --Xmx 512m -c "$FLCP" \
+    "-DFLINK_HOME=$FL" \
+    org.apache.flink.client.cli.CliFrontend
 
 echo "=== SUMMARY iter=$ITER ==="
 for f in "$LOGDIR"/*.rc.txt; do
