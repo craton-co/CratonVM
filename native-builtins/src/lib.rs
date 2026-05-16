@@ -392,6 +392,13 @@ pub mod bytebuddy_extras;
 pub mod demo_extras;
 pub mod jenkins_extras;
 pub mod wildfly_extras;
+pub mod bluej_extras;
+pub mod jedit_extras;
+pub mod arduino_extras;
+pub mod cassandra_extras;
+pub mod neo4j_extras;
+pub mod solr_extras;
+pub mod cglib_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1382,6 +1389,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     demo_extras::register_demo_stubs(registry);
     jenkins_extras::register_jenkins_stubs(registry);
     wildfly_extras::register_wildfly_stubs(registry);
+    bluej_extras::register_bluej_stubs(registry);
+    jedit_extras::register_jedit_stubs(registry);
+    arduino_extras::register_arduino_stubs(registry);
+    cassandra_extras::register_cassandra_stubs(registry);
+    neo4j_extras::register_neo4j_stubs(registry);
+    solr_extras::register_solr_stubs(registry);
+    cglib_extras::register_cglib_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.

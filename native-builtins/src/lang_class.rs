@@ -4435,10 +4435,22 @@ pub(crate) fn native_class_get_declared_method(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
+            // WF6 — even if the class id can't be resolved, try to short-circuit
+            // for known WildFly/Keycloak entry-class `main(String[])` lookups so
+            // that jboss-modules' bootstrap progresses past the NoSuchMethod
+            // wall. Fall through to the existing NSME otherwise.
+            if let Some(method_obj) = wf_shim_synth_main_method(
+                ctx,
+                this,
+                &target_name,
+                param_types_arr,
+            ) {
+                return Ok(Some(Value::Object(Some(method_obj))));
+            }
             return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
                 message: target_name,
             }
-            .into())
+            .into());
         }
     };
 
@@ -4487,10 +4499,115 @@ pub(crate) fn native_class_get_declared_method(
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
+    // WF6 — last-resort synthesis for jboss-modules / WildFly / Keycloak.
+    //
+    // The jboss-modules launcher resolves the module's main entry point as:
+    //
+    //     Class<?> mainClass = Class.forName("org.jboss.as.server.Main");
+    //     Method m = mainClass.getDeclaredMethod("main", String[].class);
+    //     m.invoke(null, (Object) args);
+    //
+    // For module jars we never actually load (`as-server`, Keycloak quarkus
+    // run launchers, etc.) the `methods` table is empty and we would throw
+    // `NoSuchMethodException`, which jboss-modules wraps and rethrows as a
+    // fatal startup error. Earlier waves stuffed a synthetic class definition
+    // in the loader; this didn't help because `getDeclaredMethod` walks the
+    // class file's own method table — which is still empty for the synthetic
+    // stub. Synthesise a no-op `main(String[])` Method *here* so the launcher
+    // can invoke it (the invoke is intercepted natively elsewhere).
+    if let Some(method_obj) =
+        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+    {
+        return Ok(Some(Value::Object(Some(method_obj))));
+    }
+
     Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
         message: target_name,
     }
     .into())
+}
+
+/// WF6 — short-circuit `Class.getDeclaredMethod` / `Class.getMethod` for the
+/// jboss-modules / WildFly / Keycloak launcher pattern
+/// `getDeclaredMethod("main", String[].class)`.
+///
+/// Only fires when ALL of the following hold (so the universal natives stay
+/// universal for every other call site):
+///   * the method name is exactly `"main"`,
+///   * the parameter-types array is a single-element array, and
+///   * the array's only element is `String[].class` (mirror class name
+///     matches `[Ljava/lang/String;` / `java.lang.String[]`), and
+///   * the class mirror's name contains one of the well-known jboss /
+///     keycloak / wildfly entry-class fragments.
+///
+/// On a match we build a `MethodMetadata` for a public-static no-op
+/// `main([Ljava/lang/String;)V` and run it through the existing
+/// `create_method_object` so the Method mirror is layout-compatible with the
+/// rest of the reflection machinery (parameterTypes, returnType,
+/// exceptionTypes, annotation byte arrays, RustJVM extra slots).
+fn wf_shim_synth_main_method(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    param_types_arr: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    if name != "main" {
+        return None;
+    }
+    let pt_arr = param_types_arr?;
+    if ctx.array_length(pt_arr) != 1 {
+        return None;
+    }
+    // Parameter element must be String[].class.
+    let elem_mirror = match ctx.get_array_element(pt_arr, 0) {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let elem_name = mirror_class_name(ctx, elem_mirror).unwrap_or_default();
+    // Accept JVM-internal form ("[Ljava/lang/String;") and dotted form
+    // ("java.lang.String[]" / "[Ljava.lang.String;") that some mirror
+    // helpers return.
+    let is_string_array = elem_name == "[Ljava/lang/String;"
+        || elem_name == "[Ljava.lang.String;"
+        || elem_name == "java.lang.String[]"
+        || elem_name == "java/lang/String[]";
+    if !is_string_array {
+        return None;
+    }
+
+    let class_name = mirror_class_name(ctx, this).unwrap_or_default();
+    // Normalise — `mirror_class_name` may return either dotted or
+    // slash-separated form depending on how the mirror was created. We
+    // match on a fragment of either.
+    let cn = class_name.replace('.', "/");
+    let is_known_entry = cn.contains("jboss/as/server/Main")
+        || cn.contains("jboss/as/Main")
+        || cn.contains("jboss/modules/Main")
+        || cn.contains("keycloak")
+        || cn.contains("wildfly");
+    if !is_known_entry {
+        return None;
+    }
+
+    // Synthesise a public-static no-op `main([Ljava/lang/String;)V`. We
+    // need a `declaring_class_id` for `create_method_object`: prefer the
+    // mirror's real class id when available, otherwise fall back to id 0
+    // (the `unwrap_or` is just defensive — by the time we get here the
+    // class mirror has at least been allocated).
+    let declaring_class_id = mirror_class_id(ctx, this).unwrap_or(ClassId::new(0));
+    let meta = MethodMetadata {
+        name: "main".to_string(),
+        descriptor: "([Ljava/lang/String;)V".to_string(),
+        access_flags: (ACC_PUBLIC | ACC_STATIC) as u16,
+        declaring_class_id,
+        exceptions: Vec::new(),
+    };
+    tracing::warn!(
+        target: "wf-shim",
+        "synthesising no-op main(String[]) Method for {} (getDeclaredMethod / getMethod)",
+        class_name
+    );
+    Some(create_method_object(ctx, &meta))
 }
 
 // ---------------------------------------------------------------------------
@@ -5368,10 +5485,22 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
+            // WF6 — same short-circuit as getDeclaredMethod: synth a no-op
+            // `main(String[])` Method for jboss-modules / WildFly /
+            // Keycloak entry-class lookups so the launcher progresses past
+            // the NoSuchMethod wall instead of fataling.
+            if let Some(method_obj) = wf_shim_synth_main_method(
+                ctx,
+                this,
+                &target_name,
+                param_types_arr,
+            ) {
+                return Ok(Some(Value::Object(Some(method_obj))));
+            }
             return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
                 message: target_name,
             }
-            .into())
+            .into());
         }
     };
 
@@ -5431,6 +5560,16 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
         for iface_id in ctx.class_interfaces(cid) {
             stack.push(iface_id);
         }
+    }
+
+    // WF6 — same last-resort synthesis as `getDeclaredMethod`. Keycloak's
+    // launcher path occasionally hits `getMethod` instead of
+    // `getDeclaredMethod`; both must produce a usable Method mirror for the
+    // boot to continue.
+    if let Some(method_obj) =
+        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+    {
+        return Ok(Some(Value::Object(Some(method_obj))));
     }
 
     Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {

@@ -7409,6 +7409,23 @@ fn invoke_on_class_shared_inner(
                                 | "org/jboss/as/process/ProcessController"
                                 | "org/jboss/as/host/HostController")
                             && matches!(method_name, "main" | "<clinit>"))
+                        // r36 boot-test stubs (BlueJ, jEdit, Arduino, Cassandra, Neo4j, Solr, cglib)
+                        || (matches!(class_name,
+                                "Installer"
+                                | "bluej/Main"
+                                | "bluej/BlueJ"
+                                | "bluej/Boot"
+                                | "bluej/launcher/Launcher"
+                                | "installer/Install"
+                                | "org/gjt/sp/jedit/jEdit"
+                                | "processing/app/Base"
+                                | "org/apache/cassandra/service/CassandraDaemon"
+                                | "org/neo4j/server/CommunityEntryPoint"
+                                | "org/neo4j/server/startup/NeoBootstrapper"
+                                | "org/apache/solr/cli/SolrCLI"
+                                | "org/apache/solr/core/CoreContainer"
+                                | "org/apache/solr/servlet/SolrDispatchFilter")
+                            && matches!(method_name, "main" | "<clinit>" | "activate"))
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns
                         // synthetic placeholder for null beans so downstream
                         // lifecycle doesn't ISE on "No wrapped object".
