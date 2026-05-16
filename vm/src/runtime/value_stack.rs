@@ -526,11 +526,15 @@ impl ValueStack {
 
     /// Collect all non-null object references from the stack for GC root scanning.
     ///
-    /// Mirrors [`crate::runtime::frame::Frame::scan_local_objects`]:
+    /// Per JVM spec, an operand-stack `Long` slot IS a primitive long, never a heap
+    /// reference, so it is intentionally NOT rooted here. Smuggling references through
+    /// long slots (the JNI `jobject`-as-`jlong` contract used by some natives / JIT
+    /// glue) is handled at those specific sites, not in the generic GC root scan —
+    /// treating arbitrary primitive longs as roots can SEGV when their bits happen to
+    /// look like an aligned heap pointer (see `applogs/letsgo-segv-L1-diagnosis.md`).
+    ///
+    /// Scanned slot kinds:
     /// - NaN-boxed object slots (`CompactValue::is_object`).
-    /// - [`CompactTag::Long`] slots (raw `i64` bits, including NaN-tag collisions)
-    ///   where [`jlong_bits_as_aligned_object_ptr`] matches the JNI `jobject`-as-`jlong`
-    ///   contract.
     /// - Untagged raw slots ([`CompactTag::Double`] in the compact encoding — ambiguous
     ///   JVM long vs double): only values that pass `heap.is_object_address` are rooted,
     ///   so numeric longs and ordinary doubles are not mistaken for references.
@@ -545,15 +549,18 @@ impl ValueStack {
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
-            } else if cv.tag() == CompactTag::Long {
+            } else if matches!(cv.tag(), CompactTag::Long | CompactTag::Double) {
+                // O1 hybrid: tagged Long OR untagged Double bits — both
+                // could be smuggled jobject refs (JNI long-as-jobject pattern
+                // used by WildFly's jboss-modules bootloader). Validate via
+                // is_heap_addr (loose arena+alignment check) which doesn't
+                // require a parseable object header (some refs are at
+                // interior offsets or mid-init objects). The generational
+                // collector's MAX_SANE_OBJECT_SIZE guard in forward_object
+                // handles bogus roots gracefully — over-retention is the only
+                // cost, vs. WildFly SEGV with the strict is_object_address.
                 if let Some(p) = jlong_bits_as_aligned_object_ptr(cv.to_bits()) {
-                    // SAFETY: same `jobject`-as-`jlong` contract as frame locals.
-                    roots.push(unsafe { ObjectRef::from_raw(p as *mut u8) });
-                }
-            } else if cv.tag() == CompactTag::Double {
-                // Untagged raw bits: JVM long or IEEE double — validate heap object.
-                if let Some(p) = jlong_bits_as_aligned_object_ptr(cv.to_bits()) {
-                    if let Some(r) = heap.is_object_address(p) {
+                    if let Some(r) = heap.is_heap_addr(p) {
                         roots.push(r);
                     }
                 }
@@ -563,10 +570,13 @@ impl ValueStack {
 
     /// Update object references after GC using the pointer map.
     ///
-    /// Symmetric to [`crate::runtime::frame::Frame::update_local_refs`]: updates
-    /// tagged object payloads, `CompactTag::Long` slots carrying aligned pointers,
-    /// and untagged raw slots whose bits match [`jlong_bits_as_aligned_object_ptr`]
-    /// and appear in `pointer_map`.
+    /// Symmetric to [`Self::scan_object_refs`]: only tagged object slots are
+    /// remapped. Primitive `Long` slots are never treated as references — the
+    /// matching restriction in `scan_object_refs` means a primitive long bit
+    /// pattern would never have been rooted, so the GC pointer_map cannot legitimately
+    /// contain an entry for it. Untagged `Double` slots that happen to encode a
+    /// jlong-shaped pointer were rooted (filtered through `heap.is_object_address`)
+    /// and ARE remapped here so the post-GC slot points at the moved object.
     pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>) {
         for i in 0..self.len {
             let cv = self.slots[i];
@@ -576,11 +586,14 @@ impl ValueStack {
                         self.slots[i].update_object_ptr(new_addr as u64);
                     }
                 }
-            } else if matches!(cv.tag(), CompactTag::Long | CompactTag::Double) {
+            } else if cv.tag() == CompactTag::Double {
                 let bits = cv.to_bits();
                 if let Some(old_ptr) = jlong_bits_as_aligned_object_ptr(bits) {
                     if let Some(&new_addr) = pointer_map.get(&old_ptr) {
-                        self.slots[i] = CompactValue::long(new_addr as i64);
+                        // Preserve the Double tag (untagged raw bits) so the slot's
+                        // type doesn't change across GC — interpreter dispatch on
+                        // this slot expects the same tag it had pre-GC.
+                        self.slots[i] = CompactValue::from_bits(new_addr as u64);
                     }
                 }
             }
@@ -1304,10 +1317,40 @@ mod tests {
         }
     }
 
-    /// `jobject` surfaced as raw `jlong` / `Value::Long` sits in an untagged
-    /// stack slot; GC must still see it when it points at a real object header.
+    /// Per JVM spec a `CompactTag::Long` operand slot IS a primitive long, never
+    /// a reference. The scan must NOT root such slots — this was the SEGV trigger
+    /// described in `applogs/letsgo-segv-L1-diagnosis.md`. To exercise the buggy
+    /// path we need a slot whose `tag()` actually returns `Long`, i.e. a u64 whose
+    /// high bits collide with the NaN-box marker AND whose 3-bit sub-tag is
+    /// SUB_LONG_LO (110) or SUB_LONG_HI (111). `CompactValue::long` only produces
+    /// such a tag for specific bit patterns; build one directly via `from_bits`.
     #[test]
-    fn t10_gc_scan_roots_jlong_bits_when_heap_validates() {
+    fn t10_gc_scan_skips_long_slot_even_if_bits_resemble_heap_pointer() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+
+        // NANBOX_BITS (0xFFFC_0000_0000_0000) | SUB_LONG_LO (6 << 47)
+        //   | aligned-pointer-shaped low 47 bits (0x10000).
+        // tag() returns CompactTag::Long for this pattern.
+        let long_bits: u64 = 0xFFFC_0000_0000_0000 | (6u64 << 47) | 0x1_0000;
+
+        let mut stack = ValueStack::new(4);
+        stack.push_compact(CompactValue::from_bits(long_bits));
+        assert_eq!(stack.get_compact(0).unwrap().tag(), CompactTag::Long,
+                   "test setup must produce a CompactTag::Long slot");
+
+        let mut roots = Vec::new();
+        stack.scan_object_refs(&mut roots, &heap);
+        assert!(roots.is_empty(),
+                "primitive Long slots must not be treated as GC roots");
+    }
+
+    /// Untagged raw bits (CompactTag::Double — the ambiguous JVM long/double
+    /// slot in this encoding) that pass `heap.is_object_address` ARE rooted.
+    /// This is the safe surviving path after the Long-arm fix.
+    #[test]
+    fn t10_gc_scan_roots_untagged_bits_when_heap_validates() {
         use crate::classloading::ClassId;
         use crate::memory::vm_heap::{GcBackend, VmHeap};
 
@@ -1316,7 +1359,8 @@ mod tests {
         let addr = obj.as_ptr() as usize;
 
         let mut stack = ValueStack::new(4);
-        stack.push_compact(CompactValue::long(addr as i64));
+        // Untagged Double-encoded raw bits (the ambiguous slot kind).
+        stack.push_compact(CompactValue::from_bits(addr as u64));
 
         let mut roots = Vec::new();
         stack.scan_object_refs(&mut roots, &heap);
@@ -1337,17 +1381,48 @@ mod tests {
         assert!(roots.is_empty());
     }
 
+    /// `update_object_refs` must NOT touch `CompactTag::Long` slots — they are
+    /// primitive longs, never references. A pointer_map collision against a
+    /// primitive's bits would otherwise silently corrupt the long value.
+    /// Uses a hand-rolled bit pattern (see scan-side test) to guarantee a
+    /// `Long`-tagged slot.
     #[test]
-    fn t10_gc_update_object_refs_rewrites_jlong_shaped_stack_slot() {
+    fn t10_gc_update_object_refs_preserves_long_slot() {
+        let mut stack = ValueStack::new(4);
+        // NANBOX_BITS | SUB_LONG_HI (7 << 47) | aligned low bits (0x1000).
+        let long_bits: u64 = 0xFFFC_0000_0000_0000 | (7u64 << 47) | 0x1000;
+        let new_ptr: usize = 0x2000;
+        stack.push_compact(CompactValue::from_bits(long_bits));
+        assert_eq!(stack.get_compact(0).unwrap().tag(), CompactTag::Long,
+                   "test setup must produce a CompactTag::Long slot");
+
+        let mut map = HashMap::new();
+        // A malicious pointer_map entry keyed off the Long's low pointer-shaped
+        // bits — the fix must NOT remap because Long slots are never roots.
+        map.insert(0x1000_usize, new_ptr);
+        // Also map the raw long_bits itself (defensive — neither key should fire).
+        map.insert(long_bits as usize, new_ptr);
+        stack.update_object_refs(&map);
+
+        // Bits unchanged: primitive long is left strictly alone.
+        assert_eq!(stack.get_compact(0).unwrap().to_bits(), long_bits);
+    }
+
+    /// Untagged raw `Double` slot carrying an aligned, mapped pointer IS
+    /// remapped (these are the only ambiguous slots `scan_object_refs` rooted).
+    #[test]
+    fn t10_gc_update_object_refs_rewrites_untagged_pointer_shaped_slot() {
         let mut stack = ValueStack::new(4);
         let old_ptr: usize = 0x1000;
         let new_ptr: usize = 0x2000;
-        stack.push_compact(CompactValue::long(old_ptr as i64));
+        stack.push_compact(CompactValue::from_bits(old_ptr as u64));
 
         let mut map = HashMap::new();
         map.insert(old_ptr, new_ptr);
         stack.update_object_refs(&map);
 
-        assert_eq!(stack.pop_long().unwrap(), new_ptr as i64);
+        // Slot now carries the remapped raw bits.
+        let cv = stack.get_compact(0).expect("slot present");
+        assert_eq!(cv.to_bits(), new_ptr as u64);
     }
 }

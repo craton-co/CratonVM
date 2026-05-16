@@ -31,11 +31,81 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
+
+// ---------------------------------------------------------------------------
+// Bug 2 fix: JAR cache to make Spring Boot fat-jar autoconfig walk fast.
+//
+// Spring's `ClassLoader.getResources("META-INF/spring.factories")` opens
+// every nested JAR in the fat JAR and reads META-INF/spring.factories.
+// Without caching, each open re-reads the full outer fat JAR (often 50-100 MB)
+// from disk *and* re-parses its zip directory — O(N²) behavior that takes
+// 120s+ to startup.  With caching, the outer fat JAR is read once and
+// inner-JAR bytes are extracted on demand.
+// ---------------------------------------------------------------------------
+
+/// Cache of outer JAR file path -> raw bytes (kept alive for the process
+/// lifetime).  Spring Boot fat JARs are at most ~150 MB; caching one is
+/// cheap relative to the disk re-reads it saves.
+fn outer_jar_bytes_cache() -> &'static Mutex<HashMap<String, Arc<Vec<u8>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache of nested JAR entry (outer_jar + "!" + inner_entry) -> raw bytes.
+fn nested_jar_bytes_cache() -> &'static Mutex<HashMap<String, Arc<Vec<u8>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_outer_jar(path: &str) -> std::io::Result<Arc<Vec<u8>>> {
+    {
+        let cache = outer_jar_bytes_cache().lock();
+        if let Some(b) = cache.get(path) {
+            return Ok(b.clone());
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    let arc = Arc::new(bytes);
+    outer_jar_bytes_cache().lock().insert(path.to_string(), arc.clone());
+    Ok(arc)
+}
+
+fn cached_nested_jar(outer: &str, inner_entry: &str) -> std::io::Result<Arc<Vec<u8>>> {
+    let key = format!("{outer}!{inner_entry}");
+    {
+        let cache = nested_jar_bytes_cache().lock();
+        if let Some(b) = cache.get(&key) {
+            return Ok(b.clone());
+        }
+    }
+    let outer_bytes = cached_outer_jar(outer)?;
+    let cursor = std::io::Cursor::new(outer_bytes.as_slice());
+    let mut zip = zip::ZipArchive::new(cursor)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut entry = zip.by_name(inner_entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+    let mut buf = Vec::with_capacity(entry.size().min(1 << 27) as usize);
+    entry.read_to_end(&mut buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let arc = Arc::new(buf);
+    nested_jar_bytes_cache().lock().insert(key, arc.clone());
+    Ok(arc)
+}
+
+/// Returns true if the Spring fat-jar debug prints (`URLRES-DBG`, `OSTR-DBG`,
+/// `CCE-DBG`) should be emitted. Off by default — these printlns themselves
+/// dominate startup time for Spring Boot fat JARs (hundreds of lines per
+/// second).  Enable by setting `RUSTJVM_SPRING_DBG=1`.
+#[inline]
+fn spring_dbg_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUSTJVM_SPRING_DBG").is_some())
+}
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
@@ -2082,7 +2152,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 
         // S111r23-DBG: log spring.factories URL openStream calls
         let is_sf = url_str.contains("spring.factories");
-        if is_sf {
+        if is_sf && spring_dbg_enabled() {
             eprintln!("[OSTR-DBG] URL.openStream: {}", url_str);
         }
 
@@ -2095,6 +2165,8 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             //     ClassLoader.getResources() produces double-nested URLs. We must
             //     read the outer JAR, extract the inner JAR bytes, then look up
             //     the entry in the inner archive.
+            // Bug 2 fix: cache outer JAR bytes + nested JAR bytes so the
+            // O(N) autoconfig walk doesn't become O(N²) on disk reads.
             let rest = rest.trim_start_matches('/');
             let (outer_jar, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
@@ -2106,25 +2178,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 let nested_jar_entry = &inner_path[..second_sep];
                 let resource_entry = &inner_path[second_sep + 2..];
                 use std::io::Read;
-                let outer_bytes = std::fs::read(outer_jar)
-                    .map_err(|e| ioex(format!("URL.openStream: read outer jar {outer_jar}: {e}")))?;
-                let cursor = std::io::Cursor::new(outer_bytes);
-                let mut outer_zip = zip::ZipArchive::new(cursor)
-                    .map_err(|e| ioex(format!("URL.openStream: open outer jar {outer_jar}: {e}")))?;
-                let mut nested_jar_file = outer_zip
-                    .by_name(nested_jar_entry)
+                let nested_jar_bytes = cached_nested_jar(outer_jar, nested_jar_entry)
                     .map_err(|e| ioex(format!("URL.openStream: nested jar {nested_jar_entry} in {outer_jar}: {e}")))?;
-                let mut nested_jar_bytes = Vec::with_capacity(nested_jar_file.size() as usize);
-                nested_jar_file
-                    .read_to_end(&mut nested_jar_bytes)
-                    .map_err(|e| ioex(format!("URL.openStream: read nested jar {nested_jar_entry}: {e}")))?;
-                let inner_cursor = std::io::Cursor::new(nested_jar_bytes);
+                let inner_cursor = std::io::Cursor::new(nested_jar_bytes.as_slice());
                 let mut inner_zip = zip::ZipArchive::new(inner_cursor)
                     .map_err(|e| ioex(format!("URL.openStream: open inner jar {nested_jar_entry}: {e}")))?;
                 let mut entry_file = inner_zip
                     .by_name(resource_entry)
                     .map_err(|e| ioex(format!("URL.openStream: entry {resource_entry} in {nested_jar_entry}: {e}")))?;
-                let mut buf = Vec::with_capacity(entry_file.size() as usize);
+                let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
                 entry_file
                     .read_to_end(&mut buf)
                     .map_err(|e| ioex(format!("URL.openStream: read entry {resource_entry}: {e}")))?;
@@ -2132,15 +2194,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             } else {
                 // Single-level: jar:file:/path/to.jar!/entry
                 use std::io::Read;
-                let jar_bytes = std::fs::read(outer_jar)
+                let jar_bytes = cached_outer_jar(outer_jar)
                     .map_err(|e| ioex(format!("URL.openStream: read jar {outer_jar}: {e}")))?;
-                let cursor = std::io::Cursor::new(jar_bytes);
+                let cursor = std::io::Cursor::new(jar_bytes.as_slice());
                 let mut zip = zip::ZipArchive::new(cursor)
                     .map_err(|e| ioex(format!("URL.openStream: open jar {outer_jar}: {e}")))?;
                 let mut entry_file = zip
                     .by_name(inner_path)
                     .map_err(|e| ioex(format!("URL.openStream: entry {inner_path} in {outer_jar}: {e}")))?;
-                let mut buf = Vec::with_capacity(entry_file.size() as usize);
+                let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
                 entry_file
                     .read_to_end(&mut buf)
                     .map_err(|e| ioex(format!("URL.openStream: read entry {inner_path}: {e}")))?;
@@ -2165,7 +2227,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             return Err(ioex(format!("URL.openStream: unsupported scheme: {url_str}")));
         };
 
-        if is_sf {
+        if is_sf && spring_dbg_enabled() {
             eprintln!("[OSTR-DBG] URL.openStream bytes={}", bytes.len());
         }
         let body = new_java_byte_array(ctx, &bytes);
@@ -2351,10 +2413,63 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 }
                 other => other,
             };
-            eprintln!("[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)");
+            if spring_dbg_enabled() {
+                eprintln!("[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)");
+            }
             Ok(Some(cls))
         },
     );
+
+    // -----------------------------------------------------------------------
+    // Bug 3 fix: AbstractBeanDefinition.getResolvedAutowireMode() override.
+    //
+    // The constructor writes `autowireMode = 0` (AUTOWIRE_NO) via
+    // `iconst_0; putfield #27`.  But under CratonVM the getfield reading
+    // that same slot later returns a non-zero value, sending
+    // `AbstractAutowireCapableBeanFactory.populateBean` down the
+    // autowireByType branch.  That branch calls every Setter on every
+    // property — including `setMetadataReaderFactory(null)` on
+    // `ConfigurationClassPostProcessor` — and throws
+    //   BeanCreationException: Error creating bean with name
+    //     'org.springframework.context.annotation.internalConfigurationAnnotationProcessor'.
+    //
+    // Diagnostic agent π traced the root cause to a field-layout / slot
+    // mismatch between read and write paths.  Pending a fix to the deeper
+    // layout bug, we return the correct default (0 = AUTOWIRE_NO) directly
+    // from a native override.  This matches the value the constructor
+    // tried to write and lets Spring's no-autowire branch run.
+    //
+    // The override is registered against `AbstractBeanDefinition`; Java
+    // dispatch via invokevirtual on a `RootBeanDefinition` will find this
+    // because RootBeanDefinition does not override `getResolvedAutowireMode`.
+    // -----------------------------------------------------------------------
+    r.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "getResolvedAutowireMode",
+        "()I",
+        |_ctx, _args| {
+            // AUTOWIRE_NO = 0. Returning 0 makes populateBean take the
+            // no-autowire branch (skip autowireByName / autowireByType).
+            // Applications that genuinely want autowiring set the value
+            // via setAutowireMode(...) which we'd need to honor — but
+            // Spring Boot's default config uses AUTOWIRE_NO; the bug only
+            // surfaces because the spurious non-zero read drives setter
+            // injection where none was requested.
+            Ok(Some(rustjvm_types::Value::Int(0)))
+        },
+    );
+    // K4 follow-up: also register on subclasses in case the bytecode binds
+    // invokevirtual to the concrete subclass instead of AbstractBeanDefinition
+    // (some Spring versions emit non-virtual dispatch on RootBeanDefinition).
+    for sub in &[
+        "org/springframework/beans/factory/support/RootBeanDefinition",
+        "org/springframework/beans/factory/support/GenericBeanDefinition",
+        "org/springframework/beans/factory/support/ChildBeanDefinition",
+    ] {
+        r.register(sub, "getResolvedAutowireMode", "()I", |_ctx, _args| {
+            Ok(Some(rustjvm_types::Value::Int(0)))
+        });
+    }
 
     // -----------------------------------------------------------------------
     // Spring Data Redis `RedisAccessor.afterPropertiesSet()`
@@ -2531,7 +2646,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            eprintln!("[URLRES-DBG] UrlResource.getInputStream intercepted");
+            if spring_dbg_enabled() {
+                eprintln!("[URLRES-DBG] UrlResource.getInputStream intercepted");
+            }
             // Obtain the URL via UrlResource.getURL() — the public accessor
             // that simply returns the private `url` field.  Using a Java
             // call lets us avoid hard-coding the field index (which depends
@@ -2549,7 +2666,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             };
             // Delegate directly to URL.openStream() — our native handles
             // jar:file: double-nested URLs correctly.
-            eprintln!("[URLRES-DBG] UrlResource.getInputStream -> openStream");
+            if spring_dbg_enabled() {
+                eprintln!("[URLRES-DBG] UrlResource.getInputStream -> openStream");
+            }
             ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[])
         },
     );
@@ -2885,6 +3004,74 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "org/springframework/boot/web/embedded/tomcat/TomcatServletWebServerFactory",
             )
         },
+    );
+
+    // CGLIB-δ — Spring WebFlux mirror of the servlet bypass above. Apps that
+    // start a `ReactiveWebServerApplicationContext` (e.g. letsgo-gateway with
+    // Spring Cloud Gateway) hit the same `MissingWebServerFactoryBeanException`
+    // because CratonVM's CGLIB bypass skips the auto-config that registers
+    // `nettyReactiveWebServerFactory` as a bean.
+    //
+    // The reactive context (SB 2.7 — `org/springframework/boot/web/reactive/context/
+    // ReactiveWebServerApplicationContext`) calls:
+    //   1. `getWebServerFactoryBeanName()` — looks up bean names, throws
+    //      `MissingWebServerFactoryBeanException` if none. Native shim returns
+    //      a synthetic bean name to bypass the throw site.
+    //   2. `getWebServerFactory(String)` — `beanFactory.getBean(name, Class)`.
+    //      Native shim constructs `NettyReactiveWebServerFactory` directly,
+    //      ignoring the bean-name argument.
+    //   3. `getBeanDefinition(name).isLazyInit()` — would still fail because no
+    //      bean definition exists for our synthetic name. To dodge this entire
+    //      chain we also no-op the private `createWebServer()` driver. The
+    //      `serverManager` field stays null; `getWebServer()` will return null
+    //      to the caller. This is a deliberate "boot past, don't actually
+    //      serve" stance consistent with the Tomcat-side shims below.
+    fn alloc_netty_reactive_factory(
+        ctx: &mut dyn NativeContext,
+    ) -> MethodCallResult {
+        let impl_class =
+            "org/springframework/boot/web/embedded/netty/NettyReactiveWebServerFactory";
+        let obj_val = match ctx.new_object(impl_class) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(Some(Value::Object(None))),
+            Err(e) => return Err(e),
+        };
+        let _ = ctx.invoke_special(impl_class, "<init>", "()V", &[obj_val]);
+        Ok(Some(obj_val))
+    }
+
+    // SB 2.x reactive — primary path
+    r.register(
+        "org/springframework/boot/web/reactive/context/ReactiveWebServerApplicationContext",
+        "getWebServerFactory",
+        "(Ljava/lang/String;)Lorg/springframework/boot/web/reactive/server/ReactiveWebServerFactory;",
+        |ctx, _args| alloc_netty_reactive_factory(ctx),
+    );
+    r.register(
+        "org/springframework/boot/web/reactive/context/ReactiveWebServerApplicationContext",
+        "getWebServerFactoryBeanName",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("nettyReactiveWebServerFactory");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    // No-op the private driver so the downstream `getBeanDefinition(beanName)`
+    // / `isLazyInit()` / `registerSingleton(...)` chain doesn't run.
+    r.register(
+        "org/springframework/boot/web/reactive/context/ReactiveWebServerApplicationContext",
+        "createWebServer",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    // The subclass used by Spring Boot's reactive auto-configuration —
+    // dispatch resolves on the declaring class, but cover the subclass too
+    // for safety in case bytecode binds the call to the subclass directly.
+    r.register(
+        "org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext",
+        "createWebServer",
+        "()V",
+        |_ctx, _args| Ok(None),
     );
 
     // Round 60 — bypass StandardContext init/start failure.

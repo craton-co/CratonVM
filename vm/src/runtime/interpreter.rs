@@ -68,10 +68,10 @@ use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactValue, ObjectRef, Value};
 use crate::vm::{
-    coerce_value_for_return, create_java_string, ensure_class_initialized_shared,
-    ensure_system_stdin_object, get_or_create_class_mirror, get_static_shared,
-    invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string, set_static_shared,
-    SharedVm,
+    coerce_value_for_return, coerce_value_for_return_validated, create_java_string,
+    ensure_class_initialized_shared, ensure_system_stdin_object, get_or_create_class_mirror,
+    get_static_shared, invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string,
+    set_static_shared, SharedVm,
 };
 
 // ---------------------------------------------------------------------------
@@ -431,14 +431,19 @@ fn process_references_after_gc(
         shared.heap.set_field(ref_obj, 1, Value::Int(1)); // REF_FIELD_QUEUE = enqueued sentinel
     }
 
-    // Enqueue objects for finalization
+    // Enqueue objects for finalization (M8 fix: relocate via pointer_map
+    // because the ref-processor holds pre-GC addresses).
     for obj_addr in &result.to_finalize {
-        shared.finalizer_thread.enqueue(*obj_addr);
+        let actual = pointer_map.get(obj_addr).copied().unwrap_or(*obj_addr);
+        shared.finalizer_thread.enqueue(actual);
     }
 
-    // Submit cleaner actions
+    // Submit cleaner actions — same pre-GC→post-GC relocation as above.
+    // Without this, run_cleaner_actions later derefs a stale address
+    // pointing at evacuated memory → SEGV at class_id_of (cleaner_probe).
     for action_addr in &result.cleaner_actions {
-        shared.cleaner_thread.submit_action(*action_addr);
+        let actual = pointer_map.get(action_addr).copied().unwrap_or(*action_addr);
+        shared.cleaner_thread.submit_action(actual);
     }
 
     // Drain ref_processor's finalization_queue → FinalizerThread (inline
@@ -759,12 +764,39 @@ fn gc_alloc_array(
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
 /// Called at safepoints and before blocking operations.
+///
+/// **Spring Boot SEGV fix (2026-05-16):** `ValueStack::scan_object_refs`
+/// still reports every `CompactTag::Long` operand-stack slot whose bits
+/// happen to look like an aligned pointer as a heap root, without consulting
+/// the heap. That mirrors the bug already removed from
+/// `Frame::scan_local_objects` (see frame.rs) but the operand-stack file is
+/// restricted from edits. Filter the freshly-scanned operand-stack roots
+/// against `heap.is_object_address` so a primitive `long` carrying e.g. a
+/// file size, hash code, or jboss-modules-internal token can no longer
+/// poison the root set and cause a `0xC0000005` SEGV when the GC later
+/// dereferences it. Locals (already cleaned), `native_pin_roots`, and
+/// `native_pending_return` come from validated paths and are appended
+/// after the filter.
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
     let mut snapshot = thread.root_snapshot.lock();
     snapshot.clear();
     for frame in &thread.frames {
         frame.scan_local_objects(&mut snapshot);
+        let before = snapshot.len();
         frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
+        // Validate every operand-stack-sourced root against the heap.
+        // `Frame::scan_local_objects` was already cleaned to drop the
+        // pointer-shaped-Long heuristic; the operand-stack scanner is
+        // restricted from edits, so filter at the boundary instead.
+        if snapshot.len() > before {
+            let added = snapshot.split_off(before);
+            for o in added {
+                let addr = o.as_ptr() as usize;
+                if shared.heap.is_object_address(addr).is_some() {
+                    snapshot.push(o);
+                }
+            }
+        }
     }
     snapshot.extend(thread.native_pin_roots.iter().copied());
     if let Some(r) = thread.native_pending_return {
@@ -2440,27 +2472,46 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // aload_0..3
+                // aload_0..3 — validate any jlong-shaped jobject against the
+                // heap before reinterpreting as ObjectRef. An unvalidated raw
+                // long (file size, hash, etc.) that happens to be 8-byte
+                // aligned would be marked by GC and SEGV (Letsgo AV family).
                 0x2a => {
-                    let v = coerce_value_for_return(frame.get_local_unchecked(0), b'L');
+                    let v = coerce_value_for_return_validated(
+                        shared,
+                        frame.get_local_unchecked(0),
+                        b'L',
+                    );
                     frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2b => {
-                    let v = coerce_value_for_return(frame.get_local_unchecked(1), b'L');
+                    let v = coerce_value_for_return_validated(
+                        shared,
+                        frame.get_local_unchecked(1),
+                        b'L',
+                    );
                     frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2c => {
-                    let v = coerce_value_for_return(frame.get_local_unchecked(2), b'L');
+                    let v = coerce_value_for_return_validated(
+                        shared,
+                        frame.get_local_unchecked(2),
+                        b'L',
+                    );
                     frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2d => {
-                    let v = coerce_value_for_return(frame.get_local_unchecked(3), b'L');
+                    let v = coerce_value_for_return_validated(
+                        shared,
+                        frame.get_local_unchecked(3),
+                        b'L',
+                    );
                     frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 1;
                     continue;
@@ -2468,27 +2519,40 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // astore_0..3 — mirror slow-path `Instruction::Astore`: JNI may
                 // leave a jobject as `Value::Long`; storing it raw corrupts ref
                 // locals (Letsgo AV after `ConfigurationClassEnhancer.enhance`).
+                // Validated variant: rejects aligned-but-unheaped long bits.
                 0x4b => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(0, coerce_value_for_return(v, b'L'));
+                    frame.set_local_unchecked(
+                        0,
+                        coerce_value_for_return_validated(shared, v, b'L'),
+                    );
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4c => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(1, coerce_value_for_return(v, b'L'));
+                    frame.set_local_unchecked(
+                        1,
+                        coerce_value_for_return_validated(shared, v, b'L'),
+                    );
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4d => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(2, coerce_value_for_return(v, b'L'));
+                    frame.set_local_unchecked(
+                        2,
+                        coerce_value_for_return_validated(shared, v, b'L'),
+                    );
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4e => {
                     let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(3, coerce_value_for_return(v, b'L'));
+                    frame.set_local_unchecked(
+                        3,
+                        coerce_value_for_return_validated(shared, v, b'L'),
+                    );
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3611,7 +3675,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x15 | 0x17 | 0x19 => {
                     let mut v = frame.get_local_unchecked(b1 as usize); // Cast: bytecode operand decoding
                     if opcode == 0x19 {
-                        v = coerce_value_for_return(v, b'L');
+                        // Validated: see aload_0..3 above.
+                        v = coerce_value_for_return_validated(shared, v, b'L');
                     }
                     frame.stack.push_unchecked(v);
                     frame.pc = saved_pc + 2;
@@ -3633,11 +3698,12 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     continue;
                 }
                 // astore (0x3a) — reference local; coerce jlong jobject handles.
+                // Validated to reject aligned non-heap long bits (Letsgo AV).
                 0x3a => {
                     let v = frame.stack.pop_unchecked();
                     frame.set_local_unchecked(
                         b1 as usize, // Cast: bytecode operand decoding
-                        coerce_value_for_return(v, b'L'),
+                        coerce_value_for_return_validated(shared, v, b'L'),
                     );
                     frame.pc = saved_pc + 2;
                     continue;
@@ -4000,7 +4066,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                         Err(e) => return Err(e),
                     }
-                    match execute_invoke(shared, thread, frame_idx, cp_index, false) {
+                    // invokeinterface: thread is_interface=true so γ's stash
+                    // arms the default-method rescue.
+                    match execute_invoke_kind(shared, thread, frame_idx, cp_index, false, true) {
                         Ok(CachedCallResult::FramePushed) => { frame_idx = thread.frames.len() - 1; continue; }
                         Ok(_) => { continue; }
                         Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
@@ -5878,7 +5946,9 @@ fn execute_instruction(
             }
         }
         Instruction::Invokeinterface { index, count: _ } => {
-            match execute_invoke(shared, thread, frame_idx, *index, false)? {
+            // is_interface=true threads γ's stash so the default-method
+            // rescue can fire on NSME for invokeinterface only.
+            match execute_invoke_kind(shared, thread, frame_idx, *index, false, true)? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
@@ -7733,10 +7803,48 @@ fn execute_invoke(
     cp_index: u16,
     is_special: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    execute_invoke_kind(shared, thread, frame_idx, cp_index, is_special, false)
+}
+
+/// Variant of `execute_invoke` that knows whether the source bytecode was
+/// `invokeinterface`. Only invokeinterface call sites pass `is_interface=true`;
+/// invokevirtual / invokespecial pass `false`. The flag gates γ's CP-resolved-
+/// interface stash so the default-method rescue at the NSME emit site never
+/// fires for non-interface dispatch (which could otherwise re-route to a
+/// stale receiver class on Java-exception unwinding through unrelated invokes).
+fn execute_invoke_kind(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    is_special: bool,
+    is_interface: bool,
+) -> Result<CachedCallResult, MethodCallFailed> {
     let current_class_id = thread.frames[frame_idx].class_id;
 
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
+
+    // KAFKA-DEFAULT-RESCUE: snapshot the CP-resolved class id (if loaded)
+    // before any downstream code can move `method_class_name`. The default-
+    // method rescue at the NSME emit site in `invoke_on_class_shared_inner`
+    // reads this via a thread-local stashed below.
+    //
+    // Option B+C gating: only stash for `invokeinterface` AND only when the
+    // CP-resolved class is actually a Java interface. Non-interface invokes
+    // (virtual / special / static) must not arm the rescue — its
+    // `find_method_recursive` walk would otherwise pick the wrong declaring
+    // class for default methods that conflict with the receiver's class
+    // hierarchy. The slot is also left unset when the resolved class isn't
+    // an interface so a malformed CP entry can't poison nested dispatch.
+    let cp_resolved_class_id: Option<ClassId> = if is_interface {
+        let cm = shared.class_manager.read();
+        cm.get_loaded_class_id(&method_class_name).and_then(|cid| {
+            cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
+        })
+    } else {
+        None
+    };
 
     let total_args = num_params + 1;
 
@@ -7777,6 +7885,11 @@ fn execute_invoke(
                         &mut thread.frames[frame_idx].stack,
                         value,
                     )?;
+                    // Hypothesis (b): lambda dispatch may have transitively
+                    // run a native through `safe_native_call`; clear the
+                    // pending-return field now that the value lives on the
+                    // operand stack so it doesn't outlive the call site.
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
                 }
                 return Ok(CachedCallResult::Handled);
             }
@@ -8183,6 +8296,14 @@ fn execute_invoke(
         }
     }
 
+    // KAFKA-DEFAULT-RESCUE: stash the CP-resolved interface (or class) id
+    // for the in-flight invoke. The default-method rescue at the NSME emit
+    // site in `invoke_on_class_shared_inner` consults this slot when the
+    // hierarchy walk on the receiver-derived dispatch class can't find the
+    // method but the CP-resolved interface declares a default body.
+    // Wrapped in an RAII guard so nested invokes restore the parent's slot.
+    let _cp_iface_guard = crate::vm::PendingCpIfaceGuard::new(cp_resolved_class_id);
+
     if let Some(res) = intercept_force_registered_native(
         shared,
         thread,
@@ -8244,6 +8365,14 @@ fn execute_invoke(
             &mut thread.frames[frame_idx].stack,
             value,
         )?;
+        // Hypothesis (b): a `safe_native_call` reached via `invoke_shared`
+        // (recursive slow path) sets `thread.native_pending_return` on object
+        // returns but the clear-after-push helper is only invoked in the
+        // stackless dispatch arms. Once the value lives on the operand stack
+        // (or a local), the stale pinned reference can outlive a subsequent
+        // minor GC and re-surface in `update_root_snapshot`. Clear it here so
+        // every slow-path consumer mirrors the stackless invariant.
+        crate::vm::native_return_pushed_to_stack(shared, thread);
     }
 
     // Populate cache for future fast-path hits
@@ -9743,6 +9872,12 @@ fn execute_invokestatic(
             &mut thread.frames[frame_idx].stack,
             value,
         )?;
+        // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
+        // path. `invoke_or_native` may recursively run `safe_native_call` which
+        // pins the object return in `thread.native_pending_return`; without
+        // this clear, the field outlives the call site and `update_root_snapshot`
+        // re-roots a stale (already-popped) ObjectRef across GC.
+        crate::vm::native_return_pushed_to_stack(shared, thread);
     }
 
     // Populate invoke cache for future fast-path hits

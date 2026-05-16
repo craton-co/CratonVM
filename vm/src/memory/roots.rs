@@ -20,10 +20,29 @@ use crate::vm::SharedVm;
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     let mut roots = Vec::new();
 
-    // 1. Thread frames — scan locals and operand stacks (SoA layout)
+    // 1. Thread frames — scan locals and operand stacks (SoA layout).
+    //
+    // Spring Boot SEGV fix (2026-05-16): `ValueStack::scan_object_refs`
+    // still reports `CompactTag::Long` operand-stack slots whose bits
+    // happen to look like an aligned pointer as roots without consulting
+    // the heap (the bug already removed from `Frame::scan_local_objects`
+    // in frame.rs). Filter operand-stack-sourced roots against
+    // `heap.is_object_address` so a primitive `long` (file size, hash,
+    // jboss-modules token) can no longer poison the root set and cause a
+    // `0xC0000005` SEGV when the GC later dereferences the bogus pointer.
     for frame in thread.frames.iter() {
         frame.scan_local_objects(&mut roots);
+        let before = roots.len();
         frame.stack.scan_object_refs(&mut roots, &shared.heap);
+        if roots.len() > before {
+            let added = roots.split_off(before);
+            for o in added {
+                let addr = o.as_ptr() as usize;
+                if shared.heap.is_object_address(addr).is_some() {
+                    roots.push(o);
+                }
+            }
+        }
     }
 
     // 2. Static fields — all classes

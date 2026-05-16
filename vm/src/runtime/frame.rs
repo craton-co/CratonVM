@@ -15,9 +15,8 @@ use crate::classloading::resolution::CachedBytecodeMethod;
 use crate::classloading::ClassId;
 use crate::runtime::ValueStack;
 use crate::types::{
-    decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr, CompactValue,
-    ObjectRef, Value, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT,
-    VTAG_RETADDR, VTAG_UNINIT,
+    decode_value, encode_value, is_object_tag, CompactValue, ObjectRef, Value, VTAG_DOUBLE,
+    VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
 };
 
 /// Create a bytecode Arc with 2 trailing zero bytes for safe speculative reads.
@@ -750,6 +749,24 @@ impl Frame {
     // ── GC scanning and pointer update helpers ─────────────────────────
 
     /// Collect all non-null Object references from locals for GC root scanning.
+    ///
+    /// **Spring Boot SEGV fix (2026-05-15):** Previously this function also treated
+    /// any `VTAG_LONG` local whose bits happened to look like an aligned object
+    /// pointer (`jlong_bits_as_aligned_object_ptr`) as a root. That heuristic was
+    /// added as a backstop for JIT/native bridges that occasionally smuggled
+    /// `jobject` handles through `Value::Long`, but it is **not safe in the
+    /// interpreter's local-variable scan**: by JVM spec a `VTAG_LONG` slot is a
+    /// primitive `long`, never a heap reference. Locals are tag-typed via
+    /// `astore`/`lstore` and `coerce_value_for_return` already promotes any
+    /// smuggled jobject to `VTAG_OBJECT` before it reaches a local slot.
+    ///
+    /// In `enhanceConfigurationClasses` (Spring 5.3.27) the frame has 15 locals
+    /// where some primitive `long` slots carried bit patterns that look like
+    /// aligned heap pointers (low 3 bits = 0, value < 1<<48). The next safepoint
+    /// (backward `goto 401`) would call this function, push the bogus pointer
+    /// into the root set, and the GC then dereferenced garbage → `0xC0000005`
+    /// SEGV. Removing the `VTAG_LONG` arm eliminates this entire class of false
+    /// positives. See `applogs/letsgo-segv-diagnosis.md` for full evidence.
     pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>) {
         for i in 0..self.local_vals.len() {
             let tag = self.local_tags[i];
@@ -758,19 +775,19 @@ impl Frame {
                 if bits != 0 {
                     roots.push(unsafe { ObjectRef::from_raw(bits as *mut u8) });
                 }
-            } else if tag == VTAG_LONG {
-                if let Some(p) = jlong_bits_as_aligned_object_ptr(bits) {
-                    // SAFETY: same jobject-as-Long contract as `coerce_value_for_return` /
-                    // slow-path `Astore` (`vm_exec` / `interpreter`).
-                    roots.push(unsafe { ObjectRef::from_raw(p as *mut u8) });
-                }
-            } else if tag == VTAG_NULL {
-                // Null object — not a root
             }
+            // VTAG_LONG / VTAG_NULL / VTAG_INT / VTAG_FLOAT / VTAG_DOUBLE /
+            // VTAG_RETADDR / VTAG_UNINIT — never a heap root.
         }
     }
 
     /// Update Object references in locals after GC using the pointer map.
+    ///
+    /// Symmetric with [`Self::scan_local_objects`]: only `VTAG_OBJECT` slots are
+    /// heap references. `VTAG_LONG` slots are primitive `long`s by spec and must
+    /// never be remapped by GC — doing so would corrupt a primitive value whose
+    /// bits happened to look like a moved pointer (Spring Boot SEGV root cause,
+    /// see `applogs/letsgo-segv-diagnosis.md`).
     pub fn update_local_refs(&mut self, pointer_map: &HashMap<usize, usize>) {
         for i in 0..self.local_vals.len() {
             let tag = self.local_tags[i];
@@ -779,12 +796,6 @@ impl Frame {
                 let old_ptr = bits as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_ptr) {
                     self.local_vals[i] = new_addr as u64;
-                }
-            } else if tag == VTAG_LONG {
-                if let Some(old_ptr) = jlong_bits_as_aligned_object_ptr(bits) {
-                    if let Some(&new_addr) = pointer_map.get(&old_ptr) {
-                        self.local_vals[i] = new_addr as u64;
-                    }
                 }
             }
         }
@@ -937,10 +948,14 @@ mod tests {
         assert_eq!(frame.get_local_raw(1) as i64, 100);
     }
 
-    /// GC must trace `jobject` bits left in a `VTAG_LONG` local (JNI / invoke
-    /// bridges) using the same aligned-pointer contract as `coerce_value_for_return`.
+    /// A `VTAG_LONG` local whose bits happen to look like an aligned object
+    /// pointer is **NOT** a heap root — primitives are not references by JVM
+    /// spec, and the bridges that used to smuggle `jobject` through `Long`
+    /// now promote them to `VTAG_OBJECT` via `coerce_value_for_return` before
+    /// the value ever reaches a local. This test guards against the Spring
+    /// Boot SEGV regression where pointer-shaped long bits were mis-rooted.
     #[test]
-    fn scan_local_objects_roots_jlong_smuggled_object_ptr() {
+    fn scan_local_objects_does_not_root_long_with_pointer_shaped_bits() {
         let mut frame = Frame::new(
             ClassId::new(0),
             "T".to_string(),
@@ -958,8 +973,7 @@ mod tests {
 
         let mut roots = Vec::new();
         frame.scan_local_objects(&mut roots);
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].as_ptr() as usize, 0x1000);
+        assert!(roots.is_empty(), "VTAG_LONG must never produce a root");
     }
 
     #[test]
@@ -983,8 +997,10 @@ mod tests {
         assert!(roots.is_empty());
     }
 
+    /// Symmetric with `scan_local_objects`: `VTAG_LONG` slots are primitives,
+    /// GC must NOT remap them even if their bits look like a moved pointer.
     #[test]
-    fn update_local_refs_remaps_jlong_smuggled_object_ptr() {
+    fn update_local_refs_does_not_touch_long_with_pointer_shaped_bits() {
         use std::collections::HashMap;
 
         let mut frame = Frame::new(
@@ -1006,7 +1022,8 @@ mod tests {
         map.insert(0x2000usize, 0x3000usize);
         frame.update_local_refs(&map);
 
-        assert_eq!(frame.get_local(0).as_long(), Some(0x3000));
+        // Long primitive must be preserved verbatim.
+        assert_eq!(frame.get_local(0).as_long(), Some(0x2000));
     }
 
     #[test]

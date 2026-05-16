@@ -1087,6 +1087,12 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "(ZZ)I",
         native_boolean_compare,
     );
+    registry.register(
+        "java/lang/Boolean",
+        "getBoolean",
+        "(Ljava/lang/String;)Z",
+        native_boolean_get_boolean,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3094,6 +3100,25 @@ pub(crate) fn native_boolean_compare(_ctx: &mut dyn NativeContext, args: &[Value
         (false, true) => -1,
         _ => 0,
     })))
+}
+
+/// `Boolean.getBoolean(String name)` — JDK semantics:
+///   returns `parseBoolean(System.getProperty(name))`, swallowing any
+///   IllegalArgumentException / NullPointerException to `false`.
+///
+/// Effectively: true iff the system property exists and equals "true"
+/// (case-insensitive).  A null/absent property yields false.
+pub(crate) fn native_boolean_get_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name_obj = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        // null or missing argument → false (matches JDK's NPE-swallow).
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = ctx.read_string(name_obj).unwrap_or_default();
+    let matches = ctx
+        .get_system_property(&key)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    Ok(Some(Value::Int(if matches { 1 } else { 0 })))
 }
 
 // --- Integer/Long radix helpers ---

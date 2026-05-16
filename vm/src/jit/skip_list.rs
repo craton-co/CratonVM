@@ -649,8 +649,25 @@ fn should_skip_jit_internal(
         // returns the property value, OR-ing the high tag bits into the
         // String reference before it is forwarded to `Long.parseLong`.
         // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/wildfly/`.
+        // WildFly 39 / session-15 progression: boot now advances past the
+        // `org/wildfly/` ban and the same rc=139 SIGSEGV surfaces in the
+        // JBoss MSC service container (`ServiceName.equals`) plus the
+        // JBoss Logging facade (`JDKLogger.<init>` / `LoggerProvider.getLogger`
+        // were dispatched ~200x in the trace immediately before the crash).
+        // Both `org/jboss/msc/` and `org/jboss/logging/` are extended below
+        // with the same SPB.8 archetype reasoning.
         if class_name.starts_with("org/wildfly/")
             && !package_allowed("org/wildfly/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/jboss/msc/")
+            && !package_allowed("org/jboss/msc/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/jboss/logging/")
+            && !package_allowed("org/jboss/logging/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -698,6 +715,45 @@ fn should_skip_jit_internal(
         }
         if class_name.starts_with("org/apache/commons/logging/")
             && !package_allowed("org/apache/commons/logging/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        // CGL.1 (Session 117 — agent O4, 2026-05-16) — provisional blanket ban
+        // for CGLIB (`net/sf/cglib/`). `apps/cglib_probe` is a minimal repro
+        // (`Enhancer.create()` over `Greeter` with a single `MethodInterceptor`
+        // lambda). After N3's lambda-subclass fix in `is_subclass`, the
+        // "Unknown callback type" error is gone, but the run now SEGFAULTs
+        // (rc=139) immediately after `<clinit>` of the generated proxy class
+        // (`CglibProbe$Greeter$$EnhancerByCGLIB$$<hash>`). With
+        // `RUSTJVM_DISABLE_JIT=1` the SEGFAULT disappears and the run
+        // surfaces a clean `IllegalStateException` (a separate downstream
+        // gap in proxy-class wiring, not a JIT issue) — i.e. classic
+        // JIT-miscompile signature.
+        //
+        // CGLIB's hot boot path is a textbook allocate-then-putfield
+        // workload: `AbstractClassGenerator.create` runs through
+        // `KeyFactory.Generator` -> `CodeEmitter.emit*` ->
+        // `DebuggingClassWriter.toByteArray` ->
+        // `ReflectUtils.defineClass` (which calls `Unsafe.defineClass`
+        // /`MethodHandles.Lookup.defineClass` with raw `byte[]`/Long
+        // pointers), allocating thousands of `MethodInfo`,
+        // `MethodWrapper`, `Type`, `Signature`, `MethodInfoTransformer`
+        // entries and storing their slots immediately after `new`. The
+        // generated proxy `<clinit>` then runs a long sequence of
+        // `Class.forName` -> `ReflectUtils.findMethods` ->
+        // `MethodProxy.create` calls that store `Method`/`MethodProxy`
+        // references into the proxy's static slots — exactly the W2-CHM
+        // archetype that bites RBC.1 / SPB.1-9. Same package model:
+        // every method on the path is JIT-promotable but the runtime
+        // miscompile poisons one of the stored references.
+        //
+        // Coarse-grained safety net so cglib_probe can progress past the
+        // SEGV. Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=net/sf/cglib/`.
+        // Track for a real fix once the underlying allocate-then-putfield
+        // miscompile is root-caused.
+        if class_name.starts_with("net/sf/cglib/")
+            && !package_allowed("net/sf/cglib/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
