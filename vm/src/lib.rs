@@ -22,6 +22,7 @@
 
 pub mod classloading;
 pub mod config;
+pub mod dispatch_trace;
 pub mod jck_capture;
 #[cfg(feature = "experimental-debug")]
 pub mod debug;

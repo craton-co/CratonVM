@@ -1586,9 +1586,15 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 tracing::warn!(
                     "Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated ({populated}/5)"
                 );
+                crate::dispatch_trace::record_note(
+                    "Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated",
+                );
             } else {
                 tracing::warn!(
                     "Post-clinit fixup: BigInteger fixup skipped — signum/mag field indices not resolved"
+                );
+                crate::dispatch_trace::record_note(
+                    "Post-clinit fixup: BigInteger fixup skipped",
                 );
             }
         }

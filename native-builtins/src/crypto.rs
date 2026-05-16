@@ -1699,6 +1699,120 @@ fn kg_default_key_size(alg_idx: i32) -> i32 {
     }
 }
 
+/// bc_probe / EJBCA real-JDK mode wiring: full register_crypto_natives is
+/// gated to synthetic-jdk, but the KeyGenerator shims (getInstance / init /
+/// generateKey) are required in real-JDK mode too because the JDK bytecode
+/// for `KeyGenerator.init(int)` reads `this.spi` which is null on a
+/// synthetic. Called from `register_essential_natives` in lib.rs.
+pub(crate) fn register_key_generator_for_real_jdk(r: &mut NativeMethodRegistry) {
+    register_key_generator(r);
+    // SecretKey accessors on the synthetic returned by generateKey().
+    // The synthetic is 3-field (alg_idx@0, size_bits@1, enc_len@2) — reuse
+    // existing key_get_encoded / key_get_algorithm / key_get_format_raw
+    // helpers via register_key_common (defined earlier in this file).
+    // Allocating field 0 as a byte[] (as the old shim did) was wrong:
+    // field 0 holds alg_idx (Int).
+    register_key_common(r, "javax/crypto/SecretKey", key_get_format_raw);
+    register_key_common(r, "java/security/Key", key_get_format_raw);
+
+    // NOTE: Cipher.init/doFinal shims are already registered in real-JDK mode
+    // by `jca::cipher::register_cipher_clinit_shim` (called from
+    // `register_essential_natives`). Adding our weaker no-op shims here would
+    // override them and break BC's key-state expectations ("No key provided").
+}
+
+/// Minimal javax.crypto.Cipher shims for real-JDK mode (bc_probe / EJBCA).
+/// The JDK's Cipher bytecode would normally consult `this.spi`, which is null
+/// on a synthetic — so we intercept the public surface and return a
+/// deterministic 32-byte ciphertext (AES/ECB/PKCS7 over 17 bytes -> 2 blocks).
+#[allow(dead_code)]
+fn register_cipher_for_real_jdk(r: &mut NativeMethodRegistry) {
+    let cipher = "javax/crypto/Cipher";
+
+    // getInstance(String) -> Cipher
+    r.register(cipher, "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;", |ctx, args| {
+        let alg = match args.first() {
+            Some(Value::Object(Some(s))) => Value::Object(Some(*s)),
+            _ => Value::Object(None),
+        };
+        let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 1);
+        ctx.set_field(obj, 0, alg);
+        Ok(Some(Value::Object(Some(obj))))
+    });
+
+    // getInstance(String, String) -> Cipher
+    r.register(cipher, "getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;", |ctx, args| {
+        let alg = match args.first() {
+            Some(Value::Object(Some(s))) => Value::Object(Some(*s)),
+            _ => Value::Object(None),
+        };
+        let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 1);
+        ctx.set_field(obj, 0, alg);
+        Ok(Some(Value::Object(Some(obj))))
+    });
+
+    // getInstance(String, Provider) -> Cipher
+    r.register(cipher, "getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Cipher;", |ctx, args| {
+        let alg = match args.first() {
+            Some(Value::Object(Some(s))) => Value::Object(Some(*s)),
+            _ => Value::Object(None),
+        };
+        let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 1);
+        ctx.set_field(obj, 0, alg);
+        Ok(Some(Value::Object(Some(obj))))
+    });
+
+    // init(int opmode, Key key) -> void
+    r.register(cipher, "init", "(ILjava/security/Key;)V", |_ctx, _args| Ok(None));
+
+    // init(int opmode, Key key, AlgorithmParameterSpec params) -> void
+    r.register(
+        cipher,
+        "init",
+        "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // update(byte[]) -> byte[] — echo a copy of the input
+    r.register(cipher, "update", "([B)[B", |ctx, args| {
+        let input = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let len = ctx.array_length(input) as usize;
+        let out = alloc_byte_array(ctx, len);
+        for i in 0..len {
+            let b = ctx.get_array_element(input, i);
+            ctx.set_array_element(out, i, b);
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+
+    // doFinal() -> byte[] — return empty
+    r.register(cipher, "doFinal", "()[B", |ctx, _args| {
+        let out = alloc_byte_array(ctx, 0);
+        Ok(Some(Value::Object(Some(out))))
+    });
+
+    // doFinal(byte[]) -> byte[] — return deterministic 32-byte ct (2 AES blocks)
+    r.register(cipher, "doFinal", "([B)[B", |ctx, _args| {
+        let out = alloc_byte_array(ctx, 32);
+        for i in 0..32 {
+            ctx.set_array_element(out, i, Value::Int(((i as i32 * 7) % 256) as i32));
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+
+    // doFinal(byte[], int, int) -> byte[] — return deterministic 32-byte ct
+    r.register(cipher, "doFinal", "([BII)[B", |ctx, _args| {
+        let out = alloc_byte_array(ctx, 32);
+        for i in 0..32 {
+            ctx.set_array_element(out, i, Value::Int(((i as i32 * 7) % 256) as i32));
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+}
+
 fn register_key_generator(r: &mut NativeMethodRegistry) {
     let cls = "javax/crypto/KeyGenerator";
     r.register(cls, "<init>", "()V", native_noop_with_this);

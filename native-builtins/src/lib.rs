@@ -382,6 +382,7 @@ pub mod jmx;
 // natives (always compiled, since real-JDK mode also reaches the
 // MXBean introspection path during KC16 boot).
 pub mod jmx_openmbean;
+pub mod jboss_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1355,6 +1356,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Main.loadModule("org.jboss.as.standalone") resolve against
     // -mp <path>/module.xml on disk.
     jboss_module_loader::register_jboss_module_loader(registry);
+    // Wildfly hang fix: register short-circuit intercepts for
+    // Module.getBootModuleLoader / ModuleLoader.getDefaultLoader so the
+    // JDK bytecode of these methods never runs after the post-clinit
+    // empty-AtomicReference fixup.
+    jboss_extras::register_jboss_wildfly_stubs(registry);
+    // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
+    // crypto module is gated to synthetic-jdk, but bc_probe needs init/
+    // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.
+    crypto::register_key_generator_for_real_jdk(registry);
     // T19.H2: SharedSecrets JavaLangAccess shim — returns a non-null
     // System$1-shaped object whose currentCarrierThread() forwards to
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"

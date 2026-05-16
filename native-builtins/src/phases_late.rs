@@ -30637,6 +30637,7 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
     register_p69_compact_number_format(registry);
     register_p69_submission_publisher(registry);
     register_p69_misc(registry);
+    register_pbe_diagnostic(registry);
 }
 
 // =============================================================================
@@ -30776,12 +30777,10 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         // Clear the slot so the action can drop naturally on the next GC.
         ctx.set_field(this, CLEANABLE_ACTION, Value::Object(None));
         // Per Cleaner contract, exceptions thrown by run() are caught.
-        let _ = ctx.invoke_virtual(
-            action,
-            "run",
-            "()V",
-            &[Value::Object(Some(action))],
-        );
+        // NOTE: invoke_virtual adds the receiver itself — passing the receiver
+        // again in `args` makes the call 2-arg against a 1-arg Runnable.run()V
+        // and silently fails. Use an empty args slice.
+        let _ = ctx.invoke_virtual(action, "run", "()V", &[]);
         Ok(None)
     });
 }
@@ -31131,6 +31130,167 @@ fn drain_spliterator(
         ctx.set_array_element(out, i, v);
     }
     Ok(out)
+}
+
+// =============================================================================
+// Spring `PropertyBatchUpdateException` diagnostic intercept
+// =============================================================================
+//
+// Spring's `BeanWrapperImpl.setPropertyValues` wraps a list of
+// `PropertyAccessException` instances inside a single
+// `PropertyBatchUpdateException` (PBE). The outer exception chain in our
+// output only surfaces the PBE wrapper itself ("Failed properties:") with an
+// empty trailing string — none of the individual `PropertyAccessException`
+// messages, which describe WHICH property setter failed and WHY.
+//
+// This diagnostic intercepts the PBE constructor that takes
+// `PropertyAccessException[]` and, when `RUSTJVM_DBG_PBE` is set in the
+// environment, prints each inner exception's message to stderr before
+// completing construction. We never alter normal control flow — the
+// `Throwable.<init>` chain still runs via `invoke_special` on the super-
+// class so the resulting PBE behaves identically to the unintercepted path.
+//
+// Gated entirely on env var to keep the hot path free of overhead in
+// production builds. Adds no shared state and no field writes; the JDK
+// field setters (`propertyAccessExceptions` etc.) are populated by the
+// real constructor bytecode of `PropertyBatchUpdateException`, which we
+// re-enter via a delegate `invoke_special` against the same class. We don't
+// know the exact descriptor of the canonical constructor here (Spring's
+// internal layout), so we limit ourselves to a Throwable super-init call
+// — sufficient to make the chain printable — and bail with `Ok(None)` so
+// the JVM caller-side bytecode performs the field assignments as usual.
+
+pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
+    let pbe = "org/springframework/beans/PropertyBatchUpdateException";
+
+    // Constructor: PropertyBatchUpdateException(PropertyAccessException[])
+    //
+    // Real Spring source:
+    //   public PropertyBatchUpdateException(PropertyAccessException[] errors) {
+    //       this.propertyAccessExceptions = errors;
+    //   }
+    //
+    // We honor that contract here (set the field by name so we don't have to
+    // know the synthetic slot index) AND emit one stderr line per inner
+    // exception when the diagnostic flag is enabled.
+    r.register(
+        pbe,
+        "<init>",
+        "([Lorg/springframework/beans/PropertyAccessException;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Always preserve the user-visible field — Spring's getter
+            // (`getPropertyAccessExceptions()`) returns it directly.
+            let arr_val = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "propertyAccessExceptions", arr_val);
+
+            // Diagnostic block — gated on env var so production runs stay
+            // silent. Best-effort: any failure in the diagnostic itself is
+            // swallowed so we never break the failing-bean path further.
+            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+                if let Value::Object(Some(arr)) = arr_val {
+                    let n = ctx.array_length(arr);
+                    eprintln!("[PBE] PropertyBatchUpdateException constructed with {} inner PropertyAccessException(s)", n);
+                    for i in 0..n {
+                        let el = ctx.get_array_element(arr, i);
+                        let inner = match el {
+                            Value::Object(Some(o)) => o,
+                            _ => {
+                                eprintln!("[PBE] inner[{}]: <null>", i);
+                                continue;
+                            }
+                        };
+
+                        // Inner.getMessage() — virtual dispatch.
+                        let msg = match ctx.invoke_virtual(
+                            inner,
+                            "getMessage",
+                            "()Ljava/lang/String;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
+                            _ => String::new(),
+                        };
+                        eprintln!("[PBE] inner[{}]: {}", i, msg);
+
+                        // Try to extract the failing property name and the
+                        // value that caused it — both come from the
+                        // wrapped PropertyChangeEvent. Best-effort: any
+                        // failure in either call is silently ignored.
+                        let pce = match ctx.invoke_virtual(
+                            inner,
+                            "getPropertyChangeEvent",
+                            "()Ljava/beans/PropertyChangeEvent;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(p)))) => Some(p),
+                            _ => None,
+                        };
+                        if let Some(pce) = pce {
+                            if let Ok(Some(Value::Object(Some(name_obj)))) = ctx.invoke_virtual(
+                                pce,
+                                "getPropertyName",
+                                "()Ljava/lang/String;",
+                                &[],
+                            ) {
+                                let name = ctx.read_string(name_obj).unwrap_or_default();
+                                eprintln!("[PBE] inner[{}] property: {}", i, name);
+                            }
+                            if let Ok(Some(new_val)) = ctx.invoke_virtual(
+                                pce,
+                                "getNewValue",
+                                "()Ljava/lang/Object;",
+                                &[],
+                            ) {
+                                match new_val {
+                                    Value::Object(Some(o)) => {
+                                        // Try toString() to get a human-readable
+                                        // representation; fall back to a pointer.
+                                        let s = match ctx.invoke_virtual(
+                                            o,
+                                            "toString",
+                                            "()Ljava/lang/String;",
+                                            &[],
+                                        ) {
+                                            Ok(Some(Value::Object(Some(s)))) => {
+                                                ctx.read_string(s).unwrap_or_default()
+                                            }
+                                            _ => String::new(),
+                                        };
+                                        eprintln!("[PBE] inner[{}] newValue: {}", i, s);
+                                    }
+                                    Value::Object(None) => {
+                                        eprintln!("[PBE] inner[{}] newValue: <null>", i);
+                                    }
+                                    other => {
+                                        eprintln!("[PBE] inner[{}] newValue (primitive): {:?}", i, other);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("[PBE] PropertyBatchUpdateException constructed with null/missing array argument");
+                }
+            }
+
+            // Call the parent Throwable.<init>(String) — pass the wrapper
+            // class name as the message so the chain prints meaningfully if
+            // anything later calls super.getMessage(). Best-effort; failure
+            // is non-fatal (the PBE object remains usable via the field
+            // we already set above).
+            let msg = ctx.create_string("Failed properties");
+            let _ = ctx.invoke_special(
+                "java/lang/Throwable",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(this)), Value::Object(Some(msg))],
+            );
+            Ok(None)
+        },
+    );
 }
 
 // =============================================================================

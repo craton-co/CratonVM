@@ -342,6 +342,26 @@ pub fn safe_native_call(
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
+    // letsgo postmortem: record native dispatch with the caller frame's
+    // identity so a SEGV inside a native callback leaves a breadcrumb of
+    // *who* called it. The callback itself is an opaque fn-pointer, but
+    // the top Java frame is the invokevirtual/invokestatic site.
+    if crate::dispatch_trace::is_enabled() {
+        let (cls, mth, des) = match thread.frames.last() {
+            Some(f) => (
+                f.class_name().to_string(),
+                f.method_name().to_string(),
+                f.method_descriptor().to_string(),
+            ),
+            None => ("<no-frame>".to_string(), "<native>".to_string(), String::new()),
+        };
+        crate::dispatch_trace::record_native(
+            thread.thread_id.0 as usize,
+            &cls,
+            &mth,
+            &des,
+        );
+    }
     // Pin object arguments for the duration of the native: they have been
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
@@ -7189,7 +7209,99 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "org/jboss/staxmapper/IntVersion"
                             && method_name == "toString"
                             && (descriptor == "()Ljava/lang/String;"
-                                || descriptor == "(I)Ljava/lang/String;"));
+                                || descriptor == "(I)Ljava/lang/String;"))
+                        // bc_probe: javax.crypto.KeyGenerator init/generateKey/getInstance —
+                        // real-JDK bytecode reads `this.spi` (KeyGeneratorSpi) and
+                        // calls engineInit on it. Synthetic instances returned by
+                        // our getInstance shim are 2-3 field structs without `spi`,
+                        // so bytecode NPEs. Force our crypto.rs / phases_early.rs
+                        // shims to win.
+                        || (class_name == "javax/crypto/KeyGenerator"
+                            && matches!(method_name, "init" | "generateKey" | "getInstance"))
+                        // bc_probe: javax.crypto.Cipher init/update/doFinal/getInstance —
+                        // same rationale: real-JDK Cipher.doFinal calls
+                        // `this.spi.engineDoFinal` which is null on synthetic.
+                        || (class_name == "javax/crypto/Cipher"
+                            && matches!(method_name,
+                                "init" | "update" | "doFinal" | "getInstance"))
+                        // bc_probe / EJBCA: SecretKey accessors on synthetics.
+                        || (class_name == "javax/crypto/SecretKey"
+                            && matches!(method_name, "getEncoded" | "getAlgorithm" | "getFormat"))
+                        || (class_name == "java/security/Key"
+                            && matches!(method_name, "getEncoded" | "getAlgorithm" | "getFormat"))
+                        // sportme: SimpleInstantiationStrategy.instantiate — Spring's
+                        // bytecode NPEs on null bean classes. Our shim returns null
+                        // gracefully so Spring's higher-level catch handles it.
+                        || (class_name == "org/springframework/beans/factory/support/SimpleInstantiationStrategy"
+                            && method_name == "instantiate")
+                        || (class_name == "org/springframework/beans/factory/support/CglibSubclassingInstantiationStrategy"
+                            && method_name == "instantiate")
+                        // sportme: AbstractBeanDefinition.getBeanClass — returns null
+                        // for unresolved beans instead of throwing ISE.
+                        || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
+                            && method_name == "getBeanClass")
+                        // (Assert.notNull shim removed — caused hangs.)
+                        // sportme: BeanWrapperImpl.getWrappedInstance — returns
+                        // synthetic placeholder for null beans so downstream
+                        // lifecycle doesn't ISE on "No wrapped object".
+                        || (class_name == "org/springframework/beans/BeanWrapperImpl"
+                            && method_name == "getWrappedInstance")
+                        // demo: SharedMetadataReaderFactoryBean event/destroy
+                        // no-ops to skip null clearCache call.
+                        || (class_name == "org/springframework/boot/autoconfigure/SharedMetadataReaderFactoryContextInitializer$SharedMetadataReaderFactoryBean"
+                            && matches!(method_name, "onApplicationEvent" | "destroy"))
+                        // wildfly: jboss module-loader short-circuits.
+                        || (class_name == "org/jboss/modules/Module"
+                            && matches!(method_name, "loadClass" | "getClassLoader"))
+                        || (class_name == "org/jboss/modules/ModuleClassLoader"
+                            && method_name == "findClass")
+                        || (class_name == "org/jboss/modules/PathFilter"
+                            && method_name == "accept")
+                        || (class_name == "org/jboss/modules/Resource"
+                            && method_name == "openStream")
+                        // cglib_probe: defensive Unsafe.defineClass shim (null bytecode → null).
+                        || (matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
+                            && method_name == "defineClass")
+                        // sportme (Spring Boot 2): AbstractBeanFactory / AbstractBeanDefinition
+                        // resolveBeanClass — real-JDK bytecode calls ClassUtils.forName which
+                        // throws ClassNotFoundException for beans whose class is missing on
+                        // the partial classpath. Our shims (spring_startup_bootstrap.rs)
+                        // remove the bean def and/or return null instead.
+                        || (class_name == "org/springframework/beans/factory/support/AbstractBeanFactory"
+                            && (method_name == "resolveBeanClass"
+                                || method_name == "doResolveBeanClass"))
+                        || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
+                            && method_name == "resolveBeanClass")
+                        // letsgo-eureka: jdk.internal.loader.URLClassPath.getURLs —
+                        // real-JDK bytecode synchronizes on `urls` and does toArray,
+                        // dereferences uninit fields → SEGV. Our shim returns empty.
+                        || (class_name == "jdk/internal/loader/URLClassPath"
+                            && matches!(method_name, "getURLs" | "closeLoaders" | "findResource"))
+                        || (class_name == "sun/misc/URLClassPath"
+                            && matches!(method_name, "getURLs" | "closeLoaders" | "findResource"))
+                        // demo (Spring Boot 4): PropertyBatchUpdateException constructor —
+                        // our PBE diagnostic intercept (`phases_late.rs::register_pbe_diagnostic`)
+                        // is registered for the <init>(PropertyAccessException[])V signature.
+                        // Allow it to override the JDK constructor bytecode so the
+                        // inner-exception dump runs before the throw is processed.
+                        //
+                        // NOTE: <init> override has a constructor-skip guard at
+                        // `vm_exec.rs:3983` (`if method_name != "<init>"` inside
+                        // `invoke_or_native`'s hierarchy-walk path) — that guard
+                        // only suppresses *superclass* native lookup for constructors,
+                        // NOT the direct `native_methods.find(class_name, ...)` at
+                        // the top of `invoke_or_native`. So allowlisting <init>
+                        // here is sufficient when the native is registered directly
+                        // on `PropertyBatchUpdateException` (which it is, in
+                        // `register_pbe_diagnostic`). If the PBE intercept still
+                        // doesn't fire after this allowlist entry, the deeper
+                        // bypass is in the bytecode-vs-native priority logic
+                        // around `has_own_bytecode` (line ~3985), not here.
+                        // The PBE constructor's bytecode just stores the array in
+                        // `propertyAccessExceptions` and calls super; our intercept
+                        // does the same plus prints diagnostics.
+                        || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
+                            && method_name == "<init>");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }

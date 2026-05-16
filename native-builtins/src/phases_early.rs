@@ -8479,12 +8479,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // KeyGenerator.init(I)V — store keySize at field 1; never touch spi
+    // (spi is null on synthetic instances, and the real JDK bytecode for
+    // init(I) calls this.spi.engineInit(...) → NPE on the real path).
     r.register(kg, "init", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let key_size = args[1].as_int().unwrap_or(128);
         ctx.set_field(this, 1, Value::Int(key_size));
         Ok(None)
     });
+    // KeyGenerator.init(I, SecureRandom)V — store keySize, ignore SecureRandom
     r.register(
         kg,
         "init",

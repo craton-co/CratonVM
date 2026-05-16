@@ -221,10 +221,26 @@ fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {
 /// IV/key array; when it is allocated by real-JDK bytecode (via
 /// `<init>` we intercept), we copy the bytes there ourselves.
 fn extract_key_bytes(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Vec<u8> {
-    match ctx.get_field(key_obj, 0) {
-        Value::Object(Some(arr)) => read_bytes(ctx, arr),
-        _ => Vec::new(),
+    // First try the historical layout (synthetic Key with byte[] at slot 0).
+    if let Value::Object(Some(arr)) = ctx.get_field(key_obj, 0) {
+        let bytes = read_bytes(ctx, arr);
+        if !bytes.is_empty() {
+            return bytes;
+        }
     }
+    // bc_probe: KeyGenerator.generateKey() returns a 3-field synthetic from
+    // crypto.rs::alloc_key — (alg_idx Int @0, size_bits Int @1, enc_len Int @2).
+    // Slot 0 is NOT a byte[] here. Fall back to invoking getEncoded() which
+    // produces a fresh byte[] of length enc_len.
+    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
+        key_obj,
+        "getEncoded",
+        "()[B",
+        &[],
+    ) {
+        return read_bytes(ctx, arr);
+    }
+    Vec::new()
 }
 
 /// Read the IV byte array out of an `IvParameterSpec` /
@@ -318,6 +334,53 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     AesGcm::decrypt(&aes_key, &nonce, ct, &aad, &tag)
                         .map_err(|e| format!("AES-GCM decrypt failed: {:?}", e))
                 }
+            }
+        }
+        "ECB" | "" => {
+            // PKCS#7-padded AES/ECB: encrypt/decrypt each 16-byte block
+            // independently with the expanded AES round keys. Probe surface
+            // is `Cipher.getInstance("AES/ECB/PKCS7Padding", "BC")` —
+            // BouncyCastle's PKCS7 padding is identical to PKCS5 (block
+            // size 16, pad byte = pad count, full pad block on aligned
+            // input).
+            let block_size = 16usize;
+            if encrypt {
+                let pad_len = block_size - (data.len() % block_size);
+                let mut padded = data.clone();
+                // For PKCS7 we ALWAYS pad — a full-block-aligned input
+                // gets a full pad block (pad_len == 16 here), which is
+                // the standard behaviour and required for unambiguous
+                // unpadding on decrypt.
+                padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+                let mut out = Vec::with_capacity(padded.len());
+                for chunk in padded.chunks(block_size) {
+                    let mut block = [0u8; 16];
+                    block.copy_from_slice(chunk);
+                    let ct = Aes::encrypt_block(&aes_key, &block);
+                    out.extend_from_slice(&ct);
+                }
+                Ok(out)
+            } else if data.len() % block_size != 0 {
+                Err(format!(
+                    "AES/ECB ciphertext length {} not a multiple of 16",
+                    data.len()
+                ))
+            } else {
+                let mut out = Vec::with_capacity(data.len());
+                for chunk in data.chunks(block_size) {
+                    let mut block = [0u8; 16];
+                    block.copy_from_slice(chunk);
+                    let pt = Aes::decrypt_block(&aes_key, &block);
+                    out.extend_from_slice(&pt);
+                }
+                // Strip PKCS7 padding from last byte.
+                if let Some(&pad) = out.last() {
+                    if pad as usize >= 1 && (pad as usize) <= block_size {
+                        let new_len = out.len().saturating_sub(pad as usize);
+                        out.truncate(new_len);
+                    }
+                }
+                Ok(out)
             }
         }
         other => Err(format!(

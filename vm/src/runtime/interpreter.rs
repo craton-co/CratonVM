@@ -329,6 +329,26 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
         // Clear the action slot so it can be GC'd on the next cycle.
         shared.heap.set_field(cleanable, 0, Value::Object(None));
         let class_id = shared.heap.class_id_of(action);
+
+        // Fast path: if the action is a lambda proxy (the common case —
+        // `cleaner.register(buf, () -> {...})`), `invoke_shared` would
+        // fall through to the abstract `Runnable.run()` declaration which
+        // has no Code attribute. Route through `try_lambda_dispatch` so
+        // the proxy's SAM impl_handle actually fires.
+        let is_lambda = shared.lambda_proxies.read().contains_key(&class_id);
+        if is_lambda {
+            // Errors are silently swallowed per the Cleaner contract.
+            let _ = try_lambda_dispatch(
+                shared,
+                thread,
+                action,
+                class_id,
+                "run",
+                &[],
+            );
+            continue;
+        }
+
         let class_name = shared
             .class_manager
             .read()
@@ -1077,6 +1097,23 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // letsgo postmortem instrumentation: record every bytecode-method
+    // entry into the global dispatch ring. Gated by `RUSTJVM_DBG_LETSGO=1`
+    // (cheap atomic-bool check on the disabled path).
+    if crate::dispatch_trace::is_enabled() {
+        let class_name_owned = shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("cid#{class_id:?}"));
+        crate::dispatch_trace::record_bytecode(
+            thread.thread_id.0 as usize,
+            &class_name_owned,
+            method_name,
+            method_descriptor,
+        );
+    }
     if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
         eprintln!("[interpreter::execute] class_id={:?} method={} desc={} args.len={}",
                   class_id, method_name, method_descriptor, args.len());
@@ -9833,40 +9870,6 @@ fn execute_invokestatic(
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
-    }
-
-    // GPU offload hook (Part E). Behind `gpu-offload`: with the
-    // feature off, the entire block is removed by the preprocessor
-    // and `execute_invokestatic` falls through to the existing CPU
-    // path unchanged. On Hit we consult the OffloadCache; the actual
-    // marshal-and-launch glue is deliberately scoped to a separate
-    // follow-up because it needs real GPU hardware to validate — see
-    // `crate::runtime::offload::try_dispatch` for the contract.
-    #[cfg(feature = "gpu-offload")]
-    {
-        if shared.config.gpu_offload_enabled
-            && shared.offload_cache.has_device()
-        {
-            match crate::runtime::offload::try_dispatch(
-                shared,
-                thread,
-                frame_idx,
-                &method_class_name,
-                &method_name,
-                &method_descriptor,
-                &args,
-            )? {
-                crate::runtime::offload::DispatchOutcome::Handled => {
-                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
-                    return Ok(CachedCallResult::Handled);
-                }
-                crate::runtime::offload::DispatchOutcome::FallThrough => {
-                    // Method is ineligible / blacklisted / launch
-                    // deopted. Run the CPU path below; the operand
-                    // stack and locals are untouched.
-                }
-            }
-        }
     }
 
     // Try stackless frame push for bytecode methods

@@ -171,47 +171,6 @@ struct Args {
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
 
-    // -----------------------------------------------------------------------
-    // GPU offload (see docs/gpu/cuda-oxide-evaluation.md)
-    //
-    // Every field below is gated behind the `gpu` Cargo feature. Without
-    // the feature the flags are not parsed, not documented in --help,
-    // and the CPU execution path is byte-identical to before the GPU
-    // work landed.
-    // -----------------------------------------------------------------------
-
-    /// Enable GPU offload of eligible static methods. Requires the
-    /// CLI to be built with `--features gpu` and a CUDA driver. With
-    /// no driver, the flag is honoured but no methods are offloaded.
-    #[cfg(feature = "gpu")]
-    #[arg(long = "gpu")]
-    gpu: bool,
-
-    /// Select CUDA device ordinal when --gpu is on. Defaults to 0.
-    #[cfg(feature = "gpu")]
-    #[arg(long = "gpu-device", value_name = "N", default_value_t = 0)]
-    gpu_device: u32,
-
-    /// Minimum estimated work (array length / loop trip count) before
-    /// a method is offloaded. Smaller inputs run on the CPU because
-    /// the host↔device round-trip dominates.
-    #[cfg(feature = "gpu")]
-    #[arg(long = "gpu-min-work", value_name = "N", default_value_t = 4096)]
-    gpu_min_work: u32,
-
-    /// Print one line per analyzer verdict (Eligible / Rejected) at
-    /// INFO level. Useful for understanding why a method did or did
-    /// not offload.
-    #[cfg(feature = "gpu")]
-    #[arg(long = "print-gpu-decisions")]
-    print_gpu_decisions: bool,
-
-    /// Probe the GPU, print device name + compute capability + memory,
-    /// then exit. Useful for sanity-checking before a real run.
-    #[cfg(feature = "gpu")]
-    #[arg(long = "gpu-info")]
-    gpu_info: bool,
-
     /// Arguments passed to the Java program's main method.
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
@@ -528,49 +487,6 @@ fn run() -> Result<()> {
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
 
-    // GPU handlers — only compiled when the `gpu` Cargo feature is on.
-    // Without the feature, the CPU execution path below is reached
-    // unconditionally and unchanged.
-    #[cfg(feature = "gpu")]
-    {
-        if args.gpu_info {
-            match cuda_bridge::probe() {
-                Ok(caps) => {
-                    println!(
-                        "device {}: {} (sm_{}{}), {:.2} GiB",
-                        caps.ordinal,
-                        caps.name,
-                        caps.compute_major,
-                        caps.compute_minor,
-                        (caps.total_global_mem as f64) / (1024.0 * 1024.0 * 1024.0)
-                    );
-                }
-                Err(e) => {
-                    println!("no CUDA device available: {e}");
-                }
-            }
-            return Ok(());
-        }
-
-        if args.gpu {
-            match cuda_bridge::probe() {
-                Ok(caps) => {
-                    info!(
-                        "gpu offload enabled on device {}: {} (sm_{}{})",
-                        args.gpu_device, caps.name, caps.compute_major, caps.compute_minor
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[rustjvm-cli] --gpu requested but no CUDA driver available ({e}); \
-                         running on CPU"
-                    );
-                    args.gpu = false;
-                }
-            }
-        }
-    }
-
     // Strip a literal `--` separator that clap parked in the trailing
     // positional list. We pass `--` through to clap so it knows where
     // program args begin (so tokens like `-mp` aren't mis-parsed as
@@ -683,17 +599,6 @@ fn run() -> Result<()> {
 
     if let Some(mode) = xverify_mode {
         config = config.with_xverify_mode(mode);
-    }
-
-    // Forward the GPU-offload CLI flags into VmConfig. Only compiled
-    // when the `gpu` Cargo feature is on; without the feature these
-    // fields do not exist on VmConfig (see vm/src/config.rs).
-    #[cfg(feature = "gpu")]
-    {
-        config.gpu_offload_enabled = args.gpu;
-        config.gpu_device_ordinal = args.gpu_device;
-        config.gpu_min_work = args.gpu_min_work;
-        config.print_gpu_decisions = args.print_gpu_decisions;
     }
 
     if let Some(bcp) = &args.boot_classpath {
@@ -887,6 +792,16 @@ fn run() -> Result<()> {
     // `--stack-dump-on-timeout=N` (with N suitably large) or set
     // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the same way they pass
     // explicit `-Xmx` instead of relying on heap defaults.
+    // `RUSTJVM_STACK_DUMP_TIMEOUT` is a high-priority override that lets
+    // an orchestrator force a short watchdog deadline (e.g. 20s) so the
+    // ring + thread stacks get dumped before an outer test timeout
+    // SIGKILLs the process. It wins over `RUSTJVM_DEFAULT_WATCHDOG_SEC`
+    // but is still trumped by an explicit `--stack-dump-on-timeout`
+    // CLI flag (the user's explicit intent always wins).
+    let env_override_timeout = std::env::var("RUSTJVM_STACK_DUMP_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0);
     let effective_watchdog = match args.stack_dump_on_timeout {
         Some(s) if s > 0 => Some(s),
         Some(_) => None, // explicit `--stack-dump-on-timeout=0` disables
@@ -895,6 +810,8 @@ fn run() -> Result<()> {
                 == Some("1")
             {
                 None
+            } else if let Some(s) = env_override_timeout {
+                Some(s)
             } else {
                 Some(
                     std::env::var("RUSTJVM_DEFAULT_WATCHDOG_SEC")
@@ -957,6 +874,15 @@ fn run() -> Result<()> {
                 eprintln!(
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
+                );
+
+                // Always dump the dispatch_trace ring on watchdog fire,
+                // even when `RUSTJVM_DBG_LETSGO` wasn't set: the header
+                // alone confirms the dump path executed, and when the
+                // env var *was* set the last few entries usually point
+                // straight at the looping/hung method.
+                rustjvm_vm::dispatch_trace::dump_to_stderr_unconditional(
+                    "watchdog",
                 );
 
                 // KC-watchdog-native: when zero Java threads ack'd a dump,
@@ -1177,6 +1103,39 @@ fn run() -> Result<()> {
             bail!("main() panicked: {msg}");
         }
     };
+
+    // [MAIN-RETURN] diagnostic — gate on RUSTJVM_DBG_MAIN_RETURN=1 so it
+    // does not pollute clean runs. When set, prints whether main() returned
+    // Ok / Err::Internal(msg) / Err::Exception, plus how long it ran and
+    // how many non-daemon threads are still alive. Used to distinguish a
+    // silent main-return (Spring's `ApplicationFailedEvent` consumed the
+    // throwable) from an external kill (watchdog timeout, OS signal).
+    if std::env::var_os("RUSTJVM_DBG_MAIN_RETURN").is_some() {
+        let swallowed = vm
+            .shared
+            .swallow_counter
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let kind = match &result {
+            Ok(_) => "Ok".to_string(),
+            Err(MethodCallFailed::InternalError(e)) => {
+                format!("Err::Internal({e})")
+            }
+            Err(MethodCallFailed::ExceptionThrown(_)) => {
+                "Err::Exception".to_string()
+            }
+        };
+        let pending_nd = vm
+            .shared
+            .thread_registry
+            .alive_non_daemon_thread_ids()
+            .len();
+        eprintln!(
+            "[MAIN-RETURN] SpringApplication/main() returned in {:.2}s; \
+             result={kind}; swallowed_vm_errors={swallowed}; \
+             pending_non_daemon_threads={pending_nd}",
+            main_elapsed.as_secs_f64()
+        );
+    }
 
     // NEW-10: before reporting the invocation result, write the
     // missing-natives audit log to the user-specified JSON path. We
@@ -1597,7 +1556,118 @@ fn run() -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// letsgo postmortem SEGV trap — Windows SEH unhandled-exception filter.
+//
+// When `RUSTJVM_DBG_LETSGO=1` is set, the VM's `dispatch_trace` ring
+// buffer records every bytecode-method entry and every native dispatch.
+// A SIGSEGV / STATUS_ACCESS_VIOLATION on Windows skips the Rust panic
+// path entirely, so we install a low-level SEH filter that dumps the
+// ring to stderr before the OS terminates the process with rc=139.
+//
+// Mirrors the pattern in `rustjvm-vm/src/lib.rs::harness_exit_shim` but
+// targets release-build crash diagnosis rather than test teardown.
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+mod letsgo_segv_trap {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        exception_code: u32,
+        exception_flags: u32,
+        exception_record: *mut ExceptionRecord,
+        exception_address: *mut core::ffi::c_void,
+        number_parameters: u32,
+        exception_information: [usize; 15],
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        exception_record: *mut ExceptionRecord,
+        context_record: *mut core::ffi::c_void,
+    }
+
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC0000005;
+    const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000001D;
+    const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC0000096;
+    const STATUS_STACK_OVERFLOW: u32 = 0xC00000FD;
+    const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xC0000094;
+
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetUnhandledExceptionFilter(
+            filter: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
+        ) -> Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>;
+    }
+
+    unsafe extern "system" fn handler(info: *mut ExceptionPointers) -> i32 {
+        if DUMPED.swap(true, Ordering::SeqCst) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        if !info.is_null() {
+            let rec = (*info).exception_record;
+            if !rec.is_null() {
+                let _ = writeln!(
+                    stderr,
+                    "===== letsgo SEH trap fired: code=0x{:08X} addr={:p} =====",
+                    (*rec).exception_code,
+                    (*rec).exception_address,
+                );
+                let code = (*rec).exception_code;
+                let name = match code {
+                    STATUS_ACCESS_VIOLATION => "STATUS_ACCESS_VIOLATION",
+                    STATUS_ILLEGAL_INSTRUCTION => "STATUS_ILLEGAL_INSTRUCTION",
+                    STATUS_PRIVILEGED_INSTRUCTION => "STATUS_PRIVILEGED_INSTRUCTION",
+                    STATUS_STACK_OVERFLOW => "STATUS_STACK_OVERFLOW",
+                    STATUS_INTEGER_DIVIDE_BY_ZERO => "STATUS_INTEGER_DIVIDE_BY_ZERO",
+                    _ => "<other>",
+                };
+                let _ = writeln!(stderr, "exception name: {name}");
+                if code == STATUS_ACCESS_VIOLATION && (*rec).number_parameters >= 2 {
+                    let op = (*rec).exception_information[0];
+                    let va = (*rec).exception_information[1];
+                    let op_str = match op {
+                        0 => "read",
+                        1 => "write",
+                        8 => "DEP/NX",
+                        _ => "?",
+                    };
+                    let _ = writeln!(
+                        stderr,
+                        "access-violation op={op} ({op_str}) faulting_va=0x{va:016X}",
+                    );
+                }
+            }
+        }
+        let _ = stderr.flush();
+        rustjvm_vm::dispatch_trace::dump_to_stderr("SEH");
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    pub fn install() {
+        unsafe {
+            SetUnhandledExceptionFilter(Some(handler));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod letsgo_segv_trap {
+    pub fn install() {}
+}
+
 fn main() {
+    // letsgo postmortem — initialize the dispatch ring + SEH trap *before*
+    // any VM startup so even crashes during init are captured.
+    rustjvm_vm::dispatch_trace::init_from_env();
+    letsgo_segv_trap::install();
+
     // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ Visibility-first panic hook.
     //
     // The previous T14 hook silenced **every** Rust panic by routing it to
@@ -1739,8 +1809,17 @@ fn main() {
     }).expect("failed to spawn main-vm thread");
     handler.join().unwrap_or_else(|e| {
         eprintln!("main-vm thread panicked: {:?}", e);
+        // letsgo postmortem — surface the dispatch trail on a panic-join,
+        // mirroring the SEH path. No-op when RUSTJVM_DBG_LETSGO is unset.
+        rustjvm_vm::dispatch_trace::dump_to_stderr("panic-join");
         std::process::exit(1);
     });
+    // Successful exit path: also dump the trail if the flag was set so
+    // we can compare the last N dispatches against the expected normal
+    // shutdown sequence (only printed when the flag is active).
+    if rustjvm_vm::dispatch_trace::is_enabled() {
+        rustjvm_vm::dispatch_trace::dump_to_stderr("normal-exit");
+    }
 }
 
 /// Parse a JVM-style memory size string (e.g., "256m", "1g", "1024k").

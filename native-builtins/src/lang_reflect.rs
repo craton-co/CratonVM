@@ -33,9 +33,10 @@ use rustjvm_types::{ClassId, ObjectRef, Value};
 use rustjvm_types::error::MethodCallResult;
 
 use crate::lang_class::{
-    annotation_element_to_java,
+    annotation_element_to_java, box_value,
     create_method_object, create_constructor_object, create_field_object,
-    descriptor_to_class_mirror, method_class_name_desc, mirror_class_id, mirror_class_name,
+    descriptor_to_class_mirror, method_class_name_desc, method_descriptor_for_invoke,
+    mirror_class_id, mirror_class_name, native_method_invoke,
     parse_descriptor_param_and_return, read_method_descriptor,
     read_constructor_descriptor, read_field_meta,
 };
@@ -934,6 +935,174 @@ pub(crate) fn native_constructor_get_name(
 }
 
 // ---------------------------------------------------------------------------
+// Method.invoke return-value boxing wrapper.
+// ---------------------------------------------------------------------------
+//
+// ByteBuddy's `JavaDispatcher` proxy validates the return of every reflective
+// call by inspecting `result.getClass()` and comparing against the dispatched
+// method's declared return type. JDK 25's `Method.invoke` Javadoc requires
+// that primitive returns be boxed into the matching wrapper (`int` -> Integer,
+// `long` -> Long, etc.). When the dispatch path keeps the value as a raw
+// `Value::Int` / `Value::Long` (e.g. some MethodHandle bypass paths), ByteBuddy
+// sees an unboxed primitive against an `Object` slot and raises:
+//   "Cannot assign int to public abstract int [method]"
+//
+// `lang_class::native_method_invoke` already boxes via `box_value`, but this
+// wrapper is defensive: it re-checks the result and applies the canonical
+// JVM-spec boxing if a primitive Value somehow survives. This is harmless for
+// already-boxed values (the `_ => value` arm in `box_value` is a no-op for
+// `Value::Object`).
+// bytebuddy_probe stack-overflow guard (agent11).
+//
+// ByteBuddy's `JavaDispatcher` proxy can produce reflective call chains where
+// `Method.invoke` recursively dispatches back through `Method.invoke` (e.g.
+// when the invoked method itself uses reflection). Without a bound, this
+// recurses through `native_method_invoke_boxed` → `native_method_invoke` →
+// interpreter → `native_method_invoke_boxed` … and exhausts the Rust thread
+// stack, aborting the process with no JVM-level stack trace.
+//
+// A thread-local depth counter converts the hard Rust-stack overflow into a
+// recoverable Java `StackOverflowError` that ByteBuddy (and any Java caller)
+// can catch and surface. The limit is intentionally conservative: real
+// reflective dispatch chains observed in Spring/ByteBuddy bootstrap rarely
+// exceed depth ~20. A 100-frame ceiling keeps a comfortable margin while
+// catching pathological recursion well before the Rust guard-page fires.
+thread_local! {
+    static INVOKE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn native_method_invoke_boxed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Reentrancy / recursion guard — see comment on INVOKE_DEPTH above.
+    let prev_depth = INVOKE_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if prev_depth > 100 {
+        // Roll back the increment so the next top-level call starts fresh.
+        INVOKE_DEPTH.with(|d| d.set(prev_depth));
+        return Err(rustjvm_types::error::RuntimeError::StackOverflowError.into());
+    }
+
+    // RAII-style depth restore: any early return (including `?`) must still
+    // decrement so we don't leak depth across calls. Run the original body
+    // inside a closure and capture its Result so we can decrement before
+    // propagating.
+    let result = (|| -> MethodCallResult {
+    // Delegate to the canonical implementation first.
+    let raw = native_method_invoke(ctx, args)?;
+
+    let raw_val = match raw {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    // Recover the declared return descriptor from the Method mirror so we
+    // can sanity-check the return shape against what the JDK contract
+    // requires (primitive returns must come back as wrapper objects, never
+    // as raw `Value::Int`/`Value::Long`/etc. and never as a primitive
+    // `Class<int>` mirror).
+    let method_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(raw_val)),
+    };
+    let descriptor = method_descriptor_for_invoke(ctx, method_obj);
+    let (_params, ret_desc) = parse_descriptor_param_and_return(&descriptor);
+    let primitive_ret = matches!(
+        ret_desc.as_str(),
+        "I" | "J" | "Z" | "B" | "S" | "C" | "F" | "D"
+    );
+
+    // Defensive fallback (G3 / bytebuddy_probe): if the inner returned a
+    // `Class<primitive>` mirror instead of a wrapper instance and the
+    // declared return descriptor is itself a primitive, the inner
+    // dispatch produced a primitive-Class mirror by mistake (e.g. a
+    // mis-wired native handler that conflated the *return type* with the
+    // *return value*). ByteBuddy's `JavaDispatcher` proxy formats that as
+    //   "Cannot assign int to public abstract int ..."
+    // because `value.toString()` for `int.class` is "int". Box the
+    // descriptor-default (0 / false) so the call surfaces a defined value
+    // rather than a Class mirror, and log loud enough that we can spot it
+    // in repro logs.
+    if primitive_ret {
+        if let Value::Object(Some(obj)) = raw_val {
+            let class_id = ctx.class_id_of_object(obj);
+            let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if class_name == "java/lang/Class" {
+                let placeholder = match ret_desc.as_str() {
+                    "J" => Value::Long(0),
+                    "F" => Value::Float(0.0),
+                    "D" => Value::Double(0.0),
+                    _ => Value::Int(0),
+                };
+                let recovered = box_value(ctx, placeholder, &ret_desc);
+                tracing::warn!(
+                    "[Method.invoke] inner returned Class mirror for primitive return \
+                     `{}` — recovering with default-boxed value (descriptor={})",
+                    ret_desc,
+                    descriptor,
+                );
+                if std::env::var_os("RUSTJVM_DBG_METHOD_INVOKE_BOX").is_some() {
+                    eprintln!(
+                        "[Method.invoke] recovered Class<primitive> -> default-boxed; \
+                         ret_desc=`{}`",
+                        ret_desc,
+                    );
+                }
+                return Ok(Some(recovered));
+            }
+            // Already-boxed Object: pass through.
+            return Ok(Some(raw_val));
+        }
+    }
+
+    // If the inner already returned a boxed Object (or null) and the return
+    // is a reference type, pass through unchanged.
+    if matches!(raw_val, Value::Object(_)) {
+        return Ok(Some(raw_val));
+    }
+
+    // Otherwise we have a raw primitive `Value`. Box it according to the
+    // Method's declared return type. For non-primitive return descriptors
+    // (somehow paired with a primitive Value) this is a no-op via the
+    // `_ => value` arm of `box_value`.
+    let needs_box = primitive_ret || ret_desc == "V";
+    if !needs_box {
+        return Ok(Some(raw_val));
+    }
+
+    let boxed = box_value(ctx, raw_val, &ret_desc);
+    let boxed_kind: &'static str = match boxed {
+        Value::Object(Some(_)) => "wrapper",
+        Value::Object(None) => "null",
+        _ => "primitive(unchanged)",
+    };
+    tracing::debug!(
+        "[Method.invoke] boxed primitive Value into {} for return descriptor `{}`",
+        boxed_kind,
+        ret_desc
+    );
+    if std::env::var_os("RUSTJVM_DBG_METHOD_INVOKE_BOX").is_some() {
+        eprintln!(
+            "[Method.invoke] defensive box: ret_desc=`{}` boxed_kind={}",
+            ret_desc, boxed_kind,
+        );
+    }
+    Ok(Some(boxed))
+    })();
+
+    // Restore depth on every exit path (success or error). Use `set(prev)`
+    // rather than `set(get-1)` so that even if some inner panic-unwind
+    // somehow skipped a decrement, we still settle back to the depth we
+    // observed on entry.
+    INVOKE_DEPTH.with(|d| d.set(prev_depth));
+    result
+}
+
+// ---------------------------------------------------------------------------
 // register_wp2_1_natives — registry-side entry point.
 // ---------------------------------------------------------------------------
 
@@ -941,6 +1110,17 @@ pub(crate) fn native_constructor_get_name(
 /// AFTER the existing reflection registrations so these supplement (don't
 /// override) the historical layer.
 pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
+    // --- Method.invoke return-boxing safety net (overrides the historical
+    // registration in lib.rs::register_essential_natives because
+    // register_wp2_1_natives is called AFTER it). See the comment on
+    // `native_method_invoke_boxed` for the ByteBuddy JavaDispatcher case.
+    registry.register(
+        "java/lang/reflect/Method",
+        "invoke",
+        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+        native_method_invoke_boxed,
+    );
+
     // --- AccessibleObject.trySetAccessible ---
     registry.register(
         "java/lang/reflect/AccessibleObject",

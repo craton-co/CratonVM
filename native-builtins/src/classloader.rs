@@ -1194,6 +1194,161 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Round-16 (agent 16): defensive `sun.misc.Unsafe.defineClass` shim for the
+// cglib proxy-generation path.
+//
+// Symptom: a SEGV / stack-overflow during cglib's proxy bytecode emit when
+// it calls `Unsafe.defineClass(name, bytecode[], off, len, loader, pd)`.
+// The crash is in the non-JIT path during bytecode generation — most
+// likely a null/short bytecode array being deref'd by the underlying
+// `define_class_full` plumbing.
+//
+// Fix: validate args up-front (null bytecode → null result; oversized
+// bytecode → null result), then delegate to the same backend used by the
+// public `ClassLoader.defineClass(String, byte[], int, int, ProtectionDomain)`
+// overload. Adding the defensive check is the win even if cglib doesn't
+// fully work — it prevents the process crash.
+//
+// Signature: `defineClass(String name, byte[] b, int off, int len,
+//                         ClassLoader loader, ProtectionDomain pd) -> Class`
+// args = [this, name, byte_array, off, len, loader, pd]
+//   (this == the Unsafe singleton, ignored)
+//
+// Note: registered from `register_classloader_natives` because the user
+// requested all cglib-related URL/Unsafe defineClass paths live in this
+// file. This does NOT shadow the existing `Unsafe.defineAnonymousClass`
+// natives in `unsafe_natives.rs` — different method name + descriptor.
+// ---------------------------------------------------------------------------
+
+/// Max class file size we accept on the Unsafe.defineClass path. cglib
+/// proxies for typical Spring/Hibernate classes are <200 KB; anything
+/// over 1 MB is almost certainly a misinterpreted argument (off/len
+/// mismatch reading past the array end) and we'd rather return null
+/// than try to parse it.
+const UNSAFE_DEFINE_CLASS_MAX_BYTES: usize = 1024 * 1024;
+
+fn unsafe_define_class_defensive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // arg[0] = this (Unsafe singleton), ignored
+    // arg[1] = name : String (may be null — bytecode carries this_class)
+    // arg[2] = b : byte[]
+    // arg[3] = off : int
+    // arg[4] = len : int
+    // arg[5] = loader : ClassLoader (may be null — system loader)
+    // arg[6] = pd : ProtectionDomain (may be null)
+
+    // Defensive arg[2] check: null array → return null instead of segfaulting.
+    let byte_array = match args.get(2) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            tracing::warn!(
+                "Unsafe.defineClass: null bytecode array — returning null"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+
+    let array_len = ctx.array_length(byte_array);
+
+    // Defensive offset/length validation.
+    let offset = match args.get(3) {
+        Some(Value::Int(v)) if *v >= 0 => *v as usize,
+        _ => 0,
+    };
+    let length = match args.get(4) {
+        Some(Value::Int(v)) if *v >= 0 => *v as usize,
+        _ => array_len,
+    };
+
+    // Sanity-cap: cglib proxies are small. Reject obviously-bogus sizes.
+    if length == 0 || length > UNSAFE_DEFINE_CLASS_MAX_BYTES {
+        tracing::warn!(
+            "Unsafe.defineClass: rejecting bytecode of length {length} \
+             (max={UNSAFE_DEFINE_CLASS_MAX_BYTES})"
+        );
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Bounds: offset+length must fit inside the array.
+    if offset > array_len || length > array_len.saturating_sub(offset) {
+        tracing::warn!(
+            "Unsafe.defineClass: offset/length out of bounds \
+             (off={offset}, len={length}, array={array_len}) — returning null"
+        );
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Extract class name (may be null — define_class_full will read this_class).
+    let name_str = match args.get(1) {
+        Some(Value::Object(Some(name_obj))) => {
+            let dotted = ctx.read_string(*name_obj).unwrap_or_default();
+            dotted.replace('.', "/")
+        }
+        _ => String::new(),
+    };
+
+    // Copy bytes defensively. Any out-of-band element read returns 0 byte.
+    let mut class_bytes = Vec::with_capacity(length);
+    for i in 0..length {
+        match ctx.get_array_element(byte_array, offset + i) {
+            Value::Int(b) => class_bytes.push(b as u8),
+            _ => class_bytes.push(0),
+        }
+    }
+
+    // Sanity check magic before handing to backend — `define_class_full`
+    // already checks this, but doing it here keeps the warn log clear
+    // about WHO rejected the bytecode.
+    if class_bytes.len() < 4 || class_bytes[0..4] != CLASS_FILE_MAGIC {
+        tracing::warn!(
+            "Unsafe.defineClass({name_str}): bad magic — returning null"
+        );
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // Resolve loader id from arg[5]. Null loader → system (id 0).
+    let loader_id = match args.get(5) {
+        Some(Value::Object(Some(loader_obj))) => {
+            get_or_assign_loader_id(ctx, *loader_obj)
+        }
+        _ => 0,
+    };
+
+    // Extract optional PD URL (same layout as cl_define_class_basic).
+    let mut pd_url: Option<String> = None;
+    if let Some(Value::Object(Some(pd))) = args.get(6) {
+        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
+            if let Some(s) = ctx.read_string(cs) {
+                pd_url = Some(s);
+            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
+                if let Some(s) = ctx.read_string(url) {
+                    pd_url = Some(s);
+                }
+            }
+        }
+    }
+
+    let opts = rustjvm_native_api::DefineClassFull {
+        code_source_url: pd_url,
+        ..Default::default()
+    };
+    match ctx.define_class_full(&name_str, &class_bytes, loader_id, opts) {
+        Ok(cid) => {
+            let mirror = ctx.get_class_mirror(cid);
+            Ok(Some(Value::Object(Some(mirror))))
+        }
+        Err(msg) => {
+            tracing::warn!(
+                "Unsafe.defineClass({name_str}) backend failed: {msg} — returning null"
+            );
+            Ok(Some(Value::Object(None)))
+        }
+    }
+}
+
 fn cl_resolve_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // resolveClass(Class) — trigger class preparation and linking
     if let Some(Value::Object(Some(class_mirror))) = args.get(1) {
@@ -1420,11 +1575,162 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(enm))))
 }
 
+// ---------------------------------------------------------------------------
+// SB-shutdown — `jdk/internal/loader/URLClassPath` safe stubs
+//
+// Spring Boot's `ClearCachesApplicationListener.clearClassLoaderCaches`,
+// invoked on `ContextRefreshedEvent`, reflectively walks the URLClassPath
+// graph reachable from `LaunchedURLClassLoader.clearCache()` and calls
+// `getURLs()` and `closeLoaders()` on each.  The real-JDK bytecode for
+// `URLClassPath.getURLs()` does:
+//     synchronized (urls) { return path.toArray(new URL[path.size()]); }
+// where `path` may be left at its default-null value when the instance
+// reached us via a code path our `<init>` natives don't cover (Unsafe
+// allocation, deserialization, custom factories, etc).  The resulting NPE
+// is swallowed into our access-violation handler — we see the trace
+// terminate at:
+//     [BC] jdk/internal/loader/URLClassPath.getURLs()[Ljava/net/URL;
+//     ===== SEH trap fired: code=0xC0000005 ...
+// because the deref reaches our null-tag sentinel.
+//
+// These stubs replace the failing bytecode with safe no-op equivalents:
+//   - `getURLs()`         → empty `URL[]`              (URL[0])
+//   - `closeLoaders()`    → empty `ArrayList`          (List<IOException>)
+//   - `closeLoaders()V`   → no-op                      (older signature)
+//   - `<clinit>()V`       → no-op                      (idempotent; prevents
+//                                                       any future drift in
+//                                                       the JDK clinit body
+//                                                       from re-introducing
+//                                                       null fields)
+//   - `findResource(...)` → null URL                   (no resource)
+//
+// Both `jdk/internal/loader/URLClassPath` (JDK 9+) and
+// `sun/misc/URLClassPath` (JDK 8 legacy) are covered.
+//
+// We piggy-back registration on `register_enumeration_impl_natives` so
+// the stubs are picked up from both the real-JDK `register_essential_natives`
+// path (which calls `register_enumeration_impl_natives` directly) and the
+// synthetic-jdk `register_classloader_natives` path (which calls it via
+// the same helper). Idempotent — re-registration is a no-op.
+// ---------------------------------------------------------------------------
+
+/// `URLClassPath.getURLs()[Ljava/net/URL;` — return an empty URL[].
+///
+/// Real-JDK bytecode reads `path` (an ArrayList) under a monitor and
+/// builds `URL[path.size()]`.  When `path` is null (because the instance
+/// was created through a path our `<init>` shim never saw) the deref
+/// crashes the VM with an access violation. An empty array is spec-legal
+/// (it just means "this loader contributes no URLs") and lets Spring
+/// Boot's clearCache iteration complete in zero iterations.
+fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::classloader",
+        "[URLClassPath shim] getURLs() returning empty URL[]"
+    );
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `URLClassPath.closeLoaders()Ljava/util/List;` — return an empty ArrayList.
+///
+/// The real method walks `loaders` and accumulates IOExceptions from each
+/// `Loader.close()` call.  When `loaders` is null we'd NPE; returning an
+/// empty list is equivalent to "no loaders to close, no exceptions raised"
+/// and matches Spring Boot's expectation (it just logs and continues).
+fn ucp_close_loaders_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::classloader",
+        "[URLClassPath shim] closeLoaders() returning empty ArrayList"
+    );
+    let list = match ctx.new_object("java/util/ArrayList")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let _ = ctx.invoke(
+        "java/util/ArrayList",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(list))],
+    );
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `URLClassPath.closeLoaders()V` — older void signature (pre-JDK 17).
+/// Always succeed without side effects.
+fn ucp_close_loaders_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::classloader",
+        "[URLClassPath shim] closeLoaders()V (void variant) no-op"
+    );
+    Ok(None)
+}
+
+/// `URLClassPath.<clinit>()V` — no-op.
+///
+/// The real-JDK static initializer wires up a `DEBUG` flag and a couple of
+/// SharedSecrets accessors.  Replacing it with a no-op is safe: any
+/// subsequent method call on URLClassPath either goes through one of our
+/// dedicated shims, or operates on instance fields that our `<init>` shims
+/// populate explicitly. Suppressing the real clinit also defuses a class
+/// of "clinit swallowed, statics left null" failure modes that would
+/// otherwise re-introduce NPEs through any new code path the JDK adds.
+fn ucp_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::classloader",
+        "[URLClassPath shim] <clinit>() no-op"
+    );
+    Ok(None)
+}
+
+/// `URLClassPath.findResource(Ljava/lang/String;Z)Ljava/net/URL;` — return null.
+///
+/// Spring Boot doesn't rely on this during clearCache, but registering a
+/// safe stub closes the same NPE window for any reflective probe that
+/// reaches us with a null `loaders` field.
+fn ucp_find_resource_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// Register the URLClassPath safe-stub natives on both the JDK 9+
+/// (`jdk/internal/loader/URLClassPath`) and the JDK 8 legacy
+/// (`sun/misc/URLClassPath`) class names.  Idempotent — see
+/// `NativeMethodRegistry::register` (last call wins on same (class,
+/// method, descriptor) tuple, no panic on duplicate).
+pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
+    for cls in &["jdk/internal/loader/URLClassPath", "sun/misc/URLClassPath"] {
+        // `<clinit>` — no-op so the real-JDK static init body never runs.
+        r.register(cls, "<clinit>", "()V", ucp_clinit_noop);
+        // `getURLs` — always return an empty URL[]. Two overloads exist on
+        // recent JDK builds: the regular `getURLs()` and a package-private
+        // `getURLs(boolean)` that includes/excludes the loaderless entries.
+        r.register(cls, "getURLs", "()[Ljava/net/URL;", ucp_get_urls_empty);
+        // `closeLoaders` — both signatures.
+        r.register(cls, "closeLoaders", "()Ljava/util/List;", ucp_close_loaders_list);
+        r.register(cls, "closeLoaders", "()V", ucp_close_loaders_void);
+        // `findResource` — return null URL when probed reflectively. Both
+        // the public (String) form and the internal (String, boolean) form
+        // are covered.
+        r.register(cls, "findResource", "(Ljava/lang/String;)Ljava/net/URL;", ucp_find_resource_null);
+        r.register(cls, "findResource", "(Ljava/lang/String;Z)Ljava/net/URL;", ucp_find_resource_null);
+    }
+}
+
 /// Register natives for our synthetic `java/util/Enumeration$Impl` helper
 /// class. Exposed so `register_essential_natives` can call it — needed in
 /// real-JDK mode where `register_classloader_natives` (synthetic-only) is
 /// skipped.
+///
+/// Note: we also chain to `register_url_class_path_safe_stubs` from here
+/// because `register_essential_natives` (real-JDK path) calls this
+/// function unconditionally, and we need the URLClassPath stubs installed
+/// in both real-JDK and synthetic-JDK modes. The two concerns are
+/// logically distinct but share a single wiring point.
 pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
+    // Install the URLClassPath safe stubs alongside the enumeration helpers
+    // so both real-JDK (`register_essential_natives`) and synthetic-JDK
+    // (`register_classloader_natives`) callers pick them up.
+    register_url_class_path_safe_stubs(r);
+
     let enm = "java/util/Enumeration$Impl";
     r.register(enm, "hasMoreElements", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2389,6 +2695,27 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // overloads route through. CGLIB / direct user code typically calls
     // these via the public Java wrappers.
     register_classloader_define_class(r);
+
+    // Round-16 (agent 16): defensive Unsafe.defineClass shim for cglib.
+    // cglib proxy generation goes through `sun.misc.Unsafe.defineClass`,
+    // which previously SEGV'd on null/oversized bytecode in the non-JIT
+    // path. This shim validates args up-front and routes through the
+    // shared `define_class_full` backend.
+    r.register(
+        "sun/misc/Unsafe",
+        "defineClass",
+        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        unsafe_define_class_defensive,
+    );
+    // jdk.internal.misc.Unsafe — JDK 9+ public path that user code can't
+    // reach directly but `jdk.internal.misc.Unsafe.getUnsafe()` callers
+    // (some bytecode-manipulation libs) hit. Same shim covers both.
+    r.register(
+        "jdk/internal/misc/Unsafe",
+        "defineClass",
+        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        unsafe_define_class_defensive,
+    );
     r.register(cl, "resolveClass", "(Ljava/lang/Class;)V", cl_resolve_class);
     r.register(cl, "findLoadedClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_find_loaded_class);
     r.register(cl, "getParent", "()Ljava/lang/ClassLoader;", cl_get_parent);

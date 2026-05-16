@@ -1161,10 +1161,44 @@ fn array_is_assignable(ctx: &dyn NativeContext, src_desc: &str, target_name: &st
     src_id == tgt_id || ctx.is_subclass(src_id, tgt_id)
 }
 
+// bytebuddy_probe stack-overflow guard (agent11).
+//
+// `Class.isAssignableFrom` is a hot path during ByteBuddy / Spring
+// reflective bootstrap, and a few of the helpers it transitively touches
+// (`array_is_assignable`, `is_subclass`) themselves consult class mirrors
+// that may re-enter this function for component-type checks. A pathological
+// type graph (or a circular array-component cycle observed under
+// ByteBuddy's `JavaDispatcher` proxy validation) can drive recursion deep
+// enough to blow the Rust thread stack.
+//
+// Mirror the depth-guard pattern from `lang_reflect::native_method_invoke_boxed`:
+// bail out with `Value::Int(0)` (i.e. "not assignable") if we re-enter this
+// function past a conservative ceiling. Returning false-but-Ok is safer than
+// throwing here because callers (`Assert.isAssignable` in Spring,
+// `JavaDispatcher` in ByteBuddy) treat a thrown error as a fatal class-init
+// failure, while a `false` return is a recoverable runtime decision.
+thread_local! {
+    static IS_ASSIGNABLE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn native_class_is_assignable_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Reentrancy / recursion guard — see comment on IS_ASSIGNABLE_DEPTH.
+    let prev_depth = IS_ASSIGNABLE_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if prev_depth > 100 {
+        IS_ASSIGNABLE_DEPTH.with(|d| d.set(prev_depth));
+        // Bail safe: report not-assignable rather than throwing, so callers
+        // that are mid-bootstrap don't see this as a hard failure.
+        return Ok(Some(Value::Int(0)));
+    }
+    // RAII-style depth restore around the original body.
+    let result = (|| -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -1224,16 +1258,54 @@ pub(crate) fn native_class_is_assignable_from(
         // returns false for these).
     }
 
+    // bytebuddy_probe + WildFly: primitive Class mirrors (`int.class`,
+    // `boolean.class`, etc.) don't have a real ClassId — `mirror_class_id`
+    // returns None. Falling through returned 0, breaking
+    // `int.class.isAssignableFrom(int.class)`, which ByteBuddy uses to
+    // validate proxy return types, and WildFly uses for reflection
+    // sanity checks during early module-loader bootstrap.
+    //
+    // Fix: name-based equality for same-name primitives BEFORE the
+    // class-id lookup. Two mirrors with identical primitive names are
+    // assignable (they ARE the same primitive type). For reference
+    // types we still go through the class-id / subclass path.
+    if !this_name.is_empty()
+        && this_name == other_name
+        && matches!(
+            this_name.as_str(),
+            "int" | "long" | "boolean" | "byte" | "short"
+                | "char" | "float" | "double" | "void"
+        )
+    {
+        return Ok(Some(Value::Int(1)));
+    }
+
     let this_class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
-        None => return Ok(Some(Value::Int(0))),
+        None => {
+            // Fallback: same non-empty name → assignable. Handles missing
+            // class_id for primitives and synthetic mirrors.
+            if !this_name.is_empty() && this_name == other_name {
+                return Ok(Some(Value::Int(1)));
+            }
+            return Ok(Some(Value::Int(0)));
+        }
     };
     let other_class_id = match mirror_class_id(ctx, other) {
         Some(id) => id,
-        None => return Ok(Some(Value::Int(0))),
+        None => {
+            if !this_name.is_empty() && this_name == other_name {
+                return Ok(Some(Value::Int(1)));
+            }
+            return Ok(Some(Value::Int(0)));
+        }
     };
     let result = other_class_id == this_class_id || ctx.is_subclass(other_class_id, this_class_id);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
+    })();
+    // Restore depth on every exit path (success or error).
+    IS_ASSIGNABLE_DEPTH.with(|d| d.set(prev_depth));
+    result
 }
 
 pub(crate) fn native_class_is_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4049,10 +4121,51 @@ fn declared_methods_with_synthetic(
     methods
 }
 
+// bytebuddy_probe stack-overflow guard (agent15).
+//
+// `Class.getDeclaredMethods` / `Class.getMethods` are heavy ByteBuddy hot
+// paths. The work each call does (`create_method_object` → allocate a
+// reflect.Method mirror per declared method → `descriptor_to_class_mirror`
+// per parameter → potentially `load_class` + `ensure_class_initialized` on
+// each parameter type → run that class's `<clinit>` via the interpreter)
+// can re-enter these natives when ByteBuddy's `JavaDispatcher`,
+// SpringFactoriesLoader, or Mockito's `MockMethodInterceptor` walk the
+// declared-method table of every class they touch during bootstrap.
+//
+// The existing depth guards on `native_method_invoke_boxed` (lang_reflect)
+// and `native_class_is_assignable_from` (this file) do not cover the
+// recursion that flows: native_class_get_declared_methods →
+// create_method_object → descriptor_to_class_mirror → load_class →
+// <clinit> → ByteBuddy.run() → native_class_get_declared_methods … which
+// is purely Rust-stack recursion that bypasses both invoke guards.
+//
+// Mirror the same pattern: a thread-local depth counter, bail with a
+// recoverable empty-array (`Class[0]`) rather than throwing, since
+// throwing during bootstrap class init turns into ExceptionInInitializerError
+// in ByteBuddy and kills the framework.
+thread_local! {
+    static GET_DECLARED_METHODS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static GET_METHODS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn native_class_get_declared_methods(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Reentrancy / recursion guard — see comment on GET_DECLARED_METHODS_DEPTH.
+    let prev_depth = GET_DECLARED_METHODS_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if prev_depth > 50 {
+        GET_DECLARED_METHODS_DEPTH.with(|d| d.set(prev_depth));
+        // Bail safe: return an empty Method[] so ByteBuddy / Mockito can
+        // recover rather than die on ExceptionInInitializerError.
+        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+    let result = (|| -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -4084,6 +4197,10 @@ pub(crate) fn native_class_get_declared_methods(
         ctx.set_array_element(arr, i, Value::Object(Some(method_obj)));
     }
     Ok(Some(Value::Object(Some(arr))))
+    })();
+    // Restore depth on every exit path (success or error).
+    GET_DECLARED_METHODS_DEPTH.with(|d| d.set(prev_depth));
+    result
 }
 
 pub(crate) fn native_class_get_declared_method(
@@ -4981,6 +5098,22 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 pub(crate) fn native_class_get_methods(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // bytebuddy_probe stack-overflow guard (agent15) — see comment on
+    // GET_DECLARED_METHODS_DEPTH above. `getMethods` walks the super/iface
+    // chain (collect_public_methods) so it can recurse even more deeply
+    // than `getDeclaredMethods` once any superclass mirror's `<clinit>`
+    // calls back into reflection.
+    let prev_depth = GET_METHODS_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if prev_depth > 50 {
+        GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
+        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+    let result = (|| -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -5003,6 +5136,9 @@ pub(crate) fn native_class_get_methods(ctx: &mut dyn NativeContext, args: &[Valu
         ctx.set_array_element(arr, i, Value::Object(Some(*mobj)));
     }
     Ok(Some(Value::Object(Some(arr))))
+    })();
+    GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
+    result
 }
 
 pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
