@@ -7246,14 +7246,8 @@ fn invoke_on_class_shared_inner(
                         // false for orphan beans whose class isn't loadable.
                         || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
                             && method_name == "hasBeanClass")
-                        // demo: BeanWrapperImpl.setPropertyValue — no-op so
-                        // per-property setter failures don't accumulate into
-                        // PropertyBatchUpdateException. Accepted trade-off:
-                        // valid beans lose property injection too.
-                        || (class_name == "org/springframework/beans/BeanWrapperImpl"
-                            && method_name == "setPropertyValue")
-                        || (class_name == "org/springframework/beans/AbstractNestablePropertyAccessor"
-                            && method_name == "setPropertyValue")
+                        // (setPropertyValue/setPropertyValues universal no-ops
+                        //  removed: regressed insurance without fixing demo.)
                         // sportme: AbstractBeanDefinition.getBeanClassName —
                         // returns null for orphan beans with unloadable classes
                         // so Spring's downstream code skips them.

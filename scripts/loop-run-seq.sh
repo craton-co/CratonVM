@@ -40,7 +40,7 @@ run_app wildfly 25 --Xmx 512m \
     --jar "$APPS/wildfly-39.0.1.Final/jboss-modules.jar" -- \
     -mp "$APPS/wildfly-39.0.1.Final/modules" \
     org.jboss.as.standalone "-Djboss.home.dir=$APPS/wildfly-39.0.1.Final"
-run_app keycloak 30 --Xmx 1g \
+run_app keycloak 60 --Xmx 1g \
     --jar "$APPS/keycloak-26.2.4/lib/quarkus-run.jar" show-config
 
 # Elasticsearch 8.15.5 — server CLI launcher.

@@ -480,42 +480,138 @@ impl ClassPath {
     /// if `BOOT-INF/classes/` or `BOOT-INF/lib/` are detected (via MANIFEST.MF
     /// or directory probing), nested entries are extracted and added to the
     /// classpath.
+    ///
+    /// **Wildcard expansion (Java CLI parity).** An entry ending in `/*` or
+    /// `\*` (or that is exactly `*`) is expanded to every `*.jar` / `*.JAR`
+    /// directly inside the parent directory. This matches HotSpot's
+    /// `-cp lib/*` syntax used by Elasticsearch, Cassandra, and most
+    /// hand-rolled launchers. Without expansion, the literal entry
+    /// `lib/*` is treated as a non-existent path and silently dropped —
+    /// producing an empty classpath and breaking `ServiceLoader`
+    /// (`META-INF/services/...`) discovery for every dependency.
     pub fn new(paths: &[String]) -> Self {
         let mut entries = Vec::new();
-        for p in paths {
-            let path = PathBuf::from(p);
-            if path.is_dir() {
-                entries.push(ClassPathEntry::Directory(path));
-            } else if path.extension().is_some_and(|ext| ext == "jar") && path.exists() {
-                match fs::read(&path) {
-                    Ok(data) => {
-                        Self::load_jar_data(&path, data, &mut entries);
+        for raw in paths {
+            for p in Self::expand_classpath_wildcard(raw) {
+                let path = PathBuf::from(&p);
+                if path.is_dir() {
+                    entries.push(ClassPathEntry::Directory(path));
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                    && path.exists()
+                {
+                    match fs::read(&path) {
+                        Ok(data) => {
+                            Self::load_jar_data(&path, data, &mut entries);
+                        }
+                        Err(e) => {
+                            debug!("Failed to read JAR {}: {e}", path.display());
+                        }
                     }
-                    Err(e) => {
-                        debug!("Failed to read JAR {}: {e}", path.display());
+                } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
+                    match Self::load_jmod(&path) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
                     }
+                } else if Self::is_likely_jimage(&path) {
+                    // NEW-5: the JDK 9+ runtime image at `$JAVA_HOME/lib/modules`
+                    // is a single jimage blob. Detection is by file name
+                    // (`modules` under any directory) plus a magic-number
+                    // verification inside `load_jimage`. The explicit file
+                    // name check lets users write `-cp /path/to/lib/modules`
+                    // without having to pass a special flag.
+                    match Self::load_jimage(&path) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
+                    }
+                } else {
+                    debug!("Skipping non-existent classpath entry: {p}");
                 }
-            } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
-                match Self::load_jmod(&path) {
-                    Ok(entry) => entries.push(entry),
-                    Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
-                }
-            } else if Self::is_likely_jimage(&path) {
-                // NEW-5: the JDK 9+ runtime image at `$JAVA_HOME/lib/modules`
-                // is a single jimage blob. Detection is by file name
-                // (`modules` under any directory) plus a magic-number
-                // verification inside `load_jimage`. The explicit file
-                // name check lets users write `-cp /path/to/lib/modules`
-                // without having to pass a special flag.
-                match Self::load_jimage(&path) {
-                    Ok(entry) => entries.push(entry),
-                    Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
-                }
-            } else {
-                debug!("Skipping non-existent classpath entry: {p}");
             }
         }
         Self { entries }
+    }
+
+    /// Expand a single classpath token, honouring Java's `dir/*` wildcard.
+    ///
+    /// HotSpot's `java -cp lib/*` expands to every JAR (`*.jar` / `*.JAR`)
+    /// directly inside `lib/` — non-recursive, ignoring sub-directories.
+    /// Non-wildcard entries pass through unchanged. The expanded order is
+    /// sorted so behaviour is deterministic across runs and platforms;
+    /// `ServiceLoader` provider ordering is observable for SPIs that
+    /// register the same interface in multiple jars, so we want
+    /// byte-identical lists across runs.
+    ///
+    /// This is the entry point used by both [`ClassPath::new`] and
+    /// [`ClassPath::add_path`] so dynamic loaders that synthesise
+    /// `someLib/*` strings benefit equally.
+    fn expand_classpath_wildcard(raw: &str) -> Vec<String> {
+        // Accept `dir/*`, `dir\*`, and the bare token `*` (current dir).
+        // Patterns with an embedded `*` mid-path are NOT supported, in
+        // line with HotSpot — pass them through literally and let the
+        // load fail with a "skipping non-existent classpath entry"
+        // debug line.
+        let (dir_part, matched) = if raw == "*" {
+            (".".to_string(), true)
+        } else if let Some(parent) = raw.strip_suffix("/*") {
+            (parent.to_string(), true)
+        } else if let Some(parent) = raw.strip_suffix("\\*") {
+            (parent.to_string(), true)
+        } else {
+            (String::new(), false)
+        };
+        if !matched {
+            return vec![raw.to_string()];
+        }
+        if dir_part.contains('*') {
+            debug!("Classpath wildcard with embedded '*' not supported: {raw}");
+            return vec![raw.to_string()];
+        }
+
+        let dir = PathBuf::from(if dir_part.is_empty() { "." } else { dir_part.as_str() });
+        let read = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(
+                    "Classpath wildcard {raw}: cannot read directory {}: {e}",
+                    dir.display()
+                );
+                // Yield zero entries — matches `java -cp missing/*`,
+                // which silently expands to the empty set rather than
+                // erroring.
+                return Vec::new();
+            }
+        };
+        let mut jars: Vec<String> = Vec::new();
+        for ent in read.flatten() {
+            let p = ent.path();
+            if !p.is_file() {
+                continue;
+            }
+            let is_jar = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("jar"));
+            if !is_jar {
+                continue;
+            }
+            jars.push(p.to_string_lossy().into_owned());
+        }
+        jars.sort();
+        if jars.is_empty() {
+            debug!(
+                "Classpath wildcard {raw}: directory {} contains no JARs",
+                dir.display()
+            );
+        } else {
+            debug!(
+                "Classpath wildcard {raw} -> {} JAR(s) under {}",
+                jars.len(),
+                dir.display()
+            );
+        }
+        jars
     }
 
     /// Heuristic: does `path` look like a JDK 9+ jimage file?
@@ -808,27 +904,37 @@ impl ClassPath {
     /// with `.jar` (or `.zip`) and exists, it is opened as a `JarFile` entry.
     /// Fat JARs are auto-detected and their nested entries are extracted.
     /// Silently skips non-existent paths or unreadable JARs.
+    ///
+    /// Supports the same `dir/*` wildcard expansion as [`ClassPath::new`] so
+    /// app servers / launchers that synthesise `lib/*` strings at runtime
+    /// (e.g. JBoss module loader, Maven plugin loaders) get every JAR in
+    /// the directory instead of silently dropping the entry.
     pub fn add_path(&mut self, path: &str) {
-        let pb = std::path::PathBuf::from(path);
-        if pb.is_dir() {
-            debug!("Dynamic classpath: adding directory {path}");
-            self.entries.push(ClassPathEntry::Directory(pb));
-        } else if pb.extension().is_some_and(|e| e == "jar" || e == "zip") && pb.exists() {
-            match std::fs::read(&pb) {
-                Ok(data) => {
-                    Self::load_jar_data(&pb, data, &mut self.entries);
+        for expanded in Self::expand_classpath_wildcard(path) {
+            let pb = std::path::PathBuf::from(&expanded);
+            if pb.is_dir() {
+                debug!("Dynamic classpath: adding directory {expanded}");
+                self.entries.push(ClassPathEntry::Directory(pb));
+            } else if pb.extension().is_some_and(|e| {
+                e.eq_ignore_ascii_case("jar") || e.eq_ignore_ascii_case("zip")
+            }) && pb.exists()
+            {
+                match std::fs::read(&pb) {
+                    Ok(data) => {
+                        Self::load_jar_data(&pb, data, &mut self.entries);
+                    }
+                    Err(e) => {
+                        debug!("Dynamic classpath: failed to read {expanded}: {e}");
+                    }
                 }
-                Err(e) => {
-                    debug!("Dynamic classpath: failed to read {path}: {e}");
+            } else if pb.extension().is_some_and(|e| e == "jmod") && pb.exists() {
+                match Self::load_jmod(&pb) {
+                    Ok(entry) => self.entries.push(entry),
+                    Err(e) => debug!("Dynamic classpath: failed to read JMOD {expanded}: {e}"),
                 }
+            } else {
+                debug!("Dynamic classpath: skipping non-existent entry {expanded}");
             }
-        } else if pb.extension().is_some_and(|e| e == "jmod") && pb.exists() {
-            match Self::load_jmod(&pb) {
-                Ok(entry) => self.entries.push(entry),
-                Err(e) => debug!("Dynamic classpath: failed to read JMOD {path}: {e}"),
-            }
-        } else {
-            debug!("Dynamic classpath: skipping non-existent entry {path}");
         }
     }
 
@@ -3331,5 +3437,154 @@ Implementation-Version: 999.999\n";
             "oversized value must be dropped");
         assert_eq!(info.attributes.get("Bar").map(String::as_str), Some("ok"),
             "subsequent attributes must still be captured");
+    }
+
+    // ── Classpath wildcard expansion (Elasticsearch / Cassandra parity) ──
+    //
+    // HotSpot's `java -cp lib/*` expands to every `*.jar` directly under
+    // `lib/`. Real-world launchers (Elasticsearch, Cassandra, hand-rolled
+    // `bin/foo` shell scripts) rely on this; without it `ServiceLoader`
+    // sees zero classpath entries and returns an empty iterator.
+
+    /// Build a temp dir with N JARs (valid zips, each containing a
+    /// `META-INF/services/dummy.SPI` so `find_all_resource_urls` has
+    /// something to enumerate). Returns the dir.
+    fn make_jar_dir(name: &str, jar_names: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for jar in jar_names {
+            let p = dir.join(jar);
+            let f = fs::File::create(&p).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("META-INF/services/dummy.SPI", opts).unwrap();
+            zip.write_all(b"com.example.Provider\n").unwrap();
+            zip.finish().unwrap();
+        }
+        dir
+    }
+
+    /// `dir/*` must expand to every `.jar` in the directory.
+    #[test]
+    fn wildcard_expands_dir_star_to_all_jars() {
+        let dir = make_jar_dir("rustjvm_wildcard_dir_star", &["a.jar", "b.jar", "c.jar"]);
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let cp = ClassPath::new(&[pattern]);
+        assert_eq!(cp.entry_count(), 3, "wildcard should expand to 3 jars");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// All wildcard-expanded jars must be visible to
+    /// `find_all_resource_urls` — this is the load-bearing claim for
+    /// ServiceLoader. Before the fix this returned an empty Vec because
+    /// the literal `lib/*` entry was silently dropped as a non-existent
+    /// path.
+    #[test]
+    fn wildcard_makes_every_jar_searchable_for_services() {
+        let dir = make_jar_dir(
+            "rustjvm_wildcard_services",
+            &["alpha.jar", "beta.jar", "gamma.jar"],
+        );
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let cp = ClassPath::new(&[pattern]);
+        let urls = cp.find_all_resource_urls("META-INF/services/dummy.SPI");
+        assert_eq!(
+            urls.len(),
+            3,
+            "every wildcard-expanded jar must contribute its META-INF/services entry"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Backslash form `dir\*` (Windows-style) must work identically.
+    #[test]
+    fn wildcard_accepts_backslash_form() {
+        let dir = make_jar_dir("rustjvm_wildcard_backslash", &["x.jar", "y.jar"]);
+        let pattern = format!("{}\\*", dir.to_string_lossy());
+        let cp = ClassPath::new(&[pattern]);
+        assert_eq!(cp.entry_count(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Non-jar files in the wildcard directory are ignored.
+    #[test]
+    fn wildcard_skips_non_jar_files() {
+        let dir = make_jar_dir("rustjvm_wildcard_skips_non_jar", &["good.jar"]);
+        fs::write(dir.join("README.txt"), b"hello").unwrap();
+        fs::write(dir.join("native.dll"), [0u8; 8]).unwrap();
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let cp = ClassPath::new(&[pattern]);
+        assert_eq!(cp.entry_count(), 1, "only `.jar` files must be picked up");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `*.JAR` (upper-case extension) is accepted — Windows is
+    /// case-insensitive and real-world launchers occasionally ship
+    /// `Some-Lib.JAR`.
+    #[test]
+    fn wildcard_accepts_uppercase_jar_extension() {
+        let dir = make_jar_dir("rustjvm_wildcard_uppercase", &["LIB.JAR"]);
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let cp = ClassPath::new(&[pattern]);
+        assert_eq!(cp.entry_count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `add_path` (dynamic loading via URLClassLoader / module loader)
+    /// honours the same wildcard so app servers that synthesise `lib/*`
+    /// strings at runtime benefit.
+    #[test]
+    fn wildcard_works_via_add_path() {
+        let dir = make_jar_dir("rustjvm_wildcard_add_path", &["one.jar", "two.jar"]);
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let mut cp = ClassPath::new(&[]);
+        cp.add_path(&pattern);
+        assert_eq!(cp.entry_count(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Non-wildcard entries pass through unchanged — `foo.jar` must
+    /// not be treated as a wildcard pattern (regression guard against
+    /// false-positive expansion).
+    #[test]
+    fn wildcard_passthrough_for_plain_jar() {
+        let dir = make_jar_dir("rustjvm_wildcard_passthrough", &["a.jar"]);
+        let plain = dir.join("a.jar").to_string_lossy().into_owned();
+        let cp = ClassPath::new(&[plain]);
+        assert_eq!(cp.entry_count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Wildcard pointing at a non-existent directory must silently
+    /// expand to nothing (matches `java -cp missing/*` behaviour).
+    #[test]
+    fn wildcard_missing_dir_yields_empty_classpath() {
+        let cp = ClassPath::new(&["definitely_does_not_exist_12345/*".to_string()]);
+        assert!(cp.is_empty());
+    }
+
+    /// Provider ordering must be deterministic across runs. Two
+    /// invocations on the same directory must produce the same URL
+    /// order — `ServiceLoader` clients can depend on first-match
+    /// semantics.
+    #[test]
+    fn wildcard_yields_deterministic_jar_order() {
+        let dir = make_jar_dir(
+            "rustjvm_wildcard_order",
+            &["zeta.jar", "alpha.jar", "mu.jar"],
+        );
+        let pattern = format!("{}/*", dir.to_string_lossy());
+        let cp1 = ClassPath::new(&[pattern.clone()]);
+        let cp2 = ClassPath::new(&[pattern]);
+        let urls1 = cp1.find_all_resource_urls("META-INF/services/dummy.SPI");
+        let urls2 = cp2.find_all_resource_urls("META-INF/services/dummy.SPI");
+        assert_eq!(urls1, urls2, "wildcard expansion order must be stable");
+        // Sanity: lexicographic — alpha < mu < zeta.
+        assert!(urls1[0].contains("alpha.jar"));
+        assert!(urls1[1].contains("mu.jar"));
+        assert!(urls1[2].contains("zeta.jar"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

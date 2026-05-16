@@ -31412,39 +31412,13 @@ pub(crate) fn register_pbe_workaround(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // demo: short-circuit the per-property setter dispatch entirely.
-    // Without this, applyPropertyValues collects each failing setter's
-    // exception and throws PropertyBatchUpdateException(exceptions). With
-    // it, no exception is captured, no PBE is thrown, and Spring proceeds
-    // (potentially with an under-initialized bean — accepted trade-off).
-    registry.register(
-        "org/springframework/beans/BeanWrapperImpl",
-        "setPropertyValue",
-        "(Lorg/springframework/beans/PropertyValue;)V",
-        |_ctx, _args| Ok(None),
-    );
-
-    // Also short-circuit the (String, Object) overload commonly used in older Spring:
-    registry.register(
-        "org/springframework/beans/BeanWrapperImpl",
-        "setPropertyValue",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
-
-    // And on the parent class AbstractNestablePropertyAccessor for inheritance dispatch:
-    registry.register(
-        "org/springframework/beans/AbstractNestablePropertyAccessor",
-        "setPropertyValue",
-        "(Lorg/springframework/beans/PropertyValue;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "org/springframework/beans/AbstractNestablePropertyAccessor",
-        "setPropertyValue",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // NOTE: prior iterations registered universal no-ops on
+    // BeanWrapperImpl.setPropertyValue{,s} and AbstractPropertyAccessor's
+    // setPropertyValue{,s} (with every descriptor variant). They DIDN'T fix
+    // demo's PBE (PBE forms via a path not covered) AND regressed insurance
+    // (rc=0 → rc=124 hang because Spring's bean property injection got
+    // silently skipped). Removed. Demo's PBE remains unresolved until a more
+    // targeted shim is found.
 }
 
 // =============================================================================

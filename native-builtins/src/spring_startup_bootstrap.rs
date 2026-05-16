@@ -1994,53 +1994,83 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
 
     // Class not on classpath. Remove the bean definition so Spring's
     // preInstantiateSingletons won't trip over it later.
+    //
+    // sportme's RedisHttpSessionConfiguration kept reaching the null-target
+    // crash even after this branch ran. Root cause: Spring's
+    // `preInstantiateSingletons` iterates `beanDefinitionNames` (a
+    // `List<String>`), and when `configurationFrozen=true` it actually
+    // iterates the cached `frozenBeanDefinitionNames` (a `String[]`). A
+    // successful `removeBeanDefinition` would normally invalidate that cache,
+    // but in CratonVM the orchestrator's intercepts on this method may
+    // short-circuit before Spring's cache-flush logic runs (and at any rate
+    // the bytecode's invalidation is conditional on locks/state we can't
+    // observe from here). Belt-and-braces: ALWAYS modify both the map and
+    // the list directly, AND null out the frozen-names cache so Spring is
+    // forced to rebuild it from the now-shortened list. Also strip
+    // `manualSingletonNames` in case the orphan was registered there.
     if let (Some(Value::Object(Some(factory))), Some(Value::Object(Some(name_str)))) =
         (this, bean_name_obj)
     {
-        // Try DefaultListableBeanFactory first (concrete impl); fall back to
-        // the BeanDefinitionRegistry interface descriptor.
-        let removed = ctx
-            .invoke(
-                "org/springframework/beans/factory/support/DefaultListableBeanFactory",
-                "removeBeanDefinition",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(factory)), Value::Object(Some(name_str))],
-            )
-            .is_ok()
-            || ctx
-                .invoke(
-                    "org/springframework/beans/factory/support/BeanDefinitionRegistry",
-                    "removeBeanDefinition",
-                    "(Ljava/lang/String;)V",
-                    &[Value::Object(Some(factory)), Value::Object(Some(name_str))],
-                )
-                .is_ok();
-        if !removed {
-            // Last-ditch: directly punch the bean out of the map/list fields
-            // so preInstantiateSingletons' iteration cannot land on it.
-            // DefaultListableBeanFactory.beanDefinitionNames is a List<String>;
-            // beanDefinitionMap is a Map<String, BeanDefinition>. Removing
-            // from both keeps both sides consistent.
-            if let Value::Object(Some(map)) =
-                ctx.get_field_by_name(factory, "beanDefinitionMap")
-            {
-                let _ = ctx.invoke(
-                    "java/util/Map",
-                    "remove",
-                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[Value::Object(Some(map)), Value::Object(Some(name_str))],
-                );
-            }
-            if let Value::Object(Some(list)) =
-                ctx.get_field_by_name(factory, "beanDefinitionNames")
-            {
-                let _ = ctx.invoke(
-                    "java/util/List",
-                    "remove",
-                    "(Ljava/lang/Object;)Z",
-                    &[Value::Object(Some(list)), Value::Object(Some(name_str))],
-                );
-            }
+        // 1. Best-effort high-level remove. We don't gate the low-level
+        //    cleanup on its success — both paths run unconditionally so a
+        //    silently-failing Java-side remove can't leave a stale entry.
+        let _ = ctx.invoke(
+            "org/springframework/beans/factory/support/DefaultListableBeanFactory",
+            "removeBeanDefinition",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(factory)), Value::Object(Some(name_str))],
+        );
+        let _ = ctx.invoke(
+            "org/springframework/beans/factory/support/BeanDefinitionRegistry",
+            "removeBeanDefinition",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(factory)), Value::Object(Some(name_str))],
+        );
+
+        // 2. Directly punch the bean out of `beanDefinitionMap`
+        //    (Map<String, BeanDefinition>) — preInstantiateSingletons looks
+        //    up each name in this map after iterating the names list.
+        if let Value::Object(Some(map)) = ctx.get_field_by_name(factory, "beanDefinitionMap") {
+            let _ = ctx.invoke(
+                "java/util/Map",
+                "remove",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(map)), Value::Object(Some(name_str))],
+            );
+        }
+
+        // 3. Remove from `beanDefinitionNames` (List<String>) — this is the
+        //    iteration source for preInstantiateSingletons when the
+        //    configuration isn't frozen.
+        if let Value::Object(Some(list)) = ctx.get_field_by_name(factory, "beanDefinitionNames")
+        {
+            let _ = ctx.invoke(
+                "java/util/List",
+                "remove",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Object(Some(name_str))],
+            );
+        }
+
+        // 4. Invalidate `frozenBeanDefinitionNames` (String[]). When
+        //    `configurationFrozen=true` Spring iterates this cached array
+        //    instead of the live list. Setting it to null forces the next
+        //    `getBeanDefinitionNames()` (or the freezeConfiguration call)
+        //    to rebuild from the updated `beanDefinitionNames` list.
+        ctx.set_field_by_name(factory, "frozenBeanDefinitionNames", Value::Object(None));
+
+        // 5. Also try removing from `manualSingletonNames` (a
+        //    LinkedHashSet<String>) in case the orphan was registered as a
+        //    manual singleton. Harmless no-op if the name isn't present.
+        if let Value::Object(Some(set)) =
+            ctx.get_field_by_name(factory, "manualSingletonNames")
+        {
+            let _ = ctx.invoke(
+                "java/util/Set",
+                "remove",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(set)), Value::Object(Some(name_str))],
+            );
         }
     }
 
