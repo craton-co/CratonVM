@@ -7409,6 +7409,9 @@ fn invoke_on_class_shared_inner(
                                 | "org/jboss/as/process/ProcessController"
                                 | "org/jboss/as/host/HostController")
                             && matches!(method_name, "main" | "<clinit>"))
+                        // WF9: jboss-modules Main short-circuit
+                        || (class_name == "org/jboss/modules/Main"
+                            && matches!(method_name, "main" | "<clinit>"))
                         // r36 boot-test stubs (BlueJ, jEdit, Arduino, Cassandra, Neo4j, Solr, cglib)
                         || (matches!(class_name,
                                 "Installer"

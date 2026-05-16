@@ -399,6 +399,7 @@ pub mod cassandra_extras;
 pub mod neo4j_extras;
 pub mod solr_extras;
 pub mod cglib_extras;
+pub mod wildfly_method_synth;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1396,6 +1397,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     neo4j_extras::register_neo4j_stubs(registry);
     solr_extras::register_solr_stubs(registry);
     cglib_extras::register_cglib_stubs(registry);
+    wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.

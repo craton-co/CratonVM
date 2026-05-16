@@ -199,6 +199,58 @@ pub fn register_bluej_stubs(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)V",
         |_ctx, _args| Ok(None),
     );
+
+    // Comprehensive Swing/AWT clinit + utility no-ops to stop the entire
+    // graphics subsystem from initializing on our partial bootstrap.
+    for cls in [
+        "javax/swing/SwingUtilities",
+        "javax/swing/UIManager$LookAndFeelInfo",
+        "javax/swing/UIDefaults",
+        "javax/swing/RepaintManager",
+        "javax/swing/JComponent$1",
+        "javax/swing/JComponent$KeyboardState",
+        "javax/swing/JRootPane",
+        "javax/swing/JLayeredPane",
+        "javax/swing/SystemEventQueueUtilities",
+        "java/awt/Container",
+        "java/awt/Window",
+        "java/awt/Dialog",
+        "java/awt/Cursor",
+        "java/awt/im/InputContext",
+        "java/awt/dnd/DropTarget",
+        "java/awt/datatransfer/DataFlavor",
+        "java/awt/Graphics2D",
+        "java/awt/Image",
+        "java/awt/Font",
+        "java/awt/FontMetrics",
+        "java/awt/RenderingHints",
+        "sun/awt/SunGraphicsCallback",
+    ] {
+        registry.register(cls, "<clinit>", "()V", |_ctx, _args| Ok(None));
+    }
+
+    // SwingUtilities.appContextGet returns null when called on a missing key.
+    registry.register(
+        "javax/swing/SwingUtilities",
+        "appContextGet",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    registry.register(
+        "javax/swing/SwingUtilities",
+        "appContextPut",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        |_ctx, _args| Ok(None),
+    );
+
+    // invokeLater on EventQueue — already shimmed; also EventDispatchThread:
+    registry.register(
+        "java/awt/EventDispatchThread",
+        "run",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
 }
 
 #[cfg(test)]
