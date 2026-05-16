@@ -211,6 +211,20 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static> DeviceBufferInner<T>
 
     pub(crate) fn device_ptr(&self) -> u64 {
         // CudaSlice exposes a CUdeviceptr; cast to u64 for our arg list.
+        //
+        // AUDIT 2026-05-16: cudarc 0.13's `device_ptr` returns
+        // `(CUdeviceptr, SyncRecord)` where the SyncRecord is a stream-
+        // ordering handle. Dropping it the instant we return the bare
+        // `u64` is unsafe if the buffer is freed while a launched kernel
+        // is still using the pointer — the SyncRecord is what prevents
+        // that race in cudarc's tracking. The current backend serializes
+        // launch + memcpy through `ctx.default_stream()`, which keeps
+        // operations stream-ordered, so the race is masked today. A
+        // future change that introduces multiple streams MUST plumb the
+        // SyncRecord through `KernelArgs::push_device_ptr` (e.g. as
+        // `KernelArg::DevicePtr { addr, _record }`) so the record lives
+        // as long as the launch.
+        // FIXME(audit-2026-05-16): plumb SyncRecord through KernelArgs.
         let (ptr, _record) = self.slice.device_ptr(&self.stream);
         ptr
     }

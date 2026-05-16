@@ -3,7 +3,8 @@
 //! Maps (class, method, descriptor) triples to Rust function callbacks
 //! that implement the native method behavior.
 
-use std::collections::HashMap;
+// AUDIT 2026-05-16: std::collections::HashMap is unused — the registry
+// migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -1069,6 +1070,12 @@ pub trait NativeContext {
     }
 
     /// Check if `module_name` exports `pkg` unconditionally (to all modules).
+    ///
+    /// AUDIT 2026-05-16: this default returns `true` (fail-open). That is
+    /// deliberate for classpath-mode contexts and mock contexts where no
+    /// JPMS configuration is loaded. **Production VM implementations MUST
+    /// override** this method with a real readability check; relying on
+    /// the default in a JPMS-enabled VM is a privilege-escalation hole.
     fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
         let _ = (module_name, pkg);
         true
@@ -1184,6 +1191,11 @@ pub trait NativeContext {
         _target_class_id: ClassId,
     ) -> Result<(), String> {
         // Default: allow (classpath-only mode, or VM without JPMS configured).
+        //
+        // AUDIT 2026-05-16: fail-open by design for mock contexts; the
+        // production VM **MUST** override this with a real
+        // module-readability + opens check. Relying on the default in a
+        // JPMS-enabled VM allows arbitrary cross-module `setAccessible`.
         Ok(())
     }
 

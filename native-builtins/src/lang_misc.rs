@@ -998,7 +998,11 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         // InternalError and NoSuchMethodError wrappers). Register all common
         // ctor descriptors here so both synthetic and real-JDK flows can
         // initialize message/cause consistently.
-        r.register(cls, "<init>", "()V", crate::native_noop_with_this);
+        // audit-2026-05-16: previously this registered the generic
+        // `native_noop_with_this`, which left `cause` un-initialised; the
+        // (String) ctor uses the JDK sentinel `cause = this`, so a later
+        // `initCause()` succeeded for (String) ctors but failed for noargs.
+        r.register(cls, "<init>", "()V", native_exc_init_noargs);
         r.register(
             cls,
             "<init>",

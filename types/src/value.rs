@@ -4,10 +4,13 @@ use std::fmt;
 ///
 /// Represents any value that can be stored in a local variable or on the operand stack.
 /// The JVM specification defines computational types that map to these variants.
+///
+/// **Layout invariant:** this enum is compile-time asserted below to be
+/// exactly 16 bytes with alignment ≤ 8 on x86-64 / AArch64.  Adding `repr(C)`
+/// would change size to 24 bytes and break JIT slot layout.  The static
+/// asserts at the bottom of this file own the invariant; the `jit` crate
+/// replicates them as belt-and-suspenders.
 #[derive(Debug, Clone, Copy, PartialEq)]
-// Note: layout is verified at compile time (16 bytes on x86-64) via static assert in jit/src/lib.rs.
-// Adding repr(C) would change size to 24 bytes and break JIT. The current Rust default
-// layout is stable for this enum shape on x86-64 and is validated by the static assert.
 pub enum Value {
     /// A 32-bit integer (also used for boolean, byte, char, short).
     Int(i32),
@@ -194,16 +197,26 @@ pub fn decode_value(val: u64, tag: u8) -> Value {
         VTAG_OBJECT => {
             let ptr = val as *mut u8;
             // T14: Gracefully handle corrupted or zero-initialized slots
-            // that have VTAG_OBJECT but invalid pointer values.  This can
-            // happen when a non-reference field is read via Unsafe reference
-            // accessors, or during bootstrap when fields haven't been
-            // properly initialized yet.
+            // that have VTAG_OBJECT but invalid pointer values in release
+            // builds.  In debug builds we panic via `debug_assert!(false, ...)`
+            // so tests catch the underlying bug (writing non-reference bits
+            // through a reference accessor) instead of silent degradation.
             if ptr.is_null() {
+                debug_assert!(
+                    false,
+                    "decode_value: VTAG_OBJECT with null pointer — likely a non-reference bit pattern \
+                     written through a reference accessor; degrading to Object(None) in release"
+                );
                 Value::Object(None)
             } else if (ptr as usize) % 8 != 0 {
                 // KC16 SIGSEGV audit: unaligned-but-nonzero pointers are
-                // treated as null rather than crashing.  Silent to avoid
-                // stderr pollution on hot read paths.
+                // treated as null in release rather than crashing; debug
+                // builds panic so the underlying bug surfaces.
+                debug_assert!(
+                    false,
+                    "decode_value: VTAG_OBJECT with unaligned pointer {ptr:p} — likely a non-reference \
+                     bit pattern written through a reference accessor; degrading to Object(None) in release"
+                );
                 Value::Object(None)
             } else {
                 Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
@@ -240,6 +253,28 @@ pub fn jlong_bits_as_aligned_object_ptr(bits: u64) -> Option<usize> {
         None
     }
 }
+
+// ---------------------------------------------------------------------------
+// Layout invariants (owned by `types` since `Value` is defined here)
+// ---------------------------------------------------------------------------
+//
+// The JIT slot layout depends on `Value` being exactly 16 bytes with align ≤ 8
+// and on `ObjectRef` being pointer-sized.  These asserts live here (alongside
+// the type definitions) so the invariant is owned by the crate that owns the
+// types.  The `jit` crate replicates the same asserts as belt-and-suspenders
+// so a JIT-only platform-port still fails to compile if the layout drifts.
+const _: () = assert!(
+    std::mem::size_of::<Value>() == 16,
+    "Value must be exactly 16 bytes (JIT slot layout depends on this)"
+);
+const _: () = assert!(
+    std::mem::align_of::<Value>() <= 8,
+    "Value alignment must not exceed 8 bytes"
+);
+const _: () = assert!(
+    std::mem::size_of::<ObjectRef>() == std::mem::size_of::<*mut u8>(),
+    "ObjectRef must be pointer-sized"
+);
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

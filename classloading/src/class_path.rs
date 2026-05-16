@@ -1,6 +1,6 @@
 use rustjvm_types::error::ClassFileError;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,12 @@ enum ClassPathEntry {
         archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
         /// True if the JAR declares `Multi-Release: true` in its manifest (JEP 238).
         multi_release: bool,
+        /// Audit-fix #7: cached set of `META-INF/versions/<N>/` directory
+        /// numbers present in this archive. Built lazily on first
+        /// multi-release lookup so subsequent lookups skip
+        /// `by_name` probes for absent versions. `None` means the
+        /// cache hasn't been built yet.
+        versions_cache: Mutex<Option<BTreeSet<u32>>>,
     },
     /// A virtual directory inside a fat JAR (e.g. `BOOT-INF/classes/`).
     /// Entries are stored as a map from relative path to byte content.
@@ -334,17 +340,128 @@ impl ManifestInfo {
 /// `META-INF/versions/{N}/` entries descending from this version down to 9.
 const MULTI_RELEASE_MAX_VERSION: u32 = 25;
 
+/// Compile-time JVM feature version this build implements. `Runtime.version()
+/// .feature()` returns this value to user code. Used to bound the
+/// multi-release JAR shadow-search range so an attacker can't smuggle a
+/// `META-INF/versions/<future-N>/java/lang/String.class` past the JVM by
+/// targeting a version we haven't been compiled to honor.
+const JVM_FEATURE_VERSION: u32 = MULTI_RELEASE_MAX_VERSION;
+
+/// Audit-fix #2: zip-bomb cap. Maximum uncompressed bytes we will
+/// `Vec::with_capacity` for a single ZIP entry. The declared `size` field
+/// in the central directory is attacker-controlled and can be up to
+/// `u64::MAX`; without this clamp a malicious JAR triggers a multi-GiB
+/// allocation before any decompression even starts. 512 MiB is well
+/// above any legitimate single class file or resource and matches the
+/// upper bound JDK 21+'s `ZipInputStream` uses internally.
+pub(crate) const MAX_UNCOMPRESSED_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Clamp a ZIP entry's declared `size()` to [`MAX_UNCOMPRESSED_ENTRY_BYTES`]
+/// for `Vec::with_capacity`. Returns the clamped capacity as `usize`.
+#[inline]
+fn safe_with_capacity(declared_size: u64) -> usize {
+    declared_size.min(MAX_UNCOMPRESSED_ENTRY_BYTES) as usize
+}
+
+/// Audit-fix #3: reject zip-slip-style entry names so attacker-controlled
+/// ZIP entries cannot poison in-memory resource caches. Validates against
+/// path-escape, absolute paths, NUL bytes, Windows drive letters, and
+/// the alternate Windows separator. Returns `false` for any name we
+/// refuse to cache.
+pub(crate) fn is_safe_entry_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.contains('\0') {
+        return false;
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return false;
+    }
+    if name.contains(':') {
+        return false; // Windows drive letters: `C:\...`
+    }
+    if name.contains('\\') {
+        // ZIP spec mandates `/` as separator; backslash is suspicious
+        // and on Windows would create an alternate path interpretation.
+        return false;
+    }
+    // Reject any path component equal to `..` (path escape) or `.`
+    // (no-op components that obscure traversal).
+    for component in name.split('/') {
+        if component == ".." || component == "." {
+            return false;
+        }
+    }
+    true
+}
+
 impl ClassPath {
+    /// Audit-fix #7: build (once) the set of `META-INF/versions/<N>/`
+    /// numbers actually present in `archive`. Subsequent multi-release
+    /// lookups iterate only over this set, skipping the per-class
+    /// `by_name` probes the previous implementation paid for every
+    /// absent version.
+    fn ensure_versions_cache(
+        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        versions_cache: &Mutex<Option<BTreeSet<u32>>>,
+    ) -> BTreeSet<u32> {
+        // Fast-path under the lock; clone-out is cheap for a set of
+        // <= ~20 small integers.
+        {
+            let guard = versions_cache.lock();
+            if let Some(cache) = guard.as_ref() {
+                return cache.clone();
+            }
+        }
+        // Build by scanning the central directory once.
+        let mut set: BTreeSet<u32> = BTreeSet::new();
+        {
+            let mut archive_guard = archive.lock();
+            for i in 0..archive_guard.len() {
+                let name = match archive_guard.by_index_raw(i) {
+                    Ok(e) => e.name().to_string(),
+                    Err(_) => continue,
+                };
+                if let Some(rest) = name.strip_prefix("META-INF/versions/") {
+                    if let Some(slash_idx) = rest.find('/') {
+                        let ver_str = &rest[..slash_idx];
+                        if let Ok(ver) = ver_str.parse::<u32>() {
+                            set.insert(ver);
+                        }
+                    }
+                }
+            }
+        }
+        let mut guard = versions_cache.lock();
+        *guard = Some(set.clone());
+        set
+    }
+
     /// Look up an entry in a multi-release JAR archive.
     ///
-    /// Checks `META-INF/versions/{N}/{name}` for N descending from
-    /// `MULTI_RELEASE_MAX_VERSION` down to 9, returning the first match.
-    /// Falls back to the base entry if no versioned entry is found.
+    /// Audit-fix #4 (multi-release shadow attack): the version-search
+    /// upper bound is now [`JVM_FEATURE_VERSION`] (the actual feature
+    /// version this VM implements), NOT a fixed-25 constant. A JAR
+    /// that ships a `META-INF/versions/99/java/lang/String.class` can
+    /// no longer shadow the base entry when the running JVM doesn't
+    /// claim version 99.
+    ///
+    /// Audit-fix #7 (perf): we consult the cached per-archive
+    /// versions set (built lazily on first lookup) and only probe
+    /// versions actually present in the archive, eliminating the
+    /// per-class 17 `by_name` round-trips.
     fn find_in_multi_release_archive(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        versions_cache: &Mutex<Option<BTreeSet<u32>>>,
         name: &str,
     ) -> Option<Vec<u8>> {
-        for ver in (9..=MULTI_RELEASE_MAX_VERSION).rev() {
+        let present = Self::ensure_versions_cache(archive, versions_cache);
+        // Search descending so the highest-supported version wins,
+        // but only over versions that ACTUALLY exist in this archive
+        // AND that are ≤ this runtime's feature version.
+        let max = JVM_FEATURE_VERSION;
+        for &ver in present.range(9..=max).rev() {
             let versioned = format!("META-INF/versions/{ver}/{name}");
             if let Some(data) = Self::find_in_archive(archive, &versioned) {
                 return Some(data);
@@ -452,6 +569,7 @@ impl ClassPath {
                         path: path.to_path_buf(),
                         archive: Mutex::new(reloaded),
                         multi_release: mr,
+                        versions_cache: Mutex::new(None),
                     });
                 } else {
                     let mr = manifest.multi_release;
@@ -460,6 +578,7 @@ impl ClassPath {
                         path: path.to_path_buf(),
                         archive: Mutex::new(archive),
                         multi_release: mr,
+                        versions_cache: Mutex::new(None),
                     });
                 }
             }
@@ -474,7 +593,8 @@ impl ClassPath {
         let result = archive
             .by_name("META-INF/MANIFEST.MF")
             .and_then(|mut entry| {
-                let mut data = Vec::with_capacity(entry.size() as usize);
+                // Audit-fix #2: clamp attacker-controlled declared size.
+                let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
                 entry.read_to_end(&mut data)?;
                 Ok(data)
             });
@@ -544,11 +664,28 @@ impl ClassPath {
                 Err(_) => continue,
             };
 
+            // Audit-fix #3 (zip-slip): refuse to cache any entry whose
+            // name escapes the JAR root, contains NUL bytes, uses
+            // absolute paths, or smuggles a Windows drive letter.
+            // In-memory caches alone do not write to disk, but a
+            // poisoned cache namespace (`../etc/passwd`) lets the
+            // attacker collide on lookup keys that legitimate code
+            // might subsequently use.
+            if !is_safe_entry_name(&name) {
+                debug!(
+                    "Fat JAR {}: rejecting unsafe entry name {name:?}",
+                    path.display()
+                );
+                continue;
+            }
+
             if name.starts_with(&classes_prefix) && name.len() > classes_prefix.len() {
                 let relative = &name[classes_prefix.len()..];
-                if !relative.is_empty() && !relative.ends_with('/') {
+                if !relative.is_empty() && !relative.ends_with('/') && is_safe_entry_name(relative)
+                {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        let mut data = Vec::with_capacity(entry.size() as usize);
+                        // Audit-fix #2: clamp zip-bomb declared size.
+                        let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
                         if entry.read_to_end(&mut data).is_ok() {
                             classes_cache.insert(relative.to_string(), data);
                         }
@@ -557,9 +694,11 @@ impl ClassPath {
             } else if name.starts_with(war_classes_prefix) && name.len() > war_classes_prefix.len()
             {
                 let relative = &name[war_classes_prefix.len()..];
-                if !relative.is_empty() && !relative.ends_with('/') {
+                if !relative.is_empty() && !relative.ends_with('/') && is_safe_entry_name(relative)
+                {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        let mut data = Vec::with_capacity(entry.size() as usize);
+                        // Audit-fix #2: clamp zip-bomb declared size.
+                        let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
                         if entry.read_to_end(&mut data).is_ok() {
                             classes_cache.insert(relative.to_string(), data);
                         }
@@ -591,7 +730,8 @@ impl ClassPath {
         let mut nested_count = 0;
         for jar_name in &nested_jar_names {
             if let Ok(mut entry) = archive.by_name(jar_name) {
-                let mut jar_data = Vec::with_capacity(entry.size() as usize);
+                // Audit-fix #2: clamp zip-bomb declared size.
+                let mut jar_data = Vec::with_capacity(safe_with_capacity(entry.size()));
                 if entry.read_to_end(&mut jar_data).is_ok() {
                     let cursor = Cursor::new(jar_data);
                     match ZipArchive::new(cursor) {
@@ -720,21 +860,43 @@ impl ClassPath {
                 ClassPathEntry::Directory(dir) => {
                     let full_path = dir.join(Path::new(&relative_path));
                     if full_path.exists() {
-                        // Canonicalize and verify the resolved path is under the classpath root.
-                        // This catches symlink-based traversal that string checks miss.
-                        if let (Ok(canon_dir), Ok(canon_path)) =
-                            (fs::canonicalize(dir), fs::canonicalize(&full_path))
-                        {
-                            if !canon_path.starts_with(&canon_dir) {
-                                debug!(
-                                    "Path traversal blocked: {} escapes {}",
-                                    canon_path.display(),
-                                    canon_dir.display()
-                                );
-                                return Err(ClassFileError::ClassNotFound {
-                                    class_name: class_name.to_string(),
-                                });
+                        // Audit-fix #5: symlink-traversal check is now
+                        // fail-CLOSED. If we cannot canonicalize either
+                        // the classpath root or the resolved file we
+                        // refuse to read — silently proceeding allowed
+                        // a symlinked `Object.class -> /etc/passwd` to
+                        // be served as classfile bytes.
+                        let canon_dir = fs::canonicalize(dir).map_err(|e| {
+                            debug!(
+                                "Refusing to load {class_name}: cannot canonicalize \
+                                 classpath root {}: {e}",
+                                dir.display()
+                            );
+                            ClassFileError::IoError {
+                                class_name: class_name.to_string(),
+                                source: e,
                             }
+                        })?;
+                        let canon_path = fs::canonicalize(&full_path).map_err(|e| {
+                            debug!(
+                                "Refusing to load {class_name}: cannot canonicalize \
+                                 resolved path {}: {e}",
+                                full_path.display()
+                            );
+                            ClassFileError::IoError {
+                                class_name: class_name.to_string(),
+                                source: e,
+                            }
+                        })?;
+                        if !canon_path.starts_with(&canon_dir) {
+                            debug!(
+                                "Path traversal blocked: {} escapes {}",
+                                canon_path.display(),
+                                canon_dir.display()
+                            );
+                            return Err(ClassFileError::ClassNotFound {
+                                class_name: class_name.to_string(),
+                            });
                         }
                         debug!("Found class {class_name} at {}", full_path.display());
                         return fs::read(&full_path).map_err(|e| ClassFileError::IoError {
@@ -743,9 +905,9 @@ impl ClassPath {
                         });
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, .. } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, &relative_path)
+                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path)
                     } else {
                         Self::find_in_archive(archive, &relative_path)
                     };
@@ -831,7 +993,19 @@ impl ClassPath {
     /// absolute path (not wrapped in `jar:!/`).  For JMOD/jimage modules,
     /// returns `None` — JDK internals aren't user-visible code.
     pub fn find_class_source_path(&self, class_name: &str) -> Option<String> {
-        if class_name.contains("..") || class_name.starts_with('/') || class_name.contains('\0') {
+        // Audit-fix #6: match `find_class`'s full validation set (NUL
+        // bytes, leading slash, backslash, drive letter, dot-dot,
+        // relative-dir prefixes). The previous truncated check let
+        // `..\\Object` or `C:\Foo` reach the JAR-name lookups below.
+        if class_name.contains("..")
+            || class_name.starts_with('/')
+            || class_name.starts_with('\\')
+            || class_name.contains("\\\\")
+            || class_name.contains('\0')
+            || class_name.contains(':')
+            || class_name.contains("./")
+            || class_name.contains(".\\")
+        {
             return None;
         }
         let relative_path = format!("{}.class", class_name);
@@ -845,9 +1019,9 @@ impl ClassPath {
                         );
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, path } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, &relative_path).is_some()
+                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path).is_some()
                     } else {
                         Self::find_in_archive(archive, &relative_path).is_some()
                     };
@@ -926,9 +1100,9 @@ impl ClassPath {
                         return Some((format!("file:/{p}/"), Vec::new()));
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, path } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, &relative_path).is_some()
+                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path).is_some()
                     } else {
                         Self::find_in_archive(archive, &relative_path).is_some()
                     };
@@ -978,6 +1152,14 @@ impl ClassPath {
         let names: Vec<String> = (0..guard.len())
             .filter_map(|i| guard.by_index_raw(i).ok().map(|e| e.name().to_string()))
             .filter(|n| {
+                // Audit-fix #3 (zip-slip): refuse to treat traversal /
+                // absolute-path entry names as signer blocks. A
+                // malicious JAR could otherwise smuggle a signature
+                // block under `../META-INF/key.RSA` that gets attached
+                // to the wrong CodeSource.
+                if !is_safe_entry_name(n) {
+                    return false;
+                }
                 let upper = n.to_ascii_uppercase();
                 upper.starts_with("META-INF/")
                     && (upper.ends_with(".RSA")
@@ -987,7 +1169,8 @@ impl ClassPath {
             .collect();
         for name in names {
             if let Ok(mut entry) = guard.by_name(&name) {
-                let mut data = Vec::with_capacity(entry.size() as usize);
+                // Audit-fix #2: clamp zip-bomb declared size.
+                let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
                 if entry.read_to_end(&mut data).is_ok() && !data.is_empty() {
                     out.push(data);
                 }
@@ -1032,9 +1215,9 @@ impl ClassPath {
                         }
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, .. } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, name)
+                        Self::find_in_multi_release_archive(archive, versions_cache, name)
                     } else {
                         Self::find_in_archive(archive, name)
                     };
@@ -1162,9 +1345,9 @@ impl ClassPath {
                         out.push(bytes);
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, .. } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
                     let bytes = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, name)
+                        Self::find_in_multi_release_archive(archive, versions_cache, name)
                     } else {
                         Self::find_in_archive(archive, name)
                     };
@@ -1248,9 +1431,9 @@ impl ClassPath {
                         urls.push(format!("file:/{p}"));
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, path } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, name).is_some()
+                        Self::find_in_multi_release_archive(archive, versions_cache, name).is_some()
                     } else {
                         Self::find_in_archive(archive, name).is_some()
                     };
@@ -1341,9 +1524,9 @@ impl ClassPath {
                         results.push(data);
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, .. } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, "module-info.class")
+                        Self::find_in_multi_release_archive(archive, versions_cache, "module-info.class")
                     } else {
                         Self::find_in_archive(archive, "module-info.class")
                     };

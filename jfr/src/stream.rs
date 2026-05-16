@@ -8,7 +8,7 @@
 //! - A set of event type filters (only those types are delivered)
 //! - One or more callbacks that are invoked for each matching event
 
-use std::collections::HashSet;
+// AUDIT 2026-05-16: std HashSet unused (replaced by FxHashSet below).
 
 use rustc_hash::FxHashSet;
 

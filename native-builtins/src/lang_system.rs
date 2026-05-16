@@ -113,8 +113,47 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
         return Ok(None);
     }
 
-    // Handle overlapping copy (same array)
+    // Primitive element-type compatibility check.
+    //
+    // FIXME(audit-2026-05-16): For *reference* arrays, JLS / `java.lang.System.arraycopy`
+    // requires a per-element assignability check between each source element's
+    // runtime class and the destination array's component class, throwing
+    // `ArrayStoreException` at the first incompatible element and copying
+    // every element *before* the offending one. We currently approximate
+    // this by checking the primitive element-type matches — that catches
+    // primitive-vs-reference and primitive-of-different-kind mismatches but
+    // misses per-element refinement for reference arrays. A proper fix
+    // needs `NativeContext::is_assignable(elem_class, dest_component_class)`
+    // or `NativeContext::array_component_class(arr) -> ClassId`, neither of
+    // which exists today (cross-crate change).
+    let src_elem = ctx.heap_element_type_of(src);
+    let dest_elem = ctx.heap_element_type_of(dest);
+    if src_elem != dest_elem {
+        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+            message: format!(
+                "arraycopy: incompatible array element types (src={:?}, dest={:?})",
+                src_elem, dest_elem
+            ),
+        }
+        .into());
+    }
+
+    // Handle overlapping copy (same array).
+    //
+    // Note (audit-2026-05-16): the pointer-equality check below is correct
+    // only because `ObjectRef` is a single-representation wrapper. If
+    // `ObjectRef` ever grows multiple in-memory representations (compressed
+    // oops, tagged pointers), this comparison must move to a canonicalising
+    // helper.
     let same_array = src.as_ptr() == dest.as_ptr();
+
+    // TODO(audit-2026-05-16): replace this per-element loop with a bulk
+    // intrinsic when `NativeContext` exposes one (e.g.
+    // `bulk_array_copy(src, src_pos, dst, dst_pos, len)`). For large
+    // primitive arrays the per-element trip through the trait object is
+    // the single biggest perf win in this crate. Adding the intrinsic is
+    // a cross-crate change (touches `native-api` + `vm`), so it is not
+    // done here — only the call site is marked.
     if same_array && src_pos < dest_pos {
         // Copy backward to handle overlap
         for i in (0..length).rev() {

@@ -13218,53 +13218,87 @@ mod unsafe_arena {
             self.read::<1>(addr).map(|b| b[0]).unwrap_or(0)
         }
 
-        pub(super) fn put_byte(&self, addr: i64, v: u8) {
-            self.write::<1>(addr, &[v]);
+        pub(super) fn put_byte(&self, addr: i64, v: u8) -> bool {
+            self.write::<1>(addr, &[v])
         }
 
         pub(super) fn get_short(&self, addr: i64) -> i16 {
             i16::from_le_bytes(self.read::<2>(addr).unwrap_or([0; 2]))
         }
 
-        pub(super) fn put_short(&self, addr: i64, v: i16) {
-            self.write::<2>(addr, &v.to_le_bytes());
+        pub(super) fn put_short(&self, addr: i64, v: i16) -> bool {
+            self.write::<2>(addr, &v.to_le_bytes())
         }
 
         pub(super) fn get_int(&self, addr: i64) -> i32 {
             i32::from_le_bytes(self.read::<4>(addr).unwrap_or([0; 4]))
         }
 
-        pub(super) fn put_int(&self, addr: i64, v: i32) {
-            self.write::<4>(addr, &v.to_le_bytes());
+        pub(super) fn put_int(&self, addr: i64, v: i32) -> bool {
+            self.write::<4>(addr, &v.to_le_bytes())
         }
 
         pub(super) fn get_long(&self, addr: i64) -> i64 {
             i64::from_le_bytes(self.read::<8>(addr).unwrap_or([0; 8]))
         }
 
-        pub(super) fn put_long(&self, addr: i64, v: i64) {
-            self.write::<8>(addr, &v.to_le_bytes());
+        pub(super) fn put_long(&self, addr: i64, v: i64) -> bool {
+            self.write::<8>(addr, &v.to_le_bytes())
+        }
+
+        // audit-2026-05-16: find the arena whose `[base, base+size)`
+        // contains `addr`. The previous impl looked up `addr` as the
+        // HashMap key directly, which only succeeded at offset 0.
+        fn locate(inner: &HashMap<i64, Arena>, addr: i64) -> Option<(i64, usize)> {
+            if let Some(arena) = inner.get(&addr) {
+                if !arena.bytes.is_empty() {
+                    return Some((addr, 0));
+                }
+            }
+            for (&base, arena) in inner.iter() {
+                if addr < base { continue; }
+                let offset = (addr - base) as u64;
+                if offset < arena.bytes.len() as u64 {
+                    return Some((base, offset as usize));
+                }
+            }
+            None
         }
 
         fn read<const N: usize>(&self, addr: i64) -> Option<[u8; N]> {
             let inner = self.inner.read();
-            let arena = inner.get(&addr)?;
-            if arena.bytes.len() < N {
+            let (base, offset) = Self::locate(&inner, addr)?;
+            let arena = inner.get(&base)?;
+            let end = offset.checked_add(N)?;
+            if end > arena.bytes.len() {
                 return None;
             }
             let mut buf = [0u8; N];
-            buf.copy_from_slice(&arena.bytes[..N]);
+            buf.copy_from_slice(&arena.bytes[offset..end]);
             Some(buf)
         }
 
-        fn write<const N: usize>(&self, addr: i64, data: &[u8; N]) {
+        /// audit-2026-05-16: returns `true` on success, `false` on
+        /// out-of-bounds (do NOT silently grow the arena).
+        fn write<const N: usize>(&self, addr: i64, data: &[u8; N]) -> bool {
             let mut inner = self.inner.write();
-            if let Some(arena) = inner.get_mut(&addr) {
-                if arena.bytes.len() < N {
-                    arena.bytes.resize(N, 0);
-                }
-                arena.bytes[..N].copy_from_slice(data);
+            let (base, offset) = match Self::locate(&inner, addr) {
+                Some(v) => v,
+                None => return false,
+            };
+            let arena = match inner.get_mut(&base) {
+                Some(a) => a,
+                None => return false,
+            };
+            let end = match offset.checked_add(N) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > arena.bytes.len() {
+                return false;
             }
+            arena.bytes[offset..end].copy_from_slice(data);
+            true
         }
     }
 
@@ -13313,32 +13347,35 @@ pub(crate) fn unsafe_arena_get_byte(addr: i64) -> u8 {
     unsafe_arena::store().get_byte(addr)
 }
 
-pub(crate) fn unsafe_arena_put_byte(addr: i64, v: u8) {
-    unsafe_arena::store().put_byte(addr, v);
+/// audit-2026-05-16: returns `true` on success, `false` when the write
+/// would extend the arena past its original size. Java natives map `false`
+/// to `IllegalArgumentException`.
+pub(crate) fn unsafe_arena_put_byte(addr: i64, v: u8) -> bool {
+    unsafe_arena::store().put_byte(addr, v)
 }
 
 pub(crate) fn unsafe_arena_get_short(addr: i64) -> i16 {
     unsafe_arena::store().get_short(addr)
 }
 
-pub(crate) fn unsafe_arena_put_short(addr: i64, v: i16) {
-    unsafe_arena::store().put_short(addr, v);
+pub(crate) fn unsafe_arena_put_short(addr: i64, v: i16) -> bool {
+    unsafe_arena::store().put_short(addr, v)
 }
 
 pub(crate) fn unsafe_arena_get_int(addr: i64) -> i32 {
     unsafe_arena::store().get_int(addr)
 }
 
-pub(crate) fn unsafe_arena_put_int(addr: i64, v: i32) {
-    unsafe_arena::store().put_int(addr, v);
+pub(crate) fn unsafe_arena_put_int(addr: i64, v: i32) -> bool {
+    unsafe_arena::store().put_int(addr, v)
 }
 
 pub(crate) fn unsafe_arena_get_long(addr: i64) -> i64 {
     unsafe_arena::store().get_long(addr)
 }
 
-pub(crate) fn unsafe_arena_put_long(addr: i64, v: i64) {
-    unsafe_arena::store().put_long(addr, v);
+pub(crate) fn unsafe_arena_put_long(addr: i64, v: i64) -> bool {
+    unsafe_arena::store().put_long(addr, v)
 }
 
 pub(crate) fn unsafe_cleaner_mark(addr: usize) -> bool {

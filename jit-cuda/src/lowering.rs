@@ -456,15 +456,54 @@ mod tests {
 
     #[test]
     fn straight_line_method_lowers_without_loop() {
-        // Use the constructor `<init>` of EligibleVectorAdd: it has no
-        // backward branch, just aload_0; invokespecial; return. The
-        // invokespecial is rejected by the analyzer, so we can't take
-        // the analyze-then-lower path. Instead, drive detect_loop
-        // directly and verify StraightLine classification.
-        //
-        // Bytecode for "iconst_0; ireturn" — straight line.
-        let bytes = vec![0x03, 0xAC];
-        let shape = super::loop_recog::detect_loop(&bytes).unwrap();
+        // AUDIT 2026-05-16: replaced the synthetic `vec![0x03, 0xAC]`
+        // (which violated the "no synthetic bytecode" rule in
+        // `test_support.rs:7-8`) with a real fixture compiled from
+        // `test_classes/gpu/EligibleStraightLine.java` whose body is
+        // `iconst_0; ireturn`.
+        let method = load_method("EligibleStraightLine", "constReturn", "()I");
+        let code = method.code().expect("constReturn has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code).unwrap();
         assert!(matches!(shape, super::loop_recog::LoopShape::StraightLine));
+    }
+
+    // AUDIT 2026-05-16: `frem`/`drem` previously emitted a non-existent
+    // `rem.f32`/`rem.f64` PTX mnemonic that ptxas rejects on every
+    // kernel. The fix routes both through `LoweringError::UnsupportedNode`
+    // so the analyzer skips the method entirely. These two tests pin the
+    // behavior so the bug cannot regress.
+
+    #[test]
+    fn frem_is_rejected_by_lowering() {
+        let method = load_method("FloatRemainder", "fremScalar", "(FF)F");
+        // `fremScalar` is a straight-line method — analyze decides it is
+        // eligible. Lowering must then reject `frem` (0x72).
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected FloatRemainder.fremScalar to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("FloatRemainder", &method, &sig, 7, 0)
+            .expect_err("frem must not lower (PTX has no rem.f32)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("frem"),
+            "expected error message to mention 'frem', got: {msg}",
+        );
+    }
+
+    #[test]
+    fn drem_is_rejected_by_lowering() {
+        let method = load_method("FloatRemainder", "dremScalar", "(DD)D");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected FloatRemainder.dremScalar to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("FloatRemainder", &method, &sig, 7, 0)
+            .expect_err("drem must not lower (PTX has no rem.f64)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("drem"),
+            "expected error message to mention 'drem', got: {msg}",
+        );
     }
 }

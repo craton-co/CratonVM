@@ -21,7 +21,11 @@ pub struct LoweredKernel {
     pub kernel_name: String,
 }
 
+// AUDIT 2026-05-16: marked `#[non_exhaustive]` so adding variants
+// in future (e.g. `Truncated`, `IntegerOverflow`) is not a breaking
+// change for downstream pattern-matching code.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoweringError {
     Unsupported(&'static str),
     Internal(String),
