@@ -202,7 +202,7 @@ See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarki
 See [docs/INSTALL.md](docs/INSTALL.md) for binary installation and getting started.
 See [docs/CONFIG.md](docs/CONFIG.md) for all configuration options and tuning parameters.
 See [docs/ROADMAP.md](docs/ROADMAP.md) for future plans and the performance roadmap.
-See [docs/gpu/cuda-oxide-evaluation.md](docs/gpu/cuda-oxide-evaluation.md) for the evaluation of [cuda-oxide](https://nvlabs.github.io/cuda-oxide/) and how the GPU-offload backend is wired (cudarc runtime, in-tree PTX emitter, `GpuLowering` trait seam).
+See [docs/gpu/README.md](docs/gpu/README.md) for the full GPU-offload reference: build modes, CLI flags, architecture, file index, FAQ. The feature is opt-in via Cargo features — the default `cargo build` produces a CPU-only JVM with no GPU code linked.
 
 ## Contributing
 
