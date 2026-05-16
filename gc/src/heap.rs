@@ -52,6 +52,39 @@ pub struct Heap {
     to_space: Mutex<Arena>,
     next_hash_code: AtomicI32,
     gc_threshold: usize,
+
+    // ---- GPU-offload coordination (Part F) --------------------------------
+    //
+    // These fields exist ONLY when the `gpu-offload` Cargo feature is on. They
+    // hold the live-token counter and the pinned-ObjectRef set described in
+    // [crate::safepoint]. With the feature off the struct has the same shape
+    // as before the GPU work.
+    /// Number of [`crate::safepoint::SafepointToken`]s currently alive on
+    /// this heap. While non-zero, `collect_garbage` and
+    /// `collect_garbage_with_finalizers` spin-yield instead of running a
+    /// collection. Tokens increment on construction and decrement on
+    /// drop; the counter is the sole gate.
+    #[cfg(feature = "gpu-offload")]
+    pub(crate) gpu_critical_count: std::sync::atomic::AtomicU32,
+
+    /// Object refs currently being marshalled to or from the GPU. These
+    /// are walked as additional GC roots so that even between kernel
+    /// launches (when no token is alive) the underlying JVM arrays stay
+    /// reachable for any pending re-use.
+    ///
+    /// Uses `parking_lot::Mutex` to match every other mutex in this struct.
+    /// `HashSet` so a pin/unpin pair is idempotent and order-independent.
+    /// Test-only counter for tests that observe "did the GC actually skip
+    /// because of the token?" without instrumenting the call path.
+    #[cfg(feature = "gpu-offload")]
+    pub(crate) gpu_pinned_refs: parking_lot::Mutex<std::collections::HashSet<ObjectRef>>,
+
+    /// Number of times `collect_garbage` (or its finalizer variant) was
+    /// asked to run but found `gpu_critical_count != 0` and bailed out.
+    /// Exposed via [`Heap::gpu_blocked_gc_count`] so tests can assert
+    /// "the GC saw the token and stepped aside" without timing tricks.
+    #[cfg(feature = "gpu-offload")]
+    pub(crate) gpu_blocked_gc_count: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: `Heap` contains only `Mutex<Arena>` (which is Send+Sync), an
@@ -83,6 +116,13 @@ impl Heap {
             to_space: Mutex::new(Arena::new(half)),
             next_hash_code: AtomicI32::new(1),
             gc_threshold: threshold,
+
+            #[cfg(feature = "gpu-offload")]
+            gpu_critical_count: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "gpu-offload")]
+            gpu_pinned_refs: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(feature = "gpu-offload")]
+            gpu_blocked_gc_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -599,9 +639,57 @@ impl Heap {
         roots: &mut [ObjectRef],
         monitors: &dyn crate::collector::MonitorCleanup,
     ) -> crate::gc::GcResult {
+        // Part F: if a GPU critical section is active, spin-yield until it
+        // ends before grabbing the arena locks. Gated to keep the default
+        // feature build byte-identical to before.
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.wait_for_gpu_critical();
+        }
+
         let mut from = self.from_space.lock();
         let mut to = self.to_space.lock();
 
+        // Part F: walk pinned refs as additional roots. We splice them onto
+        // a combined buffer, run the collector, then copy the updated
+        // ObjectRefs back into both the caller's slice and the pinned-refs
+        // set so the next pin/unpin sees post-GC addresses. The combined
+        // buffer is feature-gated; with the feature off we hand `roots`
+        // straight through, byte-identical to before.
+        #[cfg(feature = "gpu-offload")]
+        let result = {
+            let pinned_snapshot: Vec<ObjectRef> = {
+                let guard = self.gpu_pinned_refs.lock();
+                guard.iter().copied().collect()
+            };
+
+            if pinned_snapshot.is_empty() {
+                crate::gc::collect(&mut from, &mut to, roots)
+            } else {
+                let caller_len = roots.len();
+                let mut combined: Vec<ObjectRef> =
+                    Vec::with_capacity(caller_len + pinned_snapshot.len());
+                combined.extend_from_slice(roots);
+                combined.extend_from_slice(&pinned_snapshot);
+
+                let result = crate::gc::collect(&mut from, &mut to, &mut combined);
+
+                // Copy the (possibly-updated) caller roots back.
+                roots.copy_from_slice(&combined[..caller_len]);
+
+                // Rewrite the pinned-refs set with their new addresses.
+                let new_pinned = &combined[caller_len..];
+                let mut guard = self.gpu_pinned_refs.lock();
+                guard.clear();
+                for r in new_pinned {
+                    guard.insert(*r);
+                }
+
+                result
+            }
+        };
+
+        #[cfg(not(feature = "gpu-offload"))]
         let result = crate::gc::collect(&mut from, &mut to, roots);
 
         // Remap monitor table keys using the pointer mapping
@@ -622,9 +710,52 @@ impl Heap {
         finalizer_addrs: &[usize],
         monitors: &dyn crate::collector::MonitorCleanup,
     ) -> (crate::gc::GcResult, Vec<usize>) {
+        // Part F: see `collect_garbage` for the rationale on both gated blocks.
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.wait_for_gpu_critical();
+        }
+
         let mut from = self.from_space.lock();
         let mut to = self.to_space.lock();
 
+        #[cfg(feature = "gpu-offload")]
+        let (result, dead_finalizers) = {
+            let pinned_snapshot: Vec<ObjectRef> = {
+                let guard = self.gpu_pinned_refs.lock();
+                guard.iter().copied().collect()
+            };
+
+            if pinned_snapshot.is_empty() {
+                crate::gc::collect_with_finalizers(&mut from, &mut to, roots, finalizer_addrs)
+            } else {
+                let caller_len = roots.len();
+                let mut combined: Vec<ObjectRef> =
+                    Vec::with_capacity(caller_len + pinned_snapshot.len());
+                combined.extend_from_slice(roots);
+                combined.extend_from_slice(&pinned_snapshot);
+
+                let (result, dead_finalizers) = crate::gc::collect_with_finalizers(
+                    &mut from,
+                    &mut to,
+                    &mut combined,
+                    finalizer_addrs,
+                );
+
+                roots.copy_from_slice(&combined[..caller_len]);
+
+                let new_pinned = &combined[caller_len..];
+                let mut guard = self.gpu_pinned_refs.lock();
+                guard.clear();
+                for r in new_pinned {
+                    guard.insert(*r);
+                }
+
+                (result, dead_finalizers)
+            }
+        };
+
+        #[cfg(not(feature = "gpu-offload"))]
         let (result, dead_finalizers) =
             crate::gc::collect_with_finalizers(&mut from, &mut to, roots, finalizer_addrs);
 
@@ -762,6 +893,107 @@ impl Heap {
     /// The capacity of each semi-space.
     pub fn semi_space_capacity(&self) -> usize {
         self.from_space.lock().capacity()
+    }
+
+    // ----- GPU-offload coordination (Part F) ---------------------------------
+
+    /// Enter a "GPU critical section": acquire a
+    /// [`SafepointToken`](crate::safepoint::SafepointToken). While at least
+    /// one token is alive on this heap, calls to [`Heap::collect_garbage`]
+    /// and [`Heap::collect_garbage_with_finalizers`] spin-yield instead of
+    /// running a GC cycle. Drop the token to release the GC.
+    ///
+    /// Available only with the `gpu-offload` Cargo feature. See
+    /// [`crate::safepoint`] for the design rationale.
+    #[cfg(feature = "gpu-offload")]
+    pub fn enter_gpu_critical(&self) -> crate::safepoint::SafepointToken<'_> {
+        crate::safepoint::SafepointToken::new(&self.gpu_critical_count)
+    }
+
+    /// Number of [`SafepointToken`](crate::safepoint::SafepointToken)s
+    /// currently alive on this heap. Useful for tests.
+    #[cfg(feature = "gpu-offload")]
+    pub fn gpu_critical_count(&self) -> u32 {
+        self.gpu_critical_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Pin `obj` so the GC walks it as an additional root for as long as
+    /// the pin is in effect. Idempotent.
+    ///
+    /// Callers must balance every `pin_ref` with an `unpin_ref`. The
+    /// canonical pattern is "pin around marshalling, unpin after the
+    /// kernel result is read back into the heap".
+    #[cfg(feature = "gpu-offload")]
+    pub fn pin_ref(&self, obj: ObjectRef) {
+        self.gpu_pinned_refs.lock().insert(obj);
+    }
+
+    /// Forget a previously pinned `obj`. No-op if the ref was not pinned.
+    #[cfg(feature = "gpu-offload")]
+    pub fn unpin_ref(&self, obj: ObjectRef) {
+        self.gpu_pinned_refs.lock().remove(&obj);
+    }
+
+    /// Snapshot the current pinned-ref set. Mainly for tests; the GC path
+    /// reads through the mutex directly.
+    #[cfg(feature = "gpu-offload")]
+    pub fn gpu_pinned_refs_snapshot(&self) -> Vec<ObjectRef> {
+        self.gpu_pinned_refs.lock().iter().copied().collect()
+    }
+
+    /// Number of times the GC saw a non-zero `gpu_critical_count` and
+    /// stepped aside. Exposed for tests.
+    #[cfg(feature = "gpu-offload")]
+    pub fn gpu_blocked_gc_count(&self) -> u64 {
+        self.gpu_blocked_gc_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Block until no GPU critical section is in flight, using the
+    /// crate-standard yield-spin pattern (see `reference.rs::remove_timeout`).
+    ///
+    /// Returns immediately if no tokens are alive. Otherwise spin-yields,
+    /// re-checking the counter each iteration. After
+    /// [`crate::safepoint::GPU_CRITICAL_DEADLINE_SECS`] seconds we log a
+    /// single `tracing::warn!` and keep waiting — we NEVER force a
+    /// collection while a token is alive.
+    ///
+    /// Each call also increments [`Heap::gpu_blocked_gc_count`] iff the
+    /// counter was non-zero on entry, so callers can attribute blocked
+    /// cycles in tests.
+    #[cfg(feature = "gpu-offload")]
+    fn wait_for_gpu_critical(&self) {
+        use std::sync::atomic::Ordering;
+
+        let count = self.gpu_critical_count.load(Ordering::Acquire);
+        if count == 0 {
+            return;
+        }
+        // Record one "GC asked, GPU said no" event per call. We do this once
+        // (not once per iteration) so the test-visible counter matches the
+        // number of attempted collections, not the number of yield loops.
+        self.gpu_blocked_gc_count.fetch_add(1, Ordering::AcqRel);
+
+        let start = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(
+            crate::safepoint::GPU_CRITICAL_DEADLINE_SECS,
+        );
+        let mut warned = false;
+        loop {
+            std::thread::yield_now();
+            let now = self.gpu_critical_count.load(Ordering::Acquire);
+            if now == 0 {
+                return;
+            }
+            if !warned && start.elapsed() >= deadline {
+                tracing::warn!(
+                    "GC delayed >5s by GPU critical section — {} active tokens",
+                    now
+                );
+                warned = true;
+            }
+        }
     }
 }
 
@@ -1869,6 +2101,200 @@ mod tests {
         match heap.get_field_as(obj, 0, b'L') {
             Value::Object(Some(o)) => assert_eq!(o.as_ptr(), other.as_ptr()),
             other => panic!("expected Object(Some), got {other:?}"),
+        }
+    }
+
+    // ----- Part F: GPU/GC coordination tests --------------------------------
+    //
+    // The whole block is doubly-gated (#[cfg(test)] from the surrounding
+    // module + #[cfg(feature = "gpu-offload")]) so that the default
+    // `cargo test -p rustjvm-gc` invocation does not even compile this code.
+
+    #[cfg(feature = "gpu-offload")]
+    mod gpu_offload_tests {
+        use super::*;
+        use crate::collector::MonitorCleanup;
+        use std::collections::HashMap;
+
+        /// MonitorCleanup stub for tests — matches the pattern in
+        /// `tests/phase_h_integration.rs` and `gen_heap.rs::NoOpMonitors`.
+        struct NoMonitors;
+        impl MonitorCleanup for NoMonitors {
+            fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+        }
+
+        #[test]
+        fn enter_gpu_critical_increments_counter() {
+            let heap = Heap::new();
+            assert_eq!(heap.gpu_critical_count(), 0, "fresh heap has zero tokens");
+
+            let _t = heap.enter_gpu_critical();
+            assert_eq!(
+                heap.gpu_critical_count(),
+                1,
+                "one token alive after enter_gpu_critical"
+            );
+        }
+
+        #[test]
+        fn drop_token_decrements_counter() {
+            let heap = Heap::new();
+            {
+                let _t = heap.enter_gpu_critical();
+                assert_eq!(heap.gpu_critical_count(), 1);
+            }
+            assert_eq!(
+                heap.gpu_critical_count(),
+                0,
+                "counter returns to zero on token drop"
+            );
+        }
+
+        #[test]
+        fn nested_tokens_count_independently() {
+            let heap = Heap::new();
+            let t1 = heap.enter_gpu_critical();
+            let t2 = heap.enter_gpu_critical();
+            assert_eq!(heap.gpu_critical_count(), 2, "two tokens alive");
+
+            drop(t1);
+            assert_eq!(
+                heap.gpu_critical_count(),
+                1,
+                "dropping one token leaves one alive"
+            );
+
+            drop(t2);
+            assert_eq!(heap.gpu_critical_count(), 0, "all tokens released");
+        }
+
+        #[test]
+        fn safepoint_check_skips_gc_while_token_held() {
+            // Observable side-effect: gpu_blocked_gc_count increments each
+            // time collect_garbage is called while a token is alive.
+            //
+            // We do the GC call on a worker thread so we can drop the token
+            // from the main thread and join cleanly. The worker thread first
+            // races to bump gpu_blocked_gc_count, then proceeds with a
+            // (now no-op) collection.
+            use std::sync::Arc;
+            use std::thread;
+
+            let heap = Arc::new(Heap::new());
+            // Allocate an unrooted object so collect_garbage has something
+            // (or nothing — that's fine; we only care about the gate).
+            let _scratch = heap.alloc_object(ClassId::new(0), 1);
+
+            let token = heap.enter_gpu_critical();
+            assert_eq!(heap.gpu_blocked_gc_count(), 0);
+
+            let heap_clone = Arc::clone(&heap);
+            let gc_thread = thread::spawn(move || {
+                let mut roots: Vec<ObjectRef> = Vec::new();
+                heap_clone.collect_garbage(&mut roots, &NoMonitors);
+            });
+
+            // Spin until the worker has noticed the token. The blocked-count
+            // increment happens before the worker enters the yield loop, so
+            // observing it tells us the gate fired. A 5s ceiling matches
+            // GPU_CRITICAL_DEADLINE_SECS and is plenty for a wakeup.
+            let start = std::time::Instant::now();
+            while heap.gpu_blocked_gc_count() == 0 {
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    panic!("GC worker never observed the token");
+                }
+                std::thread::yield_now();
+            }
+            assert!(
+                heap.gpu_blocked_gc_count() >= 1,
+                "GC saw the token and stepped aside",
+            );
+
+            // Release the token so the worker can finish.
+            drop(token);
+            gc_thread.join().expect("GC thread joined cleanly");
+            assert_eq!(heap.gpu_critical_count(), 0);
+        }
+
+        #[test]
+        fn pinned_ref_survives_gc_with_real_heap_alloc() {
+            // Sequence:
+            // 1. Allocate a real array via the Heap API — no synthesised
+            //    ObjectRefs.
+            // 2. Pin it.
+            // 3. Run a GC with an empty `roots` slice. Without the pin,
+            //    the array would be collected (the snapshot we kept would
+            //    become a dangling-ish address). With the pin, the array
+            //    is walked as a root and survives.
+            // 4. After the GC, the (updated) pinned ref still has the
+            //    correct header.
+            let heap = Heap::new();
+            let arr = heap.alloc_array(ClassId::new(7), ArrayElementType::Int, 4);
+            heap.set_array_element(arr, 0, Value::Int(11)).unwrap();
+            heap.set_array_element(arr, 3, Value::Int(44)).unwrap();
+
+            heap.pin_ref(arr);
+            assert_eq!(
+                heap.gpu_pinned_refs_snapshot().len(),
+                1,
+                "exactly one pinned ref before GC"
+            );
+
+            // Empty caller-roots: only the pin keeps `arr` alive.
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            heap.collect_garbage(&mut roots, &NoMonitors);
+
+            // After GC the address may have moved. The pinned-refs set
+            // contains the post-GC address.
+            let pinned_after: Vec<ObjectRef> = heap.gpu_pinned_refs_snapshot();
+            assert_eq!(pinned_after.len(), 1, "pin preserved across GC");
+            let arr_new = pinned_after[0];
+
+            // The header decodes correctly via the new address.
+            let h = heap.get_header(arr_new);
+            assert_eq!(h.kind, ObjectKind::Array);
+            assert_eq!(h.array_length, 4);
+            assert_eq!(h.class_id, ClassId::new(7));
+            // And the element values survived.
+            assert_eq!(
+                heap.get_array_element(arr_new, 0).unwrap().as_int(),
+                Some(11),
+            );
+            assert_eq!(
+                heap.get_array_element(arr_new, 3).unwrap().as_int(),
+                Some(44),
+            );
+
+            heap.unpin_ref(arr_new);
+            assert_eq!(
+                heap.gpu_pinned_refs_snapshot().len(),
+                0,
+                "unpin_ref removes the entry",
+            );
+        }
+
+        #[test]
+        fn root_walker_includes_pinned_refs() {
+            // Variant of the test above that asserts the GC's pointer_map
+            // contains an entry for the pinned ref — i.e. that the root
+            // walker actually visited it. With the feature off this code
+            // doesn't compile, so we can rely on the gated combined-roots
+            // path running.
+            let heap = Heap::new();
+            let arr = heap.alloc_array(ClassId::new(3), ArrayElementType::Int, 2);
+            let old_addr = arr.as_ptr() as usize;
+
+            heap.pin_ref(arr);
+
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            let result = heap.collect_garbage(&mut roots, &NoMonitors);
+
+            assert!(
+                result.pointer_map.contains_key(&old_addr),
+                "pinned ref must appear in the GC pointer map (root walker saw it)",
+            );
+
+            heap.unpin_ref(arr);
         }
     }
 }

@@ -20,10 +20,6 @@ path = "src/main.rs"
 name = "java"
 path = "src/main.rs"
 
-[features]
-default = []
-synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]
-
 [dependencies]
 rustjvm-vm = { path = "../vm" }
 rustjvm-native-api = { path = "../native-api" }
@@ -31,6 +27,24 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+# GPU offload is an opt-in feature. Without `--features gpu` the
+# entire crate compiles to byte-identical output as before the GPU
+# work landed: no `cuda-bridge` link, no `--gpu*` CLI flags, no GPU
+# code paths. See docs/gpu/cuda-oxide-evaluation.md.
+[dependencies.cuda-bridge]
+path = "../cuda-bridge"
+optional = true
+
+[features]
+default = []
+# Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
+synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]
+# Expose --gpu* flags and link cuda-bridge in stub mode. Probing the
+# device returns DeviceError::NoDriver but the CLI surface exists.
+gpu = ["dep:cuda-bridge", "rustjvm-vm/gpu-offload"]
+# As above, plus the real CUDA driver bindings via cudarc.
+gpu-driver = ["gpu", "cuda-bridge/cuda"]
 
 [lints]
 workspace = true

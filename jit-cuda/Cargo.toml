@@ -1,0 +1,32 @@
+[package]
+name = "jit-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Java bytecode → PTX lowering for RustJVM GPU offload"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustjvm-reader = { path = "../reader" }
+rustjvm-types = { path = "../types" }
+rustjvm-jit-api = { path = "../jit-api" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Real .class files live in test_classes/gpu/. Tests parse them
+# through rustjvm-reader — no synthetic bytecode arrays.
+
+[features]
+default = []
+# Tests requiring an attached GPU (assembled by `ptxas`).
+gpu-it = []
+
+[lints]
+workspace = true
+
+[build-dependencies]
+# build.rs invokes `javac` directly via std::process::Command;
+# no extra deps needed.

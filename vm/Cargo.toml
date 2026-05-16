@@ -33,6 +33,10 @@ experimental-debug = []
 # revert two silent re-enables; gating behind a feature ensures it cannot
 # leak back into the default build.
 experimental-t19-diag = []
+# GPU offload — Part C marshalling + (future Parts E/F) interpreter hook and
+# safepoint coordination. Off by default. With this feature off, the VM crate
+# compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
+gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "rustjvm-gc/gpu-offload"]
 
 [dependencies]
 rustjvm-reader = { path = "../reader" }
@@ -47,6 +51,10 @@ rustjvm-classloading = { path = "../classloading" }
 rustjvm-gc = { path = "../gc" }
 rustjvm-jfr = { path = "../jfr" }
 rustjvm-native-awt = { path = "../native-awt" }
+# Optional, only pulled in by the `gpu-offload` feature. See the feature
+# table above. With `gpu-offload` off, these crates are not linked.
+cuda-bridge = { path = "../cuda-bridge", optional = true }
+jit-cuda = { path = "../jit-cuda", optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 indexmap = "2"
