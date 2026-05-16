@@ -19,7 +19,30 @@ run_app() {
     echo "$name rc=$rc"
 }
 
-run_app bluej 25 --Xmx 512m --jar "$APPS/BlueJ-540.jar"
+# ── Batch 1: Maven, Gradle, ActiveMQ, Felix, TomEE, GlassFish ─────────────────
+MVN_CP=$(find "$APPS/apache-maven-3.9.9/boot" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app maven 25 --Xmx 256m -c "$MVN_CP" \
+    "-Dmaven.home=$APPS/apache-maven-3.9.9" \
+    "-Dclassworlds.conf=$APPS/apache-maven-3.9.9/bin/m2.conf" \
+    org.codehaus.plexus.classworlds.launcher.Launcher
+
+GRADLE_CP=$(find "$APPS/gradle-8.10.2/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app gradle 25 --Xmx 256m -c "$GRADLE_CP" org.gradle.launcher.GradleMain
+
+run_app activemq 25 --Xmx 256m \
+    --jar "$APPS/apache-activemq-6.1.4/bin/activemq.jar"
+
+run_app felix 25 --Xmx 256m \
+    --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
+
+TC="$APPS/apache-tomee-plus-9.1.3"
+TCCP="$TC/bin/bootstrap.jar;$TC/bin/tomcat-juli.jar"
+run_app tomee 25 --Xmx 512m -c "$TCCP" \
+    "-Dcatalina.home=$TC" "-Dcatalina.base=$TC" \
+    org.apache.catalina.startup.Bootstrap version
+
+run_app glassfish 25 --Xmx 512m \
+    --jar "$APPS/glassfish7/glassfish/modules/glassfish.jar"
 
 echo "=== SUMMARY iter=$ITER ==="
 for f in "$LOGDIR"/*.rc.txt; do

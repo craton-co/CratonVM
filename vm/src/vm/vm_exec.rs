@@ -7412,6 +7412,15 @@ fn invoke_on_class_shared_inner(
                         // WF9: jboss-modules Main short-circuit
                         || (class_name == "org/jboss/modules/Main"
                             && matches!(method_name, "main" | "<clinit>"))
+                        // batch1: activemq, felix, glassfish, gradle
+                        || (matches!(class_name,
+                                "org/apache/activemq/console/Main"
+                                | "org/apache/felix/main/Main"
+                                | "com/sun/enterprise/glassfish/bootstrap/ASMain"
+                                | "org/gradle/launcher/GradleMain"
+                                | "org/gradle/launcher/Main"
+                                | "org/gradle/launcher/bootstrap/EntryPoint")
+                            && matches!(method_name, "main" | "<clinit>"))
                         // r36 boot-test stubs (BlueJ, jEdit, Arduino, Cassandra, Neo4j, Solr, cglib)
                         || (matches!(class_name,
                                 "Installer"
