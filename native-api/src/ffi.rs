@@ -4,7 +4,8 @@
 //! Foreign Function & Memory API.
 
 use std::alloc::{self, Layout};
-use std::collections::HashMap;
+// AUDIT 2026-05-16: std::collections::HashMap is unused (replaced by
+// rustc_hash::FxHashMap below).
 
 use rustc_hash::FxHashMap;
 

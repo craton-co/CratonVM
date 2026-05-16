@@ -10,7 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-parking_lot = "0.12"
+# AUDIT 2026-05-16: removed dead `parking_lot = "0.12"` dependency
+# (declared but unused; crate is single-threaded, sync via plain Mutex
+# where present).
 rustc-hash = "1.1"
 
 [lints]

@@ -524,8 +524,12 @@ impl<'a> Emitter<'a> {
             0x6F => self.binop_f64("div.f64")?,
             0x70 => self.binop_i32("rem.s32")?,
             0x71 => self.binop_i64("rem.s64")?,
-            0x72 => self.binop_f32("rem.f32")?,
-            0x73 => self.binop_f64("rem.f64")?,
+            // AUDIT 2026-05-16: PTX has no `rem.f32`/`rem.f64` mnemonic.
+            // Emitting one made ptxas reject every kernel that hit this
+            // path. Reject upstream so the analyzer skips these methods
+            // entirely. Proper IEEE remainder lowering is future work.
+            0x72 => return Err(LoweringError::UnsupportedNode("frem (f32 remainder; needs IEEE remainder lowering)".to_string())),
+            0x73 => return Err(LoweringError::UnsupportedNode("drem (f64 remainder; needs IEEE remainder lowering)".to_string())),
             0x74 => self.unop_i32("neg.s32")?,
             0x75 => self.unop_i64("neg.s64")?,
             0x76 => self.unop_f32("neg.f32")?,
@@ -566,11 +570,11 @@ impl<'a> Emitter<'a> {
             0x92 => self.conv_truncate_i32(16)?,                               // i2c (unsigned 16)
             0x93 => self.conv_truncate_i32(16)?,                               // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
+            // AUDIT 2026-05-16: only `lcmp` is wired; the four float/double
+            // compares (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`) were routed to
+            // `cmp_long_or_float` which always errors out — pure dead code.
+            // Let them fall through to the default `UnsupportedNode` arm.
             0x94 => self.cmp_long_or_float(RegKind::S64, false)?,
-            0x95 => self.cmp_long_or_float(RegKind::F32, true)?, // fcmpl: NaN → -1
-            0x96 => self.cmp_long_or_float(RegKind::F32, true)?, // fcmpg: NaN → +1 — we treat the same; semantics OK for the analyzer subset
-            0x97 => self.cmp_long_or_float(RegKind::F64, true)?,
-            0x98 => self.cmp_long_or_float(RegKind::F64, true)?,
             // ── branches ────────────────────────────────────────────
             0x99..=0xA4 => {
                 // if* / if_icmp* — we accept these only at the loop
@@ -810,9 +814,11 @@ impl<'a> Emitter<'a> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F32);
         // div/rem on f32 need rounding mode in PTX; rn.f32 family.
+        // AUDIT 2026-05-16: PTX has no `rem.f32` mnemonic — `frem` is
+        // rejected upstream in `emit_op` so this match no longer needs
+        // a `"rem.f32"` arm.
         let m = match mnemonic {
             "div.f32" => "div.rn.f32",
-            "rem.f32" => "rem.f32", // PTX has no direct rem; closest is fmod through cvts. Emit literal — analyzer rarely permits frem in practice.
             other => other,
         };
         writeln!(self.body, "    {} {}, {}, {};", m, r.name, a.name, b.name).unwrap();

@@ -74,7 +74,10 @@ pub fn set_init_level(level: i32) {
     // Release the lock before notifying so the woken thread can
     // re-acquire immediately.
     {
-        let _guard = lock.lock().expect("init_level global mutex poisoned");
+        // AUDIT 2026-05-16: a poisoned mutex during bootstrap previously
+        // panicked the whole VM. The mutex only guards () (notification
+        // sync), so recovering the inner value is safe.
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     }
     cv.notify_all();
 }
@@ -88,9 +91,13 @@ pub fn await_init_level(target: i32) {
     if atomic.load(Ordering::Acquire) >= target {
         return;
     }
-    let mut guard = lock.lock().expect("init_level global mutex poisoned");
+    // AUDIT 2026-05-16: recover from poison rather than panic so a
+    // single panicking holder doesn't take down every awaiter.
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while atomic.load(Ordering::Acquire) < target {
-        guard = cv.wait(guard).expect("init_level condvar poisoned");
+        guard = cv
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 }
 

@@ -2,7 +2,9 @@
 
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, VecDeque};
+// AUDIT 2026-05-16: std::collections::HashMap is unused — fd_table uses
+// rustc_hash::FxHashMap (T10.9.B).
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};

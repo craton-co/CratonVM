@@ -16,7 +16,11 @@
 
 use thiserror::Error;
 
+// AUDIT 2026-05-16: `#[non_exhaustive]` — variants (e.g. `OutOfMemory`,
+// `InvalidLayout`, `StreamSync`) may be added as the cudarc backend
+// matures; we don't want a downstream `match` to break.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DeviceError {
     #[error("no CUDA driver available (crate built without the `cuda` feature, or driver not installed)")]
     NoDriver,
@@ -35,7 +39,12 @@ pub enum DeviceError {
 pub type Result<T> = std::result::Result<T, DeviceError>;
 
 /// Static description of an attached GPU. Returned by [`probe`].
+///
+/// AUDIT 2026-05-16: `#[non_exhaustive]` — fields may be added (e.g.
+/// `pci_bus_id`, `multi_processor_count`, `clock_rate_khz`). Construct
+/// via this crate's APIs rather than struct literals.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeviceCaps {
     pub ordinal: u32,
     pub name: String,

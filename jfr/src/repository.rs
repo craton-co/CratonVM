@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+// AUDIT 2026-05-16: std HashMap unused (replaced by FxHashMap below).
+use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap;
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+// AUDIT 2026-05-16: std HashMap/HashSet are unused (replaced by FxHashMap/FxHashSet).
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

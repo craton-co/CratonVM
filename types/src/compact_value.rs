@@ -36,6 +36,16 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 // NaN-boxing constants
 // ---------------------------------------------------------------------------
+//
+// The NaN-boxing scheme below assumes a 64-bit address space where user-mode
+// object pointers fit within the lower 47 bits.  This holds on x86-64
+// (canonical lower-half) and AArch64 (typically 39/42/48-bit user VA).
+
+// Refuse to build the NaN-boxed CompactValue on 32-bit targets: `u64` long
+// bits cannot be stored as a `usize` round-trip, and the address-space
+// assumptions below are not met.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("CompactValue NaN-boxing requires a 64-bit target pointer width");
 
 /// Mask covering bits 63 + 62-50 (sign + exponent + quiet + marker).
 /// When all these bits are set, the value is a tagged non-double.
@@ -48,9 +58,24 @@ const NANBOX_BITS: u64 = 0xFFFC_0000_0000_0000;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
 /// Shift amount: sub-tag starts at bit 47.
+///
+/// Gated to x86-64 / AArch64 where user-mode addresses are known to fit in
+/// 47 bits.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SUBTAG_SHIFT: u32 = 47;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const SUBTAG_SHIFT: u32 = 47;
 
 /// Mask for the 47-bit payload (bits 46-0).
+///
+/// Gated to x86-64 / AArch64 where user-mode object pointers are known to fit
+/// in 47 bits.  See [`CompactValue::try_from_pointer`] for a checked
+/// constructor that returns `None` when this assumption is violated (e.g.
+/// AArch64 LVA 52-bit VA, x86-64 5-level paging 57-bit VA, `mmap(MAP_FIXED)`
+/// above `0x0000_7FFF_FFFF_FFFF`).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
 
 /// Mask for the 3-bit sub-tag (bits 49-47) after the value has been confirmed
@@ -174,7 +199,18 @@ impl CompactValue {
     ///
     /// The pointer is stored in the 47-bit payload.  On x86-64 user-space
     /// addresses fit in 47 bits (bit 47 is always 0 for canonical lower-half
-    /// addresses).
+    /// addresses) and on AArch64 user-space the high bits are likewise zero.
+    ///
+    /// # Panics
+    /// Panics (in **all** build profiles, not just debug) if `ptr` is zero or
+    /// has bits set outside the 47-bit payload range.  The previous
+    /// implementation only `debug_assert!`'d, which silently truncated the
+    /// high bits in release builds — a portability hazard on systems with
+    /// 52-bit (AArch64 LVA) or 57-bit (x86-64 5-level paging) addresses or
+    /// with `MAP_FIXED` allocations above `0x0000_7FFF_FFFF_FFFF`.
+    ///
+    /// Prefer [`try_from_pointer`](Self::try_from_pointer) for callers that
+    /// want to handle pointer-out-of-range without aborting.
     #[inline]
     pub fn object(ptr: u64) -> Self {
         debug_assert!(
@@ -186,7 +222,39 @@ impl CompactValue {
             "CompactValue::object: pointer {:#x} exceeds 47-bit address space",
             ptr
         );
+        // Belt-and-suspenders: promote the debug_assert above to an
+        // unconditional `assert!` so out-of-range pointers fail loudly in
+        // release instead of being silently masked and producing a corrupted
+        // reference.
+        assert!(
+            ptr != 0,
+            "CompactValue::object called with null pointer; use null() instead"
+        );
+        assert!(
+            ptr & !PAYLOAD_MASK == 0,
+            "CompactValue::object: pointer {:#x} exceeds 47-bit address space",
+            ptr
+        );
         Self(make_tagged(SUB_OBJECT, ptr & PAYLOAD_MASK))
+    }
+
+    /// Checked constructor: returns `Some(CompactValue)` if `ptr` fits in the
+    /// 47-bit payload, or `None` if it is null or has any bits set above bit
+    /// 46.
+    ///
+    /// Safe counterpart to [`object`](Self::object) for callers that derive
+    /// pointers from platform-supplied addresses (e.g. `mmap(MAP_FIXED)`,
+    /// AArch64 LVA, x86-64 5-level paging) where the 47-bit assumption may
+    /// not hold.
+    #[inline]
+    pub fn try_from_pointer(ptr: u64) -> Option<Self> {
+        if ptr == 0 {
+            return None;
+        }
+        if ptr & !PAYLOAD_MASK != 0 {
+            return None;
+        }
+        Some(Self(make_tagged(SUB_OBJECT, ptr)))
     }
 
     /// Create a CompactValue representing the null reference.
@@ -808,6 +876,44 @@ mod tests {
         // Maximum 47-bit user-space pointer (bit 46 set, etc.)
         let ptr: u64 = 0x0000_7FFF_FFFF_FFF8; // 47-bit, 8-byte aligned
         let cv = CompactValue::object(ptr);
+        assert_eq!(cv.as_object_ptr(), Some(ptr));
+    }
+
+    /// Pointer with bit 47+ set (out of 47-bit payload range) must panic via
+    /// the unconditional `assert!` rather than silently truncate the high
+    /// bits and produce a corrupted reference.  Regression test for the
+    /// "47-bit pointer truncation" vulnerability.
+    #[test]
+    #[should_panic(expected = "exceeds 47-bit address space")]
+    fn object_pointer_above_47bit_panics() {
+        let ptr: u64 = 0x0001_0000_0000_0000; // bit 48 set — out of range
+        let _ = CompactValue::object(ptr);
+    }
+
+    /// The checked constructor returns `None` instead of panicking for
+    /// out-of-range pointers.
+    #[test]
+    fn try_from_pointer_rejects_above_47bit() {
+        let ptr: u64 = 0x0001_0000_0000_0000;
+        assert!(CompactValue::try_from_pointer(ptr).is_none());
+    }
+
+    #[test]
+    fn try_from_pointer_rejects_null() {
+        assert!(CompactValue::try_from_pointer(0).is_none());
+    }
+
+    #[test]
+    fn try_from_pointer_accepts_valid_pointer() {
+        let ptr: u64 = 0x0000_1234_5678_ABC0;
+        let cv = CompactValue::try_from_pointer(ptr).expect("valid 47-bit pointer");
+        assert_eq!(cv.as_object_ptr(), Some(ptr));
+    }
+
+    #[test]
+    fn try_from_pointer_accepts_max_47bit() {
+        let ptr: u64 = 0x0000_7FFF_FFFF_FFF8;
+        let cv = CompactValue::try_from_pointer(ptr).expect("max 47-bit pointer");
         assert_eq!(cv.as_object_ptr(), Some(ptr));
     }
 

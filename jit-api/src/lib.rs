@@ -184,116 +184,14 @@ impl JitRuntimeHelpers {
     }
 }
 
-/// Builder for constructing a validated `JitRuntimeHelpers`.
-///
-/// All fields must be set before calling `build()`. The builder validates
-/// that no pointers are null.
-pub struct JitRuntimeHelpersBuilder {
-    helpers: JitRuntimeHelpers,
-}
-
-impl JitRuntimeHelpersBuilder {
-    /// Create a new builder with all pointers initialized to zero (invalid).
-    pub fn new() -> Self {
-        Self {
-            helpers: JitRuntimeHelpers {
-                newarray: 0,
-                new_object: 0,
-                anewarray_object: 0,
-                baload: 0,
-                bastore: 0,
-                iaload: 0,
-                iastore: 0,
-                aaload: 0,
-                aastore: 0,
-                multianewarray_2d: 0,
-                arraylength: 0,
-                getfield: 0,
-                putfield_int: 0,
-                putfield_long: 0,
-                putfield_float: 0,
-                putfield_double: 0,
-                putfield_object: 0,
-                getstatic: 0,
-                putstatic_int: 0,
-                putstatic_long: 0,
-                putstatic_float: 0,
-                putstatic_double: 0,
-                putstatic_object: 0,
-                checkcast: 0,
-                instanceof_check: 0,
-                throw_aioobe: 0,
-                invoke_dispatch: 0,
-                invoke_virtual_mic: 0,
-                write_barrier: 0,
-                uncommon_trap: 0,
-                math_fma_double: 0,
-                math_fma_float: 0,
-            },
-        }
-    }
-
-    /// Set a helper pointer by field name. Returns `&mut Self` for chaining.
-    ///
-    /// Panics if `name` is not a known field name.
-    pub fn set(&mut self, name: &str, addr: usize) -> &mut Self {
-        match name {
-            "newarray" => self.helpers.newarray = addr,
-            "new_object" => self.helpers.new_object = addr,
-            "anewarray_object" => self.helpers.anewarray_object = addr,
-            "baload" => self.helpers.baload = addr,
-            "bastore" => self.helpers.bastore = addr,
-            "iaload" => self.helpers.iaload = addr,
-            "iastore" => self.helpers.iastore = addr,
-            "aaload" => self.helpers.aaload = addr,
-            "aastore" => self.helpers.aastore = addr,
-            "multianewarray_2d" => self.helpers.multianewarray_2d = addr,
-            "arraylength" => self.helpers.arraylength = addr,
-            "getfield" => self.helpers.getfield = addr,
-            "putfield_int" => self.helpers.putfield_int = addr,
-            "putfield_long" => self.helpers.putfield_long = addr,
-            "putfield_float" => self.helpers.putfield_float = addr,
-            "putfield_double" => self.helpers.putfield_double = addr,
-            "putfield_object" => self.helpers.putfield_object = addr,
-            "getstatic" => self.helpers.getstatic = addr,
-            "putstatic_int" => self.helpers.putstatic_int = addr,
-            "putstatic_long" => self.helpers.putstatic_long = addr,
-            "putstatic_float" => self.helpers.putstatic_float = addr,
-            "putstatic_double" => self.helpers.putstatic_double = addr,
-            "putstatic_object" => self.helpers.putstatic_object = addr,
-            "checkcast" => self.helpers.checkcast = addr,
-            "instanceof_check" => self.helpers.instanceof_check = addr,
-            "throw_aioobe" => self.helpers.throw_aioobe = addr,
-            "invoke_dispatch" => self.helpers.invoke_dispatch = addr,
-            "invoke_virtual_mic" => self.helpers.invoke_virtual_mic = addr,
-            "write_barrier" => self.helpers.write_barrier = addr,
-            "uncommon_trap" => self.helpers.uncommon_trap = addr,
-            "math_fma_double" => self.helpers.math_fma_double = addr,
-            "math_fma_float" => self.helpers.math_fma_float = addr,
-            other => {
-                eprintln!("JitRuntimeHelpers: unknown field '{other}', ignoring");
-            }
-        }
-        self
-    }
-
-    /// Build the helpers, returning `Err` with a list of null field names if
-    /// validation fails.
-    pub fn build(self) -> Result<JitRuntimeHelpers, Vec<&'static str>> {
-        let nulls = self.helpers.null_pointers();
-        if nulls.is_empty() {
-            Ok(self.helpers)
-        } else {
-            Err(nulls)
-        }
-    }
-}
-
-impl Default for JitRuntimeHelpersBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// AUDIT 2026-05-16: JitRuntimeHelpersBuilder has been deleted. It was
+// unused — the real construction site is `vm/src/jit/helpers.rs` (struct-
+// literal init) and the only callers of the Builder were this crate's own
+// tests. The stringly-typed `set(name: &str, addr: usize)` silently
+// `eprintln!`-degraded on typos, providing no compile-time safety while
+// duplicating the 32-field list across five call sites. If a future
+// caller wants a builder pattern, use the struct literal directly or
+// generate it from a declarative macro keyed on `field_names()`.
 
 #[cfg(test)]
 mod tests {
@@ -631,45 +529,8 @@ mod tests {
         assert_eq!(nulls.len(), 2);
     }
 
-    // --- Builder ---
-
-    #[test]
-    fn test_builder_build_fails_with_unset_fields() {
-        let builder = JitRuntimeHelpersBuilder::new();
-        let result = builder.build();
-        assert!(result.is_err());
-        let nulls = result.unwrap_err();
-        // T1.1.28 — bumped from 30 to 32 after adding
-        // `math_fma_double` and `math_fma_float` helper slots.
-        assert_eq!(nulls.len(), 32);
-    }
-
-    #[test]
-    fn test_builder_set_and_build() {
-        let mut builder = JitRuntimeHelpersBuilder::new();
-        let names = JitRuntimeHelpers::field_names();
-        for (i, name) in names.iter().enumerate() {
-            builder.set(name, 0x1000 + i * 8);
-        }
-        let result = builder.build();
-        assert!(result.is_ok());
-        let h = result.unwrap();
-        assert!(h.validate());
-        assert_eq!(h.newarray, 0x1000);
-    }
-
-    #[test]
-    fn test_builder_partial_set_reports_missing() {
-        let mut builder = JitRuntimeHelpersBuilder::new();
-        builder.set("newarray", 0x1000);
-        builder.set("new_object", 0x1008);
-        let result = builder.build();
-        assert!(result.is_err());
-        let nulls = result.unwrap_err();
-        // 32 fields total (T1.1.28 added fma_double + fma_float),
-        // minus the 2 set above → 30 still null.
-        assert_eq!(nulls.len(), 30);
-        assert!(!nulls.contains(&"newarray"));
-        assert!(!nulls.contains(&"new_object"));
-    }
+    // --- Builder tests deleted in 2026-05-16 audit: Builder itself
+    //     was deleted (see comment above the deleted block in the
+    //     module body). The remaining tests cover the runtime-helpers
+    //     struct + validation directly.
 }
