@@ -228,6 +228,16 @@ pub struct SharedVm {
     /// VM configuration (immutable after construction).
     pub config: VmConfig,
 
+    /// GPU offload cache (Part E). Holds the CUDA `DeviceContext` and
+    /// per-method compiled-kernel cache. Cheap when offload is off:
+    /// constructed with `ctx = None` and every lookup short-circuits
+    /// to `LookupOutcome::Skip`.
+    ///
+    /// Behind the `gpu-offload` Cargo feature — the field does not
+    /// exist on the CPU-only build.
+    #[cfg(feature = "gpu-offload")]
+    pub offload_cache: std::sync::Arc<crate::runtime::offload::OffloadCache>,
+
     /// Class loader and cache, protected by an RwLock.
     pub class_manager: RwLock<ClassManager>,
 
@@ -1834,8 +1844,18 @@ impl SharedVm {
             }
         }
 
+        // Build the GPU offload cache from the config *before* moving
+        // `config` into the struct literal. With the feature off, this
+        // block does not exist.
+        #[cfg(feature = "gpu-offload")]
+        let offload_cache = std::sync::Arc::new(
+            crate::runtime::offload::OffloadCache::new(&config),
+        );
+
         let vm = Self {
             config,
+            #[cfg(feature = "gpu-offload")]
+            offload_cache,
             class_manager: RwLock::new(class_manager),
             heap,
             native_methods,

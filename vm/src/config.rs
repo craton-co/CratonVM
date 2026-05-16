@@ -174,6 +174,32 @@ pub struct VmConfig {
     /// token to `AgentRegistry::parse_agent_option` which walks the
     /// list in the canonical `Agent_OnLoad` order.
     pub jvmti_agent_options: Vec<String>,
+
+    // -----------------------------------------------------------------------
+    // GPU offload (Part E of the GPU offload plan)
+    // -----------------------------------------------------------------------
+    // Every field below is gated behind the `gpu-offload` Cargo feature.
+    // With the feature off the struct has the same shape (and the same
+    // default-constructed bit pattern) as before the GPU work landed.
+    /// Master switch — when `true` and a CUDA driver is available, eligible
+    /// static methods are offloaded to the GPU. Default `false`.
+    #[cfg(feature = "gpu-offload")]
+    pub gpu_offload_enabled: bool,
+
+    /// Ordinal of the CUDA device to use. Default `0`.
+    #[cfg(feature = "gpu-offload")]
+    pub gpu_device_ordinal: u32,
+
+    /// Minimum `estimated_work` (from the analyzer) before we pay the
+    /// upload/launch/download overhead. Default `4096`.
+    #[cfg(feature = "gpu-offload")]
+    pub gpu_min_work: u32,
+
+    /// Log one `tracing::info!` line per analyzer verdict so a developer
+    /// can see why a candidate method was or wasn't offloaded. Default
+    /// `false`.
+    #[cfg(feature = "gpu-offload")]
+    pub print_gpu_decisions: bool,
 }
 
 /// AOT compilation mode (Project Leyden, JEPs 483/514/515).
@@ -286,6 +312,14 @@ impl Default for VmConfig {
             use_container_support: true,
             xlog_spec: None,
             jvmti_agent_options: Vec::new(),
+            #[cfg(feature = "gpu-offload")]
+            gpu_offload_enabled: false,
+            #[cfg(feature = "gpu-offload")]
+            gpu_device_ordinal: 0,
+            #[cfg(feature = "gpu-offload")]
+            gpu_min_work: 4096,
+            #[cfg(feature = "gpu-offload")]
+            print_gpu_decisions: false,
         }
     }
 }

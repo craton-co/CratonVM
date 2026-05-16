@@ -18,5 +18,13 @@ rustc-hash = "1.1"
 [dev-dependencies]
 rustjvm-jit = { path = "../jit" }
 
+[features]
+default = []
+# GPU-offload coordination primitives (Part F of the GPU offload plan).
+# Enables `safepoint::SafepointToken`, `Heap::enter_gpu_critical`, and
+# GC-delay logic that pauses collection while a token is held. With this
+# feature off the crate compiles to identical bytes as before the GPU work.
+gpu-offload = []
+
 [lints]
 workspace = true

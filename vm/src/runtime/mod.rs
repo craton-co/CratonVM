@@ -45,5 +45,19 @@ pub mod agent_loader;
 pub mod proxy;
 pub mod stackwalker;
 
+// Part C of the GPU offload plan — primitive-array marshalling between the
+// JVM heap and CUDA device memory. Strictly gated behind the `gpu-offload`
+// Cargo feature so the default VM build is byte-identical to before the
+// feature was introduced. Public items in this module are only reachable
+// when the feature is on.
+#[cfg(feature = "gpu-offload")]
+pub mod gpu_marshal;
+
+// Part E of the GPU offload plan — analyzer-cache, PTX module store, and
+// dispatcher hook for the interpreter's `execute_invokestatic`. Strictly
+// gated behind the `gpu-offload` feature.
+#[cfg(feature = "gpu-offload")]
+pub mod offload;
+
 pub use call_stack::CallStack;
 pub use value_stack::ValueStack;

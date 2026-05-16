@@ -31,6 +31,8 @@ pub mod old_gen;
 pub mod reference;
 pub mod region;
 pub mod satb;
+#[cfg(feature = "gpu-offload")]
+pub mod safepoint;
 pub mod tlab;
 pub mod vm_heap;
 pub mod zgc;

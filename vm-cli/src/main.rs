@@ -171,6 +171,47 @@ struct Args {
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
 
+    // -----------------------------------------------------------------------
+    // GPU offload (see docs/gpu/cuda-oxide-evaluation.md)
+    //
+    // Every field below is gated behind the `gpu` Cargo feature. Without
+    // the feature the flags are not parsed, not documented in --help,
+    // and the CPU execution path is byte-identical to before the GPU
+    // work landed.
+    // -----------------------------------------------------------------------
+
+    /// Enable GPU offload of eligible static methods. Requires the
+    /// CLI to be built with `--features gpu` and a CUDA driver. With
+    /// no driver, the flag is honoured but no methods are offloaded.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu")]
+    gpu: bool,
+
+    /// Select CUDA device ordinal when --gpu is on. Defaults to 0.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu-device", value_name = "N", default_value_t = 0)]
+    gpu_device: u32,
+
+    /// Minimum estimated work (array length / loop trip count) before
+    /// a method is offloaded. Smaller inputs run on the CPU because
+    /// the host↔device round-trip dominates.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu-min-work", value_name = "N", default_value_t = 4096)]
+    gpu_min_work: u32,
+
+    /// Print one line per analyzer verdict (Eligible / Rejected) at
+    /// INFO level. Useful for understanding why a method did or did
+    /// not offload.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "print-gpu-decisions")]
+    print_gpu_decisions: bool,
+
+    /// Probe the GPU, print device name + compute capability + memory,
+    /// then exit. Useful for sanity-checking before a real run.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu-info")]
+    gpu_info: bool,
+
     /// Arguments passed to the Java program's main method.
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
@@ -487,6 +528,49 @@ fn run() -> Result<()> {
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
 
+    // GPU handlers — only compiled when the `gpu` Cargo feature is on.
+    // Without the feature, the CPU execution path below is reached
+    // unconditionally and unchanged.
+    #[cfg(feature = "gpu")]
+    {
+        if args.gpu_info {
+            match cuda_bridge::probe() {
+                Ok(caps) => {
+                    println!(
+                        "device {}: {} (sm_{}{}), {:.2} GiB",
+                        caps.ordinal,
+                        caps.name,
+                        caps.compute_major,
+                        caps.compute_minor,
+                        (caps.total_global_mem as f64) / (1024.0 * 1024.0 * 1024.0)
+                    );
+                }
+                Err(e) => {
+                    println!("no CUDA device available: {e}");
+                }
+            }
+            return Ok(());
+        }
+
+        if args.gpu {
+            match cuda_bridge::probe() {
+                Ok(caps) => {
+                    info!(
+                        "gpu offload enabled on device {}: {} (sm_{}{})",
+                        args.gpu_device, caps.name, caps.compute_major, caps.compute_minor
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rustjvm-cli] --gpu requested but no CUDA driver available ({e}); \
+                         running on CPU"
+                    );
+                    args.gpu = false;
+                }
+            }
+        }
+    }
+
     // Strip a literal `--` separator that clap parked in the trailing
     // positional list. We pass `--` through to clap so it knows where
     // program args begin (so tokens like `-mp` aren't mis-parsed as
@@ -599,6 +683,17 @@ fn run() -> Result<()> {
 
     if let Some(mode) = xverify_mode {
         config = config.with_xverify_mode(mode);
+    }
+
+    // Forward the GPU-offload CLI flags into VmConfig. Only compiled
+    // when the `gpu` Cargo feature is on; without the feature these
+    // fields do not exist on VmConfig (see vm/src/config.rs).
+    #[cfg(feature = "gpu")]
+    {
+        config.gpu_offload_enabled = args.gpu;
+        config.gpu_device_ordinal = args.gpu_device;
+        config.gpu_min_work = args.gpu_min_work;
+        config.print_gpu_decisions = args.print_gpu_decisions;
     }
 
     if let Some(bcp) = &args.boot_classpath {

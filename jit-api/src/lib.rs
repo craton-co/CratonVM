@@ -3,6 +3,11 @@
 //! Shared types used by the JIT compiler crate and the VM crate:
 //! - [`CachedBytecodeMethod`] — method data needed for JIT compilation
 //! - [`JitRuntimeHelpers`] — function pointer table for JIT runtime callbacks
+//! - [`gpu_lowering::GpuLowering`] (under the `gpu-lowering` feature) —
+//!   trait seam for emitting PTX from a resolved Java method.
+
+#[cfg(feature = "gpu-lowering")]
+pub mod gpu_lowering;
 
 use std::sync::Arc;
 

@@ -1,0 +1,34 @@
+[package]
+name = "cuda-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Thin CUDA Driver API bridge for RustJVM GPU offload"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bytemuck = "1.16"
+
+# cudarc is optional: when the `cuda` feature is off, the crate
+# exposes the same surface but every entry point returns
+# `DeviceError::NoDriver`. This lets the rest of the workspace
+# build and test on machines without a CUDA toolkit.
+[dependencies.cudarc]
+version = "0.13"
+default-features = false
+features = ["driver", "cuda-12060"]
+optional = true
+
+[features]
+default = []
+# Compile against a real libcuda / nvcuda.dll via cudarc.
+cuda = ["dep:cudarc"]
+# Run integration tests that require an attached NVIDIA GPU.
+gpu-it = ["cuda"]
+
+[lints]
+workspace = true

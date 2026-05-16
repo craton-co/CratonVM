@@ -13,5 +13,12 @@ categories.workspace = true
 rustjvm-types = { path = "../types" }
 rustjvm-reader = { path = "../reader" }
 
+[features]
+default = []
+# Expose the GpuLowering trait. The trait is referenced only by the
+# (optional) GPU-offload path in the VM; the CPU JIT does not link
+# it. Off by default to keep the CPU path's public surface unchanged.
+gpu-lowering = []
+
 [lints]
 workspace = true

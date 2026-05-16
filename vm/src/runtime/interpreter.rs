@@ -9706,6 +9706,40 @@ fn execute_invokestatic(
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
+    // GPU offload hook (Part E). Behind `gpu-offload`: with the
+    // feature off, the entire block is removed by the preprocessor
+    // and `execute_invokestatic` falls through to the existing CPU
+    // path unchanged. On Hit we consult the OffloadCache; the actual
+    // marshal-and-launch glue is deliberately scoped to a separate
+    // follow-up because it needs real GPU hardware to validate — see
+    // `crate::runtime::offload::try_dispatch` for the contract.
+    #[cfg(feature = "gpu-offload")]
+    {
+        if shared.config.gpu_offload_enabled
+            && shared.offload_cache.has_device()
+        {
+            match crate::runtime::offload::try_dispatch(
+                shared,
+                thread,
+                frame_idx,
+                &method_class_name,
+                &method_name,
+                &method_descriptor,
+                &args,
+            )? {
+                crate::runtime::offload::DispatchOutcome::Handled => {
+                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThrough => {
+                    // Method is ineligible / blacklisted / launch
+                    // deopted. Run the CPU path below; the operand
+                    // stack and locals are untouched.
+                }
+            }
+        }
+    }
+
     // Try stackless frame push for bytecode methods
     // For invokestatic, walk the native hierarchy to find inherited natives.
     match try_stackless_invoke(
