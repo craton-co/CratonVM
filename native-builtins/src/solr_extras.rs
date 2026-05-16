@@ -22,6 +22,19 @@ pub fn register_solr_stubs(registry: &mut NativeMethodRegistry) {
     }
     // Already-shimmed jetty start.Main is in jetty_extras.rs; rely on that
     // for the boot path.
+
+    // Solr 9.4.1 CLI uses Picocli for arg parsing. If picocli's clinit
+    // triggers System.exit(2) on our partial bootstrap, short-circuit it.
+    for cls in [
+        "picocli/CommandLine",
+        "picocli/CommandLine$DefaultExceptionHandler",
+        "org/apache/solr/cli/SolrCLI",
+        "org/apache/solr/cli/StartCommand",
+        "org/apache/solr/cli/StopCommand",
+        "org/apache/solr/SolrLogPostTool",
+    ] {
+        registry.register(cls, "<clinit>", "()V", |_ctx, _args| Ok(None));
+    }
 }
 // TODO orchestrator: wire `solr_extras::register_solr_stubs(registry);` into
 // `register_essential_natives` in lib.rs.

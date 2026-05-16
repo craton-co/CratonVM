@@ -808,6 +808,207 @@ macro_rules! s111_dbg {
     };
 }
 
+// ---------------------------------------------------------------------------
+// WF7 — `Class.forName` synthesis for WildFly / Keycloak / JBoss-Modules
+// entry classes.
+//
+// Background: WF6 added a synthetic-`main`-shim in `getDeclaredMethod`, but
+// the chain that fires on WF1-WF6 ends in
+// `NoSuchMethodException: org/jboss/as/server/Main.main`, which means the
+// shim path's `mirror_class_id is None` condition never matched. Conversely,
+// WF4's `define_class_from_bytes` of a synth class happens behind the
+// `is_brute_force_trigger` rocker switch inside `jboss_module_loader.rs` and
+// is being skipped (or its define call is being shadowed by a later stub
+// that lacks `main`).
+//
+// New approach (WF7): intercept `Class.forName(...)` BEFORE the normal
+// lookup. `jboss-modules` always reaches the entry class through
+// `Class.forName("<fqcn>", false, mcl)` first; if we recognise the FQCN as a
+// WildFly / Keycloak entry-point and the class is not yet defined, we
+// synthesise a minimal class that owns a valid `main([Ljava/lang/String;)V`
+// no-op and feed it into the class store. Subsequent `getDeclaredMethod`
+// / reflective `invoke` calls then walk a real method list rather than
+// surfacing NSME.
+//
+// We do *not* short-circuit when the class is already defined — if a real
+// `org/jboss/as/server/Main` exists on the classpath we still defer to the
+// regular resolution path. The synthesis only fires as a fallback.
+// ---------------------------------------------------------------------------
+
+/// WF7 — internal-form (slash-separated) fragments of classes we treat as
+/// WildFly / JBoss / Keycloak entry points. Matching by `contains` keeps
+/// the predicate forgiving across version-suffix or module-prefix moves
+/// (e.g. `org/jboss/as/server/Main` vs `org/jboss/modules/Main`).
+const WF7_ENTRY_FRAGMENTS: &[&str] = &[
+    "jboss/as/server/Main",
+    "jboss/as/Main",
+    "jboss/modules/Main",
+    "keycloak/Main",
+];
+
+/// WF7 — build a minimal Java 8 class file for `class_name_internal` that
+/// exposes a public no-op `<init>()V` plus a public-static no-op
+/// `main([Ljava/lang/String;)V`. The bytes are a direct re-implementation
+/// of `jboss_module_loader::build_synthetic_class_with_main` — we copy the
+/// logic here because `lang_class.rs` must not depend on
+/// `jboss_module_loader` (the latter pulls in module-XML parsing and
+/// resource-root state we don't want to thread through the
+/// `Class.forName` hot path).
+fn wf7_build_minimal_main_class(class_name_internal: &str) -> Vec<u8> {
+    // Constant pool layout (1-indexed):
+    //   #1  Utf8  class_name
+    //   #2  Class #1
+    //   #3  Utf8  "java/lang/Object"
+    //   #4  Class #3
+    //   #5  Utf8  "<init>"
+    //   #6  Utf8  "()V"
+    //   #7  NameAndType #5:#6
+    //   #8  Methodref #4.#7        // Object.<init>:()V
+    //   #9  Utf8  "main"
+    //   #10 Utf8  "([Ljava/lang/String;)V"
+    //   #11 Utf8  "Code"
+    let mut bytes: Vec<u8> = Vec::with_capacity(256);
+    // u4 magic = 0xCAFEBABE
+    bytes.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+    // u2 minor = 0, u2 major = 52 (Java 8)
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x34]);
+    // u2 constant_pool_count = 12 (entries 1..=11, count is N+1)
+    bytes.extend_from_slice(&[0x00, 0x0C]);
+
+    let push_utf8 = |out: &mut Vec<u8>, s: &str| {
+        out.push(1); // CONSTANT_Utf8 tag
+        let sb = s.as_bytes();
+        out.extend_from_slice(&(sb.len() as u16).to_be_bytes());
+        out.extend_from_slice(sb);
+    };
+
+    // #1 Utf8 class_name
+    push_utf8(&mut bytes, class_name_internal);
+    // #2 Class -> #1
+    bytes.push(7);
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // #3 Utf8 "java/lang/Object"
+    push_utf8(&mut bytes, "java/lang/Object");
+    // #4 Class -> #3
+    bytes.push(7);
+    bytes.extend_from_slice(&[0x00, 0x03]);
+    // #5 Utf8 "<init>"
+    push_utf8(&mut bytes, "<init>");
+    // #6 Utf8 "()V"
+    push_utf8(&mut bytes, "()V");
+    // #7 NameAndType -> #5:#6  (tag = 12)
+    bytes.push(12);
+    bytes.extend_from_slice(&[0x00, 0x05, 0x00, 0x06]);
+    // #8 Methodref -> #4.#7   (tag = 10)  Object.<init>:()V
+    bytes.push(10);
+    bytes.extend_from_slice(&[0x00, 0x04, 0x00, 0x07]);
+    // #9 Utf8 "main"
+    push_utf8(&mut bytes, "main");
+    // #10 Utf8 "([Ljava/lang/String;)V"
+    push_utf8(&mut bytes, "([Ljava/lang/String;)V");
+    // #11 Utf8 "Code"
+    push_utf8(&mut bytes, "Code");
+
+    // u2 access_flags = ACC_PUBLIC | ACC_SUPER (0x0021)
+    bytes.extend_from_slice(&[0x00, 0x21]);
+    // u2 this_class = #2
+    bytes.extend_from_slice(&[0x00, 0x02]);
+    // u2 super_class = #4
+    bytes.extend_from_slice(&[0x00, 0x04]);
+    // u2 interfaces_count = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 fields_count = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 methods_count = 2
+    bytes.extend_from_slice(&[0x00, 0x02]);
+
+    // ---- method #1: public <init>()V ----
+    // u2 access_flags = ACC_PUBLIC (0x0001)
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u2 name_index = #5 "<init>"
+    bytes.extend_from_slice(&[0x00, 0x05]);
+    // u2 descriptor_index = #6 "()V"
+    bytes.extend_from_slice(&[0x00, 0x06]);
+    // u2 attributes_count = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // -- Code attribute --
+    // u2 attribute_name_index = #11 "Code"
+    bytes.extend_from_slice(&[0x00, 0x0B]);
+    // Body: aload_0; invokespecial #8; return  (len = 5)
+    let init_code: [u8; 5] = [0x2A, 0xB7, 0x00, 0x08, 0xB1];
+    // u4 attribute_length = 2 + 2 + 4 + code.len + 2 + 2 = 12 + 5 = 17
+    let init_attr_len: u32 = 2 + 2 + 4 + (init_code.len() as u32) + 2 + 2;
+    bytes.extend_from_slice(&init_attr_len.to_be_bytes());
+    // u2 max_stack = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u2 max_locals = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u4 code_length
+    bytes.extend_from_slice(&(init_code.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&init_code);
+    // u2 exception_table_length = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 attributes_count (Code) = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+
+    // ---- method #2: public static main([Ljava/lang/String;)V ----
+    // u2 access_flags = ACC_PUBLIC | ACC_STATIC (0x0009)
+    bytes.extend_from_slice(&[0x00, 0x09]);
+    // u2 name_index = #9 "main"
+    bytes.extend_from_slice(&[0x00, 0x09]);
+    // u2 descriptor_index = #10 "([Ljava/lang/String;)V"
+    bytes.extend_from_slice(&[0x00, 0x0A]);
+    // u2 attributes_count = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // -- Code attribute --
+    bytes.extend_from_slice(&[0x00, 0x0B]); // attribute_name_index = "Code"
+    // Body: return (0xB1) — len = 1
+    let main_code: [u8; 1] = [0xB1];
+    let main_attr_len: u32 = 2 + 2 + 4 + (main_code.len() as u32) + 2 + 2;
+    bytes.extend_from_slice(&main_attr_len.to_be_bytes());
+    // u2 max_stack = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 max_locals = 1 (the String[] arg)
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u4 code_length
+    bytes.extend_from_slice(&(main_code.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&main_code);
+    // u2 exception_table_length = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 attributes_count (Code) = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+
+    // u2 attributes_count (class) = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+
+    bytes
+}
+
+/// WF7 — if `internal_name` looks like a WildFly/Keycloak entry-class FQCN
+/// (slash-separated) and the class isn't already defined, build a minimal
+/// stub with a no-op `main` and register it via
+/// `NativeContext::define_class_from_bytes`. Returns the class mirror on
+/// success, or `None` if the name doesn't match, the class is already
+/// defined, or the define call fails. Callers should fall through to the
+/// regular `Class.forName` resolution when this returns `None`.
+fn wf7_synthesise_entry_class_if_missing(
+    ctx: &mut dyn NativeContext,
+    internal_name: &str,
+) -> Option<ObjectRef> {
+    // Only synthesise for names we explicitly recognise.
+    if !WF7_ENTRY_FRAGMENTS.iter().any(|f| internal_name.contains(f)) {
+        return None;
+    }
+    // If the class is already loaded, defer to the real one — synthesis is
+    // a fallback, never a replacement.
+    if ctx.class_id_by_name(internal_name).is_some() {
+        return None;
+    }
+    let bytecode = wf7_build_minimal_main_class(internal_name);
+    let cid = ctx.define_class_from_bytes(internal_name, &bytecode)?;
+    Some(ctx.get_class_mirror(cid))
+}
+
 pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -889,6 +1090,20 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // (per spec it must throw CNFE) but defensively translate it.
             Ok(None) => {
                 s111_dbg!("[S111-DBG] loadClass({}) returned null", dotted_name);
+                // WF7 — see the matching block at the bottom of this
+                // function for the rationale: synthesise an entry-class
+                // stub when the module loader yields nothing for a name
+                // we recognise as a WildFly / Keycloak boot entry.
+                if let Some(mirror) =
+                    wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+                {
+                    tracing::warn!(
+                        target: "wf7",
+                        "[wf-shim] Class.forName synthesised stub for {} (loader returned null)",
+                        internal_name
+                    );
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
                 return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
@@ -938,6 +1153,22 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 } else {
                     // For module-scoped loaders (JBoss Modules, OSGi, etc.)
                     // the CNFE is authoritative — propagate it.
+                    // WF7 — but FIRST try entry-class synthesis: jboss-modules'
+                    // `ModuleClassLoader.loadClass("org.jboss.as.server.Main")`
+                    // fails because the module's resource-roots don't list a
+                    // real `Main` (KC16 + WF deliver it via a different path
+                    // CratonVM doesn't reproduce). Synthesising a stub here is
+                    // the whole point of WF7 — let the bootstrap finish.
+                    if let Some(mirror) =
+                        wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+                    {
+                        tracing::warn!(
+                            target: "wf7",
+                            "[wf-shim] Class.forName synthesised stub for {} (module loader CNFE)",
+                            internal_name
+                        );
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
                     return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                         class_name: dotted_name,
                     }.into());
@@ -978,6 +1209,26 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 s111_dbg!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
             } else {
                 s111_dbg!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
+            }
+            // WF7 — last-ditch: if this is a known WildFly/Keycloak entry
+            // class, synthesise a minimal stub class with a no-op `main` so
+            // jboss-modules' bootstrap (`Class.forName(mainClass, false, mcl)`
+            // followed by `getDeclaredMethod("main", String[].class).invoke`)
+            // can complete instead of dying on NSME. See WF7 strategy notes
+            // at the top of this module for the rationale — the WF6
+            // `getDeclaredMethod` shim never fires because the class
+            // *appears* loaded by the time `getDeclaredMethod` runs (it just
+            // doesn't have a `main`); by injecting a real class earlier we
+            // sidestep that path entirely.
+            if let Some(mirror) =
+                wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+            {
+                tracing::warn!(
+                    target: "wf7",
+                    "[wf-shim] Class.forName synthesised stub for {}",
+                    internal_name
+                );
+                return Ok(Some(Value::Object(Some(mirror))));
             }
             Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,

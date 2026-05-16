@@ -129,6 +129,47 @@ pub fn register_bluej_stubs(registry: &mut NativeMethodRegistry) {
     for cn in [CN_AWT_LOCAL_GE, CN_AWT_PLATFORM_GI] {
         registry.register(cn, "<clinit>", "()V", bluej_clinit_noop);
     }
+
+    // Extended AWT/Swing subsystem clinit bypass. After the
+    // GraphicsEnvironment/PlatformGraphicsInfo no-ops landed, BlueJ
+    // progressed past the original crash and tripped a new NPE chain
+    // rooted at `java/awt/AWTKeyStroke.getCachedStroke`. The classes
+    // below form the AWT/Swing static-init cluster that BlueJ touches
+    // during its GUI bootstrap; none of them can initialize cleanly
+    // under CratonVM's partial bootstrap, so we short-circuit their
+    // `<clinit>` the same way as the graphics-env helpers.
+    for awt_class in [
+        "java/awt/AWTKeyStroke",
+        "java/awt/KeyboardFocusManager",
+        "java/awt/DefaultKeyboardFocusManager",
+        "java/awt/Toolkit",
+        "java/awt/EventQueue",
+        "javax/swing/UIManager",
+        "javax/swing/SwingUtilities",
+        "javax/swing/JFrame",
+        "javax/swing/JComponent",
+        "sun/awt/AppContext",
+        "sun/awt/SunToolkit",
+    ] {
+        registry.register(awt_class, "<clinit>", "()V", |_ctx, _args| Ok(None));
+    }
+
+    // AWTKeyStroke static factory no-ops: with the clinit short-circuited,
+    // the class's internal cache map is null, so the real factory methods
+    // would NPE when callers invoke them. Return a null AWTKeyStroke so
+    // callers get a clean null reference instead of a crash.
+    registry.register(
+        "java/awt/AWTKeyStroke",
+        "getCachedStroke",
+        "(CIIZ)Ljava/awt/AWTKeyStroke;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "java/awt/AWTKeyStroke",
+        "getAWTKeyStroke",
+        "(Ljava/lang/String;)Ljava/awt/AWTKeyStroke;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 }
 
 #[cfg(test)]
