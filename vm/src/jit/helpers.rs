@@ -1176,11 +1176,24 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if ptr == 0 {
                 values.push(Value::Object(None));
             } else {
-                // SAFETY: ptr is non-zero and was passed from JIT code as a receiver
-                // object pointer, which points to a live heap object.
-                values.push(Value::Object(Some(ObjectRef::from_raw(
-                    ptr as usize as *mut u8,
-                ))));
+                // Defensive: JIT operand-stack slots typed as `J` (long) may
+                // leak into call sites typed `L` (reference) and arrive here
+                // as tagged-long bits that are not valid heap pointers. The
+                // pre-ξ fix only checked alignment + 48-bit range, which lets
+                // a stray aligned long (e.g. file size, hash) through; GC
+                // then walks that bogus pointer and SEGVs. Round-trip via
+                // `heap.is_object_address` (same fix shape as
+                // `value_as_validated_object_ref`).
+                let bits = ptr as u64;
+                let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                    vm.heap.is_object_address(bits as usize)
+                } else {
+                    None
+                };
+                match validated {
+                    Some(obj) => values.push(Value::Object(Some(obj))),
+                    None => values.push(Value::Object(None)),
+                }
             }
         }
     }
@@ -1198,7 +1211,20 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 if raw == 0 {
                     Value::Object(None)
                 } else {
-                    Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                    // Same validated guard as the receiver decode above:
+                    // tagged-long bits must round-trip through
+                    // `heap.is_object_address` before being treated as an
+                    // ObjectRef, otherwise GC SEGVs walking the bogus oop.
+                    let bits = raw as u64;
+                    let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                        vm.heap.is_object_address(bits as usize)
+                    } else {
+                        None
+                    };
+                    match validated {
+                        Some(obj) => Value::Object(Some(obj)),
+                        None => Value::Object(None),
+                    }
                 }
             }
             _ => Value::Int(raw as i32),
@@ -1374,6 +1400,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     if receiver_raw == 0 {
         return 0;
     }
+    // Defensive: a receiver slot carrying tagged-long bits (low 3 bits set
+    // or value above the 48-bit canonical-address ceiling) is not a valid
+    // heap pointer.  Bail out with rc=0 (the dispatcher's "no result"
+    // path); this mirrors the receiver_raw == 0 short-circuit above and
+    // avoids the `ObjectRef::from_raw` alignment panic.
+    let receiver_bits = receiver_raw as u64;
+    if (receiver_bits & 0x7) != 0 || receiver_bits >= (1u64 << 48) {
+        return 0;
+    }
+    // SAFETY: receiver_bits is non-zero, 8-byte aligned, and within the
+    // 48-bit canonical address space — matches the invariants required by
+    // ObjectRef::from_raw for live heap objects.
     let receiver_ref = ObjectRef::from_raw(receiver_raw as usize as *mut u8);
     values.push(Value::Object(Some(receiver_ref)));
 
@@ -1389,7 +1427,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 if raw == 0 {
                     Value::Object(None)
                 } else {
-                    Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                    // Same defensive guard as the receiver decode above.
+                    // Tagged-long bits in an L/[ slot are downgraded to
+                    // null instead of panicking in ObjectRef::from_raw.
+                    let bits = raw as u64;
+                    if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                        // SAFETY: bits is non-zero, 8-byte aligned, and
+                        // within the 48-bit canonical address space.
+                        Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                    } else {
+                        Value::Object(None)
+                    }
                 }
             }
             _ => Value::Int(raw as i32),

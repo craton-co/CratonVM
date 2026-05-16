@@ -1034,9 +1034,351 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Enumeration;)Ljava/lang/Class;",
         return_null_object,
     );
+
+    // M3: AbstractBeanDefinition.resolveBeanClass(ClassLoader) → return null
+    // instead of throwing ClassNotFoundException, so Spring's
+    // preInstantiateSingletons skips beans whose class is missing on the
+    // partial classpath (e.g. RedisHttpSessionConfiguration in SportMe).
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "resolveBeanClass",
+        "(Ljava/lang/ClassLoader;)Ljava/lang/Class;",
+        m3_abstract_bean_definition_resolve_bean_class,
+    );
+
+    // N6: AbstractBeanFactory.doResolveBeanClass(RootBeanDefinition, Class[])
+    // → return null instead of throwing CNFE so Spring's preInstantiateSingletons
+    // skips beans whose class is missing on the partial classpath (e.g.
+    // RedisHttpSessionConfiguration in SportMe). M3 hooked the WRONG method;
+    // the actual throw site is the private doResolveBeanClass.
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanFactory",
+        "doResolveBeanClass",
+        "(Lorg/springframework/beans/factory/support/RootBeanDefinition;[Ljava/lang/Class;)Ljava/lang/Class;",
+        m4_abstract_bean_factory_do_resolve_bean_class,
+    );
+
+    // ───────────────────────────────────────────────────────────────────────
+    // CGLIB-ε: ConfigurationClassPostProcessor.processConfigBeanDefinitions
+    //
+    // Strategy: intercept the entry point where Spring decides which
+    // @Configuration / @Import classes get processed.  At this boundary we
+    // can manually walk every @Configuration class' @Import annotation tree
+    // and register a RootBeanDefinition for each imported class on the
+    // BeanDefinitionRegistry passed in as args[1].
+    //
+    // This complements the existing CCE.enhance() bypass (net_phase_e.rs):
+    // that bypass keeps CGLIB from blowing up but leaves @Import children
+    // unregistered.  Walking @Import here closes that gap so @EnableXxx
+    // chains pull in their child @Configuration beans even when the real
+    // ConfigurationClassParser path is incomplete.
+    //
+    // Reflection plan per (Class, ClassLoader):
+    //   for ann in ctx.class_annotations(cls):
+    //     if ann.type_descriptor == "Lorg/springframework/context/annotation/Import;":
+    //       for v in ann.elements[("value", Array(...))]:
+    //         if let Class(desc) = v -> derive imported class name,
+    //         allocate RootBeanDefinition, setBeanClassName, then call
+    //         registry.registerBeanDefinition(name, bd).
+    //
+    // We register on the concrete class and also on the
+    // BeanDefinitionRegistryPostProcessor interface so virtual dispatch on
+    // either receiver hits us.  An additional alternate intercept on
+    // BeanFactoryPostProcessor.postProcessBeanFactory is registered below
+    // so the same walk runs once per context refresh even if the registry
+    // boundary is skipped.
+    // ───────────────────────────────────────────────────────────────────────
+    const CCPP: &str = "org/springframework/context/annotation/ConfigurationClassPostProcessor";
+    const BDRPP: &str = "org/springframework/beans/factory/support/BeanDefinitionRegistryPostProcessor";
+    const BFPP: &str = "org/springframework/beans/factory/config/BeanFactoryPostProcessor";
+
+    registry.register(
+        CCPP,
+        "processConfigBeanDefinitions",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        ccpp_process_config_bean_definitions,
+    );
+    registry.register(
+        CCPP,
+        "postProcessBeanDefinitionRegistry",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        ccpp_process_config_bean_definitions,
+    );
+    registry.register(
+        BDRPP,
+        "postProcessBeanDefinitionRegistry",
+        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+        ccpp_process_config_bean_definitions,
+    );
+    // Alternate: BeanFactoryPostProcessor.postProcessBeanFactory — the
+    // ConfigurableListableBeanFactory passed here also implements
+    // BeanDefinitionRegistry in real Spring, so the same walk works.
+    registry.register(
+        CCPP,
+        "postProcessBeanFactory",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        ccpp_process_config_bean_definitions,
+    );
+    registry.register(
+        BFPP,
+        "postProcessBeanFactory",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        ccpp_process_config_bean_definitions,
+    );
+}
+
+// Spring's @Import annotation descriptor.
+const IMPORT_DESC: &str = "Lorg/springframework/context/annotation/Import;";
+// Spring's @Configuration annotation descriptor.
+const CONFIGURATION_DESC: &str = "Lorg/springframework/context/annotation/Configuration;";
+
+/// Manually walk @Configuration → @Import chains and register each imported
+/// class with the BeanDefinitionRegistry passed as args[1].  This is the
+/// CGLIB-ε strategy: instead of intercepting `enhance` (where CGLIB itself
+/// runs), we intercept at the boundary where Spring decides which
+/// @Configuration classes to process.
+fn ccpp_process_config_bean_definitions(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] = receiver (ConfigurationClassPostProcessor)
+    // args[1] = BeanDefinitionRegistry (or ConfigurableListableBeanFactory)
+    let registry = match args.get(1).cloned() {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            eprintln!("[CCPP-DBG] processConfigBeanDefinitions: no registry arg → no-op");
+            return Ok(None);
+        }
+    };
+
+    // Snapshot every loaded application class so we don't mutate the list
+    // while load_class() runs inside the walk.
+    let class_names = ctx.list_application_class_names();
+    let mut seen_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut registered = 0usize;
+
+    for cls_name in &class_names {
+        let cid = match ctx.class_id_by_name(cls_name) {
+            Some(c) => c,
+            None => continue,
+        };
+        // Only walk @Configuration classes.
+        let anns = ctx.class_annotations(cid);
+        let is_config = anns
+            .iter()
+            .any(|a| a.type_descriptor == CONFIGURATION_DESC);
+        if !is_config {
+            continue;
+        }
+        walk_imports_recursive(ctx, cls_name, registry, &mut seen_imports, &mut registered, 0);
+    }
+
+    if registered > 0 {
+        eprintln!(
+            "[CCPP-DBG] processConfigBeanDefinitions: registered {} @Import bean definitions across {} @Configuration classes",
+            registered,
+            class_names.len(),
+        );
+    }
+    Ok(None)
+}
+
+/// Recursively walk a class' @Import tree and ensure every imported class
+/// has a RootBeanDefinition registered.  `seen` prevents cycles.
+fn walk_imports_recursive(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    registry: ObjectRef,
+    seen: &mut std::collections::HashSet<String>,
+    registered: &mut usize,
+    depth: usize,
+) {
+    if depth > 16 {
+        return; // safety guard against pathological @Import cycles
+    }
+    let cid = match ctx.class_id_by_name(class_name) {
+        Some(c) => c,
+        None => {
+            // Try to load on demand so @Import targets that aren't yet
+            // loaded still get walked.
+            if ctx.load_class(class_name).is_err() {
+                return;
+            }
+            match ctx.class_id_by_name(class_name) {
+                Some(c) => c,
+                None => return,
+            }
+        }
+    };
+
+    let anns = ctx.class_annotations(cid);
+    let import_ann = match anns.iter().find(|a| a.type_descriptor == IMPORT_DESC) {
+        Some(a) => a.clone(),
+        None => return,
+    };
+
+    // @Import.value() is a Class[] — find the "value" element.
+    let value_array = match import_ann
+        .elements
+        .iter()
+        .find(|(name, _)| name == "value")
+    {
+        Some((_, v)) => v.clone(),
+        None => return,
+    };
+
+    let entries = match value_array {
+        rustjvm_native_api::AnnotationElementValue::Array(v) => v,
+        single => vec![single],
+    };
+
+    for entry in entries {
+        let desc = match entry {
+            rustjvm_native_api::AnnotationElementValue::Class(d) => d,
+            _ => continue,
+        };
+        // Convert "Lcom/foo/Bar;" → "com/foo/Bar".
+        if !(desc.starts_with('L') && desc.ends_with(';')) {
+            continue;
+        }
+        let imp_class = desc[1..desc.len() - 1].to_string();
+        if !seen.insert(imp_class.clone()) {
+            continue; // already processed
+        }
+        // Skip @Import targets whose class isn't on the classpath — mirrors
+        // Spring's behavior where ClassNotFound during @Import processing
+        // simply omits the import (often guarded by @ConditionalOnClass).
+        // Without this, registering a RootBeanDefinition for a missing class
+        // throws CannotLoadBeanClassException later during bean preInstantiation.
+        if ctx.class_id_by_name(&imp_class).is_none()
+            && ctx.load_class(&imp_class).is_err()
+        {
+            if std::env::var("CCPP_DBG").is_ok() {
+                eprintln!(
+                    "[CCPP-DBG] walk_imports: skipping missing @Import target {}",
+                    imp_class
+                );
+            }
+            continue;
+        }
+        // Register a RootBeanDefinition for this imported class.
+        if register_root_bean_definition(ctx, registry, &imp_class) {
+            *registered += 1;
+        }
+        // Recurse into the import's own @Import tree.
+        walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1);
+    }
+}
+
+/// Allocate a `RootBeanDefinition`, set its bean class name, and call
+/// `registry.registerBeanDefinition(name, bd)`.  Returns true on success.
+fn register_root_bean_definition(
+    ctx: &mut dyn NativeContext,
+    registry: ObjectRef,
+    class_name: &str,
+) -> bool {
+    const RBD: &str = "org/springframework/beans/factory/support/RootBeanDefinition";
+    // Allocate. Prefer the real constructor; fall back to synthetic if the
+    // class isn't loadable in this context.
+    let bd = match ctx.new_object(RBD).ok().flatten() {
+        Some(Value::Object(Some(o))) => {
+            let _ = ctx.invoke(RBD, "<init>", "()V", &[Value::Object(Some(o))]);
+            o
+        }
+        _ => crate::alloc_concurrent_synthetic(ctx, RBD, 16),
+    };
+    // setBeanClassName(String) — declared on AbstractBeanDefinition.
+    let name_obj = ctx.create_string(class_name);
+    let _ = ctx.invoke(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "setBeanClassName",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(bd)), Value::Object(Some(name_obj))],
+    );
+    // registry.registerBeanDefinition(beanName, bd) — beanName defaults to
+    // the FQN for @Import children when the imported class has no explicit
+    // bean name.
+    let bean_name = ctx.create_string(&class_name.replace('/', "."));
+    let res = ctx.invoke(
+        "org/springframework/beans/factory/support/BeanDefinitionRegistry",
+        "registerBeanDefinition",
+        "(Ljava/lang/String;Lorg/springframework/beans/factory/config/BeanDefinition;)V",
+        &[
+            Value::Object(Some(registry)),
+            Value::Object(Some(bean_name)),
+            Value::Object(Some(bd)),
+        ],
+    );
+    res.is_ok()
 }
 
 fn return_null_object(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// M3: AbstractBeanDefinition.resolveBeanClass(ClassLoader) → Class
+///
+/// Returns null on ClassNotFound instead of throwing. Spring's downstream
+/// (`getTypeForFactoryBean`, `predictBeanType`, `isFactoryBean`,
+/// `findAutowireCandidates`) handles null gracefully; throwing would
+/// fail-fast in `preInstantiateSingletons`.
+fn m3_abstract_bean_definition_resolve_bean_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let recv = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Read beanClassName String field via getfield by name
+    let name_obj = match ctx.get_field_by_name(recv, "beanClassName") {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_name = match ctx.read_string(name_obj) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let internal = class_name.replace('.', "/");
+    // Try to load via class manager; on failure return null (no CNFE).
+    if let Some(cid) = ctx.class_id_by_name(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    // Fallback: try ensure_class_initialized (which loads if necessary).
+    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn m4_abstract_bean_factory_do_resolve_bean_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] = this (AbstractBeanFactory), args[1] = mbd (RootBeanDefinition)
+    let mbd = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name_obj = match ctx.get_field_by_name(mbd, "beanClassName") {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_name = match ctx.read_string(name_obj) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let internal = class_name.replace('.', "/");
+    if let Some(cid) = ctx.class_id_by_name(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
     Ok(Some(Value::Object(None)))
 }
 

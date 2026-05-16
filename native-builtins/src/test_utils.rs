@@ -192,6 +192,17 @@ pub(crate) struct MockNativeContext {
     /// backend.
     pub(crate) last_define_full_opts:
         UnsafeCell<Option<rustjvm_native_api::DefineClassFull>>,
+    /// CGLIB-η: snapshot of the most recent `define_class_full` call's
+    /// `loader_id` argument, so loader-inheritance tests can assert the
+    /// new class lands in the lookup class's loader namespace rather
+    /// than always in the Application loader.
+    pub(crate) last_define_full_loader: UnsafeCell<Option<u32>>,
+    /// CGLIB-η: per-class `loader_id` override, returned by the
+    /// `loader_id_of_class` trait method. Defaults to 2 (Application);
+    /// tests populate this via `set_loader_id_override(cid, raw)` where
+    /// `raw` follows the `loader_id_of_class` encoding (0=Bootstrap,
+    /// 1=Extension, 2=Application, N>=3=UserDefined(N)).
+    pub(crate) loader_id_override: UnsafeCell<HashMap<u32, i32>>,
 }
 
 impl MockNativeContext {
@@ -229,7 +240,29 @@ impl MockNativeContext {
             registered_classpath: UnsafeCell::new(Vec::new()),
             nest_host_override: UnsafeCell::new(HashMap::new()),
             last_define_full_opts: UnsafeCell::new(None),
+            last_define_full_loader: UnsafeCell::new(None),
+            loader_id_override: UnsafeCell::new(HashMap::new()),
         }
+    }
+
+    /// CGLIB-η: declare that `class_id` belongs to the given raw loader
+    /// (using the `loader_id_of_class` encoding: 0=Bootstrap,
+    /// 1=Extension, 2=Application, N>=3=UserDefined(N)).
+    #[allow(dead_code)]
+    pub(crate) fn set_loader_id_override(&self, class_id: ClassId, raw_loader: i32) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.loader_id_override.get())
+                .insert(class_id.as_u32(), raw_loader);
+        }
+    }
+
+    /// CGLIB-η: read the `loader_id` of the most recent
+    /// `define_class_full` call. `None` if no call has been made yet.
+    #[allow(dead_code)]
+    pub(crate) fn last_define_full_loader(&self) -> Option<u32> {
+        // SAFETY: single-threaded test code.
+        unsafe { *self.last_define_full_loader.get() }
     }
 
     /// WP8.11.5: declare that `child_id` has a nest host named `host`.
@@ -668,8 +701,14 @@ impl NativeContext for MockNativeContext {
         self.name_to_id.get(name).map(|&id| ClassId::new(id))
     }
 
-    fn loader_id_of_class(&self, _class_id: ClassId) -> i32 {
-        2 // default to app loader in test context
+    fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.loader_id_override.get())
+                .get(&class_id.as_u32())
+                .copied()
+                .unwrap_or(2) // default to app loader
+        }
     }
 
     fn is_record_class(&self, _class_id: ClassId) -> bool {
@@ -1143,12 +1182,13 @@ impl NativeContext for MockNativeContext {
         &mut self,
         name: &str,
         bytes: &[u8],
-        _loader_id: u32,
+        loader_id: u32,
         opts: rustjvm_native_api::DefineClassFull,
     ) -> Result<ClassId, String> {
         // SAFETY: single-threaded test code.
         unsafe {
             *self.last_define_full_opts.get() = Some(opts.clone());
+            *self.last_define_full_loader.get() = Some(loader_id);
         }
         // Use override_name if present (hidden-class mangled name path).
         let stored_name = opts.override_name.as_deref().unwrap_or(name);

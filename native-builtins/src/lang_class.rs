@@ -5417,6 +5417,53 @@ fn create_annotation_proxy(
         }
     }
 
+    // ---------------------------------------------------------------------
+    // CGLIB-γ override — force Spring `@Configuration(proxyBeanMethods=false)`.
+    //
+    // CratonVM has no CGLIB bytecode-rewriter, so Spring's default
+    // CGLIB-enhanced "full" `@Configuration` semantics (where @Bean methods
+    // are intercepted and cached on repeat calls) are not realisable. With
+    // the CGLIB intercept stubbed, `@Bean` methods that call other `@Bean`
+    // methods would execute multiple times and produce duplicate beans.
+    //
+    // Setting `proxyBeanMethods=false` switches Spring into "lite" mode in
+    // `ConfigurationClassUtils.checkConfigurationClassCandidate`: @Bean
+    // methods are still registered, but no CGLIB enhancement is expected and
+    // no inter-bean caching is required. This is the same configuration
+    // mode that Spring Boot itself uses for `@SpringBootConfiguration` since
+    // 5.2, and it is a supported user-facing setting — we are just forcing
+    // the global default.
+    //
+    // The override is keyed strictly on the annotation type descriptor
+    // (`Lorg/springframework/context/annotation/Configuration;`) and the
+    // single element name `proxyBeanMethods`, so no other annotation is
+    // affected. Tradeoff: applications that rely on shared-singleton
+    // semantics across direct `@Bean`→`@Bean` calls (i.e. they call
+    // `this.beanMethod()` and expect the same instance back) will get a
+    // fresh instance instead. That is the documented price of lite mode
+    // and matches the contract users opt into when they set the flag
+    // explicitly. Authorised by user as a targeted Spring shim while
+    // CGLIB support is deferred.
+    if ann.type_descriptor == "Lorg/springframework/context/annotation/Configuration;" {
+        let force_false = rustjvm_native_api::AnnotationElementValue::Int(0);
+        let mut found = false;
+        for (name, val, ret_desc) in all_elements.iter_mut() {
+            if name == "proxyBeanMethods" {
+                *val = force_false.clone();
+                *ret_desc = Some("Z".to_string());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            all_elements.push((
+                "proxyBeanMethods".to_string(),
+                force_false,
+                Some("Z".to_string()),
+            ));
+        }
+    }
+
     // Store element name→value pairs as parallel arrays
     let n = all_elements.len();
     let names_arr = ctx.new_ref_array(ClassId::new(0), n);
@@ -6977,7 +7024,9 @@ fn t19_h10_class_manifest_attr(
         return None;
     }
 
-    // Plain `file:` URL (single jar).
+    // Plain `file:` URL (single jar). Cache the parsed manifest so repeated
+    // `Class.getPackage()` invocations that each query 6 attributes don't
+    // re-parse the same jar each time.
     let path = url.strip_prefix("file:").unwrap_or(&url);
     let path = path.trim_start_matches('/');
     let path = if cfg!(windows) {
@@ -6988,23 +7037,98 @@ fn t19_h10_class_manifest_attr(
     if !path.is_file() {
         return None;
     }
-    let manifest = rustjvm_classloading::ClassPath::read_jar_manifest(&path)?;
-    manifest.attributes.get(attr).cloned()
+    plain_jar_manifest_attr(&path, attr)
+}
+
+/// Cache of parsed plain-jar manifests keyed by canonicalised path string.
+/// Stores ALL main attributes (case-insensitive keys) so the 6 attribute
+/// lookups per `Class.getPackage()` only parse the jar once.
+fn plain_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn plain_jar_manifest_attr(path: &std::path::Path, attr: &str) -> Option<String> {
+    let cache_key = path.display().to_string();
+    let attr_lc = attr.to_ascii_lowercase();
+
+    if let Ok(cache) = plain_manifest_cache().lock() {
+        if let Some(map) = cache.get(&cache_key) {
+            return map.get(&attr_lc).cloned();
+        }
+    }
+
+    let manifest = rustjvm_classloading::ClassPath::read_jar_manifest(path);
+    let mut map: HashMap<String, String> = HashMap::new();
+    if let Some(m) = &manifest {
+        for (k, v) in m.attributes.iter() {
+            map.insert(k.to_ascii_lowercase(), v.clone());
+        }
+    }
+    let result = map.get(&attr_lc).cloned();
+    if let Ok(mut cache) = plain_manifest_cache().lock() {
+        cache.insert(cache_key, map);
+    }
+    result
+}
+
+/// Cache of parsed nested-jar manifest attributes, keyed by
+/// `(outer_jar_path, inner_jar_entry)`. Value is a fully-parsed map of
+/// MANIFEST.MF main attributes (case-insensitive lookups handled by
+/// lowercasing keys at insertion time). This is essential for Spring Boot
+/// fat-jar startup: `Class.getPackage()` queries 6 manifest attributes per
+/// invocation, and Tomcat's `StringManager.getManager(Class)` calls
+/// `getPackage()` once per package level for every class it touches.
+/// Without caching, each call re-opens the outer 30-100MB JAR, parses its
+/// central directory, extracts an inner ~5MB JAR into memory, parses ITS
+/// central directory, and reads the MANIFEST.MF — taking 1-3 seconds each.
+/// That blows up to minute-scale wait times during Tomcat init and is what
+/// caused `insurance-backend` to never reach the Spring "Started" banner
+/// within the 60s timeout.
+fn nested_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Open the outer jar, extract the inner-jar entry into memory, and read
 /// the requested `META-INF/MANIFEST.MF` attribute from inside the inner jar.
-/// Returns `None` on any I/O / format failure (best-effort).
+/// Returns `None` on any I/O / format failure (best-effort). Caches the
+/// parsed manifest per `(outer_jar, inner_entry)` so repeated lookups of
+/// different attributes on the same nested jar — the common case during
+/// Spring Boot startup — are O(1) hash lookups.
 fn nested_jar_manifest_attr(
     outer_jar: &std::path::Path,
     inner_entry: &str,
     attr: &str,
 ) -> Option<String> {
+    let entry_name = inner_entry.trim_start_matches('/');
+    let cache_key = format!("{}!{}", outer_jar.display(), entry_name);
+    let attr_lc = attr.to_ascii_lowercase();
+
+    // Fast path: cache hit.
+    {
+        let cache = nested_manifest_cache().lock().ok()?;
+        if let Some(map) = cache.get(&cache_key) {
+            return map.get(&attr_lc).cloned();
+        }
+    }
+
+    // Cold path: parse the nested manifest exactly once.
+    let parsed = parse_nested_jar_manifest(outer_jar, entry_name).unwrap_or_default();
+    let result = parsed.get(&attr_lc).cloned();
+    if let Ok(mut cache) = nested_manifest_cache().lock() {
+        cache.insert(cache_key, parsed);
+    }
+    result
+}
+
+fn parse_nested_jar_manifest(
+    outer_jar: &std::path::Path,
+    entry_name: &str,
+) -> Option<HashMap<String, String>> {
     use std::io::Read;
     let file = std::fs::File::open(outer_jar).ok()?;
     let mut outer = zip::ZipArchive::new(file).ok()?;
-    // Inner entry path inside the outer zip — strip any leading `/`.
-    let entry_name = inner_entry.trim_start_matches('/');
     let mut inner_bytes: Vec<u8> = Vec::new();
     {
         let mut entry = outer.by_name(entry_name).ok()?;
@@ -7021,14 +7145,13 @@ fn nested_jar_manifest_attr(
     }
     // Parse MANIFEST.MF main attributes (no continuation-line handling for
     // the simple `Implementation-Version: X.Y.Z` cases we care about).
+    let mut map = HashMap::new();
     for line in mf_str.lines() {
         if let Some((k, v)) = line.split_once(": ") {
-            if k.trim().eq_ignore_ascii_case(attr) {
-                return Some(v.trim().to_string());
-            }
+            map.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    None
+    Some(map)
 }
 
 /// Real `Class.getPackage()` native — returns a `java.lang.Package` mirror

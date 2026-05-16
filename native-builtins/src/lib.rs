@@ -460,6 +460,9 @@ pub mod apps_h2;
 pub mod deprecated_internal;
 pub mod deprecated_verify;
 pub mod net_phase_e;
+// CGLIB / Spring `ConfigurationClassEnhancer.enhance` minimal bytecode emitter.
+// Registered AFTER `net_phase_e::register_phase_e_networking` so it wins.
+pub mod cglib_enhancer;
 // T16.8: Reference types (Reference / Weak / Soft / Phantom / ReferenceQueue)
 pub mod reference;
 // T16.9: Stream terminal / Flow.Subscriber overrides
@@ -656,6 +659,18 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/PrintWriter", "println", "()V", native_println_void);
     registry.register("java/io/PrintWriter", "println", "(I)V", native_println_int);
     registry.register("java/io/PrintWriter", "println", "(Ljava/lang/Object;)V", native_println_object);
+    // Single-arg `PrintWriter(OutputStream)` — JDK chains to
+    // `PrintWriter(OutputStream, boolean)` with `autoFlush=false`.  JUnit's
+    // ConsoleLauncher invokes this twice during startup (wrapping stdout
+    // and stderr); without an explicit native, real-JDK dispatch fails to
+    // resolve the constructor and the launcher silently aborts with zero
+    // tests run.
+    registry.register(
+        "java/io/PrintWriter",
+        "<init>",
+        "(Ljava/io/OutputStream;)V",
+        native_printwriter_init_outputstream,
+    );
 }
 
 std::thread_local! {
@@ -4688,6 +4703,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // every entry wins against any synthetic-placeholder from earlier
     // phases. See `native-builtins/src/net_phase_e.rs`.
     net_phase_e::register_phase_e_networking(registry);
+
+    // CGLIB / Spring `ConfigurationClassEnhancer.enhance` minimal bytecode
+    // emitter. Registered AFTER `net_phase_e::register_phase_e_networking`
+    // so the real emitter at `cglib_enhancer.rs` overrides the older
+    // "return original class" bypass registration at lines 2305-2357 of
+    // `net_phase_e.rs` (registry semantics: last-writer-wins).
+    cglib_enhancer::register_cglib_enhancer(registry);
 
     // --- Wave 5 — Net + TLS ---
     // Registered AFTER `net_phase_e` so any colliding (class, method,
@@ -10409,19 +10431,42 @@ fn native_object_notify_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // java.io.PrintStream natives
 // ---------------------------------------------------------------------------
 
-/// Detect if a PrintStream is a system stream (stdout fd=1, stderr fd=2).
-/// Returns the fd_id if it is, None otherwise.
+/// Detect if a PrintStream / PrintWriter is (or wraps) a system stream
+/// (stdout fd=1, stderr fd=2).  Returns the fd_id if so, None otherwise.
+///
+/// The receiver may be:
+///   * `System.out` / `System.err` itself, in which case ptr-equality wins
+///     immediately; OR
+///   * a `PrintWriter` (or similar wrapper) whose synthetic layout stores
+///     the underlying stream in `field 0` — e.g. `new PrintWriter(System.out)`
+///     constructed via `native_printwriter_init_outputstream`.  We follow
+///     that chain a few hops to handle BufferedWriter / OutputStreamWriter
+///     pass-throughs.
 fn stream_fd(ctx: &dyn NativeContext, args: &[Value]) -> Option<u32> {
-    if let Some(Value::Object(Some(stream))) = args.first() {
-        if let Some(out) = ctx.get_system_stream("out") {
-            if std::ptr::eq(stream.as_ptr(), out.as_ptr()) {
-                return Some(1);
-            }
+    let Some(Value::Object(Some(stream))) = args.first() else { return None; };
+    let out = ctx.get_system_stream("out");
+    let err = ctx.get_system_stream("err");
+    let matches_fd = |obj: &ObjectRef| -> Option<u32> {
+        if let Some(o) = &out {
+            if std::ptr::eq(obj.as_ptr(), o.as_ptr()) { return Some(1); }
         }
-        if let Some(err) = ctx.get_system_stream("err") {
-            if std::ptr::eq(stream.as_ptr(), err.as_ptr()) {
-                return Some(2);
-            }
+        if let Some(e) = &err {
+            if std::ptr::eq(obj.as_ptr(), e.as_ptr()) { return Some(2); }
+        }
+        None
+    };
+
+    // Direct match (PrintStream is System.out/err) or wrapped match
+    // (PrintWriter.field0 == System.out/err).  Walk a small chain to
+    // tolerate wrapper-on-wrapper layouts.
+    let mut cur = *stream;
+    for _ in 0..4 {
+        if let Some(fd) = matches_fd(&cur) {
+            return Some(fd);
+        }
+        match ctx.get_field(cur, 0) {
+            Value::Object(Some(next)) => cur = next,
+            _ => break,
         }
     }
     None
@@ -10671,6 +10716,61 @@ fn native_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// dispatches to whatever concrete subtype was wired up (StringWriter,
 /// BufferedWriter, OutputStreamWriter, etc.). If no backing writer is
 /// attached we still record the formatted line for test inspection.
+/// `PrintWriter(OutputStream out)` — single-arg constructor.
+///
+/// JDK semantics: delegates to `PrintWriter(OutputStream, boolean)` with
+/// `autoFlush=false`, which wraps the stream in a `BufferedWriter` over an
+/// `OutputStreamWriter` and stores it as the underlying `Writer`.
+///
+/// JUnit's ConsoleLauncher wraps stdout and stderr with this constructor
+/// twice during startup; previously CratonVM logged a WARN and silently
+/// continued, leading to a downstream NPE inside the launcher and zero
+/// tests executed.
+///
+/// Implementation strategy: delegate to the real two-arg JDK constructor
+/// via `invoke_special` so that the JDK's own `out`/`lock`/etc. fields get
+/// populated correctly.  As a defensive fallback (in case the two-arg ctor
+/// is itself unavailable), we also set the synthetic `field 0 = stream`
+/// convention used by `native_printwriter_printf` and the wrapping branch
+/// of `stream_fd`.
+fn native_printwriter_init_outputstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let out_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+
+    // Set the synthetic `field 0 = stream` slot up front so the stream_fd
+    // wrapper-walk works even if invoke_special below silently bails.
+    ctx.set_field(this, 0, out_val.clone());
+    // Best-effort: assign the JDK-named `out` field on the receiver so
+    // real-JDK `print*` bytecode paths find their underlying Writer.
+    ctx.set_field_by_name(this, "out", out_val.clone());
+
+    // PrintWriter inherits `protected Object lock` from `Writer`.  Real
+    // JDK methods like `flush()`, `write(...)` etc. do `synchronized (lock)`;
+    // without a lock object the bytecode NPEs on monitorenter.  Allocate a
+    // bare Object and install it under the canonical field name (we
+    // tolerate `set_field_by_name` silently failing on unknown layouts).
+    if let Ok(Some(Value::Object(Some(lock_ref)))) = ctx.new_object("java/lang/Object") {
+        ctx.set_field_by_name(this, "lock", Value::Object(Some(lock_ref)));
+    }
+
+    // Try to chain to the real two-arg JDK constructor (autoFlush=false).
+    // We ignore the result: the synthetic field-0 fallback above is enough
+    // for our native print/println intercepts, and this path is best-effort.
+    let _ = ctx.invoke_special(
+        "java/io/PrintWriter",
+        "<init>",
+        "(Ljava/io/OutputStream;Z)V",
+        &[Value::Object(Some(this)), out_val, Value::Int(0)],
+    );
+    Ok(None)
+}
+
 fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this_opt = match args.first() {
         Some(Value::Object(obj)) => *obj,

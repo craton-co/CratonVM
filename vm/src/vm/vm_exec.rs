@@ -36,6 +36,56 @@ use crate::classloading::ClassStore;
 use crate::native::registry::NativeCallback;
 
 // ---------------------------------------------------------------------------
+// CP-resolved-interface plumbing for the default-method rescue
+// ---------------------------------------------------------------------------
+//
+// invokeinterface on a receiver whose runtime class is bare `java/lang/Object`
+// (e.g. a synthetic ServiceLoader provider stub) loses track of the CP-resolved
+// interface as control flows through `execute_invoke` → `invoke_shared` →
+// `invoke_on_class_shared_inner`. The receiver-based rescues in those layers
+// cannot recover a default method declared on the interface itself because the
+// receiver class doesn't list the interface in its `interfaces` table.
+//
+// We stash the CP-resolved interface class id on a per-thread slot just before
+// the dispatch site, and consume it at the NSME-emit site to give the lookup
+// one more chance against the interface's own hierarchy. The slot is
+// per-thread and is cleared after each invoke to avoid leaking between calls.
+std::thread_local! {
+    static INVOKE_CP_IFACE_CID: std::cell::Cell<Option<ClassId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard that swaps the per-thread "pending CP iface" slot on construction
+/// and restores the prior value on drop. Use at each invoke boundary so nested
+/// invokes don't leak each other's CP iface ids.
+pub struct PendingCpIfaceGuard {
+    prev: Option<ClassId>,
+}
+
+impl PendingCpIfaceGuard {
+    pub fn new(new_cid: Option<ClassId>) -> Self {
+        let prev = INVOKE_CP_IFACE_CID.with(|c| {
+            let p = c.get();
+            c.set(new_cid);
+            p
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for PendingCpIfaceGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        INVOKE_CP_IFACE_CID.with(|c| c.set(prev));
+    }
+}
+
+/// Read (without clearing) the pending CP-resolved interface id, if any.
+fn pending_cp_iface() -> Option<ClassId> {
+    INVOKE_CP_IFACE_CID.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
 // Method-return value coercion
 // ---------------------------------------------------------------------------
 
@@ -105,6 +155,40 @@ pub fn coerce_native_return(value: Option<Value>, descriptor: &str) -> Option<Va
         return value;
     }
     value.map(|v| coerce_value_for_return(v, ret))
+}
+
+/// Validated variant of [`coerce_value_for_return`] for the `b'L' | b'['`
+/// path: instead of trusting any aligned `Value::Long` bits as a valid
+/// jobject pointer (the legacy bug that lets a `long` carrying e.g. a file
+/// size or hash code be reinterpreted as an `ObjectRef`, then later marked
+/// by GC -> Win32 SEGV / 0xC0000005), round-trip the bits through
+/// `shared.heap.is_object_address`. Real `Value::Object(_)` and primitive
+/// return types are forwarded to the legacy coercer unchanged.
+///
+/// This mirrors `value_as_validated_object_ref` and is the read-side fix
+/// for the same "Value::Long misidentified as ObjectRef" family of crashes
+/// that the ξ patch fixed on the native-pin path.
+#[inline]
+pub fn coerce_value_for_return_validated(
+    shared: &SharedVm,
+    value: Value,
+    ret_type: u8,
+) -> Value {
+    if matches!(ret_type, b'L' | b'[') {
+        return match value {
+            Value::Int(0) | Value::Long(0) => Value::Object(None),
+            Value::Object(_) => value,
+            Value::Long(v) => match jlong_bits_as_aligned_object_ptr(v as u64) {
+                Some(p) => match shared.heap.is_object_address(p) {
+                    Some(obj) => Value::Object(Some(obj)),
+                    None => Value::Object(None),
+                },
+                None => Value::Object(None),
+            },
+            other => other,
+        };
+    }
+    coerce_value_for_return(value, ret_type)
 }
 
 /// Unbox the return value of a signature-polymorphic native (invoke/
@@ -223,11 +307,29 @@ pub fn value_as_object_ref(v: Value) -> Option<ObjectRef> {
     }
 }
 
+/// Like [`value_as_object_ref`] but verifies that a `Value::Long` whose bits
+/// look like an aligned pointer actually points at a heap object before
+/// returning it. Without this check, a real `Value::Long` carrying e.g. a
+/// file size that happens to be 8-byte aligned would be reinterpreted as a
+/// jobject; the GC would later try to mark/move that bogus pointer and
+/// SEGV.  Real `Value::Object(Some(_))` is always returned as-is.
+#[inline]
+pub fn value_as_validated_object_ref(shared: &SharedVm, v: Value) -> Option<ObjectRef> {
+    match v {
+        Value::Object(Some(o)) => Some(o),
+        Value::Long(bits) => {
+            let p = jlong_bits_as_aligned_object_ptr(bits as u64)?;
+            shared.heap.is_object_address(p)
+        }
+        _ => None,
+    }
+}
+
 /// Pin a value that may encode a jobject as `Value::Long` for the duration
 /// of a native call (see `safe_native_call`).
 #[inline]
-fn pin_value_for_native_call(roots: &mut Vec<ObjectRef>, v: &Value) {
-    if let Some(o) = value_as_object_ref(*v) {
+fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &Value) {
+    if let Some(o) = value_as_validated_object_ref(shared, *v) {
         roots.push(o);
     }
 }
@@ -245,7 +347,7 @@ pub fn safe_native_call(
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
     for a in args {
-        pin_value_for_native_call(&mut thread.native_pin_roots, a);
+        pin_value_for_native_call(shared, &mut thread.native_pin_roots, a);
     }
 
     let result = {
@@ -316,7 +418,7 @@ pub fn safe_native_call(
     thread.native_pin_roots.truncate(pin_base);
     thread.native_pending_return = None;
     if let Ok(Some(v)) = &out {
-        if let Some(o) = value_as_object_ref(*v) {
+        if let Some(o) = value_as_validated_object_ref(shared, *v) {
             thread.native_pending_return = Some(o);
         }
     }
@@ -537,12 +639,28 @@ fn normalize_system_property_key(key: &str) -> &str {
 impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
+    ///
+    /// See `update_root_snapshot` (`vm/src/runtime/interpreter.rs`) for why the
+    /// operand-stack-sourced roots are filtered against `heap.is_object_address`:
+    /// `ValueStack::scan_object_refs` still treats pointer-shaped `Long` bits as
+    /// roots without heap validation (its file is restricted from edits), and
+    /// the resulting bogus addresses crash the GC at the next mark/move.
     pub(crate) fn deposit_root_snapshot(&self) {
         let mut snapshot = self.thread.root_snapshot.lock();
         snapshot.clear();
         for frame in &self.thread.frames {
             frame.scan_local_objects(&mut snapshot);
+            let before = snapshot.len();
             frame.stack.scan_object_refs(&mut snapshot, &self.shared.heap);
+            if snapshot.len() > before {
+                let added = snapshot.split_off(before);
+                for o in added {
+                    let addr = o.as_ptr() as usize;
+                    if self.shared.heap.is_object_address(addr).is_some() {
+                        snapshot.push(o);
+                    }
+                }
+            }
         }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
@@ -1139,10 +1257,30 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
-        self.shared
+        if self
+            .shared
             .class_manager
             .read()
             .is_subclass_of(child, parent)
+        {
+            return true;
+        }
+        // Synthetic lambda proxy ClassIds (>= 0x8000_0000) are not in the
+        // class manager, so `is_subclass_of` always reports false. Reflection
+        // callers like CGLIB's `CallbackInfo.determineType` then conclude that
+        // the lambda doesn't implement its functional interface and throw
+        // `IllegalStateException("Unknown callback type ...")`. Route through
+        // `lambda_proxy_satisfies` so reflective `isAssignableFrom`,
+        // `isInstance`, and friends agree with the interpreter's
+        // checkcast/instanceof view.
+        if child.as_u32() >= 0x8000_0000 {
+            return crate::runtime::interpreter::lambda_proxy_satisfies_public(
+                self.shared,
+                child,
+                parent,
+            );
+        }
+        false
     }
 
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
@@ -4239,6 +4377,15 @@ pub(super) fn proxy_invoke_handler(
         .heap
         .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(ctx.shared, ClassId::new(0));
+    // Resolve the actual declaring-interface mirror for the synthesized
+    // Method's `clazz` field — see `proxy_resolve_declaring_class_mirror`
+    // for why `ClassId(0)` (== `Object` in production) is unsafe here.
+    let declaring_mirror = proxy_resolve_declaring_class_mirror(
+        ctx.shared,
+        proxy,
+        method_name,
+        descriptor,
+    );
     let name_str = super::create_java_string(ctx.shared, method_name);
     // Parse descriptor into per-parameter and return type descriptors so we
     // can populate the synthetic Method's `returnType` and `parameterTypes`
@@ -4264,7 +4411,7 @@ pub(super) fn proxy_invoke_handler(
             .ok();
     }
     let desc_str = super::create_java_string(ctx.shared, descriptor);
-    proxy_method_set_field_by_name(ctx.shared, method_obj, "clazz", Value::Object(Some(zero_mirror)));
+    proxy_method_set_field_by_name(ctx.shared, method_obj, "clazz", Value::Object(Some(declaring_mirror)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "name", Value::Object(Some(name_str)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "returnType", Value::Object(Some(return_type_mirror)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "parameterTypes", Value::Object(Some(param_arr)));
@@ -4286,13 +4433,16 @@ pub(super) fn proxy_invoke_handler(
     if total_fields >= 8 {
         // Skip вЂ” class layout already has the JDK fields populated above.
     } else {
-        ctx.shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
+        ctx.shared.heap.set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
         ctx.shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
         ctx.shared.heap.set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         ctx.shared.heap.set_field(method_obj, 3, Value::Object(Some(param_arr)));
         ctx.shared.heap.set_field(method_obj, 4, Value::Int(1));
         ctx.shared.heap.set_field(method_obj, 5, Value::Object(Some(desc_str)));
         ctx.shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
+        // Silence "zero_mirror unused" — kept above to preserve the
+        // original allocation flow.
+        let _ = zero_mirror;
     }
 
     // Build Object[] of args вЂ” box primitives so InvocationHandler receives Object[].
@@ -4451,6 +4601,15 @@ pub(crate) fn proxy_invoke_handler_shared(
     let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
     let method_obj = shared.heap.alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
+    // Resolve the actual declaring-interface mirror for the synthesized
+    // Method's `clazz` field — see `proxy_resolve_declaring_class_mirror`
+    // for why `ClassId(0)` (== `Object` in production) is unsafe here.
+    let declaring_mirror = proxy_resolve_declaring_class_mirror(
+        shared,
+        proxy,
+        method_name,
+        descriptor,
+    );
     let name_str = super::create_java_string(shared, method_name);
     // Parse descriptor into per-parameter and return type descriptors —
     // see `proxy_invoke_handler` above for rationale.
@@ -4470,7 +4629,7 @@ pub(crate) fn proxy_invoke_handler_shared(
             .ok();
     }
     let desc_str = super::create_java_string(shared, descriptor);
-    proxy_method_set_field_by_name(shared, method_obj, "clazz", Value::Object(Some(zero_mirror)));
+    proxy_method_set_field_by_name(shared, method_obj, "clazz", Value::Object(Some(declaring_mirror)));
     proxy_method_set_field_by_name(shared, method_obj, "name", Value::Object(Some(name_str)));
     proxy_method_set_field_by_name(shared, method_obj, "returnType", Value::Object(Some(return_type_mirror)));
     proxy_method_set_field_by_name(shared, method_obj, "parameterTypes", Value::Object(Some(param_arr)));
@@ -4483,7 +4642,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         // Synthetic-mode fallback (no JDK Method class loaded): keep the
         // old hard-coded layout so callers reading raw slots still find
         // the values.
-        shared.heap.set_field(method_obj, 0, Value::Object(Some(zero_mirror)));
+        shared.heap.set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
         shared.heap.set_field(method_obj, 1, Value::Object(Some(name_str)));
         shared.heap.set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         shared.heap.set_field(method_obj, 3, Value::Object(Some(param_arr)));
@@ -4491,6 +4650,9 @@ pub(crate) fn proxy_invoke_handler_shared(
         shared.heap.set_field(method_obj, 5, Value::Object(Some(desc_str)));
         shared.heap.set_field(method_obj, 6, Value::Int(param_count as i32));
     }
+    // Silence "zero_mirror unused" — kept above to preserve the original
+    // allocation flow.
+    let _ = zero_mirror;
 
     // Build Object[] of args вЂ” box primitives. Per
     // `java.lang.reflect.InvocationHandler.invoke` contract, when the
@@ -5613,6 +5775,88 @@ pub(super) fn proxy_descriptor_to_class_mirror(
     super::get_or_create_class_mirror(shared, cid)
 }
 
+/// Resolve the Class mirror that should be stored in the synthesized
+/// `Method.clazz` field for a proxy dispatch — i.e. the interface that
+/// actually declares the method being invoked. Walks the proxy's
+/// `interfaces` array (field 1) and, for each interface, scans its
+/// `methods` list (including inherited super-interfaces, transitively)
+/// for a matching `(name, descriptor)`.
+///
+/// Falls back to the first interface mirror if no match is found, or to
+/// the `Object` mirror if the proxy carries no interfaces at all — the
+/// latter is preferable to `ClassId(0)` since `ClassId(0)` happens to be
+/// `java/lang/Object` in production builds (first class loaded), which
+/// would make `method.getDeclaringClass() == Object.class` evaluate
+/// `true` for **every** proxied method. ByteBuddy's
+/// `JavaDispatcher$ProxiedInvocationHandler.invoke` gates its real
+/// dispatch on `declaringClass != Object`, so the `ClassId(0)` sentinel
+/// caused every non-`equals`/`hashCode`/`toString` proxied call to
+/// surface as `IllegalStateException: Unexpected object method`.
+pub(super) fn proxy_resolve_declaring_class_mirror(
+    shared: &SharedVm,
+    proxy: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+) -> ObjectRef {
+    let interfaces = match shared.heap.get_field(proxy, 1) {
+        Value::Object(Some(arr)) => arr,
+        _ => return super::get_or_create_class_mirror(shared, ClassId::new(0)),
+    };
+    let n = shared.heap.array_length(interfaces);
+    let mut first_iface_mirror: Option<ObjectRef> = None;
+    for i in 0..n {
+        let iface_mirror = match shared.heap.get_array_element(interfaces, i) {
+            Ok(Value::Object(Some(m))) => m,
+            _ => continue,
+        };
+        if first_iface_mirror.is_none() {
+            first_iface_mirror = Some(iface_mirror);
+        }
+        let iface_cid = match shared
+            .class_mirrors_reverse
+            .read()
+            .get(&iface_mirror)
+            .copied()
+        {
+            Some(cid) => cid,
+            None => continue,
+        };
+        // Walk this interface + all super-interfaces (transitively)
+        // looking for a declared method matching (name, descriptor).
+        let mut visited: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();
+        let mut stack: Vec<ClassId> = vec![iface_cid];
+        while let Some(cid) = stack.pop() {
+            if !visited.insert(cid) {
+                continue;
+            }
+            let supers: Vec<ClassId> = {
+                let cm = shared.class_manager.read();
+                let Some(class) = cm.get_class(cid) else {
+                    continue;
+                };
+                let found = class.methods.iter().any(|m| {
+                    &*m.name == method_name && &*m.descriptor == descriptor
+                });
+                if found {
+                    drop(cm);
+                    return super::get_or_create_class_mirror(shared, cid);
+                }
+                class.interfaces.clone()
+            };
+            for s in supers {
+                stack.push(s);
+            }
+        }
+    }
+    // No declaring interface found — prefer the first interface mirror
+    // over `ClassId(0)` so the resulting Method object still answers
+    // `getDeclaringClass()` with a real interface (not `Object`).
+    if let Some(m) = first_iface_mirror {
+        return m;
+    }
+    super::get_or_create_class_mirror(shared, ClassId::new(0))
+}
+
 /// Box a JVM value into a Java wrapper object for use in Object[] arrays.
 /// Object references are passed through unchanged.
 pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
@@ -5716,12 +5960,22 @@ fn invoke_on_class_shared_inner(
     // fails with an internal error. Callers that pass a specific class_id
     // intentionally (invokespecial, <clinit>) use the <init>/<clinit> name
     // filter below to opt out, OR pass `no_retarget=true` (WP2.9 findSpecial).
+    //
+    // KC patch (γ generalisation): when the receiver's `class_id_of`
+    // returns `ClassId::new(0)` (synthetic alloc that lost class_id, or
+    // a bare `Object` slot) we cannot use the receiver to drive
+    // dispatch — but we also must NOT keep the original `class_id`
+    // unchanged if it names an interface (resolution will land on a
+    // method with no Code and surface as NSME).  The CP class is the
+    // spec-correct resolution target so we leave it as-is here; the
+    // S111r10 receiver-walk and the `class_name == "java/lang/Object"`
+    // path inside `invoke_or_native` handle the substitution downstream.
     let class_id = if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
         let recv_cid = args.get(0).and_then(|v| {
             if let Value::Object(Some(o)) = v { Some(shared.heap.class_id_of(*o)) } else { None }
         });
         if let Some(rc) = recv_cid {
-            if rc != class_id {
+            if rc != class_id && rc != ClassId::new(0) {
                 let cm = shared.class_manager.read();
                 let this_is_iface_or_abs = cm.get_class(class_id)
                     .map(|c| c.is_interface() || c.is_abstract())
@@ -7254,6 +7508,45 @@ fn invoke_on_class_shared_inner(
                     && descriptor == "()Ljava/lang/ThreadGroup;"
                 {
                     return Ok(Some(Value::Object(None)));
+                }
+                // KAFKA-DEFAULT-RESCUE: invokeinterface on a receiver whose
+                // runtime class is bare `java/lang/Object` (a synthetic
+                // ServiceLoader provider stub) can land here when the target
+                // is a default method declared on the CP-resolved interface
+                // itself. The receiver class doesn't list the interface in
+                // its `interfaces` table, so neither this function's
+                // hierarchy walk nor the existing receiver-based rescues
+                // find it. Consult the CP-resolved interface directly
+                // before raising NSME.
+                if let Some(cp_iface_cid) = pending_cp_iface() {
+                    if cp_iface_cid != class_id {
+                        let cm_iface = shared.class_manager.read();
+                        if let Some((m, declaring_id)) =
+                            crate::classloading::find_method_recursive(
+                                cp_iface_cid,
+                                method_name,
+                                descriptor,
+                                &cm_iface.class_store,
+                            )
+                        {
+                            // Only rescue with a real default method: a
+                            // concrete instance method declared on the
+                            // interface (or a super-interface) of the
+                            // CP-resolved type. Abstract / static entries
+                            // would not be valid dispatch targets here.
+                            if !m.is_abstract() && !m.is_static() {
+                                drop(cm_iface);
+                                return invoke_on_class_shared(
+                                    shared,
+                                    thread,
+                                    declaring_id,
+                                    method_name,
+                                    descriptor,
+                                    args,
+                                );
+                            }
+                        }
+                    }
                 }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),

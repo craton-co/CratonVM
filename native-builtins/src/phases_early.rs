@@ -8444,11 +8444,46 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // Round 15 (BcProbe): KeyGenerator.getInstance("AES", "BC") used by
+    // BouncyCastle clients. Without this shim the real-JDK 2-arg overload
+    // runs to completion (returning a real KeyGenerator wrapping a real
+    // KeyGeneratorSpi), and the subsequent kg.init(128) then dispatches
+    // through the real JDK bytecode which reads field `spi` -> NPE on a
+    // mis-shaped synthetic. Returning a 2-field synthetic here keeps the
+    // whole chain on the synthetic shim path that init/generateKey
+    // already understand.
+    r.register(
+        kg,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
+        |ctx, args| {
+            let algo = obj_arg(args, 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            ctx.set_field(obj, 0, Value::Object(Some(algo)));
+            ctx.set_field(obj, 1, Value::Int(128)); // default key size
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    // Provider-instance overload — same synthetic layout, ignores the
+    // Provider arg entirely (we synthesise the SPI via the init / generateKey
+    // shims below).
+    r.register(
+        kg,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
+        |ctx, args| {
+            let algo = obj_arg(args, 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            ctx.set_field(obj, 0, Value::Object(Some(algo)));
+            ctx.set_field(obj, 1, Value::Int(128));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(kg, "init", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let key_size = args[1].as_int().unwrap_or(128);
         ctx.set_field(this, 1, Value::Int(key_size));
-        Ok(Some(Value::Object(None)))
+        Ok(None)
     });
     r.register(
         kg,
@@ -8458,8 +8493,30 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key_size = args[1].as_int().unwrap_or(128);
             ctx.set_field(this, 1, Value::Int(key_size));
-            Ok(Some(Value::Object(None)))
+            Ok(None)
         },
+    );
+    // init(SecureRandom) — leave keySize at its default, just no-op.
+    r.register(
+        kg,
+        "init",
+        "(Ljava/security/SecureRandom;)V",
+        |_ctx, _args| Ok(None),
+    );
+    // init(AlgorithmParameterSpec) / init(AlgorithmParameterSpec, SecureRandom) —
+    // BC chooses keySize internally from the spec; we accept the call and
+    // leave field 1 alone. generateKey() will fall back to the 128-bit default.
+    r.register(
+        kg,
+        "init",
+        "(Ljava/security/spec/AlgorithmParameterSpec;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        kg,
+        "init",
+        "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+        |_ctx, _args| Ok(None),
     );
     r.register(
         kg,

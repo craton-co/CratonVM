@@ -169,6 +169,21 @@ impl VmHeap {
         }
     }
 
+    /// Loose validity check: alignment + heap-region containment.
+    ///
+    /// Unlike [`Self::is_object_address`] this does NOT read the object
+    /// header. Used by operand-stack root scanning to root ambiguous
+    /// JVM-long-vs-jobject slots without rejecting legitimate references
+    /// whose header is transiently unreadable (interior pointers, mid-
+    /// initialisation slots, or stale-bit-pattern Long slots that the GC
+    /// is well-equipped to ignore via its own size-sanity guard).
+    pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => h.is_heap_addr(addr),
+            VmHeap::G1(h) => h.is_heap_addr(addr),
+        }
+    }
+
     /// T1.7.1 — Brooks-pointer read barrier.
     ///
     /// Consults the object's compact header: if the `LockState` is

@@ -161,6 +161,39 @@ fn lookup_class_code_source(ctx: &mut dyn NativeContext, this_lookup: ObjectRef)
     None
 }
 
+/// Resolve the loader_id to use when defining a class on behalf of the
+/// given `Lookup`. CGLIB 3.4+ / Spring 5.x emit proxies via
+/// `Lookup.defineClass(byte[])` / `Lookup.defineHiddenClass(...)` and
+/// expect the new class to live in the SAME class-loader namespace as
+/// the lookup (host) class — otherwise `Class.forName(name, false,
+/// hostLoader)` (used by CGLIB's `WeakCacheKey` lookup) cannot find the
+/// freshly-defined proxy, and CGLIB silently falls back to
+/// `Unsafe.defineClass` against the application loader, breaking
+/// `getClassLoader()` parity.
+///
+/// Encoding bridge:
+///   * `loader_id_of_class` returns the NativeContext-side encoding
+///     (0=Bootstrap, 1=Extension, 2=Application, N>=3=UserDefined(N)).
+///   * `define_class_full` takes the backend encoding
+///     (0=Application, N>0=UserDefined(N)).
+/// Bootstrap / Extension / Application all collapse to 0 because the
+/// backend `define_class_full` treats `loader_id == 0` as Application
+/// (the only built-in loader namespace the backend exposes today).
+fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) -> u32 {
+    let mirror = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
+        Value::Object(Some(m)) => m,
+        _ => return 0,
+    };
+    let cid = match crate::lang_class::mirror_class_id(ctx, mirror) {
+        Some(c) => c,
+        None => return 0,
+    };
+    let raw = ctx.loader_id_of_class(cid);
+    // Negative or 0/1/2 → Application namespace (== backend loader_id 0).
+    // 3+ → UserDefined(raw) (== backend loader_id raw).
+    if raw < 3 { 0 } else { raw as u32 }
+}
+
 /// Allocate a fresh Lookup synthetic with full-power modes pointing at
 /// the given mirror. Mirrors `classloader.rs::alloc_lookup` but uses
 /// only the public `NativeContext` surface so this module stays
@@ -202,6 +235,11 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
     // Inherit the lookup class's PD CodeSource (URL).
     let code_source_url = lookup_class_code_source(ctx, this_lookup);
+    // CGLIB 3.4+ / Spring 5.x: inherit the lookup class's loader so the
+    // generated proxy can be found by `Class.forName(name, false,
+    // hostLoader)`. Without this, the proxy would always land in the
+    // Application namespace and CGLIB's WeakCacheKey lookup misses.
+    let loader_id = inherit_lookup_loader(ctx, this_lookup);
 
     let opts = rustjvm_native_api::DefineClassFull {
         skip_verification: true,
@@ -209,7 +247,7 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         ..Default::default()
     };
 
-    match ctx.define_class_full("", &class_bytes, 0, opts) {
+    match ctx.define_class_full("", &class_bytes, loader_id, opts) {
         Ok(cid) => {
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
@@ -263,6 +301,12 @@ fn lk_define_hidden_class_full(
         None
     };
     let code_source_url = lookup_class_code_source(ctx, this_lookup);
+    // CGLIB 3.4+ / ByteBuddy / Spring 5.x: inherit the lookup class's
+    // loader so private-member access checks in the new hidden class
+    // resolve against the host's loader namespace. The JEP 371 spec
+    // requires the hidden class to "share the run-time package" of the
+    // lookup class, which it cannot if the loaders differ.
+    let loader_id = inherit_lookup_loader(ctx, this_lookup);
     // Keep the original name for the mangled hidden-class label.
     let nest_host_class_name_for_label = lookup_name;
 
@@ -285,7 +329,7 @@ fn lk_define_hidden_class_full(
         ..Default::default()
     };
 
-    let cid = match ctx.define_class_full(&hidden_name, &class_bytes, 0, opts) {
+    let cid = match ctx.define_class_full(&hidden_name, &class_bytes, loader_id, opts) {
         Ok(cid) => cid,
         Err(msg) => {
             // initialize=true failures surface as a flavour of
@@ -418,6 +462,9 @@ fn lk_define_hidden_class_with_class_data(
         None
     };
     let code_source_url = lookup_class_code_source(ctx, this_lookup);
+    // Same loader-inheritance fix as the plain variant — LambdaMetafactory
+    // and CGLIB classData-bound proxies both rely on it.
+    let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let nest_host_class_name_for_label = lookup_name;
 
     let original = nest_host_class_name_for_label
@@ -436,7 +483,7 @@ fn lk_define_hidden_class_with_class_data(
         ..Default::default()
     };
 
-    let cid = match ctx.define_class_full(&hidden_name, &class_bytes, 0, opts) {
+    let cid = match ctx.define_class_full(&hidden_name, &class_bytes, loader_id, opts) {
         Ok(cid) => cid,
         Err(msg) => {
             if msg.contains("initialize after define failed") {
@@ -942,5 +989,166 @@ mod tests {
     #[test]
     fn dummy_this_is_null_object() {
         assert!(matches!(dummy_this(), Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------
+    // CGLIB-η — Loader inheritance tests
+    // -----------------------------------------------------------------
+    //
+    // CGLIB 3.4+ / Spring 5.x emit proxies via `Lookup.defineClass` and
+    // `Lookup.defineHiddenClass`. After defining, CGLIB does
+    // `Class.forName(name, false, hostLoader)` to round-trip back to the
+    // mirror — which only works if the new class lives in the lookup
+    // class's loader namespace, NOT the application loader. Prior to the
+    // CGLIB-η fix, both natives passed `loader_id = 0` (Application)
+    // unconditionally, so any class defined via a Lookup whose host was
+    // in a user-defined loader (Spring Boot's LaunchedURLClassLoader,
+    // OSGi bundle loaders, web-app WAR loaders) would be lost.
+    //
+    // These tests pin that the lookup class's loader is inherited by:
+    //   1. `Lookup.defineClass(byte[])` (the normal-class variant);
+    //   2. `Lookup.defineHiddenClass(...)`;
+    //   3. `Lookup.defineHiddenClassWithClassData(...)`.
+    //
+    // And that built-in loaders (Bootstrap/Extension/Application) all
+    // still collapse to `loader_id = 0` so we don't regress the common
+    // case.
+
+    /// Acceptance #1: a user-defined loader (id >= 3) on the lookup class
+    /// must be inherited by `Lookup.defineClass`.
+    #[test]
+    fn define_class_inherits_user_defined_loader() {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, lookup_cid) = make_lookup_for(&mut ctx, "spring/boot/Service");
+        // Spring Boot's LaunchedURLClassLoader gets a user-defined id.
+        ctx.set_loader_id_override(lookup_cid, 7);
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(
+            rustjvm_types::ArrayElementType::Byte,
+            class_bytes.len(),
+        );
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+        let r = lk_define_class_b(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+            ],
+        );
+        assert!(r.is_ok(), "defineClass must succeed: {:?}", r.err());
+        assert_eq!(
+            ctx.last_define_full_loader(),
+            Some(7),
+            "Lookup.defineClass must inherit the lookup class's user-defined loader"
+        );
+    }
+
+    /// Acceptance #2: Application loader (raw id 2) collapses to backend
+    /// loader_id 0. Same for Bootstrap (0) and Extension (1) — the
+    /// backend has no separate Bootstrap/Extension namespace today, so
+    /// they all share the Application table.
+    #[test]
+    fn define_class_built_in_loaders_collapse_to_zero() {
+        for raw in [0_i32, 1, 2] {
+            let mut ctx = MockNativeContext::new();
+            let (lookup, lookup_cid) = make_lookup_for(&mut ctx, "java/util/HashMap");
+            ctx.set_loader_id_override(lookup_cid, raw);
+
+            let class_bytes = cafebabe_minimal();
+            let bytes_arr = ctx.new_array(
+                rustjvm_types::ArrayElementType::Byte,
+                class_bytes.len(),
+            );
+            for (i, b) in class_bytes.iter().enumerate() {
+                ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+            }
+            let r = lk_define_class_b(
+                &mut ctx,
+                &[
+                    Value::Object(Some(lookup)),
+                    Value::Object(Some(bytes_arr)),
+                ],
+            );
+            assert!(r.is_ok(), "defineClass must succeed for raw={raw}");
+            assert_eq!(
+                ctx.last_define_full_loader(),
+                Some(0),
+                "raw loader {raw} (built-in) must collapse to backend loader_id 0"
+            );
+        }
+    }
+
+    /// Acceptance #3: `Lookup.defineHiddenClass(...)` inherits the
+    /// user-defined loader. CGLIB 3.4+ relies on this so the hidden
+    /// proxy is loader-visible to its host.
+    #[test]
+    fn define_hidden_class_inherits_user_defined_loader() {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, lookup_cid) = make_lookup_for(&mut ctx, "cglib/Enhancer");
+        ctx.set_loader_id_override(lookup_cid, 11);
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(
+            rustjvm_types::ArrayElementType::Byte,
+            class_bytes.len(),
+        );
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+        let opts_arr = make_options_array(&mut ctx, &[0]); // NESTMATE
+        let r = lk_define_hidden_class_full(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+                Value::Int(0),
+                Value::Object(Some(opts_arr)),
+            ],
+        );
+        assert!(r.is_ok(), "defineHiddenClass must succeed: {:?}", r.err());
+        assert_eq!(
+            ctx.last_define_full_loader(),
+            Some(11),
+            "Lookup.defineHiddenClass must inherit the lookup class's user-defined loader"
+        );
+    }
+
+    /// Acceptance #4: `Lookup.defineHiddenClassWithClassData(...)` also
+    /// inherits the user-defined loader — LambdaMetafactory and CGLIB
+    /// classData-bound proxies both rely on this.
+    #[test]
+    fn define_hidden_class_with_class_data_inherits_loader() {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, lookup_cid) = make_lookup_for(&mut ctx, "lambda/Host");
+        ctx.set_loader_id_override(lookup_cid, 42);
+        let payload = ctx.alloc_object(ClassId::new(1), 1);
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(
+            rustjvm_types::ArrayElementType::Byte,
+            class_bytes.len(),
+        );
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+        let r = lk_define_hidden_class_with_class_data(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+                Value::Object(Some(payload)),
+                Value::Int(0),
+                Value::Object(None),
+            ],
+        );
+        assert!(r.is_ok(), "defineHiddenClassWithClassData must succeed");
+        assert_eq!(
+            ctx.last_define_full_loader(),
+            Some(42),
+            "Lookup.defineHiddenClassWithClassData must inherit the user-defined loader"
+        );
     }
 }

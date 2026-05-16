@@ -1444,6 +1444,24 @@ impl G1Collector {
         Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
     }
 
+    /// Loose validity check: alignment + region containment only.
+    ///
+    /// Mirrors [`crate::gen_heap::GenerationalHeap::is_heap_addr`]. Does NOT
+    /// read the object header — used by GC root scanning of ambiguous JVM
+    /// long slots, where the strict header check is too aggressive (false
+    /// negatives drop legitimately-rooted objects, leading to dangling
+    /// pointers post-GC and downstream SEGV).
+    pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
+        if addr == 0 || addr & 0x7 != 0 {
+            return None;
+        }
+        if !self.is_addr_in_live_region(addr) {
+            return None;
+        }
+        // SAFETY: alignment + live-region containment confirmed.
+        Some(unsafe { ObjectRef::from_raw(addr as *mut u8) })
+    }
+
     /// Check if an address is within a live (non-Free) region.
     ///
     /// Used by reference processing to determine if a referent survived GC

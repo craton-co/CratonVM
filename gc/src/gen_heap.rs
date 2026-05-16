@@ -23,7 +23,7 @@
 
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -514,6 +514,36 @@ impl GenerationalHeap {
         Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
     }
 
+    /// Loose validity check: alignment + region containment only.
+    ///
+    /// Unlike [`Self::is_object_address`] this does **not** read the object
+    /// header. It is intended for GC root scanning of ambiguous slots (JVM
+    /// long vs jobject smuggled as jlong) where the header may not yet be
+    /// initialised, the pointer may target an interior offset, or the slot
+    /// may transiently look like a pointer mid-construction.
+    ///
+    /// False positives (passing a non-object aligned heap-range address) are
+    /// safe: the generational collector's `forward_object` already drops
+    /// "suspected false roots" whose computed total size exceeds
+    /// `MAX_SANE_OBJECT_SIZE`, so the worst case is over-retention rather
+    /// than a deref of garbage.
+    pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
+        if addr == 0 || addr & 0x7 != 0 {
+            return None;
+        }
+        let raw = addr as *const u8;
+        let in_region = self.young_from.lock().contains(raw)
+            || self.young_to.lock().contains(raw)
+            || self.old_gen.lock().contains(raw);
+        if !in_region {
+            return None;
+        }
+        // SAFETY: alignment + region containment guarantee a valid heap
+        // pointer; constructing an ObjectRef from it is safe — only deref
+        // through it is gated by downstream header sanity checks.
+        Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
+    }
+
     // ----- Field access ------------------------------------------------------
 
     /// Get the value of a field at the given index.
@@ -541,9 +571,15 @@ impl GenerationalHeap {
                 class_id = ?header.class_id,
                 kind_byte = header.kind as u8,
                 gc_flags = format!("{:x}", header.gc_flags),
-                "gen_heap::get_field: suspect header",
+                "gen_heap::get_field: suspect header (returning null)",
             );
-            panic!("gen_heap::get_field suspect header: num_slots={num_slots}");
+            // Rate-limited warn — do NOT panic. Returning null lets the
+            // caller raise a normal Java exception / continue in a degraded
+            // mode, matching how `array_length` is handled above. Without
+            // this, Keycloak / Kafka tests abort the JVM on a corrupt
+            // synthetic-receiver dispatch instead of surfacing a real
+            // error to the Java side.
+            return Value::Object(None);
         }
         if index >= num_slots {
             // Layout mismatch — return null/zero instead of reading past
@@ -583,9 +619,13 @@ impl GenerationalHeap {
                 kind_byte = header.kind as u8,
                 gc_flags = format!("{:x}", header.gc_flags),
                 value = ?value,
-                "gen_heap::set_field: suspect header",
+                "gen_heap::set_field: suspect header (returning silently)",
             );
-            panic!("gen_heap::set_field suspect header: num_slots={num_slots}");
+            // Rate-limited warn — do NOT panic. See matching comment in
+            // `get_field` above.  Returning without writing keeps the
+            // JVM alive so the Java side can recover or surface a real
+            // exception.
+            return;
         }
         if index >= num_slots {
             return;
@@ -679,19 +719,117 @@ impl GenerationalHeap {
             // Defensive hardening: native/bootstrap code can occasionally pass a
             // plain object into array helpers. Returning 0 keeps startup alive,
             // while diagnostics below pinpoint the exact caller and object shape.
-            let bt = Backtrace::force_capture();
-            eprintln!(
-                "[GC-ARRAY-GUARD] array_length(non-array): kind={:?} class_id={} elem={:?} stored_len={} obj={:?}\nbacktrace:\n{}",
-                header.kind,
-                header.class_id,
-                header.element_type,
-                header.array_length,
-                obj_ref,
-                bt
-            );
+            //
+            // Rate-limit the diagnostic: long-running boots (e.g. Keycloak)
+            // can hit this path tens of thousands of times. Emitting a full
+            // `Backtrace::force_capture` each time produces hundreds of MB
+            // of stderr and exhausts disk. Keep the first few one-line
+            // warnings (with backtrace gated by `RUSTJVM_GC_ARRAY_GUARD_BT`)
+            // and silently return 0 thereafter.
+            static GUARD_COUNT: AtomicUsize = AtomicUsize::new(0);
+            const GUARD_LIMIT: usize = 5;
+            let n = GUARD_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < GUARD_LIMIT {
+                // Format the entire message into one String and emit via a
+                // single locked stderr write. Multi-segment `eprintln!`
+                // formatting can interleave with other threads' stderr
+                // writes on Windows and trigger the rare
+                // "Имеющийся буфер не подходит" (os error 1784) panic on the
+                // intermediate write of large {:?} pretty-printed values.
+                //
+                // CRITICAL: we are formatting fields of a header that we
+                // already know is suspect (kind != Array). The raw bytes
+                // backing `kind` and `element_type` may be garbage — using
+                // `{:?}` on `#[repr(u8)]` enums whose byte value is outside
+                // the declared variants is undefined behavior and has been
+                // observed to provoke a `capacity overflow` panic deep in
+                // `core::fmt` (the Display jump table writing an arbitrary
+                // huge slice into the format buffer).
+                //
+                // Read the raw bytes directly via the object pointer rather
+                // than via `&ObjectHeader` field access, so we never go
+                // through the unsound enum-value path. The header layout is
+                // `#[repr(C)]`: class_id(u32) @0, kind(u8) @4, elem(u8) @5.
+                let obj_ptr = obj_ref.as_ptr();
+                // SAFETY: `obj_ref` was previously dereferenced via
+                // `get_header` above without faulting, so `obj_ptr` plus
+                // `HEADER_SIZE` bytes is readable. We read individual bytes
+                // and a 4-byte u32 within that range, which is well-defined
+                // even when the byte values do not correspond to valid enum
+                // discriminants.
+                let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
+                    let class_id_raw = (obj_ptr as *const u32).read_unaligned();
+                    let kind_byte = *obj_ptr.add(4);
+                    let elem_byte = *obj_ptr.add(5);
+                    let stored_len = (obj_ptr.add(12) as *const u32).read_unaligned();
+                    (kind_byte, elem_byte, class_id_raw, stored_len)
+                };
+                let msg = if std::env::var_os("RUSTJVM_GC_ARRAY_GUARD_BT").is_some() {
+                    let bt = Backtrace::force_capture();
+                    format!(
+                        "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{})\nbacktrace:\n{}\n",
+                        kind_byte,
+                        class_id_raw,
+                        elem_byte,
+                        stored_len,
+                        obj_ptr,
+                        n + 1,
+                        GUARD_LIMIT,
+                        bt,
+                    )
+                } else {
+                    format!(
+                        "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{}; set RUSTJVM_GC_ARRAY_GUARD_BT=1 for backtrace)\n",
+                        kind_byte,
+                        class_id_raw,
+                        elem_byte,
+                        stored_len,
+                        obj_ptr,
+                        n + 1,
+                        GUARD_LIMIT,
+                    )
+                };
+                // Atomic write via locked stderr; ignore errors (best-effort
+                // diagnostic). Avoids the eprintln panic on Windows when the
+                // writer's internal buffer is unhappy.
+                use std::io::Write;
+                let stderr = std::io::stderr();
+                let mut handle = stderr.lock();
+                let _ = handle.write_all(msg.as_bytes());
+                if n + 1 == GUARD_LIMIT {
+                    let _ = handle.write_all(
+                        b"[GC-ARRAY-GUARD] suppressing further array_length(non-array) warnings\n",
+                    );
+                }
+            }
             return 0;
         }
-        header.array_length as usize
+        // Bug 1 fix (Opus 3-bugs agent): cap array length to a sane bound so
+        // a corrupt synthetic header (e.g. 795308655 ≈ 3 GB) cannot propagate
+        // into a `Vec::with_capacity(...)` panic in callers. 16M elements is
+        // large enough for any realistic array but small enough that
+        // pre-allocating one is a finite cost rather than an OOM.
+        const MAX_REASONABLE_ARRAY_LEN: u32 = 1 << 24; // 16M elements
+        let raw_len = header.array_length;
+        if raw_len > MAX_REASONABLE_ARRAY_LEN {
+            static SUSPECT_LEN_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = SUSPECT_LEN_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                // Format with raw byte values to avoid UB on Debug-formatting
+                // a potentially-garbage `ArrayElementType` byte (same hazard
+                // as the GC-ARRAY-GUARD path above).
+                eprintln!(
+                    "[GC-ARRAY-LEN-GUARD] suspect array_length={} (>1<<24) class_id={} elem_byte={} obj={:p} (n={})",
+                    raw_len,
+                    header.class_id.as_u32(),
+                    header.element_type as u8,
+                    obj_ref.as_ptr(),
+                    n,
+                );
+            }
+            return 0;
+        }
+        raw_len as usize
     }
 
     /// Bulk-read a char[] array into a `Vec<u16>`.

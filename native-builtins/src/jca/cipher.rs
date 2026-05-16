@@ -405,8 +405,118 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     r.register("sun/security/jca/Providers", "<clinit>", "()V", clinit_noop);
     r.register("sun/security/jca/ProviderList", "<clinit>", "()V", clinit_noop);
 
+    // `javax/crypto/JceSecurity.<clinit>` — the real JDK-25 clinit invokes
+    // `setupJurisdictionPolicies()` which reads the `crypto.policy` Security
+    // property (we've no-op'd `Security.<clinit>`, so its `props` map is
+    // null) and then resolves `$JAVA_HOME/conf/security/policy/<name>/`.
+    // Even though the policy files exist on disk, the policy-file loader
+    // walks the synthetic `Security` props graph (null) and throws
+    // `SecurityException: Missing mandatory jurisdiction policy files:
+    // unlimited`, wrapped in `ExceptionInInitializerError` at
+    // `KeyGenerator.getInstance` → `JceSecurity.<clinit>`.
+    //
+    // No-opping is safe for the BcProbe path because `KeyGenerator` /
+    // `Cipher` getInstance are intercepted natively, and the only fields
+    // the surviving real-JDK code reads are:
+    //   - `isRestricted:Z` — defaults to `false` (= unlimited strength),
+    //     which is the intended "unlimited policy" outcome anyway.
+    //   - `defaultPolicy` / `exemptPolicy` — only read by
+    //     `JceSecurity.getDefaultPolicy()` / `getExemptPolicy()` which
+    //     BouncyCastle / KeyGenerator-via-native-intercept never reach.
+    //   - `verificationResults` / `verifyingProviders` / `queue` /
+    //     `codeBaseCacheRef` / `NULL_URL` / `PROVIDER_VERIFIED` — only
+    //     used by `verifyProvider` / `getVerificationResult` /
+    //     `canUseProvider`, which our `JceSecurity.canUseProvider`
+    //     intercept can short-circuit (see below).
+    r.register("javax/crypto/JceSecurity", "<clinit>", "()V", clinit_noop);
+    // `JceSecurity.canUseProvider(Provider)` returns true so that
+    // post-clinit `KeyGenerator` / `Mac` lookups don't fault on the null
+    // `verifyingProviders` map.  Real-JDK behaviour for a signed-JCE
+    // provider is `true`; for BouncyCastle (loaded via reflection in
+    // BcProbe) we accept it unconditionally — provider verification is a
+    // signing-cert check, not a security-policy gate.
+    r.register(
+        "javax/crypto/JceSecurity",
+        "canUseProvider",
+        "(Ljava/security/Provider;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    // `JceSecurity.isRestricted()` returns false (unlimited).  Matches the
+    // default field value the no-op'd clinit leaves behind, but the static
+    // accessor is explicitly registered so any reflective lookup sees a
+    // resolved method instead of a null-method-table miss on the
+    // synthetic class.
+    r.register(
+        "javax/crypto/JceSecurity",
+        "isRestricted",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    // `JceSecurity.getVerificationResult(Provider) -> Exception` returns
+    // `null` to mean "provider passed JCE jar-signing verification".  Real-
+    // JDK's clinit populates `verificationResults`/`verifyingProviders`/
+    // `PROVIDER_VERIFIED` so this method can index into them — under our
+    // no-op'd clinit those fields are null and the real bytecode NPEs at
+    // `new WeakIdentityWrapper(p, queue)` or
+    // `verificationResults.computeIfAbsent(...)`.  Bypass with `null`
+    // so the `JceSecurity.getInstance(...)` overloads (we no-op those
+    // too — see below) and any future caller see the "verified, no
+    // failure" path.
+    r.register(
+        "javax/crypto/JceSecurity",
+        "getVerificationResult",
+        "(Ljava/security/Provider;)Ljava/lang/Exception;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
     register_cipher_dispatch(r);
+    register_keygen_dispatch(r);
     register_param_specs(r);
+}
+
+/// Register the missing 2-arg `KeyGenerator.getInstance` overloads
+/// (`(String, String)` and `(String, Provider)`).  The 1-arg form is
+/// registered in `phases_early.rs::register_phase53_crypto`; the 2-arg
+/// forms fall through to the real-JDK bytecode which routes through
+/// `JceSecurity.getInstance(String, Class, String, String)` →
+/// `GetInstance.getService(type, algo, providerName)`.  In our boot we
+/// don't populate the per-provider Service tables, so `getService`
+/// returns null and the JDK code NPEs at `service.getProvider()`
+/// (KeyGenerator.java:288).
+///
+/// The native intercept ignores the provider name/object — we have a
+/// single AES/HmacSHA* implementation in `crypto_impl`, so requesting
+/// "BC" vs "SunJCE" yields identical bytes.  The synthetic layout
+/// matches `register_phase53_crypto`'s `KeyGenerator` shim:
+/// `(algorithm@0, keySize@1)`, so `KeyGenerator.init(int)` /
+/// `generateKey()` (also registered in `phases_early.rs`) work
+/// unchanged on instances allocated here.
+fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
+    let kg = "javax/crypto/KeyGenerator";
+    r.register(
+        kg,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
+        |ctx, args| {
+            let algo = obj_arg(args, 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            ctx.set_field(obj, 0, Value::Object(Some(algo)));
+            ctx.set_field(obj, 1, Value::Int(128)); // default key size
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        kg,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
+        |ctx, args| {
+            let algo = obj_arg(args, 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            ctx.set_field(obj, 0, Value::Object(Some(algo)));
+            ctx.set_field(obj, 1, Value::Int(128));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 }
 
 /// Register `Cipher.getInstance` / `init` / `update` / `updateAAD` /
