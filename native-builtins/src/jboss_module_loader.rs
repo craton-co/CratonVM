@@ -828,6 +828,21 @@ pub(crate) fn native_loader_load_module(
         register_resource_roots(ctx, &linkage_roots);
     }
 
+    // Round-19 defense-in-depth: WildFly's `org.jboss.as.standalone` module
+    // has an empty `<resources>` block — its `main-class` lives in
+    // `org.jboss.as.server` (a re-exported dep). Some module.xml files
+    // physically ship `.jar` files alongside `module.xml` that aren't
+    // listed in `<resources>` (or use globbing patterns we don't yet
+    // parse); to avoid NoSuchMethodException when `Module.run` ->
+    // `Class.forName(mainClassName, false, mcl)` hits the empty-resources
+    // case, we additionally force-register every `.jar` we physically
+    // find inside `<mp>/<dotted>/main/` (and its transitive deps' main/
+    // directories). Idempotent via `register_resource_roots`.
+    let physical_jars = collect_physical_main_dir_jars(&name);
+    if !physical_jars.is_empty() {
+        register_resource_roots(ctx, &physical_jars);
+    }
+
     // Insert into cache, but check for race-loser.
     let mut cache = module_cache().lock();
     if let Some(existing) = cache.get(&name) {
@@ -1008,6 +1023,70 @@ fn transitive_linkage_roots(start_module: &str) -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+/// Round-19 — collect every `.jar` file physically present in
+/// `<mp>/<dotted(start_module)>/main/` **and** in the same `main/` dirs of
+/// every transitive dep. This is a belt-and-braces fallback for
+/// `<resources>` blocks that are empty or that omit jars we still need on
+/// the classpath for `Class.forName(mainClassName, false, mcl)` to resolve.
+///
+/// Returns absolute paths in BFS order, deduped by visited module name.
+/// Optional / missing deps are silently skipped — same best-effort policy
+/// as `transitive_linkage_roots`.
+fn collect_physical_main_dir_jars(start_module: &str) -> Vec<PathBuf> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut jars: Vec<PathBuf> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(start_module.to_string());
+
+    // Same MAX_MODULES bound as `transitive_linkage_roots` — defensive
+    // cap against cyclical or explosive dep graphs.
+    const MAX_MODULES: usize = 4096;
+
+    while let Some(name) = queue.pop_front() {
+        if visited.len() >= MAX_MODULES {
+            break;
+        }
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let resolved = match ensure_resolved(&name) {
+            Some(r) => r,
+            None => continue,
+        };
+        // Scan the physical `main/` dir alongside module.xml. Anything that
+        // ends with `.jar` (case-insensitive, ASCII-only — JBoss filenames
+        // are always ASCII) is force-registered. `register_resource_roots`
+        // dedupes against the resource-root list we already pushed.
+        if let Ok(entries) = std::fs::read_dir(&resolved.module_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let lower = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                if lower.as_deref() == Some("jar") {
+                    jars.push(path);
+                }
+            }
+        }
+        // Recurse into module deps so the entry-point's defining module's
+        // jars are also picked up. We DO follow non-exported deps here,
+        // matching the linkage closure rationale.
+        for dep in &resolved.mx.dependencies {
+            if !matches!(dep.kind, crate::jboss_module_xml::DependencyKind::Module) {
+                continue;
+            }
+            queue.push_back(dep.name.clone());
+        }
+    }
+    jars
 }
 
 /// Search `roots` (filesystem dirs and JARs) for `entry_path` (a slash-

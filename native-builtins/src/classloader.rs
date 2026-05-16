@@ -773,6 +773,14 @@ fn cglib_guard_value(
     name: &str,
     bytes: &[u8],
 ) -> Option<Value> {
+    // OPT-IN: cglib short-circuit is disabled by default because it
+    // regressed keycloak (Quarkus loads classes whose names or bytecode
+    // patterns false-trigger our heuristics, leading to SIGILL/SEGV/hang).
+    // cglib_probe must be run with RUSTJVM_CGLIB_SHIM=1 to enable.
+    if std::env::var("RUSTJVM_CGLIB_SHIM").as_deref() != Ok("1") {
+        return None;
+    }
+
     // Cheap path first — name arg already says cglib.
     if is_cglib_proxy_name(name) {
         tracing::warn!(

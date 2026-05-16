@@ -119,42 +119,86 @@ fn native_module_loader_get_default(
 // ---------------------------------------------------------------------------
 // Round-16 (agent 16): broaden the WildFly intercept set to short-circuit
 // any potential infinite recursion in `Module.loadClass` /
-// `ModuleClassLoader.findClass`. Native-call ring buffer captured at the
-// watchdog dump shows reflection over `Module` fields followed by a hang —
-// the most likely culprit is a self-referential dispatch through the
-// ModuleClassLoader chain. These stubs sever those loops by returning
-// "not found" (null) instead of recursing into the real loader.
+// `ModuleClassLoader.findClass`. The original Round-16 shims returned null
+// unconditionally, which shadowed the proper module-aware implementations
+// in `jboss_module_loader.rs` and broke `Main.main` -> `Module.run` ->
+// `Class.forName(mainClassName, false, mcl)` for `org.jboss.as.server.Main`
+// (NoSuchMethodException: org/jboss/as/server/Main.main).
+//
+// Round-19 (this agent): replace the unconditional-null shims with
+// classpath-delegating fallbacks. They only fire as a safety net — the
+// real `native_module_classloader_load_class` /
+// `native_module_classloader_find_class` registered by
+// `jboss_module_loader.rs` should now win the dispatch race (registry
+// preserves the LAST registration; we are intentionally registering
+// `jboss_extras` BEFORE `jboss_module_loader` for those symbols below).
 // ---------------------------------------------------------------------------
 
-/// `org.jboss.modules.Module.loadClass(String)` — short-circuit to null
-/// rather than letting the real implementation recurse through the module
-/// dependency graph (which currently spins). Callers treat null as
-/// "class not found" and fall back to the system loader, which is exactly
-/// the desired behavior in CratonVM where the real JBoss module graph
-/// isn't populated.
+/// `org.jboss.modules.Module.loadClass(String)` — classpath-delegating
+/// fallback. Resolves the requested class through the standard application
+/// classpath (which `jboss_module_loader::register_resource_roots` keeps
+/// up to date with every loaded module's jars). Returns null on miss so
+/// callers' null-checks behave as JBoss's spec contract expects.
 fn native_module_load_class(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let internal = name.replace('.', "/");
+    if let Some(cid) = ctx.class_id_by_name(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    if ctx.ensure_class_initialized(&internal).is_ok() {
+        if let Some(cid) = ctx.class_id_by_name(&internal) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
-/// `org.jboss.modules.ModuleClassLoader.findClass(String)` — return null
-/// so the standard ClassLoader parent-delegation chain falls back to the
-/// system loader. The real implementation walks module dependencies and
-/// can infinite-loop on a half-built Module graph.
+/// `org.jboss.modules.ModuleClassLoader.findClass(String)` — classpath-
+/// delegating fallback (same body as `native_module_load_class`). Used only
+/// when the real `jboss_module_loader` registration didn't win dispatch.
 fn native_module_class_loader_find_class(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let internal = name.replace('.', "/");
+    if let Some(cid) = ctx.class_id_by_name(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    if ctx.ensure_class_initialized(&internal).is_ok() {
+        if let Some(cid) = ctx.class_id_by_name(&internal) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
-/// `org.jboss.modules.Module.getClassLoader()` — return null. WildFly
-/// callers that check for null fall back to the system ClassLoader (via
-/// `Class.forName`'s default lookup or `Thread.currentThread().getContextClassLoader()`).
-/// Returning the synthetic LocalModuleLoader's class loader here would
-/// just put us back into the ModuleClassLoader recursion loop.
+/// `org.jboss.modules.Module.getClassLoader()` — kept for env-gated
+/// safety. Original Round-16 returned null unconditionally, which broke
+/// `Module.run` -> `Class.forName(mainClassName, false, mcl)` (the mcl was
+/// null so forName fell back to the system loader, which then couldn't
+/// find the per-module classpath the real `jboss_module_loader.rs`
+/// implementation injects). Round-19: this shim is no longer registered.
+#[allow(dead_code)]
 fn native_module_get_class_loader(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -399,34 +443,24 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // ------------------------------------------------------------------
-    // Round-16: extra short-circuits to break ModuleClassLoader recursion
-    // observed in the WildFly 39 watchdog dump.
+    // Round-16 / Round-19: the Module.loadClass / ModuleClassLoader.findClass /
+    // Module.getClassLoader registrations were REMOVED here. They shadowed
+    // the proper module-aware implementations in `jboss_module_loader.rs`
+    // (which DO know how to look up classes against the registered module
+    // classpath) with unconditional-null returns. That made
+    // `Module.run(args)` -> `Class.forName(mainClassName, false, mcl)` fail
+    // for `org.jboss.as.server.Main` with NoSuchMethodException.
+    //
+    // The real implementations live in `jboss_module_loader::
+    // register_jboss_module_loader` and are registered first; we no
+    // longer override them here. The classpath-delegating fallbacks
+    // (`native_module_load_class` / `native_module_class_loader_find_class`)
+    // remain in this file as private helpers in case a future shim wants
+    // to call them, but they are not wired into the registry.
     // ------------------------------------------------------------------
-
-    // Module.loadClass(String)Class — return null instead of recursing.
-    registry.register(
-        CN_MODULE,
-        "loadClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        native_module_load_class,
-    );
-
-    // ModuleClassLoader.findClass(String)Class — return null.
-    registry.register(
-        CN_MODULE_CLASS_LOADER,
-        "findClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        native_module_class_loader_find_class,
-    );
-
-    // Module.getClassLoader()ClassLoader — return null so callers fall
-    // back to the system ClassLoader rather than the synthetic chain.
-    registry.register(
-        CN_MODULE,
-        "getClassLoader",
-        "()Ljava/lang/ClassLoader;",
-        native_module_get_class_loader,
-    );
+    let _ = native_module_load_class;
+    let _ = native_module_class_loader_find_class;
+    let _ = CN_MODULE_CLASS_LOADER;
 
     // PathFilter.accept(String)Z — accept all paths.
     registry.register(
