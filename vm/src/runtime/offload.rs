@@ -286,6 +286,68 @@ impl OffloadCache {
     }
 }
 
+/// Per-VM registry of [`OffloadCache`] instances, keyed by CUDA device
+/// ordinal.
+///
+/// Phase 3 introduces this layer so a single VM can address multiple
+/// GPUs without re-probing the driver on every dispatch. The first
+/// caller for a given ordinal pays the probe + context-acquisition
+/// cost; subsequent callers reuse the cached `Arc<OffloadCache>`.
+///
+/// Today every callsite passes `config.gpu_device_ordinal` (default 0),
+/// so in practice there is one cache. The registry shape is the API
+/// surface real multi-GPU support will plug into — see the
+/// `get_or_create` PHASE3 note.
+pub struct OffloadCacheRegistry {
+    per_device: parking_lot::RwLock<
+        rustc_hash::FxHashMap<u32, std::sync::Arc<OffloadCache>>,
+    >,
+}
+
+impl OffloadCacheRegistry {
+    pub fn new() -> Self {
+        Self {
+            per_device: parking_lot::RwLock::new(rustc_hash::FxHashMap::default()),
+        }
+    }
+
+    /// Get-or-construct the `OffloadCache` for `device_ordinal`. The
+    /// first caller for a given ordinal pays the probe cost; later
+    /// callers reuse the cached `Arc`.
+    pub fn get_or_create(
+        &self,
+        device_ordinal: u32,
+        config: &crate::config::VmConfig,
+    ) -> std::sync::Arc<OffloadCache> {
+        if let Some(cache) = self.per_device.read().get(&device_ordinal) {
+            return cache.clone();
+        }
+        let mut write = self.per_device.write();
+        if let Some(cache) = write.get(&device_ordinal) {
+            return cache.clone();
+        }
+        // PHASE3: per-device probe currently routes through
+        // OffloadCache::new which honours `config.gpu_device_ordinal`.
+        // When real multi-GPU lands this passes the ordinal through to
+        // cuda-bridge directly rather than re-using the config field.
+        let cache = std::sync::Arc::new(OffloadCache::new(config));
+        write.insert(device_ordinal, cache.clone());
+        cache
+    }
+
+    /// Lookup without constructing. Returns `None` if no cache has
+    /// been created for `device_ordinal` yet.
+    pub fn get(&self, device_ordinal: u32) -> Option<std::sync::Arc<OffloadCache>> {
+        self.per_device.read().get(&device_ordinal).cloned()
+    }
+}
+
+impl Default for OffloadCacheRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Identify which array parameter (if any) is the output sink.
 ///
 /// First-cut convention: the **last** array in `param_kinds`. Documented
@@ -371,7 +433,10 @@ pub fn try_dispatch(
     // tradeoff is that the very first compile of a given method holds
     // the manager's read lock for the duration of analyze+lower+load.
     // Concurrent dispatchers reading the manager are unaffected.
-    let outcome = shared.offload_cache.lookup_or_compile(
+    let cache = shared
+        .offload_registry
+        .get_or_create(shared.config.gpu_device_ordinal, &shared.config);
+    let outcome = cache.lookup_or_compile(
         class_id,
         class_name,
         method_index,
