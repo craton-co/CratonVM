@@ -35,6 +35,11 @@ pub mod satb;
 pub mod safepoint;
 pub mod tlab;
 pub mod vm_heap;
+// Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
+// feature. No in-workspace consumer references `zgc::*` today, so paying
+// the compile-time + binary-size cost on every build is pure waste. Flip
+// the feature on once a real consumer lands.
+#[cfg(feature = "zgc")]
 pub mod zgc;
 
 pub use collector::{GarbageCollector, MonitorCleanup};

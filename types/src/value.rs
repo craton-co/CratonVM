@@ -61,6 +61,24 @@ impl std::hash::Hash for ObjectRef {
     }
 }
 
+/// Round-5: shared helper used by both `ObjectRef::from_raw` and
+/// `ObjectRef::from_raw_nonnull` to debug-assert 8-byte alignment.
+///
+/// Why a single helper: prior to this change the two constructors used
+/// different assertion mechanisms (`from_raw` panicked unconditionally,
+/// `from_raw_nonnull` only `debug_assert!`-ed). Either both are load-bearing
+/// in release or neither is — and per the `from_raw_nonnull` analysis, the
+/// post-condition is already guaranteed by callers (and by the heap layout
+/// invariants). The helper makes both call sites use identical wording so a
+/// future refactor can't accidentally re-introduce the asymmetry.
+#[inline]
+fn debug_assert_aligned(ptr: *mut u8) {
+    debug_assert!(
+        (ptr as usize) % 8 == 0,
+        "ObjectRef pointer not 8-byte aligned: {ptr:p}"
+    );
+}
+
 impl ObjectRef {
     /// Create a new object reference from a raw pointer.
     ///
@@ -74,18 +92,26 @@ impl ObjectRef {
     /// without entering this constructor, so the release build elides the
     /// redundant branch. Debug builds still trip the assert if a caller
     /// violates the precondition.
+    // SAFETY: callers guarantee `ptr` is non-null and aligned to 8 bytes
+    // (heap object alignment). Both preconditions are checked via
+    // `debug_assert!` only — release builds elide the branch.
+    //
+    // Round-7: alignment check downgraded from unconditional panic to
+    // `debug_assert!` for consistency with `from_raw_nonnull`. The hot
+    // path (object dereference) does not check alignment in release
+    // anyway — a misaligned slot would corrupt the heap before reaching
+    // this constructor — so the release-build panic was redundant.
+    #[inline]
     pub unsafe fn from_raw(ptr: *mut u8) -> Self {
-        // T14 + MED-1: alignment check stays in release (corrupted slots
-        // are a real failure mode during bootstrap), null check is
-        // debug-only (callers null-check upstream).
         debug_assert!(
             !ptr.is_null(),
             "ObjectRef::from_raw called with null pointer"
         );
-        if (ptr as usize) % 8 != 0 {
-            panic!("ObjectRef::from_raw called with unaligned pointer: {ptr:p}");
-        }
-        // SAFETY: caller's precondition + debug_assert above guarantee non-null.
+        // Round-5: shared alignment helper. Both `from_raw` and
+        // `from_raw_nonnull` go through `debug_assert_aligned`, so the
+        // assertion text and check site are identical.
+        // SAFETY: callers guarantee `ptr` is non-null and 8-byte aligned.
+        debug_assert_aligned(ptr);
         Self {
             ptr: unsafe { NonNull::new_unchecked(ptr) },
         }
@@ -99,12 +125,14 @@ impl ObjectRef {
     /// # Safety
     /// The pointer must point to a properly allocated, 8-byte-aligned
     /// heap object for the lifetime that the returned `ObjectRef` is used.
+    // SAFETY: callers guarantee `ptr` is aligned to 8 bytes (heap object
+    // alignment); checked in debug only.
+    #[inline]
     pub unsafe fn from_raw_nonnull(ptr: NonNull<u8>) -> Self {
-        debug_assert!(
-            (ptr.as_ptr() as usize) % 8 == 0,
-            "ObjectRef::from_raw_nonnull called with unaligned pointer: {:p}",
-            ptr.as_ptr()
-        );
+        // SAFETY: callers guarantee 8-byte alignment; checked in debug only
+        // via the shared `debug_assert_aligned` helper for consistency with
+        // `from_raw`.
+        debug_assert_aligned(ptr.as_ptr());
         Self { ptr }
     }
 

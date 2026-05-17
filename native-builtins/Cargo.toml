@@ -41,7 +41,8 @@ fancy-regex = "0.13"
 parking_lot = "0.12"
 # WP4.2: VarHandle metadata side-table.
 rustc-hash = "1.1"
-tracing = "0.1"
+# Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 native-tls = "0.2"
 # T2.7: rustls provides server-side TLS (SSLServerSocket) with SNI dispatch,
 # ALPN negotiation, and TLS 1.3 session resumption — features that native-tls

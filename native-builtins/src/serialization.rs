@@ -1983,10 +1983,17 @@ fn register_object_input(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ObjectInput";
     // Static interface initializer — true static no-op.
     r.register(cls, "registerNatives", "()V", native_noop);
+    // Round-7 HIGH-12 fix: previously a blanket UnsupportedOperationException
+    // here propagated out of any JNDI / RMI bootstrap path that probes the
+    // interface (e.g. `InitialContext` decoding the LDAP environment). The
+    // JDK contract allows `readObject` to return null at end-of-stream, and
+    // the JNDI bootstrap recovers gracefully from `null` but not from a UOE
+    // surfaced through `Object readObject() throws ClassNotFoundException`.
+    // Return null so downstream `if (obj == null) { ... fallback ... }`
+    // branches fire instead of unwinding through the interface default.
+    // TODO: implement deserialization for at least String/Integer/Long primitives.
     r.register(cls, "readObject", "()Ljava/lang/Object;", |_ctx, _args| {
-        Err(RuntimeError::UnsupportedOperationException {
-            message: "Java object serialization is not yet supported".into(),
-        }.into())
+        Ok(Some(Value::Object(None)))
     });
     r.register(cls, "available", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))

@@ -715,24 +715,25 @@ impl GenerationalHeap {
 
     /// Get the value of a volatile field.
     ///
-    /// Issues `SeqCst` fences on either side of the load to give the
-    /// JMM-required happens-before edge. This matches the fence-only
-    /// approach used by `heap::Heap` — the previous global
-    /// `Mutex<()>` here serialised *every* volatile read across every
-    /// object in the heap, which is far stronger than the JMM requires
-    /// and turned heap-wide volatile traffic into a single-threaded
-    /// bottleneck.
+    /// JLS §17.7 requires reads and writes of volatile long / double
+    /// (and any volatile-declared field) to be atomic. The on-heap
+    /// `Value` slot is 16 bytes (8-byte tag + 8-byte payload), wider
+    /// than any stable Rust atomic primitive on x86-64, so a SeqCst
+    /// fence pair gives the required happens-before ordering but does
+    /// **not** by itself guarantee atomicity of the slot's read —
+    /// a concurrent writer could leave the tag and payload words
+    /// momentarily out of sync, surfacing as a torn long/double
+    /// (e.g. high 32 bits from the old write, low 32 from the new).
     ///
-    /// 16-byte `Value` tearing is not an issue in practice on the
-    /// supported targets: `Value` is a tagged 16-byte union where the
-    /// 8-byte tag/discriminant lives in a single naturally aligned word
-    /// and the payload is read into the matching variant. Aligned 8-byte
-    /// reads are atomic on x86-64 and AArch64; the worst-case torn read
-    /// would observe a stale tag-vs-payload pairing across two
-    /// concurrent volatile writes, which the language model permits
-    /// (the JMM only forbids "out-of-thin-air" values, not stale
-    /// values).
+    /// We close the atomicity hole with the striped-mutex pool in
+    /// [`crate::collector::volatile_stripe_lock`]: paired
+    /// `set_field_volatile` writers acquire the same stripe, so the
+    /// 16-byte read here either observes a fully old or fully new
+    /// `Value`. Striping keeps unrelated volatile fields from
+    /// serializing across the heap (the previous design used a single
+    /// heap-wide mutex which became a global bottleneck).
     pub fn get_field_volatile(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        let _guard = crate::collector::volatile_stripe_lock(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let val = self.get_field(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -741,10 +742,14 @@ impl GenerationalHeap {
 
     /// Set the value of a volatile field.
     ///
-    /// Issues `SeqCst` fences on either side of the store; see
-    /// [`Self::get_field_volatile`] for why the previous global mutex
-    /// was removed.  The write barrier still fires inside `set_field`.
+    /// Acquires the per-slot stripe lock from
+    /// [`crate::collector::volatile_stripe_lock`] to make the 16-byte
+    /// `Value` write appear atomic to a concurrent volatile reader.
+    /// SeqCst fences provide the JMM happens-before edge. The write
+    /// barrier still fires inside `set_field`. See
+    /// [`Self::get_field_volatile`] for the full rationale.
     pub fn set_field_volatile(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        let _guard = crate::collector::volatile_stripe_lock(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         self.set_field(obj_ref, index, value); // barrier fires inside set_field
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);

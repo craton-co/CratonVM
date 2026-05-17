@@ -54,6 +54,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         invoke_dispatch: s,
         invoke_virtual_mic: s,
         write_barrier: s,
+        satb_pre_write_barrier: s,
         uncommon_trap: s,
         math_fma_double: s,
         math_fma_float: s,

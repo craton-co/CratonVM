@@ -142,23 +142,53 @@ impl Default for SatbBuffer {
     }
 }
 
+/// Number of `SatbQueue` shards.  Must be a power of two so the
+/// `tid & (SHARDS-1)` mapping is a single mask.  16 chosen as a
+/// compromise between memory (each shard is a Mutex<Vec<usize>>) and
+/// throughput at mutator counts up to ~16 active flushers.
+const SHARDS: usize = 16;
+
 /// Global SATB queue shared by all threads and the concurrent marker.
 ///
 /// Application threads flush their per-thread `SatbBuffer` into this queue.
 /// Marker threads drain it to discover references that were overwritten
 /// during concurrent marking.
+///
+/// Round-7 HIGH-3 fix: the queue is sharded across `SHARDS` independent
+/// `Mutex<Vec<usize>>` buckets keyed by `thread_id % SHARDS`.  This
+/// eliminates the single-global-mutex chokepoint that serialised every
+/// mutator buffer flush during concurrent marking.  The marker drains
+/// all shards once per cycle (or on demand), so the consumer side
+/// remains a single thread.
 pub struct SatbQueue {
-    /// Accumulated entries from all threads.
-    entries: Mutex<Vec<usize>>,
+    /// Per-shard entry buckets.  Each mutator picks its shard by its
+    /// thread id, so independent threads land on independent locks in
+    /// the common case.
+    shards: [Mutex<Vec<usize>>; SHARDS],
     /// Whether SATB logging is currently active (only during concurrent mark).
     active: AtomicBool,
+}
+
+#[inline]
+fn shard_for_current_thread() -> usize {
+    // Hash the thread id into [0, SHARDS).  `ThreadId` doesn't expose
+    // its inner u64 publicly on stable, but its `Hash` impl is stable
+    // across calls within the same thread, which is all we need.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    (h.finish() as usize) & (SHARDS - 1)
 }
 
 impl SatbQueue {
     /// Create a new inactive SATB queue.
     pub fn new() -> Self {
+        // Array initialisation with a non-Copy element type — use a
+        // small helper so each shard gets its own Mutex.
+        let shards: [Mutex<Vec<usize>>; SHARDS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
         Self {
-            entries: Mutex::new(Vec::new()),
+            shards,
             active: AtomicBool::new(false),
         }
     }
@@ -181,28 +211,51 @@ impl SatbQueue {
     }
 
     /// Flush a per-thread buffer's entries into the global queue.
+    ///
+    /// Round-7 HIGH-3: writes land on the per-thread shard so concurrent
+    /// flushers from independent threads do not serialise.
     pub fn flush(&self, entries: Vec<usize>) {
         if entries.is_empty() {
             return;
         }
-        let mut queue = self.entries.lock();
+        let s = shard_for_current_thread();
+        let mut queue = self.shards[s].lock();
         queue.extend(entries);
     }
 
     /// Drain all accumulated entries for the marker to process.
+    ///
+    /// Visits every shard in order, atomically swapping each Vec out
+    /// and concatenating into a single result.  The marker is the
+    /// single consumer so per-shard ordering across shards is not
+    /// meaningful — entries from shard 0 simply precede shard 1's.
     pub fn drain(&self) -> Vec<usize> {
-        let mut queue = self.entries.lock();
-        std::mem::take(&mut *queue)
+        let mut total = 0usize;
+        let mut buckets: [Vec<usize>; SHARDS] = std::array::from_fn(|_| Vec::new());
+        for (i, shard) in self.shards.iter().enumerate() {
+            let mut guard = shard.lock();
+            let taken = std::mem::take(&mut *guard);
+            total += taken.len();
+            buckets[i] = taken;
+        }
+        let mut out = Vec::with_capacity(total);
+        for b in buckets.into_iter() {
+            out.extend(b);
+        }
+        out
     }
 
     /// Number of entries currently queued (approximate, for stats).
+    ///
+    /// Walks every shard taking each lock briefly; only used by tests
+    /// and diagnostics, never on the hot path.
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.shards.iter().map(|s| s.lock().len()).sum()
     }
 
     /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+        self.shards.iter().all(|s| s.lock().is_empty())
     }
 }
 
@@ -216,7 +269,7 @@ impl std::fmt::Debug for SatbQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SatbQueue")
             .field("active", &self.active.load(Ordering::Relaxed))
-            .field("queued", &self.entries.lock().len())
+            .field("queued", &self.len())
             .finish()
     }
 }

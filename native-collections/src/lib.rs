@@ -117,6 +117,56 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
 }
 
+/// RAII guard for a native monitor (`ctx.monitor_enter` / `monitor_exit`).
+///
+/// CRIT fix (round-5): the previous CHM write path performed
+///   `ctx.monitor_enter(seg); ... do work ...; ctx.monitor_exit(seg);`
+/// directly. If the "do work" body returned `Err(..)` early via `?`, or
+/// panicked (e.g. resize hit a guard-tripped chain corruption case), the
+/// matching `monitor_exit` never ran and the segment stayed locked
+/// forever — every subsequent thread blocking on that segment would
+/// deadlock.
+///
+/// Using `ChmMonitorGuard` instead ensures `monitor_exit` runs on every
+/// exit path, including unwinding. We store the context as a raw pointer
+/// because Drop cannot hold the original `&mut dyn NativeContext` borrow
+/// without conflicting with the body's use of the same reference. The
+/// pointer is always live: the guard is bound to a local that cannot
+/// outlive the borrow used to acquire it (the borrow is reborrowed
+/// fresh for each call inside the function body).
+///
+/// If `monitor_exit` itself panics during unwind the process aborts —
+/// preferable to silently leaking the monitor.
+struct ChmMonitorGuard {
+    ctx: *mut (dyn NativeContext + 'static),
+    seg: ObjectRef,
+}
+
+impl ChmMonitorGuard {
+    fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
+        ctx.monitor_enter(seg);
+        // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
+        // borrow ends. We transmute away the lifetime so the guard doesn't
+        // hold the &mut borrow for its scope — call sites still use ctx
+        // mutably between acquire and drop, which is sound as long as no
+        // code outlives the original &mut borrow.
+        let ctx_ptr: *mut dyn NativeContext = ctx;
+        let ctx_ptr_static: *mut (dyn NativeContext + 'static) =
+            unsafe { core::mem::transmute(ctx_ptr) };
+        ChmMonitorGuard { ctx: ctx_ptr_static, seg }
+    }
+}
+
+impl Drop for ChmMonitorGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard is always a local whose lifetime is bounded
+        // by the `&mut dyn NativeContext` borrow used in `acquire`. No
+        // other code can drop or invalidate the context while the guard
+        // is live.
+        unsafe { (*self.ctx).monitor_exit(self.seg) };
+    }
+}
+
 /// Try to read an object's string representation for display purposes.
 ///
 /// For objects that are not plain strings or primitives, this calls
@@ -1291,15 +1341,21 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
                 let mut hi_tail: Option<ObjectRef> = None;
                 let mut steps: usize = 0;
                 let step_cap = (size as usize).saturating_add(8);
+                let mut cycle_tripped = false;
                 while let Value::Object(Some(node)) = node_val {
                     steps += 1;
                     if steps > step_cap {
                         // Total live entries bound the chain length;
-                        // exceeding it indicates a cycle.
+                        // exceeding it indicates a cycle. Round-5 fix: do
+                        // NOT silently keep the partial lo/hi chains —
+                        // that loses every entry past the bound. Mark
+                        // this bucket for full re-insert via the
+                        // standard hash-prepend path below.
                         eprintln!(
-                            "[HM-RESIZE-GUARD] aborting old-chain walk at {} nodes (suspected cycle); bucket={}",
+                            "[HM-RESIZE-GUARD] aborting old-chain split walk at {} nodes (suspected cycle); bucket={} — falling back to full re-insert",
                             steps, i
                         );
+                        cycle_tripped = true;
                         break;
                     }
                     let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
@@ -1323,6 +1379,41 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
                         hi_tail = Some(node);
                     }
                     node_val = next;
+                }
+                if cycle_tripped {
+                    // Round-5 cycle-bound fallback: discard the partial
+                    // lo/hi work for this bucket and re-walk the
+                    // original chain with a visited-set so we never
+                    // follow the cycle twice, inserting each unique
+                    // node into `new_buckets` via head-prepend at the
+                    // correct index. This preserves correctness at the
+                    // cost of bucket order — much better than silently
+                    // dropping ~50% of entries.
+                    let mut seen: std::collections::HashSet<*const ()> =
+                        std::collections::HashSet::new();
+                    let mut nv = ctx.get_array_element(old_b, i);
+                    while let Value::Object(Some(node)) = nv {
+                        let key = node.as_ptr() as *const ();
+                        if !seen.insert(key) {
+                            // Already inserted — cycle detected, stop.
+                            break;
+                        }
+                        let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                            Value::Int(h) => h,
+                            _ => 0,
+                        };
+                        let next = ctx.get_field(node, NODE_FIELD_NEXT);
+                        let new_idx = map_bucket_index(key_hash, new_cap);
+                        let existing = ctx.get_array_element(new_buckets, new_idx);
+                        ctx.set_field(node, NODE_FIELD_NEXT, existing);
+                        ctx.set_array_element(
+                            new_buckets,
+                            new_idx,
+                            Value::Object(Some(node)),
+                        );
+                        nv = next;
+                    }
+                    continue;
                 }
                 // Terminate both partitioned chains.
                 if let Some(t) = lo_tail {
@@ -1390,7 +1481,17 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
         }
     }
 
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+    // Round-5 CRIT fix (publication race): publish the new buckets
+    // array with a volatile/Release-style write so that concurrent
+    // readers in `chm_get_volatile` (which use `get_field_volatile` on
+    // MAP_FIELD_BUCKETS) are guaranteed to either see the OLD fully-
+    // linked array or the NEW fully-linked array — never a half-spliced
+    // chain whose NEXT pointers were mid-rewrite. All chain mutations
+    // for `new_buckets` (the lo/hi splice and the head-prepend
+    // fallback) complete before this volatile store. The non-CHM
+    // (single-threaded HashMap) callers see identical semantics — a
+    // volatile store is at least as strong as a plain store.
+    ctx.set_field_volatile(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
     set_map_size(ctx, this, size);
     // Mirror the bucket array to the JDK-resolved `table` slot when present
     // (and different from slot 0). This is critical for AnnotationAttributes
@@ -1402,7 +1503,7 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
-            ctx.set_field(this, slot, Value::Object(Some(new_buckets)));
+            ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
         }
     }
     if table_slot != Some(MAP_FIELD_CAPACITY) {
@@ -14371,15 +14472,75 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     for (key, value) in src_entries {
         let hash = chm_key_hash(ctx, &key);
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
-            ctx.monitor_enter(seg);
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
-            ctx.monitor_exit(seg);
         }
     }
     Ok(None)
 }
 
 // --- Core read operations (lock-free) ---
+
+/// Round-5 CRIT fix (publication race): CHM-specific segment lookup.
+///
+/// Reads the segment's buckets slot via `get_field_volatile` and walks
+/// the chain using `get_field_volatile` on `NODE_FIELD_NEXT`. Pairs with
+/// `map_resize`'s `set_field_volatile` publication of the new buckets
+/// array: a reader is guaranteed to observe either the OLD or NEW
+/// fully-linked array, never a half-spliced chain.
+///
+/// Returns `Some(value)` on hit (including null-valued mappings),
+/// `None` on miss. The hash and key matching logic mirrors
+/// `native_map_get`.
+fn chm_seg_get(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    key_val: Value,
+) -> Option<Value> {
+    let (key_ref, hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(None) => (None, 0, true),
+        _ => return None,
+    };
+    // Acquire-load the buckets array reference. If the writer has
+    // begun publishing a new array, we see either the old one (with a
+    // fully-linked chain) or the new one (also fully-linked) — never a
+    // torn intermediate.
+    let buckets_val = ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS);
+    let buckets = match buckets_val {
+        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
+        _ => return None,
+    };
+    let cap = match ctx.get_field(seg, MAP_FIELD_CAPACITY) {
+        Value::Int(c) => c,
+        _ => return None,
+    };
+    if cap <= 0 {
+        return None;
+    }
+    let idx = map_bucket_index(hash, cap);
+    let mut node_val = ctx.get_array_element(buckets, idx);
+    while let Value::Object(Some(node)) = node_val {
+        let node_key_field = get_node_key(ctx, node);
+        if is_null_key {
+            if matches!(node_key_field, Value::Object(None)) {
+                return Some(get_node_value(ctx, node));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+                return Some(get_node_value(ctx, node));
+            }
+        }
+        // Acquire-load the NEXT pointer. Pairs with the writer's
+        // `set_field` of NEXT during chain construction — the writer
+        // publishes the buckets array with `set_field_volatile` AFTER
+        // all NEXT links are set, so a reader observing the new
+        // buckets array necessarily observes the corresponding NEXT
+        // writes (happens-before via Release/Acquire).
+        node_val = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
+    }
+    None
+}
 
 fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -14389,7 +14550,7 @@ fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => native_map_get(ctx, &[Value::Object(Some(seg)), key]),
+        Some(seg) => Ok(Some(chm_seg_get(ctx, seg, key).unwrap_or(Value::Object(None)))),
         None => Ok(Some(Value::Object(None))),
     }
 }
@@ -14402,7 +14563,16 @@ fn native_chm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => native_map_contains_key(ctx, &[Value::Object(Some(seg)), key]),
+        Some(seg) => {
+            // Volatile-read path: a present mapping is detected by a
+            // non-null Value::Object payload OR by walking the chain
+            // and finding a key match (which `chm_seg_get` does). A
+            // miss returns None here.
+            match chm_seg_get(ctx, seg, key) {
+                Some(_) => Ok(Some(Value::Int(1))),
+                None => Ok(Some(Value::Int(0))),
+            }
+        }
         None => Ok(Some(Value::Int(0))),
     }
 }
@@ -14416,7 +14586,10 @@ fn native_chm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => native_map_get_or_default(ctx, &[Value::Object(Some(seg)), key, default]),
+        Some(seg) => match chm_seg_get(ctx, seg, key) {
+            Some(v) => Ok(Some(v)),
+            None => Ok(Some(default)),
+        },
         None => Ok(Some(default)),
     }
 }
@@ -14449,10 +14622,8 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
-            let result = native_map_put(ctx, &[Value::Object(Some(seg)), key, value]);
-            ctx.monitor_exit(seg);
-            result
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_put(ctx, &[Value::Object(Some(seg)), key, value])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14467,10 +14638,8 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
-            let result = native_map_remove(ctx, &[Value::Object(Some(seg)), key]);
-            ctx.monitor_exit(seg);
-            result
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_remove(ctx, &[Value::Object(Some(seg)), key])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14486,10 +14655,8 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
-            let result = native_map_put_if_absent(ctx, &[Value::Object(Some(seg)), key, value]);
-            ctx.monitor_exit(seg);
-            result
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_put_if_absent(ctx, &[Value::Object(Some(seg)), key, value])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14505,10 +14672,8 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
-            let result = native_map_compute_if_absent(ctx, &[Value::Object(Some(seg)), key, func]);
-            ctx.monitor_exit(seg);
-            result
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_compute_if_absent(ctx, &[Value::Object(Some(seg)), key, func])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14524,10 +14689,8 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
-            let result = native_map_compute(ctx, &[Value::Object(Some(seg)), key, func]);
-            ctx.monitor_exit(seg);
-            result
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_compute(ctx, &[Value::Object(Some(seg)), key, func])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14544,10 +14707,8 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
-            let result = native_map_merge(ctx, &[Value::Object(Some(seg)), key, value, func]);
-            ctx.monitor_exit(seg);
-            result
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_merge(ctx, &[Value::Object(Some(seg)), key, value, func])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14583,9 +14744,8 @@ fn native_chm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     for seg in chm_all_segments(ctx, this) {
-        ctx.monitor_enter(seg);
+        let _guard = ChmMonitorGuard::acquire(ctx, seg);
         native_map_clear(ctx, &[Value::Object(Some(seg))])?;
-        ctx.monitor_exit(seg);
     }
     Ok(None)
 }
@@ -14603,9 +14763,8 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     for (key, value) in entries {
         let hash = chm_key_hash(ctx, &key);
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
-            ctx.monitor_enter(seg);
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
-            ctx.monitor_exit(seg);
         }
     }
     Ok(None)
@@ -14618,9 +14777,8 @@ fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let func = args.get(1).copied().unwrap_or(Value::Object(None));
     for seg in chm_all_segments(ctx, this) {
-        ctx.monitor_enter(seg);
+        let _guard = ChmMonitorGuard::acquire(ctx, seg);
         native_map_replace_all(ctx, &[Value::Object(Some(seg)), func])?;
-        ctx.monitor_exit(seg);
     }
     Ok(None)
 }
@@ -14799,15 +14957,13 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
             let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
                 .unwrap_or(Value::Object(None));
             if values_equal(ctx, &current, &expected_val) {
                 native_map_remove(ctx, &[Value::Object(Some(seg)), key])?;
-                ctx.monitor_exit(seg);
                 Ok(Some(Value::Int(1)))
             } else {
-                ctx.monitor_exit(seg);
                 Ok(Some(Value::Int(0)))
             }
         }
@@ -14825,18 +14981,16 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
             let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
                 .unwrap_or(Value::Object(None));
-            let result = match current {
+            match current {
                 Value::Object(None) => Ok(Some(Value::Object(None))),
                 _ => {
                     native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
                     Ok(Some(current))
                 }
-            };
-            ctx.monitor_exit(seg);
-            result
+            }
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14853,15 +15007,13 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            ctx.monitor_enter(seg);
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
             let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
                 .unwrap_or(Value::Object(None));
             if values_equal(ctx, &current, &old_val) {
                 native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
-                ctx.monitor_exit(seg);
                 Ok(Some(Value::Int(1)))
             } else {
-                ctx.monitor_exit(seg);
                 Ok(Some(Value::Int(0)))
             }
         }

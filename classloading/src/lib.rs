@@ -47,6 +47,20 @@ pub use class_manager::{
     CLASS_INIT_IN_PROGRESS, CLASS_INIT_INITIALIZED, CLASS_INIT_UNINITIALIZED,
 };
 pub use class_path::{ClassPath, ManifestInfo};
+// Round 5 audit fix (MED #10) / Round 7 audit fix (MED #11): expose the
+// reflective `(class, name, descriptor)` cache so VM-side reflective
+// resolvers (`Class.getMethod`, `MethodHandles.Lookup.findVirtual`,
+// JNI `GetMethodID`/`GetFieldID`, Spring's `ReflectionUtils.findMethod`)
+// can dedupe their per-call hierarchy walk. Invalidated in lockstep
+// with `ResolutionCache::invalidate_class` from the JVMTI
+// `RedefineClasses` path.
+pub use resolution::{LinkResolver, ResolvedMember};
+// Round 5 audit fix (LOW #11) / Round 7 carry-over: pre-flattened
+// built-in loader delegation chain. Used by VM-side callers that
+// want to walk parent-delegation without chasing trait-object
+// parent pointers (the slice walk is cache-friendly and avoids
+// 3 vtable dispatches per probe).
+pub use loaders::{BUILTIN_LOADER_DELEGATION_CHAIN, MAX_BUILTIN_LOADER_DEPTH};
 pub use module::{
     descriptor_from_module_attribute, package_of, ModuleDescriptor, ModuleRegistry,
     JAVA_BASE, UNNAMED_MODULE,

@@ -3426,6 +3426,32 @@ impl Compiler {
         if self.failed {
             return;
         }
+        // TODO(round-8, HIGH from round-5 #9 / round-4 #15): precise oop
+        // map currently only records `StackSlot::Frame` oops on the
+        // simulated operand stack. Java locals assigned to a callee-saved
+        // GPR (R12-R15, RBX, on Windows also RSI/RDI) hold their value
+        // exclusively in the register between aload/astore opcodes —
+        // those oops are invisible to the precise scanner. The
+        // conservative fallback in `vm/src/jit/conservative_roots.rs`
+        // does NOT read register values (it walks stack memory only),
+        // so a callee-saved register holding an oop at a safepoint can
+        // currently slip past root marking. We rely on the Rust runtime
+        // helpers' callee-saved-register preservation (the helper saves
+        // R12-R15/RBX in *its* prologue, where the conservative scan
+        // *does* find them on the Rust frame) for correctness today —
+        // any LTO inlining that erases the helper save would break
+        // this. The proper fix has two parts:
+        //   (1) Extend `OopMapEntry` with a `reg_oop_slot_offsets:
+        //       Vec<i16>` field that records the canonical frame slot
+        //       for each register-resident oop local that is live at
+        //       this safepoint;
+        //   (2) Emit `MOV [RBP - (idx+1)*8], reg` for each such local
+        //       immediately before the safepoint poll, so the
+        //       conservative sweep + the new precise slot list both
+        //       find the current value.
+        // Per-local oop-type tracking (we currently only track oop-ness
+        // of operand-stack entries via `stack_oop_marks`) is the
+        // prerequisite. Deferred to round-8.
         // T1.1.a — lazy resync. Non-instrumented `self.stack.push`
         // sites (aload local-to-CalleeSaved, inlined-callee pushes,
         // LICM hoists, XMM intermediate pushes) leave
@@ -3873,6 +3899,81 @@ impl Compiler {
         self.modrm_rbp_disp(reg, offset);
     }
 
+    // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
+    //
+    // CMOVcc r64, r/m64 lets us implement small-value selects (Math.min,
+    // Math.max, ternary `a < b ? x : y`) without a branch. Encoding is
+    // `REX.W 0F 4cc /r` where the condition codes match the Jcc family:
+    //   0x44 = CMOVE   (ZF=1)        0x45 = CMOVNE
+    //   0x4C = CMOVL   (SF≠OF)       0x4D = CMOVGE
+    //   0x4E = CMOVLE  (ZF=1 or SF≠OF) 0x4F = CMOVG
+    //   0x42 = CMOVB   (CF=1, unsigned <)  0x43 = CMOVAE
+    //   0x46 = CMOVBE  (CF=1 or ZF=1)      0x47 = CMOVA
+    // These helpers are emit-time primitives; the IR/lower passes have
+    // not yet been taught to detect the patterns that should use them.
+    //
+    // TODO(round-8, HIGH from round-7 jit #7): wire `emit_cmov_*` into
+    // a peephole at bytecode emission time. Candidate patterns:
+    //   * `if_icmplt; ldc small; goto K; L: ldc small; K:` → CMOVL
+    //   * Math.min(I,I) / Math.max(I,I) builtins inlined in the JIT
+    //   * `if_acmpne L; aconst_null; goto K; L: aload x; K:` → CMOVNE
+    // The current emitter performs all selects via compare+conditional
+    // jump+move, which mispredicts on hard-to-predict data (e.g. random
+    // array element comparisons in sorting kernels). A CMOV peephole
+    // would close roughly a 2-3% gap on `sort`-heavy microbenchmarks.
+
+    /// Emit `CMOVcc dst, src` (64-bit) with the given condition opcode byte
+    /// (0x40..0x4F). dst/src are encoded register-direct (mod=11).
+    #[allow(dead_code)]
+    fn emit_cmov_cc_reg_reg(&mut self, cc: u8, dst: u8, src: u8) {
+        debug_assert!((0x40..=0x4F).contains(&cc),
+            "CMOV cc opcode must be in 0x40..0x4F");
+        // REX.W with R (dst extended) and B (src extended).
+        let mut rex: u8 = 0x48;
+        if dst >= 8 { rex |= 0x04; }
+        if src >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(cc);
+        self.modrm_reg(dst, src);
+    }
+
+    /// CMOVL r64, r64 — move src into dst if SF≠OF (signed `<`).
+    #[allow(dead_code)]
+    fn emit_cmov_l_reg_reg(&mut self, dst: u8, src: u8) {
+        self.emit_cmov_cc_reg_reg(0x4C, dst, src);
+    }
+
+    /// CMOVG r64, r64 — move src into dst if ZF=0 and SF=OF (signed `>`).
+    #[allow(dead_code)]
+    fn emit_cmov_g_reg_reg(&mut self, dst: u8, src: u8) {
+        self.emit_cmov_cc_reg_reg(0x4F, dst, src);
+    }
+
+    /// CMOVLE r64, r64 — move src into dst if ZF=1 or SF≠OF (signed `<=`).
+    #[allow(dead_code)]
+    fn emit_cmov_le_reg_reg(&mut self, dst: u8, src: u8) {
+        self.emit_cmov_cc_reg_reg(0x4E, dst, src);
+    }
+
+    /// CMOVGE r64, r64 — move src into dst if SF=OF (signed `>=`).
+    #[allow(dead_code)]
+    fn emit_cmov_ge_reg_reg(&mut self, dst: u8, src: u8) {
+        self.emit_cmov_cc_reg_reg(0x4D, dst, src);
+    }
+
+    /// CMOVE r64, r64 — move src into dst if ZF=1 (equal).
+    #[allow(dead_code)]
+    fn emit_cmov_e_reg_reg(&mut self, dst: u8, src: u8) {
+        self.emit_cmov_cc_reg_reg(0x44, dst, src);
+    }
+
+    /// CMOVNE r64, r64 — move src into dst if ZF=0 (not equal).
+    #[allow(dead_code)]
+    fn emit_cmov_ne_reg_reg(&mut self, dst: u8, src: u8) {
+        self.emit_cmov_cc_reg_reg(0x45, dst, src);
+    }
+
     /// MOV reg, imm64
     #[allow(dead_code)]
     fn emit_mov_imm64(&mut self, reg: u8, imm: i64) {
@@ -4243,6 +4344,19 @@ impl Compiler {
             9 => {
                 // LEA EAX, [RAX + RAX*8]
                 self.buf.emit(&[0x8D, 0x04, 0xC0]);
+            }
+            // round-7 fix (bug 6): power-of-2 fast path for val >= 16.
+            // 2/4/8 are handled above; 16/32/.../2^30 fall through to IMUL
+            // imm32 (5 bytes) when they could be a 3-byte SHL EAX, imm8.
+            // Negative powers of two are intentionally left to the IMUL
+            // path — SHL produces an unsigned shift, and emitting
+            // SHL + NEG would not be smaller than IMUL imm8/imm32.
+            _ if val > 0 && (val as u32).is_power_of_two() => {
+                let k = (val as u32).trailing_zeros() as u8;
+                // SHL EAX, k (32-bit shift; high bits zero anyway, then
+                // the MOVSXD below sign-extends, matching Java imul
+                // semantics for non-negative results).
+                self.buf.emit(&[0xC1, 0xE0, k]); // SHL EAX, imm8
             }
             _ if (-128..=127).contains(&val) => {
                 // IMUL EAX, EAX, imm8
@@ -8628,6 +8742,30 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     self.emit_bounds_check(pc);
+                    // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
+                    // Inline-load the OLD reference at the slot and pipe it
+                    // through `jit_satb_pre_write_barrier(vm_ptr, old_ref)`
+                    // BEFORE the inline store overwrites it. The helper
+                    // short-circuits via a single Acquire load when no
+                    // concurrent mark cycle is in flight (`SatbQueue::
+                    // is_active() == false`), so the steady-state cost is
+                    // just an inline load + a not-taken-branch call. Without
+                    // this, a still-live reference overwritten by JIT code
+                    // during concurrent marking would be silently dropped by
+                    // the marker → use-after-free on the next mixed
+                    // evacuation (audit: docs/round7-gc.md §1).
+                    //
+                    // Save RAX (array) / RCX (index) into argument registers
+                    // first since `emit_ref_aload_regs` clobbers RAX with
+                    // the loaded value.
+                    self.emit_ref_aload_regs(); // RAX = OLD ref value
+                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                    self.emit_mov_reg_reg(ARG_REGS[1], RAX);
+                    self.emit_call_absolute(self.helpers.satb_pre_write_barrier);
+                    // Reload array / index / new value (helper call may have
+                    // clobbered scratch registers including RAX, RCX, RDX).
+                    self.load_slot_to_reg(RAX, array_slot);
+                    self.load_slot_to_reg(RCX, index_slot);
                     self.load_slot_to_reg(RDX, val_slot);
                     // Inline store: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
                     self.emit_ref_astore_regs();
@@ -10911,6 +11049,14 @@ impl Compiler {
                                 // class_id (ObjectHeader+0). Encoding
                                 // depends on whether the receiver reg is
                                 // an extended register (R8+).
+                                // round-7 audit (bug 4): ARG_REGS[1]
+                                // here is the receiver register — the
+                                // loop above (`emit_load_local(ARG_REGS[j+1], …)`)
+                                // wrote `arg_slots[0]` (= the receiver
+                                // by JVM invokevirtual/interface
+                                // calling convention) into ARG_REGS[0+1].
+                                // The debug_assert below is therefore
+                                // checking the right register; verified.
                                 let recv_reg = ARG_REGS[1];
                                 // MED (round-5 review): mod=00 encoding
                                 // reuses the low-3 bits of the register as
@@ -12388,6 +12534,7 @@ mod tests {
             invoke_dispatch: sentinel,
             invoke_virtual_mic: sentinel,
             write_barrier: sentinel,
+            satb_pre_write_barrier: sentinel,
             uncommon_trap: sentinel,
             math_fma_double: sentinel,
             math_fma_float: sentinel,

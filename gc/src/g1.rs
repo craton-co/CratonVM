@@ -598,6 +598,39 @@ impl G1Collector {
         // Remap monitors
         monitors.remap_after_gc(&pointer_map);
 
+        // Round-7 fix (HIGH, audit §12): the concurrent mark worklist holds
+        // raw object addresses that may have just been evacuated by this
+        // young STW. The marker, after we unpark mutators, would otherwise
+        // dereference stale pointers into freed regions → UAF. Walk the
+        // worklist and apply the same `pointer_map` we applied to roots
+        // and remembered-set updates; drop entries whose source region was
+        // freed (no forward) since those objects were unreachable via the
+        // normal evacuation closure (the only way they were on the
+        // worklist without being evacuated is if they were already dead).
+        //
+        // Done under STW (still holding `regions.lock()`), so no marker
+        // thread can be reading/writing `mark_worklist` concurrently — the
+        // concurrent marker takes the same lock for each step.
+        {
+            let mut worklist = self.mark_worklist.lock();
+            if !worklist.is_empty() {
+                worklist.retain_mut(|addr| {
+                    if let Some(&new_addr) = pointer_map.get(&*addr) {
+                        // Object was evacuated — follow the forwarding ptr.
+                        *addr = new_addr;
+                        return true;
+                    }
+                    // Not forwarded. If the address lived in a CSet region
+                    // it is now dangling (the region was reset above) so
+                    // drop it. Otherwise (Old / non-CSet) leave it alone.
+                    match self.region_for_ptr(&regions, *addr as *mut u8) {
+                        Some(idx) if cset_set.contains(&idx) => false,
+                        _ => true,
+                    }
+                });
+            }
+        }
+
         let pause_ms = start.elapsed().as_millis() as u64;
         // Relaxed ordering: collection_count and total_pause_ms are statistics
         // counters used for monitoring/logging only. They do not guard any data
@@ -944,6 +977,28 @@ impl G1Collector {
 
     /// Scan an evacuated object's reference fields. For each reference pointing
     /// into the CSet, evacuate the target and update the field.
+    ///
+    /// **STW-only correctness contract** (Round-7 audit §2): the
+    /// `pointer_map.contains_key(...)` dedup pre-check below is a
+    /// plain-`HashMap` operation that is correct ONLY because young/mixed
+    /// evacuation runs single-threaded under STW with the calling thread
+    /// holding `self.regions.lock()` for the entire collection. The
+    /// `gc_worker_threads` config field (default 4) exists for a future
+    /// parallel evacuator; the dedup will become a TOCTOU the moment the
+    /// `work_list`/`pointer_map` is shared between worker threads: two
+    /// workers can sample `contains_key == false` for the same source addr,
+    /// both call `evacuate_object`, one wins the insert, and the loser's
+    /// freshly-copied Survivor allocation is leaked while still being
+    /// pushed onto a worklist for double-scan. Before enabling parallel
+    /// evacuation, convert `pointer_map` to a `DashMap` (or per-worker
+    /// shards) and use `entry().or_insert_with(...)` so the dedup signal
+    /// is the entry's vacancy state, not a separate `contains_key` call.
+    ///
+    /// The caller is documented to hold the regions lock; we cannot
+    /// `debug_assert!` directly on lock ownership (parking_lot Mutex offers
+    /// no such API), so the invariant is enforced by the type-level
+    /// `&mut Vec<G1Region>` parameter (only the lock holder can produce
+    /// it) plus this contract comment.
     fn scan_and_evacuate_refs(
         &self,
         regions: &mut Vec<G1Region>,
@@ -2086,6 +2141,11 @@ impl GarbageCollector for G1Collector {
     }
 
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        // JLS §17.7 atomicity for 16-byte `Value` slots: acquire the per-slot
+        // stripe lock so paired writers don't expose a torn (tag, payload) to
+        // this read. SeqCst fences supply the JMM happens-before edge. See
+        // `crate::collector::volatile_stripe_lock` for the design rationale.
+        let _guard = crate::collector::volatile_stripe_lock(obj, index);
         std::sync::atomic::fence(Ordering::SeqCst);
         let val = self.get_field(obj, index);
         std::sync::atomic::fence(Ordering::SeqCst);
@@ -2093,6 +2153,9 @@ impl GarbageCollector for G1Collector {
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        // Pair with `get_field_volatile`: the stripe lock makes the 16-byte
+        // `Value` write appear atomic to a concurrent volatile reader.
+        let _guard = crate::collector::volatile_stripe_lock(obj, index);
         std::sync::atomic::fence(Ordering::SeqCst);
         self.set_field(obj, index, value);
         std::sync::atomic::fence(Ordering::SeqCst);

@@ -9,6 +9,60 @@ use crate::gc::GcResult;
 use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind};
 use rustjvm_types::{ClassId, ObjectRef, Value};
 
+// ---------------------------------------------------------------------------
+// Volatile field atomicity — striped locks
+// ---------------------------------------------------------------------------
+//
+// JLS §17.7 requires reads and writes of `volatile long` / `volatile double`
+// (and by extension all `volatile`-declared fields) to be atomic. The CratonVM
+// heap stores fields as 16-byte `Value` (8-byte tag + 8-byte payload), which
+// is wider than any stable Rust atomic primitive on x86-64 — a SeqCst fence
+// pair gives the required happens-before ordering but does **not** guarantee
+// atomicity of the 16-byte slot write itself. A concurrent volatile read
+// could otherwise observe a torn (tag, payload) pair from two overlapping
+// writes.
+//
+// We provide atomicity with a small striped-mutex pool (`parking_lot::Mutex`
+// is uncontended-fast and avoids OS calls). The previous design used a single
+// heap-wide mutex which serialized every volatile op across the whole heap
+// — striping by `(obj_ref, index)` removes that bottleneck while preserving
+// per-slot atomicity. `Mutex<()>` is the minimum primitive that gives mutual
+// exclusion without storing the data inside the lock.
+//
+// Stripe count is a power of two so the index modulo is a single AND. 64 is
+// a balance between false-sharing (a too-small pool serializes unrelated
+// fields) and memory (64 × ~5 bytes is negligible).
+const VOLATILE_STRIPE_COUNT: usize = 64;
+
+static VOLATILE_STRIPES: std::sync::OnceLock<[parking_lot::Mutex<()>; VOLATILE_STRIPE_COUNT]> =
+    std::sync::OnceLock::new();
+
+#[inline]
+fn volatile_stripes() -> &'static [parking_lot::Mutex<()>; VOLATILE_STRIPE_COUNT] {
+    VOLATILE_STRIPES.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(())))
+}
+
+/// Acquire the stripe lock guarding volatile reads/writes for the given
+/// `(obj_ref, index)`. The hash spreads keys across [`VOLATILE_STRIPE_COUNT`]
+/// stripes so unrelated volatile fields rarely contend. The caller must
+/// hold the returned guard for the duration of the slot read or write.
+#[inline]
+pub fn volatile_stripe_lock(
+    obj_ref: ObjectRef,
+    index: usize,
+) -> parking_lot::MutexGuard<'static, ()> {
+    // Mix the object address (already 8-byte-aligned, so low 3 bits are 0)
+    // with the slot index. A multiplicative mix gives even distribution
+    // across stripes for both small object pools and large sequentially-
+    // allocated heaps.
+    let addr = obj_ref.as_ptr() as usize;
+    let mixed = (addr.wrapping_shr(3))
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(index);
+    let stripe = mixed & (VOLATILE_STRIPE_COUNT - 1);
+    volatile_stripes()[stripe].lock()
+}
+
 /// Trait for monitor table cleanup after GC relocation.
 ///
 /// The VM implements this for its `MonitorTable` so the gc crate does not

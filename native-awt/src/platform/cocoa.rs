@@ -20,6 +20,7 @@ use objc2_foundation::{
 };
 
 use super::backend::*;
+use crate::font::{global_glyph_atlas, GlyphKey};
 
 // ---------------------------------------------------------------------------
 // ID generator
@@ -531,6 +532,11 @@ impl PlatformBackend for CocoaBackend {
         // expected by `TextRaster` (see backend.rs::TextRaster docs).
         // Output format and layout match x11.rs::rasterize_text verbatim so
         // both platforms feed the renderer identically.
+        //
+        // Round-5: per-char rasterization is routed through the process-wide
+        // `GlyphAtlas` so a (family, size, style, ch) tuple is only handed to
+        // fontdue once. Interactive Swing repaints reuse the cached
+        // `Arc<GlyphBitmap>` for every subsequent character draw.
         let settings = fontdue_settings(font_family, font_size, bold, italic);
         let font = match load_fontdue_font(&settings) {
             Some(f) => f,
@@ -544,24 +550,35 @@ impl PlatformBackend for CocoaBackend {
             }
         };
 
-        // First pass: measure total width and max ascent/descent.
+        // Round to integer point size for the atlas key (Java AWT fonts are
+        // integer-sized) — matches `GlyphKey::new`'s contract.
+        let atlas = global_glyph_atlas();
+        let size_u32 = font_size.round().max(1.0) as u32;
+
+        // First pass: fetch (or rasterize-and-cache) each glyph, then compute
+        // total advance and per-glyph vertical extents from the cached metrics.
         let mut total_advance = 0.0f32;
         let mut max_ascent = 0i32;
         let mut max_descent = 0i32;
 
-        let mut glyphs = Vec::new();
+        let mut glyphs: Vec<(std::sync::Arc<crate::font::GlyphBitmap>, f32)> =
+            Vec::with_capacity(text.chars().count());
         for ch in text.chars() {
-            let (metrics, bitmap) = font.rasterize(ch, font_size);
-            let ascent = metrics.ymin + metrics.height as i32;
+            let key = GlyphKey::new(font_family, size_u32, bold, italic, ch);
+            let glyph = atlas.get_or_rasterize(key, &font);
+            // `bearing_y` mirrors fontdue's `ymin` (offset from baseline to
+            // bitmap bottom — negative for descenders).
+            let ascent = glyph.bearing_y + glyph.height as i32;
             if ascent > max_ascent {
                 max_ascent = ascent;
             }
-            let descent = -metrics.ymin;
+            let descent = -glyph.bearing_y;
             if descent > max_descent {
                 max_descent = descent;
             }
-            glyphs.push((metrics, bitmap, total_advance));
-            total_advance += metrics.advance_width;
+            let advance = glyph.advance;
+            glyphs.push((glyph, total_advance));
+            total_advance += advance;
         }
 
         let w = total_advance.ceil() as u32;
@@ -583,22 +600,29 @@ impl PlatformBackend for CocoaBackend {
         let r = ((color >> 16) & 0xFF) as u32;
         let g = ((color >> 8) & 0xFF) as u32;
         let b = (color & 0xFF) as u32;
+        let rgb = (r << 16) | (g << 8) | b;
 
         let mut pixels = vec![0u32; (w * h) as usize];
 
-        for (metrics, bitmap, x_offset) in &glyphs {
-            let glyph_x0 = (*x_offset + metrics.xmin as f32) as i32;
-            let glyph_y0 = max_ascent - (metrics.ymin + metrics.height as i32);
+        // Second pass: blit each cached alpha mask into the destination buffer.
+        for (glyph, x_offset) in &glyphs {
+            let gw = glyph.width as usize;
+            let gh = glyph.height as usize;
+            if gw == 0 || gh == 0 {
+                continue;
+            }
+            let glyph_x0 = (*x_offset + glyph.bearing_x as f32) as i32;
+            let glyph_y0 = max_ascent - (glyph.bearing_y + glyph.height as i32);
 
-            for gy in 0..metrics.height {
-                for gx in 0..metrics.width {
+            for gy in 0..gh {
+                for gx in 0..gw {
                     let px = glyph_x0 + gx as i32;
                     let py = glyph_y0 + gy as i32;
                     if px >= 0 && (px as u32) < w && py >= 0 && (py as u32) < h {
-                        let alpha = bitmap[gy * metrics.width + gx] as u32;
+                        let alpha = glyph.alpha[gy * gw + gx] as u32;
                         if alpha > 0 {
                             pixels[(py as u32 * w + px as u32) as usize] =
-                                (alpha << 24) | (r << 16) | (g << 8) | b;
+                                (alpha << 24) | rgb;
                         }
                     }
                 }

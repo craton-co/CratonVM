@@ -8958,13 +8958,133 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // FileLock, MappedByteBuffer, FileChannel additions, Files.walk/list
 // ===========================================================================
 
-// --- FileLock layout: 5-field synthetic ---
+// --- FileLock layout: 6-field synthetic ---
 const FL_FIELD_CHANNEL: usize = 0;  // Object: owning FileChannel
 const FL_FIELD_POSITION: usize = 1; // Long: lock start position
 const FL_FIELD_SIZE: usize = 2;     // Long: lock region size
 const FL_FIELD_SHARED: usize = 3;   // Int: 1=shared, 0=exclusive
 const FL_FIELD_VALID: usize = 4;    // Int: 1=valid, 0=released
-const FL_NUM_FIELDS: usize = 5;
+// Slot 5: Long — non-zero in-process registry id (from `next_lock_token`).
+// Used by `release` to find the matching entry in `file_locks()` and drop
+// it. 0 means the FileLock is not registered (e.g. construction failed).
+const FL_FIELD_TOKEN: usize = 5;
+const FL_NUM_FIELDS: usize = 6;
+
+// ---------------------------------------------------------------------------
+// In-process FileLock registry (TODO(round-8): real OS-level file locks)
+//
+// The real JDK calls `fcntl(F_SETLK, &flock)` on POSIX and `LockFileEx` on
+// Windows so locks are honoured *across processes*. Wiring those in needs
+// (a) the `windows-sys` crate added to `Cargo.toml` for the Windows branch
+// and (b) a way to extract the underlying OS handle from our `FdTable`
+// (`as_raw_fd` / `as_raw_handle`). Both are tracked for round-8.
+//
+// For now we provide process-local locking semantics that are correct
+// across threads and across channels opened on the same FdId. The map is
+// keyed by fd_id (which uniquely identifies an open file inside our
+// `FdTable`) and stores the set of currently-held lock regions. A lock
+// request fails (returns null for `tryLock`) if it conflicts with any
+// existing region on the same fd; matching the JDK behaviour where two
+// channels on the same file cannot hold overlapping exclusive locks.
+//
+// Multi-process processes opening the same path go uncoordinated — that
+// is the known carryover work item.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct LockRegion {
+    /// Unique per-process token; matches `FL_FIELD_TOKEN` on the Java side.
+    token: i64,
+    position: i64,
+    /// Lock length, or `i64::MAX` for "rest of file" / whole-file locks.
+    size: i64,
+    /// `true` for shared (read) locks, `false` for exclusive (write).
+    shared: bool,
+}
+
+/// Per-fd list of currently-held lock regions. Vec is fine — the JDK
+/// itself permits "many" locks per channel but in practice a handful
+/// is the max; iterating to check conflicts is cheaper than a tree
+/// for n<32.
+static FILE_LOCKS: OnceLock<Mutex<HashMap<i64, Vec<LockRegion>>>> = OnceLock::new();
+
+fn file_locks() -> &'static Mutex<HashMap<i64, Vec<LockRegion>>> {
+    FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_lock_token() -> i64 {
+    static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Half-open `[a_pos, a_pos + a_size)` overlaps `[b_pos, b_pos + b_size)`.
+/// `i64::MAX` is treated as "rest of file" — any non-empty region that
+/// starts at or beyond it does not overlap.
+fn regions_overlap(a_pos: i64, a_size: i64, b_pos: i64, b_size: i64) -> bool {
+    let a_end = a_pos.saturating_add(a_size);
+    let b_end = b_pos.saturating_add(b_size);
+    // Standard half-open interval overlap test.
+    a_pos < b_end && b_pos < a_end
+}
+
+/// Attempt to register an in-process lock. Returns the new token on
+/// success, `None` if a conflicting region is already held.
+///
+/// Conflict rules match `java.nio.channels.FileLock`:
+///   * exclusive ∩ anything → conflict
+///   * shared ∩ shared      → ok
+fn try_acquire_file_lock(
+    fd_id: i64,
+    position: i64,
+    size: i64,
+    shared: bool,
+) -> Option<i64> {
+    let mut map = file_locks().lock();
+    let regions = map.entry(fd_id).or_default();
+    for existing in regions.iter() {
+        let want_exclusive = !shared || !existing.shared;
+        if want_exclusive
+            && regions_overlap(position, size, existing.position, existing.size)
+        {
+            return None;
+        }
+    }
+    let token = next_lock_token();
+    regions.push(LockRegion {
+        token,
+        position,
+        size,
+        shared,
+    });
+    Some(token)
+}
+
+fn release_file_lock(token: i64) {
+    if token == 0 {
+        return;
+    }
+    let mut map = file_locks().lock();
+    // We don't know which fd this token belongs to (FileLock objects do
+    // not carry fd directly), so scan. With <32 entries per fd and a
+    // typical small process this is O(n) across all fds — still cheap
+    // and avoids storing fd on the Java side.
+    for regions in map.values_mut() {
+        if let Some(idx) = regions.iter().position(|r| r.token == token) {
+            regions.swap_remove(idx);
+            return;
+        }
+    }
+}
+
+/// Extract the FdId from a FileChannel `this`. Returns 0 if the channel
+/// has no associated fd (e.g. synthetic mode without a real open).
+fn fd_from_file_channel(ctx: &dyn NativeContext, fc: ObjectRef) -> i64 {
+    match ctx.get_field(fc, FC_FIELD_FD) {
+        Value::Int(v) => v as i64,
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
 
 // --- MappedByteBuffer: uses BB layout + extra fields ---
 // Field 10 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
@@ -9080,6 +9200,21 @@ fn native_file_lock_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(this, FL_FIELD_SIZE, Value::Long(size));
     ctx.set_field(this, FL_FIELD_SHARED, Value::Int(shared));
     ctx.set_field(this, FL_FIELD_VALID, Value::Int(1));
+    // Register this lock region in the process-local registry so that
+    // overlapping `lock()` calls from sibling threads / channels see
+    // the conflict. If `channel` is non-null and has an fd, this is a
+    // real (synthetic-OS-level) registration; otherwise we still mint
+    // a token so `release` is a no-op rather than a silent drop.
+    let fd_id = match channel {
+        Value::Object(Some(fc)) => fd_from_file_channel(ctx, fc),
+        _ => 0,
+    };
+    let token = if fd_id > 0 {
+        try_acquire_file_lock(fd_id, position, size, shared != 0).unwrap_or(0)
+    } else {
+        next_lock_token()
+    };
+    ctx.set_field(this, FL_FIELD_TOKEN, Value::Long(token));
     Ok(None)
 }
 
@@ -9141,6 +9276,19 @@ fn native_file_lock_release(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // Drop the in-process registry entry so a subsequent overlapping
+    // lock can succeed. Idempotent: release() may be called multiple
+    // times by FileLock.close() / try-with-resources.
+    let token = match ctx.get_field(this, FL_FIELD_TOKEN) {
+        Value::Long(v) => v,
+        _ => 0,
+    };
+    release_file_lock(token);
+    // Zero the token so any double-release is harmless rather than
+    // accidentally dropping a freshly-minted lock that happens to
+    // reuse the same i64 (won't happen with monotonic AtomicI64 in
+    // a single process lifetime, but defensive).
+    ctx.set_field(this, FL_FIELD_TOKEN, Value::Long(0));
     ctx.set_field(this, FL_FIELD_VALID, Value::Int(0));
     Ok(None)
 }
@@ -9280,11 +9428,35 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 // ---------------------------------------------------------------------------
 
 /// FileChannel.lock() -> FileLock
-/// Creates a FileLock covering the entire file.
+/// Creates an exclusive FileLock covering the entire file. Registers
+/// the lock in the in-process FILE_LOCKS map so sibling threads /
+/// channels on the same fd see the conflict.
+///
+/// TODO(round-8): real OS-level blocking via `fcntl(F_SETLKW)` /
+/// `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`. The current implementation
+/// is correct within a single process but does not coordinate with
+/// other processes opening the same path.
 fn native_fc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
+    };
+    let fd_id = fd_from_file_channel(ctx, this);
+    let token = if fd_id > 0 {
+        // Synthetic "blocking" — we don't actually park because every
+        // other thread that may hold a region also runs in this
+        // process and would deadlock with us if they didn't release
+        // before calling lock(). Returning a fresh registration when
+        // there's no conflict is the JDK-correct fast path; on conflict
+        // we currently return null (matching tryLock semantics for now).
+        // The full blocking implementation lands with the F_SETLKW
+        // round-8 work item above.
+        match try_acquire_file_lock(fd_id, 0, i64::MAX, false) {
+            Some(t) => t,
+            None => return Ok(Some(Value::Object(None))),
+        }
+    } else {
+        next_lock_token()
     };
     let lock = alloc_file_lock(ctx);
     ctx.set_field(lock, FL_FIELD_CHANNEL, Value::Object(Some(this)));
@@ -9292,12 +9464,38 @@ fn native_fc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ctx.set_field(lock, FL_FIELD_SIZE, Value::Long(i64::MAX));
     ctx.set_field(lock, FL_FIELD_SHARED, Value::Int(0));
     ctx.set_field(lock, FL_FIELD_VALID, Value::Int(1));
+    ctx.set_field(lock, FL_FIELD_TOKEN, Value::Long(token));
     Ok(Some(Value::Object(Some(lock))))
 }
 
-/// FileChannel.tryLock() -> FileLock (best-effort, same as lock)
+/// FileChannel.tryLock() -> FileLock
+///
+/// Returns the new FileLock on success, or `null` (JDK contract) when
+/// a conflicting region is already held in this process. See the
+/// `FILE_LOCKS` registry docs for the in-process conflict semantics.
 fn native_fc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_fc_lock(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let fd_id = fd_from_file_channel(ctx, this);
+    let token = if fd_id > 0 {
+        match try_acquire_file_lock(fd_id, 0, i64::MAX, false) {
+            Some(t) => t,
+            // JDK: `tryLock` returns null when another lock is held.
+            None => return Ok(Some(Value::Object(None))),
+        }
+    } else {
+        next_lock_token()
+    };
+    let lock = alloc_file_lock(ctx);
+    ctx.set_field(lock, FL_FIELD_CHANNEL, Value::Object(Some(this)));
+    ctx.set_field(lock, FL_FIELD_POSITION, Value::Long(0));
+    ctx.set_field(lock, FL_FIELD_SIZE, Value::Long(i64::MAX));
+    ctx.set_field(lock, FL_FIELD_SHARED, Value::Int(0));
+    ctx.set_field(lock, FL_FIELD_VALID, Value::Int(1));
+    ctx.set_field(lock, FL_FIELD_TOKEN, Value::Long(token));
+    Ok(Some(Value::Object(Some(lock))))
 }
 
 /// Determine the MapMode identity by peeking at the MapMode object's

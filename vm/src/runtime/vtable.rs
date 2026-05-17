@@ -234,6 +234,10 @@ impl Vtable {
     /// stored `(method_name, descriptor)` matches before returning;
     /// on a multi-candidate bucket (FxHash collision) we scan all
     /// candidates with the same verification.
+    ///
+    /// Round-7 Fix 6: `#[inline]` so the vtable lookup folds into the
+    /// invokevirtual / invokeinterface dispatch path under LTO.
+    #[inline]
     pub fn lookup_slot(&self, name: &str, descriptor: &str) -> Option<usize> {
         let key = fast_lookup_key(name, descriptor);
         let candidates = self.fast_lookup.get(&key)?;

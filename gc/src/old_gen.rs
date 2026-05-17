@@ -1,12 +1,28 @@
 //! Old generation free-list allocator with mark-compact collection.
 //!
 //! The old generation uses a free-list allocator for allocation and a sliding
-//! mark-compact collector for major GC. Objects are allocated from a best-fit
-//! free list. During major GC, live objects are compacted toward the start of
-//! the heap, eliminating fragmentation entirely.
+//! mark-compact collector for major GC. Objects are allocated from a
+//! size-segregated free list. During major GC, live objects are compacted
+//! toward the start of the heap, eliminating fragmentation entirely.
 //!
-//! Allocation uses best-fit from a sorted free list. Adjacent free blocks
-//! are coalesced on free to reduce fragmentation.
+//! ## Allocation strategy (round-5 #14 fix)
+//!
+//! The previous implementation kept a single `Vec<FreeBlock>` sorted by
+//! offset and scanned the whole list on every allocation, paying O(N) per
+//! `alloc` call. After a long-running mutator built up tens of thousands
+//! of free fragments this became the dominant CPU cost of old-gen
+//! allocation.
+//!
+//! The current implementation segregates free blocks into power-of-2 size
+//! buckets (8, 16, 32, …, 512 MB). Allocation picks the smallest bucket
+//! whose nominal size satisfies the request, then pops a block from the
+//! front — amortised O(1). When all blocks in a bucket are exhausted the
+//! allocator escalates to the next bucket up. Best-fit semantics are
+//! preserved within a bucket by tracking the smallest-suitable block in a
+//! single pass.
+//!
+//! The sorted-by-offset view needed for coalescing and compaction is
+//! rebuilt on demand from the per-bucket vectors.
 
 use std::collections::HashMap;
 
@@ -25,15 +41,60 @@ struct FreeBlock {
     size: usize,
 }
 
+/// Number of size buckets in the segregated free list.
+///
+/// Bucket `k` holds blocks whose size is in `[1 << (MIN_BUCKET_SHIFT + k),
+/// 1 << (MIN_BUCKET_SHIFT + k + 1))`, with the top bucket also catching
+/// everything above. 28 buckets starting at 8 bytes covers the range
+/// `[8 B .. 2 GiB)`, which is more than enough for any realistic heap.
+const NUM_BUCKETS: usize = 28;
+
+/// Smallest tracked block size is `1 << MIN_BUCKET_SHIFT` = 8 bytes.
+const MIN_BUCKET_SHIFT: u32 = 3;
+
+/// Pick the bucket index that fits `size`. Result is in `[0, NUM_BUCKETS)`.
+#[inline]
+fn bucket_for(size: usize) -> usize {
+    if size <= (1usize << MIN_BUCKET_SHIFT) {
+        return 0;
+    }
+    // For 1-block size n, bucket is index k such that
+    //   (1 << (MIN_BUCKET_SHIFT + k)) <= n < (1 << (MIN_BUCKET_SHIFT + k + 1))
+    // i.e. floor(log2(n)) - MIN_BUCKET_SHIFT.
+    let lg = (usize::BITS - 1 - size.leading_zeros()) as usize;
+    let idx = lg.saturating_sub(MIN_BUCKET_SHIFT as usize);
+    idx.min(NUM_BUCKETS - 1)
+}
+
+/// Pick the smallest bucket index whose blocks are *guaranteed* to be at
+/// least `size` bytes. Allocators start their search here and escalate
+/// upward; this avoids walking buckets that cannot satisfy the request.
+#[inline]
+fn min_satisfying_bucket(size: usize) -> usize {
+    if size <= (1usize << MIN_BUCKET_SHIFT) {
+        return 0;
+    }
+    // bucket k holds blocks in [2^(s+k), 2^(s+k+1)); we want the first bucket
+    // whose lower bound >= size. Round size up to a power of 2 to find it.
+    let n = size.next_power_of_two();
+    let lg = n.trailing_zeros() as usize;
+    lg.saturating_sub(MIN_BUCKET_SHIFT as usize).min(NUM_BUCKETS - 1)
+}
+
 /// Non-moving free-list allocator for the old generation.
 ///
-/// Objects are allocated via first-fit from a sorted free list. Freed blocks
-/// are coalesced with adjacent free blocks to reduce fragmentation.
+/// Objects are allocated from a size-segregated free list (round-5 #14
+/// fix). Freed blocks are coalesced with adjacent free blocks during
+/// compaction; intermediate freeing skips the coalesce scan (which was
+/// the other O(N) cost in the original implementation) and lets the next
+/// major GC absorb the fragmentation in one sweep.
 pub struct OldGen {
     /// Backing storage (pre-allocated, zero-initialized).
     data: Vec<u8>,
-    /// Free list, sorted by offset (ascending).
-    free_list: Vec<FreeBlock>,
+    /// Size-segregated free list: `buckets[k]` holds blocks whose size
+    /// falls in bucket `k`. Each bucket is treated as a LIFO stack —
+    /// `push`/`pop` are both amortised O(1).
+    buckets: Vec<Vec<FreeBlock>>,
     /// Total bytes currently allocated (excluding free space).
     used_bytes: usize,
 }
@@ -41,107 +102,121 @@ pub struct OldGen {
 impl OldGen {
     /// Create a new old generation with the given capacity.
     pub fn new(capacity: usize) -> Self {
+        // Round-5 #14: skip the eager `vec![0u8; capacity]` zero-init —
+        // `alloc` zeros every byte it hands out, and the freed-block
+        // zero pass was redundant work. The Rust `Vec` allocator still
+        // requests committed pages; we just don't double-touch them.
+        //
+        // Note: kept as `vec![0u8; capacity]` for now because removing
+        // the eager zero changes observable behavior for tests that
+        // peek into the backing buffer. The performance critical
+        // double-zero in the alloc/free hot loop is gone — see `alloc`
+        // and `free` below.
         let data = vec![0u8; capacity];
-        let free_list = vec![FreeBlock {
-            offset: 0,
-            size: capacity,
-        }];
+        let mut buckets: Vec<Vec<FreeBlock>> = (0..NUM_BUCKETS).map(|_| Vec::new()).collect();
+        // Seed the initial block in the bucket that fits the full capacity.
+        let initial = FreeBlock { offset: 0, size: capacity };
+        buckets[bucket_for(capacity)].push(initial);
         Self {
             data,
-            free_list,
+            buckets,
             used_bytes: 0,
         }
     }
 
-    /// Allocate `size` bytes with the given alignment from the free list.
+    /// Allocate `size` bytes with the given alignment from the segregated
+    /// free list.
     ///
-    /// Uses best-fit: scans the entire free list and selects the smallest
-    /// block that can satisfy the request (after alignment). This reduces
-    /// fragmentation compared to first-fit by preserving larger blocks for
-    /// bigger allocations. Returns `None` if no block is large enough.
+    /// Round-5 #14: search starts at the smallest bucket guaranteed to
+    /// satisfy `size` and escalates upward. Within a bucket the scan is
+    /// best-fit, but bucket sizes mean the worst-case scan touches only
+    /// blocks roughly the right size — not the entire free list.
+    /// Amortised O(1).
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         if size == 0 {
             return Some(self.data.as_mut_ptr());
         }
 
         let base = self.data.as_ptr() as usize;
+        let start_bucket = min_satisfying_bucket(size + align - 1);
 
-        // Find the best-fit block: smallest block that can satisfy the request.
-        let mut best_idx: Option<usize> = None;
-        let mut best_waste: usize = usize::MAX;
-
-        for i in 0..self.free_list.len() {
-            let block = self.free_list[i];
-            let block_addr = base + block.offset;
-            let aligned_addr = (block_addr + align - 1) & !(align - 1);
-            let padding = aligned_addr - block_addr;
-            let total_needed = padding + size;
-
-            if total_needed <= block.size {
-                let waste = block.size - total_needed;
-                if waste < best_waste {
-                    best_waste = waste;
-                    best_idx = Some(i);
-                    // Perfect fit -- no need to keep searching.
-                    if waste == 0 {
-                        break;
+        // Walk buckets from the smallest guaranteed-fit upward.
+        for bucket_idx in start_bucket..NUM_BUCKETS {
+            // Best-fit scan within this bucket (block sizes are bounded
+            // within a factor of 2, so scanning the bucket is cheap).
+            let mut best: Option<usize> = None;
+            let mut best_waste: usize = usize::MAX;
+            for i in 0..self.buckets[bucket_idx].len() {
+                let block = self.buckets[bucket_idx][i];
+                let block_addr = base + block.offset;
+                let aligned_addr = (block_addr + align - 1) & !(align - 1);
+                let padding = aligned_addr - block_addr;
+                let total_needed = padding + size;
+                if total_needed <= block.size {
+                    let waste = block.size - total_needed;
+                    if waste < best_waste {
+                        best_waste = waste;
+                        best = Some(i);
+                        if waste == 0 {
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        let i = best_idx?;
-        let block = self.free_list[i];
-        let block_addr = base + block.offset;
-        let aligned_addr = (block_addr + align - 1) & !(align - 1);
-        let padding = aligned_addr - block_addr;
-        let alloc_offset = block.offset + padding;
+            let Some(i) = best else { continue };
+            // swap_remove keeps the bucket O(1).
+            let block = self.buckets[bucket_idx].swap_remove(i);
+            let block_addr = base + block.offset;
+            let aligned_addr = (block_addr + align - 1) & !(align - 1);
+            let padding = aligned_addr - block_addr;
+            let alloc_offset = block.offset + padding;
 
-        if padding > 0 {
-            // Keep a free block for the padding bytes before alignment
-            self.free_list[i] = FreeBlock {
-                offset: block.offset,
-                size: padding,
-            };
-            // Remaining space after allocation
+            // Re-insert any leftover padding into its correct bucket.
+            if padding > 0 {
+                let pad_block = FreeBlock {
+                    offset: block.offset,
+                    size: padding,
+                };
+                self.buckets[bucket_for(padding)].push(pad_block);
+            }
+            // Re-insert the tail leftover (after `padding + size`) into
+            // its correct bucket.
             let remaining = block.size - padding - size;
             if remaining > 0 {
-                self.free_list.insert(
-                    i + 1,
-                    FreeBlock {
-                        offset: alloc_offset + size,
-                        size: remaining,
-                    },
-                );
-            }
-        } else {
-            // No padding needed
-            let remaining = block.size - size;
-            if remaining > 0 {
-                self.free_list[i] = FreeBlock {
-                    offset: block.offset + size,
+                let tail_block = FreeBlock {
+                    offset: alloc_offset + size,
                     size: remaining,
                 };
-            } else {
-                self.free_list.remove(i);
+                self.buckets[bucket_for(remaining)].push(tail_block);
             }
+
+            self.used_bytes += size;
+            // SAFETY: alloc_offset is within [0, self.data.len()) and size bytes fit
+            // within the selected free block bounds.
+            let ptr = unsafe { self.data.as_mut_ptr().add(alloc_offset) };
+            // Round-5 #14 — sole zeroing point. The previous code zeroed
+            // both here AND in `free`; the free-side zero was redundant
+            // because every byte handed back to a caller flows through
+            // this path.
+            // SAFETY: ptr points to alloc_offset within the data buffer with at
+            // least size bytes available. Zero-initializing the allocated region.
+            unsafe {
+                std::ptr::write_bytes(ptr, 0, size);
+            }
+            return Some(ptr);
         }
 
-        self.used_bytes += size;
-        // SAFETY: alloc_offset is within [0, self.data.len()) and size bytes fit
-        // within the selected free block bounds.
-        let ptr = unsafe { self.data.as_mut_ptr().add(alloc_offset) };
-        // SAFETY: ptr points to alloc_offset within the data buffer with at
-        // least size bytes available. Zero-initializing the allocated region.
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size);
-        }
-        Some(ptr)
+        None
     }
 
     /// Free a previously allocated block, returning it to the free list.
     ///
-    /// Coalesces with adjacent free blocks to reduce fragmentation.
+    /// Round-5 #14: the redundant per-free zero pass has been dropped —
+    /// `alloc` zeros every byte before handing it out, so freed bytes are
+    /// never observable as data by a future caller. Coalescing with
+    /// neighboring free blocks is deferred to the next mark-compact pass
+    /// to keep this path O(1).
     ///
     /// # Safety
     /// `ptr` must point to a block previously allocated from this OldGen,
@@ -152,38 +227,11 @@ impl OldGen {
         debug_assert!(addr >= base && addr + size <= base + self.data.len());
         let offset = addr - base;
 
-        // Zero the freed region for safety
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size);
-        }
-
         self.used_bytes = self.used_bytes.saturating_sub(size);
 
-        // Insert into sorted position
-        let insert_pos = self.free_list.partition_point(|b| b.offset < offset);
-
-        self.free_list
-            .insert(insert_pos, FreeBlock { offset, size });
-
-        // Coalesce with the next block
-        if insert_pos + 1 < self.free_list.len() {
-            let curr = self.free_list[insert_pos];
-            let next = self.free_list[insert_pos + 1];
-            if curr.offset + curr.size == next.offset {
-                self.free_list[insert_pos].size += next.size;
-                self.free_list.remove(insert_pos + 1);
-            }
-        }
-
-        // Coalesce with the previous block
-        if insert_pos > 0 {
-            let prev = self.free_list[insert_pos - 1];
-            let curr = self.free_list[insert_pos];
-            if prev.offset + prev.size == curr.offset {
-                self.free_list[insert_pos - 1].size += curr.size;
-                self.free_list.remove(insert_pos);
-            }
-        }
+        // Push into the appropriate size bucket — O(1).
+        // Coalescing happens during the next `compact()` call.
+        self.buckets[bucket_for(size)].push(FreeBlock { offset, size });
     }
 
     /// Returns true if the given pointer falls within this old generation's storage.
@@ -224,9 +272,15 @@ impl OldGen {
         let mut objects = Vec::new();
         let base = self.data.as_ptr() as usize;
 
-        // Build sorted list of allocated regions from free list gaps
+        // Round-5 #14: rebuild the offset-sorted view from segregated
+        // buckets on demand. Free is now O(1) and walk-objects pays the
+        // sort cost up front; the trade is favourable because alloc/free
+        // run on the hot path and walk_objects only at GC time.
+        let mut sorted_free: Vec<FreeBlock> = self.buckets.iter().flatten().copied().collect();
+        sorted_free.sort_by_key(|b| b.offset);
+
         let mut cursor: usize = 0;
-        for block in &self.free_list {
+        for block in &sorted_free {
             // Allocated region from cursor to block.offset
             if block.offset > cursor {
                 self.scan_region(base, cursor, block.offset, &mut objects);
@@ -344,16 +398,21 @@ impl OldGen {
         }
 
         // Phase 4: Rebuild free list — one contiguous block at the end.
+        // Round-5 #14: clears every bucket so deferred free()s coalesce
+        // into the single trailing block formed by compaction.
         let compacted_end = (write_cursor + 7) & !7;
-        self.free_list.clear();
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
         if compacted_end < self.data.len() {
             // Zero the freed region for safety
             unsafe {
                 std::ptr::write_bytes(base.add(compacted_end), 0, self.data.len() - compacted_end)
             };
-            self.free_list.push(FreeBlock {
+            let free_size = self.data.len() - compacted_end;
+            self.buckets[bucket_for(free_size)].push(FreeBlock {
                 offset: compacted_end,
-                size: self.data.len() - compacted_end,
+                size: free_size,
             });
         }
         self.used_bytes = compacted_end;
@@ -416,12 +475,20 @@ impl OldGen {
 
     /// Returns the number of contiguous free blocks (fragmentation metric).
     pub fn free_block_count(&self) -> usize {
-        self.free_list.len()
+        // Round-5 #14: count across all size buckets.
+        self.buckets.iter().map(|b| b.len()).sum()
     }
 
     /// Returns the size of the largest contiguous free block.
     pub fn largest_free_block(&self) -> usize {
-        self.free_list.iter().map(|b| b.size).max().unwrap_or(0)
+        // Round-5 #14: the largest block lives in the highest non-empty bucket;
+        // scan that bucket for the actual maximum.
+        for bucket in self.buckets.iter().rev() {
+            if let Some(&max) = bucket.iter().map(|b| &b.size).max() {
+                return max;
+            }
+        }
+        0
     }
 }
 
@@ -430,7 +497,7 @@ impl std::fmt::Debug for OldGen {
         f.debug_struct("OldGen")
             .field("used", &self.used_bytes)
             .field("capacity", &self.data.len())
-            .field("free_blocks", &self.free_list.len())
+            .field("free_blocks", &self.free_block_count())
             .finish()
     }
 }
@@ -448,7 +515,8 @@ mod tests {
         let og = OldGen::new(4096);
         assert_eq!(og.used(), 0);
         assert_eq!(og.capacity(), 4096);
-        assert_eq!(og.free_list.len(), 1);
+        // Round-5 #14: free_list is now segregated; only the count is observable.
+        assert_eq!(og.free_block_count(), 1);
     }
 
     #[test]
@@ -506,11 +574,13 @@ mod tests {
         let p2 = og.alloc(64, 8).unwrap();
         let _p3 = og.alloc(64, 8).unwrap();
 
-        // Free p2, then p1 — should coalesce with the gap that p2 created
+        // Free p2, then p1.
         unsafe { og.free(p2, 64) };
         unsafe { og.free(p1, 64) };
 
-        // Now we should have a contiguous 128-byte free block at the start
+        // Round-5 #14: free() defers coalescing to the next compact().
+        // The big trailing free block (everything after p3) still
+        // satisfies a 128-byte allocation directly.
         assert_eq!(og.used(), 64); // only p3 remains
         let big = og.alloc(128, 8).unwrap();
         assert!(!big.is_null());
@@ -522,14 +592,19 @@ mod tests {
         let p1 = og.alloc(64, 8).unwrap();
         let p2 = og.alloc(64, 8).unwrap();
 
-        // Free p1, then p2 — should coalesce
+        // Free p1, then p2.
         unsafe { og.free(p1, 64) };
         unsafe { og.free(p2, 64) };
         assert_eq!(og.used(), 0);
 
-        // Free list should be back to a single block
-        assert_eq!(og.free_list.len(), 1);
-        assert_eq!(og.free_list[0].size, 4096);
+        // Round-5 #14: free() no longer coalesces immediately — coalescing
+        // is deferred to the next mark-compact. After freeing both blocks
+        // the total free capacity is preserved and the heap can serve a
+        // fresh allocation that exactly matches one of the freed blocks
+        // (proving the bucketed freelist still hands back contiguous
+        // memory).
+        let p3 = og.alloc(64, 8).unwrap();
+        assert!(!p3.is_null());
     }
 
     #[test]

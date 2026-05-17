@@ -402,6 +402,17 @@ pub(crate) fn native_thread_start0(ctx: &mut dyn NativeContext, args: &[Value]) 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Round-7 CRIT fix #3: snapshot the parent's `InheritableThreadLocal`
+    // entries and queue them against the child's Java Thread identity
+    // hash. The child's first `ThreadLocal.get/set/remove` will drain
+    // the snapshot into its own TL_MAP (see
+    // `drain_inherited_for_current_thread` in phases_early.rs). We do
+    // this *before* spawning so there's no race between parent's
+    // post-start mutations and the child's drain.
+    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries() {
+        let child_hash = ctx.identity_hash_code(this);
+        crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
+    }
     ctx.thread_start(this)
 }
 

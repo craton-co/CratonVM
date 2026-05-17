@@ -1,13 +1,25 @@
-//! Lock-free 256-slot ring buffer for postmortem dispatch tracing.
+//! 256-slot ring buffer for postmortem dispatch tracing.
 //!
 //! Gated by `RUSTJVM_DBG_LETSGO=1`. When enabled, every bytecode-method
-//! entry and every native dispatch is recorded into a fixed-size ring.
+//! entry and every native dispatch is recorded into a fixed-size ring
+//! protected by a single `parking_lot::Mutex`.  All record sites use
+//! `try_lock` so a contended slot never blocks the interpreter — it
+//! simply drops the trace entry, which is acceptable for a postmortem
+//! diagnostic ring.
+//!
 //! On SEGV (Win32 SEH unhandled-exception filter) or panic-join, the
 //! ring is dumped to stderr so we can see *what* dispatched last before
 //! the crash.
+//!
+//! Round-7 HIGH-6 fix: migrated from `std::sync::Mutex` to
+//! `parking_lot::Mutex` so this file no longer contradicts its own
+//! "lock-free" header (the previous std-Mutex variant brought pthread
+//! and poisoning overhead that is meaningless for an opt-in trace
+//! buffer).  A true lock-free epoch-per-slot ring is feasible but out
+//! of scope for this round.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 const SLOTS: usize = 256;
 
@@ -60,7 +72,7 @@ pub fn record_bytecode(thread_id: usize, cls: &str, mth: &str, des: &str) {
     }
     let seq = next_seq();
     let idx = slot_idx(seq);
-    if let Ok(mut guard) = ring().try_lock() {
+    if let Some(mut guard) = ring().try_lock() {
         let slot = &mut guard[idx];
         slot.kind = 1;
         slot.thread_id = thread_id as u32;
@@ -81,7 +93,7 @@ pub fn record_native(thread_id: usize, cls: &str, mth: &str, des: &str) {
     }
     let seq = next_seq();
     let idx = slot_idx(seq);
-    if let Ok(mut guard) = ring().try_lock() {
+    if let Some(mut guard) = ring().try_lock() {
         let slot = &mut guard[idx];
         slot.kind = 2;
         slot.thread_id = thread_id as u32;
@@ -123,7 +135,7 @@ pub fn record_note(note: &str) {
     }
     let seq = next_seq();
     let idx = slot_idx(seq);
-    if let Ok(mut guard) = ring().try_lock() {
+    if let Some(mut guard) = ring().try_lock() {
         let slot = &mut guard[idx];
         slot.kind = 3;
         slot.thread_id = 0;
@@ -163,8 +175,8 @@ pub fn dump_to_stderr_unconditional(label: &str) {
 
 fn dump_inner(label: &str) {
     let guard = match ring().try_lock() {
-        Ok(g) => g,
-        Err(_) => {
+        Some(g) => g,
+        None => {
             eprintln!("[dispatch_trace:{label}] ring locked, skipping dump");
             return;
         }

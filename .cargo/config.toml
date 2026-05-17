@@ -1,0 +1,26 @@
+# Round-7 cross-cutting Fix 5: workspace-wide rustc/linker config.
+#
+# Target a sane x86_64 baseline: SSE2 (mandatory in the AMD64 ABI), SSE4.2
+# (CRC32 / string-search hardware instructions LLVM auto-vectorises into),
+# and PCLMUL (carryless multiply, used by aes-gcm and zip CRC paths). These
+# have been universal on x86_64 desktop/server CPUs since 2011 (Nehalem,
+# Bulldozer) and lifting the baseline lets rustc emit SSE4.2-tier code by
+# default instead of pessimistically targeting the original Pentium 4
+# x86-64-v1 baseline.
+#
+# AVX2 is widespread but not universal (skipped). For developer machines,
+# override with `RUSTFLAGS="-C target-cpu=native"` to opt into AVX2/AVX-512
+# / BMI2 / etc.
+
+[build]
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+sse4.2,+pclmul"]
+
+# The VM allocates 64 MiB Java thread stacks (vm-cli DEFAULT_JAVA_STACK_SIZE)
+# and recursively interprets deeply nested call chains during class init
+# (HotSpot recursion is well known to require 8+ MiB on Windows). Bump the
+# main-thread stack reservation to 16 MiB to avoid stack overflow inside
+# the launcher before the first JvmThread is even spawned.
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "link-arg=/STACK:16777216"]

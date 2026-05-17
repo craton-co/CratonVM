@@ -43,6 +43,28 @@ Lower level = acquired first = held longer.
 | **L1**  | `JvmThread`-local state | thread-owned | `vm/src/threading/jvm_thread.rs` |
 | **L0**  | Per-call scratch (`Vec`s, `HashMap`s constructed inside a single function call) | local | — |
 
+### Sub-hierarchies within a subsystem
+
+Some subsystems contain multiple cooperating locks of their own. The
+canonical order inside the subsystem is documented here; treat them as
+all being at the subsystem's table-level when reasoning about the
+global hierarchy.
+
+| Sub-level | Lock | Type | Owner module | Rule |
+|----------:|------|------|--------------|------|
+| **L4.a** (outer) | `ProfileStore::methods` (RwLock) | rw | `jit/src/profile.rs` | acquire first |
+| **L4.b** (inner) | `ProfileStore::name_index` (RwLock) | rw | `jit/src/profile.rs` | only acquire while holding `methods`, or alone |
+
+Rationale (round-7 CRIT-2): `get_or_insert_borrowed` previously took
+`name_index.read()` first on the fast path and `methods.write()` →
+`name_index.write()` on the slow path, an AB/BA inversion under
+contention. The fix imposes the canonical `methods > name_index`
+ordering: the fast path probes `name_index` then drops it before
+touching `methods`, and the slow path acquires `methods.write()`
+*before* `name_index.write()`. `snapshot_all` further takes a
+two-phase snapshot so the per-slot `Mutex<MethodProfile>` is never
+held under `methods.read()`.
+
 ### Reading the table
 
 - A thread holding `class_manager` (L10) may acquire `heap` (L8),

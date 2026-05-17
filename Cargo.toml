@@ -16,7 +16,14 @@ categories = ["compilers", "emulators"]
 
 [workspace.dependencies]
 thiserror = "2"
-tracing = "0.1"
+# Round-7 cross-cutting Fix 3: `release_max_level_info` causes `trace!` and
+# `debug!` macros to expand to no-ops in release builds. The VM has thousands
+# of trace/debug sites in interpreter dispatch, GC scan loops, JIT entry, and
+# class-loading paths; even with subscriber filtering, the per-call
+# argument formatting / level check is non-zero. Compile-time elision wins it
+# back. Set on the workspace dep so every crate that uses
+# `tracing.workspace = true` inherits the cap.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # RJ.4 — silence lints that do not represent real defects so
@@ -59,3 +66,43 @@ opt-level = 3
 
 [profile.dev.package.flate2]
 opt-level = 3
+
+# Round-7 cross-cutting Fix 1: cargo defaults (lto=false, codegen-units=16)
+# defeat most cross-crate inlining. The VM has hundreds of `#[inline(always)]`
+# annotations on small hot-path helpers (interpreter dispatch, TLAB bump,
+# header reads) that only inline across crate boundaries under LTO.
+#
+# - `panic = "unwind"` MUST stay: the VM has 37 `std::panic::catch_unwind`
+#   sites that depend on stack unwinding to recover from JIT/interpreter
+#   faults; `panic = "abort"` would break exception safety.
+# - `codegen-units = 1` trades parallel codegen (slower link) for the
+#   single-unit optimization picture LTO + inliner need.
+# - `incremental = false` disables incremental release builds — they
+#   defeat LTO and are not safe to ship.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
+incremental = false
+debug = false
+
+# Same as release but keep line-tables-only debuginfo, useful for
+# perf/profilers (perf record, samply, vtune) without paying the size
+# cost of full debug info.
+[profile.release-with-debug]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
+# Benches must use the same codegen as release so criterion numbers are
+# representative of what users will actually run.
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
+incremental = false
+debug = false

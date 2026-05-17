@@ -269,7 +269,15 @@ fn verify_method_typestate(
 
     let declared_frames: std::collections::HashMap<u16, VerificationFrame> = match &parsed_table {
         Some(table) => {
-            let offsets = table.absolute_offsets();
+            // Round 7 audit fix (MED #8): `absolute_offsets` now
+            // returns `Result` so a malformed StackMapTable whose
+            // accumulated offset overflows u16 surfaces as a verify
+            // error here instead of silently wrapping.
+            let offsets = table.absolute_offsets().map_err(|e| LinkageError::VerifyError {
+                class_name: class_name.to_string(),
+                method_name: method.name.to_string(),
+                message: format!("StackMapTable absolute_offsets: {e}"),
+            })?;
             let mut frames = std::collections::HashMap::with_capacity(table.entries.len());
             let mut prev = compact.clone();
             for (i, entry) in table.entries.iter().enumerate() {

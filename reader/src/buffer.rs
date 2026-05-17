@@ -88,21 +88,37 @@ impl<'a> ClassFileBuffer<'a> {
 
     #[inline(always)]
     pub fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], ClassReaderError> {
+        // Round 7 audit fix (MED #7 / round-4 #7): use `checked_add`
+        // for `pos + count` so a caller passing an unvalidated `count`
+        // (e.g. derived from a u32 length field on a 32-bit target,
+        // or from `N * ENTRY_SIZE` arithmetic in the bulk parsers in
+        // `attribute.rs`) can't wrap to a small `end` and silently
+        // succeed with `self.data.get(pos..end)` returning a short
+        // prefix. On overflow we return `UnexpectedEndOfData` — there
+        // can't possibly be that many bytes left in the buffer.
         let pos = self.position;
+        let end = pos
+            .checked_add(count)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
         let bytes = self
             .data
-            .get(pos..pos + count)
+            .get(pos..end)
             .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
-        self.position = pos + count;
+        self.position = end;
         Ok(bytes)
     }
 
     pub fn skip(&mut self, count: usize) -> Result<(), ClassReaderError> {
+        // Round 7 audit fix (MED #7 / round-4 #7): same overflow
+        // hardening as `read_bytes` — see comment above.
         let pos = self.position;
-        if self.data.get(pos..pos + count).is_none() {
+        let end = pos
+            .checked_add(count)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
+        if self.data.get(pos..end).is_none() {
             return Err(ClassReaderError::UnexpectedEndOfData { position: pos });
         }
-        self.position = pos + count;
+        self.position = end;
         Ok(())
     }
 }

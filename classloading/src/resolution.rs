@@ -2,6 +2,39 @@
 //!
 //! Caches resolved constant pool references (fields, methods, and call sites) to avoid
 //! re-resolving on every instruction. The cache key is `(referring class, cp index)`.
+//!
+//! # Round 7 audit fix (LOW #13): `ClassFile` parse is parallelizable
+//!
+//! `rustjvm_reader::read_class` is pure and stateless — it takes a
+//! `&[u8]` and returns a fully-owned `ClassFile`. The cold-start JDK
+//! bootstrap parses ~6 000 classes serially and `read_class` is
+//! ~40-60 µs per class on a modern x86 core, so the serial cost adds
+//! up to ~300 ms of wall time on a 16-core host that could be ~25 ms
+//! parallel.
+//!
+//! **Why this isn't done here.** Adding `rayon` to
+//! `classloading/Cargo.toml` brings in a thread-pool + a large
+//! transitive graph (crossbeam, num_cpus) for one optimisation that
+//! only fires once at startup. The `class_manager` registration path
+//! also holds `&mut self` while inserting the parsed `ClassFile`s,
+//! which serialises the back-end of the pipeline regardless. The
+//! win is real but small relative to the dependency surface area.
+//!
+//! **TODO:** if `rayon` becomes a workspace dep for another reason,
+//! revisit: add `pub fn parallel_parse(inputs: &[(Arc<str>, &[u8])])
+//! -> Vec<Result<ClassFile, ClassFileError>>` in `rustjvm_reader`
+//! and call it from the bootstrap-scan path in `class_manager`.
+//!
+//! # Round 7 audit fix (LOW #14): JFR `StringPool` vs `intern_arc` are intentionally distinct
+//!
+//! `rustjvm_jfr::dump::StringPool` assigns `u16` IDs for the JFR
+//! binary wire format (one ID per unique string per JFR chunk; the
+//! pool resets between chunks). `rustjvm_types::intern_arc` returns
+//! a process-lifetime `Arc<str>` for runtime sharing across the
+//! VM. Different lifetimes (chunk-scoped vs process-scoped),
+//! different keying (`u16` wire ID vs identity-by-arc), different
+//! consumers (JFR file writer vs constant-pool tables). No
+//! unification opportunity — flagged for closure.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -386,6 +419,173 @@ impl ResolutionCache {
 impl Default for ResolutionCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LinkResolver — reflective (class, name, descriptor) lookup cache
+// ---------------------------------------------------------------------------
+
+/// A resolved member identifier produced by [`LinkResolver`].
+///
+/// Reflective lookups (`Class.getDeclaredMethod`,
+/// `Class.getDeclaredField`, `Class.getMethod`, `Class.getField`, JNI
+/// `GetMethodID`/`GetFieldID`, MethodHandles.Lookup, JVMTI agents,
+/// `Unsafe.objectFieldOffset`, Spring's massive reflection batches) all
+/// walk the class hierarchy in a linear `find_method` / `find_field`
+/// scan that the per-CP-index [`ResolutionCache`] never observes — the
+/// CP cache is keyed on `(referring class, cp index)` whereas
+/// reflection passes raw `&str` and the same `(declaring class, name,
+/// descriptor)` triple recurs thousands of times across the Spring
+/// startup. This entry is the deduplicated answer for one such triple.
+#[derive(Debug, Clone)]
+pub enum ResolvedMember {
+    /// A method was found at `declaring_class_id`, position `index`
+    /// inside its `methods` vec. Callers re-fetch the
+    /// [`rustjvm_reader::ClassFileMethod`] via the class store so the
+    /// cache stays small (no full snapshot).
+    Method {
+        declaring_class_id: ClassId,
+        index: u32,
+    },
+    /// A field was found at `declaring_class_id`. `absolute_index` is
+    /// the value [`crate::Class::find_own_field`] returned (i.e. the
+    /// index into the static slot array for static fields, or
+    /// `first_field_index + offset` for instance fields).
+    Field {
+        declaring_class_id: ClassId,
+        absolute_index: u32,
+        is_static: bool,
+    },
+    /// The lookup walked the hierarchy and turned up nothing — cached
+    /// so a tight loop of "does class X declare method Y?" probes
+    /// (Spring's `AnnotationUtils.findAnnotation` is the canonical hot
+    /// spot) doesn't re-walk every time.
+    NotFound,
+}
+
+/// Shared cache for reflective `(class, name, descriptor)` lookups.
+///
+/// Round 7 audit fix (HIGH #11) / round-5 carryover: the per-CP-index
+/// [`ResolutionCache`] only covers bytecode references that go through
+/// a constant pool. Reflective callers (`Class.getDeclaredMethod`,
+/// JNI `GetMethodID`, Spring's `ReflectionUtils.findMethod`, Hibernate
+/// proxy-class scanners, ByteBuddy's `getDeclaredMethods()` walk) pay
+/// the linear `find_method_recursive` / `find_field_recursive` cost
+/// on every probe. On a Spring Boot cold start the same
+/// `(Iterable.class, "iterator", "()Ljava/util/Iterator;")` triple is
+/// resolved 20-50k times. This cache keys on
+/// `(ClassId, Arc<str>, Arc<str>)` and de-dupes the answer.
+///
+/// Concurrency: writes are rare (population happens at most once per
+/// distinct triple) and reads dominate every-time, so a
+/// `parking_lot::RwLock<FxHashMap>` is the right fit: concurrent
+/// readers never block each other, and the populate path takes the
+/// write lock for a single insert. (`FxHashMap` is safe here because
+/// the keys are method-name / descriptor `Arc<str>`s already interned
+/// upstream by the constant pool — not attacker-controlled.)
+///
+/// `Arc<str>` keys allow producers to clone the constant-pool-interned
+/// strings (refcount bump, no allocation) instead of copying the bytes
+/// — matches the round-3 `Arc<str>` CP work.
+pub struct LinkResolver {
+    cache: parking_lot::RwLock<FxHashMap<(ClassId, Arc<str>, Arc<str>), ResolvedMember>>,
+}
+
+impl LinkResolver {
+    /// Build an empty resolver.
+    pub fn new() -> Self {
+        Self {
+            cache: parking_lot::RwLock::new(fx_hashmap_with_capacity(256)),
+        }
+    }
+
+    /// Probe the cache. Returns `None` on cold miss; callers must then
+    /// do the full hierarchy walk and call [`Self::insert`] with the
+    /// result (including `ResolvedMember::NotFound` so the next probe
+    /// short-circuits).
+    pub fn get(
+        &self,
+        class_id: ClassId,
+        name: &Arc<str>,
+        descriptor: &Arc<str>,
+    ) -> Option<ResolvedMember> {
+        let guard = self.cache.read();
+        // The `(ClassId, Arc<str>, Arc<str>)` key requires owned arcs,
+        // but the read path produces `&Arc<str>`; we hash & compare via
+        // refcount-bump clones. This is one branch + two atomic
+        // increments per hit — still orders of magnitude cheaper than
+        // a fresh hierarchy walk.
+        guard
+            .get(&(class_id, Arc::clone(name), Arc::clone(descriptor)))
+            .cloned()
+    }
+
+    /// Populate (or overwrite) a cache entry. Takes the write lock for
+    /// a single insert. Callers should hold no other locks while
+    /// calling — the read side runs without yielding.
+    pub fn insert(
+        &self,
+        class_id: ClassId,
+        name: Arc<str>,
+        descriptor: Arc<str>,
+        resolved: ResolvedMember,
+    ) {
+        self.cache
+            .write()
+            .insert((class_id, name, descriptor), resolved);
+    }
+
+    /// Drop every cached entry whose key class matches `class_id`, or
+    /// whose resolved declaring class matches. Mirrors
+    /// [`ResolutionCache::invalidate_class`] so a JEP 109 redefine
+    /// invalidates this cache in lockstep.
+    pub fn invalidate_class(&self, class_id: ClassId) {
+        let mut guard = self.cache.write();
+        guard.retain(|(key_class, _, _), resolved| {
+            if *key_class == class_id {
+                return false;
+            }
+            match resolved {
+                ResolvedMember::Method { declaring_class_id, .. }
+                | ResolvedMember::Field { declaring_class_id, .. } => {
+                    *declaring_class_id != class_id
+                }
+                ResolvedMember::NotFound => true,
+            }
+        });
+    }
+
+    /// Drop every cached entry (e.g. on JVM shutdown / test teardown).
+    pub fn clear(&self) {
+        self.cache.write().clear();
+    }
+
+    /// Current cache size — exposed for diagnostics / tests.
+    pub fn len(&self) -> usize {
+        self.cache.read().len()
+    }
+
+    /// True if the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.cache.read().is_empty()
+    }
+}
+
+impl Default for LinkResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for LinkResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid taking the read lock under `Debug` (cheap diagnostic
+        // path; the size is the only useful datum without dumping every
+        // key, which would be enormous).
+        f.debug_struct("LinkResolver")
+            .field("entries", &self.cache.read().len())
+            .finish()
     }
 }
 
@@ -1026,5 +1226,73 @@ mod tests {
             }
             _ => panic!("Expected Lambda call site"),
         }
+    }
+
+    /// Round 5 audit fix (MED #10) / Round 7 audit fix (MED #11):
+    /// `LinkResolver` round-trip — populate a triple, read it back,
+    /// confirm `NotFound` is also cached so the next probe
+    /// short-circuits, and verify `invalidate_class` drops every entry
+    /// whose key or resolved declaring class matches.
+    #[test]
+    fn link_resolver_caches_and_invalidates() {
+        let resolver = LinkResolver::new();
+        let class_a = ClassId::new(1);
+        let class_b = ClassId::new(2);
+        let name: Arc<str> = Arc::from("iterator");
+        let desc: Arc<str> = Arc::from("()Ljava/util/Iterator;");
+
+        // Cold miss.
+        assert!(resolver.get(class_a, &name, &desc).is_none());
+
+        // Populate with a Method resolution whose declaring class is
+        // class_b — both the key class and the resolved declaring
+        // class participate in invalidation, so we exercise both
+        // axes.
+        resolver.insert(
+            class_a,
+            Arc::clone(&name),
+            Arc::clone(&desc),
+            ResolvedMember::Method { declaring_class_id: class_b, index: 7 },
+        );
+
+        // Hit.
+        match resolver.get(class_a, &name, &desc) {
+            Some(ResolvedMember::Method { declaring_class_id, index }) => {
+                assert_eq!(declaring_class_id, class_b);
+                assert_eq!(index, 7);
+            }
+            other => panic!("expected cached Method, got {other:?}"),
+        }
+        assert_eq!(resolver.len(), 1);
+
+        // NotFound is also cached.
+        let missing_name: Arc<str> = Arc::from("totallyNotAMethod");
+        resolver.insert(
+            class_a,
+            Arc::clone(&missing_name),
+            Arc::clone(&desc),
+            ResolvedMember::NotFound,
+        );
+        assert!(matches!(
+            resolver.get(class_a, &missing_name, &desc),
+            Some(ResolvedMember::NotFound)
+        ));
+        assert_eq!(resolver.len(), 2);
+
+        // Invalidating class_b must drop the Method entry (resolved
+        // declaring class match) but keep the NotFound entry (no
+        // declaring class link).
+        resolver.invalidate_class(class_b);
+        assert!(resolver.get(class_a, &name, &desc).is_none());
+        assert!(matches!(
+            resolver.get(class_a, &missing_name, &desc),
+            Some(ResolvedMember::NotFound)
+        ));
+
+        // Invalidating class_a drops the remaining NotFound entry
+        // (key class match).
+        resolver.invalidate_class(class_a);
+        assert!(resolver.get(class_a, &missing_name, &desc).is_none());
+        assert!(resolver.is_empty());
     }
 }

@@ -521,7 +521,12 @@ impl LazyAttribute {
             let name = name.clone();
             let source = Arc::clone(source);
             let range = range.clone();
-            let decoded = decode_attribute_with_source(&name, &source, range, constant_pool)?;
+            // Round 7 audit fix (MED #7): route through the `Arc<str>`
+            // entrypoint so the body dispatch can use `Arc::ptr_eq`
+            // against canonical interned names — skips one intern
+            // lookup per lazy decode (the hot path on bootstrap).
+            let decoded =
+                decode_attribute_with_source_arc(&name, &source, range, constant_pool)?;
             *self = LazyAttribute::Decoded(decoded);
         }
         match self {
@@ -594,7 +599,13 @@ pub fn decode_attribute(
     // decoders that need slices for `Arc<[u8]>` payloads can share the
     // allocation rather than each performing their own `.to_vec()`.
     let source: Arc<[u8]> = Arc::from(bytes);
-    decode_attribute_with_source(name, &source, 0..source.len(), cp)
+    // Round 7 audit fix (MED #7): the body decoder dispatches on the
+    // attribute name via `Arc::ptr_eq` against canonical interned
+    // forms. The eager API takes `&str` for back-compat, so intern it
+    // here once. The intern table is a global `Mutex<HashMap>` lookup;
+    // amortised over the per-attribute parse work it's negligible.
+    let name_arc = rustjvm_types::intern_arc(name);
+    decode_attribute_with_source_arc(&name_arc, &source, 0..source.len(), cp)
 }
 
 /// Zero-copy attribute decoder used by the class-reader hot path.
@@ -610,6 +621,24 @@ pub fn decode_attribute(
 /// see `docs/round5-reader.md` CRIT-1.)
 pub fn decode_attribute_with_source(
     name: &str,
+    source: &Arc<[u8]>,
+    range: Range<usize>,
+    cp: &ConstantPool,
+) -> Result<Attribute, ClassReaderError> {
+    // Round 7 audit fix (MED #7): forward to the `Arc<str>` variant
+    // so the body dispatch can use `Arc::ptr_eq` against canonical
+    // names. Eager `&str` callers pay one intern lookup; the lazy
+    // hot-path caller already has an interned `Arc<str>` and uses
+    // [`decode_attribute_with_source_arc`] directly.
+    let name_arc = rustjvm_types::intern_arc(name);
+    decode_attribute_with_source_arc(&name_arc, source, range, cp)
+}
+
+/// `Arc<str>`-name variant of [`decode_attribute_with_source`] used by
+/// the lazy decode hot path. Avoids re-interning the attribute name
+/// because the caller already holds the constant-pool-interned arc.
+pub fn decode_attribute_with_source_arc(
+    name: &Arc<str>,
     source: &Arc<[u8]>,
     range: Range<usize>,
     cp: &ConstantPool,
@@ -651,14 +680,98 @@ pub fn decode_attribute_with_source(
 /// view on the shared buffer instead of a fresh `Vec<u8>` (or, post-
 /// round-4-wave-2, a fresh `Arc<[u8]>`) per payload.
 fn decode_attribute_body(
-    name: &str,
+    name: &Arc<str>,
     length: usize,
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
     source: &Arc<[u8]>,
     body_offset: usize,
 ) -> Result<Attribute, ClassReaderError> {
-    let attr = match name {
+    // Round 7 audit fix (MED #7): Arc-pointer-equality fast path
+    // against canonical interned attribute names. Round-3 made the
+    // constant pool intern every Utf8 into the global `intern_arc`
+    // table, so the `name` arc that lazy-decode hands us is the same
+    // refcounted allocation as the canonical names below. A successful
+    // `Arc::ptr_eq` is one pointer comparison — substantially cheaper
+    // than `str` equality (which loads the length prefix, then either
+    // compares 8 bytes at a time or rejects on a length mismatch). The
+    // string `match` below remains as a fallback for non-canonical
+    // names (vendor / unknown attributes) and for the rare callers
+    // that pass an `Arc<str>` that wasn't routed through `intern_arc`.
+    use std::sync::LazyLock;
+    macro_rules! canon {
+        ($name:ident, $s:expr) => {
+            static $name: LazyLock<Arc<str>> =
+                LazyLock::new(|| rustjvm_types::intern_arc($s));
+        };
+    }
+    canon!(CANON_CODE, "Code");
+    canon!(CANON_SOURCE_FILE, "SourceFile");
+    canon!(CANON_LINE_NUMBER_TABLE, "LineNumberTable");
+    canon!(CANON_LOCAL_VARIABLE_TABLE, "LocalVariableTable");
+    canon!(CANON_LOCAL_VARIABLE_TYPE_TABLE, "LocalVariableTypeTable");
+    canon!(CANON_STACK_MAP_TABLE, "StackMapTable");
+    canon!(CANON_CONSTANT_VALUE, "ConstantValue");
+    canon!(CANON_EXCEPTIONS, "Exceptions");
+    canon!(CANON_SIGNATURE, "Signature");
+    canon!(CANON_INNER_CLASSES, "InnerClasses");
+    canon!(CANON_BOOTSTRAP_METHODS, "BootstrapMethods");
+    canon!(CANON_DEPRECATED, "Deprecated");
+    canon!(CANON_SYNTHETIC, "Synthetic");
+    canon!(CANON_NEST_HOST, "NestHost");
+    canon!(CANON_NEST_MEMBERS, "NestMembers");
+    canon!(CANON_RUNTIME_VISIBLE_ANNOTATIONS, "RuntimeVisibleAnnotations");
+    canon!(CANON_RUNTIME_INVISIBLE_ANNOTATIONS, "RuntimeInvisibleAnnotations");
+    canon!(CANON_METHOD_PARAMETERS, "MethodParameters");
+    canon!(CANON_ENCLOSING_METHOD, "EnclosingMethod");
+
+    // Pick a string discriminant by Arc-ptr-eq first; fall through to
+    // the `&**name` deref for the slow path. The selected string is
+    // either the canonical static (`Arc::ptr_eq` hit) or the original
+    // attribute name (miss). The match below then uses it verbatim.
+    let dispatch_name: &str = if Arc::ptr_eq(name, &CANON_CODE) {
+        "Code"
+    } else if Arc::ptr_eq(name, &CANON_SOURCE_FILE) {
+        "SourceFile"
+    } else if Arc::ptr_eq(name, &CANON_LINE_NUMBER_TABLE) {
+        "LineNumberTable"
+    } else if Arc::ptr_eq(name, &CANON_LOCAL_VARIABLE_TABLE) {
+        "LocalVariableTable"
+    } else if Arc::ptr_eq(name, &CANON_LOCAL_VARIABLE_TYPE_TABLE) {
+        "LocalVariableTypeTable"
+    } else if Arc::ptr_eq(name, &CANON_STACK_MAP_TABLE) {
+        "StackMapTable"
+    } else if Arc::ptr_eq(name, &CANON_CONSTANT_VALUE) {
+        "ConstantValue"
+    } else if Arc::ptr_eq(name, &CANON_EXCEPTIONS) {
+        "Exceptions"
+    } else if Arc::ptr_eq(name, &CANON_SIGNATURE) {
+        "Signature"
+    } else if Arc::ptr_eq(name, &CANON_INNER_CLASSES) {
+        "InnerClasses"
+    } else if Arc::ptr_eq(name, &CANON_BOOTSTRAP_METHODS) {
+        "BootstrapMethods"
+    } else if Arc::ptr_eq(name, &CANON_DEPRECATED) {
+        "Deprecated"
+    } else if Arc::ptr_eq(name, &CANON_SYNTHETIC) {
+        "Synthetic"
+    } else if Arc::ptr_eq(name, &CANON_NEST_HOST) {
+        "NestHost"
+    } else if Arc::ptr_eq(name, &CANON_NEST_MEMBERS) {
+        "NestMembers"
+    } else if Arc::ptr_eq(name, &CANON_RUNTIME_VISIBLE_ANNOTATIONS) {
+        "RuntimeVisibleAnnotations"
+    } else if Arc::ptr_eq(name, &CANON_RUNTIME_INVISIBLE_ANNOTATIONS) {
+        "RuntimeInvisibleAnnotations"
+    } else if Arc::ptr_eq(name, &CANON_METHOD_PARAMETERS) {
+        "MethodParameters"
+    } else if Arc::ptr_eq(name, &CANON_ENCLOSING_METHOD) {
+        "EnclosingMethod"
+    } else {
+        &**name
+    };
+
+    let attr = match dispatch_name {
         "Code" => decode_code_body(buf, cp, source, body_offset)?,
         "SourceFile" => {
             let source_file_index = buf.read_u16()?;
@@ -679,34 +792,52 @@ fn decode_attribute_body(
         "Deprecated" => Attribute::Deprecated,
         "Synthetic" => Attribute::Synthetic,
         "Exceptions" => {
-            let num_exceptions = buf.read_u16()?;
-            let mut exception_indices =
-                Vec::with_capacity((num_exceptions as usize).min(PREALLOC_CAP));
-            for _ in 0..num_exceptions {
-                exception_indices.push(buf.read_u16()?);
+            // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse
+            // of the u16 cp-index array.
+            let num_exceptions = buf.read_u16()? as usize;
+            let bytes = buf.read_bytes(num_exceptions * 2)?;
+            let mut exception_indices = Vec::with_capacity(num_exceptions.min(PREALLOC_CAP));
+            for chunk in bytes.chunks_exact(2) {
+                exception_indices.push(u16::from_be_bytes([chunk[0], chunk[1]]));
             }
             Attribute::Exceptions { exception_indices }
         }
         "LineNumberTable" => {
-            let table_length = buf.read_u16()?;
-            let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
-            for _ in 0..table_length {
+            // Round 7 audit fix (MED #6 / round-4 #4): replace the
+            // per-`u16` `read_u16()` loop with a single
+            // `read_bytes(4 * count)` slice grab + linear parse from
+            // `[u8]`. Each `read_u16()` does an `Option::ok_or(...)?`
+            // bounds check + a `try_into().unwrap()` array conversion;
+            // for an `N`-entry table that's `2*N` checked reads. The
+            // bulk read does ONE bounds check and the inner parse is a
+            // tight `u16::from_be_bytes([chunk[0], chunk[1]])`
+            // (`unchecked_shl + or`) — 3-4× faster on bootstrap where
+            // LineNumberTable is ubiquitous.
+            let table_length = buf.read_u16()? as usize;
+            const ENTRY_SIZE: usize = 4; // start_pc(u16) + line_number(u16)
+            let bytes = buf.read_bytes(table_length * ENTRY_SIZE)?;
+            let mut entries = Vec::with_capacity(table_length.min(PREALLOC_CAP));
+            for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 entries.push(LineNumberEntry {
-                    start_pc: buf.read_u16()?,
-                    line_number: buf.read_u16()?,
+                    start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
+                    line_number: u16::from_be_bytes([chunk[2], chunk[3]]),
                 });
             }
             Attribute::LineNumberTable(entries)
         }
         "InnerClasses" => {
-            let num_classes = buf.read_u16()?;
-            let mut classes = Vec::with_capacity((num_classes as usize).min(PREALLOC_CAP));
-            for _ in 0..num_classes {
+            // Round 7 audit fix (MED #6 / round-4 #4): bulk slice
+            // parse — see LineNumberTable comment for rationale.
+            let num_classes = buf.read_u16()? as usize;
+            const ENTRY_SIZE: usize = 8; // four u16 fields
+            let bytes = buf.read_bytes(num_classes * ENTRY_SIZE)?;
+            let mut classes = Vec::with_capacity(num_classes.min(PREALLOC_CAP));
+            for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 classes.push(InnerClassInfo {
-                    inner_class_info_index: buf.read_u16()?,
-                    outer_class_info_index: buf.read_u16()?,
-                    inner_name_index: buf.read_u16()?,
-                    inner_class_access_flags: buf.read_u16()?,
+                    inner_class_info_index: u16::from_be_bytes([chunk[0], chunk[1]]),
+                    outer_class_info_index: u16::from_be_bytes([chunk[2], chunk[3]]),
+                    inner_name_index: u16::from_be_bytes([chunk[4], chunk[5]]),
+                    inner_class_access_flags: u16::from_be_bytes([chunk[6], chunk[7]]),
                 });
             }
             Attribute::InnerClasses(classes)
@@ -900,7 +1031,7 @@ fn decode_attribute_body(
             for _ in 0..num_annotations {
                 annotations.push(decode_annotation(buf)?);
             }
-            if name == "RuntimeVisibleAnnotations" {
+            if dispatch_name == "RuntimeVisibleAnnotations" {
                 Attribute::RuntimeVisibleAnnotations(annotations)
             } else {
                 Attribute::RuntimeInvisibleAnnotations(annotations)
@@ -919,7 +1050,7 @@ fn decode_attribute_body(
                 }
                 parameter_annotations.push(annotations);
             }
-            if name == "RuntimeVisibleParameterAnnotations" {
+            if dispatch_name == "RuntimeVisibleParameterAnnotations" {
                 Attribute::RuntimeVisibleParameterAnnotations(parameter_annotations)
             } else {
                 Attribute::RuntimeInvisibleParameterAnnotations(parameter_annotations)
@@ -931,7 +1062,7 @@ fn decode_attribute_body(
             for _ in 0..num_annotations {
                 annotations.push(decode_type_annotation(buf)?);
             }
-            if name == "RuntimeVisibleTypeAnnotations" {
+            if dispatch_name == "RuntimeVisibleTypeAnnotations" {
                 Attribute::RuntimeVisibleTypeAnnotations(annotations)
             } else {
                 Attribute::RuntimeInvisibleTypeAnnotations(annotations)
@@ -942,41 +1073,51 @@ fn decode_attribute_body(
             Attribute::AnnotationDefault(value)
         }
         "LocalVariableTable" => {
-            let table_length = buf.read_u16()?;
-            let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
-            for _ in 0..table_length {
+            // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse.
+            let table_length = buf.read_u16()? as usize;
+            const ENTRY_SIZE: usize = 10; // five u16 fields
+            let bytes = buf.read_bytes(table_length * ENTRY_SIZE)?;
+            let mut entries = Vec::with_capacity(table_length.min(PREALLOC_CAP));
+            for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 entries.push(LocalVariableEntry {
-                    start_pc: buf.read_u16()?,
-                    length: buf.read_u16()?,
-                    name_index: buf.read_u16()?,
-                    descriptor_index: buf.read_u16()?,
-                    index: buf.read_u16()?,
+                    start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
+                    length: u16::from_be_bytes([chunk[2], chunk[3]]),
+                    name_index: u16::from_be_bytes([chunk[4], chunk[5]]),
+                    descriptor_index: u16::from_be_bytes([chunk[6], chunk[7]]),
+                    index: u16::from_be_bytes([chunk[8], chunk[9]]),
                 });
             }
             Attribute::LocalVariableTable(entries)
         }
         "LocalVariableTypeTable" => {
-            let table_length = buf.read_u16()?;
-            let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
-            for _ in 0..table_length {
+            // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse.
+            let table_length = buf.read_u16()? as usize;
+            const ENTRY_SIZE: usize = 10; // five u16 fields
+            let bytes = buf.read_bytes(table_length * ENTRY_SIZE)?;
+            let mut entries = Vec::with_capacity(table_length.min(PREALLOC_CAP));
+            for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 entries.push(LocalVariableTypeEntry {
-                    start_pc: buf.read_u16()?,
-                    length: buf.read_u16()?,
-                    name_index: buf.read_u16()?,
-                    signature_index: buf.read_u16()?,
-                    index: buf.read_u16()?,
+                    start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
+                    length: u16::from_be_bytes([chunk[2], chunk[3]]),
+                    name_index: u16::from_be_bytes([chunk[4], chunk[5]]),
+                    signature_index: u16::from_be_bytes([chunk[6], chunk[7]]),
+                    index: u16::from_be_bytes([chunk[8], chunk[9]]),
                 });
             }
             Attribute::LocalVariableTypeTable(entries)
         }
         "MethodParameters" => {
-            let parameters_count = buf.read_u8()?;
-            let mut parameters =
-                Vec::with_capacity((parameters_count as usize).min(PREALLOC_CAP));
-            for _ in 0..parameters_count {
+            // Round 7 audit fix (MED #6 / round-4 #4): bulk slice
+            // parse. `parameters_count` is u8 so the maximum payload
+            // is 255*4 = 1020 bytes — a single small alloc.
+            let parameters_count = buf.read_u8()? as usize;
+            const ENTRY_SIZE: usize = 4; // two u16 fields
+            let bytes = buf.read_bytes(parameters_count * ENTRY_SIZE)?;
+            let mut parameters = Vec::with_capacity(parameters_count.min(PREALLOC_CAP));
+            for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 parameters.push(MethodParameter {
-                    name_index: buf.read_u16()?,
-                    access_flags: buf.read_u16()?,
+                    name_index: u16::from_be_bytes([chunk[0], chunk[1]]),
+                    access_flags: u16::from_be_bytes([chunk[2], chunk[3]]),
                 });
             }
             Attribute::MethodParameters(parameters)
@@ -1012,8 +1153,13 @@ fn decode_attribute_body(
             let start = body_offset + buf.position();
             let _ = buf.read_bytes(length)?;
             let data = ByteView::new(Arc::clone(source), start..start + length);
+            // Round 7 audit fix (MED #7): `name` is already an
+            // interned `Arc<str>` (the caller passed in the canonical
+            // pool-interned arc); just refcount-bump instead of
+            // re-interning, saving a global table lookup per Unknown
+            // attribute.
             Attribute::Unknown {
-                name: rustjvm_types::intern_arc(name),
+                name: Arc::clone(name),
                 data,
             }
         }
@@ -1063,6 +1209,10 @@ fn decode_attributes_vec(
         // Snapshot to enforce per-attribute length, mirroring class_reader.rs.
         let start_pos = buf.position();
         let nested_body_offset = outer_body_offset + start_pos;
+        // Round 7 audit fix (MED #7): pass the `Arc<str>` directly so
+        // the body can dispatch via `Arc::ptr_eq` against canonical
+        // names (`LineNumberTable`, `LocalVariableTable`, etc. are the
+        // ubiquitous nested attribute inside `Code`).
         let attr = decode_attribute_body(&name, length, buf, cp, source, nested_body_offset)?;
         let consumed = buf.position() - start_pos;
         if consumed != length {
@@ -1121,15 +1271,23 @@ fn decode_code_body(
     let _ = buf.read_bytes(code_length)?;
     let code = ByteView::new(Arc::clone(source), code_start..code_start + code_length);
 
-    let exception_table_length = buf.read_u16()?;
+    // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse of the
+    // ExceptionTable — replaces four per-`u16` `read_u16()` calls per
+    // entry with one `read_bytes(8 * N)` slice grab plus a tight inner
+    // `u16::from_be_bytes([..])` parse. Each `read_u16` performs a
+    // checked-slice bounds check and a `try_into().unwrap()`; the bulk
+    // version does one bounds check for the whole table.
+    let exception_table_length = buf.read_u16()? as usize;
+    const ET_ENTRY_SIZE: usize = 8; // four u16 fields
+    let et_bytes = buf.read_bytes(exception_table_length * ET_ENTRY_SIZE)?;
     let mut exception_table =
-        Vec::with_capacity((exception_table_length as usize).min(PREALLOC_CAP));
-    for _ in 0..exception_table_length {
+        Vec::with_capacity(exception_table_length.min(PREALLOC_CAP));
+    for chunk in et_bytes.chunks_exact(ET_ENTRY_SIZE) {
         exception_table.push(ExceptionTableEntry {
-            start_pc: buf.read_u16()?,
-            end_pc: buf.read_u16()?,
-            handler_pc: buf.read_u16()?,
-            catch_type: buf.read_u16()?,
+            start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
+            end_pc: u16::from_be_bytes([chunk[2], chunk[3]]),
+            handler_pc: u16::from_be_bytes([chunk[4], chunk[5]]),
+            catch_type: u16::from_be_bytes([chunk[6], chunk[7]]),
         });
     }
 
@@ -1256,13 +1414,27 @@ fn decode_target_info(
             Ok(vec![hi, lo])
         }
         0x40 | 0x41 => {
-            let table_length = buf.read_u16()?;
+            // Round 7 audit fix (MED #5 / round-4 #5): avoid re-serialising
+            // the `table_length` u16 we just decoded. The previous code
+            // called `read_u16()` (which advances the buffer past the
+            // two length bytes), then *manually pushed those same two
+            // bytes back* into the output `Vec` via `>> 8` / `as u8`
+            // before extending with the body. That's two needless byte
+            // pushes plus the shift/cast arithmetic per type-annotation.
+            //
+            // Instead, peek the length via a single `read_bytes(2)`
+            // (gives us the raw big-endian bytes verbatim), then do one
+            // contiguous `read_bytes(byte_count)` for the body and copy
+            // header + body into the output in two slice-copies. No
+            // bit-shifts, no per-byte pushes.
+            let len_bytes = buf.read_bytes(2)?;
+            let len_copy: [u8; 2] = [len_bytes[0], len_bytes[1]];
+            let table_length = u16::from_be_bytes(len_copy);
             let byte_count = 6 * table_length as usize;
+            let body = buf.read_bytes(byte_count)?;
             let mut data = Vec::with_capacity(2 + byte_count);
-            data.push((table_length >> 8) as u8);
-            data.push(table_length as u8);
-            let raw = buf.read_bytes(byte_count)?;
-            data.extend_from_slice(raw);
+            data.extend_from_slice(&len_copy);
+            data.extend_from_slice(body);
             Ok(data)
         }
         0x42 => {

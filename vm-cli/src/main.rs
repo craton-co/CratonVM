@@ -1,3 +1,13 @@
+// Round-7 cross-cutting Fix 2: install mimalloc as the global allocator. The
+// default Windows allocator (HeapAlloc) is slow on the small, high-frequency
+// allocations the VM produces (Value boxing, frame locals, parking_lot
+// internal nodes, String, Vec<u8> for class bytes). Gated behind the
+// `mimalloc` feature (on by default; disable with `--no-default-features` on
+// targets like musl that have no mimalloc support).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rustjvm_vm::error::MethodCallFailed;
@@ -614,16 +624,47 @@ fn run() -> Result<()> {
         // classes from jars listed in quarkus-application.dat. Since we can't
         // fully emulate that complex bootstrap, add all application jars to
         // the VM classpath so ClassLoader.loadClass can find them.
-        if let Some(parent) = jar_path.parent().and_then(|p| p.parent()) {
-            let app_dirs = ["lib/lib/main", "lib/lib/boot", "lib/quarkus", "lib/app"];
-            for dir_name in &app_dirs {
-                let dir = parent.join(dir_name);
-                if dir.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(&dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.extension().map_or(false, |e| e == "jar") {
-                                cp.push(p.to_string_lossy().into_owned());
+        //
+        // Round-7 fix (MED, misc): gate the dir scan on a cheap Quarkus
+        // heuristic so non-Quarkus `--jar` invocations don't pay for four
+        // pointless `read_dir` syscalls on every startup.
+        //
+        // Detection ladder (cheapest first):
+        //   1. Env override `RUSTJVM_QUARKUS=1` — force on (CI / test).
+        //   2. JAR filename contains `quarkus-` (e.g. `*-runner.jar` is
+        //      common but ambiguous; the canonical signal is the
+        //      `quarkus-` substring in the path or filename).
+        //   3. Manifest has any `Quarkus-` prefixed main attribute
+        //      (Quarkus runner JARs carry `Quarkus-App-Marker` /
+        //      `Quarkus-Build-Time`).
+        // Any miss skips the dir walk entirely.
+        let looks_quarkus = {
+            let env_forced = std::env::var_os("RUSTJVM_QUARKUS")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false);
+            let filename_hit = jar_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains("quarkus-") || n.ends_with("-runner.jar"))
+                .unwrap_or(false);
+            let manifest_hit = manifest
+                .attributes
+                .keys()
+                .any(|k| k.starts_with("Quarkus-"));
+            env_forced || filename_hit || manifest_hit
+        };
+        if looks_quarkus {
+            if let Some(parent) = jar_path.parent().and_then(|p| p.parent()) {
+                let app_dirs = ["lib/lib/main", "lib/lib/boot", "lib/quarkus", "lib/app"];
+                for dir_name in &app_dirs {
+                    let dir = parent.join(dir_name);
+                    if dir.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().map_or(false, |e| e == "jar") {
+                                    cp.push(p.to_string_lossy().into_owned());
+                                }
                             }
                         }
                     }

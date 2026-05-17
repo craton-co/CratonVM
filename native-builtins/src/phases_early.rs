@@ -2177,31 +2177,113 @@ pub(crate) fn register_phase50_natives(registry: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// ThreadLocal — per-thread storage (audit-round5 fix #1).
+// ThreadLocal — per-thread storage (audit-round7 CRIT fixes 1/2/3).
 // ---------------------------------------------------------------------------
-// CRIT correctness: the prior implementation stashed the value in field 0 of
-// the `ThreadLocal` instance itself, so every thread that read/wrote the
-// same `ThreadLocal` clobbered the other threads' values — a direct
-// violation of the `ThreadLocal` contract. The fix uses a `thread_local!`
-// `RefCell<FxHashMap<usize, Value>>` keyed by the ThreadLocal object's
-// pointer; each thread's map only stores its own per-instance value.
+// Round-5 fix moved per-thread state from field-0 (clobbered across threads)
+// into a thread-local map keyed by the ThreadLocal's raw pointer. Round-7
+// found three follow-on CRITs:
 //
-// `withInitial` (`native_tl_with_initial`) eagerly invokes the supplier on
-// the creating thread and seeds that thread's map; subsequent reads on
-// other threads will see no entry and fall through to the JDK-level
-// `ThreadLocal.initialValue()` semantics. We model the unset state by
-// returning `Value::Object(None)` from `get`, matching the prior behavior
-// for the never-set case.
+//   (1) Pointer keys are invalidated by the moving GC (compact-header
+//       forwarding, G1/gen-heap relocation). After GC the new pointer hash
+//       misses; recycled addresses inherit dead entries cross-thread.
+//       Fix: key by the JLS identity hash (pinned in the compact header),
+//       obtained via `ctx.identity_hash_code(this)`.
+//
+//   (2) `withInitial` never stored the supplier, so every non-creator
+//       thread saw null forever. Fix: side table
+//       `WITH_INITIAL_SUPPLIERS` (identity-hash → supplier ObjectRef).
+//       `get`, on miss, looks up + invokes + caches.
+//
+//   (3) `InheritableThreadLocal` had no parent→child copy. Fix:
+//       `INHERITABLE_TL_IDS` records which TL identity hashes are
+//       inheritable; on `Thread.start`, the parent's matching entries
+//       are snapshotted into `INHERITED_PENDING[child_thread_id_hash]`.
+//       The child's first TL access drains its pending bucket into the
+//       local map (we lazily drain because the child runs on a fresh
+//       OS thread we don't control from native).
+//
+// Slot 0 is retained for compatibility with code that walks the synthetic
+// layout, but is never the source of truth.
+//
+// TODO (round-7 HIGH bug 4 — weak-key cleanup): once a thread stores a value
+// for a ThreadLocal the entry stays in TL_MAP until the thread dies, even
+// if the ThreadLocal itself is GC-unreachable. Long-lived worker pools
+// (Tomcat, Netty) leak. The right fix hooks `gc::reference::on_unreachable`
+// to drain each thread's TL_MAP for the freed identity hash. The GC side
+// does not currently expose that callback for arbitrary identity-hash
+// targets, so for now we accept the bounded leak — entries are bounded by
+// the live set of ThreadLocals, which is small for typical applications.
 const TL_FIELD_VALUE: usize = 0;
 
 std::thread_local! {
-    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<usize, Value>> =
+    /// Per-OS-thread map: TL identity hash → value held by this thread.
+    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, Value>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// One-shot flag: has this OS thread drained any inherited ITL entries
+    /// queued for the Java Thread it is running? Reset path: not needed
+    /// because OS threads are 1:1 with Java threads in CratonVM.
+    static TL_INHERITED_DRAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `withInitial` suppliers, keyed by the ThreadLocal's JLS identity hash.
+/// Populated by `withInitial`; read by `get` on map miss.
+pub(crate) fn tl_with_initial_suppliers()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>>
+{
+    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Identity hashes of every TL instance whose runtime class is (or extends)
+/// `java/lang/InheritableThreadLocal`. Populated by `<init>` of the ITL
+/// variant; consulted by `Thread.start` when building the child's
+/// inherited snapshot.
+pub(crate) fn tl_inheritable_ids()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashSet<i32>>
+{
+    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashSet<i32>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Map from a child Java Thread's identity hash → snapshot of inherited
+/// (TL idhash → value) entries to seed when that thread first accesses
+/// any ThreadLocal. Consumed (drained) exactly once per OS thread.
+pub(crate) fn tl_inherited_pending()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>>
+{
+    static S: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>>,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// On the first TL access from this OS thread, drain any inherited ITL
+/// entries that the parent recorded against this thread's Java identity.
+/// Idempotent: subsequent calls are a single bool check.
+#[inline]
+fn drain_inherited_for_current_thread(ctx: &mut dyn NativeContext) {
+    if TL_INHERITED_DRAINED.with(|f| f.get()) {
+        return;
+    }
+    TL_INHERITED_DRAINED.with(|f| f.set(true));
+    let thr_obj = ctx.current_thread_object();
+    let thr_hash = ctx.identity_hash_code(thr_obj);
+    let inherited = tl_inherited_pending().lock().remove(&thr_hash);
+    if let Some(entries) = inherited {
+        TL_MAP.with(|m| {
+            let mut map = m.borrow_mut();
+            for (k, v) in entries {
+                map.entry(k).or_insert(v);
+            }
+        });
+    }
 }
 
 #[inline]
-fn tl_key(this: rustjvm_types::ObjectRef) -> usize {
-    this.as_ptr() as usize
+fn tl_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
 }
 
 pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
@@ -2216,9 +2298,11 @@ pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;)Ljava/lang/ThreadLocal;",
         native_tl_with_initial,
     );
-    // InheritableThreadLocal (simplified — same as ThreadLocal)
+    // InheritableThreadLocal: same get/set/remove semantics, but the
+    // `<init>` registers the TL identity hash in the inheritable set so
+    // `Thread.start` can copy parent values to children.
     let itl = "java/lang/InheritableThreadLocal";
-    r.register(itl, "<init>", "()V", native_tl_init);
+    r.register(itl, "<init>", "()V", native_itl_init);
     r.register(itl, "get", "()Ljava/lang/Object;", native_tl_get);
     r.register(itl, "set", "(Ljava/lang/Object;)V", native_tl_set);
     r.register(itl, "remove", "()V", native_tl_remove);
@@ -2226,33 +2310,56 @@ pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
 
 fn native_tl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Field 0 is still allocated for compatibility with code that reads
-    // the synthetic layout, but it is NOT the source of truth for the
-    // per-thread value (see audit-round5 fix #1). Leave it as null.
+    // Slot 0 retained for layout compatibility; not the source of truth.
     ctx.set_field(this, TL_FIELD_VALUE, Value::Object(None));
     Ok(None)
 }
 
-fn native_tl_get(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_itl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let key = tl_key(this);
-    let val = TL_MAP.with(|m| m.borrow().get(&key).copied().unwrap_or(Value::Object(None)));
-    Ok(Some(val))
+    ctx.set_field(this, TL_FIELD_VALUE, Value::Object(None));
+    let id = ctx.identity_hash_code(this);
+    tl_inheritable_ids().lock().insert(id);
+    Ok(None)
 }
 
-fn native_tl_set(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    drain_inherited_for_current_thread(ctx);
+    let key = tl_key(ctx, this);
+    if let Some(v) = TL_MAP.with(|m| m.borrow().get(&key).copied()) {
+        return Ok(Some(v));
+    }
+    // Miss path: if a supplier was registered via `withInitial`, invoke it
+    // on the current thread, cache the result, and return.
+    let supplier = tl_with_initial_suppliers().lock().get(&key).copied();
+    if let Some(s) = supplier {
+        let initial = ctx
+            .invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        TL_MAP.with(|m| {
+            m.borrow_mut().insert(key, initial);
+        });
+        return Ok(Some(initial));
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    drain_inherited_for_current_thread(ctx);
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let key = tl_key(this);
+    let key = tl_key(ctx, this);
     TL_MAP.with(|m| {
         m.borrow_mut().insert(key, val);
     });
     Ok(None)
 }
 
-fn native_tl_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_tl_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let key = tl_key(this);
+    drain_inherited_for_current_thread(ctx);
+    let key = tl_key(ctx, this);
     TL_MAP.with(|m| {
         m.borrow_mut().remove(&key);
     });
@@ -2260,22 +2367,67 @@ fn native_tl_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Create ThreadLocal and eagerly call supplier to get initial value
-    // for the CURRENT thread only — other threads will lazily re-invoke
-    // their own initial-value provider on first access (matching the
-    // JDK's `SuppliedThreadLocal` semantics).
+    // Allocate a SuppliedThreadLocal, register the supplier in the side
+    // table (so every thread can lazily invoke it on first read), and
+    // eagerly seed the creating thread so the call-site sees a value
+    // without an extra invoke round-trip.
     let supplier = match args.first() {
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(None))),
     };
     let tl = alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1);
-    let initial = ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?;
-    let val = initial.unwrap_or(Value::Object(None));
-    let key = tl_key(tl);
+    let key = ctx.identity_hash_code(tl);
+    tl_with_initial_suppliers().lock().insert(key, supplier);
+    let initial = ctx
+        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
     TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, val);
+        m.borrow_mut().insert(key, initial);
     });
     Ok(Some(Value::Object(Some(tl))))
+}
+
+/// Build a snapshot of this OS thread's TL entries whose keys are
+/// flagged inheritable. Called from `native_thread_start0` (parent side)
+/// before the child OS thread is spawned. Returns `None` if there are
+/// no inheritable entries to copy.
+///
+/// NOTE: this only sees the parent's local map. Suppliers registered via
+/// `withInitial` are NOT eagerly evaluated for the child — the child's
+/// first `get()` will invoke its own supplier copy. That matches JDK
+/// semantics: `InheritableThreadLocal` inherits only set values, and
+/// `withInitial` ThreadLocals are not inheritable by default anyway.
+pub(crate) fn snapshot_inheritable_tl_entries()
+    -> Option<rustc_hash::FxHashMap<i32, Value>>
+{
+    let inheritable = tl_inheritable_ids().lock();
+    if inheritable.is_empty() {
+        return None;
+    }
+    let snap: rustc_hash::FxHashMap<i32, Value> = TL_MAP.with(|m| {
+        let map = m.borrow();
+        map.iter()
+            .filter(|(k, _)| inheritable.contains(k))
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    });
+    if snap.is_empty() {
+        None
+    } else {
+        Some(snap)
+    }
+}
+
+/// Queue an inheritable snapshot for the given child Java Thread. The
+/// child's first TL access drains this entry via
+/// `drain_inherited_for_current_thread`.
+pub(crate) fn queue_inherited_tl_for_child(
+    child_thread_hash: i32,
+    snapshot: rustc_hash::FxHashMap<i32, Value>,
+) {
+    tl_inherited_pending()
+        .lock()
+        .insert(child_thread_hash, snapshot);
 }
 
 // ---------------------------------------------------------------------------

@@ -533,6 +533,37 @@ fn write_header<W: Write>(
 /// types, then serialized AFTER the in-repository events.
 ///
 /// Returns the total number of bytes written.
+/// Round-5: `durable` controls whether the writer issues `sync_all` (fsync)
+/// before renaming the `.part` file to its final `.jfr` name.
+///
+/// Pass `true` for user-initiated dumps (recording stop, `dump_recording`)
+/// where the operator expects bytes-on-disk semantics. Pass `false` for
+/// periodic snapshot paths where the cost of fsync per dump dominates and
+/// the dump is best-effort. The OS will still flush dirty pages on its
+/// own schedule.
+///
+/// TODO (round-7 CRIT #1, scope: `repository.rs:544-559`):
+///   `SpscEventRing::drop` asserts `consumer_busy == false`. If the owning
+///   `ThreadRingRegistry` is dropped while another thread is mid-drain
+///   (i.e. inside the drainer critical section), the assertion fires and
+///   aborts. Real hazard on VM shutdown when a dump races shutdown. Fix
+///   belongs in `repository.rs` `Drop` impl — either wait for `consumer_busy`
+///   to clear with a short spin-then-park, or downgrade the assertion to
+///   a `debug_assert!` and log a warning at release.
+///
+/// TODO (round-7 MED #6, dump format change):
+///   Per-event timestamps are written as full 64-bit `start_time_ns` /
+///   `end_time_ns` values. Within a single chunk, ticks are highly
+///   correlated — encoding `start_time` as a delta from `chunk_start_time`
+///   (and `end_time` as a delta from `start_time`) would shrink most
+///   varints from 6-9 bytes to 1-2 bytes. Estimated 30-40% reduction in
+///   dump size on event-heavy traces.
+///   Wire format change: bump `JFR_VERSION_MINOR` to 1 and gate decode in
+///   `read_events` on the minor version. Writer must emit
+///   `chunk_start_time` (= `start_time_ns` of this header) before the first
+///   event record so a forward sweep can resolve deltas. Reader must keep
+///   a running `last_start_time` to decode end-time-relative-to-start
+///   without reseeding per event. Defer to round-8.
 pub fn dump_to_file(
     path: &Path,
     repository: &EventRepository,
@@ -540,6 +571,7 @@ pub fn dump_to_file(
     start_time_ns: u64,
     duration_ns: u64,
     extra_events: Vec<EventInstance>,
+    durable: bool,
 ) -> Result<u64, JfrDumpError> {
     // --- Pre-process caller-supplied extra events ----------------------------
     // Cold path: dump frequency is on the order of seconds (typically at
@@ -672,10 +704,14 @@ pub fn dump_to_file(
             FILE_STATE_COMPLETE,
         )?;
 
-        // Flush buffered writer into the OS file, then fsync to ensure the
-        // bytes (including the rewritten header) are durable before rename.
+        // Flush buffered writer into the OS file. When `durable`, also
+        // fsync to ensure the bytes (including the rewritten header) are
+        // on-disk before rename. The fsync is skipped for periodic
+        // snapshot dumps where best-effort durability is acceptable.
         writer.flush()?;
-        writer.get_ref().sync_all()?;
+        if durable {
+            writer.get_ref().sync_all()?;
+        }
         file_size
     };
 
@@ -1274,7 +1310,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_dump.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 1_000_000, 3_000_000, Vec::new()).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 1_000_000, 3_000_000, Vec::new(), false).unwrap();
         assert!(file_size >= HEADER_SIZE);
 
         // Verify header
@@ -1316,7 +1352,7 @@ mod tests {
         let path = dir.join("test_empty.jfr");
 
         // Empty dump is still valid (just header + checkpoint + metadata)
-        let file_size = dump_to_file(&path, &repo, &reg, 0, 0, Vec::new()).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 0, 0, Vec::new(), false).unwrap();
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.magic, JFR_MAGIC);
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
@@ -1346,7 +1382,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_magic.jfr");
 
-        dump_to_file(&path, &repo, &reg, 100, 100, Vec::new()).unwrap();
+        dump_to_file(&path, &repo, &reg, 100, 100, Vec::new(), false).unwrap();
 
         // Read raw bytes and verify magic
         let data = std::fs::read(&path).unwrap();
@@ -1414,7 +1450,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_fields.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 500, 300, Vec::new()).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 500, 300, Vec::new(), false).unwrap();
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
@@ -1445,7 +1481,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_many.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 0, 500_000, Vec::new()).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 0, 500_000, Vec::new(), false).unwrap();
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
@@ -1476,7 +1512,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_layout.jfr");
 
-        dump_to_file(&path, &repo, &reg, 100, 100, Vec::new()).unwrap();
+        dump_to_file(&path, &repo, &reg, 100, 100, Vec::new(), false).unwrap();
         let header = read_jfr_header(&path).unwrap();
 
         // The checkpoint should sit right at HEADER_SIZE.
@@ -1600,7 +1636,7 @@ mod tests {
         // Drain the global ring and hand the events to the writer — this is
         // the contract that `FlightRecorder::dump_recording` now follows.
         let drained = global_ring_registry().drain_all();
-        let _file_size = dump_to_file(&path, &repo, &reg, 0, 0, drained).unwrap();
+        let _file_size = dump_to_file(&path, &repo, &reg, 0, 0, drained, false).unwrap();
 
         // Header should be valid
         let header = read_jfr_header(&path).unwrap();
@@ -1624,7 +1660,7 @@ mod tests {
         // A second dump with no extra events should not re-emit them.
         let path2 = dir.join("drain_rings_second.jfr");
         let repo2 = EventRepository::new(100);
-        dump_to_file(&path2, &repo2, &reg, 0, 0, Vec::new()).unwrap();
+        dump_to_file(&path2, &repo2, &reg, 0, 0, Vec::new(), false).unwrap();
         let events2 = read_events(&path2, &reg).unwrap();
         for &expected_start in &pushed_starts {
             let still_there = events2.iter().any(|e|
@@ -1672,7 +1708,7 @@ mod tests {
         let path = dir.join("sort_drained.jfr");
         // Drain the pushed events and pass them in — see Bug 1 fix.
         let drained = global_ring_registry().drain_all();
-        dump_to_file(&path, &repo, &reg, 0, 0, drained).unwrap();
+        dump_to_file(&path, &repo, &reg, 0, 0, drained, false).unwrap();
 
         let events = read_events(&path, &reg).unwrap();
         // Pull out just the ones we pushed (by tag prefix) and check they are
@@ -1732,7 +1768,7 @@ mod tests {
             dump_repo.push(event.clone());
         }
 
-        let file_size = dump_to_file(&path, &dump_repo, &fr.type_registry, start_time, duration, Vec::new()).unwrap();
+        let file_size = dump_to_file(&path, &dump_repo, &fr.type_registry, start_time, duration, Vec::new(), false).unwrap();
         let header = read_jfr_header(&path).unwrap();
 
         assert_eq!(header.magic, JFR_MAGIC);

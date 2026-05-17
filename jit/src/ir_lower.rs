@@ -479,6 +479,39 @@ impl<'a> Lowerer<'a> {
 // ── Public entry point ───────────────────────────────────────────────
 
 /// Lower the scheduled IR graph to x86-64 machine code.
+///
+/// TODO(round-8, HIGH from round-7 jit #9): no Loop-Invariant Code
+/// Motion (LICM) for `Op::LoadField` / `Op::LoadStatic` on a
+/// loop-invariant base. A loop like
+///
+///   for (int i = 0; i < n; i++) {
+///       sum += this.scale * arr[i];   // getfield `this.scale` every iter
+///   }
+///
+/// reloads `this.scale` on every iteration even though `this` is
+/// loop-invariant and `scale` is effectively final. The IR currently
+/// schedules the load inside the loop body; the lowerer faithfully
+/// emits one load per iteration.
+///
+/// Desired round-8 behavior (implemented in `ir_optimize.rs` so this
+/// lowerer sees a pre-hoisted graph):
+///   1. After GVN, detect loops via a CFG back-edge scan.
+///   2. Mark every `Op::Const`, `Op::Param`, and pure node whose
+///      inputs are loop-invariant as loop-invariant.
+///   3. Identify `Op::LoadField` / `Op::LoadStatic` where the base is
+///      loop-invariant, the field is final, and no
+///      `Op::StoreField` / `Op::StaticBarrier` in the loop body could
+///      alias.
+///   4. Move each such load to the loop pre-header block; rewrite
+///      in-loop uses to the hoisted SSA value.
+///
+/// Estimated impact on JDK-shape workloads: 5-15% on getfield-heavy
+/// inner loops; getstatic-of-final sees the largest wins because
+/// alias-checking the load is trivial.
+///
+/// Deferred from this wave because the loop-detection pass and
+/// alias-analysis lattice deserve their own session with dedicated
+/// unit tests.
 pub fn lower(
     graph: &Graph,
     schedule: &Schedule,

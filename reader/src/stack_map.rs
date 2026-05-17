@@ -143,21 +143,39 @@ impl StackMapTable {
     /// The first frame's absolute offset is `offset_delta`. Each subsequent
     /// frame's absolute offset is `previous_absolute + offset_delta + 1`.
     /// (The `+1` accounts for the implicit increment per JVM spec.)
-    pub fn absolute_offsets(&self) -> Vec<u16> {
+    ///
+    /// Round 7 audit fix (MED #8 / round-4 #6): the accumulation is
+    /// performed in `u32` arithmetic so a malformed StackMapTable whose
+    /// running absolute offset overshoots `u16::MAX` (65 535) is
+    /// detected as `InvalidClassData` instead of silently wrapping. The
+    /// JVM spec caps bytecode at 65 535 bytes (Code attribute uses a
+    /// `u4` length, but branch targets are `u2`), so any frame offset
+    /// > `u16::MAX` indicates a corrupt or maliciously-crafted class
+    /// file. Each absolute offset is bounded-checked before being
+    /// downcast back to `u16` for the returned vec, preserving the
+    /// caller-visible type.
+    pub fn absolute_offsets(&self) -> Result<Vec<u16>, ClassReaderError> {
         let mut offsets = Vec::with_capacity(self.entries.len());
-        let mut prev: Option<u16> = None;
+        let mut prev: Option<u32> = None;
 
-        for entry in &self.entries {
-            let delta = frame_offset_delta(entry);
-            let absolute = match prev {
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let delta = frame_offset_delta(entry) as u32;
+            let absolute: u32 = match prev {
                 None => delta,
                 Some(p) => p + delta + 1,
             };
-            offsets.push(absolute);
+            if absolute > u16::MAX as u32 {
+                return Err(ClassReaderError::InvalidClassData {
+                    message: format!(
+                        "StackMapTable: absolute offset {absolute} at frame {idx} exceeds u16::MAX (65535) — corrupt class file",
+                    ),
+                });
+            }
+            offsets.push(absolute as u16);
             prev = Some(absolute);
         }
 
-        offsets
+        Ok(offsets)
     }
 }
 
@@ -621,7 +639,7 @@ mod tests {
         let table = StackMapTable {
             entries: vec![StackMapFrame::SameFrame { offset_delta: 10 }],
         };
-        assert_eq!(table.absolute_offsets(), vec![10]);
+        assert_eq!(table.absolute_offsets().unwrap(), vec![10]);
     }
 
     #[test]
@@ -639,13 +657,13 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(table.absolute_offsets(), vec![10, 31, 37]);
+        assert_eq!(table.absolute_offsets().unwrap(), vec![10, 31, 37]);
     }
 
     #[test]
     fn absolute_offsets_empty() {
         let table = StackMapTable { entries: vec![] };
-        assert_eq!(table.absolute_offsets(), Vec::<u16>::new());
+        assert_eq!(table.absolute_offsets().unwrap(), Vec::<u16>::new());
     }
 
     // --- Edge cases ---

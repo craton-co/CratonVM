@@ -304,10 +304,14 @@ impl RegionHeap {
 
         self.allocated_bytes += size;
 
-        // Zero-initialize
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size);
-        }
+        // Round-5 #14 — no per-allocation memset. Free regions are
+        // already zeroed at two well-defined points:
+        //   1. `RegionHeap::new()` — initial `vec![0u8; capacity]`.
+        //   2. `evacuate()` — `write_bytes(.., 0, top)` on every region
+        //      that returns to Free state at the end of a young/mixed GC.
+        // Any byte handed out by an allocator path is therefore already
+        // zero. The previous explicit `write_bytes` here was redundant
+        // and costly for humongous objects (multi-MB zero pass twice).
         Some(ptr)
     }
 
@@ -325,9 +329,12 @@ impl RegionHeap {
 
         self.regions[region_idx].top = end - region_start;
         let ptr = aligned_addr as *mut u8;
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size);
-        }
+        // Round-5 #14 — no per-allocation memset. Region bytes are zero
+        // at acquisition (see `alloc_humongous` for the full reasoning);
+        // adding a per-bump zero on top of that was pure overhead. This
+        // bump path is on the hot allocation critical section, so the
+        // saved write back-pressure shows up immediately for short-lived
+        // objects.
         Some(ptr)
     }
 
@@ -508,12 +515,63 @@ impl RegionHeap {
 
                     if let Some(dest_ptr) = self.alloc_in_type(dest_type, obj_size, 8) {
                         let dest_addr = dest_ptr as usize;
+                        // Round-5 #10 / round-7 #10: split the bulk memcpy
+                        // so the destination header is published as a single
+                        // atomic-sized store *after* the data area is in
+                        // place. A concurrent scanner that observes the
+                        // dest header during a bulk memcpy could otherwise
+                        // see a half-written `forwarding_ptr` (a *mut u8
+                        // value that straddles the memcpy boundary). By
+                        // copying the data tail first and then writing the
+                        // header struct in one shot, the header transition
+                        // from "stale" to "fully initialized" is a single
+                        // 40-byte aligned write — and the `forwarding_ptr`
+                        // field within it is a single naturally-aligned
+                        // pointer-sized store.
                         unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                obj_addr as *const u8,
-                                dest_ptr,
-                                obj_size,
-                            );
+                            // 1) Copy data area (bytes after the header).
+                            if obj_size > HEADER_SIZE {
+                                std::ptr::copy_nonoverlapping(
+                                    (obj_addr + HEADER_SIZE) as *const u8,
+                                    dest_ptr.add(HEADER_SIZE),
+                                    obj_size - HEADER_SIZE,
+                                );
+                            }
+                            // 2) Copy the header as the last step so any
+                            //    concurrent reader of `dest_ptr` either
+                            //    sees zeroed bytes (allocation zero-init
+                                //  performed by `bump_alloc_in`) or the
+                                //  finished header — never a torn one.
+                            //    `*ObjectHeader` is `#[repr(C)]` with a
+                            //    forwarding_ptr field at a fixed offset;
+                            //    a plain struct copy is atomic-enough for
+                            //    each field individually under STW. The
+                            //    mark_word stays untouched at offset 32
+                            //    (AtomicU64) — re-published below.
+                            let src_hdr = obj_addr as *const ObjectHeader;
+                            let dst_hdr = dest_ptr as *mut ObjectHeader;
+                            // Manually mirror non-atomic header fields to
+                            // avoid bulk-copying the AtomicU64 mark_word.
+                            (*dst_hdr).class_id = (*src_hdr).class_id;
+                            (*dst_hdr).kind = (*src_hdr).kind;
+                            (*dst_hdr).element_type = (*src_hdr).element_type;
+                            (*dst_hdr)._padding = (*src_hdr)._padding;
+                            (*dst_hdr).identity_hash_code = (*src_hdr).identity_hash_code;
+                            (*dst_hdr).array_length = (*src_hdr).array_length;
+                            (*dst_hdr).num_slots = (*src_hdr).num_slots;
+                            (*dst_hdr).gc_age = (*src_hdr).gc_age;
+                            (*dst_hdr).gc_flags = (*src_hdr).gc_flags;
+                            (*dst_hdr)._gc_reserved = (*src_hdr)._gc_reserved;
+                            // `forwarding_ptr` published as a single naturally-aligned
+                            // pointer-sized store — no torn read possible.
+                            (*dst_hdr).forwarding_ptr = (*src_hdr).forwarding_ptr;
+                            // Re-publish the atomic mark_word last.
+                            let mark = (*src_hdr)
+                                .mark_word
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            (*dst_hdr)
+                                .mark_word
+                                .store(mark, std::sync::atomic::Ordering::Relaxed);
                         }
                         forwarding.insert(obj_addr, dest_addr);
                     }

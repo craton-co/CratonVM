@@ -21,6 +21,39 @@ use crate::class::ClassLoaderId;
 use crate::class_path::ClassPath;
 use rustjvm_types::error::ClassFileError;
 
+/// Round 5 audit fix (LOW #11) / Round 7 carry-over: the built-in
+/// loader hierarchy is fixed at process start
+/// (`Bootstrap → Extension → Application`). On every class-load miss
+/// the previous implementation walked the chain via trait dispatch
+/// (`bootstrap.find_class_bytes` → `extension.find_class_bytes` →
+/// `application.find_class_bytes`), which on a deep miss is 3 vtable
+/// calls + 3 inner `ClassPath::find_class` probes. Flattening into a
+/// pre-computed `&[ClassLoaderId]` lets callers walk a slice instead
+/// of chasing pointers through a parent chain.
+///
+/// For the built-in loaders this is purely a code-clarity win — the
+/// `find_class_bytes_delegated` path in `class_manager.rs` is already
+/// flat (4 sequential `if let Ok(...)` arms). User-defined loaders
+/// (`ClassLoaderId::UserDefined`) have their parent chains modelled
+/// on the **Java side** (the `parent` field of `java.lang.ClassLoader`)
+/// — the Rust side never observes a deep parent walk for those
+/// because `ClassLoader.loadClass` is implemented in Java and the
+/// native code only sees the bottom-most `defineClass` invocation.
+///
+/// Returned in delegation order: callers should probe each loader in
+/// order and return the first hit (standard parent-delegation model).
+pub const BUILTIN_LOADER_DELEGATION_CHAIN: &[ClassLoaderId] = &[
+    ClassLoaderId::Bootstrap,
+    ClassLoaderId::Extension,
+    ClassLoaderId::Application,
+];
+
+/// Round 5 audit fix (LOW #11): the maximum parent-chain depth the
+/// VM's built-in loader hierarchy ever walks. Used by callers that
+/// pre-size scratch buffers (`SmallVec<[ClassLoaderId; 4]>`) for the
+/// flat walk.
+pub const MAX_BUILTIN_LOADER_DEPTH: usize = 3;
+
 /// Trait for class loaders that can locate class bytecode.
 ///
 /// This trait is deliberately simpler than `java.lang.ClassLoader`: it only
@@ -181,5 +214,22 @@ mod tests {
     fn empty_loader_finds_nothing() {
         let loader = BootstrapClassFinder::new(&[]);
         assert!(loader.find_class_bytes("java/lang/Object").is_err());
+    }
+
+    /// Round 5 audit fix (LOW #11): the delegation chain is the
+    /// canonical parent-delegation order; callers (the class-manager
+    /// `find_class_bytes_delegated` path) walk this slice instead of
+    /// chasing trait-object parent pointers.
+    #[test]
+    fn delegation_chain_is_bootstrap_extension_application() {
+        assert_eq!(
+            BUILTIN_LOADER_DELEGATION_CHAIN,
+            &[
+                ClassLoaderId::Bootstrap,
+                ClassLoaderId::Extension,
+                ClassLoaderId::Application,
+            ]
+        );
+        assert_eq!(BUILTIN_LOADER_DELEGATION_CHAIN.len(), MAX_BUILTIN_LOADER_DEPTH);
     }
 }

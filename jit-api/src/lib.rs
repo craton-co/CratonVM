@@ -68,6 +68,20 @@ pub struct JitRuntimeHelpers {
     pub invoke_dispatch: usize,
     pub invoke_virtual_mic: usize,
     pub write_barrier: usize,
+    /// Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
+    ///
+    /// Logs the *old* reference value before a reference store, so the
+    /// concurrent marker maintains the snapshot-at-the-beginning invariant.
+    /// Without this, JIT-compiled `aastore`/`putfield`/`putstatic`
+    /// overwriting a still-live reference during concurrent marking would
+    /// drop the only path to the overwritten target → missed mark →
+    /// use-after-free on the next mixed evacuation.
+    ///
+    /// Signature: `extern "C" fn(vm_ptr: i64, old_ref: i64)`.
+    /// The helper short-circuits cheaply (single Acquire load) when
+    /// `SatbQueue::is_active() == false`, which is the steady-state when
+    /// no concurrent mark cycle is in flight.
+    pub satb_pre_write_barrier: usize,
     /// Uncommon trap handler: called from JIT code when a speculative
     /// optimization fails (wrong receiver type, unreached branch, etc.).
     /// Signature: extern "C" fn(vm_ptr: i64, reason: i64, bci: i64) -> i64
@@ -124,6 +138,17 @@ pub struct JitRuntimeHelpers {
 }
 
 impl JitRuntimeHelpers {
+    /// Number of fields included in the bulk-validation arrays
+    /// (`all_pointers` / `field_names`).
+    ///
+    /// Round-7 fix: previously the two parallel arrays each hard-coded
+    /// `[T; 33]`. If a new function-pointer field were added but only
+    /// one array updated, the parallel-array invariant would silently
+    /// drift. Now both arrays use this constant and the constructors
+    /// `debug_assert_eq!` their populated length to it, so a missing
+    /// update trips loudly in debug builds.
+    pub const NUM_FIELDS: usize = 33;
+
     /// Validate that all function pointers are non-null and properly aligned.
     ///
     /// Function pointers should be non-zero (null function pointers are invalid)
@@ -155,8 +180,8 @@ impl JitRuntimeHelpers {
     }
 
     /// Collect all pointer values into an array for bulk validation.
-    fn all_pointers(&self) -> [usize; 32] {
-        [
+    fn all_pointers(&self) -> [usize; Self::NUM_FIELDS] {
+        let arr = [
             self.newarray,
             self.new_object,
             self.anewarray_object,
@@ -186,14 +211,22 @@ impl JitRuntimeHelpers {
             self.invoke_dispatch,
             self.invoke_virtual_mic,
             self.write_barrier,
+            self.satb_pre_write_barrier,
             self.uncommon_trap,
             self.math_fma_double,
             self.math_fma_float,
-        ]
+        ];
+        // Round-7 parallel-array guard: if `NUM_FIELDS` is updated but
+        // this literal isn't (or vice versa), the array-size mismatch
+        // is a compile error — `[usize; NUM_FIELDS]` won't accept a
+        // literal of the wrong length. The redundant `debug_assert_eq!`
+        // below documents intent for callers reading the source.
+        debug_assert_eq!(arr.len(), Self::NUM_FIELDS);
+        arr
     }
 
-    fn field_names() -> [&'static str; 32] {
-        [
+    fn field_names() -> [&'static str; Self::NUM_FIELDS] {
+        let arr = [
             "newarray",
             "new_object",
             "anewarray_object",
@@ -223,10 +256,13 @@ impl JitRuntimeHelpers {
             "invoke_dispatch",
             "invoke_virtual_mic",
             "write_barrier",
+            "satb_pre_write_barrier",
             "uncommon_trap",
             "math_fma_double",
             "math_fma_float",
-        ]
+        ];
+        debug_assert_eq!(arr.len(), Self::NUM_FIELDS);
+        arr
     }
 }
 
@@ -292,6 +328,7 @@ mod tests {
             invoke_dispatch: 0x10D0,
             invoke_virtual_mic: 0x10D8,
             write_barrier: 0x10E0,
+            satb_pre_write_barrier: 0x1110,
             uncommon_trap: 0x10E8,
             math_fma_double: 0x10F0,
             math_fma_float: 0x10F8,
@@ -440,13 +477,14 @@ mod tests {
             h.putstatic_double, h.putstatic_object,
             h.checkcast, h.instanceof_check, h.throw_aioobe,
             h.invoke_dispatch, h.invoke_virtual_mic, h.write_barrier,
+            h.satb_pre_write_barrier,
         ];
         // All addresses should be unique
         let mut set = std::collections::HashSet::new();
         for p in &ptrs {
             assert!(set.insert(p), "Duplicate pointer value: {:#x}", p);
         }
-        assert_eq!(set.len(), 29);
+        assert_eq!(set.len(), 30);
     }
 
     #[test]
@@ -481,6 +519,7 @@ mod tests {
             invoke_dispatch: 0,
             invoke_virtual_mic: 0,
             write_barrier: 0,
+            satb_pre_write_barrier: 0,
             uncommon_trap: 0,
             math_fma_double: 0,
             math_fma_float: 0,
