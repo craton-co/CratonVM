@@ -11,10 +11,10 @@ categories.workspace = true
 
 [dependencies]
 rustjvm-types = { path = "../types" }
-parking_lot = "0.12"
+parking_lot.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 native-tls = "0.2"
-rustc-hash = "1.1"
+rustc-hash.workspace = true
 
 [lints]
 workspace = true

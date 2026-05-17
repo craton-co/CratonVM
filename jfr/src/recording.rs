@@ -164,6 +164,26 @@ impl Recording {
             || self.settings.enabled_events.contains(&type_id)
     }
 
+    /// Round-9 CRIT-3 helper: full filter check (state + enabled + threshold)
+    /// used by `drain_per_thread_into_repository` to decide whether to clone
+    /// an event for this recording. Mirrors the inline checks at the top of
+    /// `record_event` / `record_event_arc`.
+    pub fn passes_filter(&self, event: &EventInstance) -> bool {
+        if self.state != RecordingState::Running {
+            return false;
+        }
+        if !self.is_event_enabled(event.type_id) {
+            return false;
+        }
+        if let Some(&threshold) = self.settings.event_thresholds.get(&event.type_id) {
+            let duration_ns = event.end_time.saturating_sub(event.start_time);
+            if duration_ns < threshold.as_nanos() as u64 {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn event_count(&self) -> usize {
         self.repository.len()
     }
@@ -306,6 +326,8 @@ impl FlightRecorder {
 
         if running_len == 1 {
             // Single recording — move each event in directly, no Arc.
+            // `record_event` applies the per-recording enabled_events and
+            // threshold filters; no fan-out routing needed.
             let id = self.running_ids[0];
             if let Some(rec) = self.recordings.get_mut(&id) {
                 for ev in drained {
@@ -313,29 +335,45 @@ impl FlightRecorder {
                 }
             }
         } else {
-            // Multiple recordings — share each event via Arc. Round-5 HIGH-fix
-            // (Bug 3, 2026-05-17): for the last recipient, drop the
-            // producer's own Arc *before* calling `record_event_arc`, so
-            // the recipient observes `strong_count == 1` and takes ownership
-            // via `Arc::into_inner` without cloning the inner `EventInstance`.
-            // Intermediate recipients must clone (the repository owns by
-            // value, and the next iteration still needs an Arc).
-            let ids: Vec<u64> = self.running_ids.clone();
-            for ev in drained {
-                let arc_event = Arc::new(ev);
-                if let Some((&last_id, prefix_ids)) = ids.split_last() {
-                    for &id in prefix_ids {
-                        if let Some(rec) = self.recordings.get_mut(&id) {
-                            rec.record_event_arc(Arc::clone(&arc_event));
+            // Round-9 CRIT-3 fix (2026-05-17): route events per-recording
+            // with the per-recording filter applied *during* the drain pass.
+            // Previously the fan-out Arc-cloned every event for every
+            // recording, then each recording's `record_event_arc` filtered
+            // and dropped — wasting Arc clones for events that no recording
+            // wanted, and (more importantly) making it impossible to give
+            // ownership of a uniquely-routed event to its sole recipient
+            // without an extra clone.
+            //
+            // New shape: outer loop over recordings, inner loop over events.
+            // Each recording's `passes_filter` check (cheap — hashset lookup
+            // + threshold compare) gates the per-event clone. The last
+            // recording moves events out of `drained` rather than cloning,
+            // matching the previous "move into final recipient" optimization.
+            //
+            // Round-9 MED-7 fix (2026-05-17): iterate `&self.running_ids`
+            // instead of cloning a fresh `Vec<u64>` every pass. Split the
+            // borrow into local refs so the `&self.running_ids` iterator
+            // does not conflict with `&mut self.recordings.get_mut`.
+            let recordings = &mut self.recordings;
+            let running_ids = &self.running_ids;
+            let n = running_ids.len();
+            // Fan out to all but the last recording with clones gated by the
+            // recording's enabled_events + threshold filter.
+            for &id in &running_ids[..n - 1] {
+                if let Some(rec) = recordings.get_mut(&id) {
+                    for ev in drained.iter() {
+                        if rec.passes_filter(ev) {
+                            rec.record_event(ev.clone());
                         }
                     }
-                    // Move the original Arc into the final call — this
-                    // releases the producer's ref before the recipient
-                    // inspects the refcount, enabling the zero-clone
-                    // `Arc::into_inner` fast path.
-                    if let Some(rec) = self.recordings.get_mut(&last_id) {
-                        rec.record_event_arc(arc_event);
-                    }
+                }
+            }
+            // Final recipient takes ownership of the drained Vec — events
+            // that pass the filter are moved in; the rest drop in place.
+            let last_id = running_ids[n - 1];
+            if let Some(rec) = recordings.get_mut(&last_id) {
+                for ev in drained {
+                    rec.record_event(ev);
                 }
             }
         }

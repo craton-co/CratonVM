@@ -2263,17 +2263,87 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> ru
 }
 
 
-// Per-OS-thread cache of boxed `Integer` instances for the JLS-mandated
-// small-value range (-128..=127). Mirrors the round-6 ThreadLocal pattern:
-// `ObjectRef` is `!Send` so we cannot share globally without locks, but
-// since GC roots are walked per-thread the cached refs stay live and
-// identity equality holds within a thread (which is all `Integer.valueOf`
-// must guarantee — see JLS 5.1.7).
-std::thread_local! {
-    static INTEGER_CACHE: std::cell::RefCell<[Option<rustjvm_types::ObjectRef>; 256]> =
-        const { std::cell::RefCell::new([None; 256]) };
-    static BOOLEAN_CACHE: std::cell::Cell<[Option<rustjvm_types::ObjectRef>; 2]> =
-        const { std::cell::Cell::new([None; 2]) };
+// Round-9 CRIT GC-correctness fix: BOOLEAN_CACHE and INTEGER_CACHE must
+// live process-global, NOT thread-local. Two reasons:
+//   (1) JLS § 5.1.7 requires `Boolean.TRUE == Boolean.TRUE` and
+//       `Integer.valueOf(n) == Integer.valueOf(n)` for n in [-128,127]
+//       across ALL threads (the boxing conversion produces one canonical
+//       cached instance per primitive value). A thread-local cache makes
+//       these identity comparisons fail when the two operands come from
+//       different threads.
+//   (2) Under a moving GC, thread-local ObjectRefs that are *not* scanned
+//       as roots on every thread point at stale (collected or relocated)
+//       addresses. We now (a) hold the cache process-wide and (b) wire
+//       `gc_scan_value_of_cache_roots` / `gc_update_value_of_cache_refs`
+//       into `vm/src/memory/{roots.rs,gc.rs}` so the cached entries are
+//       both kept live and re-pointed after compaction.
+static INTEGER_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 256]>,
+> = std::sync::OnceLock::new();
+
+fn integer_cache() -> &'static parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 256]> {
+    INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 256]))
+}
+
+static BOOLEAN_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 2]>,
+> = std::sync::OnceLock::new();
+
+fn boolean_cache() -> &'static parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 2]> {
+    BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 2]))
+}
+
+/// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
+/// Reports every cached Integer/Boolean ObjectRef so the GC keeps it live.
+pub fn gc_scan_value_of_cache_roots(out: &mut Vec<rustjvm_types::ObjectRef>) {
+    {
+        let cache = integer_cache().lock();
+        for slot in cache.iter() {
+            if let Some(o) = slot {
+                out.push(*o);
+            }
+        }
+    }
+    {
+        let cache = boolean_cache().lock();
+        for slot in cache.iter() {
+            if let Some(o) = slot {
+                out.push(*o);
+            }
+        }
+    }
+}
+
+/// GC post-compaction hook — called from `vm/src/memory/gc.rs::update_all_roots`.
+/// Remaps every cached entry through the GC's pointer map.
+pub fn gc_update_value_of_cache_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    {
+        let mut cache = integer_cache().lock();
+        for slot in cache.iter_mut() {
+            if let Some(obj_ref) = slot {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { rustjvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+    {
+        let mut cache = boolean_cache().lock();
+        for slot in cache.iter_mut() {
+            if let Some(obj_ref) = slot {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { rustjvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2283,12 +2353,21 @@ pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value
     };
     if (-128..=127).contains(&val) {
         let idx = (val + 128) as usize;
-        if let Some(cached) = INTEGER_CACHE.with(|c| c.borrow()[idx]) {
+        // Fast path: lock, read, drop lock before any heap allocation.
+        if let Some(cached) = { let c = integer_cache().lock(); c[idx] } {
             return Ok(Some(Value::Object(Some(cached))));
         }
         let obj = alloc_wrapper(ctx, "java/lang/Integer");
         ctx.set_field(obj, 0, Value::Int(val));
-        INTEGER_CACHE.with(|c| c.borrow_mut()[idx] = Some(obj));
+        // Re-check under the lock — another thread may have populated the
+        // slot while we were allocating. If so, drop ours and return theirs
+        // (the loser allocation is collectible — but the race is rare and
+        // it preserves the JLS identity invariant).
+        let mut cache = integer_cache().lock();
+        if let Some(existing) = cache[idx] {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        cache[idx] = Some(obj);
         return Ok(Some(Value::Object(Some(obj))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Integer");
@@ -2587,21 +2666,22 @@ pub(crate) fn native_boolean_value_of(ctx: &mut dyn NativeContext, args: &[Value
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    // `Boolean.valueOf(z)` returns one of two cached instances (TRUE/FALSE)
-    // per JLS contract. Cache per OS thread (ObjectRef is !Send); identity
-    // equality holds for the only two values that exist.
+    // Round-9 CRIT fix: `Boolean.valueOf(z)` must return the same canonical
+    // TRUE/FALSE instance across ALL threads (JLS § 5.1.7). A thread-local
+    // cache produced two distinct ObjectRefs for `Boolean.TRUE` on two
+    // threads, breaking `==` identity. Now process-global under a lock.
     let idx = if val != 0 { 1 } else { 0 };
-    let cached = BOOLEAN_CACHE.with(|c| c.get()[idx]);
-    if let Some(o) = cached {
+    if let Some(o) = { let c = boolean_cache().lock(); c[idx] } {
         return Ok(Some(Value::Object(Some(o))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Boolean");
     ctx.set_field(obj, 0, Value::Int(if val != 0 { 1 } else { 0 }));
-    BOOLEAN_CACHE.with(|c| {
-        let mut arr = c.get();
-        arr[idx] = Some(obj);
-        c.set(arr);
-    });
+    // Re-check under the lock — another thread may have raced us.
+    let mut cache = boolean_cache().lock();
+    if let Some(existing) = cache[idx] {
+        return Ok(Some(Value::Object(Some(existing))));
+    }
+    cache[idx] = Some(obj);
     Ok(Some(Value::Object(Some(obj))))
 }
 

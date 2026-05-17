@@ -471,6 +471,43 @@ impl G1Collector {
             }
         }
 
+        // CRIT (round-9 gc CRIT-1): install a `HumongousFiller` sentinel
+        // header at the START of every continuation region. The previous
+        // round-5 fix only zeroed the continuation bytes, but a zero
+        // header still decodes as a well-formed `Object` (class_id=0,
+        // kind=Object=0, num_slots=0). A heap walker iterating with the
+        // generic per-object size formula treats the zeroed bytes as a
+        // 40-byte object and the next 40 bytes as another, and so on,
+        // following any garbage that survives at later offsets.
+        //
+        // The filler is a single sentinel header (HEADER_SIZE bytes) that
+        // walkers detect via `is_humongous_filler()` and use to break out
+        // of the per-region iteration. No oops are scanned and the
+        // continuation region is effectively dark to the walker.
+        //
+        // The first region (start) is the HumongousStart and contains the
+        // actual application object header at offset 0 — leave it alone.
+        for i in 1..regions_needed {
+            let n = regions[start + i].cursor;
+            if n >= HEADER_SIZE {
+                let p = regions[start + i].base_ptr_mut();
+                // SAFETY: continuation region's first HEADER_SIZE bytes are
+                // owned by this allocation and were just zeroed; writing a
+                // sentinel ObjectHeader here is well-defined.
+                let filler = ObjectHeader::new(
+                    ClassId::new(0),
+                    ObjectKind::HumongousFiller,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                    0,
+                );
+                unsafe {
+                    std::ptr::write(p as *mut ObjectHeader, filler);
+                }
+            }
+        }
+
         let ptr = regions[start].base_ptr_mut();
         Some((ptr, start))
     }
@@ -1185,6 +1222,11 @@ impl G1Collector {
         while offset < cursor {
             let obj_ptr = unsafe { base.add(offset) };
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Round-9 gc CRIT-1: humongous continuation filler covers the
+            // entire region; skip without trying to follow any oops.
+            if is_humongous_filler(header) {
+                break;
+            }
             let obj_size = object_total_size(header);
             if obj_size < HEADER_SIZE || offset + obj_size > cursor {
                 break;
@@ -1278,6 +1320,11 @@ impl G1Collector {
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                // Round-9 gc CRIT-1: humongous continuation filler covers
+                // the entire region; skip the rest.
+                if is_humongous_filler(header) {
+                    break;
+                }
                 let obj_size = object_total_size(header);
 
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
@@ -1583,6 +1630,11 @@ impl G1Collector {
             while offset < region.cursor {
                 let obj_addr = base + offset;
                 let header = unsafe { &*(obj_addr as *const ObjectHeader) };
+                // Round-9 gc CRIT-1: humongous continuation filler covers
+                // the entire region with no live objects of its own; skip.
+                if is_humongous_filler(header) {
+                    break;
+                }
                 let obj_size = object_total_size(header);
 
                 if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
@@ -2050,6 +2102,10 @@ impl G1Collector {
         let header = unsafe { &*(raw as *const ObjectHeader) };
         match header.kind {
             ObjectKind::Object | ObjectKind::Array => {}
+            // Round-9 gc CRIT-1: humongous-continuation filler is a
+            // walker sentinel, not a heap object. Reject so root scans
+            // can't accidentally "validate" the address of a filler.
+            ObjectKind::HumongousFiller => return None,
         }
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
         if header.num_slots > MAX_PLAUSIBLE_SLOTS {
@@ -2116,6 +2172,11 @@ impl G1Collector {
             while offset < used {
                 let ptr = (base + offset) as *mut u8;
                 let header = unsafe { &*(ptr as *const ObjectHeader) };
+                // Round-9 gc CRIT-1: HumongousFiller is a walker sentinel;
+                // never report it as a real object.
+                if is_humongous_filler(header) {
+                    break;
+                }
                 let total_size = if header.kind == ObjectKind::Array {
                     HEADER_SIZE
                         + array_data_size(header.array_length as usize, header.element_type)
@@ -2436,6 +2497,15 @@ fn object_total_size(header: &ObjectHeader) -> usize {
     } else {
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }
+}
+
+/// Round-9 gc CRIT-1: returns true if this header marks the start of a
+/// humongous continuation filler region. Walkers MUST check this before
+/// computing a per-object size — the filler covers the whole region
+/// regardless of the (synthetic) per-field values stored in the header.
+#[inline]
+fn is_humongous_filler(header: &ObjectHeader) -> bool {
+    matches!(header.kind, ObjectKind::HumongousFiller)
 }
 
 /// Update reference fields in an object using the forwarding map.

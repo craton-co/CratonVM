@@ -25,8 +25,13 @@ use tracing::info;
 const DEFAULT_WATCHDOG_SEC: u64 = 120;
 /// Grace period in seconds after the watchdog fires before SIGKILL.
 const WATCHDOG_GRACE_SEC: u64 = 3;
-/// Default Java thread stack size in bytes (64 MiB).
-const DEFAULT_JAVA_STACK_SIZE: usize = 64 * 1024 * 1024;
+// Round-9 cross-cutting MED-6 fix (audit `round9-cross-cutting.md`): the
+// `DEFAULT_JAVA_STACK_SIZE` constant that used to live here was dead code
+// — the real default (and the only knob consulted by the spawn path) is
+// in `vm/src/vm/vm_exec.rs` at the `child_stack_size` calculation, which
+// honours `RUST_MIN_STACK` and defaults independently. Keeping a duplicate
+// const here was a maintenance hazard (two sources of truth) so it was
+// removed; document the real owner above instead.
 /// Maximum depth of `Throwable.getCause()` chain we render before
 /// stopping (defensive against malicious or pathological cycles).
 ///

@@ -17,9 +17,9 @@ rustjvm-types = { path = "../types" }
 rustjvm-native-api = { path = "../native-api" }
 # Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
 tracing = { version = "0.1", features = ["release_max_level_info"] }
-parking_lot = "0.12"
+parking_lot.workspace = true
 bitflags = "2"
-rustc-hash = "1.1"
+rustc-hash.workspace = true
 # fontdue is pure Rust — used by the X11 and Cocoa backends for glyph
 # rasterization. Declared at the top level so it is available on all
 # target platforms that need it (Linux, macOS). The Windows backend uses

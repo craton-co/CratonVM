@@ -18,7 +18,7 @@ synthetic-jdk = []
 [dependencies]
 rustjvm-types = { path = "../types" }
 rustjvm-native-api = { path = "../native-api" }
-parking_lot = "0.12"
+parking_lot.workspace = true
 # Round-8 cross-cutting Bug 3: pin `zip` to the workspace entry so this
 # crate and any future workspace consumer share one resolution. See the
 # workspace-deps comment for the pending `native-builtins` migration off
@@ -32,7 +32,7 @@ notify = { version = "6", default-features = false, features = ["macos_kqueue"] 
 # warrants SipHash; FxHashMap removes the per-op hash overhead on the hot
 # allocate/free and getIntOption0/setIntOption0 paths. Matches the migration
 # already done in native-api (`fd_table`, `ffi`, `native_ring`, `registry`).
-rustc-hash = "1.1"
+rustc-hash.workspace = true
 
 # WP3.1 — real platform-backed Selector. Linux uses epoll via libc; Windows
 # uses WSAPoll via raw `#[link(name = "Ws2_32")]` FFI (same approach as

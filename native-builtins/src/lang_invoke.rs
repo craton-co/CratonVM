@@ -57,7 +57,7 @@ const NAME_INVOKE: &str = "invoke";
 /// argument shape at the call site: for an array-element access the layout is
 /// always `[vh, array_object, index, ...]`. When args[1] is an array object
 /// and args[2] is an Int, treat the call as array-element access.
-fn vh_array_call(ctx: &dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, usize)> {
+fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, usize)> {
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return None,
@@ -75,8 +75,8 @@ fn vh_array_call(ctx: &dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, 
 /// Read the VH_FIELD_DESC string from a VarHandle object. Prefers the
 /// WP4.2 side table (see vh_meta_table comment) and falls back to the
 /// raw object slot for VarHandles allocated outside our path.
-fn vh_field_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
-    if let Some(m) = vh_meta_get(vh) {
+fn vh_field_desc(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
+    if let Some(m) = vh_meta_get(ctx, vh) {
         return Cow::Owned(m.field_desc.clone());
     }
     match vh_read_string(ctx, vh, VH_FIELD_DESC) {
@@ -87,7 +87,7 @@ fn vh_field_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
 
 /// Convert a VarHandle field descriptor to the single-char type descriptor
 /// that `box_value` expects (e.g. "I", "J", "Ljava/lang/Object;").
-fn vh_type_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
+fn vh_type_desc(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
     let desc = vh_field_desc(ctx, vh);
     if desc.len() == 1 { desc } else { Cow::Borrowed(DESC_REF) }
 }
@@ -168,36 +168,51 @@ pub(crate) struct VarHandleMeta {
 // `parking_lot::Mutex` to drop pthread / poisoning overhead and align
 // with the rest of the project.  Every VarHandle `get`/`set`/`CAS` op
 // hits this table, so even a small per-op saving compounds.
+// Round-9 CRIT GC-correctness fix: keys must survive moving GC.
+// Previously this table was keyed by `vh.as_ptr() as usize` — when the GC
+// relocated the VarHandle during compaction the entry became orphaned and
+// every subsequent `varhandle_get/_set/_compare_and_set` silently fell
+// back to slot reads (which return Object(None) for our synthetic layout
+// on real-JDK VarHandle, see WP4.2 comment above).
+//
+// The fix: use `NativeContext::identity_hash_code(vh)` as the key.
+// `identity_hash_code` is GC-stable — see `gc/src/compact_header.rs`
+// (HashCodeTable::update_after_gc remaps after compaction). All meta
+// accessors therefore take `&mut dyn NativeContext` so they can compute
+// the key.
 static VH_META_TABLE: std::sync::OnceLock<
-    parking_lot::Mutex<rustc_hash::FxHashMap<usize, Arc<VarHandleMeta>>>,
+    parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>>,
 > = std::sync::OnceLock::new();
 
 fn vh_meta_table()
--> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, Arc<VarHandleMeta>>> {
+-> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>> {
     VH_META_TABLE.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-pub(crate) fn vh_meta_put(vh: ObjectRef, meta: VarHandleMeta) {
+pub(crate) fn vh_meta_put(ctx: &mut dyn NativeContext, vh: ObjectRef, meta: VarHandleMeta) {
+    let key = ctx.identity_hash_code(vh);
     let mut t = vh_meta_table().lock();
-    t.insert(vh.as_ptr() as usize, Arc::new(meta));
+    t.insert(key, Arc::new(meta));
 }
 
-pub(crate) fn vh_meta_get(vh: ObjectRef) -> Option<Arc<VarHandleMeta>> {
+pub(crate) fn vh_meta_get(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Option<Arc<VarHandleMeta>> {
+    let key = ctx.identity_hash_code(vh);
     let t = vh_meta_table().lock();
     // Refcount bump only — no per-field String clone.
-    t.get(&(vh.as_ptr() as usize)).cloned()
+    t.get(&key).cloned()
 }
 
-pub(crate) fn vh_meta_update_field_index(vh: ObjectRef, idx: i32) {
+pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: ObjectRef, idx: i32) {
+    let key = ctx.identity_hash_code(vh);
     let mut t = vh_meta_table().lock();
-    let Some(existing) = t.get(&(vh.as_ptr() as usize)) else {
+    let Some(existing) = t.get(&key) else {
         return;
     };
     // Build a fresh Arc with the bumped field_index (Arc-immutability —
     // the old Arc may still be held by an in-flight call site).
     let mut updated = (**existing).clone();
     updated.field_index = idx;
-    t.insert(vh.as_ptr() as usize, Arc::new(updated));
+    t.insert(key, Arc::new(updated));
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +760,7 @@ pub(crate) fn alloc_instance_var_handle(
     ctx.set_field(vh, VH_CLASS_ID, Value::Int(class_id.as_u32() as i32));
     // WP4.2: also stash in the side table so the descriptor-aware setter
     // on real-JDK VarHandle layout doesn't drop our metadata.
-    vh_meta_put(vh, VarHandleMeta {
+    vh_meta_put(ctx, vh, VarHandleMeta {
         kind: VH_KIND_INSTANCE,
         class_name: class_name.to_string(),
         field_name: field_name.to_string(),
@@ -774,7 +789,7 @@ pub(crate) fn alloc_static_var_handle(
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(-1)); // resolved lazily
     ctx.set_field(vh, VH_CLASS_ID, Value::Int(0));
     // WP4.2: side table for descriptor-aware-coercion-safe metadata access.
-    vh_meta_put(vh, VarHandleMeta {
+    vh_meta_put(ctx, vh, VarHandleMeta {
         kind: VH_KIND_STATIC,
         class_name: class_name.to_string(),
         field_name: field_name.to_string(),
@@ -786,7 +801,7 @@ pub(crate) fn alloc_static_var_handle(
 }
 
 /// Read VarHandle metadata helpers.
-fn vh_read_string(ctx: &dyn NativeContext, vh: ObjectRef, field: usize) -> Option<String> {
+fn vh_read_string(ctx: &mut dyn NativeContext, vh: ObjectRef, field: usize) -> Option<String> {
     match ctx.get_field(vh, field) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -812,7 +827,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // the bound Arc for `kind`/`field_index`/`class_name`/`field_name`/
     // `field_desc`. Previously each helper (`vh_meta_get`, `vh_type_desc`,
     // the by-name resolve fallback) re-locked the table 2–3× per native.
-    let meta = vh_meta_get(this);
+    let meta = vh_meta_get(ctx, this);
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
@@ -849,7 +864,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     Some(idx) => {
                         // Cache for next time
                         ctx.set_field(this, VH_FIELD_INDEX, Value::Int(idx as i32));
-                        vh_meta_update_field_index(this, idx as i32);
+                        vh_meta_update_field_index(ctx, this, idx as i32);
                         let val = ctx.get_field(receiver, idx);
                         // Reuse already-computed type descriptor.
                         Ok(Some(box_value(ctx, val, &td)))
@@ -907,7 +922,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     // Round-7 HIGH-2 fix: bind the Arc once and reuse for kind / field_index
     // / class+field lookups instead of re-locking `vh_meta_table` each branch.
-    let meta = vh_meta_get(this);
+    let meta = vh_meta_get(ctx, this);
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
@@ -938,7 +953,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 };
                 if let Some(idx) = ctx.resolve_field_index(&class, &field) {
                     ctx.set_field(this, VH_FIELD_INDEX, Value::Int(idx as i32));
-                    vh_meta_update_field_index(this, idx as i32);
+                    vh_meta_update_field_index(ctx, this, idx as i32);
                     ctx.set_field(receiver, idx, value);
                 }
             }
@@ -994,7 +1009,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     }
     // Round-7 HIGH-2 fix: fetch meta once and reuse across the kind probe
     // and the class/field fallback below.
-    let meta = vh_meta_get(this);
+    let meta = vh_meta_get(ctx, this);
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
@@ -1030,7 +1045,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         match ctx.resolve_field_index(&class, &field) {
             Some(i) => {
                 ctx.set_field(this, VH_FIELD_INDEX, Value::Int(i as i32));
-                vh_meta_update_field_index(this, i as i32);
+                vh_meta_update_field_index(ctx, this, i as i32);
                 i
             }
             None => return Ok(Some(Value::Int(0))),

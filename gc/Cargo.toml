@@ -11,9 +11,9 @@ categories.workspace = true
 
 [dependencies]
 rustjvm-types = { path = "../types" }
-parking_lot = "0.12"
+parking_lot.workspace = true
 tracing.workspace = true
-rustc-hash = "1.1"
+rustc-hash.workspace = true
 
 [dev-dependencies]
 rustjvm-jit = { path = "../jit" }

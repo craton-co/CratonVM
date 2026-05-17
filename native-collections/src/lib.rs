@@ -118,7 +118,7 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
 }
 
 // ---------------------------------------------------------------------------
-// Per-segment resize lock (Bug 1 CRIT correctness fix)
+// Per-segment resize lock (Bug 1+2 CRIT correctness fix, round-10)
 // ---------------------------------------------------------------------------
 //
 // Lock-free CHM readers walk old bucket chains and follow NEXT pointers via
@@ -126,40 +126,45 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
 // place to splice the hi/lo partitions, a concurrent reader can skip past
 // the keys living in the hi partition and return a spurious miss.
 //
-// The proper long-term fix is clone-resize: allocate fresh Node objects for
-// the new hi/lo sub-chains and leave the OLD chain untouched so readers
-// observing the OLD buckets array can still walk it correctly. That requires
-// invasive changes to `map_resize` and the node alloc path.
+// Round-10 fix (Bug 1+2 CRIT, round-9 native-misc CRIT-1/CRIT-2):
+// The earlier implementation looked up a per-segment RwLock through a global
+// `Mutex<HashMap<ptr, Arc<RwLock>>>` — every CHM read AND write paid the
+// global Mutex, completely defeating the per-segment design. The map was
+// also keyed by raw segment heap pointer, which is GC-relocatable, so a
+// moving GC could cause cross-segment aliasing (two distinct segments share
+// a lock if their heap addresses overlap after collection).
+//
+// Replacement: a fixed-size striped array of 256 `parking_lot::RwLock`s
+// (the project already depends on `parking_lot` transitively via tokio /
+// dashmap; if not, fall back to `std::sync::RwLock`). The stripe index is
+// derived from the segment's identity hash code, which is stable across GC
+// moves. No global lock; lookup is a single masked array index.
+//
+// Trade-off: occasional false sharing if two segments hash to the same
+// stripe (1/256 collision rate). That serializes resizes between unrelated
+// segments — acceptable since resize is rare. Reads stay fully concurrent
+// because the read lock is non-exclusive.
 //
 // TODO(round-6+): replace the RwLock with a clone-resize implementation that
 // allocates new Node objects via `alloc_node` and links the new sub-chains
 // without mutating the old chain. The old chain is then unreachable from the
 // new buckets array and becomes GC-collectible. That restores fully
-// lock-free reads.
-//
-// Interim correctness fix: a per-segment `RwLock` is acquired in write mode
-// around `map_resize` and in read mode around `chm_seg_get`. Concurrent
-// readers serialize against an in-progress resize but parallel reads still
-// proceed. This is keyed by the segment's heap pointer (segments live for
-// the lifetime of the CHM, so the address is stable).
-fn chm_seg_resize_locks() -> &'static std::sync::Mutex<
-    std::collections::HashMap<usize, std::sync::Arc<std::sync::RwLock<()>>>,
-> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<usize, std::sync::Arc<std::sync::RwLock<()>>>,
-        >,
-    > = std::sync::OnceLock::new();
-    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
+// lock-free reads and eliminates the need for striped locks entirely.
 
-fn chm_seg_lock_for(seg: ObjectRef) -> std::sync::Arc<std::sync::RwLock<()>> {
-    let key = seg.as_ptr() as usize;
-    let mut map = chm_seg_resize_locks().lock().unwrap_or_else(|e| e.into_inner());
-    std::sync::Arc::clone(
-        map.entry(key)
-            .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(()))),
-    )
+const NUM_SEG_LOCKS: usize = 256;
+
+fn chm_seg_lock_for(seg_id: i32) -> &'static std::sync::RwLock<()> {
+    static SEG_LOCKS: std::sync::OnceLock<Vec<std::sync::RwLock<()>>> =
+        std::sync::OnceLock::new();
+    let locks = SEG_LOCKS.get_or_init(|| {
+        let mut v = Vec::with_capacity(NUM_SEG_LOCKS);
+        for _ in 0..NUM_SEG_LOCKS {
+            v.push(std::sync::RwLock::new(()));
+        }
+        v
+    });
+    // Mask with NUM_SEG_LOCKS-1 since NUM_SEG_LOCKS is a power of two.
+    &locks[(seg_id as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 /// RAII guard for a native monitor (`ctx.monitor_enter` / `monitor_exit`).
@@ -1356,22 +1361,77 @@ fn get_node_value(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
 /// Maximum capacity for HashMap buckets (~1 billion).
 const MAP_MAX_CAPACITY: i32 = 1 << 30;
 
+// Bug 5 (HIGH) round-10: thread-local flag set while a CHM mutator
+// (native_chm_put / put_if_absent / compute_* / merge / replace*) is on
+// the stack. `map_resize` consults the flag — only CHM-segment resizes
+// pay the striped-lock cost; plain HashMap resizes run lock-free.
+thread_local! {
+    static CHM_RESIZE_LOCK_NEEDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard that marks the current thread as being inside a CHM
+/// mutator. While alive, `map_resize` calls performed by code below this
+/// frame take the per-segment write lock against concurrent readers.
+struct ChmResizeLockGuard {
+    prev: bool,
+}
+
+impl ChmResizeLockGuard {
+    fn enter() -> Self {
+        let prev = CHM_RESIZE_LOCK_NEEDED.with(|c| {
+            let p = c.get();
+            c.set(true);
+            p
+        });
+        ChmResizeLockGuard { prev }
+    }
+}
+
+impl Drop for ChmResizeLockGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        CHM_RESIZE_LOCK_NEEDED.with(|c| c.set(prev));
+    }
+}
+
 /// Resize the HashMap when load factor is exceeded.
+///
+/// Whether the per-segment resize lock is taken is governed by the
+/// thread-local `CHM_RESIZE_LOCK_NEEDED` flag, set by `ChmResizeLockGuard`
+/// inside CHM mutator entry points. Plain `java/util/HashMap` callers
+/// resize lock-free (HashMap is not thread-safe). CHM segment callers
+/// take the write lock so concurrent CHM lock-free readers in
+/// `chm_seg_get` serialize against the in-place NEXT mutations below.
 fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    // Bug 1 (CRIT) interim fix: take the write-lock on this segment's
-    // resize lock to exclude concurrent CHM lock-free readers in
-    // `chm_seg_get`. The in-place NEXT mutations below would otherwise
-    // make readers skip past hi-partition entries (spurious miss).
+    let is_concurrent = CHM_RESIZE_LOCK_NEEDED.with(|c| c.get());
+    map_resize_inner(ctx, this, is_concurrent);
+}
+
+fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent: bool) {
+    // Bug 1+2+5 (CRIT/HIGH) round-10 fix: only take the resize lock when
+    // resizing a CHM segment. Plain `java/util/HashMap.put` is single-
+    // threaded; serializing its resize through the striped lock array
+    // (round-9 native-misc HIGH-3) was pure overhead.
     //
-    // This lock is harmless for non-CHM single-threaded HashMap users
-    // (zero contention). For CHM, it serializes resize against
-    // concurrent reads but parallel reads still proceed.
+    // For CHM segments, the per-segment striped RwLock (256 stripes,
+    // keyed by `ctx.identity_hash_code(this)`) excludes concurrent
+    // lock-free readers in `chm_seg_get` while we mutate NEXT pointers
+    // in place.
     //
     // TODO(round-6+): replace with a clone-resize that allocates fresh
     // Node objects for the new sub-chains and leaves the old chain
-    // untouched, so reads can stay fully lock-free.
-    let resize_lock = chm_seg_lock_for(this);
-    let _write_guard = resize_lock.write().unwrap_or_else(|e| e.into_inner());
+    // untouched, so reads can stay fully lock-free and this lock can be
+    // removed entirely.
+    let _write_guard = if is_concurrent {
+        let seg_id = ctx.identity_hash_code(this);
+        Some(
+            chm_seg_lock_for(seg_id)
+                .write()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    } else {
+        None
+    };
 
     let (old_buckets, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
@@ -14548,6 +14608,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(None),
     };
     let src_entries = map_collect_entries(ctx, source);
+    let _resize_flag = ChmResizeLockGuard::enter();
     for (key, value) in src_entries {
         let hash = chm_key_hash(ctx, &key);
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
@@ -14581,15 +14642,20 @@ fn chm_seg_get(
         Value::Object(None) => (None, 0, true),
         _ => return None,
     };
-    // Bug 1 (CRIT) interim fix: take a read-lock against any in-progress
-    // `map_resize` on this segment. The resize path mutates old-chain
-    // NEXT pointers in place, which can cause lock-free readers to skip
-    // past keys living in the hi partition. The read-lock serializes
-    // readers against the writer's mutation; parallel reads remain
-    // concurrent. See chm_seg_resize_locks() doc for the long-term
-    // clone-resize TODO.
-    let resize_lock = chm_seg_lock_for(seg);
-    let _read_guard = resize_lock.read().unwrap_or_else(|e| e.into_inner());
+    // Bug 1+2 (CRIT) round-10 fix: take a read-lock against any
+    // in-progress concurrent `map_resize_concurrent` on this segment.
+    // The resize path mutates old-chain NEXT pointers in place, which
+    // can cause lock-free readers to skip past keys living in the hi
+    // partition. The read-lock serializes readers against the writer's
+    // mutation; parallel reads remain concurrent.
+    //
+    // Stripe is selected by `ctx.identity_hash_code(seg)` (stable
+    // across GC moves) and indexes into a 256-entry static RwLock
+    // array — no global Mutex, no raw-pointer keying.
+    let seg_id = ctx.identity_hash_code(seg);
+    let _read_guard = chm_seg_lock_for(seg_id)
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     // Acquire-load the buckets array reference. If the writer has
     // begun publishing a new array, we see either the old one (with a
     // fully-linked chain) or the new one (also fully-linked) — never a
@@ -14710,6 +14776,7 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])
         }
@@ -14726,6 +14793,7 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_remove(ctx, &[Value::Object(Some(seg)), key])
         }
@@ -14743,6 +14811,7 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put_if_absent(ctx, &[Value::Object(Some(seg)), key, value])
         }
@@ -14760,6 +14829,7 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_compute_if_absent(ctx, &[Value::Object(Some(seg)), key, func])
         }
@@ -14777,6 +14847,7 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_compute(ctx, &[Value::Object(Some(seg)), key, func])
         }
@@ -14795,6 +14866,7 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_merge(ctx, &[Value::Object(Some(seg)), key, value, func])
         }
@@ -14831,6 +14903,7 @@ fn native_chm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    let _resize_flag = ChmResizeLockGuard::enter();
     for seg in chm_all_segments(ctx, this) {
         let _guard = ChmMonitorGuard::acquire(ctx, seg);
         native_map_clear(ctx, &[Value::Object(Some(seg))])?;
@@ -14847,6 +14920,7 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    let _resize_flag = ChmResizeLockGuard::enter();
     let entries = map_collect_entries(ctx, source);
     for (key, value) in entries {
         let hash = chm_key_hash(ctx, &key);
@@ -14864,6 +14938,7 @@ fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(None),
     };
     let func = args.get(1).copied().unwrap_or(Value::Object(None));
+    let _resize_flag = ChmResizeLockGuard::enter();
     for seg in chm_all_segments(ctx, this) {
         let _guard = ChmMonitorGuard::acquire(ctx, seg);
         native_map_replace_all(ctx, &[Value::Object(Some(seg)), func])?;
@@ -15045,6 +15120,7 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
                 .unwrap_or(Value::Object(None));
@@ -15069,6 +15145,7 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
                 .unwrap_or(Value::Object(None));
@@ -15095,6 +15172,7 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
                 .unwrap_or(Value::Object(None));

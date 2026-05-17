@@ -33,6 +33,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # `tracing.workspace = true` inherits the cap.
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Round-9 cross-cutting MED-9: hoist `parking_lot` and `rustc-hash` to the
+# workspace so every consumer resolves to one version. Previously declared
+# literally in 11 (parking_lot) / 9 (rustc-hash) crate manifests; each new
+# bump risked drift. Crates opt in via `parking_lot.workspace = true` /
+# `rustc-hash.workspace = true`.
+parking_lot = "0.12"
+rustc-hash = "1.1"
 
 # RJ.4 — silence lints that do not represent real defects so
 # `cargo doc --workspace --no-deps` stays at zero warnings (the

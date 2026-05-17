@@ -10410,6 +10410,18 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             }
             Ok(Some(Value::Object(Some(clone))))
         }
+        // Round-9 gc CRIT-1: HumongousFiller is a GC-internal walker
+        // sentinel that should never reach the Object.clone() path.
+        // If it ever does, treat it as an NPE rather than silently
+        // returning a clone of garbage.
+        rustjvm_types::ObjectKind::HumongousFiller => Err(
+            rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "clone on humongous-continuation filler (GC sentinel)".to_string(),
+                ),
+            }
+            .into(),
+        ),
     }
 }
 
@@ -29048,10 +29060,16 @@ impl Default for LongAdderCells {
     }
 }
 
+// Round-9 CRIT GC-correctness fix: key by `identity_hash_code(this)` not
+// by raw `this.as_ptr() as usize`. Under a moving collector the
+// LongAdder is invisibly relocated and the table loses its cell strip,
+// silently dropping every striped add (LongAdder.sum() then under-reports
+// by the lost cells). `identity_hash_code` is GC-stable — see
+// `gc/src/compact_header.rs` HashCodeTable::update_after_gc.
 fn long_adder_cells_table()
--> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, std::sync::Arc<LongAdderCells>>> {
+-> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, std::sync::Arc<LongAdderCells>>> {
     static TABLE: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<usize, std::sync::Arc<LongAdderCells>>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<i32, std::sync::Arc<LongAdderCells>>>,
     > = std::sync::OnceLock::new();
     TABLE.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -29060,26 +29078,32 @@ fn long_adder_cells_table()
 /// returned `Arc` lives for the lifetime of the table (we never evict —
 /// the cells follow the LongAdder's heap lifetime, and our process-lifetime
 /// heap means there is no use-after-free risk for the contained
-/// `AtomicI64`s).
-fn long_adder_cells(this: ObjectRef) -> std::sync::Arc<LongAdderCells> {
-    let key = this.as_ptr() as usize;
+/// `AtomicI64`s). Keyed by GC-stable `identity_hash_code`.
+fn long_adder_cells(ctx: &mut dyn NativeContext, this: ObjectRef) -> std::sync::Arc<LongAdderCells> {
+    let key = ctx.identity_hash_code(this);
     let mut t = long_adder_cells_table().lock();
     t.entry(key)
         .or_insert_with(|| std::sync::Arc::new(LongAdderCells::default()))
         .clone()
 }
 
-/// Pick a stripe index for the current thread. We hash `ThreadId` into a
-/// per-thread cell index. The hash is stable for a thread's lifetime, so a
-/// hot loop on one thread keeps hitting the same cell (and pays
-/// uncontended atomic-add cost). Different threads collide on hash mod
-/// `LA_CELL_COUNT` — the fixed 8-stripe design accepts pairwise collisions
-/// for compactness.
+/// Pick a stripe index for the current thread. Round-9 CRIT-5 fix:
+/// `std::thread::ThreadId` is allocated as a dense sequential counter
+/// (1, 2, 3, ...), and the low bits of `FxHash(small dense integers)` are
+/// highly correlated — eight threads mapping to indices via
+/// `FxHash(tid) & 7` would frequently collide on the same cell, defeating
+/// the stripe's purpose. Mix with the Fibonacci constant
+/// `0x9E37_79B9_7F4A_7C15` (golden-ratio multiplier; same constant used
+/// by `gc::collector::volatile_stripe_lock`) and take the high bits.
 fn long_adder_stripe() -> usize {
     use std::hash::{Hash, Hasher};
+    // std::thread::ThreadId has no public `as_u64`; pipe it through a tiny
+    // FxHasher to extract a stable 64-bit value, then apply the Fibonacci
+    // spread and take the high bits as the 8-cell index.
     let mut h = rustc_hash::FxHasher::default();
     std::thread::current().id().hash(&mut h);
-    (h.finish() as usize) & (LA_CELL_COUNT - 1)
+    let tid_u64 = h.finish();
+    ((tid_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 56) as usize & (LA_CELL_COUNT - 1)
 }
 
 fn native_long_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29090,7 +29114,7 @@ fn native_long_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.set_field(this, 0, Value::Long(0));
     // Pre-allocate the cell strip so the first `add` does not race the
     // map insert under the side-table mutex.
-    let _ = long_adder_cells(this);
+    let _ = long_adder_cells(ctx, this);
     Ok(None)
 }
 
@@ -29120,8 +29144,8 @@ fn native_long_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     // Contended path: stripe to a cell, do an uncontended atomic add.
     // `fetch_add` on `AtomicI64` is wait-free, no CAS-loop, no spinning.
-    let cells = long_adder_cells(this);
     let idx = long_adder_stripe();
+    let cells = long_adder_cells(ctx, this);
     cells.cells[idx].fetch_add(x, std::sync::atomic::Ordering::Relaxed);
     Ok(None)
 }
@@ -29140,8 +29164,8 @@ fn native_long_adder_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if ctx.compare_and_swap_field(this, 0, current, new_val) {
         return Ok(None);
     }
-    let cells = long_adder_cells(this);
     let idx = long_adder_stripe();
+    let cells = long_adder_cells(ctx, this);
     cells.cells[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(None)
 }
@@ -29160,17 +29184,18 @@ fn native_long_adder_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if ctx.compare_and_swap_field(this, 0, current, new_val) {
         return Ok(None);
     }
-    let cells = long_adder_cells(this);
     let idx = long_adder_stripe();
+    let cells = long_adder_cells(ctx, this);
     cells.cells[idx].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     Ok(None)
 }
 
 /// Sum the per-cell strip into a single i64. Caller adds `base` separately.
-fn long_adder_cells_sum(this: ObjectRef) -> i64 {
+fn long_adder_cells_sum(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
     // Fast path: no cells allocated yet (init / never contended).
+    let key = ctx.identity_hash_code(this);
     let t = long_adder_cells_table().lock();
-    let Some(c) = t.get(&(this.as_ptr() as usize)).cloned() else {
+    let Some(c) = t.get(&key).cloned() else {
         return 0;
     };
     drop(t);
@@ -29194,7 +29219,7 @@ fn native_long_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Long(v) => v,
         _ => 0,
     };
-    let cells = long_adder_cells_sum(this);
+    let cells = long_adder_cells_sum(ctx, this);
     Ok(Some(Value::Long(base.wrapping_add(cells))))
 }
 
@@ -29209,7 +29234,7 @@ fn native_long_adder_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Long(v) => v,
         _ => 0,
     };
-    let total = base.wrapping_add(long_adder_cells_sum(this));
+    let total = base.wrapping_add(long_adder_cells_sum(ctx, this));
     Ok(Some(Value::Int(total as i32)))
 }
 
@@ -29223,8 +29248,9 @@ fn native_long_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     ctx.set_field_volatile(this, 0, Value::Long(0));
     // Round-7 HIGH-16: also zero every stripe cell, otherwise contended
     // adds remain visible after `reset()`.
+    let key = ctx.identity_hash_code(this);
     let t = long_adder_cells_table().lock();
-    if let Some(c) = t.get(&(this.as_ptr() as usize)).cloned() {
+    if let Some(c) = t.get(&key).cloned() {
         drop(t);
         for cell in c.cells.iter() {
             cell.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -29253,8 +29279,9 @@ fn native_long_adder_sum_then_reset(
         }
     };
     let mut total = base;
+    let key = ctx.identity_hash_code(this);
     let t = long_adder_cells_table().lock();
-    if let Some(c) = t.get(&(this.as_ptr() as usize)).cloned() {
+    if let Some(c) = t.get(&key).cloned() {
         drop(t);
         for cell in c.cells.iter() {
             let old = cell.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -29275,7 +29302,7 @@ fn native_long_adder_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Long(v) => v,
         _ => 0,
     };
-    let total = base.wrapping_add(long_adder_cells_sum(this));
+    let total = base.wrapping_add(long_adder_cells_sum(ctx, this));
     let s = ctx.create_string(&total.to_string());
     Ok(Some(Value::Object(Some(s))))
 }

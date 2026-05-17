@@ -290,6 +290,18 @@ pub struct ProfileStore {
     /// path.  Expected to be 0 in normal operation; non-zero indicates
     /// a SipHash collision (or, more likely, a logic bug).
     name_index_collisions: std::sync::atomic::AtomicU64,
+
+    /// round-9 fix (HIGH): diagnostic counter — number of times the
+    /// re-probe in the collision-counter path observed an entry that
+    /// matched the queried key, indicating a legal concurrent insert
+    /// raced with us between our first probe (line ~410) and the
+    /// re-probe (line ~443). This is a BENIGN race (the map is
+    /// insert-only; another writer simply published the same key
+    /// we were about to look up), not a logic bug, so we soft-count
+    /// it instead of panicking via a `debug_assert!` as the previous
+    /// round-8 code did. Non-zero values here are expected under
+    /// concurrent load and do not indicate corruption.
+    name_index_benign_races: std::sync::atomic::AtomicU64,
 }
 
 impl ProfileStore {
@@ -299,7 +311,17 @@ impl ProfileStore {
             invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
             name_index: parking_lot::RwLock::new(FxHashMap::default()),
             name_index_collisions: std::sync::atomic::AtomicU64::new(0),
+            name_index_benign_races: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// round-9 fix (HIGH): observed benign re-probe races (between the
+    /// first probe and the collision re-probe, another writer published
+    /// an entry that matches the queried key). Exposed for diagnostics
+    /// only; non-zero values are normal under concurrent load.
+    pub fn name_index_benign_races(&self) -> u64 {
+        self.name_index_benign_races
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// round-7 fix (bug 2): observed name-index fingerprint collisions
@@ -441,20 +463,33 @@ impl ProfileStore {
         {
             let idx = self.name_index.read();
             if let Some((cached_key, _)) = idx.get(&fingerprint) {
-                // Sanity: confirm we're still looking at a real collision
-                // (i.e. the entry has not silently been replaced by an
-                // equal-key entry, which would not be a collision at all).
-                debug_assert!(
-                    !(cached_key.class_id == class_id
-                        && cached_key.method_name.as_ref() == method_name.as_ref()
-                        && cached_key.descriptor.as_ref() == descriptor.as_ref()),
-                    "ProfileStore re-probe saw a matching entry that the \
-                     first probe missed: name_index is no longer insert-only. \
-                     Move the collision-counter increment into the first \
-                     probe's collision arm before adding eviction.",
-                );
-                self.name_index_collisions
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Round-9 fix (HIGH): the previous `debug_assert!` here
+                // panicked on a perfectly legal benign race — between
+                // our first probe (line ~410) and this re-probe, another
+                // writer can legitimately publish an entry for the SAME
+                // key we were looking up (insert-only map, slow path
+                // wins the race). The assertion was guarding against
+                // eviction (which the map does not perform), but the
+                // matching-entry-after-mismatch case it tripped on IS
+                // the benign race the comment itself describes.
+                //
+                // Soft-count the two cases separately so the diagnostic
+                // information is preserved without crashing under load.
+                if cached_key.class_id == class_id
+                    && cached_key.method_name.as_ref() == method_name.as_ref()
+                    && cached_key.descriptor.as_ref() == descriptor.as_ref()
+                {
+                    // Benign race: another writer inserted our key
+                    // between the two probes. Not a collision; do not
+                    // bump the collision counter.
+                    self.name_index_benign_races
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    // Real fingerprint collision: different MethodKey
+                    // shares our SipHash fingerprint.
+                    self.name_index_collisions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
 

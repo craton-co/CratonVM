@@ -59,11 +59,11 @@ thiserror.workspace = true
 tracing.workspace = true
 indexmap = "2"
 bitfield-struct = "0.9"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-parking_lot = "0.12"
+zip.workspace = true
+parking_lot.workspace = true
 regex = "1"
 libloading = "0.8"
-rustc-hash = "1.1"
+rustc-hash.workspace = true
 # NEW-20: bench-gate binary uses serde to read criterion estimates.json
 # files and the committed bench/baseline.json file.
 serde = { version = "1", features = ["derive"] }

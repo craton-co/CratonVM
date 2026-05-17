@@ -588,14 +588,29 @@ impl Drop for SpscEventRing {
         // a warning and leak the slot storage — slots are tiny (1024 *
         // sizeof(EventInstance)) and leaking on shutdown is preferable to
         // UAF.
+        // Round-9 CRIT-1 fix (2026-05-17): the previous 10k spin cap was too
+        // tight for a full 1024-slot ring under contended dumps — drainers
+        // copying the full ring would routinely outlast the cap, causing the
+        // shutdown path to leak slot memory rather than wait. Use exponential
+        // backoff (spin_loop → yield_now ramp) and a 1M-iteration safety cap,
+        // which gives drainers plenty of time while still preventing an
+        // infinite hang on a buggy consumer.
         let mut spins = 0u32;
+        let mut backoff = 1u32;
         while self.consumer_busy.load(Ordering::Acquire) {
-            std::hint::spin_loop();
+            for _ in 0..backoff {
+                std::hint::spin_loop();
+            }
+            if backoff >= 64 {
+                std::thread::yield_now();
+            }
             spins += 1;
-            if spins > 10_000 {
+            backoff = backoff.saturating_mul(2).min(1024);
+            if spins > 1_000_000 {
                 eprintln!(
-                    "WARN: SpscEventRing dropped with consumer still active; \
-                     leaking slot storage to avoid use-after-free"
+                    "WARN: SpscEventRing dropped with consumer still active \
+                     after 1M iterations; leaking slot storage to avoid \
+                     use-after-free"
                 );
                 // Replace slots with an empty box so `Drop` for the field
                 // frees nothing; the original allocation is forgotten.

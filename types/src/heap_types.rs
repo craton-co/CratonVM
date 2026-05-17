@@ -144,11 +144,24 @@ pub fn array_data_size(length: usize, element_type: ArrayElementType) -> Result<
 }
 
 /// Whether a heap allocation is a regular object or an array.
+///
+/// `HumongousFiller` is a synthetic sentinel kind (round-9 gc CRIT-1 fix):
+/// the GC writes a header with this kind at the start of every humongous
+/// continuation region. Heap walkers MUST treat this header as "skip the
+/// entire region; not a real object, no oops to scan". Without this
+/// sentinel, the zeroed bytes of a continuation region decode as a
+/// well-formed `Object` (kind=0, class_id=0, num_slots=0) and walkers
+/// iterate the region as a 40-byte object, following the next zero header,
+/// and so on -- effectively scanning garbage as live objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ObjectKind {
     Object = 0,
     Array = 1,
+    /// Round-9 gc CRIT-1: sentinel header at the start of a humongous
+    /// continuation region. A walker that sees this kind must skip to
+    /// the end of the enclosing region without iterating bytes.
+    HumongousFiller = 2,
 }
 
 /// The element type for Java arrays (maps to `newarray` atype values).

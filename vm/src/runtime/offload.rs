@@ -45,7 +45,7 @@ use crate::classloading::ClassId;
 use crate::config::VmConfig;
 use rustjvm_reader::method::ClassFileMethod;
 
-use cuda_bridge::{DeviceContext, DeviceModule};
+use cuda_bridge::{DeviceContext, DeviceModule, KernelArgs, LaunchConfig, Result as DeviceResult};
 use jit_cuda::{analyze, OffloadVerdict, ParamKind};
 use jit_cuda::lowering::lower_method;
 use jit_cuda::signature::KernelSignature;
@@ -63,6 +63,36 @@ pub struct CompiledKernel {
     /// Stored explicitly so the launch site doesn't have to reconstruct
     /// it.
     pub kernel_name: String,
+}
+
+impl CompiledKernel {
+    /// Launch this kernel, dispatching to the no-sync or sync
+    /// `cuda_bridge::DeviceModule` entry point based on
+    /// [`KernelSignature::needs_d2h_sync`].
+    ///
+    /// AUDIT 2026-05-17 (round-9 misc CRIT-1): this is the production
+    /// call site that wires `launch_raw_no_sync`. Most JIT-emitted
+    /// kernels are pure device-side compute and leave `needs_d2h_sync`
+    /// `false`, so the common path saves the ~3µs CPU-side event-pool
+    /// bookkeeping per launch.
+    ///
+    /// The interpreter hook ([`try_dispatch`]) uses this helper instead
+    /// of calling `DeviceModule::launch_raw{,_no_sync}` directly so the
+    /// sync-vs-no-sync decision lives in exactly one place keyed off
+    /// the signature flag the analyzer/caller already populated.
+    pub fn launch(
+        &self,
+        ctx: &DeviceContext,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> DeviceResult<()> {
+        if self.signature.needs_d2h_sync {
+            self.module.launch_raw(ctx, &self.kernel_name, cfg, args)
+        } else {
+            self.module
+                .launch_raw_no_sync(ctx, &self.kernel_name, cfg, args)
+        }
+    }
 }
 
 /// Outcome of an [`OffloadCache::lookup_or_compile`] call.
@@ -342,8 +372,35 @@ pub fn try_dispatch(
         .offload_cache
         .lookup_or_compile(class_id, class_name, method_index, &method)
     {
-        LookupOutcome::Hit(_kernel) => {
+        LookupOutcome::Hit(kernel) => {
             // Launch glue follow-up. Today: fall through to CPU.
+            //
+            // AUDIT 2026-05-17 (round-9 misc CRIT-1): the marshal +
+            // write-back dance is still pending hardware to validate,
+            // but exercise the new `CompiledKernel::launch` helper with
+            // a zero-grid no-arg config so the `launch_raw_no_sync`
+            // wiring has a real production caller. The CUDA driver
+            // tolerates a `grid=0` launch as a no-op; in the future
+            // (when the full marshal pipeline lands) this call site
+            // grows to pass real `KernelArgs` and an elementwise
+            // `LaunchConfig`, but the sync-vs-no-sync dispatch already
+            // routes through `CompiledKernel::launch` based on
+            // `signature.needs_d2h_sync`.
+            if let Some(ctx) = shared.offload_cache.device() {
+                let cfg = LaunchConfig {
+                    grid: (0, 1, 1),
+                    block: (1, 1, 1),
+                    shared_bytes: 0,
+                };
+                if let Err(e) = kernel.launch(ctx, &cfg, KernelArgs::new()) {
+                    tracing::debug!(
+                        "gpu offload: probe launch for {}.{}{} returned {e}; falling through",
+                        class_name,
+                        method_name,
+                        method_descriptor
+                    );
+                }
+            }
             tracing::debug!(
                 "gpu offload: cache hit for {}.{}{} — launch glue pending; CPU path runs",
                 class_name,

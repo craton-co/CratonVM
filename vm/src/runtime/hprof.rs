@@ -250,6 +250,10 @@ impl<'a> HprofDumper<'a> {
                         _ => self.write_prim_array_dump(&mut seg, obj),
                     }
                 }
+                // Round-9 gc CRIT-1: humongous-continuation filler is a
+                // walker sentinel, never a real object. Skip from heap
+                // dumps.
+                ObjectKind::HumongousFiller => continue,
             }
 
             // Flush segment if it exceeds threshold

@@ -179,6 +179,13 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
         param_kinds,
         return_kind,
         estimated_work,
+        // AUDIT 2026-05-17 (round-9 misc CRIT-1): the analyzer cannot
+        // see across the dispatch boundary to know whether the launch
+        // will be followed by a host read-back. Default `false` so the
+        // common pure-device kernel path takes the cheaper no-sync
+        // entry point; the launch site flips this to `true` only when
+        // it knows a `to_host` will follow.
+        needs_d2h_sync: false,
     })
 }
 
