@@ -323,24 +323,17 @@ fn refill(
     };
 
     // Copy read bytes into a Rust Vec<u8>, prepending any carryover.
-    let mut bytes: Vec<u8> = Vec::new();
+    // AUDIT 2026-05-17: bulk-read both buffers via NativeContext intrinsic.
     let carry_len = ctx.get_field(this, SD_CARRY_LEN).as_int().unwrap_or(0) as usize;
+    let read_len = if n > 0 { n as usize } else { 0 };
+    let mut bytes: Vec<u8> = vec![0u8; carry_len + read_len];
     if carry_len > 0 {
         if let Value::Object(Some(carr)) = ctx.get_field(this, SD_CARRY) {
-            for i in 0..carry_len {
-                if let Value::Int(b) = ctx.get_array_element(carr, i) {
-                    bytes.push((b & 0xFF) as u8);
-                }
-            }
+            ctx.read_byte_array_into(carr, 0, &mut bytes[..carry_len]);
         }
     }
-
-    if n > 0 {
-        for i in 0..(n as usize) {
-            if let Value::Int(b) = ctx.get_array_element(tmp, i) {
-                bytes.push((b & 0xFF) as u8);
-            }
-        }
+    if read_len > 0 {
+        ctx.read_byte_array_into(tmp, 0, &mut bytes[carry_len..carry_len + read_len]);
     }
 
     if bytes.is_empty() {
@@ -375,9 +368,8 @@ fn refill(
     // Save carryover bytes (if any) for the next refill.
     if !carry.is_empty() {
         let carr = ctx.new_array(ArrayElementType::Byte, carry.len());
-        for (i, &b) in carry.iter().enumerate() {
-            ctx.set_array_element(carr, i, Value::Int(b as i8 as i32));
-        }
+        // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
+        ctx.write_byte_array_from(carr, 0, carry);
         ctx.set_field(this, SD_CARRY, Value::Object(Some(carr)));
         ctx.set_field(this, SD_CARRY_LEN, Value::Int(carry.len() as i32));
     } else {

@@ -4,8 +4,7 @@
 //! `sun/java2d/*` classes. Each callback maps Java-side API calls to
 //! the Rust peer/renderer/EDT infrastructure in this crate.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -36,9 +35,52 @@ use crate::swing;
 // fields require coordinating with class-loader synthesis and break when
 // the real-JDK class is loaded.
 
-fn invocation_event_callbacks() -> &'static Mutex<FxHashMap<i32, u64>> {
-    static INSTANCE: OnceLock<Mutex<FxHashMap<i32, u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(FxHashMap::default()))
+/// Maximum number of pending event-hash → callback_id mappings. If an
+/// `InvocationEvent` is never `dispatch`'d (GC'd before the EDT picks it up,
+/// for example), the entry would leak forever. Cap with FIFO eviction so a
+/// misbehaving app can't grow this map without bound.
+const MAX_INVOCATION_CALLBACKS: usize = 10_000;
+
+struct InvocationCallbackTable {
+    map: FxHashMap<i32, u64>,
+    order: std::collections::VecDeque<i32>,
+}
+
+impl InvocationCallbackTable {
+    fn new() -> Self {
+        Self {
+            map: FxHashMap::default(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: i32, value: u64) {
+        while self.map.len() >= MAX_INVOCATION_CALLBACKS {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        if self.map.insert(key, value).is_none() {
+            self.order.push_back(key);
+        }
+    }
+
+    fn remove(&mut self, key: i32) -> Option<u64> {
+        let v = self.map.remove(&key);
+        if v.is_some() {
+            if let Some(pos) = self.order.iter().position(|&k| k == key) {
+                self.order.remove(pos);
+            }
+        }
+        v
+    }
+}
+
+fn invocation_event_callbacks() -> &'static Mutex<InvocationCallbackTable> {
+    static INSTANCE: OnceLock<Mutex<InvocationCallbackTable>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(InvocationCallbackTable::new()))
 }
 
 fn bind_invocation_event(event_hash: i32, callback_id: u64) {
@@ -46,7 +88,7 @@ fn bind_invocation_event(event_hash: i32, callback_id: u64) {
 }
 
 fn take_invocation_event_callback(event_hash: i32) -> Option<u64> {
-    invocation_event_callbacks().lock().remove(&event_hash)
+    invocation_event_callbacks().lock().remove(event_hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -75,13 +117,19 @@ struct GfxEntry {
     target: GfxTarget,
 }
 
+/// Each Graphics2D context is wrapped in its own `Arc<Mutex<...>>` so that
+/// concurrent draw calls on *different* Graphics2D objects don't serialise
+/// through the registry's outer lock — we only hold the outer lock long
+/// enough to clone the Arc.
+type GfxHandle = Arc<Mutex<GfxEntry>>;
+
 struct GfxRegistry {
-    map: HashMap<i32, GfxEntry>,
+    map: FxHashMap<i32, GfxHandle>,
 }
 
 impl GfxRegistry {
     fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self { map: FxHashMap::default() }
     }
 }
 
@@ -90,30 +138,39 @@ fn gfx_registry() -> &'static Mutex<GfxRegistry> {
     INSTANCE.get_or_init(|| Mutex::new(GfxRegistry::new()))
 }
 
+/// Look up (or lazily create) the `GfxHandle` for a Java Graphics2D receiver.
+/// Holds the outer registry lock only long enough to clone the `Arc`.
+fn gfx_handle_for(ctx: &dyn NativeContext, receiver: ObjectRef) -> GfxHandle {
+    let hash = ctx.identity_hash_code(receiver);
+    let mut reg = gfx_registry().lock();
+    if let Some(handle) = reg.map.get(&hash) {
+        return handle.clone();
+    }
+    // Lazy fallback: caller invoked a draw method on a Graphics2D that
+    // we never saw `create`/`getGraphics` for.  Allocate a default-sized
+    // detached buffer so the call doesn't panic.
+    let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
+        state: Graphics2DState::create(1, 1),
+        target: GfxTarget::Detached,
+    }));
+    reg.map.insert(hash, handle.clone());
+    handle
+}
+
 /// Ensure a `Graphics2DState` exists for the given Java Graphics2D receiver,
 /// then run `f` against it. Lazily creates a detached context if no
 /// associated target has been registered, so misbehaving callers still get
 /// drawing semantics (writing into a throwaway buffer) instead of panics.
+///
+/// The outer registry lock is released before `f` runs, so concurrent draw
+/// calls on different Graphics2D objects don't block each other.
 fn with_gfx<F, R>(ctx: &dyn NativeContext, receiver: ObjectRef, f: F) -> R
 where
     F: FnOnce(&mut Graphics2DState) -> R,
     R: Default,
 {
-    let hash = ctx.identity_hash_code(receiver);
-    let mut reg = gfx_registry().lock();
-    if !reg.map.contains_key(&hash) {
-        // Lazy fallback: caller invoked a draw method on a Graphics2D that
-        // we never saw `create`/`getGraphics` for.  Allocate a default-sized
-        // detached buffer so the call doesn't panic.
-        reg.map.insert(
-            hash,
-            GfxEntry {
-                state: Graphics2DState::create(1, 1),
-                target: GfxTarget::Detached,
-            },
-        );
-    }
-    let entry = reg.map.get_mut(&hash).expect("just inserted");
+    let handle = gfx_handle_for(ctx, receiver);
+    let mut entry = handle.lock();
     f(&mut entry.state)
 }
 
@@ -128,14 +185,11 @@ fn register_gfx_for_image(ctx: &dyn NativeContext, gfx_obj: ObjectRef, image_id:
         }
     };
     let hash = ctx.identity_hash_code(gfx_obj);
-    let mut reg = gfx_registry().lock();
-    reg.map.insert(
-        hash,
-        GfxEntry {
-            state: Graphics2DState::create(w.max(1), h.max(1)),
-            target: GfxTarget::Image(image_id),
-        },
-    );
+    let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
+        state: Graphics2DState::create(w.max(1), h.max(1)),
+        target: GfxTarget::Image(image_id),
+    }));
+    gfx_registry().lock().map.insert(hash, handle);
 }
 
 fn register_gfx_for_peer(ctx: &dyn NativeContext, gfx_obj: ObjectRef, peer_id: PeerId) {
@@ -147,22 +201,20 @@ fn register_gfx_for_peer(ctx: &dyn NativeContext, gfx_obj: ObjectRef, peer_id: P
         }
     };
     let hash = ctx.identity_hash_code(gfx_obj);
-    let mut reg = gfx_registry().lock();
-    reg.map.insert(
-        hash,
-        GfxEntry {
-            state: Graphics2DState::create(w, h),
-            target: GfxTarget::Peer(peer_id),
-        },
-    );
+    let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
+        state: Graphics2DState::create(w, h),
+        target: GfxTarget::Peer(peer_id),
+    }));
+    gfx_registry().lock().map.insert(hash, handle);
 }
 
 /// Flush Graphics2D pixel data back to its target (BufferedImage or peer)
 /// and remove the registry entry. Called from `dispose()`.
 fn dispose_gfx(ctx: &dyn NativeContext, receiver: ObjectRef) {
     let hash = ctx.identity_hash_code(receiver);
-    let entry = { gfx_registry().lock().map.remove(&hash) };
-    let Some(mut entry) = entry else { return; };
+    let handle = { gfx_registry().lock().map.remove(&hash) };
+    let Some(handle) = handle else { return; };
+    let mut entry = handle.lock();
     entry.state.dispose();
     match entry.target {
         GfxTarget::Image(image_id) => {
@@ -613,16 +665,22 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                     if let Some(img) = get_obj(args, 1) {
                         let (x, y) = (get_int(args, 2), get_int(args, 3));
                         if let Value::Long(id) = ctx.get_field_by_name(img, "imageId") {
-                            let (pixels, w, h) = {
-                                let reg = image::image_registry();
-                                match reg.get(ImageId(id as u64)) {
-                                    Some(bimg) => (bimg.get_data_buffer().to_vec(),
-                                                   bimg.width(), bimg.height()),
-                                    None => (Vec::new(), 0, 0),
+                            // Acquire locks in the same order as `dispose_gfx`
+                            // (Gfx entry first, then image registry) so the two
+                            // can't deadlock when racing on the same Graphics2D.
+                            // Holding the image-registry lock just long enough
+                            // to borrow the source pixel buffer as a slice
+                            // avoids an 8 MiB `.to_vec()` per call (≈ a 1080p
+                            // frame buffer).
+                            let handle = gfx_handle_for(ctx, this);
+                            let mut entry = handle.lock();
+                            let reg = image::image_registry();
+                            if let Some(bimg) = reg.get(ImageId(id as u64)) {
+                                let pixels: &[u32] = bimg.get_data_buffer();
+                                let (w, h) = (bimg.width(), bimg.height());
+                                if !pixels.is_empty() {
+                                    entry.state.draw_image(pixels, w, h, x, y);
                                 }
-                            };
-                            if !pixels.is_empty() {
-                                with_gfx(ctx, this, |g| g.draw_image(&pixels, w, h, x, y));
                             }
                         }
                     }
@@ -677,8 +735,8 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
         registry.register(class, "getClipBounds", "()Ljava/awt/Rectangle;", |ctx, args| {
             let bounds = if let Some(this) = get_obj(args, 0) {
                 let hash = ctx.identity_hash_code(this);
-                let reg = gfx_registry().lock();
-                reg.map.get(&hash).and_then(|e| e.state.get_clip_bounds())
+                let handle = gfx_registry().lock().map.get(&hash).cloned();
+                handle.and_then(|h| h.lock().state.get_clip_bounds())
             } else {
                 None
             };
@@ -717,8 +775,8 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
         registry.register(class, "getTransform", "()Ljava/awt/geom/AffineTransform;", |ctx, args| {
             let xform = if let Some(this) = get_obj(args, 0) {
                 let hash = ctx.identity_hash_code(this);
-                let reg = gfx_registry().lock();
-                reg.map.get(&hash).map(|e| e.state.get_transform())
+                let handle = gfx_registry().lock().map.get(&hash).cloned();
+                handle.map(|h| h.lock().state.get_transform())
                     .unwrap_or_else(crate::renderer::AffineTransform::identity)
             } else {
                 crate::renderer::AffineTransform::identity()
@@ -761,18 +819,52 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/awt/RenderingHints$Key;Ljava/lang/Object;)V", |ctx, args| {
             if let Some(this) = get_obj(args, 0) {
                 use crate::graphics2d::{RenderingHintKey as K, RenderingHintValue as V};
-                // Best-effort: identify by key/value identity hash.  We map
-                // anything we can read to a sensible default.  Since the JDK
-                // RenderingHints constants aren't fully modelled here we just
-                // toggle antialiasing on whenever a key is set — preserves
-                // existing behaviour for AA-enabled apps.
-                let key_hash = get_obj(args, 1).map(|o| ctx.identity_hash_code(o)).unwrap_or(0);
-                let val_hash = get_obj(args, 2).map(|o| ctx.identity_hash_code(o)).unwrap_or(0);
-                let _ = (key_hash, val_hash);
-                // TODO: RenderingHints key/value identity is not modelled —
-                // applying Antialiasing=On unconditionally.  Real mapping
-                // requires the JDK constant pool.
-                with_gfx(ctx, this, |g| g.set_rendering_hint(K::Antialiasing, V::On));
+                // Real JDK encodes hint identity as an int `privatekey` on
+                // `RenderingHints.Key` and on each value singleton. Read
+                // those fields and map the standard `java.awt.RenderingHints`
+                // constants. Without this mapping we'd unconditionally turn
+                // antialiasing on, which silently corrupts apps that
+                // explicitly request AA=OFF (e.g. pixel art renderers).
+                let key_obj = get_obj(args, 1);
+                let val_obj = get_obj(args, 2);
+                let key_id = key_obj
+                    .map(|o| match ctx.get_field_by_name(o, "privatekey") {
+                        Value::Int(v) => v,
+                        _ => -1,
+                    })
+                    .unwrap_or(-1);
+                let val_id = val_obj
+                    .map(|o| match ctx.get_field_by_name(o, "privatekey") {
+                        Value::Int(v) => v,
+                        _ => -1,
+                    })
+                    .unwrap_or(-1);
+
+                // SunHints constant identifiers (mirror real JDK numbering).
+                let key = match key_id {
+                    1 => Some(K::Antialiasing),       // KEY_ANTIALIASING
+                    9 => Some(K::TextAntialiasing),   // KEY_TEXT_ANTIALIASING
+                    5 => Some(K::Interpolation),      // KEY_INTERPOLATION
+                    _ => None,
+                };
+                let value = match val_id {
+                    1 | 9  => Some(V::On),                          // VALUE_*_ON
+                    2 | 10 => Some(V::Off),                         // VALUE_*_OFF
+                    195    => Some(V::BilinearInterpolation),       // VALUE_INTERPOLATION_BILINEAR
+                    196    => Some(V::NearestNeighborInterpolation),// VALUE_INTERPOLATION_NEAREST_NEIGHBOR
+                    0 | -1 => None,
+                    _      => Some(V::Default),
+                };
+
+                if let (Some(k), Some(v)) = (key, value) {
+                    with_gfx(ctx, this, |g| g.set_rendering_hint(k, v));
+                } else if key_id < 0 {
+                    // Fields unreadable (RenderingHints clinit may not have
+                    // run): fall back to previous best-effort AA=on so apps
+                    // that explicitly request AA still get it.
+                    with_gfx(ctx, this, |g| g.set_rendering_hint(K::Antialiasing, V::On));
+                }
+                // else: known key but unrecognised value — leave state alone.
             }
             void_ok()
         });
@@ -814,8 +906,8 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
             // image/peer.
             let target = if let Some(this) = get_obj(args, 0) {
                 let hash = ctx.identity_hash_code(this);
-                let reg = gfx_registry().lock();
-                reg.map.get(&hash).map(|e| e.target).unwrap_or(GfxTarget::Detached)
+                let handle = gfx_registry().lock().map.get(&hash).cloned();
+                handle.map(|h| h.lock().target).unwrap_or(GfxTarget::Detached)
             } else {
                 GfxTarget::Detached
             };
@@ -826,10 +918,11 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                     GfxTarget::Peer(pid) => register_gfx_for_peer(ctx, *obj, pid),
                     GfxTarget::Detached => {
                         let hash = ctx.identity_hash_code(*obj);
-                        gfx_registry().lock().map.insert(hash, GfxEntry {
+                        let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
                             state: Graphics2DState::create(1, 1),
                             target: GfxTarget::Detached,
-                        });
+                        }));
+                        gfx_registry().lock().map.insert(hash, handle);
                     }
                 }
             }
@@ -1058,29 +1151,51 @@ fn register_font_natives(registry: &mut NativeMethodRegistry) {
         }
         int_ok(0)
     });
-    registry.register("java/awt/FontMetrics", "getAscent", "()I", |_ctx, args| {
-        int_ok(((get_int(args, 0).max(12) as f32) * 0.8).round() as i32)
+    // FontMetrics receivers carry their (Font.size) via the `font` field on
+    // FontMetrics. `args[0]` is the FontMetrics receiver (an `ObjectRef`),
+    // **not** an int — `get_int(args, 0)` would always return 0 and the
+    // `.max(12)` floor would mask the bug. Resolve the actual font size by
+    // reading `this.font.size`.
+    fn font_metrics_size(ctx: &dyn NativeContext, args: &[Value]) -> f32 {
+        let this = match get_obj(args, 0) { Some(o) => o, None => return 12.0 };
+        // FontMetrics has a `Font font` field; Font has an `int size` field.
+        let font = match ctx.get_field_by_name(this, "font") {
+            Value::Object(Some(o)) => o,
+            // Some callers may stash the size directly on the FontMetrics.
+            _ => match ctx.get_field_by_name(this, "size") {
+                Value::Int(s) => return (s as f32).max(1.0),
+                _ => return 12.0,
+            },
+        };
+        match ctx.get_field_by_name(font, "size") {
+            Value::Int(s) if s > 0 => s as f32,
+            _ => 12.0,
+        }
+    }
+
+    registry.register("java/awt/FontMetrics", "getAscent", "()I", |ctx, args| {
+        int_ok((font_metrics_size(ctx, args) * 0.8).round() as i32)
     });
-    registry.register("java/awt/FontMetrics", "getDescent", "()I", |_ctx, args| {
-        int_ok(((get_int(args, 0).max(12) as f32) * 0.2).round() as i32)
+    registry.register("java/awt/FontMetrics", "getDescent", "()I", |ctx, args| {
+        int_ok((font_metrics_size(ctx, args) * 0.2).round() as i32)
     });
-    registry.register("java/awt/FontMetrics", "getLeading", "()I", |_ctx, args| {
-        int_ok(((get_int(args, 0).max(12) as f32) * 0.05).round().max(1.0) as i32)
+    registry.register("java/awt/FontMetrics", "getLeading", "()I", |ctx, args| {
+        int_ok((font_metrics_size(ctx, args) * 0.05).round().max(1.0) as i32)
     });
-    registry.register("java/awt/FontMetrics", "getHeight", "()I", |_ctx, args| {
-        let s = get_int(args, 0).max(12) as f32;
+    registry.register("java/awt/FontMetrics", "getHeight", "()I", |ctx, args| {
+        let s = font_metrics_size(ctx, args);
         int_ok(((s * 0.8).round() + (s * 0.2).round() + (s * 0.05).round().max(1.0)) as i32)
     });
     registry.register("java/awt/FontMetrics", "stringWidth", "(Ljava/lang/String;)I", |ctx, args| {
         let text = read_string(ctx, args, 1).unwrap_or_default();
-        let size = get_int(args, 0).max(12) as f32;
+        let size = font_metrics_size(ctx, args);
         int_ok((text.len() as f32 * size * 0.55).round() as i32)
     });
-    registry.register("java/awt/FontMetrics", "charWidth", "(C)I", |_ctx, args| {
-        int_ok((get_int(args, 0).max(12) as f32 * 0.55).round() as i32)
+    registry.register("java/awt/FontMetrics", "charWidth", "(C)I", |ctx, args| {
+        int_ok((font_metrics_size(ctx, args) * 0.55).round() as i32)
     });
-    registry.register("java/awt/FontMetrics", "getMaxAdvance", "()I", |_ctx, args| {
-        int_ok(get_int(args, 0).max(12))
+    registry.register("java/awt/FontMetrics", "getMaxAdvance", "()I", |ctx, args| {
+        int_ok(font_metrics_size(ctx, args).round() as i32)
     });
 }
 

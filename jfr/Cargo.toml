@@ -10,12 +10,17 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-# AUDIT 2026-05-16: removed dead `parking_lot = "0.12"` dependency
-# (declared but unused; crate is single-threaded, sync via plain Mutex
-# where present).
+# Round-4 (2026-05-17): re-introduced for the `ThreadRingRegistry::rings`
+# RwLock — the previous std `Mutex` serialized every drain against every
+# register, and the registry-side critical section is read-heavy (one
+# register per thread-lifetime, many drains).
+parking_lot = "0.12"
 rustc-hash = "1.1"
 # J5 (round-2): SmallVec for inline EventInstance.fields storage. Most events
 # carry <= 4 fields, so this avoids a heap allocation per event on the hot path.
+# TODO(round-4-wave-3): wire SmallVec into `EventInstance.fields`. The current
+# `Vec<EventValue>` allocates per emit; changing the field type cascades into
+# every constructor across the workspace (vm tests, recording, stream, etc.).
 smallvec = "1"
 
 [lints]

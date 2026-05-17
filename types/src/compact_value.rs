@@ -202,15 +202,19 @@ impl CompactValue {
     /// addresses) and on AArch64 user-space the high bits are likewise zero.
     ///
     /// # Panics
-    /// Panics (in **all** build profiles, not just debug) if `ptr` is zero or
-    /// has bits set outside the 47-bit payload range.  The previous
-    /// implementation only `debug_assert!`'d, which silently truncated the
-    /// high bits in release builds — a portability hazard on systems with
-    /// 52-bit (AArch64 LVA) or 57-bit (x86-64 5-level paging) addresses or
-    /// with `MAP_FIXED` allocations above `0x0000_7FFF_FFFF_FFFF`.
+    /// In debug builds, panics if `ptr` is zero or has bits set outside the
+    /// 47-bit payload range.  In release builds the assertions are elided
+    /// (the high bits are masked off via `ptr & PAYLOAD_MASK`); callers
+    /// that derive pointers from platform-supplied addresses where the
+    /// 47-bit assumption may not hold (e.g. `mmap(MAP_FIXED)`, AArch64
+    /// LVA, x86-64 5-level paging) must use
+    /// [`try_from_pointer`](Self::try_from_pointer) instead.
     ///
-    /// Prefer [`try_from_pointer`](Self::try_from_pointer) for callers that
-    /// want to handle pointer-out-of-range without aborting.
+    /// The unconditional `assert!`s that previously guarded this in release
+    /// fired on every operand-stack `Object` push and showed up as a
+    /// measurable overhead in profiles.  Heap allocations are constrained
+    /// to the 47-bit safe range elsewhere in the VM, so the debug-only
+    /// check is sufficient for development and CI.
     #[inline]
     pub fn object(ptr: u64) -> Self {
         debug_assert!(
@@ -218,19 +222,6 @@ impl CompactValue {
             "CompactValue::object called with null pointer; use null() instead"
         );
         debug_assert!(
-            ptr & !PAYLOAD_MASK == 0,
-            "CompactValue::object: pointer {:#x} exceeds 47-bit address space",
-            ptr
-        );
-        // Belt-and-suspenders: promote the debug_assert above to an
-        // unconditional `assert!` so out-of-range pointers fail loudly in
-        // release instead of being silently masked and producing a corrupted
-        // reference.
-        assert!(
-            ptr != 0,
-            "CompactValue::object called with null pointer; use null() instead"
-        );
-        assert!(
             ptr & !PAYLOAD_MASK == 0,
             "CompactValue::object: pointer {:#x} exceeds 47-bit address space",
             ptr

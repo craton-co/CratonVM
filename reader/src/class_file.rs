@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::attribute::{Attribute, LazyAttribute};
 use crate::class_access_flags::ClassAccessFlags;
 use crate::class_file_version::ClassFileVersion;
@@ -6,14 +8,22 @@ use crate::field::ClassFileField;
 use crate::method::ClassFileMethod;
 
 /// A parsed Java `.class` file (JVM spec 4.1).
+///
+/// `this_class`, `super_class`, and `interfaces` are stored as `Arc<str>`
+/// rather than `String`. Backing storage is the pool-interned name from
+/// the constant pool's Utf8 entries (see `rustjvm_types::intern_arc`), so
+/// constructing a `ClassFile` no longer allocates a fresh `String` for
+/// each of these names — every clone is a refcount bump on the shared
+/// pool allocation. Downstream `String`-flavoured consumers can still
+/// read the name as `&str` via `Arc<str>`'s deref.
 #[derive(Debug)]
 pub struct ClassFile {
     pub version: ClassFileVersion,
     pub constant_pool: ConstantPool,
     pub access_flags: ClassAccessFlags,
-    pub this_class: String,
-    pub super_class: Option<String>,
-    pub interfaces: Vec<String>,
+    pub this_class: Arc<str>,
+    pub super_class: Option<Arc<str>>,
+    pub interfaces: Vec<Arc<str>>,
     pub fields: Vec<ClassFileField>,
     pub methods: Vec<ClassFileMethod>,
     pub attributes: Vec<LazyAttribute>,
@@ -27,7 +37,7 @@ impl ClassFile {
     /// "attribute absent" and "attribute still raw".
     pub fn source_file(&self) -> Option<&str> {
         self.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::SourceFile(name)) => Some(name.as_str()),
+            Some(Attribute::SourceFile(name)) => Some(&**name),
             _ => None,
         })
     }
@@ -77,8 +87,8 @@ mod tests {
             version: ClassFileVersion::JAVA_8,
             constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
             access_flags: flags,
-            this_class: "com/example/Test".to_string(),
-            super_class: Some("java/lang/Object".to_string()),
+            this_class: Arc::from("com/example/Test"),
+            super_class: Some(Arc::from("java/lang/Object")),
             interfaces: Vec::new(),
             fields: Vec::new(),
             methods: Vec::new(),
@@ -125,7 +135,7 @@ mod tests {
     fn source_file_present() {
         let mut cf = make_class_file(ClassAccessFlags::PUBLIC);
         cf.attributes
-            .push(LazyAttribute::new_decoded(Attribute::SourceFile("Test.java".to_string())));
+            .push(LazyAttribute::new_decoded(Attribute::SourceFile(Arc::from("Test.java"))));
         assert_eq!(cf.source_file(), Some("Test.java"));
     }
 
@@ -206,6 +216,6 @@ mod tests {
     #[test]
     fn this_class_name() {
         let cf = make_class_file(ClassAccessFlags::PUBLIC);
-        assert_eq!(cf.this_class, "com/example/Test");
+        assert_eq!(&*cf.this_class, "com/example/Test");
     }
 }

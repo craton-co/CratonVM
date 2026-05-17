@@ -1809,6 +1809,7 @@ dependencies = [
 name = "rustjvm-jfr"
 version = "0.2.0"
 dependencies = [
+ "parking_lot",
  "rustc-hash",
  "smallvec",
 ]

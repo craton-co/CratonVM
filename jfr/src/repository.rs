@@ -3,8 +3,9 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::event::{EventInstance, EventTypeId};
@@ -15,16 +16,28 @@ use crate::event::{EventInstance, EventTypeId};
 // a real lock-free single-producer/single-consumer ring (`SpscEventRing`)
 // backed by atomics. The producer is the owning thread (registers the shard
 // via `register_current_thread`, pushes via `push_to_thread_ring`); the
-// consumer is whichever thread calls `drain_all` (the dump path). Concurrent
-// drains across `ThreadRingRegistry`s are still safe because each shard is
-// only ever drained from one place at a time — the registry-level
-// `rings: Mutex<...>` serializes the shard-list snapshot, after which each
-// shard is consumed by exactly one caller within `drain_all`.
+// consumer is whichever thread calls `drain_all` (the dump path).
+//
+// Round-4 (2026-05-17): the registry-level lock is now a
+// `parking_lot::RwLock` instead of `std::sync::Mutex` — drains and shard
+// counts proceed concurrently under read locks; only first-time registration
+// takes the write lock.
 
 /// In-memory event storage with ring-buffer eviction.
 ///
 /// Uses a `VecDeque` for O(1) front eviction and maintains a secondary
 /// `type_index` mapping `EventTypeId` to buffer indices for O(1) type queries.
+///
+/// Round-4 (2026-05-17) eviction fix: the per-type index is now a
+/// `VecDeque<usize>` instead of `Vec<usize>`. The previous design used
+/// `Vec::position(...).swap_remove(...)` on every eviction — a *linear scan*
+/// of the indices for the evicted event's type (O(N_type) per push at
+/// steady-state once the ring is full, where N_type could be in the
+/// thousands for hot types like `jdk.ObjectAllocationSample`).
+///
+/// Because events are pushed in monotonic `abs_index` order, the evicted
+/// event's index for its type is *always* the front of the per-type deque,
+/// so `pop_front()` gives O(1) eviction without any search.
 pub struct EventRepository {
     events: VecDeque<EventInstance>,
     max_events: usize,
@@ -32,7 +45,10 @@ pub struct EventRepository {
     /// Index from event type_id to the set of logical indices (offset from
     /// `total_recorded - events.len()`). Maintained on push/evict/clear.
     /// T10.9.B: FxHashMap — EventTypeId is internal.
-    type_index: FxHashMap<EventTypeId, Vec<usize>>,
+    /// Round-4: per-type list is a `VecDeque<usize>` so eviction is
+    /// `pop_front()` (O(1)) instead of `position()` + `swap_remove`
+    /// (O(N_type) linear scan).
+    type_index: FxHashMap<EventTypeId, VecDeque<usize>>,
     /// The absolute index of the first element currently in `events`.
     /// Equals `total_recorded - events.len()` after each push.
     base_index: u64,
@@ -54,14 +70,32 @@ impl EventRepository {
         if self.events.len() >= self.max_events {
             // Evict oldest (front) — O(1) with VecDeque
             if let Some(evicted) = self.events.pop_front() {
-                // Remove evicted event from type index
-                if let Some(indices) = self.type_index.get_mut(&evicted.type_id) {
-                    if let Some(pos) = indices.iter().position(|&i| i == self.base_index as usize) {
-                        indices.swap_remove(pos);
+                // Remove evicted event from type index. Round-4 fix:
+                // because events are pushed in monotonic abs-index order,
+                // the front of the per-type deque is always the evicted
+                // event's index — no search needed. O(1) instead of the
+                // prior O(N_type) `position()` linear scan.
+                let drop_type = if let Some(indices) = self.type_index.get_mut(&evicted.type_id) {
+                    // Defensive: the front *should* equal base_index, but if
+                    // a future caller mutates state out of order we still
+                    // produce a correct (if slower) answer by scanning.
+                    let target = self.base_index as usize;
+                    if indices.front().copied() == Some(target) {
+                        indices.pop_front();
+                    } else if let Some(pos) = indices.iter().position(|&i| i == target) {
+                        // Fallback path — preserves correctness if the
+                        // monotonic invariant is ever broken. Logged as a
+                        // TODO so the slow path can be removed once the
+                        // invariant is verified in property tests.
+                        // TODO(round-4-wave-3): assert this path is dead.
+                        indices.remove(pos);
                     }
-                    if indices.is_empty() {
-                        self.type_index.remove(&evicted.type_id);
-                    }
+                    indices.is_empty()
+                } else {
+                    false
+                };
+                if drop_type {
+                    self.type_index.remove(&evicted.type_id);
                 }
                 self.base_index += 1;
             }
@@ -71,7 +105,7 @@ impl EventRepository {
         self.type_index
             .entry(event.type_id)
             .or_default()
-            .push(abs_index);
+            .push_back(abs_index);
 
         self.events.push_back(event);
         self.total_recorded += 1;
@@ -122,7 +156,7 @@ impl EventRepository {
                     })
                     .collect()
             }
-            None => vec![],
+            None => Vec::new(),
         }
     }
 
@@ -431,14 +465,30 @@ thread_local! {
 /// other shards); the dumper drains all shards by popping each one to
 /// exhaustion in turn.
 ///
-/// The registry-level mutex is only taken at:
-///   - first-emit registration (once per thread, lifetime)
-///   - `drain_all` (typically once per dump interval), to snapshot the list
-///     of shards. The mutex is released before we touch any shard.
+/// The registry-level lock is only taken at:
+///   - first-emit registration (once per thread, lifetime — write lock)
+///   - `drain_all` (typically once per dump interval, read lock), to snapshot
+///     the list of shards. The lock is released before we touch any shard.
 ///
-/// Steady-state emits never touch the registry-level mutex.
+/// Steady-state emits never touch the registry-level lock.
+///
+/// Round-4 (2026-05-17) drain_all race fix: the registry now uses a
+/// `parking_lot::RwLock` instead of `std::sync::Mutex`. Critical reasoning:
+///   * `register_current_thread` is the only writer (push to the shard list),
+///     and runs at most once per producer thread's lifetime.
+///   * `drain_all` and `registered_thread_count` are pure readers (clone Arcs
+///     out and release the lock before touching the shards).
+///   * Multiple dump threads no longer block each other on the registry-level
+///     critical section; the SPSC discipline still requires that the *same*
+///     shard never be drained by two threads concurrently, but the registry
+///     itself is now read-shared safely.
+///
+/// The dumper consumer-side races are addressed at the shard level: each
+/// `SpscEventRing` has a single declared consumer (the dump thread that owns
+/// the drain pass). Inside `drain_all`, every shard is popped to exhaustion
+/// by exactly one caller within the closure, preserving the SPSC contract.
 pub struct ThreadRingRegistry {
-    rings: Mutex<Vec<Arc<SpscEventRing>>>,
+    rings: RwLock<Vec<Arc<SpscEventRing>>>,
     /// Bounded capacity propagated to each newly-registered thread shard.
     /// The actual ring capacity may be rounded up to the next power of two.
     shard_capacity: usize,
@@ -451,7 +501,7 @@ impl ThreadRingRegistry {
     /// Events pushed when the ring is full are dropped (drop-newest).
     pub fn new(shard_capacity: usize) -> Self {
         Self {
-            rings: Mutex::new(Vec::new()),
+            rings: RwLock::new(Vec::new()),
             shard_capacity: shard_capacity.max(1),
         }
     }
@@ -474,9 +524,9 @@ impl ThreadRingRegistry {
             *cell.borrow_mut() = Some(Arc::clone(&ring));
         });
         // Publish a clone to the global registry so drainers can find it.
-        if let Ok(mut rings) = self.rings.lock() {
-            rings.push(Arc::clone(&ring));
-        }
+        // Write lock — held only for the duration of the push (one Arc-clone +
+        // one Vec push). `parking_lot::RwLock::write` does not return a Result.
+        self.rings.write().push(Arc::clone(&ring));
         ring
     }
 
@@ -488,16 +538,19 @@ impl ThreadRingRegistry {
     /// `start_time`.
     ///
     /// SPSC invariant: this method must not be called concurrently by two
-    /// threads on the same shard. The registry-level mutex snapshots the
-    /// shard list, but does not prevent two callers from racing on shard
-    /// drain. In practice there is exactly one dump thread per
+    /// threads on the *same shard*. The registry-level RwLock snapshots the
+    /// shard list under a read lock, but does not prevent two callers from
+    /// racing on shard drain. In practice there is exactly one dump thread per
     /// `ThreadRingRegistry` instance, so this is fine.
     pub fn drain_all(&self) -> Vec<EventInstance> {
-        // Snapshot the Arc list under the registry lock so we don't hold it
-        // while draining each shard. The Arc clones make the list cheap to copy.
-        let shards: Vec<Arc<SpscEventRing>> = match self.rings.lock() {
-            Ok(guard) => guard.iter().map(Arc::clone).collect(),
-            Err(_) => return Vec::new(),
+        // Snapshot the Arc list under a read lock so we don't hold it while
+        // draining each shard. The Arc clones make the list cheap to copy.
+        // Read lock: concurrent drains and concurrent `registered_thread_count`
+        // calls can proceed in parallel; only `register_current_thread`
+        // (which is once-per-thread-lifetime) takes the write lock.
+        let shards: Vec<Arc<SpscEventRing>> = {
+            let guard = self.rings.read();
+            guard.iter().map(Arc::clone).collect()
         };
         let mut out = Vec::new();
         for shard in shards {
@@ -508,7 +561,7 @@ impl ThreadRingRegistry {
 
     /// Number of registered thread shards. Useful for tests and diagnostics.
     pub fn registered_thread_count(&self) -> usize {
-        self.rings.lock().map(|g| g.len()).unwrap_or(0)
+        self.rings.read().len()
     }
 
     /// Bounded capacity used when registering new thread shards. (Note: the

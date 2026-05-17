@@ -6,6 +6,8 @@
 //!
 //! This is the core of Pass 3 verification (JVM spec 4.10.1).
 
+use std::sync::Arc;
+
 use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use rustjvm_reader::instruction::Instruction;
 
@@ -189,7 +191,7 @@ pub fn verify_instruction(
                     VType::from_field_descriptor(elem_desc)
                 }
                 VType::Null => VType::Null,
-                _ => VType::ObjectRef("java/lang/Object".to_string()),
+                _ => VType::ObjectRef(Arc::from("java/lang/Object")),
             };
             frame.push(elem_type)?;
             ok_through()
@@ -880,11 +882,15 @@ pub fn verify_instruction(
                     let is_ok = match &receiver {
                         super::vtype::VType::Null | super::vtype::VType::Top => true,
                         super::vtype::VType::ObjectRef(name) => {
-                            name == "java/lang/ref/Reference"
-                                || name == "java/lang/ref/WeakReference"
-                                || name == "java/lang/ref/SoftReference"
-                                || name == "java/lang/ref/PhantomReference"
-                                || hierarchy.is_subclass(name, "java/lang/ref/Reference")
+                            // `name` is `&Arc<str>`; deref to `&str` to
+                            // compare against string literals and pass into
+                            // the hierarchy trait method.
+                            let n: &str = name;
+                            n == "java/lang/ref/Reference"
+                                || n == "java/lang/ref/WeakReference"
+                                || n == "java/lang/ref/SoftReference"
+                                || n == "java/lang/ref/PhantomReference"
+                                || hierarchy.is_subclass(n, "java/lang/ref/Reference")
                         }
                         _ => false,
                     };
@@ -926,11 +932,10 @@ pub fn verify_instruction(
                 // current class, not the superclass being invoked).
                 // For Uninitialized(n), replace with the method owner
                 // (which matches the `new` site's class).
-                let replacement_class = match &receiver {
-                    VType::UninitializedThis => Some(current_class_name.to_string()),
-                    VType::Uninitialized(_) => {
-                        resolve_method_owner_name_and_type(cp, *index).map(|(o, _, _)| o)
-                    }
+                let replacement_class: Option<Arc<str>> = match &receiver {
+                    VType::UninitializedThis => Some(Arc::from(current_class_name)),
+                    VType::Uninitialized(_) => resolve_method_owner_name_and_type(cp, *index)
+                        .map(|(o, _, _)| Arc::from(o.as_str())),
                     _ => None,
                 };
                 if let Some(cls) = replacement_class {
@@ -1007,7 +1012,7 @@ pub fn verify_instruction(
                 11 => "[J", // long
                 _ => return Err(verify_err(&format!("newarray: invalid atype {_atype}"))),
             };
-            frame.push(VType::ArrayRef(desc.to_string()))?;
+            frame.push(VType::ArrayRef(Arc::from(desc)))?;
             ok_through()
         }
 
@@ -1022,7 +1027,7 @@ pub fn verify_instruction(
             } else {
                 format!("[L{class_name};")
             };
-            frame.push(VType::ArrayRef(desc))?;
+            frame.push(VType::ArrayRef(Arc::from(desc.as_str())))?;
             ok_through()
         }
 
@@ -1031,11 +1036,11 @@ pub fn verify_instruction(
             for _ in 0..*dimensions {
                 frame.pop_expect(&VType::Int, hierarchy)?;
             }
-            let class_name = cp.get_class_name(*index).ok_or_else(|| {
+            let class_name = cp.get_class_name_arc(*index).ok_or_else(|| {
                 verify_err(&format!("multianewarray: invalid class index {index}"))
             })?;
             // The result is an array reference
-            frame.push(VType::ArrayRef(class_name.to_string()))?;
+            frame.push(VType::ArrayRef(class_name))?;
             ok_through()
         }
 
@@ -1054,12 +1059,12 @@ pub fn verify_instruction(
         Instruction::Checkcast(index) => {
             pop_reference(frame, hierarchy)?;
             let class_name = cp
-                .get_class_name(*index)
+                .get_class_name_arc(*index)
                 .ok_or_else(|| verify_err(&format!("checkcast: invalid class index {index}")))?;
             if class_name.starts_with('[') {
-                frame.push(VType::ArrayRef(class_name.to_string()))?;
+                frame.push(VType::ArrayRef(class_name))?;
             } else {
-                frame.push(VType::ObjectRef(class_name.to_string()))?;
+                frame.push(VType::ObjectRef(class_name))?;
             }
             ok_through()
         }
@@ -1279,18 +1284,16 @@ fn verify_ldc(
             frame.push(VType::Float)?;
         }
         Some(ConstantPoolEntry::StringReference { .. }) => {
-            frame.push(VType::ObjectRef("java/lang/String".to_string()))?;
+            frame.push(VType::ObjectRef(Arc::from("java/lang/String")))?;
         }
         Some(ConstantPoolEntry::ClassReference { .. }) => {
-            frame.push(VType::ObjectRef("java/lang/Class".to_string()))?;
+            frame.push(VType::ObjectRef(Arc::from("java/lang/Class")))?;
         }
         Some(ConstantPoolEntry::MethodHandle { .. }) => {
-            frame.push(VType::ObjectRef(
-                "java/lang/invoke/MethodHandle".to_string(),
-            ))?;
+            frame.push(VType::ObjectRef(Arc::from("java/lang/invoke/MethodHandle")))?;
         }
         Some(ConstantPoolEntry::MethodType { .. }) => {
-            frame.push(VType::ObjectRef("java/lang/invoke/MethodType".to_string()))?;
+            frame.push(VType::ObjectRef(Arc::from("java/lang/invoke/MethodType")))?;
         }
         Some(ConstantPoolEntry::Dynamic {
             name_and_type_index,
@@ -1628,7 +1631,7 @@ mod tests {
 
         assert_eq!(
             frame.pop().unwrap(),
-            VType::ObjectRef("java/lang/String".to_string())
+            VType::ObjectRef(Arc::from("java/lang/String"))
         );
     }
 
@@ -1769,7 +1772,7 @@ mod tests {
         let h = MockHierarchy;
         let mut frame = make_frame(1, 4);
         frame
-            .push(VType::ObjectRef("java/lang/Exception".to_string()))
+            .push(VType::ObjectRef(Arc::from("java/lang/Exception")))
             .unwrap();
 
         let result =

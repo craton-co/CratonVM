@@ -629,9 +629,13 @@ impl ValueStack {
             // reinterpret the bits.
             CompactTag::Double => {
                 self.len -= 1;
-                // as_double returns None only for NaN-tagged slots, which we've
-                // excluded; but be defensive in case of edge cases.
-                Ok(cv.as_double().unwrap_or(f64::from_bits(cv.to_bits())))
+                // `as_double()` returns None exclusively for NaN-tagged
+                // slots, which the `CompactTag::Double` arm has already
+                // excluded — the previous `unwrap_or(from_bits(to_bits()))`
+                // was always taking the `Some` branch and the fallback was
+                // pure dead code hiding the type-safety invariant.
+                // For the same reason this `expect` cannot fire at runtime.
+                Ok(cv.as_double().expect("CompactTag::Double slot always decodes via as_double"))
             }
             CompactTag::Long => {
                 // A raw i64 value landed here (e.g. via `CompactValue::long`

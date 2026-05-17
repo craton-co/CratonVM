@@ -37,6 +37,14 @@ thread_local! {
     /// Pending AIOOBE from JIT bounds check.  Set by `jit_throw_aioobe`,
     /// consumed by the interpreter after JIT code returns `i64::MIN`.
     static JIT_PENDING_AIOOBE: Cell<Option<(i64, i64)>> = const { Cell::new(None) };
+
+    /// Pending NullPointerException from a JIT array helper (`jit_iaload`,
+    /// `jit_aaload`, `jit_arraylength` called with a null array reference).
+    /// Consumed by the interpreter post-JIT-return path the same way as
+    /// `JIT_PENDING_AIOOBE`. The helper returns `i64::MIN` to signal deopt;
+    /// the interpreter detects the sentinel, takes this flag, and throws a
+    /// real `NullPointerException` through the method's exception table.
+    static JIT_PENDING_NPE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Set the current thread's JvmThread pointer for JIT helper access.
@@ -91,6 +99,26 @@ pub fn take_jit_pending_aioobe() -> Option<(i64, i64)> {
     JIT_PENDING_AIOOBE.with(|e| e.take())
 }
 
+/// Take (consume) a pending NPE from a JIT array helper (`jit_iaload`,
+/// `jit_aaload`, `jit_arraylength`). Returns `true` if an NPE was pending.
+///
+/// The JVM specifies that all three opcodes throw `NullPointerException`
+/// when their array reference is null; the JIT array helpers previously
+/// swallowed the null silently (returning 0 / -1), which let JIT'd
+/// Java code continue with corrupt state. Now they set this flag, return
+/// `i64::MIN`, and the interpreter post-JIT path constructs the real
+/// `java/lang/NullPointerException` and routes it through the method's
+/// exception table — same pattern as `take_jit_pending_aioobe`.
+pub fn take_jit_pending_npe() -> bool {
+    JIT_PENDING_NPE.with(|e| e.take())
+}
+
+/// Internal: set the pending-NPE flag. Called from the array helpers.
+#[inline]
+fn set_jit_pending_npe() {
+    JIT_PENDING_NPE.with(|e| e.set(true));
+}
+
 /// Obtain an exclusive reference to the JIT thread. Returns None if not set.
 ///
 /// # Safety
@@ -115,14 +143,44 @@ unsafe fn jit_thread_mut() -> Option<&'static mut JvmThread> {
 /// `entry` must be a live code pointer from [`try_jit_compile_callee`] /
 /// `CompiledMethod::entry_ptr`. `args_slice` is the raw `i64` array the JIT
 /// stub passes (receiver + parameters in JVM order).
+///
+/// **Arity limits.** The transmuted call-tables below cover the System V
+/// AMD64 / win64 register-arg conventions for up to 4 Java args (plus an
+/// optional `vm_ptr` context slot). For methods with more arguments we do
+/// **not** silently return 0 — that was a HIGH-severity correctness bug
+/// that let any JIT-dispatched callsite with a 5+ arg method (e.g. many
+/// `java.util.concurrent` worker constructors, Spring `BeanWrapperImpl`
+/// setters) appear to return null/0 to its caller while never actually
+/// executing the body.
+///
+/// TODO(round-4-wave-3): emit stack arg setup for >4 arg JIT calls so we
+/// can stay on the compiled fast path. Until then, callees with too many
+/// args are routed through the interpreter via `bail_to_interpreter`. The
+/// caller passes `vm`, `thread`, `info`, and the decoded `Value` arg
+/// vector so the bailout can issue a real `invoke_or_native` and surface
+/// any thrown exception through `handle_jit_dispatch_error`.
 #[inline]
 unsafe fn call_jit_compiled_method_entry(
     entry: usize,
     needs_ctx: bool,
     vm_ptr: i64,
     args_slice: &[i64],
+    // Bailout context. `bail_args` are the Java-level `Value`s reconstructed
+    // by the caller; on too-many-args we hand them to `invoke_or_native`.
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    bail_args: &[Value],
 ) -> i64 {
     let n = args_slice.len();
+    // Register-arg coverage: ctx-ABI can pass 3 Java args plus vm_ptr (4 total
+    // System V regs); no-ctx ABI can pass 4 Java args. Beyond that we don't
+    // have stack-arg setup, so bail to the interpreter rather than calling
+    // through with truncated arguments.
+    let register_limit = if needs_ctx { 3 } else { 4 };
+    if n > register_limit {
+        return bail_to_interpreter(vm, thread, info, bail_args);
+    }
     if needs_ctx {
         match n {
             0 => {
@@ -141,7 +199,8 @@ unsafe fn call_jit_compiled_method_entry(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
             }
-            _ => 0,
+            // Unreachable — guarded by `register_limit` check above.
+            _ => bail_to_interpreter(vm, thread, info, bail_args),
         }
     } else {
         match n {
@@ -165,7 +224,45 @@ unsafe fn call_jit_compiled_method_entry(
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
             }
-            _ => 0,
+            // Unreachable — guarded by `register_limit` check above.
+            _ => bail_to_interpreter(vm, thread, info, bail_args),
+        }
+    }
+}
+
+/// Bail a JIT-dispatched call out to the interpreter when the compiled
+/// callee has more arguments than `call_jit_compiled_method_entry`'s
+/// register-arg dispatch tables can pass. Issues `invoke_or_native` with
+/// the full `Value` argument vector and converts the result back to the
+/// `i64` register-ABI return value expected by the JIT caller. Exceptions
+/// are stashed via `handle_jit_dispatch_error` so the interpreter post-JIT
+/// path can route them through the caller's exception table.
+#[inline(never)]
+unsafe fn bail_to_interpreter(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    args: &[Value],
+) -> i64 {
+    let res = crate::vm::invoke_or_native(
+        vm,
+        thread,
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+        args,
+    );
+    match res {
+        Ok(Some(Value::Int(v))) => v as i64,
+        Ok(Some(Value::Long(v))) => v,
+        Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+        Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+        Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+        Ok(Some(Value::Object(None))) | Ok(None) => 0,
+        Ok(_) => 0,
+        Err(e) => {
+            handle_jit_dispatch_error(vm, thread, e, info);
+            0
         }
     }
 }
@@ -436,9 +533,16 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to an int array object. Null and out-of-bounds are handled gracefully.
+// pointer to an int array object. Null triggers a pending NPE + `i64::MIN` deopt
+// sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
-    if array_ptr == 0 { return 0; }
+    if array_ptr == 0 {
+        // JVMS §iaload: throw NullPointerException on null array reference.
+        // Signal the interpreter via the pending-NPE flag + `i64::MIN` deopt
+        // sentinel (same protocol as `jit_throw_aioobe`).
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     // SAFETY: array_ptr is non-null and points to a live int[] on the GC heap.
     // The element at HEADER_SIZE + index*4 is within bounds (checked below).
     let ptr = array_ptr as *const u8;
@@ -465,9 +569,14 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to a reference array object. Null and out-of-bounds are handled gracefully.
+// pointer to a reference array object. Null triggers a pending NPE + `i64::MIN`
+// deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
-    if array_ptr == 0 { return 0; }
+    if array_ptr == 0 {
+        // JVMS §aaload: throw NullPointerException on null array reference.
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
     // ptr::read is used because Value::Object may contain non-Copy ObjectRef.
     let ptr = array_ptr as *const u8;
@@ -543,9 +652,16 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to any array object. Returns the array length or -1 for null.
+// pointer to any array object. Null triggers a pending NPE + `i64::MIN` deopt
+// sentinel (JVMS §arraylength requires NullPointerException on null).
 pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
-    if array_ptr == 0 { return -1; }
+    if array_ptr == 0 {
+        // JVMS §arraylength: throw NullPointerException on null array reference.
+        // Previously returned -1, which JIT'd Java would happily compare against
+        // and use as an array bound — masking real null-deref bugs in user code.
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     // SAFETY: array_ptr is non-null and points to a live array on the GC heap.
     // ARRAY_LENGTH_OFFSET is the fixed offset to the u32 length field.
     let ptr = array_ptr as *const u8;
@@ -1598,7 +1714,21 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             let needs_ctx = mic
                 .cached_needs_context
                 .load(std::sync::atomic::Ordering::Acquire);
-            return call_jit_compiled_method_entry(entry as usize, needs_ctx, vm_ptr, args_slice);
+            // `values` already holds the full receiver + decoded param vector
+            // for this dispatch site (built above before the cache hit). It
+            // is forwarded as the bailout argument list so that callees with
+            // more than 4 args route through the interpreter instead of
+            // silently returning 0 from the truncated register-arg table.
+            return call_jit_compiled_method_entry(
+                entry as usize,
+                needs_ctx,
+                vm_ptr,
+                args_slice,
+                vm,
+                thread,
+                info,
+                &values,
+            );
         }
 
         // Entry not cached yet — use cached class name for fast dispatch.
@@ -1897,20 +2027,43 @@ impl DeoptimizationController {
         );
 
         // Emit JFR deoptimization event
+        // Round-4: emit_deoptimization_event takes `&'static str` for reason
+        // and action — both are bounded enums, so map to static literals
+        // rather than `format!("{:?}", ...)`-allocating per deopt.
         {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
+            let reason_static: &'static str = match reason {
+                rustjvm_jit::deopt::DeoptReason::NullCheck => "NullCheck",
+                rustjvm_jit::deopt::DeoptReason::ClassCheck => "ClassCheck",
+                rustjvm_jit::deopt::DeoptReason::BoundsCheck => "BoundsCheck",
+                rustjvm_jit::deopt::DeoptReason::DivByZero => "DivByZero",
+                rustjvm_jit::deopt::DeoptReason::ReceiverTypeChanged => "ReceiverTypeChanged",
+                rustjvm_jit::deopt::DeoptReason::ClassLoading => "ClassLoading",
+                rustjvm_jit::deopt::DeoptReason::UninitializedAccess => "UninitializedAccess",
+                rustjvm_jit::deopt::DeoptReason::TransferToInterpreter => "TransferToInterpreter",
+                rustjvm_jit::deopt::DeoptReason::UncommonTrap => "UncommonTrap",
+                rustjvm_jit::deopt::DeoptReason::SpeculationFailed => "SpeculationFailed",
+                rustjvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
+                rustjvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
+            };
+            let action_static: &'static str = match action {
+                rustjvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",
+                rustjvm_jit::deopt::DeoptAction::RecompileAndReinterpret => "RecompileAndReinterpret",
+                rustjvm_jit::deopt::DeoptAction::MakeNotEntrant => "MakeNotEntrant",
+                rustjvm_jit::deopt::DeoptAction::MakeNotCompilable => "MakeNotCompilable",
+            };
             let mut jfr = vm.flight_recorder.lock();
             rustjvm_jfr::builtin::emit_deoptimization_event(
                 &mut jfr,
                 &method_key,
                 0, // compile_id
-                &format!("{:?}", reason),
-                &format!("{:?}", action),
+                reason_static,
+                action_static,
                 bci as i32,
-                0, // thread_id
+                0, // thread_id — TODO(round-4-wave-3): plumb real thread id
                 now_ns,
             );
         }
@@ -2064,24 +2217,35 @@ mod tests {
     }
 
     #[test]
-    fn jit_iaload_null_returns_zero() {
+    fn jit_iaload_null_sets_pending_npe() {
         // SAFETY: array_ptr is 0 (null), so the function returns early without dereferencing.
+        // JVMS §iaload: NPE on null array. Helper returns the i64::MIN deopt sentinel
+        // and sets the pending-NPE flag for the interpreter to consume.
+        let _ = take_jit_pending_npe(); // clear any prior state
         let result = unsafe { jit_iaload(0, 0) };
-        assert_eq!(result, 0);
+        assert_eq!(result, i64::MIN);
+        assert!(take_jit_pending_npe(), "iaload(null) must set pending NPE flag");
     }
 
     #[test]
-    fn jit_aaload_null_returns_zero() {
+    fn jit_aaload_null_sets_pending_npe() {
         // SAFETY: array_ptr is 0 (null), so the function returns early without dereferencing.
+        // JVMS §aaload: NPE on null array.
+        let _ = take_jit_pending_npe();
         let result = unsafe { jit_aaload(0, 0) };
-        assert_eq!(result, 0);
+        assert_eq!(result, i64::MIN);
+        assert!(take_jit_pending_npe(), "aaload(null) must set pending NPE flag");
     }
 
     #[test]
-    fn jit_arraylength_null_returns_neg_one() {
+    fn jit_arraylength_null_sets_pending_npe() {
         // SAFETY: array_ptr is 0 (null), so the function returns early without dereferencing.
+        // JVMS §arraylength: NPE on null array. Previously returned -1, which
+        // silently corrupted any downstream length-comparison or loop-bound use.
+        let _ = take_jit_pending_npe();
         let result = unsafe { jit_arraylength(0) };
-        assert_eq!(result, -1);
+        assert_eq!(result, i64::MIN);
+        assert!(take_jit_pending_npe(), "arraylength(null) must set pending NPE flag");
     }
 
     #[test]

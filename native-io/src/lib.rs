@@ -78,12 +78,20 @@ pub fn is_path_validation_enabled() -> bool {
 
 /// Validate a file path to prevent path traversal and null-byte injection.
 /// Returns the canonicalized path string on success, or an error on failure.
+///
+/// AUDIT 2026-05-17:
+///   * The null-byte check ALWAYS runs — it is a security check, not a
+///     validation toggle. A null byte in a path is a known C-string
+///     truncation attack on the host syscall layer regardless of whether
+///     traversal checks are enabled.
+///   * Traversal rejection uses `Path::components()` so that legitimate
+///     filenames such as `foo..bar.txt` (which contain `..` as a literal
+///     substring but no `..` segment) are accepted. We reject only paths
+///     containing a `ParentDir` component (`..` as a path segment).
 fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
-    if !is_path_validation_enabled() {
-        return Ok(path.to_string());
-    }
-
-    // Reject null bytes
+    // Reject null bytes (security check — runs even when validation
+    // is otherwise disabled, since a NUL truncates the path at the
+    // host C-string boundary).
     if path.contains('\0') {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::SecurityException {
@@ -92,8 +100,17 @@ fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
         )));
     }
 
-    // Reject path traversal sequences
-    if path.contains("..") {
+    if !is_path_validation_enabled() {
+        return Ok(path.to_string());
+    }
+
+    // Reject path traversal sequences — only reject `..` as a path
+    // segment, not as a substring. `foo..bar.txt` is a perfectly legal
+    // filename.
+    if Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::SecurityException {
                 message: format!("Path traversal detected: {}", path),
@@ -648,9 +665,9 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    for (i, &byte) in buf[..n].iter().enumerate() {
-        ctx.set_array_element(arr, off + i, Value::Int(byte as i32));
-    }
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic (round-3
+    // perf path) — avoids N virtual dispatches + Value boxing per byte.
+    ctx.write_byte_array_from(arr, off, &buf[..n]);
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -674,9 +691,8 @@ fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    for (i, &byte) in buf[..n].iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(byte as i32));
-    }
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
+    ctx.write_byte_array_from(arr, 0, &buf[..n]);
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -862,11 +878,8 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(None),
     };
     let mut buf = vec![0u8; len];
-    for (i, slot) in buf.iter_mut().enumerate() {
-        if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
-            *slot = b as u8;
-        }
-    }
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
+    ctx.read_byte_array_into(arr, off, &mut buf);
     let write_start = std::time::Instant::now();
     ctx.fd_table().write_bytes(fd, &buf).map_err(io_err)?;
     let write_dur = write_start.elapsed();
@@ -890,11 +903,8 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let mut buf = vec![0u8; len];
-    for (i, slot) in buf.iter_mut().enumerate() {
-        if let Value::Int(b) = ctx.get_array_element(arr, i) {
-            *slot = b as u8;
-        }
-    }
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
+    ctx.read_byte_array_into(arr, 0, &mut buf);
     ctx.fd_table().write_bytes(fd, &buf).map_err(io_err)?;
     Ok(None)
 }
@@ -942,11 +952,8 @@ fn native_fos_write_bytes_ignore_append(ctx: &mut dyn NativeContext, args: &[Val
         _ => return Ok(None),
     };
     let mut buf = vec![0u8; len];
-    for (i, slot) in buf.iter_mut().enumerate() {
-        if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
-            *slot = b as u8;
-        }
-    }
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
+    ctx.read_byte_array_into(arr, off, &mut buf);
     ctx.fd_table().write_bytes(fd, &buf).map_err(io_err)?;
     Ok(None)
 }
@@ -12020,6 +12027,25 @@ mod io_tests {
         let result = validate_path("/etc/../passwd");
         assert!(result.is_ok());
         // Reset to default
+        set_path_validation_enabled(true);
+    }
+
+    /// AUDIT 2026-05-17: legitimate filenames that contain `..` as a
+    /// literal substring (but not as a path segment) must be accepted.
+    #[test]
+    fn path_validation_accepts_literal_dotdot_in_filename() {
+        set_path_validation_enabled(true);
+        let result = validate_path("/tmp/foo..bar.txt");
+        assert!(result.is_ok(), "rejected legitimate filename: {result:?}");
+    }
+
+    /// AUDIT 2026-05-17: the null-byte check is a security check and
+    /// must run even when path validation is otherwise disabled.
+    #[test]
+    fn path_validation_disabled_still_rejects_null_byte() {
+        set_path_validation_enabled(false);
+        let result = validate_path("/etc/passwd\0.txt");
+        assert!(result.is_err(), "null byte accepted with validation off");
         set_path_validation_enabled(true);
     }
 

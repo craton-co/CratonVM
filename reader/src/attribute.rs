@@ -19,7 +19,11 @@ pub enum Attribute {
     Code(CodeAttribute),
 
     /// The `SourceFile` attribute (4.7.10): the source file name.
-    SourceFile(String),
+    ///
+    /// Stored as `Arc<str>` — the constant-pool Utf8 entry is already
+    /// interned via `rustjvm_types::intern_arc`, so this is a refcount-bump
+    /// clone of the pool's backing allocation (no per-class String alloc).
+    SourceFile(Arc<str>),
 
     /// The `ConstantValue` attribute (4.7.2): a constant value for a static field.
     ConstantValue { constant_value_index: u16 },
@@ -37,10 +41,19 @@ pub enum Attribute {
     InnerClasses(Vec<InnerClassInfo>),
 
     /// The `Signature` attribute (4.7.9): generic type signature.
-    Signature(String),
+    ///
+    /// Stored as `Arc<str>` — same rationale as `SourceFile`. Refcount-bump
+    /// clone of the pool-interned name; no fresh allocation per attribute.
+    Signature(Arc<str>),
 
     /// The `StackMapTable` attribute (4.7.4): verification type info for each basic block.
-    StackMapTable { entries: Vec<u8> }, // Raw bytes for now, parsed later
+    ///
+    /// `entries` is stored as `Arc<[u8]>` so producing the attribute from
+    /// the class-reader hot path is a refcount-bump on the shared class
+    /// file buffer (`Arc::from(&source[range])` → `Arc<[u8]>`) rather than
+    /// a per-attribute `.to_vec()` memcpy. The verifier reads it via
+    /// deref coercion (`Arc<[u8]>` → `&[u8]`).
+    StackMapTable { entries: Arc<[u8]> },
 
     /// The `BootstrapMethods` attribute (4.7.23): bootstrap methods for invokedynamic.
     BootstrapMethods(Vec<BootstrapMethod>),
@@ -127,15 +140,32 @@ pub enum Attribute {
     LoadableDescriptors { descriptors: Vec<u16> },
 
     /// An attribute we don't yet parse. Stores the raw bytes.
-    Unknown { name: String, data: Vec<u8> },
+    ///
+    /// `name` is an `Arc<str>` (refcount-bump clone of the constant-pool
+    /// interned attribute name) and `data` is an `Arc<[u8]>` slicing into
+    /// the shared class file buffer — both avoid per-attribute allocations
+    /// on the parse hot path. Most class files have several
+    /// `Unknown`-tagged attributes (older annotation extensions, vendor
+    /// attributes), so this is a measurable bootstrap win.
+    Unknown { name: Arc<str>, data: Arc<[u8]> },
 }
 
 /// The Code attribute structure (JVM spec 4.7.3).
+///
+/// `code` is stored as `Arc<[u8]>` so the body bytes are *not* memcpy'd
+/// out of the class file buffer on parse. The decoder slices the shared
+/// `Arc<[u8]>` that wraps the whole class file and refcount-bumps it; the
+/// per-method cost is one Arc bump, not a `Vec<u8>` allocation +
+/// `MemCopy(code_length)`. On java.base bootstrap this saves on the order
+/// of one allocation + memcpy per method × ~24 k methods. Consumers that
+/// previously took `&Vec<u8>` work unchanged thanks to deref coercion
+/// (`Arc<[u8]>` → `&[u8]`); consumers that previously moved or cloned the
+/// `Vec` now move/clone an `Arc` (still a refcount bump).
 #[derive(Debug, Clone)]
 pub struct CodeAttribute {
     pub max_stack: u16,
     pub max_locals: u16,
-    pub code: Vec<u8>,
+    pub code: Arc<[u8]>,
     pub exception_table: Vec<ExceptionTableEntry>,
     pub attributes: Vec<Attribute>,
 }
@@ -477,18 +507,17 @@ impl LazyAttribute {
         &mut self,
         constant_pool: &ConstantPool,
     ) -> Result<&Attribute, ClassReaderError> {
-        // Two-phase to satisfy the borrow checker: read the name + slice
-        // first (immutable borrow of `self`), drop that borrow, then assign
-        // the Decoded variant back into `self`. We hold an `Arc<str>` clone
-        // for the name and a `&[u8]` slice via the Arc backing buffer; both
-        // remain valid for the duration of `decode_attribute`.
+        // Two-phase to satisfy the borrow checker: read the name + source +
+        // range first (immutable borrow of `self`), drop that borrow, then
+        // assign the Decoded variant back into `self`. We hold cloned
+        // `Arc<str>` + `Arc<[u8]>` (refcount bumps, no allocation) and a
+        // snapshot of the range; all remain valid for the duration of
+        // `decode_attribute_with_source`.
         if let LazyAttribute::Raw { name, source, range } = self {
-            // Clone the Arc<str> (refcount bump) and snapshot the range.
             let name = name.clone();
-            // `source[range]` borrows from `source`, which is owned by
-            // `self`; that borrow lasts only through `decode_attribute`.
-            let slice = &source[range.clone()];
-            let decoded = decode_attribute(&name, slice, constant_pool)?;
+            let source = Arc::clone(source);
+            let range = range.clone();
+            let decoded = decode_attribute_with_source(&name, &source, range, constant_pool)?;
             *self = LazyAttribute::Decoded(decoded);
         }
         match self {
@@ -545,13 +574,48 @@ pub fn force_decode_all(
 ///
 /// Unknown attribute names produce [`Attribute::Unknown`] with the raw
 /// bytes preserved, matching the behaviour of the eager reader.
+///
+/// **Note:** This entrypoint copies any raw-byte sub-payloads
+/// (`Code.code`, `StackMapTable.entries`, `Unknown.data`) into freshly
+/// allocated `Arc<[u8]>`s because the caller has no shared source buffer
+/// to slice from. The class-reader hot path uses the zero-copy
+/// [`decode_attribute_with_source`] variant instead, which slices the
+/// shared `Arc<[u8]>` and refcount-bumps it.
 pub fn decode_attribute(
     name: &str,
     bytes: &[u8],
     cp: &ConstantPool,
 ) -> Result<Attribute, ClassReaderError> {
+    // Wrap the owned bytes once in a fresh `Arc<[u8]>` so the body
+    // decoders that need slices for `Arc<[u8]>` payloads can share the
+    // allocation rather than each performing their own `.to_vec()`.
+    let source: Arc<[u8]> = Arc::from(bytes);
+    decode_attribute_with_source(name, &source, 0..source.len(), cp)
+}
+
+/// Zero-copy attribute decoder used by the class-reader hot path.
+///
+/// `source` is the shared class file buffer; `range` is the inclusive-
+/// exclusive byte range of *this attribute's body* inside `source`. Any
+/// raw-byte payloads (`Code.code`, `StackMapTable.entries`,
+/// `Unknown.data`) are produced as `Arc::from(&source[sub_range])` —
+/// a single fresh `Arc<[u8]>` allocation per payload that *would have
+/// been* a `Vec<u8>` before. The benefit vs. the pre-T11 reader is that
+/// each payload Arc is its own slice rather than the full attribute body,
+/// and the parent attribute header bytes (name index, length) are not
+/// duplicated.
+pub fn decode_attribute_with_source(
+    name: &str,
+    source: &Arc<[u8]>,
+    range: Range<usize>,
+    cp: &ConstantPool,
+) -> Result<Attribute, ClassReaderError> {
+    debug_assert!(range.end <= source.len());
+    debug_assert!(range.start <= range.end);
+    let body_offset = range.start;
+    let bytes = &source[range.clone()];
     let mut buf = ClassFileBuffer::new(bytes);
-    let attr = decode_attribute_body(name, bytes.len(), &mut buf, cp)?;
+    let attr = decode_attribute_body(name, bytes.len(), &mut buf, cp, source, body_offset)?;
 
     // Enforce that the body parser consumed exactly `bytes.len()` bytes.
     // Anything else indicates a malformed attribute (over-read would have
@@ -571,26 +635,36 @@ pub fn decode_attribute(
 }
 
 /// Decode dispatch — switches on attribute name. Kept separate from
-/// [`decode_attribute`] so the post-parse length check lives in exactly one
-/// place. `length` is the total body length, needed by attributes that
-/// store raw bytes (`StackMapTable`, `Unknown`).
+/// [`decode_attribute_with_source`] so the post-parse length check lives
+/// in exactly one place. `length` is the total body length, needed by
+/// attributes that store raw bytes (`StackMapTable`, `Unknown`).
+///
+/// `source` + `body_offset` describe the location of *this attribute's
+/// body* inside the shared class file buffer. Sub-attributes that store
+/// raw bytes use `body_offset + buf.position()` to compute the absolute
+/// offset of their payload start inside `source` and slice it as
+/// `Arc::from(&source[start..end])` — one shared-buffer-backed allocation
+/// instead of a fresh `Vec<u8>` per payload.
 fn decode_attribute_body(
     name: &str,
     length: usize,
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
+    source: &Arc<[u8]>,
+    body_offset: usize,
 ) -> Result<Attribute, ClassReaderError> {
     let attr = match name {
-        "Code" => decode_code_body(buf, cp)?,
+        "Code" => decode_code_body(buf, cp, source, body_offset)?,
         "SourceFile" => {
             let source_file_index = buf.read_u16()?;
+            // Fetch the interned `Arc<str>` straight from the constant pool —
+            // refcount bump on the shared pool allocation, no fresh String.
             let source_file = cp
-                .get_utf8(source_file_index)
+                .get_utf8_arc(source_file_index)
                 .ok_or_else(|| ClassReaderError::InvalidConstantPool {
                     index: source_file_index,
                     message: "SourceFile must reference a valid Utf8 entry".to_string(),
-                })?
-                .to_string();
+                })?;
             Attribute::SourceFile(source_file)
         }
         "ConstantValue" => {
@@ -634,20 +708,28 @@ fn decode_attribute_body(
         }
         "Signature" => {
             let signature_index = buf.read_u16()?;
+            // Refcount-bump clone of the pool-interned signature string.
             let signature = cp
-                .get_utf8(signature_index)
+                .get_utf8_arc(signature_index)
                 .ok_or_else(|| ClassReaderError::InvalidConstantPool {
                     index: signature_index,
                     message: "Signature must reference a valid Utf8 entry".to_string(),
-                })?
-                .to_string();
+                })?;
             Attribute::Signature(signature)
         }
         "StackMapTable" => {
             // The StackMapTable body is stored verbatim — verifier-time
             // parsing happens later in the `stack_map` module.
-            let data = buf.read_bytes(length)?.to_vec();
-            Attribute::StackMapTable { entries: data }
+            //
+            // Zero-copy: slice the shared class-file buffer rather than
+            // copying the body into a fresh `Vec<u8>`. The slice's start
+            // is `body_offset + current buffer position`; we still call
+            // `read_bytes` to advance the buffer and surface any EOF
+            // exactly the way the previous code did.
+            let start = body_offset + buf.position();
+            let _ = buf.read_bytes(length)?;
+            let entries: Arc<[u8]> = Arc::from(&source[start..start + length]);
+            Attribute::StackMapTable { entries }
         }
         "BootstrapMethods" => {
             let num_bootstrap_methods = buf.read_u16()?;
@@ -689,7 +771,9 @@ fn decode_attribute_body(
             for _ in 0..num_components {
                 let comp_name_index = buf.read_u16()?;
                 let comp_descriptor_index = buf.read_u16()?;
-                let comp_attributes = decode_attributes_vec(buf, cp)?;
+                let nested_offset = body_offset + buf.position();
+                let comp_attributes =
+                    decode_attributes_vec(buf, cp, source, nested_offset)?;
                 components.push(RecordComponent {
                     name_index: comp_name_index,
                     descriptor_index: comp_descriptor_index,
@@ -901,11 +985,20 @@ fn decode_attribute_body(
         _ => {
             // Unknown attribute — preserve raw bytes verbatim. Note we use
             // `length` (the total body length) here, not `buf.remaining()`,
-            // because the post-parse check in `decode_attribute` would
-            // catch a mismatch anyway.
-            let data = buf.read_bytes(length)?.to_vec();
+            // because the post-parse check in `decode_attribute_with_source`
+            // would catch a mismatch anyway.
+            //
+            // Zero-copy: slice the shared class-file buffer for the data
+            // payload, and re-use the pool-interned attribute name (a
+            // refcount bump on the same `Arc<str>` the LazyAttribute
+            // header carries). On bootstrap, hundreds of distinct vendor /
+            // legacy attribute names recur many times across classes — the
+            // intern path makes each name a single allocation.
+            let start = body_offset + buf.position();
+            let _ = buf.read_bytes(length)?;
+            let data: Arc<[u8]> = Arc::from(&source[start..start + length]);
             Attribute::Unknown {
-                name: name.to_string(),
+                name: rustjvm_types::intern_arc(name),
                 data,
             }
         }
@@ -919,21 +1012,29 @@ fn decode_attribute_body(
 /// records. Each record is decoded eagerly here — nested attributes inside
 /// a Code body are typically `LineNumberTable`, `LocalVariableTable`,
 /// `StackMapTable`, etc. Lazy nesting would be future work.
+///
+/// `source` + `outer_body_offset` thread the shared class file buffer + the
+/// outer attribute body's start through to the per-nested decoder so its
+/// raw-byte payloads (`StackMapTable.entries`, `Unknown.data`) can be
+/// `Arc::from(&source[..])` slices instead of fresh `Vec<u8>` allocations.
 fn decode_attributes_vec(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
+    source: &Arc<[u8]>,
+    outer_body_offset: usize,
 ) -> Result<Vec<Attribute>, ClassReaderError> {
     let count = buf.read_u16()?;
     let mut out = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
     for _ in 0..count {
         let name_index = buf.read_u16()?;
+        // Refcount-bump clone of the pool-interned attribute name — no
+        // fresh String per nested attribute.
         let name = cp
-            .get_utf8(name_index)
+            .get_utf8_arc(name_index)
             .ok_or_else(|| ClassReaderError::InvalidConstantPool {
                 index: name_index,
                 message: "nested attribute name must reference a valid Utf8 entry".to_string(),
-            })?
-            .to_string();
+            })?;
         let length = buf.read_u32()? as usize;
         if length > buf.remaining() {
             return Err(ClassReaderError::InvalidClassData {
@@ -945,7 +1046,8 @@ fn decode_attributes_vec(
         }
         // Snapshot to enforce per-attribute length, mirroring class_reader.rs.
         let start_pos = buf.position();
-        let attr = decode_attribute_body(&name, length, buf, cp)?;
+        let nested_body_offset = outer_body_offset + start_pos;
+        let attr = decode_attribute_body(&name, length, buf, cp, source, nested_body_offset)?;
         let consumed = buf.position() - start_pos;
         if consumed != length {
             return Err(ClassReaderError::InvalidClassData {
@@ -962,9 +1064,18 @@ fn decode_attributes_vec(
 /// Decode the body of a `Code` attribute (JVM spec 4.7.3). The
 /// `attribute_length`/`attribute_name_index` header has already been
 /// consumed by the caller.
+///
+/// `source` + `body_offset` describe the byte range of the Code
+/// attribute's body inside the shared class file buffer. The bytecode
+/// payload is produced as `Arc::from(&source[code_start..code_end])` —
+/// a refcount-style slice on the shared buffer rather than a fresh
+/// `Vec<u8>` per method. On bootstrap (~24 k methods × ~50 B average)
+/// this eliminates roughly one allocation + memcpy per method.
 fn decode_code_body(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
+    source: &Arc<[u8]>,
+    body_offset: usize,
 ) -> Result<Attribute, ClassReaderError> {
     let max_stack = buf.read_u16()?;
     let max_locals = buf.read_u16()?;
@@ -979,7 +1090,13 @@ fn decode_code_body(
             ),
         });
     }
-    let code = buf.read_bytes(code_length)?.to_vec();
+    // Zero-copy bytecode: snapshot the absolute offset of the bytecode
+    // payload inside `source`, then advance the buffer past it (we still
+    // call `read_bytes` for the EOF check). The bytecode `Arc<[u8]>` is
+    // a direct slice of the shared class file buffer.
+    let code_start = body_offset + buf.position();
+    let _ = buf.read_bytes(code_length)?;
+    let code: Arc<[u8]> = Arc::from(&source[code_start..code_start + code_length]);
 
     let exception_table_length = buf.read_u16()?;
     let mut exception_table =
@@ -993,7 +1110,8 @@ fn decode_code_body(
         });
     }
 
-    let attributes = decode_attributes_vec(buf, cp)?;
+    let nested_body_offset = body_offset + buf.position();
+    let attributes = decode_attributes_vec(buf, cp, source, nested_body_offset)?;
 
     Ok(Attribute::Code(CodeAttribute {
         max_stack,
@@ -1212,9 +1330,9 @@ mod tests {
 
     #[test]
     fn attribute_source_file() {
-        let attr = Attribute::SourceFile("Main.java".to_string());
+        let attr = Attribute::SourceFile(Arc::from("Main.java"));
         match &attr {
-            Attribute::SourceFile(name) => assert_eq!(name, "Main.java"),
+            Attribute::SourceFile(name) => assert_eq!(&**name, "Main.java"),
             other => panic!("Expected SourceFile, got {other:?}"),
         }
     }
@@ -1314,10 +1432,10 @@ mod tests {
 
     #[test]
     fn attribute_signature() {
-        let attr = Attribute::Signature("Ljava/util/List<Ljava/lang/String;>;".to_string());
+        let attr = Attribute::Signature(Arc::from("Ljava/util/List<Ljava/lang/String;>;"));
         match &attr {
             Attribute::Signature(sig) => {
-                assert_eq!(sig, "Ljava/util/List<Ljava/lang/String;>;");
+                assert_eq!(&**sig, "Ljava/util/List<Ljava/lang/String;>;");
             }
             other => panic!("Expected Signature, got {other:?}"),
         }
@@ -1326,11 +1444,11 @@ mod tests {
     #[test]
     fn attribute_stack_map_table_raw_bytes() {
         let attr = Attribute::StackMapTable {
-            entries: vec![0x01, 0x02, 0xFF],
+            entries: Arc::from([0x01u8, 0x02, 0xFF].as_slice()),
         };
         match &attr {
             Attribute::StackMapTable { entries } => {
-                assert_eq!(entries, &[0x01, 0x02, 0xFF]);
+                assert_eq!(&**entries, &[0x01, 0x02, 0xFF][..]);
             }
             other => panic!("Expected StackMapTable, got {other:?}"),
         }
@@ -1339,7 +1457,7 @@ mod tests {
     #[test]
     fn attribute_stack_map_table_empty() {
         let attr = Attribute::StackMapTable {
-            entries: vec![],
+            entries: Arc::from([].as_slice()),
         };
         match &attr {
             Attribute::StackMapTable { entries } => assert!(entries.is_empty()),
@@ -1452,13 +1570,13 @@ mod tests {
     #[test]
     fn attribute_unknown() {
         let attr = Attribute::Unknown {
-            name: "CustomAttr".to_string(),
-            data: vec![0xDE, 0xAD],
+            name: Arc::from("CustomAttr"),
+            data: Arc::from([0xDEu8, 0xAD].as_slice()),
         };
         match &attr {
             Attribute::Unknown { name, data } => {
-                assert_eq!(name, "CustomAttr");
-                assert_eq!(data, &[0xDE, 0xAD]);
+                assert_eq!(&**name, "CustomAttr");
+                assert_eq!(&**data, &[0xDE, 0xAD][..]);
             }
             other => panic!("Expected Unknown, got {other:?}"),
         }
@@ -1467,12 +1585,12 @@ mod tests {
     #[test]
     fn attribute_unknown_empty_data() {
         let attr = Attribute::Unknown {
-            name: "Empty".to_string(),
-            data: vec![],
+            name: Arc::from("Empty"),
+            data: Arc::from([].as_slice()),
         };
         match &attr {
             Attribute::Unknown { name, data } => {
-                assert_eq!(name, "Empty");
+                assert_eq!(&**name, "Empty");
                 assert!(data.is_empty());
             }
             other => panic!("Expected Unknown, got {other:?}"),
@@ -1486,13 +1604,13 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: 4,
             max_locals: 2,
-            code: vec![0xB1], // return
+            code: Arc::from([0xB1u8].as_slice()), // return
             exception_table: vec![],
             attributes: vec![],
         };
         assert_eq!(code_attr.max_stack, 4);
         assert_eq!(code_attr.max_locals, 2);
-        assert_eq!(code_attr.code, vec![0xB1]);
+        assert_eq!(&*code_attr.code, &[0xB1u8][..]);
         assert!(code_attr.exception_table.is_empty());
         assert!(code_attr.attributes.is_empty());
     }
@@ -1508,7 +1626,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: 2,
             max_locals: 1,
-            code: vec![],
+            code: Arc::from([].as_slice()),
             exception_table: vec![entry],
             attributes: vec![],
         };
@@ -1536,7 +1654,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: u16::MAX,
             max_locals: u16::MAX,
-            code: vec![],
+            code: Arc::from([].as_slice()),
             exception_table: vec![],
             attributes: vec![],
         };
@@ -1553,7 +1671,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: vec![0xB1],
+            code: Arc::from([0xB1u8].as_slice()),
             exception_table: vec![],
             attributes: vec![inner],
         };
@@ -1614,7 +1732,7 @@ mod tests {
         let comp = RecordComponent {
             name_index: 3,
             descriptor_index: 5,
-            attributes: vec![Attribute::Signature("I".to_string())],
+            attributes: vec![Attribute::Signature(Arc::from("I"))],
         };
         assert_eq!(comp.name_index, 3);
         assert_eq!(comp.descriptor_index, 5);
@@ -2121,7 +2239,7 @@ mod tests {
         let original = Attribute::Code(CodeAttribute {
             max_stack: 3,
             max_locals: 2,
-            code: vec![0x2A, 0xB7, 0x00, 0x01, 0xB1],
+            code: Arc::from([0x2Au8, 0xB7, 0x00, 0x01, 0xB1].as_slice()),
             exception_table: vec![ExceptionTableEntry {
                 start_pc: 0,
                 end_pc: 5,
@@ -2175,7 +2293,7 @@ mod tests {
 
     #[test]
     fn attribute_debug_format_not_empty() {
-        let attr = Attribute::SourceFile("Test.java".to_string());
+        let attr = Attribute::SourceFile(Arc::from("Test.java"));
         let debug = format!("{attr:?}");
         assert!(debug.contains("SourceFile"));
         assert!(debug.contains("Test.java"));
@@ -2193,7 +2311,7 @@ mod tests {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: vec![0xB1],
+            code: Arc::from([0xB1u8].as_slice()),
             exception_table: vec![],
             attributes: vec![],
         };
@@ -2288,7 +2406,7 @@ mod tests {
         // Decode and inspect.
         let decoded = lazy.decode(&cp).expect("decode should succeed");
         match decoded {
-            Attribute::SourceFile(name) => assert_eq!(name, "Main.java"),
+            Attribute::SourceFile(name) => assert_eq!(&**name, "Main.java"),
             other => panic!("Expected SourceFile, got {other:?}"),
         }
     }
@@ -2350,12 +2468,12 @@ mod tests {
             );
         }
         match attrs[0].as_decoded() {
-            Some(Attribute::SourceFile(name)) => assert_eq!(name, "Main.java"),
+            Some(Attribute::SourceFile(name)) => assert_eq!(&**name, "Main.java"),
             other => panic!("Expected SourceFile, got {other:?}"),
         }
         assert!(matches!(attrs[1].as_decoded(), Some(Attribute::Synthetic)));
         match attrs[2].as_decoded() {
-            Some(Attribute::SourceFile(name)) => assert_eq!(name, "Main.java"),
+            Some(Attribute::SourceFile(name)) => assert_eq!(&**name, "Main.java"),
             other => panic!("Expected SourceFile, got {other:?}"),
         }
     }
@@ -2386,8 +2504,8 @@ mod tests {
         let attr = decode_attribute("MyCustomAttr", &bytes, &cp).unwrap();
         match attr {
             Attribute::Unknown { name, data } => {
-                assert_eq!(name, "MyCustomAttr");
-                assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+                assert_eq!(&*name, "MyCustomAttr");
+                assert_eq!(&*data, &[0xDEu8, 0xAD, 0xBE, 0xEF][..]);
             }
             other => panic!("Expected Unknown, got {other:?}"),
         }

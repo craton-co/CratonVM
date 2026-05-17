@@ -40481,14 +40481,26 @@ fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             // Decode the optional String reason; if present and non-empty,
             // emit a JFR VirtualThreadPinned event.
-            let reason = match args.first() {
+            //
+            // Round-4: emit_virtual_thread_pinned_jfr now takes `&'static str`
+            // (the JEP 491 reason taxonomy is bounded). Map the decoded Java
+            // string to a static literal — for unknown / arbitrary reasons we
+            // fall back to a generic literal rather than allocating an
+            // `Arc<str>` per pinning event.
+            let reason_str: String = match args.first() {
                 Some(Value::Object(Some(s))) => {
                     ctx.read_string(*s)
                         .unwrap_or_else(|| "VirtualThread pinned (no reason)".to_string())
                 }
                 _ => "VirtualThread pinned (no reason)".to_string(),
             };
-            ctx.emit_virtual_thread_pinned_jfr(&reason);
+            let reason_static: &'static str = match reason_str.as_str() {
+                "Synchronized" => "Synchronized",
+                "Native" => "Native",
+                "Monitor" => "Monitor",
+                _ => "VirtualThread pinned",
+            };
+            ctx.emit_virtual_thread_pinned_jfr(reason_static);
             Ok(None)
         },
     );

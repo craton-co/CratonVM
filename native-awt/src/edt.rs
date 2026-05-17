@@ -103,7 +103,15 @@ pub struct EventDispatchThread {
     /// `register_runnable` (called from the `invokeLater` /
     /// `invokeAndWait` natives); read & removed by the `InvocationEvent.
     /// dispatch()V` native via [`Self::take_runnable`].
+    ///
+    /// If a posted `InvocationEvent` is never dispatched (e.g. because the
+    /// app GC's it before draining the queue, or the EDT shuts down with
+    /// pending events) the entry would leak forever. We cap the map at
+    /// [`Self::MAX_RUNNABLES`] entries with FIFO eviction so misbehaving
+    /// callers can't grow this map without bound. The `insertion_order`
+    /// VecDeque tracks the eviction order.
     runnables: Mutex<FxHashMap<u64, ObjectRef>>,
+    runnables_order: Mutex<VecDeque<u64>>,
     /// Monotonic counter for callback ids.  We can't reuse the Runnable's
     /// identity hash because (a) two separate `invokeLater(sameRunnable)`
     /// calls must each dispatch once, and (b) identity hash codes are i32
@@ -122,6 +130,7 @@ impl EventDispatchThread {
             wake_receiver: Arc::new(Mutex::new(rx)),
             pending_invocations: Mutex::new(HashMap::new()),
             runnables: Mutex::new(FxHashMap::default()),
+            runnables_order: Mutex::new(VecDeque::new()),
             // Start above 0 so callers can safely use `0` as "no id".
             next_callback_id: AtomicU64::new(1),
         }
@@ -132,18 +141,44 @@ impl EventDispatchThread {
         self.next_callback_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Maximum number of pending Runnables held in the side-table before
+    /// FIFO eviction kicks in. See `runnables` field doc.
+    const MAX_RUNNABLES: usize = 10_000;
+
     /// Register a Runnable ObjectRef under a callback id.  Called from the
     /// `invokeLater` / `invokeAndWait` natives BEFORE posting the
     /// corresponding `AwtEvent::invocation` so that the dispatch site
     /// can always find the Runnable.
     pub fn register_runnable(&self, callback_id: u64, runnable: ObjectRef) {
-        self.runnables.lock().insert(callback_id, runnable);
+        let mut map = self.runnables.lock();
+        let mut order = self.runnables_order.lock();
+        // Evict oldest entries if at capacity.
+        while map.len() >= Self::MAX_RUNNABLES {
+            if let Some(old) = order.pop_front() {
+                map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        if map.insert(callback_id, runnable).is_none() {
+            order.push_back(callback_id);
+        }
     }
 
     /// Remove and return the Runnable registered for `callback_id`, if
     /// any.  Called by `InvocationEvent.dispatch()V`.
     pub fn take_runnable(&self, callback_id: u64) -> Option<ObjectRef> {
-        self.runnables.lock().remove(&callback_id)
+        let removed = self.runnables.lock().remove(&callback_id);
+        if removed.is_some() {
+            // Remove from order tracker. Linear scan is fine: the order
+            // deque is bounded by `MAX_RUNNABLES`, and successful dispatches
+            // typically take the head (cheap).
+            let mut order = self.runnables_order.lock();
+            if let Some(pos) = order.iter().position(|&id| id == callback_id) {
+                order.remove(pos);
+            }
+        }
+        removed
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -179,6 +214,7 @@ impl EventDispatchThread {
         // their callback ids happen to be reused (we use a monotonic
         // counter, so collisions are unlikely — but the leak is real).
         self.runnables.lock().clear();
+        self.runnables_order.lock().clear();
     }
 
     /// Returns `true` if the EDT is currently running.

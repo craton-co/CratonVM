@@ -23,6 +23,7 @@
 //! `Policy` whose `implies(perm, target, actions, code_base)` method returns
 //! true if any grant covers the requested permission.
 
+use std::borrow::Cow;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -213,6 +214,7 @@ impl Policy {
         subject_principals: &[(String, String)],
     ) -> bool {
         let norm_class = normalize_class(permission_class);
+        let norm_class_ref: &str = norm_class.as_ref();
         for grant in &self.grants {
             // WP6.8: a grant whose `${...}` substitution failed must
             // never imply anything.  This is the "no silent downgrade"
@@ -234,10 +236,10 @@ impl Policy {
             for perm in &grant.permissions {
                 // AllPermission implies everything — short-circuit class /
                 // target / action matching entirely.
-                if normalize_class(&perm.class_name) == "java.security.AllPermission" {
+                if normalize_class(&perm.class_name).as_ref() == "java.security.AllPermission" {
                     return true;
                 }
-                if !class_matches(&perm.class_name, &norm_class) {
+                if !class_matches(&perm.class_name, norm_class_ref) {
                     continue;
                 }
                 if !permission_target_matches(&perm.class_name, perm.target.as_deref(), target) {
@@ -257,8 +259,17 @@ impl Policy {
 // Implication helpers
 // ---------------------------------------------------------------------------
 
-fn normalize_class(s: &str) -> String {
-    s.replace('/', ".")
+/// Convert a permission class name to dotted form, returning a `Cow<str>`
+/// that borrows the input when normalization is a no-op (no '/' present).
+/// On the `Policy::implies_full` hot path the request's permission class is
+/// already dotted (`java.io.FilePermission`), so this avoids the per-call
+/// `String` allocation the previous `s.replace('/', ".")` always paid.
+fn normalize_class(s: &str) -> Cow<'_, str> {
+    if s.contains('/') {
+        Cow::Owned(s.replace('/', "."))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 fn class_matches(grant_class: &str, request_class: &str) -> bool {
@@ -266,7 +277,7 @@ fn class_matches(grant_class: &str, request_class: &str) -> bool {
     if grant_class == "java.security.AllPermission" {
         return true;
     }
-    normalize_class(grant_class) == request_class
+    normalize_class(grant_class).as_ref() == request_class
 }
 
 /// Match the `codeBase` filter. An unconstrained grant (`None`) matches
@@ -342,7 +353,7 @@ fn permission_target_matches(
     grant_target: Option<&str>,
     request_target: &str,
 ) -> bool {
-    if normalize_class(class_name) == "java.net.SocketPermission" {
+    if normalize_class(class_name).as_ref() == "java.net.SocketPermission" {
         return socket_permission_matches(grant_target, request_target);
     }
     target_matches(grant_target, request_target)
@@ -771,12 +782,13 @@ fn principals_match(
     }
     for required in grant_principals {
         let required_class = normalize_class(&required.class_name);
+        let required_class_ref: &str = required_class.as_ref();
         let required_name = required.name.trim();
         let mut matched = false;
         for (subj_class, subj_name) in subject_principals {
             let subj_class_norm = normalize_class(subj_class);
-            let class_ok = required_class == "*"
-                || required_class == subj_class_norm;
+            let class_ok = required_class_ref == "*"
+                || required_class_ref == subj_class_norm.as_ref();
             let name_ok = required_name == "*" || required_name == subj_name;
             if class_ok && name_ok {
                 matched = true;

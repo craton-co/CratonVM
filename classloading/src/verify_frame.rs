@@ -45,7 +45,7 @@ impl VerificationFrame {
             if method_name == "<init>" {
                 locals.push(VType::UninitializedThis);
             } else {
-                locals.push(VType::ObjectRef(class_name.to_string()));
+                locals.push(VType::ObjectRef(std::sync::Arc::from(class_name)));
             }
         }
 
@@ -89,7 +89,7 @@ impl VerificationFrame {
             if method_name == "<init>" {
                 locals.push(VType::UninitializedThis);
             } else {
-                locals.push(VType::ObjectRef(class_name.to_string()));
+                locals.push(VType::ObjectRef(std::sync::Arc::from(class_name)));
             }
         }
 
@@ -393,6 +393,7 @@ fn verify_error(message: &str) -> LinkageError {
 mod tests {
     use super::*;
     use crate::vtype::VType;
+    use std::sync::Arc;
 
     struct MockHierarchy;
 
@@ -445,7 +446,7 @@ mod tests {
         // local[0] = Foo, local[1] = Int, local[2] = Top
         assert_eq!(
             frame.locals[0],
-            VType::ObjectRef("com/example/Foo".to_string())
+            VType::ObjectRef(Arc::from("com/example/Foo"))
         );
         assert_eq!(frame.locals[1], VType::Int);
         assert_eq!(frame.locals[2], VType::Top);
@@ -553,10 +554,10 @@ mod tests {
         let h = MockHierarchy;
         let mut current =
             VerificationFrame::initial_frame("Foo", "m", "()V", true, 1, 1);
-        current.locals[0] = VType::ObjectRef("java/lang/String".to_string());
+        current.locals[0] = VType::ObjectRef(Arc::from("java/lang/String"));
         let mut declared =
             VerificationFrame::initial_frame("Foo", "m", "()V", true, 1, 1);
-        declared.locals[0] = VType::ObjectRef("java/lang/CharSequence".to_string());
+        declared.locals[0] = VType::ObjectRef(Arc::from("java/lang/CharSequence"));
         assert!(current.is_assignable_to(&declared, &h));
     }
 

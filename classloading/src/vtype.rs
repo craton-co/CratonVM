@@ -8,6 +8,8 @@
 //! The `ClassHierarchy` trait decouples the verifier from `ClassStore`, enabling
 //! mock testing.
 
+use std::sync::Arc;
+
 use rustjvm_reader::constant_pool::ConstantPool;
 use rustjvm_reader::stack_map::VerificationTypeInfo;
 
@@ -66,10 +68,18 @@ pub enum VType {
     Null,
     /// A reference to an instance of the named class.
     /// Name is in internal form: `"java/lang/Object"`.
-    ObjectRef(String),
+    ///
+    /// Stored as `Arc<str>` so frame clones (which happen on every
+    /// branch target, exception handler entry, and worklist iteration)
+    /// only bump a refcount instead of heap-allocating every class name.
+    /// The names come from the constant pool (already `Arc<str>`), so
+    /// constructing one is a `Arc::clone`, not an allocation.
+    ObjectRef(Arc<str>),
     /// A reference to an array type.
     /// Descriptor is in field descriptor form: `"[I"`, `"[Ljava/lang/String;"`.
-    ArrayRef(String),
+    ///
+    /// Same `Arc<str>` rationale as [`VType::ObjectRef`].
+    ArrayRef(Arc<str>),
     /// The uninitialized `this` reference in a constructor (before `<init>` call).
     UninitializedThis,
     /// A reference to an uninitialized object created by `new` at the given offset.
@@ -112,20 +122,22 @@ impl VType {
             VerificationTypeInfo::Null => Ok(VType::Null),
             VerificationTypeInfo::UninitializedThis => Ok(VType::UninitializedThis),
             VerificationTypeInfo::Object { cpool_index } => {
-                let class_name =
-                    cp.get_class_name(*cpool_index)
-                        .ok_or_else(|| LinkageError::VerifyError {
-                            class_name: String::new(),
-                            method_name: String::new(),
-                            message: format!(
-                                "invalid class reference at constant pool index {cpool_index}"
-                            ),
-                        })?;
-                // Determine if it's an array type or object type
+                let class_name = cp.get_class_name_arc(*cpool_index).ok_or_else(|| {
+                    LinkageError::VerifyError {
+                        class_name: String::new(),
+                        method_name: String::new(),
+                        message: format!(
+                            "invalid class reference at constant pool index {cpool_index}"
+                        ),
+                    }
+                })?;
+                // Determine if it's an array type or object type. The
+                // `Arc<str>` is moved into the chosen variant — no
+                // allocation, no `.to_string()`.
                 if class_name.starts_with('[') {
-                    Ok(VType::ArrayRef(class_name.to_string()))
+                    Ok(VType::ArrayRef(class_name))
                 } else {
-                    Ok(VType::ObjectRef(class_name.to_string()))
+                    Ok(VType::ObjectRef(class_name))
                 }
             }
             VerificationTypeInfo::Uninitialized { offset } => Ok(VType::Uninitialized(*offset)),
@@ -152,9 +164,9 @@ impl VType {
             Some(b'L') => {
                 // Strip 'L' prefix and ';' suffix to get the class name
                 let class_name = &descriptor[1..descriptor.len() - 1];
-                VType::ObjectRef(class_name.to_string())
+                VType::ObjectRef(Arc::from(class_name))
             }
-            Some(b'[') => VType::ArrayRef(descriptor.to_string()),
+            Some(b'[') => VType::ArrayRef(Arc::from(descriptor)),
             _ => VType::Top, // invalid descriptor → Top (verification will fail later)
         }
     }
@@ -206,6 +218,8 @@ impl VType {
             // not INTERFACE) and `is_subclass` returns false because the
             // stub's `interfaces` array is empty.
             (VType::ObjectRef(child), VType::ObjectRef(parent)) => {
+                // `child` / `parent` are `&Arc<str>`; deref to `&str` for
+                // the `ClassHierarchy` trait methods.
                 hierarchy.is_subclass(child, parent)
                     || hierarchy.is_interface(parent)
                     || is_known_jdk_interface(parent)
@@ -216,9 +230,9 @@ impl VType {
             // interface, accept it under the JVMS verifier relaxation —
             // runtime will enforce the actual type.
             (VType::ArrayRef(_), VType::ObjectRef(parent)) => {
-                parent == "java/lang/Object"
-                    || parent == "java/io/Serializable"
-                    || parent == "java/lang/Cloneable"
+                &**parent == "java/lang/Object"
+                    || &**parent == "java/io/Serializable"
+                    || &**parent == "java/lang/Cloneable"
                     || hierarchy.is_interface(parent)
                     || is_known_jdk_interface(parent)
             }
@@ -263,13 +277,13 @@ impl VType {
 
             // Two object references → common superclass
             (VType::ObjectRef(a), VType::ObjectRef(b)) => {
-                VType::ObjectRef(hierarchy.common_superclass(a, b))
+                VType::ObjectRef(Arc::from(hierarchy.common_superclass(a, b).as_str()))
             }
 
             // Array + Object → Object
             (VType::ArrayRef(_), VType::ObjectRef(_))
             | (VType::ObjectRef(_), VType::ArrayRef(_)) => {
-                VType::ObjectRef("java/lang/Object".to_string())
+                VType::ObjectRef(Arc::from("java/lang/Object"))
             }
 
             // Two arrays → merge element types if both are reference arrays;
@@ -338,7 +352,7 @@ fn array_is_assignable(
 /// Merge two array types.
 fn merge_arrays(a: &str, b: &str, hierarchy: &dyn ClassHierarchy) -> VType {
     if a == b {
-        return VType::ArrayRef(a.to_string());
+        return VType::ArrayRef(Arc::from(a));
     }
 
     let a_elem = &a[1..];
@@ -350,15 +364,15 @@ fn merge_arrays(a: &str, b: &str, hierarchy: &dyn ClassHierarchy) -> VType {
             let a_class = &a_elem[1..a_elem.len() - 1];
             let b_class = &b_elem[1..b_elem.len() - 1];
             let common = hierarchy.common_superclass(a_class, b_class);
-            VType::ArrayRef(format!("[L{common};"))
+            VType::ArrayRef(Arc::from(format!("[L{common};").as_str()))
         }
         // Both nested arrays
         (Some(b'['), Some(b'[')) => match merge_arrays(a_elem, b_elem, hierarchy) {
-            VType::ArrayRef(inner) => VType::ArrayRef(format!("[{inner}")),
-            _ => VType::ObjectRef("java/lang/Object".to_string()),
+            VType::ArrayRef(inner) => VType::ArrayRef(Arc::from(format!("[{inner}").as_str())),
+            _ => VType::ObjectRef(Arc::from("java/lang/Object")),
         },
         // Otherwise → Object (arrays of different primitive types, etc.)
-        _ => VType::ObjectRef("java/lang/Object".to_string()),
+        _ => VType::ObjectRef(Arc::from("java/lang/Object")),
     }
 }
 
@@ -605,7 +619,7 @@ pub fn param_types_from_descriptor(descriptor: &str) -> Vec<VType> {
                         }
                     }
                 }
-                types.push(VType::ArrayRef(inner[start..i].to_string()));
+                types.push(VType::ArrayRef(Arc::from(&inner[start..i])));
             }
             _ => {
                 i += 1; // skip unknown
@@ -713,7 +727,7 @@ mod tests {
     fn from_descriptor_object() {
         assert_eq!(
             VType::from_field_descriptor("Ljava/lang/String;"),
-            VType::ObjectRef("java/lang/String".to_string())
+            VType::ObjectRef(Arc::from("java/lang/String"))
         );
     }
 
@@ -721,7 +735,7 @@ mod tests {
     fn from_descriptor_int_array() {
         assert_eq!(
             VType::from_field_descriptor("[I"),
-            VType::ArrayRef("[I".to_string())
+            VType::ArrayRef(Arc::from("[I"))
         );
     }
 
@@ -729,7 +743,7 @@ mod tests {
     fn from_descriptor_object_array() {
         assert_eq!(
             VType::from_field_descriptor("[Ljava/lang/Object;"),
-            VType::ArrayRef("[Ljava/lang/Object;".to_string())
+            VType::ArrayRef(Arc::from("[Ljava/lang/Object;"))
         );
     }
 
@@ -737,7 +751,7 @@ mod tests {
     fn from_descriptor_2d_array() {
         assert_eq!(
             VType::from_field_descriptor("[[I"),
-            VType::ArrayRef("[[I".to_string())
+            VType::ArrayRef(Arc::from("[[I"))
         );
     }
 
@@ -762,7 +776,7 @@ mod tests {
 
     #[test]
     fn is_reference_object() {
-        assert!(VType::ObjectRef("Foo".to_string()).is_reference());
+        assert!(VType::ObjectRef(Arc::from("Foo")).is_reference());
     }
 
     #[test]
@@ -772,7 +786,7 @@ mod tests {
 
     #[test]
     fn is_reference_array() {
-        assert!(VType::ArrayRef("[I".to_string()).is_reference());
+        assert!(VType::ArrayRef(Arc::from("[I")).is_reference());
     }
 
     #[test]
@@ -792,56 +806,56 @@ mod tests {
     #[test]
     fn null_assignable_to_object() {
         let h = MockHierarchy;
-        assert!(VType::Null.is_assignable_to(&VType::ObjectRef("java/lang/Object".to_string()), &h));
+        assert!(VType::Null.is_assignable_to(&VType::ObjectRef(Arc::from("java/lang/Object")), &h));
     }
 
     #[test]
     fn null_assignable_to_array() {
         let h = MockHierarchy;
-        assert!(VType::Null.is_assignable_to(&VType::ArrayRef("[I".to_string()), &h));
+        assert!(VType::Null.is_assignable_to(&VType::ArrayRef(Arc::from("[I")), &h));
     }
 
     #[test]
     fn subclass_assignable_to_superclass() {
         let h = MockHierarchy;
-        assert!(VType::ObjectRef("java/lang/String".to_string())
-            .is_assignable_to(&VType::ObjectRef("java/lang/Object".to_string()), &h));
+        assert!(VType::ObjectRef(Arc::from("java/lang/String"))
+            .is_assignable_to(&VType::ObjectRef(Arc::from("java/lang/Object")), &h));
     }
 
     #[test]
     fn superclass_not_assignable_to_subclass() {
         let h = MockHierarchy;
-        assert!(!VType::ObjectRef("java/lang/Object".to_string())
-            .is_assignable_to(&VType::ObjectRef("java/lang/String".to_string()), &h));
+        assert!(!VType::ObjectRef(Arc::from("java/lang/Object"))
+            .is_assignable_to(&VType::ObjectRef(Arc::from("java/lang/String")), &h));
     }
 
     #[test]
     fn array_assignable_to_object() {
         let h = MockHierarchy;
-        assert!(VType::ArrayRef("[I".to_string())
-            .is_assignable_to(&VType::ObjectRef("java/lang/Object".to_string()), &h));
+        assert!(VType::ArrayRef(Arc::from("[I"))
+            .is_assignable_to(&VType::ObjectRef(Arc::from("java/lang/Object")), &h));
     }
 
     #[test]
     fn array_assignable_to_serializable() {
         let h = MockHierarchy;
-        assert!(VType::ArrayRef("[I".to_string())
-            .is_assignable_to(&VType::ObjectRef("java/io/Serializable".to_string()), &h));
+        assert!(VType::ArrayRef(Arc::from("[I"))
+            .is_assignable_to(&VType::ObjectRef(Arc::from("java/io/Serializable")), &h));
     }
 
     #[test]
     fn covariant_reference_array() {
         let h = MockHierarchy;
         // [String is assignable to [Object
-        assert!(VType::ArrayRef("[Ljava/lang/String;".to_string())
-            .is_assignable_to(&VType::ArrayRef("[Ljava/lang/Object;".to_string()), &h));
+        assert!(VType::ArrayRef(Arc::from("[Ljava/lang/String;"))
+            .is_assignable_to(&VType::ArrayRef(Arc::from("[Ljava/lang/Object;")), &h));
     }
 
     #[test]
     fn primitive_array_not_covariant() {
         let h = MockHierarchy;
-        assert!(!VType::ArrayRef("[I".to_string())
-            .is_assignable_to(&VType::ArrayRef("[J".to_string()), &h));
+        assert!(!VType::ArrayRef(Arc::from("[I"))
+            .is_assignable_to(&VType::ArrayRef(Arc::from("[J")), &h));
     }
 
     #[test]
@@ -865,9 +879,9 @@ mod tests {
         assert!(VType::Int.is_assignable_to(&VType::Top, &h));
         assert!(VType::Long.is_assignable_to(&VType::Top, &h));
         assert!(VType::Null.is_assignable_to(&VType::Top, &h));
-        assert!(VType::ObjectRef("java/lang/String".to_string())
+        assert!(VType::ObjectRef(Arc::from("java/lang/String"))
             .is_assignable_to(&VType::Top, &h));
-        assert!(VType::ArrayRef("[I".to_string()).is_assignable_to(&VType::Top, &h));
+        assert!(VType::ArrayRef(Arc::from("[I")).is_assignable_to(&VType::Top, &h));
     }
 
     // --- Interface relaxation (JVMS §4.10.1.2) ----------------------------
@@ -884,8 +898,8 @@ mod tests {
     fn object_assignable_to_interface() {
         // Object.is_assignable_to(SomeInterface) → true (relaxation rule).
         let h = MockHierarchy;
-        let obj = VType::ObjectRef("java/lang/Object".to_string());
-        let iface = VType::ObjectRef("java/io/Serializable".to_string());
+        let obj = VType::ObjectRef(Arc::from("java/lang/Object"));
+        let iface = VType::ObjectRef(Arc::from("java/io/Serializable"));
         assert!(obj.is_assignable_to(&iface, &h));
     }
 
@@ -893,8 +907,8 @@ mod tests {
     fn interface_assignable_to_object() {
         // SomeInterface.is_assignable_to(Object) → true (always was).
         let h = MockHierarchy;
-        let iface = VType::ObjectRef("java/io/Serializable".to_string());
-        let obj = VType::ObjectRef("java/lang/Object".to_string());
+        let iface = VType::ObjectRef(Arc::from("java/io/Serializable"));
+        let obj = VType::ObjectRef(Arc::from("java/lang/Object"));
         assert!(iface.is_assignable_to(&obj, &h));
     }
 
@@ -908,8 +922,8 @@ mod tests {
         // time assignment must still succeed because the target is an
         // interface.
         let h = MockHierarchy;
-        let s = VType::ObjectRef("java/lang/String".to_string());
-        let iface = VType::ObjectRef("java/lang/Cloneable".to_string());
+        let s = VType::ObjectRef(Arc::from("java/lang/String"));
+        let iface = VType::ObjectRef(Arc::from("java/lang/Cloneable"));
         // Sanity: MockHierarchy does NOT model String <: Cloneable.
         assert!(!h.is_subclass("java/lang/String", "java/lang/Cloneable"));
         // Yet is_assignable_to must accept it (interface relaxation).
@@ -935,8 +949,8 @@ mod tests {
             }
         }
         let h = OnlyInterfaceHierarchy;
-        let arr = VType::ArrayRef("[I".to_string());
-        let iface = VType::ObjectRef("my/pkg/IFoo".to_string());
+        let arr = VType::ArrayRef(Arc::from("[I"));
+        let iface = VType::ObjectRef(Arc::from("my/pkg/IFoo"));
         assert!(arr.is_assignable_to(&iface, &h));
     }
 
@@ -978,8 +992,8 @@ mod tests {
         // must still accept the assignment because Collection is a
         // well-known JDK interface.
         let h = StubHierarchyMissingInterfaceFlag;
-        let list = VType::ObjectRef("java/util/List".to_string());
-        let collection = VType::ObjectRef("java/util/Collection".to_string());
+        let list = VType::ObjectRef(Arc::from("java/util/List"));
+        let collection = VType::ObjectRef(Arc::from("java/util/Collection"));
 
         // Sanity: the hierarchy genuinely cannot prove the relationship.
         assert!(!h.is_subclass("java/util/List", "java/util/Collection"));
@@ -996,8 +1010,8 @@ mod tests {
     fn arraylist_assignable_to_iterable_via_jdk_table() {
         // Concrete class to interface, both via JDK fallback.
         let h = StubHierarchyMissingInterfaceFlag;
-        let al = VType::ObjectRef("java/util/ArrayList".to_string());
-        let iter = VType::ObjectRef("java/lang/Iterable".to_string());
+        let al = VType::ObjectRef(Arc::from("java/util/ArrayList"));
+        let iter = VType::ObjectRef(Arc::from("java/lang/Iterable"));
         assert!(al.is_assignable_to(&iter, &h));
     }
 
@@ -1007,8 +1021,8 @@ mod tests {
         // class-to-class assignments. Only known JDK interfaces relax
         // the check.
         let h = StubHierarchyMissingInterfaceFlag;
-        let foo = VType::ObjectRef("com/example/Foo".to_string());
-        let bar = VType::ObjectRef("com/example/Bar".to_string());
+        let foo = VType::ObjectRef(Arc::from("com/example/Foo"));
+        let bar = VType::ObjectRef(Arc::from("com/example/Bar"));
         assert!(!foo.is_assignable_to(&bar, &h));
     }
 
@@ -1042,7 +1056,7 @@ mod tests {
     #[test]
     fn merge_null_with_object() {
         let h = MockHierarchy;
-        let obj = VType::ObjectRef("java/lang/String".to_string());
+        let obj = VType::ObjectRef(Arc::from("java/lang/String"));
         assert_eq!(VType::Null.merge(&obj, &h), obj);
         assert_eq!(obj.merge(&VType::Null, &h), obj);
     }
@@ -1050,22 +1064,22 @@ mod tests {
     #[test]
     fn merge_two_objects() {
         let h = MockHierarchy;
-        let s = VType::ObjectRef("java/lang/String".to_string());
-        let al = VType::ObjectRef("java/util/ArrayList".to_string());
+        let s = VType::ObjectRef(Arc::from("java/lang/String"));
+        let al = VType::ObjectRef(Arc::from("java/util/ArrayList"));
         assert_eq!(
             s.merge(&al, &h),
-            VType::ObjectRef("java/lang/Object".to_string())
+            VType::ObjectRef(Arc::from("java/lang/Object"))
         );
     }
 
     #[test]
     fn merge_subclass_with_superclass() {
         let h = MockHierarchy;
-        let integer = VType::ObjectRef("java/lang/Integer".to_string());
-        let number = VType::ObjectRef("java/lang/Number".to_string());
+        let integer = VType::ObjectRef(Arc::from("java/lang/Integer"));
+        let number = VType::ObjectRef(Arc::from("java/lang/Number"));
         assert_eq!(
             integer.merge(&number, &h),
-            VType::ObjectRef("java/lang/Number".to_string())
+            VType::ObjectRef(Arc::from("java/lang/Number"))
         );
     }
 
@@ -1078,33 +1092,33 @@ mod tests {
     #[test]
     fn merge_array_with_object_is_object() {
         let h = MockHierarchy;
-        let arr = VType::ArrayRef("[I".to_string());
-        let obj = VType::ObjectRef("java/lang/String".to_string());
+        let arr = VType::ArrayRef(Arc::from("[I"));
+        let obj = VType::ObjectRef(Arc::from("java/lang/String"));
         assert_eq!(
             arr.merge(&obj, &h),
-            VType::ObjectRef("java/lang/Object".to_string())
+            VType::ObjectRef(Arc::from("java/lang/Object"))
         );
     }
 
     #[test]
     fn merge_two_reference_arrays() {
         let h = MockHierarchy;
-        let a = VType::ArrayRef("[Ljava/lang/String;".to_string());
-        let b = VType::ArrayRef("[Ljava/util/ArrayList;".to_string());
+        let a = VType::ArrayRef(Arc::from("[Ljava/lang/String;"));
+        let b = VType::ArrayRef(Arc::from("[Ljava/util/ArrayList;"));
         assert_eq!(
             a.merge(&b, &h),
-            VType::ArrayRef("[Ljava/lang/Object;".to_string())
+            VType::ArrayRef(Arc::from("[Ljava/lang/Object;"))
         );
     }
 
     #[test]
     fn merge_different_primitive_arrays() {
         let h = MockHierarchy;
-        let a = VType::ArrayRef("[I".to_string());
-        let b = VType::ArrayRef("[J".to_string());
+        let a = VType::ArrayRef(Arc::from("[I"));
+        let b = VType::ArrayRef(Arc::from("[J"));
         assert_eq!(
             a.merge(&b, &h),
-            VType::ObjectRef("java/lang/Object".to_string())
+            VType::ObjectRef(Arc::from("java/lang/Object"))
         );
     }
 
@@ -1127,8 +1141,8 @@ mod tests {
             types,
             vec![
                 VType::Int,
-                VType::ObjectRef("java/lang/String".to_string()),
-                VType::ArrayRef("[D".to_string()),
+                VType::ObjectRef(Arc::from("java/lang/String")),
+                VType::ArrayRef(Arc::from("[D")),
                 VType::Long,
             ]
         );
@@ -1137,7 +1151,7 @@ mod tests {
     #[test]
     fn param_types_2d_array() {
         let types = param_types_from_descriptor("([[I)V");
-        assert_eq!(types, vec![VType::ArrayRef("[[I".to_string())]);
+        assert_eq!(types, vec![VType::ArrayRef(Arc::from("[[I"))]);
     }
 
     // --- return_type_from_descriptor ---
@@ -1156,7 +1170,7 @@ mod tests {
     fn return_type_object() {
         assert_eq!(
             return_type_from_descriptor("()Ljava/lang/String;"),
-            Some(VType::ObjectRef("java/lang/String".to_string()))
+            Some(VType::ObjectRef(Arc::from("java/lang/String")))
         );
     }
 
@@ -1164,7 +1178,7 @@ mod tests {
     fn return_type_array() {
         assert_eq!(
             return_type_from_descriptor("()[I"),
-            Some(VType::ArrayRef("[I".to_string()))
+            Some(VType::ArrayRef(Arc::from("[I")))
         );
     }
 }

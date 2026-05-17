@@ -473,16 +473,9 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         return Ok(Some(Value::Int(0)));
     }
     let to_write = (limit - position) as usize;
-    // Materialise the slice from the array — Value::Int holds bytes
-    // for `byte[]` (sign-extended -128..127 range).
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
     let mut bytes = vec![0u8; to_write];
-    for i in 0..to_write {
-        let v = ctx.get_array_element(arr, position as usize + i);
-        bytes[i] = match v {
-            Value::Int(n) => (n & 0xFF) as u8,
-            _ => 0,
-        };
-    }
+    ctx.read_byte_array_into(arr, position as usize, &mut bytes);
     let n = write_pipe(end.raw, &bytes).map_err(|e| io_error(format!("write: {e}")))?;
     if n > 0 {
         buffer_set_position(ctx, buf, position + n as i32);
@@ -524,9 +517,9 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // EOF — JDK signals -1.
         return Ok(Some(Value::Int(-1)));
     }
-    for i in 0..(n as usize) {
-        ctx.set_array_element(arr, position as usize + i, Value::Int(bytes[i] as i8 as i32));
-    }
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
+    let copy_len = (n as usize).min(bytes.len());
+    ctx.write_byte_array_from(arr, position as usize, &bytes[..copy_len]);
     buffer_set_position(ctx, buf, position + n as i32);
     Ok(Some(Value::Int(n as i32)))
 }
@@ -558,12 +551,8 @@ fn sink_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         )));
     }
     let mut bytes = vec![0u8; len];
-    for i in 0..len {
-        bytes[i] = match ctx.get_array_element(arr, off + i) {
-            Value::Int(n) => (n & 0xFF) as u8,
-            _ => 0,
-        };
-    }
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
+    ctx.read_byte_array_into(arr, off, &mut bytes);
     let n = write_pipe(end.raw, &bytes).map_err(|e| io_error(format!("write: {e}")))?;
     Ok(Some(Value::Int(n as i32)))
 }
@@ -597,9 +586,9 @@ fn source_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    for i in 0..(n as usize) {
-        ctx.set_array_element(arr, off + i, Value::Int(bytes[i] as i8 as i32));
-    }
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
+    let copy_len = (n as usize).min(bytes.len());
+    ctx.write_byte_array_from(arr, off, &bytes[..copy_len]);
     Ok(Some(Value::Int(n as i32)))
 }
 

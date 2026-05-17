@@ -70,7 +70,16 @@ fn populate_sfi(
     entry: &rustjvm_native_api::StackTraceEntry,
 ) -> rustjvm_types::ObjectRef {
     let sf = alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
-    let cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
+    // Reuse the shared `dotted_class_name` cache (lang_class) so repeat
+    // frames for the same class do not re-run `.replace('/', '.')` and
+    // allocate a fresh `String` per frame. The cache returns an
+    // `Arc<str>` keyed by `ClassId`; first touch computes the dotted
+    // form, subsequent reads clone the `Arc`.
+    let dotted = match ctx.class_id_by_name(&entry.class_name) {
+        Some(cid) => crate::lang_class::dotted_class_name(cid, &entry.class_name),
+        None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
+    };
+    let cls_str = ctx.create_string(&dotted);
     let meth_str = ctx.create_string(&entry.method_name);
     let file_str = match &entry.source_file {
         Some(f) => Value::Object(Some(ctx.create_string(f))),

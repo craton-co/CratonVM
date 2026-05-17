@@ -146,6 +146,21 @@ impl ConstantPool {
         }
     }
 
+    /// Get a class name by resolving a ClassReference, as a shared `Arc<str>`.
+    ///
+    /// Same as [`get_class_name`] but returns the interned `Arc<str>` directly
+    /// (a refcount bump rather than an allocation). Hot path for the bytecode
+    /// verifier, which materialises `VType::ObjectRef(Arc<str>)` for every
+    /// `new` / `checkcast` / exception-handler catch type.
+    pub fn get_class_name_arc(&self, index: u16) -> Option<Arc<str>> {
+        match self.get(index) {
+            Some(ConstantPoolEntry::ClassReference { name_index }) => {
+                self.get_utf8_arc(*name_index)
+            }
+            _ => None,
+        }
+    }
+
     /// Get the name and descriptor from a NameAndType entry.
     pub fn get_name_and_type(&self, index: u16) -> Option<(&str, &str)> {
         match self.get(index) {

@@ -7,6 +7,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use rustc_hash::FxHashSet;
 use rustjvm_reader::class_access_flags::ClassAccessFlags;
 use rustjvm_reader::class_file_version::ClassFileVersion;
 use rustjvm_reader::constant_pool::ConstantPool;
@@ -597,22 +598,53 @@ impl Class {
     ///
     /// Walks the superclass chain and interface list recursively. Needs access
     /// to the `ClassStore` to look up parent classes by `ClassId`.
+    ///
+    /// **Visited set:** the recursion uses an `FxHashSet<ClassId>` to dedupe
+    /// nodes already explored. Without it, diamond interface hierarchies
+    /// (e.g. `B implements I1, I2` where `I1 extends I3` and `I2 extends I3`,
+    /// or the much wider real-JDK shapes around `java/util/List` /
+    /// `java/util/Collection` / `java/util/SequencedCollection`) trigger an
+    /// exponential blowup: every shared interface in the DAG is visited
+    /// `2^k` times where `k` is the diamond depth. With the visited set the
+    /// walk is linear in the size of the (super, interface) DAG.
     pub fn is_subclass_of(&self, other_id: ClassId, store: &ClassStore) -> bool {
-        self.is_subclass_of_bounded(other_id, store, 0)
+        // Cheap early-out — the overwhelmingly common case is `self == other`
+        // or the immediate superclass match, neither of which needs the
+        // visited-set allocation.
+        if self.id == other_id {
+            return true;
+        }
+        let mut visited: FxHashSet<ClassId> = FxHashSet::default();
+        self.is_subclass_of_inner(other_id, store, 0, &mut visited)
     }
 
-    fn is_subclass_of_bounded(&self, other_id: ClassId, store: &ClassStore, depth: usize) -> bool {
+    fn is_subclass_of_inner(
+        &self,
+        other_id: ClassId,
+        store: &ClassStore,
+        depth: usize,
+        visited: &mut FxHashSet<ClassId>,
+    ) -> bool {
         if depth > MAX_HIERARCHY_DEPTH {
             return false;
         }
         if self.id == other_id {
             return true;
         }
+        // Mark this node visited; if we have seen it before in another
+        // branch of the diamond, skip — its answer was already false (we
+        // wouldn't be re-entering otherwise).
+        if !visited.insert(self.id) {
+            return false;
+        }
 
         // Walk the superclass chain.
         if let Some(super_id) = self.superclass {
+            if super_id == other_id {
+                return true;
+            }
             if let Some(super_class) = store.get(super_id) {
-                if super_class.is_subclass_of_bounded(other_id, store, depth + 1) {
+                if super_class.is_subclass_of_inner(other_id, store, depth + 1, visited) {
                     return true;
                 }
             }
@@ -620,8 +652,11 @@ impl Class {
 
         // Walk implemented interfaces.
         for &iface_id in &self.interfaces {
+            if iface_id == other_id {
+                return true;
+            }
             if let Some(iface_class) = store.get(iface_id) {
-                if iface_class.is_subclass_of_bounded(other_id, store, depth + 1) {
+                if iface_class.is_subclass_of_inner(other_id, store, depth + 1, visited) {
                     return true;
                 }
             }
@@ -840,7 +875,7 @@ pub fn find_method_recursive<'a>(
         }
     }
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited: FxHashSet<ClassId> = FxHashSet::default();
     let mut i = 0;
     while i < queue.len() {
         let iface_id = queue[i];

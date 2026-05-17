@@ -316,7 +316,7 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
                     attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
-                        code: code.clone(),
+                        code: code.clone().into(),
                         exception_table: vec![],
                         attributes: vec![],
                     }))],

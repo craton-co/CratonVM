@@ -201,6 +201,8 @@ fn verify_method_typestate(
 
     // Find the StackMapTable raw bytes among the Code attribute's
     // sub-attributes.
+    // `entries: &Arc<[u8]>` (round 4 reader) — deref to a `&[u8]` slice
+    // that lives as long as the attribute does.
     let stack_map_raw = code_attr.attributes.iter().find_map(|a| match a {
         rustjvm_reader::attribute::Attribute::StackMapTable { entries } => Some(&entries[..]),
         _ => None,
@@ -294,11 +296,11 @@ fn verify_method_typestate(
         std::collections::HashMap::with_capacity(code_attr.exception_table.len());
     for entry in &code_attr.exception_table {
         let catch = if entry.catch_type == 0 {
-            VType::ObjectRef("java/lang/Throwable".to_string())
+            VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable"))
         } else {
-            match cp.get_class_name(entry.catch_type) {
-                Some(name) => VType::ObjectRef(name.to_string()),
-                None => VType::ObjectRef("java/lang/Throwable".to_string()),
+            match cp.get_class_name_arc(entry.catch_type) {
+                Some(name) => VType::ObjectRef(name),
+                None => VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable")),
             }
         };
         handler_targets.insert(entry.handler_pc, catch);
@@ -515,11 +517,11 @@ fn verify_pre_java7_inference(
         for entry in &code_attr.exception_table {
             if pc >= entry.start_pc as usize && pc < entry.end_pc as usize {
                 let catch = if entry.catch_type == 0 {
-                    VType::ObjectRef("java/lang/Throwable".to_string())
+                    VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable"))
                 } else {
-                    match cp.get_class_name(entry.catch_type) {
-                        Some(name) => VType::ObjectRef(name.to_string()),
-                        None => VType::ObjectRef("java/lang/Throwable".to_string()),
+                    match cp.get_class_name_arc(entry.catch_type) {
+                        Some(name) => VType::ObjectRef(name),
+                        None => VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable")),
                     }
                 };
                 let mut handler_frame = current.clone();
@@ -1235,7 +1237,7 @@ mod tests {
             vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
-                code: vec![0xB1], // return
+                code: vec![0xB1].into(), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))]
@@ -1646,7 +1648,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack,
                     max_locals,
-                    code,
+                    code: code.into(),
                     exception_table,
                     attributes: vec![],
                 }))],
@@ -1884,7 +1886,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xac], // ireturn on empty stack
+                code: vec![0xac].into(), // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1928,7 +1930,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xac], // ireturn on empty stack
+                code: vec![0xac].into(), // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1972,7 +1974,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0xb2, 0x00], // getstatic with truncated index
+                code: vec![0xb2, 0x00].into(), // getstatic with truncated index
                 exception_table: vec![],
                 attributes: vec![],
             }))],

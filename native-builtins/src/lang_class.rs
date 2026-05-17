@@ -4039,8 +4039,11 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         _ => None,
     };
 
-    // Build invocation arguments
-    let mut invoke_args: Vec<Value> = Vec::new();
+    // Build invocation arguments. Pre-size for params + optional receiver
+    // so the per-arg push loop never reallocates on hot reflective dispatch
+    // paths (ByteBuddy / Jackson hit this thousands of times during boot).
+    let receiver_slots = if is_static { 0 } else { 1 };
+    let mut invoke_args: Vec<Value> = Vec::with_capacity(param_descs.len() + receiver_slots);
 
     if !is_static {
         // Instance method: receiver is first arg
@@ -5067,14 +5070,21 @@ fn wf_shim_synth_main_method(
 /// forked Surefire VMs are short-lived so we do not hook GC for eviction.
 #[derive(Clone)]
 struct ConstructorMirrorSideMeta {
-    descriptor: String,
+    /// Raw `<init>` descriptor.  `Arc<str>` so cloning out of the table
+    /// per `peek_constructor_mirror_side` does not allocate a fresh
+    /// `String` heap buffer on every reflective Constructor read
+    /// (hot path during JDK boot / Surefire fork).
+    descriptor: Arc<str>,
     param_count: i32,
     accessible: bool,
 }
 
-fn constructor_mirror_side_table() -> &'static Mutex<HashMap<usize, ConstructorMirrorSideMeta>> {
-    static TABLE: OnceLock<Mutex<HashMap<usize, ConstructorMirrorSideMeta>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+// FxHashMap instead of std::HashMap: SipHash on a pointer-derived `usize`
+// key is pure overhead — pointers are already well-distributed and need
+// no cryptographic strength. FxHash is a couple of multiply/xor ops.
+fn constructor_mirror_side_table() -> &'static Mutex<FxHashMap<usize, ConstructorMirrorSideMeta>> {
+    static TABLE: OnceLock<Mutex<FxHashMap<usize, ConstructorMirrorSideMeta>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
 fn register_constructor_mirror_side(
@@ -5088,7 +5098,7 @@ fn register_constructor_mirror_side(
     g.insert(
         key,
         ConstructorMirrorSideMeta {
-            descriptor: descriptor.to_string(),
+            descriptor: Arc::from(descriptor),
             param_count,
             accessible,
         },
@@ -5210,7 +5220,7 @@ pub(crate) fn read_constructor_descriptor(
     ctor_obj: rustjvm_types::ObjectRef,
 ) -> Option<String> {
     if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
-        return Some(m.descriptor);
+        return Some((*m.descriptor).to_string());
     }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);

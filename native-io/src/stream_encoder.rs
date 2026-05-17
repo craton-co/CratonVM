@@ -154,9 +154,8 @@ fn write_bytes(
         return Ok(());
     }
     let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(buf, i, Value::Int(b as i8 as i32));
-    }
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
+    ctx.write_byte_array_from(buf, 0, &bytes);
     ctx.invoke_virtual(
         os,
         "write",
@@ -184,12 +183,11 @@ fn native_se_write_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let len = int_arg(args, 3) as usize;
     let cap = ctx.array_length(cbuf);
     let end = off.saturating_add(len).min(cap);
-    let mut chars = Vec::with_capacity(end - off);
-    for i in off..end {
-        match ctx.get_array_element(cbuf, i) {
-            Value::Int(v) => chars.push((v & 0xFFFF) as u16),
-            _ => chars.push(0),
-        }
+    let take = end.saturating_sub(off);
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
+    let mut chars = vec![0u16; take];
+    if take > 0 {
+        ctx.read_char_array_into(cbuf, off, &mut chars);
     }
     write_bytes(ctx, this, &chars)?;
     Ok(None)

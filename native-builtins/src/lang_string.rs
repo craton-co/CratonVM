@@ -48,9 +48,27 @@ fn fill_string_chars(
     if dst.capacity() < len {
         dst.reserve(len - dst.capacity());
     }
-    // Tight loop with hoisted bounds; per-element trait dispatch is
-    // unavoidable without a bulk-read intrinsic on `NativeContext`, but
-    // skipping the `.collect()` chain lets the compiler inline through it.
+    // Fast path: when the backing array is a primitive `char[]`, ask the
+    // VM for a bulk copy via `read_char_array_into`. This collapses N
+    // virtual-dispatched `get_array_element` calls into a single
+    // `copy_nonoverlapping` from the compact char-array payload, which
+    // dominates `String.equals` / `indexOf(String)` / `startsWith` /
+    // `contains` performance on long strings. Per-element fallback handles
+    // compact-string byte[] backings (LATIN-1 or UTF-16 BE) where the
+    // bulk intrinsic does not apply.
+    let elem_type = ctx.heap_element_type_of(arr);
+    if matches!(elem_type, rustjvm_types::ArrayElementType::Char) {
+        // Safety: we reserved capacity above; set the length and have the
+        // VM fill the buffer in one shot.
+        dst.resize(len, 0);
+        let written = ctx.read_char_array_into(arr, 0, &mut dst[..]);
+        // Defensive: trim to what the VM actually wrote (the default
+        // impl can short-circuit on a non-Int slot).
+        dst.truncate(written);
+        return;
+    }
+    // Tight loop with hoisted bounds; falls back to per-element reads for
+    // compact-string byte[] backings.
     for i in 0..len {
         let ch = match ctx.get_array_element(arr, i) {
             Value::Int(v) => v as u16,
@@ -670,29 +688,25 @@ pub(crate) fn native_string_equals(ctx: &mut dyn NativeContext, args: &[Value]) 
         return Ok(Some(Value::Int(1)));
     }
 
-    // Compare char arrays
-    let (arr_a, len_a) = match string_char_array(ctx, this) {
+    // Cheap rejection: different backing-array lengths cannot be equal.
+    // Avoids the bulk decode for the common "different strings" case.
+    let (_, len_a) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
-    let (arr_b, len_b) = match string_char_array(ctx, other) {
+    let (_, len_b) = match string_char_array(ctx, other) {
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
-
     if len_a != len_b {
         return Ok(Some(Value::Int(0)));
     }
 
-    for i in 0..len_a {
-        let a = ctx.get_array_element(arr_a, i);
-        let b = ctx.get_array_element(arr_b, i);
-        if a != b {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
-
-    Ok(Some(Value::Int(1)))
+    // Bulk-read both char arrays into thread-local scratch buffers and
+    // compare on the local slices in one shot — the inner loop is a
+    // plain `==` on `[u16]` which the compiler can SIMD.
+    let equal = with_two_string_chars_scratches(ctx, this, other, |a, b| a == b);
+    Ok(Some(Value::Int(if equal { 1 } else { 0 })))
 }
 
 pub(crate) fn native_string_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -705,22 +719,15 @@ pub(crate) fn native_string_index_of(ctx: &mut dyn NativeContext, args: &[Value]
         _ => 0,
     };
 
-    let (arr, len) = match string_char_array(ctx, this) {
-        Some(v) => v,
-        None => return Ok(Some(Value::Int(-1))),
-    };
-
-    for i in 0..len {
-        let elem = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        if elem == ch {
-            return Ok(Some(Value::Int(i as i32)));
-        }
-    }
-
-    Ok(Some(Value::Int(-1)))
+    // Bulk-decode the receiver into the thread-local scratch buffer (one
+    // VM-bulk copy when the backing array is `char[]`), then scan the
+    // local slice. Avoids N per-element virtual `get_array_element`
+    // calls when the haystack is long.
+    let needle = (ch & 0xFFFF) as u16;
+    let pos = with_string_chars_scratch(ctx, this, |buf| {
+        buf.iter().position(|&c| c == needle).map(|i| i as i32).unwrap_or(-1)
+    });
+    Ok(Some(Value::Int(pos)))
 }
 
 /// T2.2.6: `String.indexOf(int ch, int fromIndex)`.
@@ -746,30 +753,23 @@ pub(crate) fn native_string_index_of_from(
         _ => 0,
     };
 
-    let (arr, len) = match string_char_array(ctx, this) {
-        Some(v) => v,
-        None => return Ok(Some(Value::Int(-1))),
-    };
-
-    let start = from.max(0) as usize;
-    if start >= len {
-        return Ok(Some(Value::Int(-1)));
-    }
     // Note: for BMP characters this matches the raw char; for supplementary
     // code points the caller is expected to have already decomposed to
     // surrogates in the underlying `String.value` char array, so a direct
     // code-unit compare is still correct against the leading surrogate.
-    let needle = ch & 0xFFFF;
-    for i in start..len {
-        let elem = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v & 0xFFFF,
-            _ => 0,
-        };
-        if elem == needle {
-            return Ok(Some(Value::Int(i as i32)));
+    let needle = (ch & 0xFFFF) as u16;
+    let pos = with_string_chars_scratch(ctx, this, |buf| {
+        let start = from.max(0) as usize;
+        if start >= buf.len() {
+            return -1i32;
         }
-    }
-    Ok(Some(Value::Int(-1)))
+        buf[start..]
+            .iter()
+            .position(|&c| c == needle)
+            .map(|i| (start + i) as i32)
+            .unwrap_or(-1)
+    });
+    Ok(Some(Value::Int(pos)))
 }
 
 /// T2.2.6: `String.lastIndexOf(int ch, int fromIndex)`.
@@ -793,27 +793,23 @@ pub(crate) fn native_string_last_index_of_from(
         _ => 0,
     };
 
-    let (arr, len) = match string_char_array(ctx, this) {
-        Some(v) => v,
-        None => return Ok(Some(Value::Int(-1))),
-    };
-    if from < 0 || len == 0 {
+    if from < 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    let start = (from as usize).min(len - 1);
-    let needle = ch & 0xFFFF;
-    let mut i = start as isize;
-    while i >= 0 {
-        let elem = match ctx.get_array_element(arr, i as usize) {
-            Value::Int(v) => v & 0xFFFF,
-            _ => 0,
-        };
-        if elem == needle {
-            return Ok(Some(Value::Int(i as i32)));
+    let needle = (ch & 0xFFFF) as u16;
+    let pos = with_string_chars_scratch(ctx, this, |buf| {
+        if buf.is_empty() {
+            return -1i32;
         }
-        i -= 1;
-    }
-    Ok(Some(Value::Int(-1)))
+        let start = (from as usize).min(buf.len() - 1);
+        // rposition scans backwards; map onto the original index.
+        buf[..=start]
+            .iter()
+            .rposition(|&c| c == needle)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    });
+    Ok(Some(Value::Int(pos)))
 }
 
 // NOTE: `native_string_code_point_at` (T2.2.7) and

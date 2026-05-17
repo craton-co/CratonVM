@@ -387,8 +387,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
         let cf = read_class(&bytes)
             .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-        // `this_class` is already resolved to a String by the reader.
-        (cf.methods, cf.this_class)
+        // Round 4: `cf.this_class` is now `Arc<str>`; materialise into
+        // the existing `String` return type for test-fixture parity.
+        (cf.methods, cf.this_class.to_string())
     }
 
     fn find_method_index(methods: &[ClassFileMethod], name: &str, descriptor: &str) -> u16 {
