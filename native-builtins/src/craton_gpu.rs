@@ -154,6 +154,51 @@ mod state {
 }
 
 // ---------------------------------------------------------------------------
+// Public accessors for cross-crate use (Phase 6 #3: GpuArray routing)
+// ---------------------------------------------------------------------------
+//
+// The `state` module is intentionally private (the native-handler
+// implementation is the only thing meant to touch the synthetic
+// store directly). But the GPU dispatch code in
+// `rustjvm_vm::runtime::offload` needs to read array bytes back
+// when it sees a `craton.gpu.GpuArray` Java argument to a kernel —
+// it gets the long handle from the GpuArray's `handle` field and
+// looks up the bytes here.
+//
+// Two thin accessors that take + return owned data are enough; no
+// raw reference into the mutex is exposed.
+
+/// (Phase 6 #3) Snapshot the host bytes + element type for the
+/// array handle returned by `Native.arrayWrap*`. Returns `None` if
+/// the handle is unknown or has been released. The returned
+/// `Vec<u8>` is a fresh allocation; the caller may modify it
+/// without affecting the store.
+#[cfg(feature = "gpu-offload")]
+pub fn array_snapshot(
+    handle: u64,
+) -> Option<(rustjvm_types::ArrayElementType, usize, Vec<u8>)> {
+    state::with(|s| {
+        s.arrays
+            .get(&handle)
+            .map(|e| (e.element_type, e.element_count, e.bytes.clone()))
+    })
+}
+
+/// (Phase 6 #3) Replace the host bytes for the array handle. The
+/// `element_count` and `element_type` stay as set by `arrayWrap`;
+/// only the byte payload is overwritten. Called after a kernel
+/// completes so a subsequent `GpuArray.toHost()` reads the new
+/// contents.
+#[cfg(feature = "gpu-offload")]
+pub fn array_replace_bytes(handle: u64, bytes: Vec<u8>) {
+    state::with(|s| {
+        if let Some(e) = s.arrays.get_mut(&handle) {
+            e.bytes = bytes;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

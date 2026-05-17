@@ -1281,7 +1281,32 @@ pub fn dispatch_method_from_native(
                     }
                     continue;
                 }
-                // Second: is it a boxed primitive? Java's varargs
+                // Second: is it a craton.gpu.GpuArray? If so, route
+                // through the residency tracker — read the long
+                // `handle` field, snapshot the bytes from
+                // native-builtins/craton_gpu, marshal as if it were
+                // a plain primitive array. Phase 7 will pre-cache
+                // the DeviceBuffer in the resident state so this
+                // path skips the H→D copy when the bytes haven't
+                // changed since the previous kernel.
+                if let Some((etype, len, host_bytes, arr_handle)) =
+                    try_gpu_array_snapshot(shared, *obj_ref)
+                {
+                    match marshal_resident_array_arg(
+                        ctx, etype, len, host_bytes, arr_handle,
+                    ) {
+                        Ok((args_after, wb)) => {
+                            kernel_args = args_after(kernel_args);
+                            writebacks.push(wb);
+                        }
+                        Err(msg) => {
+                            drop(token);
+                            return record_failed_submission(Some(stream.clone()), msg);
+                        }
+                    }
+                    continue;
+                }
+                // Third: is it a boxed primitive? Java's varargs
                 // autobox `int` → Integer, etc.
                 match try_unbox_primitive(shared, *obj_ref) {
                     Some(Value::Int(v)) => kernel_args = kernel_args.push_i32(v),
@@ -1293,7 +1318,7 @@ pub fn dispatch_method_from_native(
                         return record_failed_submission(
                             Some(stream.clone()),
                             format!(
-                                "submitMethod: arg #{i} is neither a primitive array nor a boxed primitive",
+                                "submitMethod: arg #{i} is not a primitive array, GpuArray, or boxed primitive",
                             ),
                         );
                     }
@@ -1353,10 +1378,18 @@ pub fn dispatch_method_from_native(
 
 #[cfg(feature = "gpu-offload")]
 enum MarshalWriteback {
+    // Plain JVM primitive arrays (Phase 5).
     I32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
     I64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
     F32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
     F64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
+    // Phase 6 #3 — GpuArray-backed args. Writeback target is the
+    // resident-store entry keyed by `handle`, not a Java array
+    // object.
+    ResidentI32 { handle: u64, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
+    ResidentI64 { handle: u64, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
+    ResidentF32 { handle: u64, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
+    ResidentF64 { handle: u64, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -1396,7 +1429,174 @@ impl MarshalWriteback {
                 gpu_marshal::write_back_f64(*obj, &shared.heap, &dst, token);
                 Ok(())
             }
+            // Phase 6 #3 — write back into the resident store via
+            // `native-builtins::craton_gpu::array_replace_bytes`. A
+            // subsequent `GpuArray.toHost()` reads the updated bytes.
+            Self::ResidentI32 { handle, buf, len } => {
+                let mut dst = vec![0i32; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into i32 (resident): {e}"))?;
+                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
+                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+                Ok(())
+            }
+            Self::ResidentI64 { handle, buf, len } => {
+                let mut dst = vec![0i64; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into i64 (resident): {e}"))?;
+                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
+                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+                Ok(())
+            }
+            Self::ResidentF32 { handle, buf, len } => {
+                let mut dst = vec![0f32; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into f32 (resident): {e}"))?;
+                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
+                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+                Ok(())
+            }
+            Self::ResidentF64 { handle, buf, len } => {
+                let mut dst = vec![0f64; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into f64 (resident): {e}"))?;
+                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
+                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+                Ok(())
+            }
         }
+    }
+}
+
+/// Phase 6 #3: detect a `craton.gpu.GpuArray` Java object and read
+/// its (element_type, length, host bytes, native handle) tuple from
+/// the resident-array store. Returns `None` for any non-GpuArray
+/// object so callers can fall through to other arg shapes.
+///
+/// The GpuArray Java layout (P3-2):
+///   field 0: `long handle`
+///   field 1: `Class<?> elementType`  (unused here; type comes from
+///                                     the resident-store record)
+#[cfg(feature = "gpu-offload")]
+fn try_gpu_array_snapshot(
+    shared: &crate::vm::SharedVm,
+    obj_ref: rustjvm_types::ObjectRef,
+) -> Option<(rustjvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
+    let cid = shared.heap.class_id_of(obj_ref);
+    let cm = shared.class_manager.read();
+    let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
+    drop(cm);
+    if cls_name != "craton/gpu/GpuArray" {
+        return None;
+    }
+    // field 0 holds the long `handle`.
+    let handle = match shared.heap.get_field(obj_ref, 0) {
+        rustjvm_types::Value::Long(h) => h as u64,
+        _ => return None,
+    };
+    let (etype, len, bytes) =
+        rustjvm_native_builtins::craton_gpu::array_snapshot(handle)?;
+    Some((etype, len, bytes, handle))
+}
+
+/// Marshal a resident GpuArray as a kernel arg. The shape of the
+/// closure + writeback record mirrors `marshal_array_arg` but the
+/// source bytes are the resident-store snapshot rather than a JVM
+/// array — and the writeback target is the resident store (so a
+/// subsequent `GpuArray.toHost()` reads the post-kernel content).
+#[cfg(feature = "gpu-offload")]
+fn marshal_resident_array_arg(
+    ctx: &cuda_bridge::DeviceContext,
+    element_type: rustjvm_types::ArrayElementType,
+    len: usize,
+    host_bytes: Vec<u8>,
+    arr_handle: u64,
+) -> Result<
+    (
+        Box<dyn FnOnce(cuda_bridge::KernelArgs) -> cuda_bridge::KernelArgs>,
+        MarshalWriteback,
+    ),
+    String,
+> {
+    use crate::runtime::gpu_marshal;
+    use rustjvm_types::ArrayElementType;
+
+    match element_type {
+        ArrayElementType::Int => {
+            let host: &[i32] = bytemuck::cast_slice(&host_bytes);
+            let buf = gpu_marshal::upload(ctx, host)
+                .map_err(|e| format!("upload i32 (GpuArray, len={len}): {e}"))?;
+            let wb = MarshalWriteback::ResidentI32 { handle: arr_handle, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::ResidentI32 { buf, .. } => {
+                    let len32 = len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i32>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<i32> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len32)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        ArrayElementType::Long => {
+            let host: &[i64] = bytemuck::cast_slice(&host_bytes);
+            let buf = gpu_marshal::upload(ctx, host)
+                .map_err(|e| format!("upload i64 (GpuArray, len={len}): {e}"))?;
+            let wb = MarshalWriteback::ResidentI64 { handle: arr_handle, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::ResidentI64 { buf, .. } => {
+                    let len32 = len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i64>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<i64> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len32)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        ArrayElementType::Float => {
+            let host: &[f32] = bytemuck::cast_slice(&host_bytes);
+            let buf = gpu_marshal::upload(ctx, host)
+                .map_err(|e| format!("upload f32 (GpuArray, len={len}): {e}"))?;
+            let wb = MarshalWriteback::ResidentF32 { handle: arr_handle, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::ResidentF32 { buf, .. } => {
+                    let len32 = len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f32>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<f32> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len32)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        ArrayElementType::Double => {
+            let host: &[f64] = bytemuck::cast_slice(&host_bytes);
+            let buf = gpu_marshal::upload(ctx, host)
+                .map_err(|e| format!("upload f64 (GpuArray, len={len}): {e}"))?;
+            let wb = MarshalWriteback::ResidentF64 { handle: arr_handle, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::ResidentF64 { buf, .. } => {
+                    let len32 = len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f64>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<f64> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len32)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        other => Err(format!(
+            "submitMethod: GpuArray element type {other:?} unsupported"
+        )),
     }
 }
 

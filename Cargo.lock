@@ -1956,6 +1956,7 @@ name = "rustjvm-vm"
 version = "0.2.0"
 dependencies = [
  "bitfield-struct",
+ "bytemuck",
  "criterion",
  "cuda-bridge",
  "indexmap",
