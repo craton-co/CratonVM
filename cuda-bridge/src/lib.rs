@@ -216,10 +216,17 @@ mod backend_stub;
 #[cfg(not(feature = "cuda"))]
 use backend_stub as backend;
 
+pub mod async_memcpy;
+pub mod event;
+pub mod launch;
+pub mod stream;
+
 // We need a trivial Pod-trait shim because cudarc requires
 // `bytemuck::Pod` for safe transfer. Re-export so callers don't have
 // to add bytemuck themselves.
 pub use bytemuck;
+pub use event::Event;
+pub use stream::{Stream, StreamOp};
 
 #[cfg(all(test, not(feature = "cuda")))]
 mod stub_tests {
