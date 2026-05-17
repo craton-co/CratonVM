@@ -14,6 +14,7 @@
 //!   `test_classes/gpu/`, compiled by the workspace `build.rs`.
 
 pub mod analyzer;
+pub mod annotations;
 pub mod emitter;
 pub mod lowering;
 pub mod signature;
@@ -22,5 +23,9 @@ pub mod signature;
 mod test_support;
 
 pub use analyzer::{analyze, OffloadVerdict, ParamKind, Reason};
+pub use annotations::{
+    AdmissionHint, ClassAnnotations, EnableAsyncAttrs, GpuExcludeAttrs, GpuKernelAttrs, GridShape,
+    MethodAnnotations,
+};
 pub use emitter::{LoweringError, PtxKernel, PtxModule, PtxParam};
 pub use signature::KernelSignature;
