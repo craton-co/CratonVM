@@ -5,7 +5,9 @@ Round-4 wave-2 introduced `Arc<[u8]>` payloads for `CodeAttribute.code`, `StackM
 ---
 
 ## [CRIT] 1. `Arc::from(&source[range])` allocates fresh — the wave-2 zero-copy fix is a no-op
-**File:** `reader/src/attribute.rs:731, 999, 1099`
+**Status:** FIXED (round-5). `reader/src/byte_view.rs` introduces `ByteView { source: Arc<[u8]>, start, end }`. `CodeAttribute.code`, `StackMapTable.entries`, and `Unknown.data` now hold `ByteView`; the three decoder sites use `ByteView::new(Arc::clone(source), range)` — single atomic refcount bump, no memcpy. Downstream consumers that require an owned `Arc<[u8]>` (`VtableMethodSnapshot.code`) call `ByteView::to_arc()`, which pays the same alloc+memcpy cost once at vtable installation rather than on every parse. See round-5 fix below.
+
+**File:** `reader/src/attribute.rs:731, 999, 1099` (now lines 741, 1015, 1117)
 
 ```rust
 let code: Arc<[u8]> = Arc::from(&source[code_start..code_start + code_length]);

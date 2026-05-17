@@ -230,6 +230,85 @@ unsafe fn call_jit_compiled_method_entry(
     }
 }
 
+/// Attempt to call a JIT-compiled entry through the register-only
+/// transmute tables. Returns `Some(rc)` on success, `None` when the arg
+/// count exceeds the table coverage (4 with no-ctx, 3 with-ctx). The
+/// caller is expected to fall through to the interpreter slow-path in
+/// `jit_invoke_dispatch` (which decodes args into `Value`s and bails)
+/// rather than returning the previous silent `0` — that was the round-5
+/// MED follow-up to the round-4 wave-2 fix for the helper dispatch path.
+///
+/// CRIT (round-5 review): three sibling sites in `jit_invoke_dispatch`
+/// (the thread-local DISPATCH_CACHE fast-path, the JIT cache fast-path,
+/// and the post-compile fast-path) each carried `_ => 0` arms that
+/// silently dropped 5+-arg callees. Sharing this helper keeps the
+/// register-table dispatch in one place and removes those drop sites.
+///
+/// SAFETY: `entry` must be a live JIT-compiled extern "C" entry point
+/// whose calling convention matches `needs_ctx` (with-ctx prepends an
+/// `i64` VM pointer to the Java arg slots). `args_slice` must contain
+/// exactly `args_slice.len()` valid i64 arg slots; on overflow we don't
+/// dereference the table at all.
+#[inline]
+unsafe fn try_call_compiled_entry(
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> Option<i64> {
+    let n = args_slice.len();
+    if needs_ctx {
+        Some(match n {
+            0 => {
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr)
+            }
+            1 => {
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr, args_slice[0])
+            }
+            2 => {
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr, args_slice[0], args_slice[1])
+            }
+            3 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
+            }
+            // TODO(round-6-wave-2): extend register-table coverage or
+            // emit stack-arg setup so 4+-arg with-ctx callees stay on
+            // the JIT fast-path. Until then return None so the caller
+            // bails to the interpreter (correct semantics, slower).
+            _ => return None,
+        })
+    } else {
+        Some(match n {
+            0 => {
+                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
+                f()
+            }
+            1 => {
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0])
+            }
+            2 => {
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0], args_slice[1])
+            }
+            3 => {
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0], args_slice[1], args_slice[2])
+            }
+            4 => {
+                let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
+                f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
+            }
+            // TODO(round-6-wave-2): see with-ctx branch above.
+            _ => return None,
+        })
+    }
+}
+
 /// Bail a JIT-dispatched call out to the interpreter when the compiled
 /// callee has more arguments than `call_jit_compiled_method_entry`'s
 /// register-arg dispatch tables can pass. Issues `invoke_or_native` with
@@ -265,6 +344,85 @@ unsafe fn bail_to_interpreter(
             0
         }
     }
+}
+
+/// Decode a JIT dispatch helper's raw `i64` argument slice into the
+/// `Vec<Value>` the interpreter expects.  Centralised so that the slow
+/// path in `jit_invoke_dispatch` and the three `try_call_compiled_entry`
+/// overflow bailouts (DISPATCH_CACHE hit, JIT-cache hit, post-compile)
+/// all reconstruct args the same way — round-5 CRIT-1 fix.
+///
+/// `invoke_kind` matches the JIT calling-convention encoding: 0/1/2 are
+/// virtual/static/special with an explicit receiver in `args_slice[0]`;
+/// 3 is the no-receiver form (used for static and indy callees that the
+/// JIT emits without a leading `this` slot).
+///
+/// SAFETY: `args_slice` must be a slice of valid `i64` arg slots produced
+/// by the JIT caller. `vm` must be a live `SharedVm`; the heap is queried
+/// to validate any potential object pointers before round-tripping them
+/// through `ObjectRef`.
+#[inline]
+unsafe fn decode_dispatch_values(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+) -> Vec<Value> {
+    let mut values = Vec::with_capacity(args_slice.len());
+    let mut desc_iter = DescriptorParamIter::new(info.descriptor);
+
+    if info.invoke_kind != 3 {
+        if !args_slice.is_empty() {
+            let ptr = args_slice[0];
+            if ptr == 0 {
+                values.push(Value::Object(None));
+            } else {
+                // Defensive: tagged-long bits in an L-typed receiver slot
+                // are downgraded to null instead of being treated as a
+                // heap pointer (else GC SEGVs walking a bogus oop).
+                let bits = ptr as u64;
+                let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                    vm.heap.is_object_address(bits as usize)
+                } else {
+                    None
+                };
+                match validated {
+                    Some(obj) => values.push(Value::Object(Some(obj))),
+                    None => values.push(Value::Object(None)),
+                }
+            }
+        }
+    }
+
+    let start_idx = if info.invoke_kind != 3 { 1 } else { 0 };
+    for &raw in &args_slice[start_idx..] {
+        let val = match desc_iter.next() {
+            Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
+                Value::Int(raw as i32)
+            }
+            Some(b'J') => Value::Long(raw),
+            Some(b'F') => Value::Float(f32::from_bits(raw as u32)),
+            Some(b'D') => Value::Double(f64::from_bits(raw as u64)),
+            Some(b'L') | Some(b'[') => {
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    let bits = raw as u64;
+                    let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                        vm.heap.is_object_address(bits as usize)
+                    } else {
+                        None
+                    };
+                    match validated {
+                        Some(obj) => Value::Object(Some(obj)),
+                        None => Value::Object(None),
+                    }
+                }
+            }
+            _ => Value::Int(raw as i32),
+        };
+        values.push(val);
+    }
+    values
 }
 
 // ---------------------------------------------------------------------------
@@ -504,9 +662,18 @@ pub unsafe extern "C" fn jit_anewarray_object(
 // ---------------------------------------------------------------------------
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to a byte/boolean array object. Null and out-of-bounds are handled gracefully.
+// pointer to a byte/boolean array object. Null triggers a pending NPE + `i64::MIN`
+// deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
-    if array_ptr == 0 { return 0; }
+    if array_ptr == 0 {
+        // JVMS §baload: throw NullPointerException on null array reference.
+        // Previously returned 0, which silently fabricated a zero byte and
+        // masked real null-deref bugs in user code. Match the iaload/aaload
+        // protocol: flag the pending NPE and return the deopt sentinel so the
+        // post-JIT interpreter path throws on resume.
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     // SAFETY: array_ptr is non-null and points to a live array object on the GC heap.
     // ARRAY_LENGTH_OFFSET is the fixed offset to the length field in the array header.
     let ptr = array_ptr as *const u8;
@@ -519,9 +686,17 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to a byte/boolean array object. Null and out-of-bounds are handled gracefully.
+// pointer to a byte/boolean array object. Null sets the pending-NPE flag (the
+// interpreter post-JIT path throws on resume); out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
-    if array_ptr == 0 { return; }
+    if array_ptr == 0 {
+        // JVMS §bastore: throw NullPointerException on null array reference.
+        // Previously silently no-op'd, dropping the user's intended write and
+        // hiding the bug. Stores have no return slot, so we only flag the
+        // pending NPE — the interpreter resumes at the deopt PC and throws.
+        set_jit_pending_npe();
+        return;
+    }
     // SAFETY: array_ptr is non-null and points to a live array object on the GC heap.
     let ptr = array_ptr as *mut u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
@@ -555,9 +730,15 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to an int array object. Null and out-of-bounds are handled gracefully.
+// pointer to an int array object. Null sets the pending-NPE flag (the interpreter
+// post-JIT path throws on resume); out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
-    if array_ptr == 0 { return; }
+    if array_ptr == 0 {
+        // JVMS §iastore: throw NullPointerException on null array reference.
+        // Previously silently no-op'd, dropping the write and masking the bug.
+        set_jit_pending_npe();
+        return;
+    }
     // SAFETY: array_ptr is non-null and points to a live int[] on the GC heap.
     let ptr = array_ptr as *mut u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
@@ -594,7 +775,12 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
 // for non-null stores to maintain generational GC card table invariants.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
-    if array_ptr == 0 { return; }
+    if array_ptr == 0 {
+        // JVMS §aastore: throw NullPointerException on null array reference.
+        // Previously silently no-op'd, dropping the write and masking the bug.
+        set_jit_pending_npe();
+        return;
+    }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
     let ptr = array_ptr as *mut u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
@@ -1204,65 +1390,31 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     });
     if let Some((entry, needs_ctx)) = cached_entry {
         // SAFETY: entry is a JIT-compiled function pointer cached from a previous successful
-        // compilation. The transmutes convert it to the correct extern "C" fn signature based
-        // on arg count. The JIT compiler guarantees the compiled code uses extern "C" ABI with
-        // i64 parameters matching the method's JVM descriptor.
-        let n = num_args as usize;
-        let cached_ret = if needs_ctx {
-            match n {
-                0 => {
-                    let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                    f(vm_ptr)
-                }
-                1 => {
-                    let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                    f(vm_ptr, args_slice[0])
-                }
-                2 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                    f(vm_ptr, args_slice[0], args_slice[1])
-                }
-                3 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                    f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
-                }
-                _ => 0,
-            }
-        } else {
-            match n {
-                0 => {
-                    let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
-                    f()
-                }
-                1 => {
-                    let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                    f(args_slice[0])
-                }
-                2 => {
-                    let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                    f(args_slice[0], args_slice[1])
-                }
-                3 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                    f(args_slice[0], args_slice[1], args_slice[2])
-                }
-                4 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                    f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
-                }
-                _ => 0,
-            }
-        };
-        return cached_ret;
+        // compilation. `try_call_compiled_entry` selects the correct extern "C" fn signature
+        // based on arg count; on overflow it returns None and we bail to the interpreter.
+        // CRIT round-5 fix: the previous `_ => 0` arm silently dropped 5+-arg callees;
+        // wave-2 changed it to fall through to the slow path, and this wave goes one
+        // step further by routing directly through `bail_to_interpreter` so the bail is
+        // explicit at the call site (matches the MIC fast-path at `:1722`).
+        if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+            return rc;
+        }
+        // Overflow: decode args once and hand off to the interpreter.
+        if let Some(thread) = jit_thread_mut() {
+            let bail_args = decode_dispatch_values(vm, info, args_slice);
+            return bail_to_interpreter(vm, thread, info, &bail_args);
+        }
+        return 0;
     }
 
-    // Check JIT cache for a compiled version of this callee
+    // Check JIT cache for a compiled version of this callee.
+    // PERF: `JitCache::get` takes `&str`, so we can pass the static literals from
+    // `info` directly. Earlier code wrapped each in `Arc::from(...)` which
+    // allocated a fresh heap buffer + atomic header on every dispatch — three
+    // wasted allocations per hot call. Deref coercion handles the conversion.
     {
-        let class_arc: std::sync::Arc<str> = std::sync::Arc::from(info.class_name);
-        let method_arc: std::sync::Arc<str> = std::sync::Arc::from(info.method_name);
-        let desc_arc: std::sync::Arc<str> = std::sync::Arc::from(info.descriptor);
         let jit_cache = vm.jit_cache.read();
-        if let Some(compiled) = jit_cache.get(&class_arc, &method_arc, &desc_arc) {
+        if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
             let needs_ctx = compiled.needs_context();
             // Cache for future calls
@@ -1272,53 +1424,18 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             drop(jit_cache);
             // SAFETY: entry was obtained from a CompiledMethod in the JIT cache, whose
             // entry_ptr points to executable memory with the correct extern "C" ABI.
-            // The transmutes match the compiled method's parameter count.
-            let n = num_args as usize;
-            if needs_ctx {
-                return match n {
-                    0 => {
-                        let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr)
-                    }
-                    1 => {
-                        let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr, args_slice[0])
-                    }
-                    2 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr, args_slice[0], args_slice[1])
-                    }
-                    3 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
-                    }
-                    _ => 0,
-                };
-            } else {
-                return match n {
-                    0 => {
-                        let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
-                        f()
-                    }
-                    1 => {
-                        let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0])
-                    }
-                    2 => {
-                        let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0], args_slice[1])
-                    }
-                    3 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0], args_slice[1], args_slice[2])
-                    }
-                    4 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
-                    }
-                    _ => 0,
-                };
+            // CRIT round-5 fix: on >ARG_REGS args, route directly to the interpreter
+            // via `bail_to_interpreter` rather than silently returning 0 (the original
+            // wave-2 fall-through was already correct; this just makes the bail
+            // explicit at the call site to match the MIC fast-path).
+            if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+                return rc;
             }
+            if let Some(thread) = jit_thread_mut() {
+                let bail_args = decode_dispatch_values(vm, info, args_slice);
+                return bail_to_interpreter(vm, thread, info, &bail_args);
+            }
+            return 0;
         }
     }
 
@@ -1336,53 +1453,16 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 dc.borrow_mut().insert(info_key, DispatchCache { entry, needs_context: needs_ctx });
             });
             // SAFETY: entry was just produced by try_compile_callee, which returns a validated
-            // JIT entry pointer. The transmutes match the compiled method's parameter count.
-            let n = num_args as usize;
-            if needs_ctx {
-                return match n {
-                    0 => {
-                        let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr)
-                    }
-                    1 => {
-                        let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr, args_slice[0])
-                    }
-                    2 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr, args_slice[0], args_slice[1])
-                    }
-                    3 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
-                    }
-                    _ => 0,
-                };
-            } else {
-                return match n {
-                    0 => {
-                        let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
-                        f()
-                    }
-                    1 => {
-                        let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0])
-                    }
-                    2 => {
-                        let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0], args_slice[1])
-                    }
-                    3 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0], args_slice[1], args_slice[2])
-                    }
-                    4 => {
-                        let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                        f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
-                    }
-                    _ => 0,
-                };
+            // JIT entry pointer. CRIT round-5 fix: bail explicitly to the interpreter on
+            // >ARG_REGS args via `bail_to_interpreter` (matches the MIC fast-path).
+            if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+                return rc;
             }
+            if let Some(thread) = jit_thread_mut() {
+                let bail_args = decode_dispatch_values(vm, info, args_slice);
+                return bail_to_interpreter(vm, thread, info, &bail_args);
+            }
+            return 0;
         }
     }
 
@@ -1394,70 +1474,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     };
 
-    let mut values = Vec::with_capacity(num_args.max(0) as usize);
-    let mut desc_iter = DescriptorParamIter::new(info.descriptor);
-
-    if info.invoke_kind != 3 {
-        if !args_slice.is_empty() {
-            let ptr = args_slice[0];
-            if ptr == 0 {
-                values.push(Value::Object(None));
-            } else {
-                // Defensive: JIT operand-stack slots typed as `J` (long) may
-                // leak into call sites typed `L` (reference) and arrive here
-                // as tagged-long bits that are not valid heap pointers. The
-                // pre-ξ fix only checked alignment + 48-bit range, which lets
-                // a stray aligned long (e.g. file size, hash) through; GC
-                // then walks that bogus pointer and SEGVs. Round-trip via
-                // `heap.is_object_address` (same fix shape as
-                // `value_as_validated_object_ref`).
-                let bits = ptr as u64;
-                let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                    vm.heap.is_object_address(bits as usize)
-                } else {
-                    None
-                };
-                match validated {
-                    Some(obj) => values.push(Value::Object(Some(obj))),
-                    None => values.push(Value::Object(None)),
-                }
-            }
-        }
-    }
-
-    let start_idx = if info.invoke_kind != 3 { 1 } else { 0 };
-    for &raw in &args_slice[start_idx..] {
-        let val = match desc_iter.next() {
-            Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
-                Value::Int(raw as i32)
-            }
-            Some(b'J') => Value::Long(raw),
-            Some(b'F') => Value::Float(f32::from_bits(raw as u32)),
-            Some(b'D') => Value::Double(f64::from_bits(raw as u64)),
-            Some(b'L') | Some(b'[') => {
-                if raw == 0 {
-                    Value::Object(None)
-                } else {
-                    // Same validated guard as the receiver decode above:
-                    // tagged-long bits must round-trip through
-                    // `heap.is_object_address` before being treated as an
-                    // ObjectRef, otherwise GC SEGVs walking the bogus oop.
-                    let bits = raw as u64;
-                    let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                        vm.heap.is_object_address(bits as usize)
-                    } else {
-                        None
-                    };
-                    match validated {
-                        Some(obj) => Value::Object(Some(obj)),
-                        None => Value::Object(None),
-                    }
-                }
-            }
-            _ => Value::Int(raw as i32),
-        };
-        values.push(val);
-    }
+    // Round-5 CRIT-1 fix: share arg-decoding with the three cache-hit
+    // overflow bailouts above via `decode_dispatch_values`.
+    let values = decode_dispatch_values(vm, info, args_slice);
 
     let result: Option<Value> = match info.invoke_kind {
         0 | 2 => {
@@ -2063,7 +2082,11 @@ impl DeoptimizationController {
                 reason_static,
                 action_static,
                 bci as i32,
-                0, // thread_id — TODO(round-4-wave-3): plumb real thread id
+                // Round-5 MED-fix (2026-05-17): plumb the real JFR thread id
+                // so JMC can attribute the deopt to the thread that triggered
+                // it. `current_jfr_thread_id()` is TLS-cached, allocates once
+                // per thread, and steady-state cost is a TLS read + branch.
+                rustjvm_jfr::builtin::current_jfr_thread_id(),
                 now_ns,
             );
         }

@@ -1,0 +1,278 @@
+//! Shared, zero-copy byte view into a parent `Arc<[u8]>` allocation.
+//!
+//! `ByteView` exists to fix the round-4 regression where
+//! `Arc::from(&source[range])` was claimed to share the parent class-file
+//! buffer but actually allocated a brand-new `ArcInner<[u8]>` and memcpy'd
+//! the slice (see `impl From<&[T]> for Arc<[T]>`). `ByteView` stores a
+//! refcount-bumped clone of the parent `Arc<[u8]>` plus a `start..end`
+//! range; constructing one from the class-file hot path is a single
+//! atomic `Arc::clone` and no memcpy.
+//!
+//! Most consumers read these bytes as `&[u8]`; the `Deref<Target=[u8]>`
+//! and `AsRef<[u8]>` impls below make `ByteView` a drop-in replacement
+//! for `Arc<[u8]>` at use sites that only need slice access.
+//!
+//! For consumers that genuinely need an owned `Arc<[u8]>` (e.g.
+//! `VtableMethodSnapshot.code`, `Frame.code`), call [`ByteView::to_arc`].
+//! That path *does* allocate + memcpy, but it does so exactly once at
+//! vtable installation rather than on every parse, matching the cost
+//! profile the round-4 fix originally claimed.
+
+use std::ops::{Deref, Range};
+use std::sync::Arc;
+
+/// A zero-copy view into a shared `Arc<[u8]>` buffer.
+///
+/// Cloning a `ByteView` is a single atomic refcount bump on the parent
+/// `Arc<[u8]>` plus two `usize` copies. Dereferencing yields the slice
+/// `&source[start..end]`.
+#[derive(Clone)]
+pub struct ByteView {
+    source: Arc<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl ByteView {
+    /// Construct a view into `source[range]`. Panics if the range falls
+    /// outside `source`.
+    #[inline]
+    pub fn new(source: Arc<[u8]>, range: Range<usize>) -> Self {
+        assert!(range.start <= range.end, "ByteView range start > end");
+        assert!(
+            range.end <= source.len(),
+            "ByteView range end {} exceeds source length {}",
+            range.end,
+            source.len()
+        );
+        Self {
+            source,
+            start: range.start,
+            end: range.end,
+        }
+    }
+
+    /// Build a view from an owned `Vec<u8>` — convenience for tests and
+    /// callers that don't have a pre-existing shared buffer. The vector
+    /// is converted into an `Arc<[u8]>` (single allocation) and the view
+    /// covers its whole length.
+    #[inline]
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self::new(Arc::from(bytes), 0..len)
+    }
+
+    /// Build a view from a borrowed slice — copies once into a fresh
+    /// `Arc<[u8]>`. Convenience for test fixtures; production code on
+    /// the reader hot path should use [`ByteView::new`] with the shared
+    /// class-file buffer.
+    #[inline]
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        Self::new(Arc::from(bytes), 0..len)
+    }
+
+    /// Empty view — does not allocate.
+    #[inline]
+    pub fn empty() -> Self {
+        let empty: Arc<[u8]> = Arc::from(Vec::<u8>::new());
+        Self {
+            source: empty,
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Returns the underlying byte slice.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY of bounds: enforced by `ByteView::new`.
+        &self.source[self.start..self.end]
+    }
+
+    /// Number of bytes in the view.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// `true` if the view is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.end == self.start
+    }
+
+    /// Materialize a fresh, standalone `Arc<[u8]>` containing only the
+    /// view's bytes. Allocates + memcpys (`Arc::from(&[u8])`); intended
+    /// for downstream consumers like `VtableMethodSnapshot.code` and
+    /// `Frame.code` whose lifetimes are decoupled from the class-file
+    /// buffer.
+    ///
+    /// Same one-time cost as the broken `Arc::from(&source[range])`
+    /// previously paid on every parse — except this happens at vtable
+    /// installation, not during the parse hot path.
+    #[inline]
+    pub fn to_arc(&self) -> Arc<[u8]> {
+        Arc::from(self.as_bytes())
+    }
+}
+
+impl Default for ByteView {
+    /// Empty view with no allocation pressure beyond the shared empty Arc.
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Deref for ByteView {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for ByteView {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for ByteView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mirror the `Arc<[u8]>` Debug shape so format!("{:?}", view)
+        // stays terse in transitive Debug output.
+        f.debug_struct("ByteView")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl PartialEq for ByteView {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ByteView {}
+
+impl PartialEq<[u8]> for ByteView {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_bytes() == other
+    }
+}
+
+impl PartialEq<&[u8]> for ByteView {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.as_bytes() == *other
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for ByteView {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.as_bytes() == other.as_slice()
+    }
+}
+
+impl PartialEq<Vec<u8>> for ByteView {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_bytes() == other.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for ByteView {
+    /// Convert from a `Vec<u8>` via `ByteView::from_vec`. Allocates a
+    /// single `Arc<[u8]>` and the view covers the whole buffer. Convenience
+    /// for test fixtures (`vec![...].into()`) and producers that already
+    /// own the bytes.
+    #[inline]
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
+impl From<&[u8]> for ByteView {
+    /// Convert from a borrowed slice via `ByteView::from_slice`. Copies
+    /// once into a fresh `Arc<[u8]>`.
+    #[inline]
+    fn from(bytes: &[u8]) -> Self {
+        Self::from_slice(bytes)
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for ByteView {
+    /// Convert from a fixed-size array (test convenience for
+    /// `[0xB1u8].into()`-style call sites).
+    #[inline]
+    fn from(bytes: [u8; N]) -> Self {
+        Self::from_slice(&bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_view_shares_parent_arc() {
+        let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let strong_before = Arc::strong_count(&parent);
+        let view = ByteView::new(Arc::clone(&parent), 2..6);
+        assert_eq!(Arc::strong_count(&parent), strong_before + 1);
+        assert_eq!(view.as_bytes(), &[3u8, 4, 5, 6][..]);
+        assert_eq!(view.len(), 4);
+        assert!(!view.is_empty());
+
+        // Clone is a refcount bump, no extra allocation.
+        let cloned = view.clone();
+        assert_eq!(Arc::strong_count(&parent), strong_before + 2);
+        assert_eq!(cloned.as_bytes(), view.as_bytes());
+    }
+
+    #[test]
+    fn deref_yields_slice() {
+        let view = ByteView::from_vec(vec![10u8, 20, 30]);
+        let slice: &[u8] = &view;
+        assert_eq!(slice, &[10u8, 20, 30][..]);
+        assert_eq!(view[0], 10);
+        assert_eq!(view.len(), 3);
+    }
+
+    #[test]
+    fn from_slice_and_from_vec_round_trip() {
+        let v = ByteView::from_slice(&[1u8, 2, 3]);
+        assert_eq!(v.as_bytes(), &[1u8, 2, 3][..]);
+        let v2 = ByteView::from_vec(vec![4, 5]);
+        assert_eq!(v2.as_bytes(), &[4u8, 5][..]);
+    }
+
+    #[test]
+    fn empty_view_is_empty() {
+        let v = ByteView::empty();
+        assert!(v.is_empty());
+        assert_eq!(v.len(), 0);
+        assert_eq!(v.as_bytes(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn to_arc_returns_independent_arc() {
+        let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
+        let view = ByteView::new(Arc::clone(&parent), 1..3);
+        let owned: Arc<[u8]> = view.to_arc();
+        assert_eq!(&*owned, &[2u8, 3][..]);
+        // owned is decoupled from parent.
+        drop(view);
+        drop(parent);
+        assert_eq!(&*owned, &[2u8, 3][..]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_panics_on_out_of_bounds_range() {
+        let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3]);
+        let _ = ByteView::new(parent, 0..10);
+    }
+}

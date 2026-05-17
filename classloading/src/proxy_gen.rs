@@ -374,7 +374,11 @@ fn parse_one_field(desc: &str, i: usize) -> (DescKind, usize) {
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum CpKey {
-    Utf8(String),
+    // Round 5 audit fix (MED): `Utf8` was removed from this enum. UTF-8
+    // dedup is now performed by `CpBuilder::utf8_dedup` (a dedicated
+    // `HashMap<String, u16>`) so probe-time lookup uses a `&str` key
+    // — no `s.to_string()` per `add_utf8` call. Owned strings are
+    // allocated only on cache miss (the actual insert path).
     Class(String),
     String(u16),
     NameAndType(u16, u16),
@@ -393,6 +397,14 @@ enum CpKey {
 pub struct CpBuilder {
     entries: Vec<u8>,
     dedup: HashMap<CpKey, u16>,
+    /// Round 5 audit fix (MED): dedicated UTF-8 dedup map keyed on
+    /// owned `String`. `add_utf8` probes with the borrowed `&str`
+    /// (HashMap's `K: Borrow<Q>` impl makes `get(&str)` work against
+    /// `HashMap<String, _>`) so the owned `String` is only built on
+    /// cache miss. Previously every probe allocated an owned `String`
+    /// for `CpKey::Utf8(s.to_string())` regardless of hit/miss — a
+    /// 12+ allocations-per-method overhead on `proxy_gen` emission.
+    utf8_dedup: HashMap<String, u16>,
     count: u16,
 }
 
@@ -401,6 +413,7 @@ impl CpBuilder {
         Self {
             entries: Vec::with_capacity(256),
             dedup: HashMap::new(),
+            utf8_dedup: HashMap::new(),
             count: 0,
         }
     }
@@ -417,9 +430,13 @@ impl CpBuilder {
     }
 
     /// CONSTANT_Utf8 (tag 1, JVMS §4.4.7).
+    ///
+    /// Round 5 audit fix (MED): probe with the borrowed `&str` first
+    /// (zero allocation) and only build the owned `String` key on
+    /// cache miss. `HashMap<String, _>::get(&str)` works because
+    /// `String: Borrow<str>` — the lookup hashes the `&str` directly.
     pub fn add_utf8(&mut self, s: &str) -> u16 {
-        let key = CpKey::Utf8(s.to_string());
-        if let Some(&i) = self.dedup.get(&key) {
+        if let Some(&i) = self.utf8_dedup.get(s) {
             return i;
         }
         let idx = self.next_index();
@@ -429,7 +446,7 @@ impl CpBuilder {
         self.entries
             .extend_from_slice(&(bytes.len() as u16).to_be_bytes());
         self.entries.extend_from_slice(bytes);
-        self.dedup.insert(key, idx);
+        self.utf8_dedup.insert(s.to_string(), idx);
         idx
     }
 

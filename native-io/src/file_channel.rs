@@ -362,14 +362,28 @@ fn native_fc_transfer_to0(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Ok(Some(Value::Long(0)));
     }
 
-    // Linux fast path: real zero-copy via sendfile(2).
+    // Linux fast path: real zero-copy via sendfile(2). For
+    // regular-file → regular-file transfers, `copy_file_range(2)` is
+    // strictly better on modern kernels (5.3+) because it can do
+    // filesystem-internal reflinks / server-side copies on btrfs/XFS
+    // and short-circuits to a pagecache-only copy on ext4, whereas
+    // sendfile always streams pages through the pipe machinery.
+    //
+    // AUDIT 2026-05-17: prefer copy_file_range; fall back to sendfile
+    // on EXDEV / ENOSYS / EINVAL (different mounts, older kernels,
+    // non-regular-file fds), then fall back again to the userspace
+    // loop if both refuse. Other errors propagate.
     #[cfg(target_os = "linux")]
     {
+        if let Some(n) =
+            transfer_via_copy_file_range(ctx, src_fd, position, count, dst_fd)?
+        {
+            return Ok(Some(Value::Long(n)));
+        }
         if let Some(n) = transfer_via_sendfile(ctx, src_fd, position, count, dst_fd)? {
             return Ok(Some(Value::Long(n)));
         }
-        // sendfile said UNSUPPORTED → fall through to the userspace
-        // loop below.
+        // Both said UNSUPPORTED → fall through to the userspace loop.
     }
 
     // Windows: TransmitFile is the Win32 zero-copy moral
@@ -406,6 +420,111 @@ fn fd_id_arg(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> Option<
         Some(Value::Long(v)) if *v > 2 && *v < u32::MAX as i64 => Some(*v as FdId),
         _ => None,
     }
+}
+
+/// Linux: drive `libc::copy_file_range(2)` in a loop. Best for
+/// file→file transfers (filesystem-internal reflink on btrfs/XFS,
+/// pagecache copy on ext4 — no syscall overhead per page). Returns
+/// `Ok(Some(n))` on success / short copy, `Ok(None)` if the kernel
+/// reports the syscall is unsupported (older kernel, EXDEV across
+/// filesystems, non-regular-file fds), `Err` on hard errors.
+///
+/// AUDIT 2026-05-17: added per round-5 native-misc HIGH item — the
+/// userspace 64 KiB loop is the cold-cache path; copy_file_range is
+/// what GNU `cp --reflink=auto` uses and saves both the userspace
+/// copy and the per-page syscall overhead for large transfers.
+#[cfg(target_os = "linux")]
+fn transfer_via_copy_file_range(
+    ctx: &mut dyn NativeContext,
+    src_fd: FdId,
+    position: i64,
+    count: i64,
+    dst_fd: FdId,
+) -> Result<Option<i64>, MethodCallFailed> {
+    use std::os::unix::io::AsRawFd;
+
+    let src_file = ctx
+        .fd_table()
+        .clone_file(src_fd)
+        .map_err(|e| io_error(format!("transferTo0: clone src: {e}")))?;
+    let dst_file = match ctx.fd_table().clone_file(dst_fd) {
+        Ok(f) => f,
+        Err(_) => {
+            // Non-file destination — copy_file_range requires two
+            // regular files. Let the caller try sendfile / userspace.
+            return Ok(None);
+        }
+    };
+
+    let src_raw = src_file.as_raw_fd();
+    let dst_raw = dst_file.as_raw_fd();
+    let mut src_off: libc::loff_t = position as libc::loff_t;
+    // Destination uses its current cursor; passing NULL for off_out
+    // tells the kernel to advance dst's file offset.
+    let mut transferred: i64 = 0;
+    let mut remaining = count;
+    while remaining > 0 {
+        // copy_file_range has no documented per-call cap; the kernel
+        // returns whatever it can do in one go. Pass `remaining` and
+        // trust the short-write loop.
+        let chunk = remaining as usize;
+        // SAFETY: src_raw, dst_raw are open kernel fds; src_off points
+        // to a valid stack-local loff_t; off_out is NULL (kernel uses
+        // dst's cursor); flags must be 0 per man page.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src_raw,
+                &mut src_off as *mut libc::loff_t,
+                dst_raw,
+                std::ptr::null_mut::<libc::loff_t>(),
+                chunk as libc::size_t,
+                0u32,
+            )
+        };
+        if r > 0 {
+            transferred += r as i64;
+            remaining -= r as i64;
+        } else if r == 0 {
+            // EOF on src.
+            break;
+        } else {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ENOSYS)
+                | Some(libc::EXDEV)
+                | Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::EBADF) => {
+                    // Kernel doesn't support copy_file_range for this
+                    // pair (older kernel, cross-filesystem, non-regular
+                    // fd, etc). Let the caller try sendfile.
+                    if transferred == 0 {
+                        return Ok(None);
+                    }
+                    return Ok(Some(transferred));
+                }
+                Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+                    if transferred > 0 {
+                        return Ok(Some(transferred));
+                    }
+                    return Ok(Some(IOSTATUS_UNAVAILABLE));
+                }
+                Some(libc::EINTR) => {
+                    if transferred > 0 {
+                        return Ok(Some(transferred));
+                    }
+                    return Ok(Some(IOSTATUS_INTERRUPTED));
+                }
+                _ => {
+                    return Err(io_error(format!(
+                        "transferTo0: copy_file_range: {err}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(Some(transferred))
 }
 
 /// Linux: drive `libc::sendfile` in a loop until `count` bytes are

@@ -808,6 +808,219 @@ pub struct ClassManager {
     /// is a trusted `u32` and this map is consulted on every populate of a
     /// per-thread invoke-cache entry; FxHash is a measurable win.
     redefine_generations: RwLock<FxHashMap<ClassId, Arc<AtomicU32>>>,
+
+    /// Round 5 audit fix (HIGH): the distinct user-defined `ClassLoaderId`s
+    /// observed in [`Self::loaded_classes`]. Used by
+    /// [`Self::find_class_by_name`] so the user-loader extension probe is
+    /// an O(loaders) lookup rather than an O(entries) scan that rebuilt
+    /// the set every call (a Spring app with ~15k loaded classes and a
+    /// handful of user loaders previously walked the full map per miss).
+    ///
+    /// Built incrementally: every insert into [`Self::loaded_classes`]
+    /// with a `ClassLoaderId::UserDefined(_)` key inserts into this set
+    /// (set insert is idempotent — duplicates are no-ops). The set only
+    /// grows because class-loader unloading is not implemented in this
+    /// VM. Cap is implicit by the number of distinct user loaders
+    /// (typically ≤10 in real apps; Spring Boot devtools peaks ~3).
+    user_loaders: FxHashSet<ClassLoaderId>,
+
+    /// Round 5 audit fix (HIGH): per-class initialization state for the
+    /// AtomicU8 fast path. Values: 0 = UNINITIALIZED (or any pre-init state),
+    /// 1 = IN_PROGRESS, 2 = INITIALIZED. The VM calls
+    /// [`Self::class_init_state_handle`] to obtain the `Arc<AtomicU8>` once
+    /// and then checks the warm-path state with a single atomic load — no
+    /// `RwLock<ClassManager>` round-trip on the steady-state hot path.
+    ///
+    /// The full class lifecycle in `Class::state` (Loaded → Verifying →
+    /// Verified → Preparing → Prepared → Initializing → Initialized) is
+    /// authoritative; this AtomicU8 is a cache of "is it INITIALIZED?"
+    /// that the slow path keeps in sync via
+    /// [`Self::set_class_init_state`].
+    ///
+    /// Entries are created lazily by `class_init_state_handle` so classes
+    /// that are never initialized cost nothing.
+    init_states: RwLock<FxHashMap<ClassId, Arc<std::sync::atomic::AtomicU8>>>,
+}
+
+/// Initialization-state values stored in [`ClassManager::init_states`].
+pub const CLASS_INIT_UNINITIALIZED: u8 = 0;
+pub const CLASS_INIT_IN_PROGRESS: u8 = 1;
+pub const CLASS_INIT_INITIALIZED: u8 = 2;
+
+/// Round 5 audit fix (HIGH): debug-only snapshot of every invariant
+/// field on [`Class`] used by [`ClassManager::redefine_class`] to verify
+/// that the redefine touched ONLY the documented mutable set:
+///
+/// * `methods`
+/// * `constant_pool`
+/// * `bootstrap_methods`
+/// * `annotations`
+/// * `source_file`
+///
+/// `from_class` destructures the entire `Class` with `..`-trailing pattern
+/// removed so adding a new field is a hard compile error here until the
+/// author classifies it as either an invariant (add to this struct + the
+/// assertion) or a mutable redefine field (add to the swap block + the
+/// documented set above).
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct RedefineInvariantSnapshot {
+    id: ClassId,
+    loader_id: ClassLoaderId,
+    name: Arc<str>,
+    version_major: u16,
+    version_minor: u16,
+    state: ClassState,
+    initializing_thread: Option<u64>,
+    access_flags_bits: u16,
+    superclass: Option<ClassId>,
+    interfaces: Vec<ClassId>,
+    field_sigs: Vec<(Arc<str>, Arc<str>, u16)>,
+    first_field_index: usize,
+    num_total_fields: usize,
+    signature: Option<String>,
+    nest_host: Option<String>,
+    nest_members: Vec<String>,
+    record_components_len: usize,
+    permitted_subclasses: Vec<String>,
+    inner_classes_len: usize,
+    enclosing_method_present: bool,
+    hidden: bool,
+    module_name: Option<String>,
+    is_synthetic_stub: bool,
+    has_finalizer: bool,
+    code_source_present: bool,
+    array_info_present: bool,
+}
+
+#[cfg(debug_assertions)]
+impl RedefineInvariantSnapshot {
+    fn from_class(c: &Class) -> Self {
+        // Destructure with explicit names. The trailing `..` is
+        // intentionally omitted on the field list so a new field added
+        // to `Class` produces an "unused field" warning (or, with
+        // `#![deny(unused)]` in test/CI builds, a hard error) until the
+        // author wires it through here.
+        //
+        // We don't snapshot the explicitly mutable fields
+        // (`methods`, `constant_pool`, `bootstrap_methods`,
+        // `annotations`, `source_file`) — those are expected to change.
+        let Class {
+            id,
+            loader_id,
+            name,
+            source_file: _,
+            version,
+            state,
+            initializing_thread,
+            constant_pool: _,
+            access_flags,
+            superclass,
+            interfaces,
+            fields,
+            methods: _,
+            first_field_index,
+            num_total_fields,
+            bootstrap_methods: _,
+            signature,
+            annotations: _,
+            nest_host,
+            nest_members,
+            record_components,
+            permitted_subclasses,
+            inner_classes,
+            enclosing_method,
+            hidden,
+            module_name,
+            is_synthetic_stub,
+            has_finalizer,
+            code_source,
+            array_info,
+        } = c;
+        Self {
+            id: *id,
+            loader_id: *loader_id,
+            name: Arc::clone(name),
+            version_major: version.major,
+            version_minor: version.minor,
+            state: *state,
+            initializing_thread: *initializing_thread,
+            access_flags_bits: access_flags.bits(),
+            superclass: *superclass,
+            interfaces: interfaces.clone(),
+            field_sigs: fields
+                .iter()
+                .map(|f| (Arc::clone(&f.name), Arc::clone(&f.descriptor), f.access_flags.bits()))
+                .collect(),
+            first_field_index: *first_field_index,
+            num_total_fields: *num_total_fields,
+            signature: signature.clone(),
+            nest_host: nest_host.clone(),
+            nest_members: nest_members.clone(),
+            record_components_len: record_components.len(),
+            permitted_subclasses: permitted_subclasses.clone(),
+            inner_classes_len: inner_classes.len(),
+            enclosing_method_present: enclosing_method.is_some(),
+            hidden: *hidden,
+            module_name: module_name.clone(),
+            is_synthetic_stub: *is_synthetic_stub,
+            has_finalizer: *has_finalizer,
+            code_source_present: code_source.is_some(),
+            array_info_present: array_info.is_some(),
+        }
+    }
+
+    fn assert_eq(&self, after: &Self, class_name: &str) {
+        // One assert per invariant so the failure message tells the
+        // future-author exactly which field they mutated.
+        debug_assert_eq!(self.id, after.id, "redefine_class mutated Class::id on {class_name}");
+        debug_assert_eq!(self.loader_id, after.loader_id, "redefine_class mutated Class::loader_id on {class_name}");
+        debug_assert!(Arc::ptr_eq(&self.name, &after.name) || *self.name == *after.name,
+            "redefine_class mutated Class::name on {class_name}");
+        debug_assert_eq!(self.version_major, after.version_major, "redefine_class mutated Class::version.major on {class_name}");
+        debug_assert_eq!(self.version_minor, after.version_minor, "redefine_class mutated Class::version.minor on {class_name}");
+        debug_assert_eq!(self.state, after.state, "redefine_class mutated Class::state on {class_name}");
+        debug_assert_eq!(self.initializing_thread, after.initializing_thread,
+            "redefine_class mutated Class::initializing_thread on {class_name}");
+        debug_assert_eq!(self.access_flags_bits, after.access_flags_bits,
+            "redefine_class mutated Class::access_flags on {class_name}");
+        debug_assert_eq!(self.superclass, after.superclass,
+            "redefine_class mutated Class::superclass on {class_name}");
+        debug_assert_eq!(self.interfaces, after.interfaces,
+            "redefine_class mutated Class::interfaces on {class_name}");
+        debug_assert_eq!(self.field_sigs, after.field_sigs,
+            "redefine_class mutated Class::fields shape on {class_name}");
+        debug_assert_eq!(self.first_field_index, after.first_field_index,
+            "redefine_class mutated Class::first_field_index on {class_name}");
+        debug_assert_eq!(self.num_total_fields, after.num_total_fields,
+            "redefine_class mutated Class::num_total_fields on {class_name}");
+        debug_assert_eq!(self.signature, after.signature,
+            "redefine_class mutated Class::signature on {class_name}");
+        debug_assert_eq!(self.nest_host, after.nest_host,
+            "redefine_class mutated Class::nest_host on {class_name}");
+        debug_assert_eq!(self.nest_members, after.nest_members,
+            "redefine_class mutated Class::nest_members on {class_name}");
+        debug_assert_eq!(self.record_components_len, after.record_components_len,
+            "redefine_class mutated Class::record_components on {class_name}");
+        debug_assert_eq!(self.permitted_subclasses, after.permitted_subclasses,
+            "redefine_class mutated Class::permitted_subclasses on {class_name}");
+        debug_assert_eq!(self.inner_classes_len, after.inner_classes_len,
+            "redefine_class mutated Class::inner_classes on {class_name}");
+        debug_assert_eq!(self.enclosing_method_present, after.enclosing_method_present,
+            "redefine_class mutated Class::enclosing_method on {class_name}");
+        debug_assert_eq!(self.hidden, after.hidden,
+            "redefine_class mutated Class::hidden on {class_name}");
+        debug_assert_eq!(self.module_name, after.module_name,
+            "redefine_class mutated Class::module_name on {class_name}");
+        debug_assert_eq!(self.is_synthetic_stub, after.is_synthetic_stub,
+            "redefine_class mutated Class::is_synthetic_stub on {class_name}");
+        debug_assert_eq!(self.has_finalizer, after.has_finalizer,
+            "redefine_class mutated Class::has_finalizer on {class_name}");
+        debug_assert_eq!(self.code_source_present, after.code_source_present,
+            "redefine_class mutated Class::code_source on {class_name}");
+        debug_assert_eq!(self.array_info_present, after.array_info_present,
+            "redefine_class mutated Class::array_info on {class_name}");
+    }
 }
 
 impl ClassManager {
@@ -864,6 +1077,8 @@ impl ClassManager {
             skip_bytecode_verification: FxHashSet::default(),
             hidden_name_counter: 0,
             redefine_generations: RwLock::new(FxHashMap::with_capacity_and_hasher(8, Default::default())),
+            user_loaders: FxHashSet::with_capacity_and_hasher(4, Default::default()),
+            init_states: RwLock::new(FxHashMap::with_capacity_and_hasher(256, Default::default())),
         }
     }
 
@@ -952,12 +1167,18 @@ impl ClassManager {
                 return Some(id);
             }
         }
-        // Custom-loader fallback: linear scan. Cheap in practice
-        // (built-in loaders cover the entire JDK + classpath) and the
-        // outer caller cache typically short-circuits the second hit.
-        for ((_, class_name), &id) in self.loaded_classes.iter() {
-            if &**class_name == name {
-                return Some(id);
+        // Round 5 audit fix (HIGH): custom-loader fallback now probes the
+        // small `user_loaders` set by exact key instead of linearly
+        // walking every entry in `loaded_classes`. Same fix as
+        // `find_class_by_name`. Empty-set early-out keeps the common
+        // "no user loaders" case at zero extra work.
+        if !self.user_loaders.is_empty() {
+            for loader_id in &self.user_loaders {
+                if let Some(&id) =
+                    self.loaded_classes.get(&(*loader_id, Arc::clone(&probe)))
+                {
+                    return Some(id);
+                }
             }
         }
         None
@@ -2231,6 +2452,12 @@ impl ClassManager {
             }
         }
         self.loaded_classes.insert(key, id);
+        // Round 5 audit fix (HIGH): mirror user-defined loader ids into
+        // the `user_loaders` set so `find_class_by_name` can probe them
+        // without re-walking every entry in `loaded_classes` per call.
+        if matches!(loader_id, ClassLoaderId::UserDefined(_)) {
+            self.user_loaders.insert(loader_id);
+        }
         // Route through the FIFO-tracking helper so the byte budget
         // (`class_bytes_cache_cap`, default 16 MiB) is enforced. Without
         // this, every classfile would stay resident forever — ~90 MB on
@@ -2341,14 +2568,63 @@ impl ClassManager {
         // and for classes whose superclass hasn't been processed yet
         // (which only happens in pathological re-entry paths; the normal
         // load order guarantees the super is built first).
-        let mut entries: Vec<Option<VtableSlotDescriptor>> = match superclass_id {
+        //
+        // Round 5 audit fix (MED): borrow the parent slice first and
+        // pre-count how many of THIS class's methods are virtual. If
+        // the class has zero virtual methods (very common for
+        // marker interfaces, all-static utility classes, and synthetic
+        // shells) we clone the parent vec once with the exact capacity
+        // it needs and skip the entire override-detection inner loop.
+        // Pre-counting also lets us `Vec::with_capacity(parent + own)`
+        // so the subsequent `entries.push` calls never reallocate
+        // (the previous `cloned().unwrap_or_default()` allocated at
+        // parent length and then re-grew on every fresh slot — three
+        // reallocs on a class adding 5 methods to a 20-slot parent).
+        let parent_slice: &[Option<VtableSlotDescriptor>] = match superclass_id {
             Some(sid) => self
                 .vtable_descriptors
                 .get(&sid)
-                .cloned()
-                .unwrap_or_default(),
-            None => Vec::new(),
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            None => &[],
         };
+
+        let class = match self.class_store.get(class_id) {
+            Some(c) => c,
+            None => return (parent_slice.to_vec(), Vec::new()),
+        };
+
+        // Pre-count own virtual methods so we can size the entries vec
+        // exactly. This walk is cheap (one pass over `class.methods`
+        // with three flag checks per method) and pays for itself by
+        // eliminating the Vec re-grows below.
+        let own_virtual_count = class
+            .methods
+            .iter()
+            .filter(|m| {
+                !m.is_static()
+                    && !m.access_flags.contains(
+                        rustjvm_reader::class_access_flags::MethodAccessFlags::PRIVATE,
+                    )
+                    && &*m.name != "<init>"
+                    && &*m.name != "<clinit>"
+            })
+            .count();
+
+        // Fast path: this class declares no virtual methods, so it
+        // cannot override or extend the parent's vtable. Hand back a
+        // tight clone of the parent slice with no override list.
+        // Saves the `name_to_slot` map build + per-method match work.
+        if own_virtual_count == 0 {
+            return (parent_slice.to_vec(), Vec::new());
+        }
+
+        // Mutating path: allocate the destination vec with the exact
+        // capacity it needs (`parent_len + own_virtual_count`) so
+        // subsequent `push`es never realloc.
+        let mut entries: Vec<Option<VtableSlotDescriptor>> =
+            Vec::with_capacity(parent_slice.len() + own_virtual_count);
+        entries.extend_from_slice(parent_slice);
 
         // Maintain a (name, desc) -> slot index so we can detect overrides
         // without a linear scan for every method.
@@ -2366,11 +2642,6 @@ impl ClassManager {
                 name_to_slot.insert((Arc::clone(&e.method_name), Arc::clone(&e.descriptor)), slot);
             }
         }
-
-        let class = match self.class_store.get(class_id) {
-            Some(c) => c,
-            None => return (entries, Vec::new()),
-        };
         let class_id_u32 = class_id.as_u32();
         let super_u32 = superclass_id.map(|s| s.as_u32());
 
@@ -2415,9 +2686,12 @@ impl ClassManager {
                 Some(VtableMethodSnapshot {
                     class_name: class.name.to_string(),
                     source_file: class.source_file.clone(),
-                    // `code_attr.code: Arc<[u8]>` — `.clone()` is a
-                    // refcount bump, not a Vec realloc/memcpy.
-                    code: Arc::clone(&code_attr.code),
+                    // `code_attr.code: ByteView` — `.to_arc()` allocates
+                    // + memcpys once at vtable installation so the
+                    // snapshot owns a standalone `Arc<[u8]>` that is
+                    // decoupled from the class-file buffer (Frame.code
+                    // and JIT consumers want a free-standing Arc).
+                    code: code_attr.code.to_arc(),
                     exception_table: code_attr.exception_table.clone(),
                     max_stack: code_attr.max_stack,
                     max_locals: code_attr.max_locals,
@@ -2632,6 +2906,57 @@ impl ClassManager {
                 .entry(class_id)
                 .or_insert_with(|| Arc::new(AtomicU32::new(0))),
         )
+    }
+
+    /// Round 5 audit fix (HIGH): obtain the `Arc<AtomicU8>` cache of
+    /// `class_id`'s initialization state for the warm-path fast check.
+    ///
+    /// Callers hold onto the returned `Arc` and consult it via a single
+    /// atomic load on every entry to a class-init checkpoint
+    /// (interpreter dispatch, JIT entry, reflection access). When the
+    /// load returns [`CLASS_INIT_INITIALIZED`] the call can return
+    /// immediately without acquiring the class manager `RwLock` — the
+    /// previous code path took a `read()` lock + did a `get_class` +
+    /// matched on the full `ClassState` enum on every single dispatch.
+    ///
+    /// Entries are created lazily on first call. Initial state is
+    /// [`CLASS_INIT_UNINITIALIZED`]; the slow init path bumps it to
+    /// [`CLASS_INIT_IN_PROGRESS`] when it claims the class and to
+    /// [`CLASS_INIT_INITIALIZED`] when init succeeds (via
+    /// [`Self::set_class_init_state`]).
+    pub fn class_init_state_handle(
+        &self,
+        class_id: ClassId,
+    ) -> Arc<std::sync::atomic::AtomicU8> {
+        // Fast path: read lock + clone existing Arc if present.
+        {
+            let guard = self.init_states.read().expect("init_states poisoned");
+            if let Some(handle) = guard.get(&class_id) {
+                return Arc::clone(handle);
+            }
+        }
+        // Slow path: upgrade to write lock and insert. Re-check inside
+        // the lock to handle a sibling thread racing the same insert.
+        let mut guard = self.init_states.write().expect("init_states poisoned");
+        Arc::clone(
+            guard
+                .entry(class_id)
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU8::new(CLASS_INIT_UNINITIALIZED))),
+        )
+    }
+
+    /// Round 5 audit fix (HIGH): update the AtomicU8 init-state cache
+    /// for `class_id`. Called by the slow path
+    /// (`vm_util::ensure_class_initialized_shared`) immediately after
+    /// the underlying `Class::state` transitions to
+    /// [`ClassState::Initialized`] or
+    /// [`ClassState::InitializationError`] (the latter is reported as
+    /// UNINITIALIZED so the fast path falls through to the slow path,
+    /// which reports the error). `Release` ordering pairs with
+    /// `Acquire` reads on the fast path.
+    pub fn set_class_init_state(&self, class_id: ClassId, state: u8) {
+        let handle = self.class_init_state_handle(class_id);
+        handle.store(state, std::sync::atomic::Ordering::Release);
     }
 
     /// WP2.4-B — JEP 109 + JVMTI `RedefineClasses` semantics. Replace
@@ -2967,18 +3292,18 @@ impl ClassManager {
                     if i >= new_class_file.methods.len() {
                         break;
                     }
-                    // `c.code: Arc<[u8]>` — clone is a refcount bump. We
-                    // compare via `&[u8]` so empty fallback is just an
-                    // empty slice without an extra alloc.
-                    let old_code: Arc<[u8]> = m
+                    // `c.code: ByteView` — deref to `&[u8]` for the
+                    // equality compare. Empty fallback is the empty
+                    // slice with no allocation.
+                    let old_code: &[u8] = m
                         .code()
-                        .map(|c| Arc::clone(&c.code))
-                        .unwrap_or_else(|| Arc::from([].as_slice()));
-                    let new_code: Arc<[u8]> = new_class_file.methods[i]
+                        .map(|c| &c.code[..])
+                        .unwrap_or(&[]);
+                    let new_code: &[u8] = new_class_file.methods[i]
                         .code()
-                        .map(|c| Arc::clone(&c.code))
-                        .unwrap_or_else(|| Arc::from([].as_slice()));
-                    if &*old_code != &*new_code {
+                        .map(|c| &c.code[..])
+                        .unwrap_or(&[]);
+                    if old_code != new_code {
                         debug!(
                             class = %existing_name,
                             method = %m.name,
@@ -3068,6 +3393,27 @@ impl ClassManager {
             .unwrap_or(false)
             || self.skip_bytecode_verification.contains(&class_id);
 
+        // Round 5 audit fix (HIGH): in debug builds, snapshot every
+        // invariant field of `Class` so that a `debug_assert!` block
+        // after the swap can verify the redefine touched ONLY the
+        // documented mutable set (`methods`, `constant_pool`,
+        // `bootstrap_methods`, `annotations`, `source_file`). If any
+        // other field changes — e.g. a future commit accidentally
+        // mutates `superclass` from this path — the assertion fires
+        // and aborts, preventing silent type-confusion bugs from
+        // shipping to release builds.
+        //
+        // The destructuring pattern below uses `..` so that adding a
+        // new field to `Class` is a hard compile error here until the
+        // author classifies it as either an invariant (add to the
+        // snapshot below + the assertion) or a mutable redefine field
+        // (add to the post-swap mutation block + the documented set).
+        #[cfg(debug_assertions)]
+        let invariant_snapshot: Option<RedefineInvariantSnapshot> = self
+            .class_store
+            .get(class_id)
+            .map(RedefineInvariantSnapshot::from_class);
+
         // Snapshot + swap. The snapshot is only retained for rollback
         // when we're going to run the verifier; otherwise we drop the
         // old vecs immediately.
@@ -3107,6 +3453,22 @@ impl ClassManager {
             }
             snapshot
         };
+
+        // Round 5 audit fix (HIGH): verify that ONLY the documented
+        // mutable fields changed. The mutable set is:
+        //   methods, constant_pool, bootstrap_methods, annotations, source_file
+        // Everything else is a JEP 109 invariant and a mutation here
+        // would silently corrupt downstream caches (vtable, JIT,
+        // resolution cache) that key off identity-stable fields.
+        #[cfg(debug_assertions)]
+        if let (Some(before), Some(after)) = (
+            invariant_snapshot,
+            self.class_store
+                .get(class_id)
+                .map(RedefineInvariantSnapshot::from_class),
+        ) {
+            before.assert_eq(&after, &existing_name);
+        }
 
         // ---- Step 5b: verify the freshly-installed bytecode ----
         // Run the same Pass-2 (structural) + Pass-3 (bytecode type
@@ -3385,33 +3747,31 @@ impl ClassManager {
             }
         }
 
-        // Round 4 audit fix: user-defined loaders. Instead of iterating
-        // every (loader, name) entry (~15k on a Spring app), collect the
-        // distinct user-defined loader ids ONCE and probe each (loader,
-        // arc_key) by exact key. This still touches every entry once
-        // overall, but each subsequent miss is then O(loaders) hash
-        // probes per key rather than O(entries).
+        // Round 5 audit fix (HIGH): user-defined loaders are now tracked
+        // incrementally in `self.user_loaders` (insert on every
+        // `loaded_classes` insert with a `ClassLoaderId::UserDefined(_)`
+        // key). The previous Round-4 implementation re-collected the set
+        // by walking every entry in `loaded_classes` on each call — that
+        // walk was the same O(entries) we set out to remove in Round 4,
+        // just hidden one indirection deeper. The new path is
+        // O(user_loaders) (typically ≤10).
         //
-        // We materialise the set lazily — if the early-return above
-        // already found the class, the user-defined scan never runs.
-        let user_loaders: FxHashSet<ClassLoaderId> = self
-            .loaded_classes
-            .keys()
-            .filter_map(|(loader_id, _)| match loader_id {
-                ClassLoaderId::UserDefined(_) => Some(*loader_id),
-                _ => None,
-            })
-            .collect();
-        for key in &keys {
-            let arc_key: Arc<str> = Arc::from(key.as_str());
-            for loader_id in &user_loaders {
-                if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
-                    if let Some(class) = self.get_class(id) {
-                        if class.hidden {
-                            continue;
+        // Early-out: most apps never define a user loader, in which case
+        // the set is empty and we skip the inner loop entirely.
+        if !self.user_loaders.is_empty() {
+            for key in &keys {
+                let arc_key: Arc<str> = Arc::from(key.as_str());
+                for loader_id in &self.user_loaders {
+                    if let Some(&id) =
+                        self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key)))
+                    {
+                        if let Some(class) = self.get_class(id) {
+                            if class.hidden {
+                                continue;
+                            }
                         }
+                        return Some(id);
                     }
-                    return Some(id);
                 }
             }
         }
@@ -3469,6 +3829,12 @@ impl ClassManager {
         // and `loaded_classes` is the only index.
         let name_arc = rustjvm_types::intern_arc(name);
         self.loaded_classes.insert((loader_id, name_arc), id);
+        // Round 5 audit fix (HIGH): keep `user_loaders` in sync — see
+        // `define_class_with_options` for the rationale (avoid the
+        // O(entries) walk in `find_class_by_name`).
+        if matches!(loader_id, ClassLoaderId::UserDefined(_)) {
+            self.user_loaders.insert(loader_id);
+        }
     }
 
     /// Create a synthetic stub class for a JDK class that has no .class file.
@@ -7258,7 +7624,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 4,
-                code: Arc::from([0x01u8, 0xb1].as_slice()), // aconst_null; return
+                code: rustjvm_reader::ByteView::from_slice(&[0x01u8, 0xb1]), // aconst_null; return
                 exception_table: vec![],
                 attributes: vec![],
             }))],

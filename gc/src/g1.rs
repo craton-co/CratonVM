@@ -964,6 +964,23 @@ impl G1Collector {
                         let ref_ptr = raw as usize as *mut u8;
                         if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&region_idx) {
+                                // Round-5 fix (CRIT, O(N²)): the prior code
+                                // pushed `new_ptr` onto the worklist in BOTH
+                                // branches of the dedup `if/else`, so every
+                                // already-evacuated target was rescanned —
+                                // turning ref-cycles into quadratic blow-up
+                                // and reaching the worklist budget cap in
+                                // pathological graphs. The dedup signal we
+                                // need is "was this evacuation fresh?".
+                                // `evacuate_object` inserts into
+                                // `pointer_map` only when it actually
+                                // copies; if the entry was already present
+                                // it returns the existing forward without
+                                // touching the map. Sample BEFORE the call
+                                // and push to the worklist only on a fresh
+                                // evacuation.
+                                let already_forwarded =
+                                    pointer_map.contains_key(&(ref_ptr as usize));
                                 if let Some(new_ptr) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
@@ -974,13 +991,7 @@ impl G1Collector {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                     }
-                                    // Only add to worklist if newly evacuated
-                                    if !pointer_map
-                                        .get(&(ref_ptr as usize))
-                                        .map_or(false, |&v| v == new_ptr as usize)
-                                    {
-                                        work_list.push(new_ptr);
-                                    } else {
+                                    if !already_forwarded {
                                         work_list.push(new_ptr);
                                     }
                                 }
@@ -1002,6 +1013,12 @@ impl G1Collector {
                     let ref_ptr = ref_obj.as_ptr();
                     if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                         if cset.contains(&region_idx) {
+                            // Round-5 fix (CRIT, O(N²)): only push the
+                            // forwarded target onto the worklist when this
+                            // call site actually evacuated it. See the
+                            // matching comment in the Array branch above.
+                            let already_forwarded =
+                                pointer_map.contains_key(&(ref_ptr as usize));
                             if let Some(new_ptr) = self.evacuate_object(
                                 regions,
                                 ref_ptr,
@@ -1015,7 +1032,9 @@ impl G1Collector {
                                 unsafe {
                                     std::ptr::write(slot_ptr as *mut Value, new_value);
                                 }
-                                work_list.push(new_ptr);
+                                if !already_forwarded {
+                                    work_list.push(new_ptr);
+                                }
                             }
                         } else if let Some(&new_addr) = pointer_map.get(&(ref_ptr as usize)) {
                             let new_value = Value::Object(Some(unsafe {

@@ -1289,6 +1289,40 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         n
     }
 
+    fn write_char_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u16]) -> bool {
+        // AUDIT 2026-05-17: symmetric to `read_char_array_into` above.
+        // Used by `stream_decoder::refill` to populate the read-ahead
+        // char buffer in one `memcpy` instead of N virtual dispatches.
+        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+            return false;
+        }
+        if self.shared.heap.element_type_of(arr) != ArrayElementType::Char {
+            return false;
+        }
+        let len = self.shared.heap.array_length(arr);
+        let end = match dst_off.checked_add(src.len()) {
+            Some(e) => e,
+            None => return false,
+        };
+        if end > len {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: bounds checked above. Char arrays store 2 bytes per
+        // element matching host-endian `u16` (see `read_char_array_into`).
+        unsafe {
+            let base = self.shared.heap.array_data_ptr(arr);
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr() as *const u8,
+                base.add(dst_off * 2),
+                src.len() * 2,
+            );
+        }
+        true
+    }
+
     fn bulk_array_copy(
         &mut self,
         src: ObjectRef,
@@ -3783,6 +3817,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let referent_addr = referent.as_ptr() as usize;
         let queue_addr = queue.map(|q| q.as_ptr() as usize);
         self.shared.ref_processor.lock().discover_reference(rt, ref_addr, referent_addr, queue_addr);
+    }
+
+    /// Round-5 fix (HIGH): wire native `Reference.get()` into the
+    /// reference processor's SoftReference LRU so cached referents stay
+    /// alive across major GCs proportional to how recently the
+    /// application touched them. The cost is one `SystemTime::now()`
+    /// plus a short linear scan / `BTreeMap` re-key — the same overhead
+    /// HotSpot pays on every soft-ref `get()` call.
+    fn touch_soft_reference(&mut self, reference_obj: ObjectRef) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ref_addr = reference_obj.as_ptr() as usize;
+        self.shared
+            .ref_processor
+            .lock()
+            .touch_soft_reference(ref_addr, now_ms);
     }
 
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {

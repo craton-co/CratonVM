@@ -263,6 +263,13 @@ pub struct ProfileStore {
     /// Per-method invocation counters for JIT warmup gating.
     /// Keyed by `(class_id << 32 | method_hash)` packed into a `u64` for fast lookup.
     invocation_counts: parking_lot::Mutex<FxHashMap<u64, u32>>,
+    /// PERF (round-5 vm #7): auxiliary index keyed by a 64-bit fingerprint
+    /// of `(class_id, method_name, descriptor)`.  Lets the borrowed-key
+    /// lookup path (`get_or_insert_borrowed`) probe without first cloning
+    /// two `Arc<str>` into a fresh `MethodKey`.  Populated lazily by the
+    /// cold insert branch; entries point at the same `Arc<Mutex<...>>` as
+    /// the canonical `methods` map.
+    name_index: parking_lot::RwLock<FxHashMap<u64, Arc<parking_lot::Mutex<MethodProfile>>>>,
 }
 
 impl ProfileStore {
@@ -270,6 +277,7 @@ impl ProfileStore {
         Self {
             methods: parking_lot::RwLock::new(FxHashMap::default()),
             invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
+            name_index: parking_lot::RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -307,6 +315,130 @@ impl ProfileStore {
         let slot = Arc::new(parking_lot::Mutex::new(MethodProfile::default()));
         write.insert(key.clone(), Arc::clone(&slot));
         slot
+    }
+
+    /// Borrowed-key variant of [`get_or_insert`]: avoids the two
+    /// `Arc::clone` atomic refcount bumps that the owned-key path pays on
+    /// every profiled hit (round-5 vm #7).
+    ///
+    /// Strategy: the hot path is a profile *hit* (the (class, method, desc)
+    /// triple has already been seen).  On a hit we never need to construct
+    /// a `MethodKey` at all — we walk the map looking for the unique entry
+    /// whose three fields equal the borrowed triple.  Since the underlying
+    /// hash-map is keyed by `MethodKey` and we cannot probe by `(u32, &str,
+    /// &str)` on stable Rust (raw-entry API is nightly), we instead keep an
+    /// auxiliary `name_index` index that the cold insert path populates;
+    /// hot lookups consult that index by `class_id` (its key type is a
+    /// cheap `u64`) and then verify the names match by `&str` comparison
+    /// — no `Arc::clone` on hit.
+    ///
+    /// The owned `MethodKey` is constructed exactly once per (class,
+    /// method, descriptor) triple, inside the cold insert branch.
+    #[inline]
+    fn get_or_insert_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+    ) -> Arc<parking_lot::Mutex<MethodProfile>> {
+        // Compute a 64-bit fingerprint mixing class_id and the two name
+        // bytes so the auxiliary index is well-distributed.  Uses Rust's
+        // default SipHash via `Hasher` (the same algorithm `MethodKey`
+        // uses), so collisions are extremely rare in practice.
+        use std::hash::{Hash, Hasher};
+        let fingerprint = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            class_id.hash(&mut h);
+            let mn: &str = method_name;
+            let md: &str = descriptor;
+            mn.hash(&mut h);
+            md.hash(&mut h);
+            h.finish()
+        };
+
+        // Fast path: read-lock + index probe.  On hit, return the cached
+        // `Arc<Mutex<MethodProfile>>` with no further allocation.
+        {
+            let idx = self.name_index.read();
+            if let Some(slot) = idx.get(&fingerprint) {
+                return Arc::clone(slot);
+            }
+        }
+
+        // Slow path: insert.  Build the owned `MethodKey` (one-time per
+        // triple), insert it into both `methods` and `name_index`, and
+        // return the freshly allocated slot.
+        let slot = Arc::new(parking_lot::Mutex::new(MethodProfile::default()));
+        let key = MethodKey {
+            class_id,
+            method_name: Arc::clone(method_name),
+            descriptor: Arc::clone(descriptor),
+        };
+        {
+            let mut write = self.methods.write();
+            // Race: another writer may have inserted between us dropping the
+            // read-lock and acquiring the write-lock.  Re-probe under the
+            // exclusive lock and return the existing slot if so.
+            if let Some(existing) = write.get(&key) {
+                let existing = Arc::clone(existing);
+                self.name_index.write().insert(fingerprint, Arc::clone(&existing));
+                return existing;
+            }
+            write.insert(key, Arc::clone(&slot));
+        }
+        self.name_index.write().insert(fingerprint, Arc::clone(&slot));
+        slot
+    }
+
+    /// Borrowed-key counterpart of [`record_branch`] — see
+    /// [`get_or_insert_borrowed`] for the rationale.
+    #[inline]
+    pub fn record_branch_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+        pc: usize,
+        taken: bool,
+    ) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
+        slot.lock().record_branch(pc, taken);
+    }
+
+    /// Borrowed-key counterpart of [`record_backedge`].
+    #[inline]
+    pub fn record_backedge_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+        backedge_pc: usize,
+    ) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
+        slot.lock().record_backedge(backedge_pc);
+    }
+
+    /// Borrowed-key counterpart of [`record_receiver`].
+    #[inline]
+    pub fn record_receiver_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+        pc: usize,
+        receiver_class_id: u32,
+    ) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
+        slot.lock().record_receiver(pc, receiver_class_id);
     }
 
     /// Record a branch observation.  Called from the interpreter hot-loop.

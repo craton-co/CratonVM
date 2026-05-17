@@ -14,12 +14,13 @@
 //! Layouts:
 //!   MulticastSocket = 5 fields (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_types::{ObjectRef, Value};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -145,13 +146,19 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
 ///
 /// Drop is automatic on removal from the map; Rust's `std::net::TcpListener`
 /// / `TcpStream` close their underlying file descriptor on drop.
+///
+/// AUDIT 2026-05-17: each live OS handle is wrapped in `Arc<Mutex<_>>`
+/// so callers can clone the inner handle out of the map under a brief
+/// read-lock, drop the map lock, then perform the blocking syscall
+/// (`read` / `write` / `accept`) without serializing every Net op in
+/// the process. This mirrors the `random_access_file::with_file` pattern.
 pub enum NetSocketHandle {
     /// Freshly created via `socket0` but not yet bound / connected.
     Unbound,
     /// Bound + listening (post `bind0`).
-    Listener(TcpListener),
+    Listener(Arc<Mutex<TcpListener>>),
     /// Active stream (connected via `connect0` or accepted).
-    Stream(TcpStream),
+    Stream(Arc<Mutex<TcpStream>>),
     /// Marked closed but still in the map so `close(fd)` is idempotent.
     Closed,
 }
@@ -333,7 +340,7 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
     net_sockets()
         .write()
-        .insert(fd, NetSocketHandle::Listener(listener));
+        .insert(fd, NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
     Ok(None)
 }
 
@@ -358,23 +365,24 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("accept: FileDescriptor has no fd id"))?;
 
-    // Clone the Listener out via try_clone so we can release the map lock
-    // before the blocking accept() call. Otherwise holding the write lock
-    // across the accept would serialize all Net operations process-wide.
-    let listener_clone = {
+    // AUDIT 2026-05-17: take the map read-lock briefly to clone the
+    // per-listener `Arc<Mutex<_>>`, drop the map lock, then perform the
+    // blocking accept(). Holding the global map lock across accept()
+    // would serialize all Net operations process-wide for the duration
+    // of the listen.
+    let listener_handle = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Listener(l)) => l
-                .try_clone()
-                .map_err(|e| net_err("accept: clone listener", e))?,
+            Some(NetSocketHandle::Listener(l)) => Arc::clone(l),
             Some(_) => return Err(ioex("accept: fd is not a listener")),
             None => return Err(ioex("accept: unknown fd")),
         }
     };
 
-    let (stream, peer) = listener_clone
-        .accept()
-        .map_err(|e| net_err("accept", e))?;
+    let (stream, peer) = {
+        let listener = listener_handle.lock();
+        listener.accept().map_err(|e| net_err("accept", e))?
+    };
 
     // Write peer port onto the FileDescriptor's `handle` for round-tripping
     // through synthetic tests that inspect it directly.
@@ -397,7 +405,7 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
     }
 
-    let new_fd = register_handle(NetSocketHandle::Stream(stream));
+    let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
     Ok(Some(Value::Int(new_fd)))
 }
 
@@ -425,7 +433,7 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
     net_sockets()
         .write()
-        .insert(fd, NetSocketHandle::Stream(stream));
+        .insert(fd, NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
 
     // Return 1 to indicate connection completed (matching JDK IOStatus).
     Ok(Some(Value::Int(1)))
@@ -443,8 +451,17 @@ fn net_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         1 => std::net::Shutdown::Write,
         _ => std::net::Shutdown::Both,
     };
-    let map = net_sockets().read();
-    if let Some(NetSocketHandle::Stream(s)) = map.get(&fd) {
+    // AUDIT 2026-05-17: clone the per-stream Arc under the map read-lock,
+    // then drop the map lock before issuing the shutdown syscall.
+    let stream_handle = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    };
+    if let Some(handle) = stream_handle {
+        let s = handle.lock();
         let _ = s.shutdown(dir);
     }
     Ok(None)
@@ -489,19 +506,23 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .ok_or_else(|| ioex("read0: FileDescriptor has no fd id"))?;
 
     let mut buf = vec![0u8; len as usize];
-    let n = {
+    // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
+    // brief read-lock, drop the map lock, then perform the blocking read
+    // on the per-socket Mutex. Otherwise the global map lock serializes
+    // every Net I/O op against the longest-running read on any socket.
+    let stream_handle = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => {
-                // TcpStream::read takes &self via its Read impl on a
-                // mutable reference — but we only have &TcpStream.
-                // The std impl is `impl Read for &TcpStream` so we can
-                // read through a &TcpStream without needing &mut.
-                let mut r = s;
-                r.read(&mut buf).map_err(|e| net_err("read0", e))?
-            }
+            Some(NetSocketHandle::Stream(s)) => Arc::clone(s),
             _ => return Err(ioex("read0: fd not a stream")),
         }
+    };
+    let n = {
+        let s = stream_handle.lock();
+        // The std impl is `impl Read for &TcpStream` so we can
+        // read through a &TcpStream without needing &mut.
+        let mut r = &*s;
+        r.read(&mut buf).map_err(|e| net_err("read0", e))?
     };
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
@@ -535,15 +556,20 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     unsafe {
         std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len as usize);
     }
-    let n = {
+    // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
+    // brief read-lock, drop the map lock, then perform the blocking write
+    // on the per-socket Mutex (see net_read0 for the rationale).
+    let stream_handle = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => {
-                let mut w = s;
-                w.write(&buf).map_err(|e| net_err("write0", e))?
-            }
+            Some(NetSocketHandle::Stream(s)) => Arc::clone(s),
             _ => return Err(ioex("write0: fd not a stream")),
         }
+    };
+    let n = {
+        let s = stream_handle.lock();
+        let mut w = &*s;
+        w.write(&buf).map_err(|e| net_err("write0", e))?
     };
     Ok(Some(Value::Int(n as i32)))
 }
@@ -570,25 +596,25 @@ fn net_set_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("setIntOption0: FileDescriptor has no fd id"))?;
 
-    // Apply via std::net where possible.
-    {
+    // AUDIT 2026-05-17: clone the per-stream Arc under the map read-lock
+    // so the actual setsockopt happens without the global map lock held.
+    let stream_handle = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => {
-                match (level, opt) {
-                    (IPPROTO_TCP, TCP_NODELAY) => {
-                        s.set_nodelay(val != 0).map_err(|e| net_err("TCP_NODELAY", e))?;
-                    }
-                    (SOL_SOCKET, SO_KEEPALIVE) => {
-                        // std::net::TcpStream has no keepalive setter until
-                        // the socket2 crate is pulled in; remember the value
-                        // so getIntOption0 is consistent.
-                    }
-                    _ => {}
-                }
+            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    };
+    if let Some(handle) = stream_handle {
+        let s = handle.lock();
+        match (level, opt) {
+            (IPPROTO_TCP, TCP_NODELAY) => {
+                s.set_nodelay(val != 0).map_err(|e| net_err("TCP_NODELAY", e))?;
             }
-            Some(NetSocketHandle::Listener(_)) => {
-                // TcpListener exposes few runtime knobs; record only.
+            (SOL_SOCKET, SO_KEEPALIVE) => {
+                // std::net::TcpStream has no keepalive setter until
+                // the socket2 crate is pulled in; remember the value
+                // so getIntOption0 is consistent.
             }
             _ => {}
         }
@@ -607,13 +633,20 @@ fn net_get_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .ok_or_else(|| ioex("getIntOption0: FileDescriptor has no fd id"))?;
 
     // Prefer the live socket state when std exposes it.
-    {
+    // AUDIT 2026-05-17: clone the Arc under the map read-lock; query
+    // the OS without the map lock held.
+    let stream_handle = {
         let map = net_sockets().read();
-        if let Some(NetSocketHandle::Stream(s)) = map.get(&fd) {
-            if level == IPPROTO_TCP && opt == TCP_NODELAY {
-                let v = s.nodelay().unwrap_or(false);
-                return Ok(Some(Value::Int(if v { 1 } else { 0 })));
-            }
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    };
+    if let Some(handle) = stream_handle {
+        let s = handle.lock();
+        if level == IPPROTO_TCP && opt == TCP_NODELAY {
+            let v = s.nodelay().unwrap_or(false);
+            return Ok(Some(Value::Int(if v { 1 } else { 0 })));
         }
     }
     // Otherwise return what was last set, defaulting to 0.
@@ -631,11 +664,25 @@ fn net_get_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 fn net_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj).unwrap_or(-1);
-    let map = net_sockets().read();
-    let port = match map.get(&fd) {
-        Some(NetSocketHandle::Listener(l)) => l.local_addr().map(|a| a.port() as i32).unwrap_or(0),
-        Some(NetSocketHandle::Stream(s)) => s.local_addr().map(|a| a.port() as i32).unwrap_or(0),
-        _ => 0,
+    // AUDIT 2026-05-17: clone the handle Arc under a brief map read-lock,
+    // then drop the map lock before issuing the syscall.
+    enum Handle {
+        L(Arc<Mutex<TcpListener>>),
+        S(Arc<Mutex<TcpStream>>),
+        None,
+    }
+    let handle = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Listener(l)) => Handle::L(Arc::clone(l)),
+            Some(NetSocketHandle::Stream(s)) => Handle::S(Arc::clone(s)),
+            _ => Handle::None,
+        }
+    };
+    let port = match handle {
+        Handle::L(l) => l.lock().local_addr().map(|a| a.port() as i32).unwrap_or(0),
+        Handle::S(s) => s.lock().local_addr().map(|a| a.port() as i32).unwrap_or(0),
+        Handle::None => 0,
     };
     Ok(Some(Value::Int(port)))
 }
@@ -644,19 +691,32 @@ fn net_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj).unwrap_or(-1);
-    let addr_text = {
+    // AUDIT 2026-05-17: clone handle Arc, drop map lock, then syscall.
+    enum Handle {
+        L(Arc<Mutex<TcpListener>>),
+        S(Arc<Mutex<TcpStream>>),
+        None,
+    }
+    let handle = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Listener(l)) => l
-                .local_addr()
-                .map(|a| a.ip().to_string())
-                .unwrap_or_else(|_| "0.0.0.0".to_string()),
-            Some(NetSocketHandle::Stream(s)) => s
-                .local_addr()
-                .map(|a| a.ip().to_string())
-                .unwrap_or_else(|_| "0.0.0.0".to_string()),
-            _ => "0.0.0.0".to_string(),
+            Some(NetSocketHandle::Listener(l)) => Handle::L(Arc::clone(l)),
+            Some(NetSocketHandle::Stream(s)) => Handle::S(Arc::clone(s)),
+            _ => Handle::None,
         }
+    };
+    let addr_text = match handle {
+        Handle::L(l) => l
+            .lock()
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        Handle::S(s) => s
+            .lock()
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        Handle::None => "0.0.0.0".to_string(),
     };
     let ia = ctx.new_object("java/net/InetAddress")?;
     if let Some(Value::Object(Some(ia_obj))) = ia {
@@ -675,10 +735,17 @@ fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn net_remote_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj).unwrap_or(-1);
-    let map = net_sockets().read();
-    let port = match map.get(&fd) {
-        Some(NetSocketHandle::Stream(s)) => s.peer_addr().map(|a| a.port() as i32).unwrap_or(0),
-        _ => 0,
+    // AUDIT 2026-05-17: clone handle Arc, drop map lock, then syscall.
+    let stream_handle = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    };
+    let port = match stream_handle {
+        Some(s) => s.lock().peer_addr().map(|a| a.port() as i32).unwrap_or(0),
+        None => 0,
     };
     Ok(Some(Value::Int(port)))
 }
@@ -687,15 +754,21 @@ fn net_remote_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn net_remote_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj).unwrap_or(-1);
-    let addr_text = {
+    // AUDIT 2026-05-17: clone handle Arc, drop map lock, then syscall.
+    let stream_handle = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => s
-                .peer_addr()
-                .map(|a| a.ip().to_string())
-                .unwrap_or_else(|_| "0.0.0.0".to_string()),
-            _ => "0.0.0.0".to_string(),
+            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+            _ => None,
         }
+    };
+    let addr_text = match stream_handle {
+        Some(s) => s
+            .lock()
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        None => "0.0.0.0".to_string(),
     };
     let ia = ctx.new_object("java/net/InetAddress")?;
     if let Some(Value::Object(Some(ia_obj))) = ia {
@@ -864,7 +937,7 @@ pub(crate) fn _test_peek_kind(fd: i32) -> &'static str {
 /// opens listeners out-of-band (not required by any current test but cheap
 /// to provide).
 pub fn register_prebuilt_listener(l: TcpListener) -> i32 {
-    register_handle(NetSocketHandle::Listener(l))
+    register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(l))))
 }
 
 /// Resolve an "address:port" string into a `SocketAddr`. Used by tests and
@@ -918,7 +991,7 @@ mod tests {
         // Direct binding via TcpListener + our registry.
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
         let local = listener.local_addr().unwrap();
-        let fd = register_handle(NetSocketHandle::Listener(listener));
+        let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
         assert_eq!(_test_peek_kind(fd), "listener");
         assert!(local.port() > 0, "ephemeral port should be > 0");
         remove_fd(fd);
@@ -1051,11 +1124,11 @@ mod tests {
     fn t19_5_localPort_reports_actual_bound_port() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let expected = listener.local_addr().unwrap().port();
-        let fd = register_handle(NetSocketHandle::Listener(listener));
+        let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
         let actual = {
             let map = net_sockets().read();
             match map.get(&fd) {
-                Some(NetSocketHandle::Listener(l)) => l.local_addr().unwrap().port(),
+                Some(NetSocketHandle::Listener(l)) => l.lock().local_addr().unwrap().port(),
                 _ => 0,
             }
         };
@@ -1077,7 +1150,7 @@ mod tests {
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let peer = client.peer_addr().unwrap();
         assert_eq!(peer.ip().to_string(), "127.0.0.1");
-        let fd = register_handle(NetSocketHandle::Stream(client));
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(client))));
         // Confirm the handle is indexed as a Stream.
         assert_eq!(_test_peek_kind(fd), "stream");
         remove_fd(fd);
@@ -1114,13 +1187,13 @@ mod tests {
     fn t19_5_shutdown_is_noop_on_listener() {
         // shutdown() on a listener fd should not panic — it's a no-op.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = register_handle(NetSocketHandle::Listener(listener));
+        let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
         // Simulate the inner match of net_shutdown without needing
         // a FileDescriptor object.
         let map = net_sockets().read();
         match map.get(&fd) {
             Some(NetSocketHandle::Stream(s)) => {
-                let _ = s.shutdown(std::net::Shutdown::Both);
+                let _ = s.lock().shutdown(std::net::Shutdown::Both);
             }
             _ => {}
         }

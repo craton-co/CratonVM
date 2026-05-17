@@ -1133,6 +1133,14 @@ impl GenerationalHeap {
         self.concurrent_gc_state = Some(gc_state);
     }
 
+    /// Round-5 fix (CRIT — UAF): expose the SATB queue handle so the
+    /// VM can drain per-thread SATB buffers at safepoint entry. Returns
+    /// `None` until `enable_concurrent_gc` has been called (i.e. until
+    /// the concurrent old-gen collector is wired up).
+    pub fn satb_queue_handle(&self) -> Option<Arc<SatbQueue>> {
+        self.satb_queue.clone()
+    }
+
     /// Get the old generation's base pointer and capacity (for creating a ConcurrentMarker).
     pub fn old_gen_info(&self) -> (usize, usize) {
         let og = self.old_gen.lock();

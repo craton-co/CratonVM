@@ -2177,9 +2177,32 @@ pub(crate) fn register_phase50_natives(registry: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// ThreadLocal — 1-field synthetic (field 0 = value Object)
+// ThreadLocal — per-thread storage (audit-round5 fix #1).
 // ---------------------------------------------------------------------------
+// CRIT correctness: the prior implementation stashed the value in field 0 of
+// the `ThreadLocal` instance itself, so every thread that read/wrote the
+// same `ThreadLocal` clobbered the other threads' values — a direct
+// violation of the `ThreadLocal` contract. The fix uses a `thread_local!`
+// `RefCell<FxHashMap<usize, Value>>` keyed by the ThreadLocal object's
+// pointer; each thread's map only stores its own per-instance value.
+//
+// `withInitial` (`native_tl_with_initial`) eagerly invokes the supplier on
+// the creating thread and seeds that thread's map; subsequent reads on
+// other threads will see no entry and fall through to the JDK-level
+// `ThreadLocal.initialValue()` semantics. We model the unset state by
+// returning `Value::Object(None)` from `get`, matching the prior behavior
+// for the never-set case.
 const TL_FIELD_VALUE: usize = 0;
+
+std::thread_local! {
+    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<usize, Value>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+#[inline]
+fn tl_key(this: rustjvm_types::ObjectRef) -> usize {
+    this.as_ptr() as usize
+}
 
 pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
     let c = "java/lang/ThreadLocal";
@@ -2203,31 +2226,44 @@ pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
 
 fn native_tl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Field 0 is still allocated for compatibility with code that reads
+    // the synthetic layout, but it is NOT the source of truth for the
+    // per-thread value (see audit-round5 fix #1). Leave it as null.
     ctx.set_field(this, TL_FIELD_VALUE, Value::Object(None));
     Ok(None)
 }
 
-fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_tl_get(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let val = ctx.get_field(this, TL_FIELD_VALUE);
+    let key = tl_key(this);
+    let val = TL_MAP.with(|m| m.borrow().get(&key).copied().unwrap_or(Value::Object(None)));
     Ok(Some(val))
 }
 
-fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_tl_set(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, TL_FIELD_VALUE, val);
+    let key = tl_key(this);
+    TL_MAP.with(|m| {
+        m.borrow_mut().insert(key, val);
+    });
     Ok(None)
 }
 
-fn native_tl_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_tl_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, TL_FIELD_VALUE, Value::Object(None));
+    let key = tl_key(this);
+    TL_MAP.with(|m| {
+        m.borrow_mut().remove(&key);
+    });
     Ok(None)
 }
 
 fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Create ThreadLocal and eagerly call supplier to get initial value
+    // for the CURRENT thread only — other threads will lazily re-invoke
+    // their own initial-value provider on first access (matching the
+    // JDK's `SuppliedThreadLocal` semantics).
     let supplier = match args.first() {
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(None))),
@@ -2235,7 +2271,10 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let tl = alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1);
     let initial = ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?;
     let val = initial.unwrap_or(Value::Object(None));
-    ctx.set_field(tl, TL_FIELD_VALUE, val);
+    let key = tl_key(tl);
+    TL_MAP.with(|m| {
+        m.borrow_mut().insert(key, val);
+    });
     Ok(Some(Value::Object(Some(tl))))
 }
 

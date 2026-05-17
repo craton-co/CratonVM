@@ -1237,7 +1237,7 @@ mod tests {
             vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
-                code: vec![0xB1].into(), // return
+                code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))]
@@ -1648,7 +1648,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack,
                     max_locals,
-                    code: code.into(),
+                    code: rustjvm_reader::ByteView::from_vec(code),
                     exception_table,
                     attributes: vec![],
                 }))],
@@ -1886,7 +1886,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xac].into(), // ireturn on empty stack
+                code: rustjvm_reader::ByteView::from_vec(vec![0xac]), // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1930,7 +1930,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xac].into(), // ireturn on empty stack
+                code: rustjvm_reader::ByteView::from_vec(vec![0xac]), // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1974,7 +1974,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0xb2, 0x00].into(), // getstatic with truncated index
+                code: rustjvm_reader::ByteView::from_vec(vec![0xb2, 0x00]), // getstatic with truncated index
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -2033,7 +2033,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code,
+                code: rustjvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],

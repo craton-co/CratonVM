@@ -261,6 +261,21 @@ pub trait NativeContext {
         dst.len()
     }
 
+    /// Bulk write from a host `u16` buffer into a Java `char[]` array at
+    /// the given destination offset. Returns `true` on success, `false` on
+    /// bounds error / wrong array kind.
+    ///
+    /// AUDIT 2026-05-17: symmetric to `read_char_array_into`. Used by
+    /// `stream_decoder::refill` to populate the read-ahead char buffer
+    /// in one shot instead of N `set_array_element` round-trips. The
+    /// VM override `memcpy`s into the compact char-array payload.
+    fn write_char_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u16]) -> bool {
+        for (i, c) in src.iter().enumerate() {
+            self.set_array_element(arr, dst_off + i, Value::Int(*c as i32));
+        }
+        true
+    }
+
     /// Bulk copy of array elements (primitive arrays only — for ref arrays
     /// the caller must do per-element typecheck). `src` and `dst` may alias
     /// (the VM override uses `copy_within` for same-array overlap, falling
@@ -720,6 +735,45 @@ pub trait NativeContext {
         new_val: Value,
     ) -> bool;
 
+    /// audit-round5 fix #9 (HIGH): atomic `fetch_add` on an `int` instance
+    /// field. Returns the *previous* value (matching `AtomicInteger.getAndAdd`
+    /// / `AtomicI32::fetch_add` semantics).
+    ///
+    /// Default implementation is a `compare_and_swap_field` retry loop —
+    /// existing trait implementors keep working unchanged. The VM override
+    /// should map this to a single `LOCK XADD` (one trait dispatch, no
+    /// CAS spin under contention).
+    fn atomic_fetch_add_int(&mut self, obj: ObjectRef, index: usize, delta: i32) -> i32 {
+        loop {
+            let current = self.get_field_volatile(obj, index);
+            let old = match current {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let new_val = Value::Int(old.wrapping_add(delta));
+            if self.compare_and_swap_field(obj, index, current, new_val) {
+                return old;
+            }
+        }
+    }
+
+    /// audit-round5 fix #9 (HIGH): atomic `fetch_add` on a `long` instance
+    /// field — `AtomicLong.getAndAdd` / `AtomicI64::fetch_add` analogue.
+    /// See `atomic_fetch_add_int` for the default-impl rationale.
+    fn atomic_fetch_add_long(&mut self, obj: ObjectRef, index: usize, delta: i64) -> i64 {
+        loop {
+            let current = self.get_field_volatile(obj, index);
+            let old = match current {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let new_val = Value::Long(old.wrapping_add(delta));
+            if self.compare_and_swap_field(obj, index, current, new_val) {
+                return old;
+            }
+        }
+    }
+
     // -- Park/Unpark (LockSupport) --
 
     /// Park the current thread (block until unparked or timeout).
@@ -1148,6 +1202,18 @@ pub trait NativeContext {
         referent: ObjectRef,
         queue: Option<ObjectRef>,
     );
+
+    /// Notify the GC's reference processor that a `SoftReference.get()` just
+    /// observed its referent, refreshing the LRU timestamp used by
+    /// soft-reference clearing heuristics on the next major GC.
+    ///
+    /// Round-5 fix (HIGH): without this hook, the LRU index sees
+    /// `last_access_time_ms == 0` forever and every SoftReference looks
+    /// infinitely stale — clearing on the first low-memory cycle and
+    /// defeating soft-ref-backed caches. The VM overrides this with a
+    /// call into `ReferenceProcessor::touch_soft_reference`. The default
+    /// no-op keeps mock/test contexts compiling.
+    fn touch_soft_reference(&mut self, _reference_obj: ObjectRef) {}
 
     /// Record a JFR thread sleep event. Called by Thread.sleep implementations.
     /// Default is no-op; the VM overrides this with the real JFR recorder.

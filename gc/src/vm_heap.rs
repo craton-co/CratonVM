@@ -535,6 +535,37 @@ impl VmHeap {
         }
     }
 
+    /// Round-5 fix (CRIT — UAF): drain THIS thread's per-thread SATB
+    /// buffer into the global SATB queue.
+    ///
+    /// Must be called on every mutator thread immediately before it
+    /// blocks at a GC safepoint, and on the GC-initiating thread before
+    /// it runs initial-mark / remark. Without this drain, up to
+    /// `DEFAULT_SATB_CAPACITY` (256) overwritten references per thread
+    /// remain in the thread-local buffer and never reach the marker —
+    /// causing the classic SATB lost-object scenario (A→B replaced by
+    /// A→null after A is scanned but before B is scanned), which the
+    /// next evacuation turns into a use-after-free on B.
+    ///
+    /// The `thread_local!` storage means each thread must call this
+    /// itself; the GC cannot reach into another thread's buffer.
+    pub fn flush_thread_satb(&self) {
+        match self {
+            VmHeap::G1(h) => {
+                if h.satb_queue().is_active() {
+                    crate::satb::flush_thread_satb_buffer(h.satb_queue());
+                }
+            }
+            VmHeap::Generational(h) => {
+                if let Some(q) = h.satb_queue_handle() {
+                    if q.is_active() {
+                        crate::satb::flush_thread_satb_buffer(&q);
+                    }
+                }
+            }
+        }
+    }
+
     /// Check if old generation needs GC (generational only).
     pub fn old_gen_needs_gc(&self) -> bool {
         match self {

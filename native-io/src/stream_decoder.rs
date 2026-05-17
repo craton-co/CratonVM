@@ -266,9 +266,20 @@ fn refill_and_copy(
                 _ => break,
             };
             let take = (limit - pos).min(len - produced);
-            for i in 0..take {
-                let c = ctx.get_array_element(buf, pos + i);
-                ctx.set_array_element(out, off + produced + i, c);
+            // AUDIT 2026-05-17: bulk copy via the primitive-array
+            // intrinsic. char[] is a primitive array so the VM override
+            // uses a single `ptr::copy` between the two payloads.
+            if take > 0 {
+                let ok = ctx.bulk_array_copy(buf, pos, out, off + produced, take);
+                if !ok {
+                    // Fall back to per-element if the VM rejected the
+                    // bulk (shouldn't happen for two well-formed char[]
+                    // arrays of matching kind).
+                    for i in 0..take {
+                        let c = ctx.get_array_element(buf, pos + i);
+                        ctx.set_array_element(out, off + produced + i, c);
+                    }
+                }
             }
             ctx.set_field(this, SD_POS, Value::Int((pos + take) as i32));
             produced += take;
@@ -357,9 +368,12 @@ fn refill(
     let chars = engine::decode_bytes_lossy(&name, decodable);
 
     // Stash chars into the read-ahead buffer.
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic. The VM
+    // override does a single `copy_nonoverlapping` into the compact
+    // char-array payload, eliminating the per-element virtual dispatch.
     let char_arr = ctx.new_array(ArrayElementType::Char, chars.len());
-    for (i, &c) in chars.iter().enumerate() {
-        ctx.set_array_element(char_arr, i, Value::Int(c as i32));
+    if !chars.is_empty() {
+        ctx.write_char_array_from(char_arr, 0, &chars);
     }
     ctx.set_field(this, SD_CHARS, Value::Object(Some(char_arr)));
     ctx.set_field(this, SD_POS, Value::Int(0));
