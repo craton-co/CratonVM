@@ -71,7 +71,20 @@ run_app keycloak 30 --Xmx 1g \
     --jar "$APPS/keycloak-26.2.4/lib/quarkus-run.jar" show-config &
 P3=$!
 
-wait $P1 $P2 $P3
+# Elasticsearch 8.15.5 — server CLI launcher
+ES="$APPS/elasticsearch-8.15.5"
+ES_CP=$(find "$ES/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app elasticsearch 25 --Xmx 512m -c "$ES_CP" \
+    "-Dcli.name=server" \
+    "-Dcli.script=$ES/bin/elasticsearch" \
+    "-Dcli.libs=lib/tools/server-cli" \
+    "-Des.path.home=$ES" \
+    "-Des.path.conf=$ES/config" \
+    "-Des.distribution.type=default" \
+    org.elasticsearch.launcher.CliToolLauncher &
+P4=$!
+
+wait $P1 $P2 $P3 $P4
 
 echo "=== SUMMARY iter=$ITER ==="
 for f in "$LOGDIR"/*.rc.txt; do

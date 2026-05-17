@@ -1504,6 +1504,37 @@ impl NativeMethodRegistry {
         self.methods.is_empty()
     }
 
+    /// Fallback search: find any registered native callback whose
+    /// `(method_name, descriptor)` matches, regardless of class.
+    ///
+    /// Used by the slow-path dispatcher recovery for the case where a
+    /// synthetic native-allocated object (e.g. our `Pattern` instances
+    /// allocated with `ClassId::new(0)`) ends up routed through
+    /// `java/lang/Object` because the heap reports `class_id_of` as 0
+    /// (the literal Object class id). A scoped native like
+    /// `java/util/regex/Pattern.matcher(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;`
+    /// is uniquely identified by `(method_name, descriptor)` because
+    /// `Object` has no such method — so this scan recovers the
+    /// correct callback without needing the CP method-ref class.
+    ///
+    /// Returns the first matching callback found. The scan is O(N)
+    /// over the registry; call sites should gate this on the slow
+    /// recovery path (NSME about to be raised), not the hot dispatch.
+    pub fn find_by_method_descriptor(
+        &self,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeCallback> {
+        let needle_suffix = format!(".{method_name}{descriptor}");
+        for (hash, triple) in self.keys.iter() {
+            if triple.ends_with(&needle_suffix) {
+                if let Some(cb) = self.methods.get(hash).copied() {
+                    return Some(cb);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Default for NativeMethodRegistry {

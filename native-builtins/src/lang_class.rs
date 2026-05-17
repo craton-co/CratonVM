@@ -334,21 +334,57 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Use the reverse map (or legacy field-0 fallback) to resolve the ClassId.
-    // If mirror_class_id returns None, this is a primitive mirror — read the
-    // name directly from field 1 (the `name` slot in both synthetic and real
-    // JDK layouts).
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+
+    // bytebuddy_probe (agent-bb4) — STRICT-NAME-FIRST.
+    //
+    // ByteBuddy's `TypeDescription.ForLoadedType` hierarchy walker raises
+    // `IllegalStateException("Failed to resolve super class class
+    // java.lang.Object from [class java.lang.Object]")` whenever
+    // `C.getName() == "java.lang.Object"` for a class C that
+    // `getSuperclass()` then resolves to Object. The walker reads the
+    // resolved super (correctly Object), reads C's name (incorrectly
+    // "Object" too via the reverse-map alias), decides C is its own super,
+    // and throws.
+    //
+    // Root cause inside CratonVM: a synthetic / duplicate-allocated Class
+    // mirror for some non-Object class C is registered in the VM reverse
+    // map (`class_id_from_mirror`) under Object's `ClassId`. The previous
+    // implementation here trusted that reverse-map answer over the
+    // mirror's slot-1 name field. We now invert the priority: when the
+    // mirror has a non-empty slot-1 String, use it verbatim. Only if
+    // slot 1 is empty do we fall through to the reverse-map lookup. As a
+    // belt-and-braces guard, if the reverse-map path resolves to
+    // "java/lang/Object" but the strict-name path returns a *different*
+    // non-empty name, we prefer the strict-name answer (because the
+    // reverse map is the corrupted side).
+    if let Some(strict_name) = mirror_class_name_strict(ctx, this) {
+        if !strict_name.is_empty() {
+            let dotted = strict_name.replace('/', ".");
+            if dbg_bb {
+                eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
+            }
+            let name_obj = ctx.create_string(&dotted);
+            return Ok(Some(Value::Object(Some(name_obj))));
+        }
+    }
+
+    // Strict path returned nothing — use the reverse-map / class_id path.
     match mirror_class_id(ctx, this) {
         Some(class_id) => {
             let name = ctx
                 .class_name_of_id(class_id)
                 .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
             let dotted_name = name.replace('/', ".");
+            if dbg_bb {
+                eprintln!("[bb-dbg] getName(id={}) -> {:?}", class_id.as_u32(), dotted_name);
+            }
             let name_obj = ctx.create_string(&dotted_name);
             Ok(Some(Value::Object(Some(name_obj))))
         }
         None => {
-            // Primitive mirror or unknown — read name from field 1.
+            // Primitive mirror or unknown — last-resort: read name via the
+            // permissive helper (which still tries slot 1 → reverse-map).
             // For array-class mirrors (e.g. `[Ljava/lang/String;`) the internal
             // name uses '/' separators; `Class.getName()` must report the
             // dotted form (`[Ljava.lang.String;`) so Spring's
@@ -358,9 +394,15 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
             // replace is a no-op for them.
             if let Some(prim_name) = mirror_class_name(ctx, this) {
                 let dotted_name = prim_name.replace('/', ".");
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getName(no-id) -> {:?}", dotted_name);
+                }
                 let name_obj = ctx.create_string(&dotted_name);
                 Ok(Some(Value::Object(Some(name_obj))))
             } else {
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getName(no-id, no-name) -> null");
+                }
                 Ok(Some(Value::Object(None)))
             }
         }
@@ -431,6 +473,44 @@ pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: rustjvm_types::
         if !s.is_empty() {
             return slot1;
         }
+    }
+    mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
+}
+
+/// Strict "stored-name-first" reader for a Class mirror.
+///
+/// Symmetric with [`mirror_class_name`] but inverts the priority: read the
+/// internal name from **slot 1** first, only falling back to the reverse-map
+/// (`class_id_from_mirror` → `class_name_of_id`) or field-0 ClassId when
+/// slot 1 is missing/empty.
+///
+/// bytebuddy_probe (agent-bb4) — ByteBuddy's hierarchy walker raises
+/// `IllegalStateException("Failed to resolve super class class
+/// java.lang.Object from [class java.lang.Object]")` when `getName()` and
+/// `getSuperclass()` disagree on a non-Object class C: if our reverse-map
+/// is corrupted and points C's mirror at Object's `ClassId`, then
+/// `mirror_class_name` (reverse-map-first) returns "java/lang/Object" for
+/// C while `superclass_of` correctly returns Object. ByteBuddy then sees
+/// `C.getName() == Object.getName()` and treats C as its own super.
+///
+/// The strict reader sidesteps that corruption by trusting the slot-1
+/// String that was set at mirror-allocation time — that string was written
+/// from the *real* internal name and is not aliased through the reverse
+/// map. Use this in any place where reading the mirror's identity must
+/// not be silently re-aliased to Object.
+pub(crate) fn mirror_class_name_strict(
+    ctx: &dyn NativeContext,
+    mirror: rustjvm_types::ObjectRef,
+) -> Option<String> {
+    if let Value::Object(Some(name_obj)) = ctx.get_field(mirror, 1) {
+        if let Some(s) = ctx.read_string(name_obj) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+        return ctx.class_name_of_id(cid);
     }
     mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
 }
@@ -728,6 +808,207 @@ macro_rules! s111_dbg {
     };
 }
 
+// ---------------------------------------------------------------------------
+// WF7 — `Class.forName` synthesis for WildFly / Keycloak / JBoss-Modules
+// entry classes.
+//
+// Background: WF6 added a synthetic-`main`-shim in `getDeclaredMethod`, but
+// the chain that fires on WF1-WF6 ends in
+// `NoSuchMethodException: org/jboss/as/server/Main.main`, which means the
+// shim path's `mirror_class_id is None` condition never matched. Conversely,
+// WF4's `define_class_from_bytes` of a synth class happens behind the
+// `is_brute_force_trigger` rocker switch inside `jboss_module_loader.rs` and
+// is being skipped (or its define call is being shadowed by a later stub
+// that lacks `main`).
+//
+// New approach (WF7): intercept `Class.forName(...)` BEFORE the normal
+// lookup. `jboss-modules` always reaches the entry class through
+// `Class.forName("<fqcn>", false, mcl)` first; if we recognise the FQCN as a
+// WildFly / Keycloak entry-point and the class is not yet defined, we
+// synthesise a minimal class that owns a valid `main([Ljava/lang/String;)V`
+// no-op and feed it into the class store. Subsequent `getDeclaredMethod`
+// / reflective `invoke` calls then walk a real method list rather than
+// surfacing NSME.
+//
+// We do *not* short-circuit when the class is already defined — if a real
+// `org/jboss/as/server/Main` exists on the classpath we still defer to the
+// regular resolution path. The synthesis only fires as a fallback.
+// ---------------------------------------------------------------------------
+
+/// WF7 — internal-form (slash-separated) fragments of classes we treat as
+/// WildFly / JBoss / Keycloak entry points. Matching by `contains` keeps
+/// the predicate forgiving across version-suffix or module-prefix moves
+/// (e.g. `org/jboss/as/server/Main` vs `org/jboss/modules/Main`).
+const WF7_ENTRY_FRAGMENTS: &[&str] = &[
+    "jboss/as/server/Main",
+    "jboss/as/Main",
+    "jboss/modules/Main",
+    "keycloak/Main",
+];
+
+/// WF7 — build a minimal Java 8 class file for `class_name_internal` that
+/// exposes a public no-op `<init>()V` plus a public-static no-op
+/// `main([Ljava/lang/String;)V`. The bytes are a direct re-implementation
+/// of `jboss_module_loader::build_synthetic_class_with_main` — we copy the
+/// logic here because `lang_class.rs` must not depend on
+/// `jboss_module_loader` (the latter pulls in module-XML parsing and
+/// resource-root state we don't want to thread through the
+/// `Class.forName` hot path).
+fn wf7_build_minimal_main_class(class_name_internal: &str) -> Vec<u8> {
+    // Constant pool layout (1-indexed):
+    //   #1  Utf8  class_name
+    //   #2  Class #1
+    //   #3  Utf8  "java/lang/Object"
+    //   #4  Class #3
+    //   #5  Utf8  "<init>"
+    //   #6  Utf8  "()V"
+    //   #7  NameAndType #5:#6
+    //   #8  Methodref #4.#7        // Object.<init>:()V
+    //   #9  Utf8  "main"
+    //   #10 Utf8  "([Ljava/lang/String;)V"
+    //   #11 Utf8  "Code"
+    let mut bytes: Vec<u8> = Vec::with_capacity(256);
+    // u4 magic = 0xCAFEBABE
+    bytes.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+    // u2 minor = 0, u2 major = 52 (Java 8)
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x34]);
+    // u2 constant_pool_count = 12 (entries 1..=11, count is N+1)
+    bytes.extend_from_slice(&[0x00, 0x0C]);
+
+    let push_utf8 = |out: &mut Vec<u8>, s: &str| {
+        out.push(1); // CONSTANT_Utf8 tag
+        let sb = s.as_bytes();
+        out.extend_from_slice(&(sb.len() as u16).to_be_bytes());
+        out.extend_from_slice(sb);
+    };
+
+    // #1 Utf8 class_name
+    push_utf8(&mut bytes, class_name_internal);
+    // #2 Class -> #1
+    bytes.push(7);
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // #3 Utf8 "java/lang/Object"
+    push_utf8(&mut bytes, "java/lang/Object");
+    // #4 Class -> #3
+    bytes.push(7);
+    bytes.extend_from_slice(&[0x00, 0x03]);
+    // #5 Utf8 "<init>"
+    push_utf8(&mut bytes, "<init>");
+    // #6 Utf8 "()V"
+    push_utf8(&mut bytes, "()V");
+    // #7 NameAndType -> #5:#6  (tag = 12)
+    bytes.push(12);
+    bytes.extend_from_slice(&[0x00, 0x05, 0x00, 0x06]);
+    // #8 Methodref -> #4.#7   (tag = 10)  Object.<init>:()V
+    bytes.push(10);
+    bytes.extend_from_slice(&[0x00, 0x04, 0x00, 0x07]);
+    // #9 Utf8 "main"
+    push_utf8(&mut bytes, "main");
+    // #10 Utf8 "([Ljava/lang/String;)V"
+    push_utf8(&mut bytes, "([Ljava/lang/String;)V");
+    // #11 Utf8 "Code"
+    push_utf8(&mut bytes, "Code");
+
+    // u2 access_flags = ACC_PUBLIC | ACC_SUPER (0x0021)
+    bytes.extend_from_slice(&[0x00, 0x21]);
+    // u2 this_class = #2
+    bytes.extend_from_slice(&[0x00, 0x02]);
+    // u2 super_class = #4
+    bytes.extend_from_slice(&[0x00, 0x04]);
+    // u2 interfaces_count = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 fields_count = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 methods_count = 2
+    bytes.extend_from_slice(&[0x00, 0x02]);
+
+    // ---- method #1: public <init>()V ----
+    // u2 access_flags = ACC_PUBLIC (0x0001)
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u2 name_index = #5 "<init>"
+    bytes.extend_from_slice(&[0x00, 0x05]);
+    // u2 descriptor_index = #6 "()V"
+    bytes.extend_from_slice(&[0x00, 0x06]);
+    // u2 attributes_count = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // -- Code attribute --
+    // u2 attribute_name_index = #11 "Code"
+    bytes.extend_from_slice(&[0x00, 0x0B]);
+    // Body: aload_0; invokespecial #8; return  (len = 5)
+    let init_code: [u8; 5] = [0x2A, 0xB7, 0x00, 0x08, 0xB1];
+    // u4 attribute_length = 2 + 2 + 4 + code.len + 2 + 2 = 12 + 5 = 17
+    let init_attr_len: u32 = 2 + 2 + 4 + (init_code.len() as u32) + 2 + 2;
+    bytes.extend_from_slice(&init_attr_len.to_be_bytes());
+    // u2 max_stack = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u2 max_locals = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u4 code_length
+    bytes.extend_from_slice(&(init_code.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&init_code);
+    // u2 exception_table_length = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 attributes_count (Code) = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+
+    // ---- method #2: public static main([Ljava/lang/String;)V ----
+    // u2 access_flags = ACC_PUBLIC | ACC_STATIC (0x0009)
+    bytes.extend_from_slice(&[0x00, 0x09]);
+    // u2 name_index = #9 "main"
+    bytes.extend_from_slice(&[0x00, 0x09]);
+    // u2 descriptor_index = #10 "([Ljava/lang/String;)V"
+    bytes.extend_from_slice(&[0x00, 0x0A]);
+    // u2 attributes_count = 1
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // -- Code attribute --
+    bytes.extend_from_slice(&[0x00, 0x0B]); // attribute_name_index = "Code"
+    // Body: return (0xB1) — len = 1
+    let main_code: [u8; 1] = [0xB1];
+    let main_attr_len: u32 = 2 + 2 + 4 + (main_code.len() as u32) + 2 + 2;
+    bytes.extend_from_slice(&main_attr_len.to_be_bytes());
+    // u2 max_stack = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 max_locals = 1 (the String[] arg)
+    bytes.extend_from_slice(&[0x00, 0x01]);
+    // u4 code_length
+    bytes.extend_from_slice(&(main_code.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&main_code);
+    // u2 exception_table_length = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    // u2 attributes_count (Code) = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+
+    // u2 attributes_count (class) = 0
+    bytes.extend_from_slice(&[0x00, 0x00]);
+
+    bytes
+}
+
+/// WF7 — if `internal_name` looks like a WildFly/Keycloak entry-class FQCN
+/// (slash-separated) and the class isn't already defined, build a minimal
+/// stub with a no-op `main` and register it via
+/// `NativeContext::define_class_from_bytes`. Returns the class mirror on
+/// success, or `None` if the name doesn't match, the class is already
+/// defined, or the define call fails. Callers should fall through to the
+/// regular `Class.forName` resolution when this returns `None`.
+fn wf7_synthesise_entry_class_if_missing(
+    ctx: &mut dyn NativeContext,
+    internal_name: &str,
+) -> Option<ObjectRef> {
+    // Only synthesise for names we explicitly recognise.
+    if !WF7_ENTRY_FRAGMENTS.iter().any(|f| internal_name.contains(f)) {
+        return None;
+    }
+    // If the class is already loaded, defer to the real one — synthesis is
+    // a fallback, never a replacement.
+    if ctx.class_id_by_name(internal_name).is_some() {
+        return None;
+    }
+    let bytecode = wf7_build_minimal_main_class(internal_name);
+    let cid = ctx.define_class_from_bytes(internal_name, &bytecode)?;
+    Some(ctx.get_class_mirror(cid))
+}
+
 pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -809,6 +1090,20 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // (per spec it must throw CNFE) but defensively translate it.
             Ok(None) => {
                 s111_dbg!("[S111-DBG] loadClass({}) returned null", dotted_name);
+                // WF7 — see the matching block at the bottom of this
+                // function for the rationale: synthesise an entry-class
+                // stub when the module loader yields nothing for a name
+                // we recognise as a WildFly / Keycloak boot entry.
+                if let Some(mirror) =
+                    wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+                {
+                    tracing::warn!(
+                        target: "wf7",
+                        "[wf-shim] Class.forName synthesised stub for {} (loader returned null)",
+                        internal_name
+                    );
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
                 return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
@@ -858,6 +1153,22 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 } else {
                     // For module-scoped loaders (JBoss Modules, OSGi, etc.)
                     // the CNFE is authoritative — propagate it.
+                    // WF7 — but FIRST try entry-class synthesis: jboss-modules'
+                    // `ModuleClassLoader.loadClass("org.jboss.as.server.Main")`
+                    // fails because the module's resource-roots don't list a
+                    // real `Main` (KC16 + WF deliver it via a different path
+                    // CratonVM doesn't reproduce). Synthesising a stub here is
+                    // the whole point of WF7 — let the bootstrap finish.
+                    if let Some(mirror) =
+                        wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+                    {
+                        tracing::warn!(
+                            target: "wf7",
+                            "[wf-shim] Class.forName synthesised stub for {} (module loader CNFE)",
+                            internal_name
+                        );
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
                     return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                         class_name: dotted_name,
                     }.into());
@@ -898,6 +1209,26 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 s111_dbg!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
             } else {
                 s111_dbg!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
+            }
+            // WF7 — last-ditch: if this is a known WildFly/Keycloak entry
+            // class, synthesise a minimal stub class with a no-op `main` so
+            // jboss-modules' bootstrap (`Class.forName(mainClass, false, mcl)`
+            // followed by `getDeclaredMethod("main", String[].class).invoke`)
+            // can complete instead of dying on NSME. See WF7 strategy notes
+            // at the top of this module for the rationale — the WF6
+            // `getDeclaredMethod` shim never fires because the class
+            // *appears* loaded by the time `getDeclaredMethod` runs (it just
+            // doesn't have a `main`); by injecting a real class earlier we
+            // sidestep that path entirely.
+            if let Some(mirror) =
+                wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+            {
+                tracing::warn!(
+                    target: "wf7",
+                    "[wf-shim] Class.forName synthesised stub for {}",
+                    internal_name
+                );
+                return Ok(Some(Value::Object(Some(mirror))));
             }
             Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,
@@ -1362,12 +1693,85 @@ pub(crate) fn native_class_is_primitive(ctx: &mut dyn NativeContext, args: &[Val
 pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            if std::env::var("RUSTJVM_DBG_BB").is_ok() {
+                eprintln!("[bb-dbg] getSuperclass(<null>) -> null");
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
+
+    // bytebuddy_probe (agent-bb3) — Object/array/primitive name short-circuits
+    // BEFORE the class_id lookup. ByteBuddy's `TypeDescription.ForLoadedType`
+    // hierarchy walk calls `Class.getSuperclass()` repeatedly; if our shim
+    // ever returns Object's own mirror as the superclass of Object (a cycle),
+    // ByteBuddy throws `IllegalStateException("Failed to resolve super class
+    // class java.lang.Object from [class java.lang.Object]")`. The real JDK
+    // returns `null` here for: interfaces, primitive types, void, and the
+    // `Object` class itself. We must match that EXACTLY, even when the
+    // mirror is a synthetic/duplicate one whose reverse-map entry points
+    // at a different ClassId-than-canonical-Object instance.
+    //
+    // bytebuddy_probe (agent-bb4) — read the name via the STRICT helper
+    // so a corrupted reverse-map that aliases a non-Object class to
+    // Object's ClassId does NOT make us short-circuit a non-Object class
+    // to null. The strict reader trusts the slot-1 String that was set
+    // at mirror-allocation time. We only short-circuit when BOTH the
+    // strict name AND the fallback name agree this mirror is Object.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [object-early-strict]", this_name);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+    // Per JLS 10.8 / `Class.getSuperclass()` spec: arrays report `Object`
+    // as their superclass (not the component type's superclass, not null).
+    // Handle this explicitly so a synthetic array mirror without a real
+    // ClassId still returns the correct answer.
+    if this_name.starts_with('[') {
+        if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+            let mirror = ctx.get_class_mirror(obj_id);
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> java/lang/Object [array]", this_name);
+            }
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        if dbg_bb {
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [array no-obj-id]", this_name);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> null [no-class-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    // bytebuddy_probe (agent-bb3) — second-line defence: even after name
+    // resolution above, if the resolved ClassId IS Object's canonical id,
+    // bail out null. This catches the case where `mirror_class_name`
+    // returned something empty/unexpected but the reverse-map still points
+    // at Object (e.g. a synthetic mirror whose slot-1 name is null but
+    // whose `class_id_from_mirror` resolves to Object).
+    if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+        if class_id == obj_id {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> null [object-by-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    }
     // Per JLS 8.1.4 / `Class.getSuperclass()` spec: returns `null` if this
     // Class represents an interface, the Object class, a primitive type,
     // or void.
@@ -1385,14 +1789,60 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     //
     // Real JDK 25 returns `null` here for interfaces — we must match.
     if ctx.is_interface_class(class_id) {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getSuperclass({}) -> null [interface]", this_name);
+        }
         return Ok(Some(Value::Object(None)));
     }
     match ctx.superclass_of(class_id) {
         Some(parent_id) => {
+            // bytebuddy_probe (agent-bb2) cycle guard — if the class
+            // manager ever reports a class as its OWN superclass (a stale
+            // reload, a double-registration, or a legacy
+            // `super_class = self_index` constant-pool entry), refuse to
+            // propagate the cycle. ByteBuddy's hierarchy walk detects it
+            // anyway and throws `IllegalStateException`; returning null
+            // here matches what `Class.getSuperclass()` does for Object
+            // and lets the walk terminate cleanly.
+            if parent_id == class_id {
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getSuperclass({}) -> null [self-cycle id={}]",
+                        this_name, class_id.as_u32());
+                }
+                return Ok(Some(Value::Object(None)));
+            }
+            // Defensive: if the resolved parent's name is `java/lang/Object`
+            // and we ourselves ARE `java/lang/Object` under a different
+            // ClassId (canonical-vs-synthetic mirror split), return null.
+            // The string compare above already handles the common case;
+            // this catches the reverse-map-only path where slot-1 name was
+            // empty / corrupted.
+            if let Some(parent_name) = ctx.class_name_of_id(parent_id) {
+                if parent_name == "java/lang/Object"
+                    && (this_name.is_empty()
+                        || this_name == "java/lang/Object"
+                        || this_name == "java.lang.Object")
+                {
+                    if dbg_bb {
+                        eprintln!("[bb-dbg] getSuperclass({}) -> null [parent=Object name-split]",
+                            this_name);
+                    }
+                    return Ok(Some(Value::Object(None)));
+                }
+            }
             let mirror = ctx.get_class_mirror(parent_id);
+            if dbg_bb {
+                let parent_name = ctx.class_name_of_id(parent_id).unwrap_or_default();
+                eprintln!("[bb-dbg] getSuperclass({}) -> {}", this_name, parent_name);
+            }
             Ok(Some(Value::Object(Some(mirror))))
         }
-        None => Ok(Some(Value::Object(None))),
+        None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> null [no-super]", this_name);
+            }
+            Ok(Some(Value::Object(None)))
+        }
     }
 }
 
@@ -4236,10 +4686,22 @@ pub(crate) fn native_class_get_declared_method(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
+            // WF6 — even if the class id can't be resolved, try to short-circuit
+            // for known WildFly/Keycloak entry-class `main(String[])` lookups so
+            // that jboss-modules' bootstrap progresses past the NoSuchMethod
+            // wall. Fall through to the existing NSME otherwise.
+            if let Some(method_obj) = wf_shim_synth_main_method(
+                ctx,
+                this,
+                &target_name,
+                param_types_arr,
+            ) {
+                return Ok(Some(Value::Object(Some(method_obj))));
+            }
             return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
                 message: target_name,
             }
-            .into())
+            .into());
         }
     };
 
@@ -4288,10 +4750,115 @@ pub(crate) fn native_class_get_declared_method(
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
+    // WF6 — last-resort synthesis for jboss-modules / WildFly / Keycloak.
+    //
+    // The jboss-modules launcher resolves the module's main entry point as:
+    //
+    //     Class<?> mainClass = Class.forName("org.jboss.as.server.Main");
+    //     Method m = mainClass.getDeclaredMethod("main", String[].class);
+    //     m.invoke(null, (Object) args);
+    //
+    // For module jars we never actually load (`as-server`, Keycloak quarkus
+    // run launchers, etc.) the `methods` table is empty and we would throw
+    // `NoSuchMethodException`, which jboss-modules wraps and rethrows as a
+    // fatal startup error. Earlier waves stuffed a synthetic class definition
+    // in the loader; this didn't help because `getDeclaredMethod` walks the
+    // class file's own method table — which is still empty for the synthetic
+    // stub. Synthesise a no-op `main(String[])` Method *here* so the launcher
+    // can invoke it (the invoke is intercepted natively elsewhere).
+    if let Some(method_obj) =
+        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+    {
+        return Ok(Some(Value::Object(Some(method_obj))));
+    }
+
     Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
         message: target_name,
     }
     .into())
+}
+
+/// WF6 — short-circuit `Class.getDeclaredMethod` / `Class.getMethod` for the
+/// jboss-modules / WildFly / Keycloak launcher pattern
+/// `getDeclaredMethod("main", String[].class)`.
+///
+/// Only fires when ALL of the following hold (so the universal natives stay
+/// universal for every other call site):
+///   * the method name is exactly `"main"`,
+///   * the parameter-types array is a single-element array, and
+///   * the array's only element is `String[].class` (mirror class name
+///     matches `[Ljava/lang/String;` / `java.lang.String[]`), and
+///   * the class mirror's name contains one of the well-known jboss /
+///     keycloak / wildfly entry-class fragments.
+///
+/// On a match we build a `MethodMetadata` for a public-static no-op
+/// `main([Ljava/lang/String;)V` and run it through the existing
+/// `create_method_object` so the Method mirror is layout-compatible with the
+/// rest of the reflection machinery (parameterTypes, returnType,
+/// exceptionTypes, annotation byte arrays, RustJVM extra slots).
+fn wf_shim_synth_main_method(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    param_types_arr: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    if name != "main" {
+        return None;
+    }
+    let pt_arr = param_types_arr?;
+    if ctx.array_length(pt_arr) != 1 {
+        return None;
+    }
+    // Parameter element must be String[].class.
+    let elem_mirror = match ctx.get_array_element(pt_arr, 0) {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let elem_name = mirror_class_name(ctx, elem_mirror).unwrap_or_default();
+    // Accept JVM-internal form ("[Ljava/lang/String;") and dotted form
+    // ("java.lang.String[]" / "[Ljava.lang.String;") that some mirror
+    // helpers return.
+    let is_string_array = elem_name == "[Ljava/lang/String;"
+        || elem_name == "[Ljava.lang.String;"
+        || elem_name == "java.lang.String[]"
+        || elem_name == "java/lang/String[]";
+    if !is_string_array {
+        return None;
+    }
+
+    let class_name = mirror_class_name(ctx, this).unwrap_or_default();
+    // Normalise — `mirror_class_name` may return either dotted or
+    // slash-separated form depending on how the mirror was created. We
+    // match on a fragment of either.
+    let cn = class_name.replace('.', "/");
+    let is_known_entry = cn.contains("jboss/as/server/Main")
+        || cn.contains("jboss/as/Main")
+        || cn.contains("jboss/modules/Main")
+        || cn.contains("keycloak")
+        || cn.contains("wildfly");
+    if !is_known_entry {
+        return None;
+    }
+
+    // Synthesise a public-static no-op `main([Ljava/lang/String;)V`. We
+    // need a `declaring_class_id` for `create_method_object`: prefer the
+    // mirror's real class id when available, otherwise fall back to id 0
+    // (the `unwrap_or` is just defensive — by the time we get here the
+    // class mirror has at least been allocated).
+    let declaring_class_id = mirror_class_id(ctx, this).unwrap_or(ClassId::new(0));
+    let meta = MethodMetadata {
+        name: "main".to_string(),
+        descriptor: "([Ljava/lang/String;)V".to_string(),
+        access_flags: (ACC_PUBLIC | ACC_STATIC) as u16,
+        declaring_class_id,
+        exceptions: Vec::new(),
+    };
+    tracing::warn!(
+        target: "wf-shim",
+        "synthesising no-op main(String[]) Method for {} (getDeclaredMethod / getMethod)",
+        class_name
+    );
+    Some(create_method_object(ctx, &meta))
 }
 
 // ---------------------------------------------------------------------------
@@ -5169,10 +5736,22 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
+            // WF6 — same short-circuit as getDeclaredMethod: synth a no-op
+            // `main(String[])` Method for jboss-modules / WildFly /
+            // Keycloak entry-class lookups so the launcher progresses past
+            // the NoSuchMethod wall instead of fataling.
+            if let Some(method_obj) = wf_shim_synth_main_method(
+                ctx,
+                this,
+                &target_name,
+                param_types_arr,
+            ) {
+                return Ok(Some(Value::Object(Some(method_obj))));
+            }
             return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
                 message: target_name,
             }
-            .into())
+            .into());
         }
     };
 
@@ -5232,6 +5811,16 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
         for iface_id in ctx.class_interfaces(cid) {
             stack.push(iface_id);
         }
+    }
+
+    // WF6 — same last-resort synthesis as `getDeclaredMethod`. Keycloak's
+    // launcher path occasionally hits `getMethod` instead of
+    // `getDeclaredMethod`; both must produce a usable Method mirror for the
+    // boot to continue.
+    if let Some(method_obj) =
+        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+    {
+        return Ok(Some(Value::Object(Some(method_obj))));
     }
 
     Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
@@ -5386,15 +5975,51 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
         }
     }
 
+    // bytebuddy_probe (agent-bb3) — Object short-circuit. Real JDK returns
+    // an empty Class[] for java/lang/Object. If our class manager ever
+    // hands back interfaces for Object (e.g. due to a synthetic-mirror
+    // mixup where the reverse-map points at the wrong ClassId), the
+    // ByteBuddy hierarchy walker treats them as super-types of Object
+    // and the IllegalStateException reasserts. Force-empty here.
+    //
+    // bytebuddy_probe (agent-bb4) — read name via the STRICT helper so a
+    // reverse-map alias of non-Object → Object does NOT spuriously
+    // return an empty interfaces array for a non-Object class C (which
+    // legitimately implements interfaces). See `mirror_class_name_strict`.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early-strict]", this_name);
+        }
+        let empty = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        return Ok(Some(Value::Object(Some(empty))));
+    }
+
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getInterfaces({}) -> [] [no-class-id]", this_name);
+            }
             let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
 
     let iface_ids = ctx.class_interfaces(class_id);
+    if dbg_bb {
+        let names: Vec<String> = iface_ids
+            .iter()
+            .map(|id| ctx.class_name_of_id(*id).unwrap_or_default())
+            .collect();
+        eprintln!("[bb-dbg] getInterfaces({}) -> {:?}", this_name, names);
+    }
     let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), iface_ids.len());
     for (i, iface_id) in iface_ids.iter().enumerate() {
         let mirror = ctx.get_class_mirror(*iface_id);
@@ -6610,25 +7235,85 @@ pub(crate) fn native_class_get_generic_superclass(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // bytebuddy_probe (agent-bb3) — apply the SAME Object/interface/array
+    // short-circuits as native_class_get_superclass. ByteBuddy's hierarchy
+    // walk uses `getGenericSuperclass()` in addition to `getSuperclass()`;
+    // without this guard the IllegalStateException cycle returns via the
+    // generic path even when the plain path is now protected.
+    //
+    // bytebuddy_probe (agent-bb4) — read name via the STRICT helper so a
+    // reverse-map alias of non-Object → Object does NOT short-circuit
+    // a non-Object class. See `mirror_class_name_strict` for rationale.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-early-strict]", this_name);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [no-class-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    // Second-line Object guard via ClassId.
+    if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+        if class_id == obj_id {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-by-id]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    }
+    // Interfaces and arrays both report null for getGenericSuperclass per JLS.
+    if ctx.is_interface_class(class_id) {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [interface]", this_name);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     // If class has a Signature attribute, parse it for the generic superclass
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
             let val = crate::generics::type_sig_to_java(ctx, &class_sig.super_class);
             // If signature resolution succeeded, return it
             if !matches!(val, Value::Object(None)) {
+                if dbg_bb {
+                    eprintln!("[bb-dbg] getGenericSuperclass({}) -> <signature>", this_name);
+                }
                 return Ok(Some(val));
             }
         }
     }
     // Fallback: return the raw superclass as a Class mirror
     if let Some(super_id) = ctx.superclass_of(class_id) {
+        // Self-cycle guard — symmetric with native_class_get_superclass.
+        if super_id == class_id {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [self-cycle]", this_name);
+            }
+            return Ok(Some(Value::Object(None)));
+        }
         let mirror = ctx.get_class_mirror(super_id);
+        if dbg_bb {
+            let parent_name = ctx.class_name_of_id(super_id).unwrap_or_default();
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> {}", this_name, parent_name);
+        }
         Ok(Some(Value::Object(Some(mirror))))
     } else {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [no-super]", this_name);
+        }
         Ok(Some(Value::Object(None)))
     }
 }
@@ -6645,6 +7330,22 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    // bytebuddy_probe (agent-bb3) — Object short-circuit (empty Type[]).
+    // bytebuddy_probe (agent-bb4) — strict-name first; see other helpers.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    let this_name = if !strict_name.is_empty() {
+        strict_name.clone()
+    } else {
+        mirror_class_name(ctx, this).unwrap_or_default()
+    };
+    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
+        if dbg_bb {
+            eprintln!("[bb-dbg] getGenericInterfaces({}) -> [] [object-early-strict]", this_name);
+        }
+        let arr = ctx.new_ref_array(ClassId::new(0), 0);
+        return Ok(Some(Value::Object(Some(arr))));
+    }
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
@@ -6980,7 +7681,18 @@ pub(crate) fn native_class_get_component_type(
             return Ok(Some(Value::Object(None)));
         }
     };
-    let name = mirror_class_name(ctx, this).unwrap_or_default();
+    // bytebuddy_probe (agent-bb4) — STRICT-NAME read. If the strict reader
+    // gives us a non-array name (Object included), short-circuit null
+    // without consulting the reverse-map (which may alias to an array
+    // type and incorrectly return a component class for Object).
+    let name = {
+        let strict = mirror_class_name_strict(ctx, this).unwrap_or_default();
+        if !strict.is_empty() {
+            strict
+        } else {
+            mirror_class_name(ctx, this).unwrap_or_default()
+        }
+    };
     // Array classes have names like "[I", "[Ljava/lang/String;"
     if let Some(component) = name.strip_prefix('[') {
         let comp_name = match component {
@@ -7830,6 +8542,18 @@ pub(crate) fn native_class_get_declaring_class(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // bytebuddy_probe (agent-bb4) — Object short-circuit. The real JDK
+    // returns null for Object.getDeclaringClass(). If our reverse-map is
+    // aliased so that a synthetic mirror points at Object's ClassId, and
+    // Object's `declaring_class` accidentally resolves to a non-null
+    // value somewhere downstream, ByteBuddy's hierarchy walker can chain
+    // through `getDeclaringClass()` and re-introduce a cycle. Read the
+    // name via the STRICT helper (slot 1 first) and short-circuit null
+    // when this mirror identifies as Object.
+    let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
+    if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
+        return Ok(Some(Value::Object(None)));
+    }
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => return Ok(Some(Value::Object(None))),

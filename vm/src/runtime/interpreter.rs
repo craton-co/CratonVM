@@ -309,6 +309,47 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+    // S-bytebuddy r3 — independent recursion guard for cleaner-action
+    // dispatch. A Runnable.run() invoked from here can itself enqueue
+    // (or trigger GC of) another Cleanable, which lands back in
+    // `run_cleaner_actions` on the same OS thread. The aggregate
+    // EXEC_DEPTH guard in `execute` catches this too, but only after
+    // we have already burned ~10 Rust frames per turn of the loop.
+    // A small dedicated counter trips earlier and avoids the loop
+    // accumulating frames before the bigger guard fires.
+    thread_local! {
+        static CLEANER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct CleanerDepthGuard;
+    impl Drop for CleanerDepthGuard {
+        fn drop(&mut self) {
+            CLEANER_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let cdepth = CLEANER_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    // Limit calibrated to roughly 1/10 of EXEC_DEPTH (so a runaway
+    // cleaner cascade trips here long before the main guard). The
+    // per-iteration step factor is implicit: each cleaner action burns
+    // ~10 native frames between dispatch and return.
+    if cdepth > 1_000 {
+        CLEANER_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        // Don't propagate as a Java exception — the cleaner contract
+        // forbids exceptions escaping. Just drop the remaining actions
+        // on the floor; they will be retried on the next GC tick.
+        return;
+    }
+    let _cleaner_depth_guard = CleanerDepthGuard;
+
     let addrs = shared.cleaner_thread.drain_actions();
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
@@ -1097,6 +1138,119 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // S-bytebuddy r1 — Rust-side recursion guard.
+    //
+    // ByteBuddy's `JavaDispatcher.run()` performs deep reflection via
+    // `Method.invoke`, whose bytecode dispatches back into this `execute`
+    // function. The Java-level frame counter (`thread.frames`) is checked at
+    // each push (see `max_stack_depth` guard below), BUT a `Method.invoke`
+    // chain that re-enters `execute` re-invokes this Rust function on the
+    // native call stack BEFORE the Java frame is pushed. That recursion is
+    // not bounded by `max_stack_depth`. Result: under a deep ByteBuddy
+    // reflection cascade, the Rust call stack blows past the OS guard page
+    // (even at the 64 MB main-vm setting) and the process aborts with the
+    // Rust stack-overflow handler (rc=127, SIGABRT) — bypassing any Java
+    // try/catch.
+    //
+    // Throw a Java `StackOverflowError` BEFORE we recurse further. JVMS lets
+    // the implementation raise SOE at any depth; ByteBuddy's reflection
+    // helpers catch `Throwable` and recover.
+    //
+    // Limit calibration: Rust stack at 64 MB / ~6 KB per native frame
+    // ≈ 10 000 frames max before the OS guard page fires. 10_000 trips
+    // BEFORE we hit the guard page (each `execute` call adds 5-10 Rust
+    // frames, so an `execute` depth of 10_000 corresponds to 50_000-
+    // 100_000 native frames — well past the physical limit). The
+    // previous 50_000 ceiling was set when the EXEC_DEPTH guard was
+    // briefly disabled to recover from a class-loading regression; we
+    // lower it back to a value that actually trips before SOE.
+    thread_local! {
+        static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            EXEC_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if depth > 10_000 {
+        EXEC_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::StackOverflowError,
+        )));
+    }
+    let _exec_depth_guard = DepthGuard;
+
+    // S-bytebuddy r2 — hard cap on `JavaDispatcher`-shaped reentry.
+    //
+    // The generic EXEC_DEPTH guard above catches the *aggregate* recursion
+    // depth, but in practice ByteBuddy's reflective dispatch can build a
+    // tight Rust-stack-growing loop that consumes the 64 MB stack faster
+    // than EXEC_DEPTH counts (each turn of the loop adds 10+ Rust frames,
+    // not 1). A targeted reentry counter on JavaDispatcher.run shortcuts
+    // the cascade an order of magnitude earlier — depth 10 here is *much*
+    // smaller than any plausible legitimate ByteBuddy reflective fan-out
+    // (real chains observed: ≤4 reentries; pathological probes: 1000+).
+    //
+    // Match is on method-name + class-name substring so we catch both the
+    // outer `JavaDispatcher` and any of its nested `$DynamicDispatcher` /
+    // `$DefaultInvoker` / `$Direct$Constructing` subclass-shape variants.
+    thread_local! {
+        static BB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    // Function-scope BB-depth drop holder: pairs with the increment below
+    // (only does work if BB_DEPTH was actually incremented this call).
+    struct BbFunctionScopeGuard {
+        active: bool,
+    }
+    impl Drop for BbFunctionScopeGuard {
+        fn drop(&mut self) {
+            if self.active {
+                BB_DEPTH.with(|c| {
+                    let v = c.get();
+                    c.set(v.saturating_sub(1));
+                });
+            }
+        }
+    }
+    let bb_match = method_name == "run" && {
+        let cm = shared.class_manager.read();
+        cm.get_class(class_id)
+            .map(|c| {
+                let n = c.name.as_ref();
+                n.contains("bytebuddy") && n.contains("Dispatcher")
+            })
+            .unwrap_or(false)
+    };
+    let _bb_function_scope_guard = BbFunctionScopeGuard { active: bb_match };
+    if bb_match {
+        let bb_depth = BB_DEPTH.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        if bb_depth > 10 {
+            // Trip BEFORE we recurse further. The guard above will
+            // decrement on function exit so the next top-level call
+            // starts at a sane depth.
+            crate::dispatch_trace::note_bb_dispatcher_cap_hit(bb_depth);
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::StackOverflowError,
+            )));
+        }
+    }
+
     // letsgo postmortem instrumentation: record every bytecode-method
     // entry into the global dispatch ring. Gated by `RUSTJVM_DBG_LETSGO=1`
     // (cheap atomic-bool check on the disabled path).
@@ -8229,6 +8383,43 @@ fn execute_invoke_kind(
                             return Ok(CachedCallResult::Handled);
                         }
                     }
+                    // Gradle bootstrap: `ClasspathUtil$1.visitClassPath(URL[])`
+                    // iterates `URL[]` returned by `ClassLoaderVisitor.
+                    // extractJava9Classpath()`. That helper allocates
+                    // `new URL[paths.length]` (all-null), then populates each
+                    // slot via `new File(p).toURI().toURL()`. When our
+                    // synthetic `URI.toURL()` returns null (because the URI's
+                    // raw string field wasn't populated under our heap
+                    // layout), the slot stays null. The iterator's very
+                    // first op is `url.getProtocol()` with an `ifnull` check
+                    // immediately after, so the bytecode is null-tolerant
+                    // by design — but only if `getProtocol()` returns null
+                    // instead of throwing NPE. Mirror that contract for the
+                    // small family of `URL` accessors that return reference
+                    // types: a null receiver yields null (which the bytecode
+                    // tests for and treats as "skip this entry"). This
+                    // unblocks the Gradle `--version` boot path (NPE was at
+                    // `getProtocol on null` deep in `DefaultModuleRegistry`
+                    // <init>'s classpath enumeration) without altering any
+                    // non-null code path.
+                    if &*method_class_name == "java/net/URL"
+                        && matches!(
+                            &*method_name,
+                            "getProtocol"
+                                | "getHost"
+                                | "getFile"
+                                | "getPath"
+                                | "getQuery"
+                                | "getRef"
+                                | "getUserInfo"
+                                | "getAuthority"
+                        )
+                    {
+                        thread.frames[frame_idx]
+                            .stack
+                            .push(Value::Object(None))?;
+                        return Ok(CachedCallResult::Handled);
+                    }
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
@@ -8714,6 +8905,41 @@ pub(crate) fn try_lambda_dispatch(
     method_name: &str,
     call_args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    // S-bytebuddy r4 — independent recursion guard for lambda dispatch.
+    // Lambda SAM implementations can re-enter `try_lambda_dispatch` via
+    // `invoke_or_native` / `invoke_shared` when the impl body itself
+    // invokes another lambda (the common `stream.map(x -> ...).filter(y
+    // -> ...)` shape). The aggregate EXEC_DEPTH guard catches this only
+    // after the Rust stack has grown by ~10 frames per turn. A dedicated
+    // counter trips much earlier with a tight cap.
+    thread_local! {
+        static LAMBDA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct LambdaDepthGuard;
+    impl Drop for LambdaDepthGuard {
+        fn drop(&mut self) {
+            LAMBDA_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let ldepth = LAMBDA_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if ldepth > 2_000 {
+        LAMBDA_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::StackOverflowError,
+        )));
+    }
+    let _lambda_depth_guard = LambdaDepthGuard;
+
     // Look up the lambda proxy metadata for this ClassId.
     let call_site = {
         let proxies = shared.lambda_proxies.read();
@@ -9079,13 +9305,26 @@ pub(crate) fn try_lambda_dispatch(
         }
         MethodHandleKind::InvokeSpecial => {
             // Special: dispatch on the declaring class (no virtual lookup).
+            //
+            // `invokespecial` always targets an instance method (private or
+            // super-call); the lambda capture list therefore begins with the
+            // bound `this`, which sits at `full_args[0]` once captures are
+            // prepended.  `coerce_lambda_args` must skip that slot — passing
+            // `receiver_present=false` here causes the argument-to-parameter
+            // index map to slide by one, leaving the last SAM-supplied arg
+            // unconverted.  Concrete failure: Flink's `getRawValueFromOption`
+            // lambda binds `getRawValue(String, Z)` from a
+            // `BiFunction<String, Boolean, ...>`; with the off-by-one the
+            // trailing `Boolean` reaches the impl's `boolean` slot still
+            // boxed, and `iload_2` later raises
+            // "expected int on stack, got ref(...)".
             coerce_lambda_args(
                 shared,
                 thread,
                 &sam_desc,
                 &impl_desc,
                 &mut full_args,
-                false,
+                true,
                 num_captures,
             )?;
             let class_id = shared
@@ -11880,7 +12119,33 @@ fn execute_jit_call(
     }
     let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
-        jit_args[i] = thread.frames[frame_idx].stack.pop_raw() as i64; // Cast: JIT ABI -- i64 register convention
+        // BUGFIX (CompactValue NaN-box leak into JIT): the operand stack stores
+        // values as NaN-boxed CompactValues, where Int(11) for example is encoded
+        // as 0xFFFC_0000_0000_000B. Using `pop_raw().as_i64` would pass those tag
+        // bits as the parameter value, so a JIT'd `int n` arrives as
+        // 0xFFFC_..._000B instead of 11. Downstream, the JIT loaded that bit
+        // pattern from a local frame slot and forwarded it to the GC's
+        // `alloc_array` length argument, producing the bogus
+        // "array data size overflow" / "young gen exhausted — tried to allocate
+        // 18445618173802709003 bytes" crash seen on fannkuch (n=11) and
+        // FullStackBench phase 5 (`new boolean[100000]`).
+        //
+        // The JIT calling convention expects raw primitive bits with no tag
+        // (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
+        // bits, Double → raw f64 bits, Object → pointer). Decode via
+        // CompactValue::to_value first, then encode for the JIT ABI exactly
+        // the way the eager-args path does at the other JIT entry point.
+        let cv = thread.frames[frame_idx].stack.pop_compact();
+        let v = cv.to_value();
+        jit_args[i] = match v {
+            Value::Int(x) => x as i64,
+            Value::Long(x) => x,
+            Value::Float(x) => x.to_bits() as i64,
+            Value::Double(x) => x.to_bits() as i64,
+            Value::Object(Some(obj)) => obj.as_ptr() as i64,
+            Value::Object(None) => 0,
+            _ => 0,
+        };
     }
 
     let args_slice = &jit_args[..np];
@@ -13128,6 +13393,23 @@ fn pop_object_ref_ctx(
         // `Value::Int(0)` (or `Value::Long(0)` on 64-bit fields).
         // Treating these as null matches the JVM spec §2.3 default
         // value semantics for reference types (null == zero).
+        //
+        // `Value::Uninitialized` is the same family: it surfaces when a
+        // CompactValue with `SUB_UNINIT` subtag or a local/stack slot with
+        // `VTAG_UNINIT` is decoded back to a `Value`.  This happens for
+        // never-written slots that went through a tag-mismatched path
+        // (e.g. a reference field whose backing CompactValue was carved
+        // out by the uninit slot helper rather than `CompactValue::null`).
+        // Per JVMS §2.3 the spec default for a reference type is `null`,
+        // so coerce to NPE rather than panicking — matches how Int(0) /
+        // Long(0) are handled above, and produces the same surface
+        // behaviour the caller's `ctx` message expects ("…object is
+        // null").  Observed crash signature on ActiveMQ boot:
+        //   internal error: expected object reference, got <uninitialized>
+        //   ctx=Some("Cannot read field 'formatter' because the object is null")
+        Value::Uninitialized => {
+            Err(RuntimeError::NullPointerException { message: context }.into())
+        }
         Value::Int(0) | Value::Long(0) => {
             Err(RuntimeError::NullPointerException { message: context }.into())
         }

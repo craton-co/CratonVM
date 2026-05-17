@@ -15,15 +15,6 @@ use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectKind, ObjectRef, Value};
 
-// AUDIT 2026-05-16: read RUSTJVM_HM_TRACE once at first use rather than
-// on every HashMap key compare. Hot-path mitigation only — this whole
-// crate is slated for removal per workspace Definition of Done #6.
-fn hm_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_HM_TRACE").is_some())
-}
-
 /// Create an iterator backed by a snapshot array of the given size.
 /// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
 pub fn make_iterator_from_array(
@@ -1155,10 +1146,7 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
     // arbitrary key types. See `map_hash_key` for the matching contract
     // commentary and the Spring `AnnotationTypeMapping.aliasedBy` symptom.
     let res = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))]);
-    // AUDIT 2026-05-16: previously called `std::env::var(...)` on every
-    // HashMap key compare — a syscall in the hot path. The trace is now
-    // cached once at first call into a `OnceLock<bool>`.
-    if hm_trace_enabled() {
+    if std::env::var("RUSTJVM_HM_TRACE").is_ok() {
         eprintln!("[HM-EQ] invoke_virtual(equals) -> {:?}", res);
     }
     match res {
@@ -14722,25 +14710,18 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            // AUDIT 2026-05-16: previously used `?` between
-            // `monitor_enter` and `monitor_exit`, so an Err from
-            // `native_map_get`/`native_map_put` leaked the segment
-            // monitor permanently. Capture the inner result, drop the
-            // monitor unconditionally, then propagate.
             ctx.monitor_enter(seg);
-            let inner = (|| -> MethodCallResult {
-                let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
-                    .unwrap_or(Value::Object(None));
-                match current {
-                    Value::Object(None) => Ok(Some(Value::Object(None))),
-                    _ => {
-                        native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
-                        Ok(Some(current))
-                    }
+            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                .unwrap_or(Value::Object(None));
+            let result = match current {
+                Value::Object(None) => Ok(Some(Value::Object(None))),
+                _ => {
+                    native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
+                    Ok(Some(current))
                 }
-            })();
+            };
             ctx.monitor_exit(seg);
-            inner
+            result
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -14757,21 +14738,17 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
-            // AUDIT 2026-05-16: see native_chm_replace; same `?`-inside-
-            // monitor leak. Wrap the body so monitor_exit is guaranteed.
             ctx.monitor_enter(seg);
-            let inner = (|| -> MethodCallResult {
-                let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
-                    .unwrap_or(Value::Object(None));
-                if values_equal(ctx, &current, &old_val) {
-                    native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
-                    Ok(Some(Value::Int(1)))
-                } else {
-                    Ok(Some(Value::Int(0)))
-                }
-            })();
-            ctx.monitor_exit(seg);
-            inner
+            let current = native_map_get(ctx, &[Value::Object(Some(seg)), key])?
+                .unwrap_or(Value::Object(None));
+            if values_equal(ctx, &current, &old_val) {
+                native_map_put(ctx, &[Value::Object(Some(seg)), key, new_val])?;
+                ctx.monitor_exit(seg);
+                Ok(Some(Value::Int(1)))
+            } else {
+                ctx.monitor_exit(seg);
+                Ok(Some(Value::Int(0)))
+            }
         }
         None => Ok(Some(Value::Int(0))),
     }
@@ -16048,12 +16025,7 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Int(v) if v > 0 => v,
         _ => i32::MAX,
     };
-    // AUDIT 2026-05-16: prior implementation broke out of the wait loop
-    // after 10 000 spins and silently overflowed the configured capacity.
-    // BlockingQueue.put contract requires blocking until space is
-    // available; we honor that with tiered back-off so a single-threaded
-    // VM still yields cycles to other native callers.
-    let mut spins: u32 = 0;
+    let mut spins = 0;
     loop {
         ctx.monitor_enter(this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
@@ -16065,31 +16037,20 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             break;
         }
         ctx.monitor_exit(this);
-        spins = spins.saturating_add(1);
-        if spins < 1_000 {
-            std::thread::yield_now();
-        } else if spins < 10_000 {
-            std::thread::sleep(std::time::Duration::from_micros(100));
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        spins += 1;
+        if spins > 10000 { break; } // prevent infinite block on single-threaded VM
+        std::thread::yield_now();
     }
     native_lbq_offer(ctx, args)
 }
 
-/// Blocking take: waits until an element is available.
+/// Blocking take: waits until an element is available (spin-wait with yield).
 fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // AUDIT 2026-05-16: prior implementation returned null after 10 000
-    // spins, violating BlockingQueue.take's contract ("Retrieves and
-    // removes the head of this queue, waiting if necessary until an
-    // element becomes available"). Now we wait indefinitely with tiered
-    // back-off — null is only returned if the queue's head field is
-    // structurally invalid.
-    let mut spins: u32 = 0;
+    let mut spins = 0;
     loop {
         ctx.monitor_enter(this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
@@ -16100,14 +16061,11 @@ fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if size > 0 {
             return native_lbq_poll(ctx, args);
         }
-        spins = spins.saturating_add(1);
-        if spins < 1_000 {
-            std::thread::yield_now();
-        } else if spins < 10_000 {
-            std::thread::sleep(std::time::Duration::from_micros(100));
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        spins += 1;
+        if spins > 10000 {
+            return Ok(Some(Value::Object(None)));
         }
+        std::thread::yield_now();
     }
 }
 

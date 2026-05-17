@@ -1,0 +1,668 @@
+//! Log4j 2.x API shims: keep `org.apache.logging.log4j.LogManager` callers
+//! from NPE'ing when the real log4j-core provider chain doesn't bootstrap
+//! under CratonVM.
+//!
+//! # Symptom this addresses
+//!
+//! Spark (and many other apps that pull in `log4j-api-2.x.jar`) call
+//! `LogManager.getLogger(...)` early during startup. The real bytecode of
+//! `getLogger` delegates to `getContext(...).getLogger(name, fqcn, mf)`.
+//! `getContext()` in turn calls `getFactory().getContext(...)`. CratonVM
+//! already short-circuits `LogManager.<clinit>` to a no-op (see
+//! `elasticsearch_extras.rs`) because the real clinit walks a ServiceLoader
+//! chain that crashes on LambdaMetafactory / invokedynamic. That leaves
+//! the static `factory` field null, so `factory.getContext(...)` throws:
+//!
+//! ```text
+//! [WF-NPE-TRACE] msg=NullPointerException { message: Some("Cannot invoke getContext on null") }
+//! [WF-NPE-STK 5] org/apache/logging/log4j/LogManager.getContext pc=16
+//! [WF-NPE-STK 4] org/apache/logging/log4j/LogManager.getLogger pc=8
+//! [WF-NPE-STK 3] org/apache/spark/internal/Logging.initializeLogging pc=12
+//! ```
+//!
+//! # Fix
+//!
+//! Two-layer intercept on the `org/apache/logging/log4j/LogManager` static
+//! surface:
+//!
+//!   1. Every `getContext(...)` overload returns a synthetic
+//!      `org.apache.logging.log4j.simple.SimpleLoggerContext` instance.
+//!      This is the no-op fallback context the log4j-api jar ships for
+//!      exactly this scenario (no provider on the classpath).
+//!   2. Every `getLogger(...)` overload returns a synthetic
+//!      `org.apache.logging.log4j.simple.SimpleLogger` instance. Callers
+//!      then invoke `Logger.info/warn/error/debug/isXxxEnabled` on this
+//!      object via the `Logger` interface; we register no-op natives on
+//!      `SimpleLogger` for each of these so the bytecode of SimpleLogger
+//!      (which may itself touch null fields) never runs.
+//!
+//! Together these mean any `LogManager` caller observes a complete,
+//! non-null logging pipeline that silently discards every record.
+//! Equivalent to running with the JDK's `NullLogger` — the app boots,
+//! nothing gets logged, no NPEs propagate.
+//!
+//! # Scope / safety
+//!
+//! Registration is unconditional from `register_essential_natives` so the
+//! shim is always available (no env-var gate). The shim only fires when a
+//! caller actually invokes one of these `LogManager` static methods, so
+//! apps that don't touch log4j observe no behavioural change.
+//!
+//! No security manager interaction: CratonVM runs without a SecurityManager
+//! at init phase 4, so the privileged-action wrappers the real bytecode
+//! uses are equivalent to plain method calls.
+
+#![allow(clippy::needless_pass_by_value)]
+
+use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use rustjvm_types::error::MethodCallResult;
+use rustjvm_types::{ObjectRef, Value};
+
+const CN_LOGMANAGER: &str = "org/apache/logging/log4j/LogManager";
+const CN_SIMPLE_LOGGER_CONTEXT: &str = "org/apache/logging/log4j/simple/SimpleLoggerContext";
+const CN_SIMPLE_LOGGER: &str = "org/apache/logging/log4j/simple/SimpleLogger";
+const CN_ABSTRACT_LOGGER: &str = "org/apache/logging/log4j/spi/AbstractLogger";
+/// log4j-core's concrete `Logger` impl. Many apps (Spark, Hadoop, Hive)
+/// cast the result of `LogManager.getLogger(...)` to this type rather
+/// than to the `Logger` interface, so when `log4j-core` is on the
+/// classpath we must hand out instances of THIS class to avoid CCE.
+const CN_CORE_LOGGER: &str = "org/apache/logging/log4j/core/Logger";
+const CN_CORE_LOGGER_CONTEXT: &str = "org/apache/logging/log4j/core/LoggerContext";
+
+/// Build a synthetic `LoggerContext`. Prefers `org.apache.logging.log4j
+/// .core.LoggerContext` (the concrete log4j-core class) so callers that
+/// cast the result to `core.LoggerContext` don't trip ClassCastException.
+/// Falls back to `simple.SimpleLoggerContext` when log4j-core isn't on
+/// the classpath. Both implement `org.apache.logging.log4j.spi.LoggerContext`.
+fn build_logger_context(ctx: &mut dyn NativeContext) -> ObjectRef {
+    if ctx.class_id_by_name(CN_CORE_LOGGER_CONTEXT).is_some()
+        || ctx.ensure_class_initialized(CN_CORE_LOGGER_CONTEXT).is_ok()
+    {
+        return crate::alloc_concurrent_synthetic(ctx, CN_CORE_LOGGER_CONTEXT, 16);
+    }
+    crate::alloc_concurrent_synthetic(ctx, CN_SIMPLE_LOGGER_CONTEXT, 16)
+}
+
+/// Build a synthetic `Logger` carrying just the supplied logger name
+/// (or `<root>` if `None`). Prefers `org.apache.logging.log4j.core.Logger`
+/// (the concrete log4j-core class) so apps that cast the result to
+/// `core.Logger` (e.g. Spark's `Logging.initializeLogging`) don't trip
+/// ClassCastException. Falls back to `simple.SimpleLogger`.
+///
+/// Slot 0 in both `core.Logger` and `simple.SimpleLogger` is the
+/// inherited `AbstractLogger.name` field (the only instance field on
+/// AbstractLogger), which `Logger.getName()` reads.
+fn build_simple_logger(ctx: &mut dyn NativeContext, name: Option<&str>) -> ObjectRef {
+    let cls = if ctx.class_id_by_name(CN_CORE_LOGGER).is_some()
+        || ctx.ensure_class_initialized(CN_CORE_LOGGER).is_ok()
+    {
+        CN_CORE_LOGGER
+    } else {
+        CN_SIMPLE_LOGGER
+    };
+    let obj = crate::alloc_concurrent_synthetic(ctx, cls, 16);
+    let name_str = ctx.create_string(name.unwrap_or("<root>"));
+    ctx.set_field(obj, 0, Value::Object(Some(name_str)));
+    obj
+}
+
+/// Resolve a caller-supplied identifier (`String`, `Class`, or `Object`)
+/// into a logger name. Falls back to `<root>` when the argument is null
+/// or unresolvable so we never construct a logger with a null name.
+fn extract_logger_name(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> Option<String> {
+    match arg {
+        Some(Value::Object(Some(o))) => {
+            // Try as a String first.
+            if let Some(s) = ctx.read_string(*o) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            // Try as a Class mirror — read its `name` slot if available.
+            // We don't have a stable `class_name_of_mirror` API across
+            // synthetic/real modes, so fall back to None and let the
+            // caller use the `<root>` default.
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LogManager.getContext overloads
+// ---------------------------------------------------------------------------
+
+fn native_get_context_0(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(build_logger_context(ctx)))))
+}
+
+// ---------------------------------------------------------------------------
+// LogManager.getLogger overloads
+// ---------------------------------------------------------------------------
+
+fn native_get_logger_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, None)))))
+}
+
+fn native_get_logger_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name = extract_logger_name(ctx, args.first());
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, name.as_deref())))))
+}
+
+fn native_get_logger_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // (Class) — we don't bother reading the class name; the synthetic
+    // logger only ever swallows records, so the name is cosmetic.
+    let _ = args;
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, None)))))
+}
+
+fn native_get_logger_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let _ = args;
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, None)))))
+}
+
+fn native_get_root_logger(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, Some("")))))) // root has empty name
+}
+
+// ---------------------------------------------------------------------------
+// SimpleLoggerContext.getLogger overloads — used when a caller obtained a
+// LoggerContext via our `getContext` shim and then asks it for a logger.
+// ---------------------------------------------------------------------------
+
+fn native_ctx_get_logger_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (this, String)
+    let name = extract_logger_name(ctx, args.get(1));
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, name.as_deref())))))
+}
+
+fn native_ctx_get_logger_string_mf(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (this, String, MessageFactory)
+    let name = extract_logger_name(ctx, args.get(1));
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, name.as_deref())))))
+}
+
+fn native_ctx_get_logger_name_fqcn_mf(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // log4j-api 2.x: `LoggerContext.getLogger(String, String, MessageFactory)`
+    // (this, String name, String fqcn, MessageFactory) — the path
+    // LogManager.getLogger uses internally.
+    let name = extract_logger_name(ctx, args.get(1));
+    Ok(Some(Value::Object(Some(build_simple_logger(ctx, name.as_deref())))))
+}
+
+// ---------------------------------------------------------------------------
+// Logger no-op natives. Each maps to one or more abstract methods declared
+// on `org.apache.logging.log4j.Logger` (the interface). They are registered
+// on `SimpleLogger` because that is the concrete receiver class our
+// `getLogger` shims hand out.
+// ---------------------------------------------------------------------------
+
+/// Generic `()V` no-op for `Logger.info/warn/error/debug/trace/fatal`
+/// overloads that don't return a value.
+fn native_log_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+/// Generic `()Z` returning false for `isXxxEnabled` checks. Returning
+/// false means "level not enabled" so callers that wrap their log calls
+/// in `if (logger.isInfoEnabled()) { ... }` skip the entire log body —
+/// the cheapest path through the user's code.
+fn native_log_is_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// `Logger.getName()` — return the `name` slot the `build_simple_logger`
+/// helper stashed at slot 0. Falls back to a synthesized empty string
+/// when the slot is null so callers never observe a null result.
+fn native_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+        return Ok(Some(Value::Object(Some(s))));
+    }
+    let empty = ctx.create_string("");
+    Ok(Some(Value::Object(Some(empty))))
+}
+
+/// `Logger.getLevel()` — return null. The `Logger` interface contract
+/// allows null ("inherit from parent" / "not explicitly set"); callers
+/// generally only consult the result to compare against another Level
+/// or to format a record, both of which tolerate null.
+fn native_logger_get_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Logger.getMessageFactory()` — return null. Same null-tolerance
+/// rationale as `getLevel`; the only common caller is the
+/// `LogManager.getLogger` path itself, which we already short-circuit.
+fn native_logger_get_message_factory(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `core.Logger.getAppenders()` — return an empty `java.util.HashMap`.
+/// Spark's `Logging$.islog4j2DefaultConfigured` reads the result and
+/// iterates the entry set; an empty map is the "no appenders configured"
+/// answer that lets Spark fall back to its default log4j configuration
+/// path instead of NPE'ing on the unpopulated `privateConfig` field.
+fn native_core_logger_get_appenders(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let map = crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 16);
+    Ok(Some(Value::Object(Some(map))))
+}
+
+/// `core.Logger.getContext()` — return a synthetic core.LoggerContext.
+/// Some callers chain `getLogger().getContext().getXxx()` and would NPE
+/// on the unpopulated `context` field.
+fn native_core_logger_get_context(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(build_logger_context(ctx)))))
+}
+
+/// `core.Logger.getParent()` — return null. The synthetic logger has
+/// no parent; callers that walk the chain stop at null.
+fn native_core_logger_get_parent(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+/// Register every log4j 2.x LogManager / Logger shim owned by this module.
+///
+/// Wired unconditionally from `register_essential_natives` in
+/// `native-builtins/src/lib.rs`. No env-var gate — the shims only fire
+/// when a caller actually invokes one of these methods, so apps that
+/// don't touch log4j are unaffected.
+pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
+    // --- LogManager.getContext overloads ------------------------------
+    // Every overload returns the same synthetic SimpleLoggerContext.
+    let get_ctx_descriptors = [
+        "()Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Z)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/ClassLoader;Z)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/ClassLoader;ZLjava/lang/Object;)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/ClassLoader;ZLjava/net/URI;)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/ClassLoader;ZLjava/lang/Object;Ljava/net/URI;)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/ClassLoader;ZLjava/lang/Object;Ljava/net/URI;Ljava/lang/String;)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/String;Z)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/String;Ljava/lang/ClassLoader;Z)Lorg/apache/logging/log4j/spi/LoggerContext;",
+        "(Ljava/lang/String;Ljava/lang/ClassLoader;ZLjava/net/URI;Ljava/lang/String;)Lorg/apache/logging/log4j/spi/LoggerContext;",
+    ];
+    for desc in get_ctx_descriptors {
+        registry.register(CN_LOGMANAGER, "getContext", desc, native_get_context_0);
+    }
+
+    // --- LogManager.getLogger overloads -------------------------------
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "()Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_0,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_string,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/Class;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_class,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/Object;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_object,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/Class;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_class,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/Object;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_object,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_string,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_0,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getLogger",
+        "(Ljava/lang/String;Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_string,
+    );
+
+    // FormatterLogger overloads — same dispatch, same synthetic logger.
+    registry.register(
+        CN_LOGMANAGER,
+        "getFormatterLogger",
+        "()Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_0,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getFormatterLogger",
+        "(Ljava/lang/Class;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_class,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getFormatterLogger",
+        "(Ljava/lang/Object;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_object,
+    );
+    registry.register(
+        CN_LOGMANAGER,
+        "getFormatterLogger",
+        "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+        native_get_logger_string,
+    );
+
+    registry.register(
+        CN_LOGMANAGER,
+        "getRootLogger",
+        "()Lorg/apache/logging/log4j/Logger;",
+        native_get_root_logger,
+    );
+
+    // `LogManager.getFactory` — return null. Callers (in real bytecode)
+    // null-check before dereferencing. Returning null is safer than
+    // building a synthetic LoggerContextFactory because we don't have a
+    // stable signature for the various factory implementations across
+    // log4j versions.
+    registry.register(
+        CN_LOGMANAGER,
+        "getFactory",
+        "()Lorg/apache/logging/log4j/spi/LoggerContextFactory;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // `LogManager.exists(String) -> boolean` — return false. Callers
+    // use this to gate `getLogger` calls; saying "no" forces them to
+    // either skip the call or fall through to `getLogger`, which we
+    // already shim.
+    registry.register(
+        CN_LOGMANAGER,
+        "exists",
+        "(Ljava/lang/String;)Z",
+        native_log_is_enabled,
+    );
+
+    // `LogManager.shutdown` overloads — no-op.
+    for desc in [
+        "()V",
+        "(Z)V",
+        "(ZZ)V",
+        "(Lorg/apache/logging/log4j/spi/LoggerContext;)V",
+    ] {
+        registry.register(CN_LOGMANAGER, "shutdown", desc, native_log_void);
+    }
+
+    // --- SimpleLoggerContext.getLogger overloads ----------------------
+    // Required for any caller path that obtained a LoggerContext through
+    // our `getContext` shim and then calls `ctx.getLogger(name, ...)`.
+    registry.register(
+        CN_SIMPLE_LOGGER_CONTEXT,
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/apache/logging/log4j/spi/ExtendedLogger;",
+        native_ctx_get_logger_string,
+    );
+    registry.register(
+        CN_SIMPLE_LOGGER_CONTEXT,
+        "getLogger",
+        "(Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/spi/ExtendedLogger;",
+        native_ctx_get_logger_string_mf,
+    );
+    registry.register(
+        CN_SIMPLE_LOGGER_CONTEXT,
+        "getLogger",
+        "(Ljava/lang/String;Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/Logger;",
+        native_ctx_get_logger_name_fqcn_mf,
+    );
+
+    // SimpleLoggerContext.<init> — no-op so the synthetic-alloc path
+    // doesn't trip on the real ctor reading uninitialised
+    // PropertiesUtil state.
+    registry.register(CN_SIMPLE_LOGGER_CONTEXT, "<init>", "()V", native_log_void);
+
+    // --- core.LoggerContext.getLogger overloads -----------------------
+    // Same shape as SimpleLoggerContext but for the log4j-core path.
+    // Spark / Hadoop / Hive callers go through `core.LoggerContext.
+    // getLogger(name, fqcn, mf)` after our `getContext` shim hands them
+    // a core.LoggerContext instance.
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "getLogger",
+        "(Ljava/lang/String;)Lorg/apache/logging/log4j/core/Logger;",
+        native_ctx_get_logger_string,
+    );
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "getLogger",
+        "(Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/core/Logger;",
+        native_ctx_get_logger_string_mf,
+    );
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "getLogger",
+        "(Ljava/lang/String;Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)Lorg/apache/logging/log4j/Logger;",
+        native_ctx_get_logger_name_fqcn_mf,
+    );
+    // No-op the ctor and clinit so the heavy bytecode (which builds a
+    // Configuration tree, NULL_CONFIGURATION etc.) never runs.
+    registry.register(CN_CORE_LOGGER_CONTEXT, "<init>", "()V", native_log_void);
+    registry.register(CN_CORE_LOGGER_CONTEXT, "<clinit>", "()V", native_log_void);
+
+    // core.LoggerContext static `getContext` overloads — some callers
+    // (Spark `Logging.initializeLogging`) call these directly instead
+    // of going through `LogManager.getContext`.
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "getContext",
+        "()Lorg/apache/logging/log4j/core/LoggerContext;",
+        native_get_context_0,
+    );
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "getContext",
+        "(Z)Lorg/apache/logging/log4j/core/LoggerContext;",
+        native_get_context_0,
+    );
+
+    // --- SimpleLogger no-op surface -----------------------------------
+    register_simple_logger_methods(registry);
+
+    // --- core.Logger extras -------------------------------------------
+    // Spark's `Logging$.islog4j2DefaultConfigured` calls
+    // `core.Logger.getAppenders()` then iterates the entry set. Returning
+    // an empty map (instead of NPE'ing on the unpopulated privateConfig
+    // field of our synthetic instance) lets the boot proceed.
+    registry.register(
+        CN_CORE_LOGGER,
+        "getAppenders",
+        "()Ljava/util/Map;",
+        native_core_logger_get_appenders,
+    );
+    registry.register(
+        CN_CORE_LOGGER,
+        "getContext",
+        "()Lorg/apache/logging/log4j/core/LoggerContext;",
+        native_core_logger_get_context,
+    );
+    registry.register(
+        CN_CORE_LOGGER,
+        "getParent",
+        "()Lorg/apache/logging/log4j/core/Logger;",
+        native_core_logger_get_parent,
+    );
+}
+
+/// Register no-op natives on `SimpleLogger` for every Logger interface
+/// method Spark / Hadoop / Hive / etc. commonly invoke. Each one returns
+/// either void or `false` so the caller treats the level as disabled and
+/// produces no further log activity.
+fn register_simple_logger_methods(registry: &mut NativeMethodRegistry) {
+    // For each class (concrete log4j-core / simple-logger receivers
+    // AND the shared abstract base, in case dispatch falls through the
+    // vtable to AbstractLogger).
+    for cls in [CN_SIMPLE_LOGGER, CN_CORE_LOGGER, CN_ABSTRACT_LOGGER] {
+        // <init> no-op so allocation+construct paths don't NPE on the
+        // real ctor's MessageFactory / PropertiesUtil chain.
+        registry.register(cls, "<init>", "()V", native_log_void);
+        registry.register(cls, "<init>", "(Ljava/lang/String;)V", native_log_void);
+        registry.register(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)V",
+            native_log_void,
+        );
+
+        // Accessors.
+        registry.register(cls, "getName", "()Ljava/lang/String;", native_logger_get_name);
+        registry.register(
+            cls,
+            "getLevel",
+            "()Lorg/apache/logging/log4j/Level;",
+            native_logger_get_level,
+        );
+        registry.register(
+            cls,
+            "getMessageFactory",
+            "()Lorg/apache/logging/log4j/message/MessageFactory;",
+            native_logger_get_message_factory,
+        );
+
+        // isXxxEnabled — return false universally so wrapped log bodies
+        // are skipped.
+        for m in [
+            "isTraceEnabled",
+            "isDebugEnabled",
+            "isInfoEnabled",
+            "isWarnEnabled",
+            "isErrorEnabled",
+            "isFatalEnabled",
+        ] {
+            registry.register(cls, m, "()Z", native_log_is_enabled);
+            registry.register(
+                cls,
+                m,
+                "(Lorg/apache/logging/log4j/Marker;)Z",
+                native_log_is_enabled,
+            );
+        }
+        // isEnabled(Level) / isEnabled(Level, Marker)
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;)Z",
+            native_log_is_enabled,
+        );
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;)Z",
+            native_log_is_enabled,
+        );
+
+        // The full Logger interface surface is huge (hundreds of
+        // overloads of info/warn/error/debug/trace/fatal/log). Register
+        // just the most common ones — the rest go through the bytecode
+        // path. Bytecode paths in SimpleLogger check our isXxxEnabled
+        // returning false first, so they exit early without reading
+        // null fields.
+        for level in ["trace", "debug", "info", "warn", "error", "fatal"] {
+            for desc in [
+                "(Ljava/lang/String;)V",
+                "(Ljava/lang/CharSequence;)V",
+                "(Ljava/lang/Object;)V",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+                "(Ljava/lang/String;[Ljava/lang/Object;)V",
+                "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+                "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
+                "(Lorg/apache/logging/log4j/message/Message;)V",
+                "(Lorg/apache/logging/log4j/message/Message;Ljava/lang/Throwable;)V",
+            ] {
+                registry.register(cls, level, desc, native_log_void);
+            }
+        }
+
+        // logIfEnabled / logMessage — used by SLF4J bridge and
+        // AbstractLogger callers. All void no-ops.
+        for desc in [
+            "(Ljava/lang/String;Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Lorg/apache/logging/log4j/message/Message;Ljava/lang/Throwable;)V",
+            "(Ljava/lang/String;Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/CharSequence;Ljava/lang/Throwable;)V",
+            "(Ljava/lang/String;Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+            "(Ljava/lang/String;Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;)V",
+            "(Ljava/lang/String;Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ] {
+            registry.register(cls, "logIfEnabled", desc, native_log_void);
+            registry.register(cls, "logMessage", desc, native_log_void);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_log4j_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_log4j_stubs(&mut r);
+        // getContext()LLoggerContext;
+        assert!(
+            r.find(
+                CN_LOGMANAGER,
+                "getContext",
+                "()Lorg/apache/logging/log4j/spi/LoggerContext;",
+            )
+            .is_some(),
+            "LogManager.getContext() must be registered"
+        );
+        // getLogger(String)
+        assert!(
+            r.find(
+                CN_LOGMANAGER,
+                "getLogger",
+                "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+            )
+            .is_some(),
+            "LogManager.getLogger(String) must be registered"
+        );
+        // SimpleLogger.isInfoEnabled()
+        assert!(
+            r.find(CN_SIMPLE_LOGGER, "isInfoEnabled", "()Z").is_some(),
+            "SimpleLogger.isInfoEnabled() must be registered"
+        );
+    }
+}
