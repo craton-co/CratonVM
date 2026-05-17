@@ -53,6 +53,8 @@ pub mod stackwalker;
 #[cfg(feature = "gpu-offload")]
 pub mod gpu_marshal;
 
+#[cfg(feature = "gpu-offload")] pub mod gpu_residency;
+
 // Part E of the GPU offload plan — analyzer-cache, PTX module store, and
 // dispatcher hook for the interpreter's `execute_invokestatic`. Strictly
 // gated behind the `gpu-offload` feature.
