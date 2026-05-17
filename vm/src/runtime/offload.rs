@@ -833,28 +833,11 @@ pub(crate) fn maybe_warmup_gpu(
 // up by the Phase 3 Java glue. When the bridge gains a real
 // `Stream`, replace the local type alias with the import.
 
-/// Stand-in for a future `cuda_bridge::Stream`. The real CUDA
-/// stream wrapper will live in `cuda-bridge` and carry the cudarc
-/// `CudaStream` handle. Today this is an opaque marker that lets the
-/// async API land in its final shape.
-///
-/// PHASE3-CUDA-TODO: replace with `pub use cuda_bridge::Stream` (or a
-/// re-export) once the bridge exposes the type.
+/// The CUDA stream type used by `StreamSubmission`. Re-exported
+/// from `cuda-bridge` so callers can use a single `Stream` path
+/// regardless of where they're working.
 #[cfg(feature = "gpu-offload")]
-pub struct Stream {
-    /// Logical stream id. Zero is reserved for the "default" stream.
-    pub id: u64,
-}
-
-#[cfg(feature = "gpu-offload")]
-impl Stream {
-    /// Construct a placeholder stream with the given id. The real
-    /// implementation will take a `cuda_bridge::DeviceContext` and
-    /// create a fresh `CudaStream`.
-    pub fn new(id: u64) -> Self {
-        Self { id }
-    }
-}
+pub use cuda_bridge::Stream;
 
 /// Result of a kernel dispatch, serialised in a form the Java layer
 /// can unmarshal without touching device memory directly. Today only

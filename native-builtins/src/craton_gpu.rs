@@ -22,28 +22,23 @@
 //! round-trip via a synthetic future whose `futureGetErrorMessage`
 //! returns `"no CUDA device"`.
 //!
-//! ## What is genuinely incomplete (`PHASE3-GUESS`)
+//! ## Status (Phase 3.5)
 //!
-//! Anywhere we need to **return a freshly-constructed Java object** of
-//! a known interface type (`GpuExecutor`, `GpuFuture`, `GpuStream`) we
-//! hit a wall: `NativeContext::new_object` requires a *concrete* class
-//! name, and the concrete impl classes (`GpuExecutorImpl`, etc.) do not
-//! exist on the Java side yet — they're owned by another Phase-3 item
-//! (P3-1/P3-2). For Phase 3 we return `Value::Object(None)` (the JVM
-//! sees a `null`) and mark the call site with a `PHASE3-GUESS` comment
-//! so the integration agent can fix it once the impl classes land.
+//! All five handlers that previously carried a `PHASE3-GUESS` marker
+//! now instantiate real Java impl objects via the
+//! `instantiate_handle_wrapper` helper:
 //!
-//! Handlers carrying a `PHASE3-GUESS` today:
-//!   * `builtin_open_executor`  — needs `craton/gpu/internal/GpuExecutorImpl`
-//!   * `builtin_submit`         — needs `craton/gpu/internal/GpuFutureImpl`
-//!   * `builtin_launch`         — same
-//!   * `builtin_new_stream`     — needs `craton/gpu/internal/GpuStreamImpl`
-//!   * `builtin_future_get_result` — needs a way to round-trip an
-//!     arbitrary boxed primitive back as a Java mirror. For now returns
-//!     `null` for the synthetic failed future.
+//!   * `builtin_open_executor`  → `craton/gpu/internal/GpuExecutorImpl`
+//!   * `builtin_submit`         → `craton/gpu/internal/GpuFutureImpl`
+//!   * `builtin_launch`         → `craton/gpu/internal/GpuFutureImpl`
+//!   * `builtin_new_stream`     → `craton/gpu/internal/GpuStreamImpl`
+//!   * `builtin_future_get_result` returns the stored `ObjectRef` from
+//!     `FutureState::Done` (today every synthetic future is `Failed`,
+//!     so the call returns `null` until real CUDA work lands).
 //!
-//! All other handlers operate purely on `long` handles, which is
-//! sufficient for the Java side to drive them.
+//! The remaining `PHASE4-CUDA-TODO` is the underlying cuda backend
+//! port — when that finishes, the futures stop being unconditionally
+//! `Failed` and the `Done` path becomes hot.
 
 #![cfg_attr(not(feature = "gpu-offload"), allow(dead_code))]
 
@@ -302,21 +297,44 @@ fn snapshot_java_array(
 // Executor lifecycle
 // ---------------------------------------------------------------------------
 
+/// Allocate a new Java object of `class_name`, run its `<init>(J)V`
+/// constructor with the supplied handle, and return the boxed
+/// `ObjectRef` ready to hand back to the JVM.
+///
+/// Used by the five handlers that return an opaque Java wrapper around
+/// a native handle (executor / future / stream impls). The impl
+/// classes' constructors do two things: write `handle` and register
+/// with `StreamCleaner`; both must run, so we invoke the real `<init>`
+/// rather than poke `handle` via `set_field_by_name`.
+#[cfg(feature = "gpu-offload")]
+fn instantiate_handle_wrapper(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    class_name: &str,
+    handle: u64,
+) -> rustjvm_types::error::MethodCallResult {
+    let allocated = ctx.new_object(class_name)?;
+    match allocated {
+        Some(Value::Object(Some(obj))) => {
+            ctx.invoke(
+                class_name,
+                "<init>",
+                "(J)V",
+                &[Value::Object(Some(obj)), Value::Long(handle as i64)],
+            )?;
+            Ok(Some(Value::Object(Some(obj))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
 /// `Native.openExecutor(int device) -> GpuExecutor`
 ///
-/// PHASE3-GUESS: Returns `null` to the JVM. To return a real `GpuExecutor`
-/// we need a concrete impl class (e.g. `craton/gpu/internal/GpuExecutorImpl`)
-/// owned by P3-1 / P3-2 that the test harness can drive. Once that class
-/// lands the body becomes:
-///
-/// ```ignore
-/// let obj = ctx.new_object("craton/gpu/internal/GpuExecutorImpl")?;
-/// ctx.set_field_by_name(obj_ref, "handle", Value::Long(handle as i64));
-/// Ok(Some(Value::Object(Some(obj_ref))))
-/// ```
+/// Allocates a synthetic executor handle, stores the device-ordinal
+/// in our process-wide state map, then instantiates a
+/// `GpuExecutorImpl` wrapping the handle.
 #[cfg(feature = "gpu-offload")]
 fn builtin_open_executor(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let device = arg_int(args, 0);
@@ -325,12 +343,7 @@ fn builtin_open_executor(
         s.executors.insert(h, device);
         h
     });
-    // We record the handle in our state so `releaseExecutor` can find it,
-    // but cannot return a constructed Java object yet (see module docs).
-    let _ = handle;
-    // PHASE3-GUESS: see module docs — return a null GpuExecutor until the
-    // impl class exists.
-    Ok(Some(Value::Object(None)))
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuExecutorImpl", handle)
 }
 
 /// `Native.releaseExecutor(long handle)`
@@ -364,33 +377,33 @@ fn record_failed_future() -> u64 {
 
 /// `Native.submit(long execHandle, GpuCallable c) -> GpuFuture`
 ///
-/// PHASE3-GUESS: records a Failed future in our state but returns `null`
-/// because we cannot instantiate `GpuFutureImpl` yet (see module docs).
+/// Records a Failed future in our state (no CUDA device available),
+/// then wraps the handle in a real `GpuFutureImpl` Java object so
+/// `Native.futureSynchronize` + `Native.futureGetErrorMessage` can
+/// drive the round-trip end-to-end.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
     let _callable = arg_object(args, 1);
-    let _future_handle = record_failed_future();
-    // PHASE3-GUESS: needs craton/gpu/internal/GpuFutureImpl
-    Ok(Some(Value::Object(None)))
+    let future_handle = record_failed_future();
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", future_handle)
 }
 
 /// `Native.launch(long execHandle, GpuRunnable r) -> GpuFuture`
 ///
-/// Same shape as `submit`. PHASE3-GUESS for the same reason.
+/// Same shape as `submit`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_launch(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
     let _runnable = arg_object(args, 1);
-    let _future_handle = record_failed_future();
-    // PHASE3-GUESS: needs craton/gpu/internal/GpuFutureImpl
-    Ok(Some(Value::Object(None)))
+    let future_handle = record_failed_future();
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", future_handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,21 +412,20 @@ fn builtin_launch(
 
 /// `Native.newStream(long execHandle) -> GpuStream`
 ///
-/// PHASE3-GUESS: records the stream in state, returns `null` until
-/// `GpuStreamImpl` lands.
+/// Records the stream → executor mapping in our state and wraps the
+/// new handle in a `GpuStreamImpl`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_new_stream(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let exec = arg_long(args, 0) as u64;
-    let _handle = state::with(|s| {
+    let handle = state::with(|s| {
         let h = s.fresh_handle();
         s.streams.insert(h, exec);
         h
     });
-    // PHASE3-GUESS: needs craton/gpu/internal/GpuStreamImpl
-    Ok(Some(Value::Object(None)))
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuStreamImpl", handle)
 }
 
 /// `Native.closeStream(long streamHandle)`
@@ -467,10 +479,11 @@ fn builtin_future_synchronize(
 
 /// `Native.futureGetResult(long futureHandle) -> Object`
 ///
-/// PHASE3-GUESS: for `Done` futures with a stored mirror this returns it;
-/// for `Failed` / unknown returns `null`. A future Phase will need a way
-/// to wrap primitive results back into the right boxed mirrors — for now
-/// the synthetic future is always `Failed`, so callers see `null`.
+/// Returns the stored mirror for `Done` futures, `null` otherwise.
+/// PHASE4-CUDA-TODO: today every synthetic future is `Failed` (no
+/// device); the stored-`Done` path will be exercised once the real
+/// CUDA launch path lands and populates `FutureState::Done` with a
+/// freshly-built primitive-array `ObjectRef`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_get_result(
     _ctx: &mut dyn rustjvm_native_api::NativeContext,
