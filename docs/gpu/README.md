@@ -19,6 +19,7 @@ it, or extend the feature, read on.
 | [`first-results.md`](first-results.md) | Acceptance-criteria scaffold for the GPU-equipped verification machine. Empty results table until real numbers land. |
 | [`annotations.md`](annotations.md) | Phase 1 reference: `@GpuKernel`, `@GpuExclude`, `@EnableGpuAsync` directives for user-facing offload control. |
 | [`streams-events.md`](streams-events.md) | Phase 2 reference: `Stream`, `Event`, async memcpy, `launch_on_stream`, stub op log for tests. |
+| [`async-api.md`](async-api.md) | Phase 3 reference: `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload. |
 
 ## At a glance
 
