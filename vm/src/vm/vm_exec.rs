@@ -855,6 +855,34 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.heap.class_id_of(obj)
     }
 
+    /// Phase 5: override the GPU dispatch escape hatch. Delegates
+    /// to `crate::runtime::offload::dispatch_method_from_native`
+    /// when the gpu-offload feature is on; otherwise returns None
+    /// (the trait's default).
+    fn gpu_dispatch_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(crate::runtime::offload::dispatch_method_from_native(
+                self.shared,
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+            ))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (class_name, method_name, descriptor, java_args);
+            None
+        }
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         match self.shared.load_class_concurrent(class_name) {
             Ok(class_id) => self

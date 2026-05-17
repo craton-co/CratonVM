@@ -23,6 +23,20 @@ public final class Native {
     public static native <R> GpuFuture<R> submit(long execHandle, GpuCallable<R> task);
     public static native GpuFuture<Void>  launch(long execHandle, GpuRunnable task);
 
+    /**
+     * Phase 5: explicit named-method dispatch. Bypasses lambda
+     * resolution by taking the target method by class + name +
+     * descriptor directly. The {@code args} array holds the boxed
+     * primitive scalars, primitive arrays, and
+     * {@link craton.gpu.GpuArray} handles to pass to the kernel.
+     */
+    public static native <R> GpuFuture<R> submitMethod(
+        long execHandle,
+        String className,
+        String methodName,
+        String descriptor,
+        Object[] args);
+
     public static native GpuStream newStream(long execHandle);
     public static native void      closeStream(long streamHandle);
 

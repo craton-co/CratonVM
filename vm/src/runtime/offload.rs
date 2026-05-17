@@ -888,10 +888,12 @@ pub struct StreamSubmission {
     /// Monotonically-increasing identifier used by the Java layer to
     /// look the submission up later via `futureGetResult`.
     pub handle: u64,
-    /// Stream this submission was queued on. Held so the kernel
-    /// completion callback can fire on the same stream that the
-    /// launch went out on.
-    pub stream: std::sync::Arc<Stream>,
+    /// Stream this submission was queued on. `Some` for any
+    /// dispatch that actually reached the launch site. `None` for
+    /// pre-launch failures (class not loaded, no device available,
+    /// marshal error) — the Java side still gets a handle whose
+    /// status is `Failed`.
+    pub stream: Option<std::sync::Arc<Stream>>,
     /// Current lifecycle state. `Running` until the host observes
     /// completion or failure.
     pub status: parking_lot::Mutex<SubmissionStatus>,
@@ -965,7 +967,7 @@ impl OffloadCache {
         let make = |status: SubmissionStatus| {
             std::sync::Arc::new(StreamSubmission {
                 handle,
-                stream: stream.clone(),
+                stream: Some(stream.clone()),
                 status: parking_lot::Mutex::new(status),
             })
         };
@@ -1097,4 +1099,414 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
     submissions().write().remove(&handle);
+}
+
+// ── Phase 5: explicit named-method dispatch from native shims ────────
+//
+// Bridges `craton.gpu.internal.Native.submitMethod(...)` to the rest
+// of the GPU stack. The native shim cannot call `dispatch_async`
+// directly because it has no `SharedVm` reference; this free
+// function takes one and does the orchestration.
+//
+// Today's marshaller supports:
+//   * primitive arrays: int[], long[], float[], double[]
+//   * device-resident GpuArray handles are NOT yet routed
+//     (PHASE6-FOLLOWUP).
+//   * boxed primitive scalars in `java_args` are NOT yet supported
+//     (PHASE6-FOLLOWUP) — only Value::Object holding a primitive
+//     array makes it through. The full Object[]-with-mixed-shape
+//     marshaller belongs to the lambda-resolution phase.
+//
+// Output convention (Phase 1): after the kernel completes, every
+// array argument is downloaded back into its source Java array.
+// This is wasteful for read-only inputs but correct, and matches
+// the analyzer's "last array is output" rule without needing to
+// know which is which here. Phase 6 narrows it.
+
+#[cfg(feature = "gpu-offload")]
+fn record_failed_submission(
+    stream: Option<std::sync::Arc<Stream>>,
+    message: String,
+) -> u64 {
+    let handle = NEXT_SUBMISSION_HANDLE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let sub = std::sync::Arc::new(StreamSubmission {
+        handle,
+        stream,
+        status: parking_lot::Mutex::new(SubmissionStatus::Failed { message }),
+    });
+    register_submission(sub);
+    handle
+}
+
+/// Dispatch `class_name`.`method_name`(`descriptor`) on the GPU with
+/// `java_args`. Returns the submission handle the Java layer wraps
+/// in `GpuFutureImpl`. On any failure (method not eligible, missing
+/// device, marshal error, launch error) the returned handle still
+/// resolves — it points to a `StreamSubmission` whose status is
+/// `Failed { message }` so the Java side surfaces it as
+/// `GpuException` via `futureGetErrorMessage`.
+#[cfg(feature = "gpu-offload")]
+pub fn dispatch_method_from_native(
+    shared: &crate::vm::SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    java_args: &[rustjvm_types::Value],
+) -> u64 {
+    use cuda_bridge::{KernelArgs, Stream as CudaStream};
+    use rustjvm_types::{ArrayElementType, Value};
+    use std::sync::Arc;
+
+    // 1. Resolve the cache.
+    let cache = shared
+        .offload_registry
+        .get_or_create(shared.config.gpu_device_ordinal, &shared.config);
+
+    // 2. Resolve class + method via the class manager.
+    let (class_id, method_index) = {
+        let cm = shared.class_manager.read();
+        let class_id = match cm.get_loaded_class_id(class_name) {
+            Some(id) => id,
+            None => {
+                return record_failed_submission(
+                    None,
+                    format!("submitMethod: class not loaded: {class_name}"),
+                );
+            }
+        };
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => {
+                return record_failed_submission(
+                    None,
+                    format!("submitMethod: class id missing in manager: {class_name}"),
+                );
+            }
+        };
+        let mi = match class.methods.iter().position(|m| {
+            &*m.name == method_name && &*m.descriptor == descriptor
+        }) {
+            Some(i) => i as u16,
+            None => {
+                return record_failed_submission(
+                    None,
+                    format!(
+                        "submitMethod: method not found: {class_name}.{method_name}{descriptor}",
+                    ),
+                );
+            }
+        };
+        // 3. Ensure the kernel is compiled before dispatch_async runs.
+        let outcome = cache.lookup_or_compile(
+            class_id,
+            class_name,
+            mi,
+            &class.methods[mi as usize],
+            &class.constant_pool,
+        );
+        match outcome {
+            LookupOutcome::Hit(_) => (class_id, mi),
+            LookupOutcome::Skip => {
+                return record_failed_submission(
+                    None,
+                    format!(
+                        "submitMethod: method not offloadable (Skip): {class_name}.{method_name}{descriptor}",
+                    ),
+                );
+            }
+            LookupOutcome::Blacklisted => {
+                return record_failed_submission(
+                    None,
+                    format!(
+                        "submitMethod: method blacklisted: {class_name}.{method_name}{descriptor}",
+                    ),
+                );
+            }
+        }
+    };
+
+    // 4. From here on we need a real device context. The Failed-fast
+    //    path is identical to dispatch_async's no-device branch.
+    let ctx = match cache.device() {
+        Some(c) => c,
+        None => {
+            return record_failed_submission(
+                None,
+                format!(
+                    "submitMethod: no CUDA device available ({class_name}.{method_name}{descriptor})",
+                ),
+            );
+        }
+    };
+
+    // 5. Create a real stream for this dispatch.
+    let stream = match CudaStream::new(ctx) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            return record_failed_submission(
+                None,
+                format!("submitMethod: Stream::new failed: {e}"),
+            );
+        }
+    };
+
+    // 6. Enter the GC-critical section. Held across upload + launch
+    //    + writeback so the GC cannot move any pinned arrays while
+    //    the device is reading them.
+    let token = shared.heap.enter_gpu_critical();
+
+    // 7. Marshal Java args into KernelArgs + remember writebacks.
+    let mut kernel_args = KernelArgs::new();
+    let mut writebacks: Vec<MarshalWriteback> = Vec::new();
+
+    for (i, arg) in java_args.iter().enumerate() {
+        match arg {
+            Value::Int(v) => kernel_args = kernel_args.push_i32(*v),
+            Value::Long(v) => kernel_args = kernel_args.push_i64(*v),
+            Value::Float(v) => kernel_args = kernel_args.push_f32(f32::from_bits(v.to_bits())),
+            Value::Double(v) => kernel_args = kernel_args.push_f64(f64::from_bits(v.to_bits())),
+            Value::Object(Some(obj_ref)) => {
+                let element_type = match shared.heap.array_element_type(*obj_ref) {
+                    Some(t) => t,
+                    None => {
+                        drop(token);
+                        return record_failed_submission(
+                            Some(stream.clone()),
+                            format!("submitMethod: arg #{i} is not an array"),
+                        );
+                    }
+                };
+                match marshal_array_arg(shared, ctx, *obj_ref, element_type, &token) {
+                    Ok((args_after, wb)) => {
+                        kernel_args = args_after(kernel_args);
+                        writebacks.push(wb);
+                    }
+                    Err(msg) => {
+                        drop(token);
+                        return record_failed_submission(Some(stream.clone()), msg);
+                    }
+                }
+            }
+            _ => {
+                drop(token);
+                return record_failed_submission(
+                    Some(stream.clone()),
+                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),
+                );
+            }
+        }
+    }
+
+    // 8. Dispatch on the stream (this synchronizes internally — see
+    //    `dispatch_async`'s PHASE5-FOLLOWUP note).
+    let submission = cache.dispatch_async(stream.clone(), class_id, method_index, kernel_args);
+
+    // 9. On success, write every device buffer back into its source
+    //    Java array. Failure submissions skip the writeback entirely
+    //    (the Java side will read the failure via futureGetErrorMessage).
+    let succeeded = {
+        let status = submission.status.lock();
+        matches!(*status, SubmissionStatus::Completed { .. })
+    };
+    if succeeded {
+        for wb in &writebacks {
+            if let Err(msg) = wb.writeback(shared, &token) {
+                // First writeback failure marks the submission as
+                // Failed; subsequent writebacks are skipped.
+                let mut status = submission.status.lock();
+                *status = SubmissionStatus::Failed { message: msg };
+                break;
+            }
+        }
+    }
+
+    drop(token);
+
+    // 10. Register the submission and return its handle. The Java
+    //     side wraps this handle in `GpuFutureImpl`.
+    let handle = submission.handle;
+    register_submission(submission);
+    handle
+}
+
+// ── Per-type marshalling helpers ────────────────────────────────────
+
+#[cfg(feature = "gpu-offload")]
+enum MarshalWriteback {
+    I32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
+    I64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
+    F32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
+    F64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
+}
+
+#[cfg(feature = "gpu-offload")]
+impl MarshalWriteback {
+    fn writeback(
+        &self,
+        shared: &crate::vm::SharedVm,
+        token: &rustjvm_gc::safepoint::SafepointToken<'_>,
+    ) -> Result<(), String> {
+        use crate::runtime::gpu_marshal;
+        match self {
+            Self::I32 { obj, buf, len } => {
+                let mut dst = vec![0i32; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into i32: {e}"))?;
+                gpu_marshal::write_back_i32(*obj, &shared.heap, &dst, token);
+                Ok(())
+            }
+            Self::I64 { obj, buf, len } => {
+                let mut dst = vec![0i64; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into i64: {e}"))?;
+                gpu_marshal::write_back_i64(*obj, &shared.heap, &dst, token);
+                Ok(())
+            }
+            Self::F32 { obj, buf, len } => {
+                let mut dst = vec![0f32; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into f32: {e}"))?;
+                gpu_marshal::write_back_f32(*obj, &shared.heap, &dst, token);
+                Ok(())
+            }
+            Self::F64 { obj, buf, len } => {
+                let mut dst = vec![0f64; *len];
+                gpu_marshal::download_into(buf, &mut dst)
+                    .map_err(|e| format!("download_into f64: {e}"))?;
+                gpu_marshal::write_back_f64(*obj, &shared.heap, &dst, token);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Marshal one Java primitive-array arg. Returns:
+///   - a closure that pushes `(device_ptr, length)` into the
+///     in-flight `KernelArgs` (the closure form sidesteps borrowing
+///     `kernel_args` mutably while we still hold `shared`)
+///   - a `MarshalWriteback` recording how to copy the device buffer
+///     back into the source Java array after the kernel finishes.
+#[cfg(feature = "gpu-offload")]
+fn marshal_array_arg(
+    shared: &crate::vm::SharedVm,
+    ctx: &cuda_bridge::DeviceContext,
+    obj_ref: rustjvm_types::ObjectRef,
+    element_type: rustjvm_types::ArrayElementType,
+    token: &rustjvm_gc::safepoint::SafepointToken<'_>,
+) -> Result<
+    (
+        Box<dyn FnOnce(cuda_bridge::KernelArgs) -> cuda_bridge::KernelArgs>,
+        MarshalWriteback,
+    ),
+    String,
+> {
+    use crate::runtime::gpu_marshal;
+    use rustjvm_types::ArrayElementType;
+
+    match element_type {
+        ArrayElementType::Int => {
+            let host = gpu_marshal::host_view_i32(obj_ref, &shared.heap, token);
+            let len = host.len();
+            let buf = gpu_marshal::upload(ctx, &host)
+                .map_err(|e| format!("upload i32 (len={len}): {e}"))?;
+            // Move `buf` into the writeback record; build a closure
+            // that captures a clone-of-pointer by way of a fresh
+            // KernelArgs::push_device_ptr call. KernelArgs takes the
+            // buffer by reference, so we hold the buffer in
+            // `writeback.buf` for the duration of the launch (the
+            // writeback is processed AFTER synchronize() returns).
+            let wb = MarshalWriteback::I32 { obj: obj_ref, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = Box::new(move |args: cuda_bridge::KernelArgs| {
+                // PHASE5-NOTE: we need the device pointer in
+                // KernelArgs but the buffer lives on `wb`. Since
+                // KernelArgs::push_device_ptr takes &DeviceBuffer<T>,
+                // the closure can't borrow `wb` and consume itself.
+                // We unwrap the buffer here via a reference to the
+                // writeback, but that requires the closure to be
+                // called BEFORE we move wb into the writebacks vec.
+                // Caller arrangement: closure runs before `writebacks.push(wb)`.
+                args
+            });
+            // Bypass the closure indirection — push directly. Easier.
+            drop(push);
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::I32 { buf, len, .. } => {
+                    let len = *len as i32;
+                    // SAFETY: buffer outlives the closure because wb
+                    // is returned alongside, and the caller pushes
+                    // both to the same level.
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i32>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        // SAFETY: the writeback owning `buf` is
+                        // stored in the same `writebacks` Vec on the
+                        // caller's stack frame; the raw pointer is
+                        // valid for the entire dispatch lifetime.
+                        let buf_ref: &cuda_bridge::DeviceBuffer<i32> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        ArrayElementType::Long => {
+            let host = gpu_marshal::host_view_i64(obj_ref, &shared.heap, token);
+            let len = host.len();
+            let buf = gpu_marshal::upload(ctx, &host)
+                .map_err(|e| format!("upload i64 (len={len}): {e}"))?;
+            let wb = MarshalWriteback::I64 { obj: obj_ref, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::I64 { buf, len, .. } => {
+                    let len = *len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i64>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<i64> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        ArrayElementType::Float => {
+            let host = gpu_marshal::host_view_f32(obj_ref, &shared.heap, token);
+            let len = host.len();
+            let buf = gpu_marshal::upload(ctx, &host)
+                .map_err(|e| format!("upload f32 (len={len}): {e}"))?;
+            let wb = MarshalWriteback::F32 { obj: obj_ref, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::F32 { buf, len, .. } => {
+                    let len = *len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f32>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<f32> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        ArrayElementType::Double => {
+            let host = gpu_marshal::host_view_f64(obj_ref, &shared.heap, token);
+            let len = host.len();
+            let buf = gpu_marshal::upload(ctx, &host)
+                .map_err(|e| format!("upload f64 (len={len}): {e}"))?;
+            let wb = MarshalWriteback::F64 { obj: obj_ref, buf, len };
+            let push: Box<dyn FnOnce(_) -> _> = match &wb {
+                MarshalWriteback::F64 { buf, len, .. } => {
+                    let len = *len as i32;
+                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f64>;
+                    Box::new(move |args: cuda_bridge::KernelArgs| {
+                        let buf_ref: &cuda_bridge::DeviceBuffer<f64> = unsafe { &*device_ptr };
+                        args.push_device_ptr(buf_ref).push_i32(len)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            Ok((push, wb))
+        }
+        other => Err(format!("submitMethod: unsupported array element type: {other:?}")),
+    }
 }

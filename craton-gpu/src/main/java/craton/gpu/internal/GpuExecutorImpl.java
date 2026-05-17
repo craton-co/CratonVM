@@ -55,4 +55,10 @@ final class GpuExecutorImpl implements GpuExecutor {
     long handle() {
         return handle;
     }
+
+    @Override
+    public long handleForDispatch() {
+        if (closed) throw new GpuException("executor is closed");
+        return handle;
+    }
 }

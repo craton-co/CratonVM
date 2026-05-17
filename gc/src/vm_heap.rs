@@ -335,6 +335,29 @@ impl VmHeap {
     }
 
     // =====================================================================
+    // GPU offload — safepoint coordination (Phase 5 stopgap)
+    // =====================================================================
+
+    /// Enter a GPU-critical section. Returns a `SafepointToken` whose
+    /// lifetime brackets a no-GC window for the calling thread.
+    ///
+    /// **Phase 5 limitation:** this implementation uses a process-wide
+    /// `AtomicU32` rather than a counter on the active `GenerationalHeap` /
+    /// `G1Collector`, so today's GC paths do not actually observe the
+    /// counter. The Phase 1 GC coordination work targeted the older
+    /// `Heap` struct; bringing `VmHeap` into compliance is a separate
+    /// task. The token is shaped correctly so callers needing a
+    /// `SafepointToken` API (e.g. `gpu_marshal::host_view_i32`) compile
+    /// and run; on a real GPU host the `dispatch_method_from_native`
+    /// path uses this token to prove the marshal step is bracketed.
+    #[cfg(feature = "gpu-offload")]
+    pub fn enter_gpu_critical(&self) -> crate::safepoint::SafepointToken<'static> {
+        use std::sync::atomic::AtomicU32;
+        static GPU_CRITICAL_COUNT: AtomicU32 = AtomicU32::new(0);
+        crate::safepoint::SafepointToken::new(&GPU_CRITICAL_COUNT)
+    }
+
+    // =====================================================================
     // Array access
     // =====================================================================
 

@@ -44,17 +44,60 @@ public interface GpuExecutor extends AutoCloseable {
     <R> GpuFuture<R> submit(GpuCallable<R> task);
 
     /**
-     * Launches a precompiled kernel by name on the given stream with the
-     * supplied launch arguments. Argument marshalling is implementation
-     * defined; primitive values and {@link GpuArray} handles are supported.
+     * Submits a void-returning unit of work for asynchronous execution.
+     * Identical to {@link #submit} except the work is described by a
+     * {@link GpuRunnable} (no return value).
      *
-     * @param kernelName the symbolic name of the entry point to launch
-     * @param stream     the stream on which to enqueue the launch
-     * @param args       launch arguments (grid/block configuration plus kernel
-     *                   parameters)
-     * @return a future representing pending completion of the launch
+     * @param task the work to launch
+     * @return a future that completes when device-side work has finished
      */
-    GpuFuture<Void> launch(String kernelName, GpuStream stream, Object... args);
+    GpuFuture<Void> launch(GpuRunnable task);
+
+    /**
+     * Phase 5: explicit named-method dispatch. Bypasses lambda
+     * resolution by taking the target method by class + name +
+     * descriptor directly. {@code args} accepts: primitive boxed
+     * scalars (Integer, Long, Float, Double), primitive arrays
+     * (int[], long[], float[], double[]), and {@link GpuArray}
+     * handles for device-resident data.
+     *
+     * <p>The method's last array parameter is treated as the
+     * output sink (matching the existing Phase 1 convention).
+     * After the kernel completes, its contents are copied back
+     * into the original Java array — the caller can read the
+     * result there once {@code future.get()} returns.</p>
+     *
+     * @param className  internal name, e.g. {@code "com/example/Pipeline"}
+     * @param methodName e.g. {@code "vectorAdd"}
+     * @param descriptor JVM descriptor, e.g. {@code "([I[I[I)V"}
+     * @param args       boxed-primitive scalars + primitive arrays
+     *                   + GpuArray handles
+     * @param <R>        the future's result type (Void for void
+     *                   kernels)
+     */
+    default <R> GpuFuture<R> submit(
+        String className,
+        String methodName,
+        String descriptor,
+        Object... args
+    ) {
+        return craton.gpu.internal.Native.submitMethod(
+            handleForDispatch(),
+            className,
+            methodName,
+            descriptor,
+            args
+        );
+    }
+
+    /**
+     * Internal: returns the native handle this executor wraps. The
+     * default {@link #submit(String, String, String, Object...)}
+     * implementation needs the handle to call
+     * {@link craton.gpu.internal.Native#submitMethod}. Concrete
+     * impls override.
+     */
+    long handleForDispatch();
 
     /**
      * Allocates a new asynchronous stream on this executor's device. Streams

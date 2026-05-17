@@ -67,6 +67,12 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.register(KLASS, "openExecutor", "(I)Lcraton/gpu/GpuExecutor;", builtin_open_executor);
     registry.register(KLASS, "submit",       "(JLcraton/gpu/GpuCallable;)Lcraton/gpu/GpuFuture;", builtin_submit);
     registry.register(KLASS, "launch",       "(JLcraton/gpu/GpuRunnable;)Lcraton/gpu/GpuFuture;", builtin_launch);
+    registry.register(
+        KLASS,
+        "submitMethod",
+        "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
+        builtin_submit_method,
+    );
     registry.register(KLASS, "newStream",    "(J)Lcraton/gpu/GpuStream;", builtin_new_stream);
     registry.register(KLASS, "closeStream",  "(J)V", builtin_close_stream);
 
@@ -404,6 +410,133 @@ fn builtin_launch(
     let _runnable = arg_object(args, 1);
     let future_handle = record_failed_future();
     instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", future_handle)
+}
+
+/// `Native.submitMethod(long execHandle, String className, String methodName,
+///                      String descriptor, Object[] args) -> GpuFuture`
+///
+/// Phase 5: explicit named-method dispatch. Bypasses lambda
+/// resolution. Resolves the target method via the class manager,
+/// marshals `args` into `KernelArgs`, and dispatches asynchronously
+/// through `OffloadCache::dispatch_async`. Returns a `GpuFutureImpl`
+/// wrapping the submission handle the Java side polls.
+///
+/// Stub-mode behavior: the underlying
+/// `dispatch_method_from_native` records a `Failed` submission with
+/// message "no CUDA device" / "class not loaded" / etc., depending
+/// on which check trips first. The Java side surfaces it as
+/// `GpuException` via `futureGetErrorMessage`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_submit_method(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let _exec = arg_long(args, 0) as u64;
+
+    // Read the three string params. If any is null/unreadable, fail
+    // synthetically and let the Java side surface it.
+    let class_name = match arg_object(args, 1).and_then(|o| ctx.read_string(o)) {
+        Some(s) => s,
+        None => {
+            let h = record_failed_future_with_message("submitMethod: className was null");
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                h,
+            );
+        }
+    };
+    let method_name = match arg_object(args, 2).and_then(|o| ctx.read_string(o)) {
+        Some(s) => s,
+        None => {
+            let h = record_failed_future_with_message("submitMethod: methodName was null");
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                h,
+            );
+        }
+    };
+    let descriptor = match arg_object(args, 3).and_then(|o| ctx.read_string(o)) {
+        Some(s) => s,
+        None => {
+            let h = record_failed_future_with_message("submitMethod: descriptor was null");
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                h,
+            );
+        }
+    };
+
+    // Convert the Object[] argument array into a Vec<Value>. Each
+    // slot is read via NativeContext::get_array_element so the JVM
+    // layer can unbox / reference-pass as it normally would for a
+    // varargs call.
+    let java_args_obj = match arg_object(args, 4) {
+        Some(o) => o,
+        None => {
+            let h = record_failed_future_with_message("submitMethod: args array was null");
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                h,
+            );
+        }
+    };
+    let n = ctx.array_length(java_args_obj);
+    let mut java_args: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        java_args.push(ctx.get_array_element(java_args_obj, i));
+    }
+
+    // Dispatch via the NativeContext escape hatch. The VM's impl
+    // calls into `runtime::offload::dispatch_method_from_native`.
+    let submission_handle = match ctx.gpu_dispatch_method(
+        &class_name,
+        &method_name,
+        &descriptor,
+        &java_args,
+    ) {
+        Some(h) => h,
+        None => {
+            // gpu-offload feature off on the VM side. Fall back to
+            // the synthetic Failed-future path so the Java side gets
+            // a coherent error.
+            record_failed_future_with_message(
+                "submitMethod: gpu-offload feature is disabled in this build",
+            )
+        }
+    };
+
+    instantiate_handle_wrapper(
+        ctx,
+        "craton/gpu/internal/GpuFutureImpl",
+        submission_handle,
+    )
+}
+
+/// gpu-offload-off shim — submitMethod is unreachable in default
+/// builds because `register()` is a no-op. Kept here so callers can
+/// always name the function regardless of feature.
+#[cfg(not(feature = "gpu-offload"))]
+fn builtin_submit_method(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _args: &[rustjvm_types::Value],
+) -> rustjvm_types::error::MethodCallResult {
+    Ok(Some(rustjvm_types::Value::Object(None)))
+}
+
+#[cfg(feature = "gpu-offload")]
+fn record_failed_future_with_message(message: &str) -> u64 {
+    state::with(|s| {
+        let h = s.fresh_handle();
+        s.futures.insert(
+            h,
+            state::FutureState::Failed { message: message.to_string() },
+        );
+        h
+    })
 }
 
 // ---------------------------------------------------------------------------

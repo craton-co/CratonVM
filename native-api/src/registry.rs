@@ -105,6 +105,30 @@ pub trait NativeContext {
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
+    /// Phase 5 escape hatch for GPU offload — dispatch the named method
+    /// asynchronously on the GPU and return the submission handle. The
+    /// default impl returns `None` (no GPU offload). The VM's
+    /// `NativeContextImpl` overrides under `#[cfg(feature = "gpu-offload")]`
+    /// to resolve `class_name`/`method_name`/`descriptor` against the
+    /// class manager, marshal `java_args` into `KernelArgs`, and call
+    /// `OffloadCache::dispatch_async`. The returned handle is what the
+    /// Java `GpuFutureImpl` wraps; pass it back to
+    /// `Native.futureSynchronize` / `Native.futureGetResult` to drive
+    /// the future.
+    ///
+    /// `java_args` follows the same convention as the JVM stack: each
+    /// `Value::Object(Some(...))` is a Java array reference, each
+    /// `Value::Int/Long/Float/Double` is a primitive scalar.
+    fn gpu_dispatch_method(
+        &mut self,
+        _class_name: &str,
+        _method_name: &str,
+        _descriptor: &str,
+        _java_args: &[Value],
+    ) -> Option<u64> {
+        None
+    }
+
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
     fn new_object(&mut self, class_name: &str) -> MethodCallResult;
