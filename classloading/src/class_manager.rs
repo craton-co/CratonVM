@@ -886,13 +886,7 @@ impl ClassManager {
             has_finalizer: false,
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         };
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
@@ -2059,13 +2053,7 @@ impl ClassManager {
             is_synthetic_stub: false,
             has_finalizer: false, // computed below
             code_source,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         };
 
         // Compute has_finalizer: true if this class or any ancestor
@@ -3251,13 +3239,7 @@ impl ClassManager {
             has_finalizer: false, // synthetic stubs don't override finalize()
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         };
 
         debug!(
@@ -3465,13 +3447,7 @@ impl ClassManager {
             // other call site (see access_control, verifier, vm.rs,
             // benches, tests). Wire up real `ArrayInfo` once a consumer
             // (e.g. `Class.getComponentType` fast-path) actually reads it.
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         };
 
         debug!(
@@ -5885,13 +5861,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
 
         let child_fields = vec![make_field("a", false), make_field("b", false)];
@@ -6116,13 +6086,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_record());
@@ -6180,13 +6144,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_sealed());
@@ -6230,13 +6188,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.is_record());
@@ -6281,13 +6233,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         assert!(store.get(parent_id).unwrap().is_sealed());
 
@@ -6348,13 +6294,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let cls = store.get(id).unwrap();
         // java/lang/Object itself should NOT be considered as "declares_finalize"
@@ -6403,13 +6343,7 @@ mod tests {
             has_finalizer: true,
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.declares_finalize());
@@ -6449,13 +6383,7 @@ mod tests {
             has_finalizer: false,
             signature: None,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.declares_finalize());
@@ -6740,13 +6668,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let entries = mgr.build_vtable_descriptors(id, superclass);
         mgr.vtable_descriptors.insert(id, entries);
@@ -7006,13 +6928,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
 
         let (entries, overrides) = mgr.build_vtable_descriptors_with_overrides(id, None);
@@ -7079,13 +6995,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let (_entries, overrides) =
             mgr.build_vtable_descriptors_with_overrides(sub_id, Some(super_id));
@@ -7161,13 +7071,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         let entries = mgr.build_vtable_descriptors(id, None);
         assert_eq!(entries.len(), 1);

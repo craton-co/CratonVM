@@ -1811,6 +1811,7 @@ name = "rustjvm-jfr"
 version = "0.2.0"
 dependencies = [
  "rustc-hash",
+ "smallvec",
 ]
 
 [[package]]

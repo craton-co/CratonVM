@@ -420,6 +420,13 @@ impl VtableManager {
 
     /// Resolve a virtual method call: look up the vtable for the given class
     /// and return a cloned entry if found and resolved.
+    ///
+    /// Round-2 VM §8 HIGH — cloning a `VtableEntry` triggers three
+    /// `Arc` refcount bumps (`method_name`, `descriptor`,
+    /// `resolved_method`). Hot-path callers that only need the
+    /// dispatch snapshot should prefer
+    /// [`VtableManager::resolve_virtual_method`] which clones the
+    /// single `Arc<CachedBytecodeMethod>` and avoids the other two.
     pub fn resolve_virtual(
         &self,
         class_id: u64,
@@ -434,6 +441,35 @@ impl VtableManager {
         } else {
             None
         }
+    }
+
+    /// Hot-path counterpart to [`VtableManager::resolve_virtual`]:
+    /// returns only the cached `Arc<CachedBytecodeMethod>` for the
+    /// resolved entry.
+    ///
+    /// Round-2 VM §8 HIGH — cloning a full `VtableEntry` performs
+    /// three `Arc` bumps (`method_name`, `descriptor`,
+    /// `resolved_method`) even though the interpreter's
+    /// `invokevirtual` fast path only needs the third one. This
+    /// helper clones the dispatch `Arc` alone, eliminating the other
+    /// two refcount round-trips per invoke. Returns `None` when the
+    /// class has no vtable, the method isn't present, the slot is
+    /// unresolved, or the entry is a native/abstract method without
+    /// a cached bytecode snapshot.
+    #[inline]
+    pub fn resolve_virtual_method(
+        &self,
+        class_id: u64,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<Arc<rustjvm_jit_api::CachedBytecodeMethod>> {
+        let vtable = self.tables.get(&class_id)?;
+        let slot = vtable.lookup_slot(name, descriptor)?;
+        let entry = vtable.get(slot)?;
+        if !entry.resolved {
+            return None;
+        }
+        entry.resolved_method.clone()
     }
 
     // -----------------------------------------------------------------
@@ -482,7 +518,7 @@ impl VtableManager {
         self.tables.insert(class_id, vtable);
     }
 
-    /// Zero-allocation fast path: look up a vtable slot by class+slot pair.
+    /// Slot-indexed lookup that returns a fully cloned `VtableEntry`.
     ///
     /// Returns `Some(entry.clone())` only when the slot is populated and
     /// marked resolved. Called from the interpreter's `invokevirtual`
@@ -490,9 +526,19 @@ impl VtableManager {
     ///
     /// HIGH-5 — the returned clone is now O(1): `method_name` and
     /// `descriptor` are `Arc<str>` so cloning the entry is a pair of
-    /// refcount bumps rather than two heap copies. Callers that don't
-    /// need an owned entry can still prefer `vtable_entry_ref` below
-    /// to avoid even the refcount traffic.
+    /// refcount bumps rather than two heap copies.
+    ///
+    /// Round-2 VM §8 HIGH — the full entry clone is still three Arc
+    /// refcount bumps (`method_name`, `descriptor`, `resolved_method`).
+    /// Hot-path callers (`invokevirtual` fast path) that only need to
+    /// push a frame should prefer
+    /// [`VtableManager::resolve_virtual_slot_method`], which clones a
+    /// single `Arc<CachedBytecodeMethod>` and skips the other two
+    /// refcount round-trips. Use this variant only when the
+    /// `(declaring_class_id, method_index, method_name, descriptor,
+    /// is_native)` descriptive fields are all needed by the caller —
+    /// or use [`VtableManager::vtable_entry_ref`] to borrow without
+    /// any refcount traffic at all.
     pub fn resolve_virtual_slot(&self, class_id: u64, slot: usize) -> Option<VtableEntry> {
         let vtable = self.tables.get(&class_id)?;
         let entry = vtable.get(slot)?;
@@ -501,6 +547,35 @@ impl VtableManager {
         } else {
             None
         }
+    }
+
+    /// Hot-path slot-indexed lookup that returns only the cached
+    /// `Arc<CachedBytecodeMethod>` for the slot.
+    ///
+    /// Round-2 VM §8 HIGH — `resolve_virtual_slot` clones the full
+    /// `VtableEntry` (three `Arc` refcount bumps). The interpreter's
+    /// `invokevirtual` fast-path miss only needs the `resolved_method`
+    /// Arc to push a frame; this helper returns just that single
+    /// `Arc<CachedBytecodeMethod>` so each invoke pays one refcount
+    /// bump instead of three.
+    ///
+    /// Returns `None` when:
+    /// - the class has no installed vtable,
+    /// - the slot is out of range or empty,
+    /// - the entry is marked unresolved (CHA invalidation), or
+    /// - the entry has no cached bytecode snapshot (abstract / native).
+    ///
+    /// Callers that need the descriptive fields too should still use
+    /// [`VtableManager::resolve_virtual_slot`] or
+    /// [`VtableManager::vtable_entry_ref`].
+    #[inline]
+    pub fn resolve_virtual_slot_method(
+        &self,
+        class_id: u64,
+        slot: usize,
+    ) -> Option<Arc<rustjvm_jit_api::CachedBytecodeMethod>> {
+        self.vtable_entry_ref(class_id, slot)
+            .and_then(|e| e.resolved_method.clone())
     }
 
     /// Borrow the vtable entry at `(class_id, slot)` without cloning.
@@ -1531,6 +1606,83 @@ mod tests {
             e.resolved_method.is_none(),
             "native methods carry no bytecode Arc",
         );
+    }
+
+    /// Round-2 VM §8 HIGH — `resolve_virtual_slot_method` returns the
+    /// same `Arc<CachedBytecodeMethod>` payload the full
+    /// `resolve_virtual_slot` would carry, but as a bare Arc clone so
+    /// the hot path skips two needless refcount bumps on
+    /// `method_name` / `descriptor`.
+    #[test]
+    fn resolve_virtual_slot_method_returns_cached_arc() {
+        let mut mgr = VtableManager::new();
+        let stub = make_dispatch_stub(42, "tick", "()V");
+        let stub_weak = Arc::downgrade(&stub);
+        mgr.install_vtable(
+            42,
+            vec![Some(VtableEntry {
+                declaring_class_id: 42,
+                method_index: 0,
+                method_name: Arc::<str>::from("tick"),
+                descriptor: Arc::<str>::from("()V"),
+                resolved: true,
+                resolved_method: Some(stub),
+                is_native: false,
+            })],
+        );
+
+        // Slot-indexed helper returns just the bytecode Arc.
+        let got = mgr
+            .resolve_virtual_slot_method(42, 0)
+            .expect("slot populated and resolved");
+        assert!(
+            stub_weak.upgrade().is_some(),
+            "vtable should still own the installed Arc",
+        );
+        assert_eq!(&*got.method_name, "tick");
+        assert_eq!(&*got.method_descriptor, "()V");
+
+        // Name-based helper does the same for the slow path.
+        let got_named = mgr
+            .resolve_virtual_method(42, "tick", "()V")
+            .expect("named lookup hits");
+        assert!(Arc::ptr_eq(&got, &got_named));
+
+        // Unresolved → None for both variants.
+        mgr.invalidate_for_override(42, 0);
+        assert!(mgr.resolve_virtual_slot_method(42, 0).is_none());
+        assert!(mgr.resolve_virtual_method(42, "tick", "()V").is_none());
+    }
+
+    /// Round-2 VM §8 HIGH — a vtable entry with no cached bytecode
+    /// (abstract / native) returns `None` from the `_method` helpers
+    /// even when the slot itself is resolved.
+    #[test]
+    fn resolve_virtual_method_none_for_native_slot() {
+        let mut mgr = VtableManager::new();
+        mgr.install_vtable(
+            88,
+            vec![Some(VtableEntry {
+                declaring_class_id: 88,
+                method_index: 0,
+                method_name: Arc::<str>::from("getClass"),
+                descriptor: Arc::<str>::from("()Ljava/lang/Class;"),
+                resolved: true,
+                resolved_method: None, // native — no bytecode
+                is_native: true,
+            })],
+        );
+        assert!(mgr.resolve_virtual_slot_method(88, 0).is_none());
+        assert!(
+            mgr.resolve_virtual_method(88, "getClass", "()Ljava/lang/Class;")
+                .is_none(),
+        );
+        // The full-entry variant still returns Some(..) because the
+        // slot is resolved — callers that need to detect the native
+        // case rely on `is_native` from the full entry.
+        let full = mgr.resolve_virtual_slot(88, 0).unwrap();
+        assert!(full.is_native);
+        assert!(full.resolved_method.is_none());
     }
 
     /// T10.9.A — installing a vtable with a dispatch-bearing entry

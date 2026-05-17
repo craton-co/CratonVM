@@ -1172,7 +1172,6 @@ fn verify_code_attribute_presence(class: &Class) -> Result<(), LinkageError> {
 mod tests {
     use super::*;
     use crate::class::{ClassId, ClassLoaderId, ClassState};
-    use std::sync::OnceLock;
 
     use rustjvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
     use rustjvm_reader::class_access_flags::ClassAccessFlags;
@@ -1222,12 +1221,6 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
-            attributes: Vec::new(),
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         });
         id
     }
@@ -1675,12 +1668,6 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
-            attributes: Vec::new(),
-            source_file_cache: OnceLock::new(),
-            signature_cache: OnceLock::new(),
-            nest_host_cache: OnceLock::new(),
-            enclosing_method_cache: OnceLock::new(),
-            record_components_cache: OnceLock::new(),
         }
     }
 

@@ -66,7 +66,7 @@ use crate::memory::heap::ArrayElementType;
 use crate::memory::roots::collect_roots;
 use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
-use crate::types::{CompactValue, ObjectRef, Value};
+use crate::types::{CompactTag, CompactValue, ObjectRef, Value};
 use crate::vm::{
     coerce_value_for_return, coerce_value_for_return_validated, create_java_string,
     ensure_class_initialized_shared, ensure_system_stdin_object, get_or_create_class_mirror,
@@ -2584,12 +2584,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         // SAFETY: code_ptr points to the method's bytecode array; saved_pc + 2 < code_len is checked above.
                         let next2 = unsafe { *code_ptr.add(saved_pc + 2) };
                         // iload_X; iload_Y; iadd → push locals[X] + locals[Y]
+                        // Round-3: typed int helpers avoid the Value enum round-trip
+                        // when both locals are already int-tagged.
                         if next2 == 0x60 {
-                            if let (Value::Int(vx), Value::Int(vy)) = (
-                                frame.get_local_unchecked(local_idx),
-                                frame.get_local_unchecked(local_y),
-                            ) {
-                                frame.stack.push_unchecked(Value::Int(vx.wrapping_add(vy)));
+                            let cvx = frame.get_local_compact_unchecked(local_idx);
+                            let cvy = frame.get_local_compact_unchecked(local_y);
+                            if let (Some(vx), Some(vy)) = (cvx.as_int(), cvy.as_int()) {
+                                frame.stack.push_int_unchecked(vx.wrapping_add(vy));
                                 frame.pc = saved_pc + 3;
                                 continue;
                             }
@@ -2643,6 +2644,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                     }
                     // iload_X; iconst_1; iadd; istore_X → locals[X] += 1
+                    // Round-3: typed int helpers — same wrapping_add, no Value enum.
                     if b1 == 0x04 && saved_pc + 3 < code_len {
                         // SAFETY: code_ptr points to the method's bytecode array; saved_pc + 3 < code_len is checked above.
                         let next2 = unsafe { *code_ptr.add(saved_pc + 2) };
@@ -2651,8 +2653,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if next2 == 0x60 && next3 >= 0x3b && next3 <= 0x3e
                             && (next3 - 0x3b) as usize == local_idx // Cast: bytecode operand decoding
                         {
-                            if let Value::Int(v) = frame.get_local_unchecked(local_idx) {
-                                frame.set_local_unchecked(local_idx, Value::Int(v.wrapping_add(1)));
+                            let cv = frame.get_local_compact_unchecked(local_idx);
+                            if let Some(v) = cv.as_int() {
+                                frame.set_local_int_unchecked(local_idx, v.wrapping_add(1));
                                 frame.pc = saved_pc + 4;
                                 continue;
                             }
@@ -2664,122 +2667,160 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if let Value::Object(Some(arr_ref)) = arr_val {
                             let len = shared.heap.array_length(arr_ref);
                             // JVM spec: arraylength returns i32; array length bounded by Integer.MAX_VALUE
-                            frame.stack.push_unchecked(Value::Int(len as i32));
+                            frame.stack.push_int_unchecked(len as i32);
                             frame.pc = saved_pc + 2;
                             continue;
                         }
                     }
-                    // No superinstruction matched — fall back to plain iload
-                    frame.stack.push_unchecked(frame.get_local_unchecked(local_idx));
+                    // No superinstruction matched — fall back to plain iload.
+                    // Round-3: push the raw CompactValue (no Value round-trip).
+                    frame.stack.push_compact(frame.get_local_compact_unchecked(local_idx));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // istore_0..3
+                // istore_0..3 — Round-3: pop the raw CompactValue and stash directly.
+                // No Value enum round-trip; tag is preserved verbatim from the stack slot.
                 0x3b => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(0, v);
+                    let cv = frame.stack.pop_compact();
+                    frame.set_local_compact_unchecked(0, cv);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x3c => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(1, v);
+                    let cv = frame.stack.pop_compact();
+                    frame.set_local_compact_unchecked(1, cv);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x3d => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(2, v);
+                    let cv = frame.stack.pop_compact();
+                    frame.set_local_compact_unchecked(2, cv);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x3e => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(3, v);
+                    let cv = frame.stack.pop_compact();
+                    frame.set_local_compact_unchecked(3, cv);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // aload_0..3 — validate any jlong-shaped jobject against the
-                // heap before reinterpreting as ObjectRef. An unvalidated raw
-                // long (file size, hash, etc.) that happens to be 8-byte
-                // aligned would be marked by GC and SEGV (Letsgo AV family).
+                // aload_0..3 — Round-3: branch on compact tag.
+                //
+                // Object / Null / Uninitialized locals are pushed verbatim with
+                // zero validation overhead.  Only NaN-tagged Long slots
+                // (SUB_LONG_LO/HI) — the legacy JNI smuggled-jobject path —
+                // need `coerce_value_for_return_validated` to reject pointer-
+                // shaped longs that aren't heap-mapped (Letsgo AV family).
+                // Untagged Double-shaped slots are not reference candidates
+                // here; aload is a single-slot reference load by spec.
                 0x2a => {
-                    let v = coerce_value_for_return_validated(
-                        shared,
-                        frame.get_local_unchecked(0),
-                        b'L',
-                    );
-                    frame.stack.push_unchecked(v);
+                    let cv = frame.get_local_compact_unchecked(0);
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(
+                            shared,
+                            cv.to_value(),
+                            b'L',
+                        );
+                        frame.stack.push_unchecked(v);
+                    } else {
+                        frame.stack.push_compact(cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2b => {
-                    let v = coerce_value_for_return_validated(
-                        shared,
-                        frame.get_local_unchecked(1),
-                        b'L',
-                    );
-                    frame.stack.push_unchecked(v);
+                    let cv = frame.get_local_compact_unchecked(1);
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(
+                            shared,
+                            cv.to_value(),
+                            b'L',
+                        );
+                        frame.stack.push_unchecked(v);
+                    } else {
+                        frame.stack.push_compact(cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2c => {
-                    let v = coerce_value_for_return_validated(
-                        shared,
-                        frame.get_local_unchecked(2),
-                        b'L',
-                    );
-                    frame.stack.push_unchecked(v);
+                    let cv = frame.get_local_compact_unchecked(2);
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(
+                            shared,
+                            cv.to_value(),
+                            b'L',
+                        );
+                        frame.stack.push_unchecked(v);
+                    } else {
+                        frame.stack.push_compact(cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x2d => {
-                    let v = coerce_value_for_return_validated(
-                        shared,
-                        frame.get_local_unchecked(3),
-                        b'L',
-                    );
-                    frame.stack.push_unchecked(v);
+                    let cv = frame.get_local_compact_unchecked(3);
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(
+                            shared,
+                            cv.to_value(),
+                            b'L',
+                        );
+                        frame.stack.push_unchecked(v);
+                    } else {
+                        frame.stack.push_compact(cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // astore_0..3 — mirror slow-path `Instruction::Astore`: JNI may
-                // leave a jobject as `Value::Long`; storing it raw corrupts ref
-                // locals (Letsgo AV after `ConfigurationClassEnhancer.enhance`).
-                // Validated variant: rejects aligned-but-unheaped long bits.
+                // astore_0..3 — Round-3: branch on compact tag.
+                //
+                // Only Long-tagged slots flow through `coerce_value_for_return_validated`
+                // (the JNI smuggled-jobject path that GCs the underlying handle —
+                // Letsgo AV after `ConfigurationClassEnhancer.enhance`).
+                // Object, Null, Int, Float, Double, Uninitialized, ReturnAddress
+                // are stashed directly with no decoding.
                 0x4b => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(
-                        0,
-                        coerce_value_for_return_validated(shared, v, b'L'),
-                    );
+                    let cv = frame.stack.pop_compact();
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
+                        frame.set_local_unchecked(0, v);
+                    } else {
+                        frame.set_local_compact_unchecked(0, cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4c => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(
-                        1,
-                        coerce_value_for_return_validated(shared, v, b'L'),
-                    );
+                    let cv = frame.stack.pop_compact();
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
+                        frame.set_local_unchecked(1, v);
+                    } else {
+                        frame.set_local_compact_unchecked(1, cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4d => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(
-                        2,
-                        coerce_value_for_return_validated(shared, v, b'L'),
-                    );
+                    let cv = frame.stack.pop_compact();
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
+                        frame.set_local_unchecked(2, v);
+                    } else {
+                        frame.set_local_compact_unchecked(2, cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x4e => {
-                    let v = frame.stack.pop_unchecked();
-                    frame.set_local_unchecked(
-                        3,
-                        coerce_value_for_return_validated(shared, v, b'L'),
-                    );
+                    let cv = frame.stack.pop_compact();
+                    if cv.tag() == CompactTag::Long {
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
+                        frame.set_local_unchecked(3, v);
+                    } else {
+                        frame.set_local_compact_unchecked(3, cv);
+                    }
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -2884,15 +2925,19 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 3;
                     continue;
                 }
-                // iinc
+                // iinc — Round-3: typed int read/write, no Value enum.
+                //
+                // `get_local_int_unchecked` returns 0 for non-Int slots (mirrors
+                // the prior `Value::Int(_)` match — falling through to the slow
+                // path on type-mismatch is unnecessary because verified
+                // bytecode guarantees Int at this site).
                 0x84 => {
                     let idx = b1 as usize; // Cast: bytecode operand decoding
                     let inc = b2 as i8 as i32; // Cast: bytecode operand decoding
-                    if let Value::Int(v) = frame.get_local_unchecked(idx) {
-                        frame.set_local_unchecked(idx, Value::Int(v.wrapping_add(inc)));
-                        frame.pc = saved_pc + 3;
-                        continue;
-                    }
+                    let v = frame.get_local_int_unchecked(idx);
+                    frame.set_local_int_unchecked(idx, v.wrapping_add(inc));
+                    frame.pc = saved_pc + 3;
+                    continue;
                 }
                 // goto
                 0xa7 => {
@@ -3587,101 +3632,76 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // fadd (0x62)
+                // fadd (0x62) — Round-3: typed float helpers, no Value enum.
+                //
+                // Verified bytecode guarantees the top two slots are Float-tagged
+                // here.  IEEE 754 semantics (NaN propagation, ±Inf on divide-by-
+                // zero) are preserved by the underlying `f32` arithmetic.
                 0x62 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Float(va), Value::Float(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Float(va + vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_float_unchecked();
+                    let a = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(a + b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // fsub (0x66)
                 0x66 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Float(va), Value::Float(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Float(va - vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_float_unchecked();
+                    let a = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(a - b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // fmul (0x6a)
                 0x6a => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Float(va), Value::Float(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Float(va * vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_float_unchecked();
+                    let a = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(a * b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
-                // fdiv (0x6e)
+                // fdiv (0x6e) — JVMS: f / 0.0 = ±Inf / NaN (no exception).
                 0x6e => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Float(va), Value::Float(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Float(va / vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_float_unchecked();
+                    let a = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(a / b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
-                // dadd (0x63)
+                // dadd (0x63) — Round-3: typed double helpers, no Value enum.
+                //
+                // Verified bytecode guarantees Double operands. IEEE 754
+                // semantics preserved by the underlying `f64` arithmetic.
                 0x63 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Double(va), Value::Double(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Double(va + vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_double_unchecked();
+                    let a = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(a + b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // dsub (0x67)
                 0x67 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Double(va), Value::Double(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Double(va - vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_double_unchecked();
+                    let a = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(a - b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // dmul (0x6b)
                 0x6b => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Double(va), Value::Double(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Double(va * vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_double_unchecked();
+                    let a = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(a * b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
-                // ddiv (0x6f)
+                // ddiv (0x6f) — JVMS: d / 0.0 = ±Inf / NaN (no exception).
                 0x6f => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Double(va), Value::Double(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Double(va / vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let b = frame.stack.pop_double_unchecked();
+                    let a = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(a / b);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // i2b (0x91), i2c (0x92), i2s (0x93) — AUDIT CRIT-4
                 0x91 => {
@@ -3742,19 +3762,19 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // fconst_0..2 (0x0b-0x0d)
+                // fconst_0..2 (0x0b-0x0d) — direct CompactValue float push (no Value enum encode).
                 0x0b => {
-                    frame.stack.push_unchecked(Value::Float(0.0));
+                    frame.stack.push_float_unchecked(0.0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x0c => {
-                    frame.stack.push_unchecked(Value::Float(1.0));
+                    frame.stack.push_float_unchecked(1.0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x0d => {
-                    frame.stack.push_unchecked(Value::Float(2.0));
+                    frame.stack.push_float_unchecked(2.0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3782,15 +3802,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // pop
+                // pop — discard the top slot without decoding (no Value enum round-trip).
                 0x57 => {
-                    frame.stack.pop_unchecked();
+                    frame.stack.pop_compact();
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // aconst_null
+                // aconst_null — push a CompactValue::null() directly (no Value enum encode).
                 0x01 => {
-                    frame.stack.push_unchecked(Value::Object(None));
+                    frame.stack.push_compact(CompactValue::null());
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3912,9 +3932,11 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         // decode path handles them correctly.
                         _ => cv.to_value(),
                     };
-                    let idx_val = frame.stack.pop_unchecked();
+                    // Round-3: typed int pop for the array index — the spec
+                    // mandates an int operand for every x-astore.
+                    let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
-                    if let (Value::Object(Some(arr_ref)), Value::Int(index)) = (arr_val, idx_val) {
+                    if let Value::Object(Some(arr_ref)) = arr_val {
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
@@ -3942,16 +3964,17 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                     }
                     frame.stack.push_unchecked(arr_val);
-                    frame.stack.push_unchecked(idx_val);
+                    frame.stack.push_int_unchecked(index);
                     frame.stack.push_unchecked(value);
                 }
                 // aastore (0x53) — needs SATB pre-barrier + write barrier
                 0x53 => {
                     let value =
                         coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
-                    let idx_val = frame.stack.pop_unchecked();
+                    // Round-3: typed int pop for the array index.
+                    let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
-                    if let (Value::Object(Some(arr_ref)), Value::Int(index)) = (arr_val, idx_val) {
+                    if let Value::Object(Some(arr_ref)) = arr_val {
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
@@ -3985,15 +4008,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                     }
                     frame.stack.push_unchecked(arr_val);
-                    frame.stack.push_unchecked(idx_val);
+                    frame.stack.push_int_unchecked(index);
                     frame.stack.push_unchecked(value);
                 }
-                // arraylength (0xbe)
+                // arraylength (0xbe) — direct int push on the success path.
                 0xbe => {
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
                         let len = shared.heap.array_length(arr_ref);
-                        frame.stack.push_unchecked(Value::Int(len as i32)); // Cast: array length to JVM int
+                        frame.stack.push_int_unchecked(len as i32); // Cast: array length to JVM int
                         frame.pc = saved_pc + 1;
                         continue;
                     }

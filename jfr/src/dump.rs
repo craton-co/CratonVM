@@ -10,6 +10,8 @@
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use rustc_hash::FxHashMap;
+
 use crate::event::{EventInstance, EventTypeId, EventTypeRegistry, EventValue};
 use crate::repository::EventRepository;
 
@@ -76,8 +78,30 @@ impl From<io::Error> for JfrDumpError {
 ///
 /// JFR uses an unsigned LEB128 encoding where each byte stores 7 bits of data
 /// and the high bit indicates whether more bytes follow.
+///
+/// Allocates a new `Vec<u8>`. Hot paths should prefer
+/// [`write_compressed_int_into`] which appends into a caller-provided buffer.
 pub fn encode_compressed_int(value: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
+    write_compressed_int_into(&mut buf, value);
+    buf
+}
+
+/// Encode a signed i64 as a JFR compressed long (zigzag + LEB128).
+///
+/// Allocates a new `Vec<u8>`. Hot paths should prefer
+/// [`write_compressed_long_into`] which appends into a caller-provided buffer.
+pub fn encode_compressed_long(value: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(10);
+    write_compressed_long_into(&mut buf, value);
+    buf
+}
+
+/// J2 (round-2): append a JFR compressed-int encoding of `value` to `buf`
+/// without allocating. Saves the per-call `Vec` allocation that
+/// [`encode_compressed_int`] incurs.
+#[inline]
+pub fn write_compressed_int_into(buf: &mut Vec<u8>, value: u64) {
     let mut v = value;
     loop {
         let mut byte = (v & 0x7F) as u8;
@@ -90,14 +114,27 @@ pub fn encode_compressed_int(value: u64) -> Vec<u8> {
             break;
         }
     }
-    buf
 }
 
-/// Encode a signed i64 as a JFR compressed long (zigzag + LEB128).
-pub fn encode_compressed_long(value: i64) -> Vec<u8> {
-    // Zigzag encode: map signed to unsigned so small magnitudes produce small values
+/// J2 (round-2): append a JFR compressed-long (zigzag + LEB128) encoding of
+/// `value` to `buf` without allocating.
+#[inline]
+pub fn write_compressed_long_into(buf: &mut Vec<u8>, value: i64) {
     let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    encode_compressed_int(zigzag)
+    write_compressed_int_into(buf, zigzag);
+}
+
+/// Length of the compressed-int encoding of `value`, in bytes.
+/// Used to size the `size` prefix of size-prefixed records before encoding.
+#[inline]
+fn compressed_int_len(value: u64) -> usize {
+    let mut v = value;
+    let mut n = 1usize;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
 }
 
 /// Decode a JFR compressed integer from a byte slice, returning `(value, bytes_consumed)`.
@@ -129,22 +166,80 @@ pub fn decode_compressed_long(data: &[u8]) -> Option<(i64, usize)> {
 // Event serialization
 // ---------------------------------------------------------------------------
 
+/// J1 (round-2): a string constant-pool used to dedupe repeated string field
+/// payloads in an event chunk. Built once per dump from the events being
+/// emitted; each unique `Arc<str>` / `&'static str` payload is assigned a
+/// monotonically-increasing pool index. Event records then write the index
+/// (a compressed-int, typically 1-2 bytes) instead of the full UTF-8 body,
+/// and the checkpoint section emits the pool table once.
+///
+/// Lookups are by byte-slice value so the `String` and `Str` variants share
+/// one pool entry when they carry the same payload.
+struct StringPool {
+    /// Index lookup, keyed by interned byte content.
+    by_bytes: FxHashMap<Vec<u8>, u32>,
+    /// Insertion-ordered entries — emitted to the checkpoint section.
+    order: Vec<Vec<u8>>,
+}
+
+impl StringPool {
+    fn new() -> Self {
+        Self { by_bytes: FxHashMap::default(), order: Vec::new() }
+    }
+
+    /// Look up or insert `bytes`, returning its pool index.
+    fn intern(&mut self, bytes: &[u8]) -> u32 {
+        if let Some(&idx) = self.by_bytes.get(bytes) {
+            return idx;
+        }
+        let idx = self.order.len() as u32;
+        let owned = bytes.to_vec();
+        self.by_bytes.insert(owned.clone(), idx);
+        self.order.push(owned);
+        idx
+    }
+
+    /// Look up `bytes`, returning the pool index if known. Used on the write
+    /// path after the pool has been pre-populated by walking every event.
+    fn get(&self, bytes: &[u8]) -> Option<u32> {
+        self.by_bytes.get(bytes).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn entries(&self) -> &[Vec<u8>] {
+        &self.order
+    }
+}
+
+/// Intern every string-typed payload in `fields` into `pool`. Used by
+/// `dump_to_file` as the per-chunk pre-pass before serialization.
+fn intern_event_strings(pool: &mut StringPool, fields: &[EventValue]) {
+    for f in fields {
+        if let Some(bytes) = f.as_str_bytes() {
+            pool.intern(bytes);
+        }
+    }
+}
+
 /// Encode a single event field value into a byte buffer.
-fn encode_event_value(value: &EventValue, buf: &mut Vec<u8>) {
+///
+/// When a `StringPool` is provided, `String`/`Str` payloads are written as a
+/// 1-byte string-encoding tag of `4` (pool index reference) followed by a
+/// compressed-int pool index, instead of the inline UTF-8 form. Unknown
+/// strings (shouldn't happen — pool is pre-populated) fall back to the
+/// inline tag-3 form.
+fn encode_event_value(value: &EventValue, buf: &mut Vec<u8>, pool: Option<&StringPool>) {
     match value {
-        EventValue::Long(v) => buf.extend_from_slice(&encode_compressed_long(*v)),
-        EventValue::Int(v) => buf.extend_from_slice(&encode_compressed_long(*v as i64)),
+        EventValue::Long(v) => write_compressed_long_into(buf, *v),
+        EventValue::Int(v) => write_compressed_long_into(buf, *v as i64),
         EventValue::Float(v) => buf.extend_from_slice(&v.to_bits().to_be_bytes()),
         EventValue::Double(v) => buf.extend_from_slice(&v.to_bits().to_be_bytes()),
         EventValue::Boolean(v) => buf.push(if *v { 1 } else { 0 }),
-        EventValue::String(s) => {
-            // JFR string encoding: length-prefixed UTF-8
-            // Encoding type 3 = UTF-8 with length
-            buf.push(3); // STRING_ENCODING_UTF8
-            let bytes = s.as_bytes();
-            buf.extend_from_slice(&encode_compressed_int(bytes.len() as u64));
-            buf.extend_from_slice(bytes);
-        }
+        EventValue::String(s) => write_string_bytes(buf, s.as_bytes(), pool),
+        EventValue::Str(s) => write_string_bytes(buf, s.as_bytes(), pool),
         EventValue::Null => {
             // JFR null string: encoding type 0
             buf.push(0);
@@ -152,48 +247,93 @@ fn encode_event_value(value: &EventValue, buf: &mut Vec<u8>) {
     }
 }
 
-/// Serialize a single event into a self-contained byte record.
+/// Emit a string-typed field. With a pool, writes tag `4` + interned index;
+/// without (or on miss), writes inline tag `3` + length-prefixed UTF-8.
+#[inline]
+fn write_string_bytes(buf: &mut Vec<u8>, bytes: &[u8], pool: Option<&StringPool>) {
+    if let Some(p) = pool {
+        if let Some(idx) = p.get(bytes) {
+            // STRING_ENCODING_CONSTANT_POOL_REF = 4
+            buf.push(4);
+            write_compressed_int_into(buf, idx as u64);
+            return;
+        }
+    }
+    // Inline UTF-8 fallback: encoding type 3
+    buf.push(3);
+    write_compressed_int_into(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+}
+
+/// J2 (round-2): serialize one event into `scratch` (cleared first), then
+/// prefix-and-flush to `writer` — no per-event Vec allocations on the hot path.
 ///
-/// Layout: [size: compressed_int] [type_id: compressed_int] [start_ticks: compressed_long]
-///         [duration_ticks: compressed_long] [thread_id: compressed_long] [fields...]
+/// Layout: `[size: compressed_int] [type_id] [start_ticks] [duration_ticks]
+///          [thread_id] [fields...]`
 ///
-/// The `size` field encodes the total record length in bytes (including the
-/// size field itself).  Because the size field is variable-length, we may need
-/// to iterate to get a stable encoding.
-fn serialize_event(
+/// `scratch` only needs to be sized once at the call site (`Vec::with_capacity`
+/// for a typical event payload); the function reuses its existing allocation
+/// across every call.
+fn serialize_event_into<W: Write>(
+    scratch: &mut Vec<u8>,
+    writer: &mut W,
     type_id: EventTypeId,
     start_time: u64,
     end_time: u64,
     thread_id: u64,
     fields: &[EventValue],
-) -> Vec<u8> {
-    // Encode the body (everything after the size prefix)
-    let mut body = Vec::new();
-    body.extend_from_slice(&encode_compressed_int(type_id.0 as u64));
-    body.extend_from_slice(&encode_compressed_long(start_time as i64));
+    pool: Option<&StringPool>,
+) -> io::Result<()> {
+    scratch.clear();
+    write_compressed_int_into(scratch, type_id.0 as u64);
+    write_compressed_long_into(scratch, start_time as i64);
     let duration = end_time.saturating_sub(start_time);
-    body.extend_from_slice(&encode_compressed_long(duration as i64));
-    body.extend_from_slice(&encode_compressed_long(thread_id as i64));
+    write_compressed_long_into(scratch, duration as i64);
+    write_compressed_long_into(scratch, thread_id as i64);
     for field in fields {
-        encode_event_value(field, &mut body);
+        encode_event_value(field, scratch, pool);
     }
+    write_size_prefixed(writer, scratch)
+}
 
-    // Determine the size prefix.  The total record size includes the size
-    // field itself, so we iterate: guess the size-of-size, check if it
-    // remains stable, and fix up if needed.
+/// Compute the size-prefix length that yields a stable total, then write
+/// the prefix followed by the body.
+///
+/// JFR records are size-prefixed using a variable-length compressed-int that
+/// *includes the size field itself* — so picking the prefix length requires
+/// a fixpoint search. In practice this converges in at most one iteration
+/// because the prefix is 1-2 bytes for bodies under ~16 KiB.
+fn write_size_prefixed<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
     let body_len = body.len();
     let mut size_prefix_len = 1usize;
-    loop {
+    let total = loop {
         let total = size_prefix_len + body_len;
-        let actual_prefix_len = encode_compressed_int(total as u64).len();
-        if actual_prefix_len == size_prefix_len {
-            let mut record = Vec::with_capacity(total);
-            record.extend_from_slice(&encode_compressed_int(total as u64));
-            record.extend_from_slice(&body);
-            return record;
+        let actual = compressed_int_len(total as u64);
+        if actual == size_prefix_len {
+            break total;
         }
-        size_prefix_len = actual_prefix_len;
+        size_prefix_len = actual;
+    };
+    // Write the size prefix straight to the writer — small (<= 10 bytes) so
+    // a stack array is fine and avoids touching the heap.
+    let mut prefix = [0u8; 10];
+    let mut len = 0usize;
+    let mut v = total as u64;
+    loop {
+        let mut byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        prefix[len] = byte;
+        len += 1;
+        if v == 0 {
+            break;
+        }
     }
+    writer.write_all(&prefix[..len])?;
+    writer.write_all(body)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +344,12 @@ fn serialize_event(
 const METADATA_TYPE_ID: u64 = 0;
 const CHECKPOINT_TYPE_ID: u64 = 1;
 
-/// Write the metadata section describing all event types.
-/// Returns the bytes of the metadata section.
-fn build_metadata_section(registry: &EventTypeRegistry, start_time_ns: u64) -> Vec<u8> {
+/// Write the metadata section describing all event types directly into `writer`.
+fn write_metadata_section<W: Write>(
+    writer: &mut W,
+    registry: &EventTypeRegistry,
+    start_time_ns: u64,
+) -> io::Result<()> {
     // The metadata section is itself an event with type_id = METADATA_TYPE_ID.
     // It contains a description of all event types using a simplified encoding.
     //
@@ -214,47 +357,47 @@ fn build_metadata_section(registry: &EventTypeRegistry, start_time_ns: u64) -> V
     // We use a simplified but compatible format: a single metadata event containing
     // all type descriptors encoded as compressed fields.
 
-    let mut body = Vec::new();
+    let mut body = Vec::with_capacity(1024);
 
     // Metadata event header
-    body.extend_from_slice(&encode_compressed_int(METADATA_TYPE_ID));
-    body.extend_from_slice(&encode_compressed_long(start_time_ns as i64));
+    write_compressed_int_into(&mut body, METADATA_TYPE_ID);
+    write_compressed_long_into(&mut body, start_time_ns as i64);
     // Duration = 0 for metadata
-    body.extend_from_slice(&encode_compressed_long(0));
+    write_compressed_long_into(&mut body, 0);
 
     // Number of type descriptors
     let types: Vec<_> = registry.iter().collect();
-    body.extend_from_slice(&encode_compressed_int(types.len() as u64));
+    write_compressed_int_into(&mut body, types.len() as u64);
 
     for (id, event_type) in &types {
         // Type ID
-        body.extend_from_slice(&encode_compressed_int(id.0 as u64));
+        write_compressed_int_into(&mut body, id.0 as u64);
         // Name (length-prefixed UTF-8)
         let name_bytes = event_type.name.as_bytes();
-        body.extend_from_slice(&encode_compressed_int(name_bytes.len() as u64));
+        write_compressed_int_into(&mut body, name_bytes.len() as u64);
         body.extend_from_slice(name_bytes);
         // Category count + categories
-        body.extend_from_slice(&encode_compressed_int(event_type.category.len() as u64));
+        write_compressed_int_into(&mut body, event_type.category.len() as u64);
         for cat in &event_type.category {
             let cat_bytes = cat.as_bytes();
-            body.extend_from_slice(&encode_compressed_int(cat_bytes.len() as u64));
+            write_compressed_int_into(&mut body, cat_bytes.len() as u64);
             body.extend_from_slice(cat_bytes);
         }
         // Description
         let desc_bytes = event_type.description.as_bytes();
-        body.extend_from_slice(&encode_compressed_int(desc_bytes.len() as u64));
+        write_compressed_int_into(&mut body, desc_bytes.len() as u64);
         body.extend_from_slice(desc_bytes);
         // Field count + fields
-        body.extend_from_slice(&encode_compressed_int(event_type.fields.len() as u64));
+        write_compressed_int_into(&mut body, event_type.fields.len() as u64);
         for field in &event_type.fields {
             let fname_bytes = field.name.as_bytes();
-            body.extend_from_slice(&encode_compressed_int(fname_bytes.len() as u64));
+            write_compressed_int_into(&mut body, fname_bytes.len() as u64);
             body.extend_from_slice(fname_bytes);
             let ftype_bytes = field.type_name.as_bytes();
-            body.extend_from_slice(&encode_compressed_int(ftype_bytes.len() as u64));
+            write_compressed_int_into(&mut body, ftype_bytes.len() as u64);
             body.extend_from_slice(ftype_bytes);
             let fdesc_bytes = field.description.as_bytes();
-            body.extend_from_slice(&encode_compressed_int(fdesc_bytes.len() as u64));
+            write_compressed_int_into(&mut body, fdesc_bytes.len() as u64);
             body.extend_from_slice(fdesc_bytes);
         }
         // Flags: has_thread, has_stacktrace
@@ -262,63 +405,63 @@ fn build_metadata_section(registry: &EventTypeRegistry, start_time_ns: u64) -> V
         body.push(if event_type.has_stacktrace { 1 } else { 0 });
     }
 
-    // Wrap in a size-prefixed record.  Because the size prefix is itself a
-    // variable-length compressed int, we iterate until the prefix length is
-    // stable (same pattern as `serialize_event`).
-    let body_len = body.len();
-    let mut size_prefix_len = 1usize;
-    loop {
-        let total = size_prefix_len + body_len;
-        let actual_prefix_len = encode_compressed_int(total as u64).len();
-        if actual_prefix_len == size_prefix_len {
-            let mut record = Vec::with_capacity(total);
-            record.extend_from_slice(&encode_compressed_int(total as u64));
-            record.extend_from_slice(&body);
-            return record;
-        }
-        size_prefix_len = actual_prefix_len;
-    }
+    write_size_prefixed(writer, &body)
 }
 
 // ---------------------------------------------------------------------------
 // Checkpoint section
 // ---------------------------------------------------------------------------
 
-/// Build a minimal checkpoint section.
-/// In a full JFR implementation this contains constant pool entries (strings,
-/// thread names, stack traces, etc.). We write a minimal checkpoint that
-/// declares zero constant pools.
-fn build_checkpoint_section(start_time_ns: u64) -> Vec<u8> {
-    let mut body = Vec::new();
+/// Tag identifying the string-pool constant-pool in the checkpoint section.
+/// Picked to be distinct from any built-in JFR type ID we use elsewhere.
+const STRING_POOL_TYPE_ID: u64 = 2;
+
+/// Write a checkpoint section into `writer`. When the supplied string pool is
+/// non-empty, the section declares a single constant pool of type
+/// `STRING_POOL_TYPE_ID`, containing every interned string as
+/// `(index, length-prefixed-utf8-bytes)`. Event records that reference these
+/// strings emit tag `4` + a compressed-int index (typically 1-2 bytes) instead
+/// of the full UTF-8 body — the J1 win.
+///
+/// On an empty pool we still emit a valid checkpoint declaring zero pools, so
+/// readers that look at the count are happy.
+fn write_checkpoint_section<W: Write>(
+    writer: &mut W,
+    start_time_ns: u64,
+    pool: &StringPool,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(64 + pool.len() * 16);
 
     // Checkpoint event type ID
-    body.extend_from_slice(&encode_compressed_int(CHECKPOINT_TYPE_ID));
+    write_compressed_int_into(&mut body, CHECKPOINT_TYPE_ID);
     // Timestamp
-    body.extend_from_slice(&encode_compressed_long(start_time_ns as i64));
+    write_compressed_long_into(&mut body, start_time_ns as i64);
     // Duration = 0
-    body.extend_from_slice(&encode_compressed_long(0));
+    write_compressed_long_into(&mut body, 0);
     // Delta to next checkpoint: 0 (this is the only one)
-    body.extend_from_slice(&encode_compressed_long(0));
+    write_compressed_long_into(&mut body, 0);
     // Checkpoint type mask: 0 = flush
-    body.extend_from_slice(&encode_compressed_int(0));
-    // Number of constant pools: 0
-    body.extend_from_slice(&encode_compressed_int(0));
+    write_compressed_int_into(&mut body, 0);
 
-    // Wrap in size-prefixed record.  Iterate until the size-prefix length is
-    // stable (same pattern as `serialize_event`).
-    let body_len = body.len();
-    let mut size_prefix_len = 1usize;
-    loop {
-        let total = size_prefix_len + body_len;
-        let actual_prefix_len = encode_compressed_int(total as u64).len();
-        if actual_prefix_len == size_prefix_len {
-            let mut record = Vec::with_capacity(total);
-            record.extend_from_slice(&encode_compressed_int(total as u64));
-            record.extend_from_slice(&body);
-            return record;
+    if pool.len() == 0 {
+        // No constant pools.
+        write_compressed_int_into(&mut body, 0);
+    } else {
+        // One constant pool: the string interning table.
+        write_compressed_int_into(&mut body, 1);
+        // Pool type ID.
+        write_compressed_int_into(&mut body, STRING_POOL_TYPE_ID);
+        // Entry count.
+        write_compressed_int_into(&mut body, pool.len() as u64);
+        for (idx, bytes) in pool.entries().iter().enumerate() {
+            // (idx, len-prefixed UTF-8 bytes)
+            write_compressed_int_into(&mut body, idx as u64);
+            write_compressed_int_into(&mut body, bytes.len() as u64);
+            body.extend_from_slice(bytes);
         }
-        size_prefix_len = actual_prefix_len;
     }
+
+    write_size_prefixed(writer, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +561,19 @@ pub fn dump_to_file(
     }
     let mut guard = PartGuard { path: &part_path, armed: true };
 
+    // J1 (round-2): walk every event we're about to emit and intern its string
+    // payloads into a per-chunk constant pool. Subsequent serialization writes
+    // a compressed-int pool index per string instead of the full UTF-8 body,
+    // turning N copies of "Allocation Failure" into a single pool entry + N
+    // 1-byte tag-and-index references.
+    let mut string_pool = StringPool::new();
+    for ev in repository.iter() {
+        intern_event_strings(&mut string_pool, &ev.fields);
+    }
+    for ev in &drained {
+        intern_event_strings(&mut string_pool, &ev.fields);
+    }
+
     let file_size = {
         let file = std::fs::File::create(&part_path)?;
         let mut writer = io::BufWriter::new(file);
@@ -425,41 +581,51 @@ pub fn dump_to_file(
         // Write placeholder header (will be updated at the end)
         write_header(&mut writer, 0, 0, 0, start_time_ns, duration_ns, FILE_STATE_WRITING)?;
 
+        // J1: emit the checkpoint section (containing the string pool) BEFORE
+        // the events so readers can resolve constant-pool indices during the
+        // forward sweep. `checkpoint_offset` is recorded for the header.
+        let checkpoint_offset = writer.seek(SeekFrom::Current(0))?;
+        write_checkpoint_section(&mut writer, start_time_ns, &string_pool)?;
+
+        // J2 (round-2): one reusable scratch buffer for every event body. Sized
+        // for a typical event payload up front; serialize_event_into clears
+        // and refills it per call without re-allocating.
+        let mut scratch: Vec<u8> = Vec::with_capacity(256);
+        let pool_ref = if string_pool.len() == 0 { None } else { Some(&string_pool) };
+
         // Write events from the recording's repository first, preserving the
-        // existing on-disk layout for callers that have no per-thread rings.
+        // existing on-disk ordering relative to drained events.
         for event in repository.iter() {
-            let record = serialize_event(
+            serialize_event_into(
+                &mut scratch,
+                &mut writer,
                 event.type_id,
                 event.start_time,
                 event.end_time,
                 event.thread_id,
                 &event.fields,
-            );
-            writer.write_all(&record)?;
+                pool_ref,
+            )?;
         }
 
         // Then write the drained per-thread events (already sorted by
         // start_time, already filtered to known types).
         for event in &drained {
-            let record = serialize_event(
+            serialize_event_into(
+                &mut scratch,
+                &mut writer,
                 event.type_id,
                 event.start_time,
                 event.end_time,
                 event.thread_id,
                 &event.fields,
-            );
-            writer.write_all(&record)?;
+                pool_ref,
+            )?;
         }
-
-        // Write checkpoint
-        let checkpoint_offset = writer.seek(SeekFrom::Current(0))?;
-        let checkpoint = build_checkpoint_section(start_time_ns);
-        writer.write_all(&checkpoint)?;
 
         // Write metadata
         let metadata_offset = writer.seek(SeekFrom::Current(0))?;
-        let metadata = build_metadata_section(registry, start_time_ns);
-        writer.write_all(&metadata)?;
+        write_metadata_section(&mut writer, registry, start_time_ns)?;
 
         // Compute final file size
         let file_size = writer.seek(SeekFrom::Current(0))?;
@@ -554,11 +720,16 @@ pub struct JfrFileHeader {
 /// Decode a single `EventValue` from `data[pos..]` using the declared field
 /// `type_name` ("int", "long", "float", "double", "boolean", "string").
 ///
+/// `pool` provides the decoded constant pool for tag-4 (pool-reference)
+/// strings. When `None`, only inline (tag-3) and null (tag-0) strings are
+/// accepted; this preserves compatibility for files written before J1.
+///
 /// Returns the decoded value plus the number of bytes consumed.
 fn decode_event_value(
     data: &[u8],
     pos: usize,
     type_name: &str,
+    pool: Option<&[std::sync::Arc<str>]>,
 ) -> Result<(EventValue, usize), JfrDumpError> {
     match type_name {
         "int" => {
@@ -632,6 +803,28 @@ fn decode_event_value(
                     })?;
                     Ok((EventValue::String(std::sync::Arc::from(s)), 1 + lc + len as usize))
                 }
+                4 => {
+                    // Pool-reference: compressed-int index into the chunk pool.
+                    let (idx, ic) = decode_compressed_int(&data[pos + 1..]).ok_or_else(|| {
+                        JfrDumpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pool index decode failed",
+                        ))
+                    })?;
+                    let table = pool.ok_or_else(|| {
+                        JfrDumpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pool-ref string but no constant pool was loaded",
+                        ))
+                    })?;
+                    let entry = table.get(idx as usize).ok_or_else(|| {
+                        JfrDumpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("pool index {} out of range (size {})", idx, table.len()),
+                        ))
+                    })?;
+                    Ok((EventValue::String(std::sync::Arc::clone(entry)), 1 + ic))
+                }
                 _ => Err(JfrDumpError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unknown string encoding tag {}", tag),
@@ -643,6 +836,113 @@ fn decode_event_value(
             format!("unsupported field type '{}'", other),
         ))),
     }
+}
+
+/// Parse a JFR checkpoint section starting at `data[offset..]`. Returns the
+/// decoded string-pool entries (if any) and the byte length of the section.
+///
+/// We only extract the one constant pool we emit (STRING_POOL_TYPE_ID); other
+/// pool types are skipped over their declared length. On a malformed
+/// checkpoint we degrade to an empty pool rather than aborting the read.
+fn parse_checkpoint_pool(
+    data: &[u8],
+    offset: usize,
+) -> Result<(Vec<std::sync::Arc<str>>, usize), JfrDumpError> {
+    if offset >= data.len() {
+        return Ok((Vec::new(), 0));
+    }
+    let (record_size, size_len) = decode_compressed_int(&data[offset..]).ok_or_else(|| {
+        JfrDumpError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint record size decode failed",
+        ))
+    })?;
+    let record_end = offset + record_size as usize;
+    if record_end > data.len() {
+        return Err(JfrDumpError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint record extends past EOF",
+        )));
+    }
+    let mut pos = offset + size_len;
+
+    // Skip: type_id, timestamp, duration, delta, type_mask.
+    for _ in 0..5 {
+        let (_, c) = decode_compressed_long(&data[pos..]).ok_or_else(|| {
+            JfrDumpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "checkpoint header field decode failed",
+            ))
+        })?;
+        pos += c;
+    }
+    // Number of constant pools.
+    let (n_pools, c) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+        JfrDumpError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "constant pool count decode failed",
+        ))
+    })?;
+    pos += c;
+
+    let mut strings: Vec<std::sync::Arc<str>> = Vec::new();
+    for _ in 0..n_pools {
+        let (pool_type, ptc) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+            JfrDumpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pool type decode failed",
+            ))
+        })?;
+        pos += ptc;
+        let (n_entries, nec) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+            JfrDumpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pool entry count decode failed",
+            ))
+        })?;
+        pos += nec;
+
+        if pool_type == STRING_POOL_TYPE_ID {
+            strings.reserve(n_entries as usize);
+            for _ in 0..n_entries {
+                let (_idx, ic) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+                    JfrDumpError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pool entry index decode failed",
+                    ))
+                })?;
+                pos += ic;
+                let (slen, lc) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+                    JfrDumpError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pool entry length decode failed",
+                    ))
+                })?;
+                pos += lc;
+                let end = pos + slen as usize;
+                if end > record_end {
+                    return Err(JfrDumpError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pool entry body extends past record",
+                    )));
+                }
+                let s = std::str::from_utf8(&data[pos..end]).map_err(|e| {
+                    JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, e))
+                })?;
+                strings.push(std::sync::Arc::from(s));
+                pos = end;
+            }
+        } else {
+            // Unknown pool type — we have no length field to skip, so abort
+            // rather than misalign. Should not happen for files we wrote.
+            return Err(JfrDumpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown checkpoint pool type {}", pool_type),
+            )));
+        }
+    }
+
+    Ok((strings, record_end - offset))
 }
 
 /// Read every event record from a previously-written JFR file. The provided
@@ -673,12 +973,36 @@ pub fn read_events(
     }
     let checkpoint_offset =
         u64::from_be_bytes(data[16..24].try_into().unwrap()) as usize;
+    let metadata_offset =
+        u64::from_be_bytes(data[24..32].try_into().unwrap()) as usize;
 
-    // Walk records between header end and the checkpoint section. Each record
-    // starts with a compressed_int size field that includes the size byte(s).
-    let mut pos = HEADER_SIZE as usize;
+    // J1 (round-2): the writer emits checkpoint BEFORE events, so we parse the
+    // pool first, then walk events between (checkpoint_end .. metadata_offset).
+    // Files written by older versions place the checkpoint AFTER events; we
+    // detect that layout by comparing offsets and fall back to the legacy walk.
+    let (pool, events_start, events_end) =
+        if checkpoint_offset >= HEADER_SIZE as usize && checkpoint_offset < metadata_offset {
+            // Determine layout: if checkpoint sits right after the header (new
+            // layout), parse the pool and walk events after it. Otherwise the
+            // checkpoint is after the events (legacy) — events live between
+            // HEADER_SIZE and checkpoint_offset.
+            if checkpoint_offset == HEADER_SIZE as usize {
+                let (p, len) = parse_checkpoint_pool(&data, checkpoint_offset)?;
+                (p, checkpoint_offset + len, metadata_offset)
+            } else {
+                (Vec::new(), HEADER_SIZE as usize, checkpoint_offset)
+            }
+        } else {
+            (Vec::new(), HEADER_SIZE as usize, checkpoint_offset)
+        };
+    let pool_ref: Option<&[std::sync::Arc<str>]> =
+        if pool.is_empty() { None } else { Some(&pool) };
+
+    // Walk records within [events_start, events_end). Each record starts with
+    // a compressed_int size field that includes the size byte(s).
+    let mut pos = events_start;
     let mut out = Vec::new();
-    while pos < checkpoint_offset {
+    while pos < events_end {
         let (total_size, size_len) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -686,10 +1010,10 @@ pub fn read_events(
             ))
         })?;
         let record_end = pos + total_size as usize;
-        if record_end > checkpoint_offset {
+        if record_end > events_end {
             return Err(JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "record extends past checkpoint",
+                "record extends past events region",
             )));
         }
 
@@ -736,7 +1060,7 @@ pub fn read_events(
 
         let mut fields = Vec::with_capacity(ty.fields.len());
         for field in &ty.fields {
-            let (v, c) = decode_event_value(&data, rpos, &field.type_name)?;
+            let (v, c) = decode_event_value(&data, rpos, &field.type_name, pool_ref)?;
             fields.push(v);
             rpos += c;
         }
@@ -1104,6 +1428,10 @@ mod tests {
 
     #[test]
     fn test_dump_event_data_between_header_and_checkpoint() {
+        // J1 (round-2): events now live between the checkpoint section (at
+        // HEADER_SIZE) and `metadata_offset`. The checkpoint sits right after
+        // the header so readers can resolve constant-pool string references
+        // during the forward sweep.
         let (reg, type_id) = make_registry_with_one_type();
         let mut repo = EventRepository::new(10);
         repo.push(EventInstance {
@@ -1121,22 +1449,21 @@ mod tests {
         dump_to_file(&path, &repo, &reg, 100, 100).unwrap();
         let header = read_jfr_header(&path).unwrap();
 
-        // Events live between HEADER_SIZE and checkpoint_offset
-        let event_region_size = header.checkpoint_offset - HEADER_SIZE;
-        assert!(event_region_size > 0, "event region should be non-empty");
+        // The checkpoint should sit right at HEADER_SIZE.
+        assert_eq!(header.checkpoint_offset, HEADER_SIZE);
+        assert!(header.metadata_offset > header.checkpoint_offset);
 
-        // Read the event region
-        let data = std::fs::read(&path).unwrap();
-        let event_data = &data[HEADER_SIZE as usize..header.checkpoint_offset as usize];
-
-        // First byte(s) of the event region should decode as a valid compressed int (size)
-        let (size, consumed) = decode_compressed_int(event_data).unwrap();
-        assert!(size > 0);
-        assert!(consumed > 0);
-
-        // The event type ID should follow the size
-        let (decoded_type_id, _) = decode_compressed_int(&event_data[consumed..]).unwrap();
-        assert_eq!(decoded_type_id, type_id.0 as u64);
+        // The event region lives between (checkpoint_end .. metadata_offset).
+        // We don't compute checkpoint_end here directly; instead just read the
+        // events back via `read_events` and assert they roundtrip.
+        let events = read_events(&path, &reg).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].type_id, type_id);
+        assert_eq!(events[0].start_time, 100);
+        match &events[0].fields[1] {
+            EventValue::String(s) => assert_eq!(s.as_ref(), "a"),
+            other => panic!("expected interned String, got {:?}", other),
+        }
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -1172,13 +1499,19 @@ mod tests {
 
     #[test]
     fn test_serialize_event_basic() {
-        let record = serialize_event(
+        let mut scratch = Vec::with_capacity(64);
+        let mut record: Vec<u8> = Vec::new();
+        serialize_event_into(
+            &mut scratch,
+            &mut record,
             EventTypeId(5),
             1000,
             2000,
             1,
             &[EventValue::Int(42)],
-        );
+            None,
+        )
+        .unwrap();
         // Should be non-empty and start with a size prefix
         assert!(!record.is_empty());
         let (size, consumed) = decode_compressed_int(&record).unwrap();

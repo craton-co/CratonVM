@@ -303,6 +303,250 @@ pub fn font_engine() -> parking_lot::MutexGuard<'static, FontEngine> {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Glyph atlas — per-glyph alpha-bitmap cache
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Round-2 N2-2 fix: `rasterize_text` in the X11 and Cocoa backends currently
+// loads a fontdue Font and re-rasterizes every glyph on every call. For a UI
+// typing in a JTextField each keystroke re-rasterizes every visible character,
+// which is unnecessary work since glyph alpha masks are pure functions of
+// (family, size, weight, style, codepoint).
+//
+// `GlyphAtlas` caches `Arc<GlyphBitmap>` keyed by those identifying inputs.
+// Lookups are O(1) (FxHashMap) under a single `parking_lot::Mutex`. The
+// returned `Arc` shares one allocation across all callers, so the platform
+// compositor can hold it without copying.
+//
+// The atlas is colour-agnostic: it stores the raw alpha mask returned by
+// fontdue. The platform composites that mask into ARGB with whatever ink
+// colour the caller requested. Keying by colour would multiply the working
+// set by ~16M with zero rasterization savings.
+//
+// TODO(platform-migration): the following sites still call
+// `font.rasterize(ch, font_size)` directly per glyph per call and should be
+// migrated to `global_glyph_atlas().get_or_rasterize(key, &font)`:
+//   - `native-awt/src/platform/x11.rs::rasterize_text` (≈line 595)
+//   - `native-awt/src/platform/cocoa.rs::rasterize_text` (≈line 554)
+// Both sites use the identical fontdue-based code path, so the migration is
+// mechanical: build a `GlyphKey` per char, fetch the bitmap from the atlas,
+// then composite `bitmap.alpha` into the ARGB output using
+// `bitmap.bearing_x` / `bearing_y` / `advance` for positioning (replacing the
+// raw `metrics.xmin` / `metrics.ymin` / `metrics.advance_width` uses).
+
+/// Default capacity (number of distinct glyphs) for the global atlas.
+///
+/// Sized for typical Swing UIs: a few logical fonts × a handful of point
+/// sizes × {plain, bold, italic} × the ASCII printable range plus common
+/// punctuation easily fits well under this. Pathological apps cycling many
+/// glyph variants will trigger the bulk-eviction path below.
+const GLYPH_ATLAS_CAP: usize = 2048;
+
+/// Identifying tuple for a rasterized glyph.
+///
+/// `family_id` is the FxHash of the family name (after logical-family
+/// canonicalization). Using a 32-bit hash instead of the `Arc<str>` keeps
+/// the key `Copy` and 16 bytes wide — cheap enough that we don't bother
+/// interning. Collisions on family names are negligible in practice (the
+/// realistic universe is ~10 family strings) and a collision would only
+/// produce a visually-wrong glyph for one application run, not a crash.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct GlyphKey {
+    /// Hashed family name (Dialog, SansSerif, Monospaced, …).
+    pub family_id: u32,
+    /// Pixel size (fontdue takes f32; we round to u32 since sub-pixel sizes
+    /// are not exposed by `java.awt.Font` integer points).
+    pub size: u32,
+    /// Bold weight flag.
+    pub bold: bool,
+    /// Italic style flag.
+    pub italic: bool,
+    /// Unicode code point.
+    pub ch: u32,
+}
+
+impl GlyphKey {
+    /// Hash a family name into the `family_id` field.
+    ///
+    /// Uses FxHash (same hasher as the atlas map) for cheap, deterministic
+    /// hashing without a per-process random seed. Callers should pass the
+    /// canonical family name (see [`FontEngine::get_logical_family`]) so two
+    /// aliases like "Dialog" and "Arial" share the same key.
+    pub fn family_id_from(name: &str) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        name.hash(&mut hasher);
+        // Truncate the 64-bit FxHash to 32 bits; the residual collision rate
+        // is far below the noise floor for our ~10-family realistic universe.
+        hasher.finish() as u32
+    }
+
+    /// Convenience constructor that takes the family name as a string and
+    /// hashes it. Use this from the platform sites that have the raw family
+    /// string in hand.
+    pub fn new(family: &str, size: u32, bold: bool, italic: bool, ch: char) -> Self {
+        GlyphKey {
+            family_id: Self::family_id_from(family),
+            size,
+            bold,
+            italic,
+            ch: ch as u32,
+        }
+    }
+}
+
+/// A cached rasterized glyph: alpha mask plus placement metrics.
+///
+/// `alpha` is `Arc<[u8]>` so the cache and all callers share one allocation.
+/// `width * height` bytes; row-major, no padding. Each byte is the fontdue
+/// coverage value in 0..=255 (treated as straight alpha by the compositor).
+///
+/// Placement fields mirror the subset of `fontdue::Metrics` that the
+/// platform compositors actually consume. We do not store the full
+/// `fontdue::Metrics` because (a) it changes shape across fontdue versions
+/// and (b) we don't need its extra fields here.
+#[derive(Clone)]
+pub struct GlyphBitmap {
+    /// Alpha mask (0..=255). `width * height` bytes, row-major.
+    pub alpha: Arc<[u8]>,
+    /// Bitmap width in pixels.
+    pub width: u32,
+    /// Bitmap height in pixels.
+    pub height: u32,
+    /// Horizontal offset from the pen position to the bitmap's left edge.
+    /// Maps to `fontdue::Metrics::xmin`.
+    pub bearing_x: i32,
+    /// Vertical offset from the baseline to the bitmap's bottom edge
+    /// (positive = above baseline). Maps to `fontdue::Metrics::ymin`.
+    pub bearing_y: i32,
+    /// Horizontal pen advance after this glyph, in pixels.
+    pub advance: f32,
+}
+
+/// Process-wide cache of rasterized glyphs.
+///
+/// Eviction strategy: when the map reaches `cap`, drop the first
+/// `cap / 2` entries observed during hashmap iteration. FxHashMap's
+/// iteration order is deterministic for a given insertion history but not
+/// LRU-ordered, so this is effectively pseudo-random eviction. That's the
+/// right trade-off here:
+///
+///   - True LRU would require per-lookup bookkeeping (linked-list pointer
+///     updates under the same mutex), making the hot get path measurably
+///     slower for the steady-state cache-hit case we're optimizing.
+///   - The working set of an interactive UI is small (a few hundred glyphs)
+///     and refills cheaply: a missed glyph just re-rasterizes once, then
+///     stays hot.
+///   - The cap is a soft pressure-release valve, not a precision tool.
+///
+/// If profiling later shows excessive thrashing on real workloads, swap the
+/// internals for a real LRU without changing the public API.
+pub struct GlyphAtlas {
+    cache: Mutex<rustc_hash::FxHashMap<GlyphKey, Arc<GlyphBitmap>>>,
+    cap: usize,
+}
+
+impl GlyphAtlas {
+    /// Construct an empty atlas with the given soft cap.
+    pub fn new(cap: usize) -> Self {
+        GlyphAtlas {
+            cache: Mutex::new(rustc_hash::FxHashMap::default()),
+            cap,
+        }
+    }
+
+    /// Soft cap on cache entries before eviction kicks in.
+    #[inline]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Current number of cached glyphs. Mainly useful for tests / debug.
+    pub fn len(&self) -> usize {
+        self.cache.lock().len()
+    }
+
+    /// Whether the cache currently holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.cache.lock().is_empty()
+    }
+
+    /// Drop all cached glyphs. Mainly for tests; production code should
+    /// rely on bounded growth via [`GlyphAtlas::new`]'s `cap`.
+    pub fn clear(&self) {
+        self.cache.lock().clear();
+    }
+
+    /// Look up a glyph; rasterize via `fontdue_font` and insert if missing.
+    ///
+    /// The returned `Arc<GlyphBitmap>` is shared with the cache. The hot
+    /// path is a single mutex acquire and a hashmap lookup — no allocation.
+    /// On a miss we rasterize outside the lock (the only contention-sensitive
+    /// section is the insert), then re-acquire to insert.
+    ///
+    /// Note: in the rare race where two threads miss the same key
+    /// concurrently we may rasterize twice; both bitmaps will be byte-equal
+    /// and the second insert overwrites the first. That's harmless and
+    /// cheaper than holding the mutex across the rasterization call.
+    pub fn get_or_rasterize(
+        &self,
+        key: GlyphKey,
+        fontdue_font: &fontdue::Font,
+    ) -> Arc<GlyphBitmap> {
+        // Hot path: scoped lock, drops before any work.
+        if let Some(g) = self.cache.lock().get(&key).cloned() {
+            return g;
+        }
+
+        // Miss: rasterize outside the lock. `from_u32` is the safe path —
+        // we never want to panic on a surrogate or out-of-range code point
+        // sneaked in by upstream string handling.
+        let ch = std::char::from_u32(key.ch).unwrap_or(' ');
+        let (metrics, alpha_vec) = fontdue_font.rasterize(ch, key.size as f32);
+
+        let bitmap = Arc::new(GlyphBitmap {
+            alpha: alpha_vec.into(),
+            width: metrics.width as u32,
+            height: metrics.height as u32,
+            bearing_x: metrics.xmin,
+            bearing_y: metrics.ymin,
+            advance: metrics.advance_width,
+        });
+
+        // Insert path. Reacquire the lock and bulk-evict if at cap.
+        let mut cache = self.cache.lock();
+        if cache.len() >= self.cap {
+            // Pseudo-random bulk eviction: drop the first half of whatever
+            // the iterator yields. Cheaper than tracking LRU and adequate
+            // for the soft-cap role this serves. See `GlyphAtlas` docs.
+            let drop_count = cache.len() / 2;
+            let keys_to_drop: Vec<GlyphKey> =
+                cache.keys().take(drop_count).copied().collect();
+            for k in keys_to_drop {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(key, Arc::clone(&bitmap));
+        bitmap
+    }
+}
+
+impl Default for GlyphAtlas {
+    fn default() -> Self {
+        Self::new(GLYPH_ATLAS_CAP)
+    }
+}
+
+/// Process-global glyph atlas, lazily initialised on first use.
+///
+/// Shared across all platform backends and all threads. The atlas itself is
+/// internally synchronised (`Mutex`), so callers do not need any further
+/// locking around `get_or_rasterize`.
+pub fn global_glyph_atlas() -> &'static GlyphAtlas {
+    static ATLAS: OnceLock<GlyphAtlas> = OnceLock::new();
+    ATLAS.get_or_init(|| GlyphAtlas::new(GLYPH_ATLAS_CAP))
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -524,5 +768,82 @@ mod tests {
         let spec = FontSpec::new("Dialog", PLAIN, 12);
         let m = engine.get_metrics(&spec);
         assert!(m.ascent > 0);
+    }
+
+    // ── Glyph atlas ──────────────────────────────────────────────────
+
+    #[test]
+    fn glyph_key_family_id_canonical() {
+        // Same string → same hash, every time.
+        let a = GlyphKey::family_id_from("SansSerif");
+        let b = GlyphKey::family_id_from("SansSerif");
+        assert_eq!(a, b);
+
+        // Different strings → almost-certainly different hashes (32-bit).
+        let c = GlyphKey::family_id_from("Monospaced");
+        assert_ne!(a, c, "Distinct family names should hash apart");
+    }
+
+    #[test]
+    fn glyph_key_equality_and_hash() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let k1 = GlyphKey::new("Dialog", 12, false, false, 'A');
+        let k2 = GlyphKey::new("Dialog", 12, false, false, 'A');
+        let k3 = GlyphKey::new("Dialog", 12, true, false, 'A');
+        assert_eq!(k1, k2);
+        assert_ne!(k1, k3);
+
+        let hash = |k: &GlyphKey| {
+            let mut h = DefaultHasher::new();
+            k.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&k1), hash(&k2));
+    }
+
+    #[test]
+    fn glyph_atlas_construction_and_bounds() {
+        let atlas = GlyphAtlas::new(64);
+        assert!(atlas.is_empty());
+        assert_eq!(atlas.len(), 0);
+        assert_eq!(atlas.cap(), 64);
+    }
+
+    #[test]
+    fn glyph_atlas_clear() {
+        let atlas = GlyphAtlas::new(8);
+        // Directly poke a bitmap in so we don't need a real fontdue font.
+        {
+            let mut cache = atlas.cache.lock();
+            cache.insert(
+                GlyphKey::new("Dialog", 12, false, false, 'A'),
+                Arc::new(GlyphBitmap {
+                    alpha: Vec::<u8>::new().into(),
+                    width: 0,
+                    height: 0,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                    advance: 0.0,
+                }),
+            );
+        }
+        assert_eq!(atlas.len(), 1);
+        atlas.clear();
+        assert!(atlas.is_empty());
+    }
+
+    #[test]
+    fn glyph_atlas_default_uses_global_cap() {
+        let atlas = GlyphAtlas::default();
+        assert_eq!(atlas.cap(), GLYPH_ATLAS_CAP);
+    }
+
+    #[test]
+    fn global_glyph_atlas_returns_same_instance() {
+        let a = global_glyph_atlas() as *const GlyphAtlas;
+        let b = global_glyph_atlas() as *const GlyphAtlas;
+        assert_eq!(a, b, "global_glyph_atlas() must be a singleton");
     }
 }

@@ -1486,18 +1486,57 @@ pub(crate) fn native_math_to_degrees(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Double(v.to_degrees())))
 }
 
-pub(crate) fn native_math_random(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+thread_local! {
+    static MATH_RANDOM_SEED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn thread_id_u64() -> u64 {
+    // No stable `ThreadId::as_u64`; use a process-wide counter assigned per thread.
     use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0x5DEECE66D);
+    static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+    thread_local! { static TID: u64 = NEXT_TID.fetch_add(1, Ordering::Relaxed); }
+    TID.with(|t| *t)
+}
 
-    // Simple LCG (same constants as java.util.Random)
-    let old = SEED.load(Ordering::Relaxed);
-    let new_seed = old.wrapping_mul(0x5DEECE66D).wrapping_add(0xB) & 0xFFFF_FFFF_FFFF;
-    SEED.store(new_seed, Ordering::Relaxed);
+#[inline]
+fn init_seed_if_zero() -> u64 {
+    MATH_RANDOM_SEED.with(|c| {
+        let v = c.get();
+        if v != 0 {
+            return v;
+        }
+        // Lazy first-touch seed from time + thread id so threads don't all
+        // start with the same constant.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5DEECE66D);
+        let tid = thread_id_u64();
+        let seed = now_ns.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(tid);
+        let seed = if seed == 0 { 0x5DEECE66D } else { seed };
+        c.set(seed);
+        seed
+    })
+}
 
-    // Use top 53 bits to make a double in [0, 1)
-    let bits = (new_seed >> 1) as f64 / (1u64 << 47) as f64;
-    Ok(Some(Value::Double(bits.abs().fract())))
+pub(crate) fn native_math_random(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let next = MATH_RANDOM_SEED.with(|c| {
+        let mut v = c.get();
+        if v == 0 {
+            v = init_seed_if_zero();
+        }
+        // SplitMix64 — advance state then mix.
+        let new = v.wrapping_add(0x9E3779B97F4A7C15);
+        c.set(new);
+        let mut z = new;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    });
+    // Convert to [0.0, 1.0) double: take top 53 bits.
+    let bits = (next >> 11) as f64 / ((1u64 << 53) as f64);
+    Ok(Some(Value::Double(bits)))
 }
 
 #[inline]

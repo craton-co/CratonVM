@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::buffer::ClassFileBuffer;
@@ -382,29 +383,67 @@ pub struct MethodParameter {
 /// [`new_decoded`]: LazyAttribute::new_decoded
 #[derive(Debug, Clone)]
 pub enum LazyAttribute {
-    /// Undecoded: name + raw byte body of the attribute (the bytes that
-    /// follow the `attribute_length` field, exactly `attribute_length` of
-    /// them). The bytes are owned by the `LazyAttribute` so they outlive
-    /// the source class file buffer.
+    /// Undecoded: name + a (refcounted) reference into the original class
+    /// file buffer plus the byte range that contains this attribute's body.
+    ///
+    /// The `source` is an `Arc<[u8]>` shared with every other lazy attribute
+    /// produced from the same class file: cloning a `LazyAttribute` is one
+    /// refcount bump on `name`, one refcount bump on `source`, and a
+    /// `Range` copy — no body bytes are duplicated. The first lazy
+    /// attribute for a class file pins the entire class buffer alive; when
+    /// the last lazy attribute (or its decoded descendant retaining a
+    /// reference) drops, the backing buffer is freed.
+    ///
+    /// The range is `[start, end)` within `source`; `source[range.clone()]`
+    /// is exactly the `attribute_length` body bytes, *excluding* the
+    /// `attribute_name_index` and `attribute_length` header fields.
     Raw {
         /// The attribute name, e.g. `"Code"`, `"SourceFile"`. Shared
         /// `Arc<str>` from the constant pool's string pool.
         name: Arc<str>,
-        /// The raw attribute body bytes. Does NOT include the
-        /// `attribute_name_index` or `attribute_length` header fields.
-        bytes: Vec<u8>,
+        /// The shared backing buffer (typically the whole class file).
+        source: Arc<[u8]>,
+        /// Byte range within `source` containing the attribute body.
+        range: Range<usize>,
     },
     /// Decoded: parsed [`Attribute`] variant.
     Decoded(Attribute),
 }
 
 impl LazyAttribute {
-    /// Construct from raw attribute body bytes. The `name` is the attribute
-    /// name as resolved from the constant pool; `bytes` is the attribute
-    /// body (i.e. exactly `attribute_length` bytes, *excluding* the name
-    /// index and length header fields).
+    /// Construct a `Raw` variant from a shared source buffer + byte range.
+    ///
+    /// This is the zero-copy constructor: callers that already hold the
+    /// class file as an `Arc<[u8]>` clone the Arc (refcount bump, no
+    /// memcpy) and hand it in alongside the body's `start..end` range.
+    pub fn new_raw_in(name: Arc<str>, source: Arc<[u8]>, range: Range<usize>) -> Self {
+        debug_assert!(
+            range.end <= source.len(),
+            "LazyAttribute::new_raw_in: range {:?} exceeds source len {}",
+            range,
+            source.len()
+        );
+        debug_assert!(
+            range.start <= range.end,
+            "LazyAttribute::new_raw_in: empty/inverted range {:?}",
+            range
+        );
+        LazyAttribute::Raw { name, source, range }
+    }
+
+    /// Construct from owned attribute body bytes.
+    ///
+    /// Wraps the `Vec<u8>` in a fresh `Arc<[u8]>` and points at the whole
+    /// thing. Preserved as a convenience for callers (tests, synthetic
+    /// attribute construction) that already have owned bytes; the
+    /// production class reader path uses [`new_raw_in`] to avoid the
+    /// allocation entirely.
+    ///
+    /// [`new_raw_in`]: LazyAttribute::new_raw_in
     pub fn new_raw(name: Arc<str>, bytes: Vec<u8>) -> Self {
-        LazyAttribute::Raw { name, bytes }
+        let source: Arc<[u8]> = bytes.into();
+        let len = source.len();
+        Self::new_raw_in(name, source, 0..len)
     }
 
     /// Construct from an already-decoded [`Attribute`].
@@ -438,16 +477,18 @@ impl LazyAttribute {
         &mut self,
         constant_pool: &ConstantPool,
     ) -> Result<&Attribute, ClassReaderError> {
-        // Two-phase to satisfy the borrow checker: take ownership of the raw
-        // bytes, decode, then write the decoded variant back into `self`.
-        if let LazyAttribute::Raw { name, bytes } = self {
-            // `mem::take` cheaply moves the contents out, leaving empty
-            // placeholders. The Raw variant is unobservable to callers
-            // between the take and the assignment below because we have
-            // exclusive `&mut self`.
-            let name = std::mem::take(name);
-            let bytes = std::mem::take(bytes);
-            let decoded = decode_attribute(&name, &bytes, constant_pool)?;
+        // Two-phase to satisfy the borrow checker: read the name + slice
+        // first (immutable borrow of `self`), drop that borrow, then assign
+        // the Decoded variant back into `self`. We hold an `Arc<str>` clone
+        // for the name and a `&[u8]` slice via the Arc backing buffer; both
+        // remain valid for the duration of `decode_attribute`.
+        if let LazyAttribute::Raw { name, source, range } = self {
+            // Clone the Arc<str> (refcount bump) and snapshot the range.
+            let name = name.clone();
+            // `source[range]` borrows from `source`, which is owned by
+            // `self`; that borrow lasts only through `decode_attribute`.
+            let slice = &source[range.clone()];
+            let decoded = decode_attribute(&name, slice, constant_pool)?;
             *self = LazyAttribute::Decoded(decoded);
         }
         match self {

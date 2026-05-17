@@ -341,13 +341,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: std::sync::OnceLock::new(),
-            signature_cache: std::sync::OnceLock::new(),
-            nest_host_cache: std::sync::OnceLock::new(),
-            enclosing_method_cache: std::sync::OnceLock::new(),
-            record_components_cache: std::sync::OnceLock::new(),
         });
         id
     }
@@ -715,13 +709,7 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
-            attributes: Vec::new(),
             array_info: None,
-            source_file_cache: std::sync::OnceLock::new(),
-            signature_cache: std::sync::OnceLock::new(),
-            nest_host_cache: std::sync::OnceLock::new(),
-            enclosing_method_cache: std::sync::OnceLock::new(),
-            record_components_cache: std::sync::OnceLock::new(),
         });
         id
     }
