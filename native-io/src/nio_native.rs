@@ -231,10 +231,11 @@ fn native_fd_preclose0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     Ok(None)
 }
 
-/// `force0(FileDescriptor, boolean) -> int` — fsync. Return 0 (success).
-fn native_fd_force0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
-}
+// `force0` — the real, fsync-issuing implementation lives in
+// `file_channel.rs::native_fc_force0` and is registered by
+// `register_file_channel_real`. The previous stub here was a silent
+// no-op which corrupted durability guarantees for callers of
+// `FileChannel.force` — removed to prevent re-introduction.
 
 /// `truncate0(FileDescriptor, long) -> int`
 fn native_fd_truncate0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -306,41 +307,16 @@ fn native_fd_setdirect0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 // sun/nio/ch/FileChannelImpl natives (the static ones that live on
 // FileDispatcherImpl in JDK 25 — but historically these also exist on
 // FileChannelImpl; register on both classes for safety).
+//
+// NOTE: `map0`, `unmap0`, `transferTo0`, `maxDirectTransferSize0`, and
+// `force0` are intentionally NOT defined here. Their canonical, real
+// implementations live in `file_channel.rs` and are registered by
+// `register_file_channel_real`. Previously this module carried stub
+// versions and registered them on the same (class, name, desc) keys —
+// whichever registration ran last won, which was fragile and on at
+// least one config let the no-op `force0` stub clobber the real
+// fsync-issuing implementation, silently breaking durability.
 // ---------------------------------------------------------------------------
-
-/// `map0(FileDescriptor, int prot, long pos, long size, boolean isSync) -> long`
-///
-/// In JDK 25 this lives on `FileDispatcherImpl` but callers may also
-/// hit `FileChannelImpl.map0`. We refuse to produce a fake address
-/// and instead throw IOException so the JDK falls back to non-mapped
-/// I/O (this is why we set `sun.zip.disableMemoryMapping=true`).
-fn native_fc_map0_real(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Err(io_error(
-        "map0: memory-mapped files are disabled in this VM; see sun.zip.disableMemoryMapping",
-    ))
-}
-
-/// `unmap0(long addr, long size) -> int` — unmap a previously-mapped
-/// region. Since map0 never succeeds, this is a noop.
-fn native_fc_unmap0_real(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
-}
-
-/// `transferTo0(FileDescriptor, long pos, long count, FileDescriptor, boolean) -> long`
-///
-/// Returns -2 (`IOStatus.UNSUPPORTED`) so the JDK falls back to a
-/// user-space copy loop via read/write.
-fn native_fc_transfer_to0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Long(-2)))
-}
-
-/// `maxDirectTransferSize0() -> int` — upper bound on transferTo.
-fn native_fc_max_direct_transfer_size0(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(Some(Value::Int(8 * 1024 * 1024)))
-}
 
 /// `position0(FileDescriptor, long) -> long` — get/set position.
 /// On JDK 25 the second arg is the requested position (-1 to query).
@@ -445,7 +421,8 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         r.register(cls, "writev0", "(Ljava/io/FileDescriptor;JI)J", native_fd_writev0);
         r.register(cls, "size0", "(Ljava/io/FileDescriptor;)J", native_fd_size0);
         r.register(cls, "seek0", "(Ljava/io/FileDescriptor;J)J", native_fd_seek0);
-        r.register(cls, "force0", "(Ljava/io/FileDescriptor;Z)I", native_fd_force0);
+        // `force0` is registered by `file_channel.rs::register_file_channel_real`
+        // (real fsync via `std::fs::File::sync_all` / `sync_data`).
         r.register(cls, "truncate0", "(Ljava/io/FileDescriptor;J)I", native_fd_truncate0);
         r.register(cls, "available0", "(Ljava/io/FileDescriptor;)I", native_fd_available0);
         r.register(cls, "isOther0", "(Ljava/io/FileDescriptor;)Z", native_fd_isother0);
@@ -457,30 +434,22 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         r.register(cls, "setDirect0", "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I",
                    native_fd_setdirect0);
         r.register(cls, "init", "()V", native_nt_init);
-        // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 /
-        // allocationGranularity0 also live here in JDK 25.
-        r.register(cls, "map0", "(Ljava/io/FileDescriptor;IJJZ)J", native_fc_map0_real);
-        r.register(cls, "map0", "(Ljava/io/FileDescriptor;IJJ)J", native_fc_map0_real);
-        r.register(cls, "unmap0", "(JJ)I", native_fc_unmap0_real);
-        r.register(cls, "transferTo0",
-                   "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J",
-                   native_fc_transfer_to0);
-        r.register(cls, "transferTo0",
-                   "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J",
-                   native_fc_transfer_to0);
-        r.register(cls, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
+        // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 / force0
+        // are registered by `file_channel.rs::register_file_channel_real`
+        // (real memmap2 / sendfile / fsync implementations). They were
+        // previously stubbed here and the duplicate registration was
+        // fragile — order-of-registration decided which won. Only
+        // `allocationGranularity0` (a pure constant) is owned here.
         r.register(cls, "allocationGranularity0", "()J", native_fc_allocation_granularity0);
     }
 
     // --- FileChannelImpl (legacy names for older JDKs that carried the
-    // natives directly on this class). These are also the ones we
-    // previously registered for `unmap0` in synthetic mode. ---
+    // natives directly on this class). The map0 / unmap0 / transferTo0 /
+    // maxDirectTransferSize0 entries here are owned by
+    // `file_channel.rs::register_file_channel_real`. Only `position0`,
+    // `allocationGranularity0` and `initIDs` remain — none of those
+    // have a "real" counterpart and they are otherwise harmless.
     let fci = "sun/nio/ch/FileChannelImpl";
-    r.register(fci, "map0", "(IJJZ)J", native_fc_map0_real);
-    r.register(fci, "map0", "(IJJ)J", native_fc_map0_real);
-    r.register(fci, "unmap0", "(JJ)I", native_fc_unmap0_real);
-    r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
-    r.register(fci, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
     r.register(fci, "position0", "(Ljava/io/FileDescriptor;J)J", native_fc_position0);
     r.register(fci, "allocationGranularity0", "()J", native_fc_allocation_granularity0);
     r.register(fci, "initIDs", "()J", |_c, _a| Ok(Some(Value::Long(65536))));

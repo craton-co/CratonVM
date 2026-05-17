@@ -252,6 +252,40 @@ fn composite(src: u32, dst: u32, mode: CompositeMode) -> u32 {
     }
 }
 
+// ── Row-level composite helpers (fast paths) ─────────────────────────
+//
+// These walk a `&mut [u32]` destination slice and a (solid color or
+// source slice) and apply SRC_OVER in a tight scalar loop. Kept simple
+// so the optimizer can vectorize / unroll; SIMD intrinsics can be
+// dropped in later without touching the call sites.
+
+/// SRC_OVER blend of a single solid `src_argb` into every pixel of `dst`.
+/// Caller has already filtered out the fully-opaque and fully-transparent
+/// edge cases (those are handled with a memset / no-op).
+#[inline]
+fn composite_row_src_over_solid(dst: &mut [u32], src_argb: u32) {
+    for d in dst.iter_mut() {
+        *d = composite(src_argb, *d, CompositeMode::SrcOver);
+    }
+}
+
+/// SRC_OVER blend of `src` slice into `dst` slice (same length).
+#[inline]
+fn composite_row_src_over(dst: &mut [u32], src: &[u32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        let sv = *s;
+        let sa = argb_a(sv);
+        // Branch on alpha so the common cases (fully opaque sprite pixel
+        // and fully transparent pixel) don't pay the full blend cost.
+        if sa == 255 {
+            *d = sv;
+        } else if sa != 0 {
+            *d = composite(sv, *d, CompositeMode::SrcOver);
+        }
+    }
+}
+
 // ── SoftwareRenderer ──────────────────────────────────────────────────
 
 pub struct SoftwareRenderer {
@@ -432,6 +466,97 @@ impl SoftwareRenderer {
 
     fn fill_rect_raw(&mut self, x: i32, y: i32, w: u32, h: u32) {
         let color = self.color;
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        // Fast path: identity transform + axis-aligned rect.
+        // Clip is computed ONCE; inner loop is per-row slice work.
+        if self.transform.is_identity() {
+            // Compute the destination rect in buffer space (inclusive-exclusive).
+            let mut x0 = x;
+            let mut y0 = y;
+            let mut x1 = x.saturating_add(w as i32);
+            let mut y1 = y.saturating_add(h as i32);
+
+            // Clip against the buffer.
+            x0 = x0.max(0);
+            y0 = y0.max(0);
+            x1 = x1.min(self.width as i32);
+            y1 = y1.min(self.height as i32);
+
+            // Clip against the user clip rect, if any.
+            if let Some(ref clip) = self.clip {
+                x0 = x0.max(clip.x);
+                y0 = y0.max(clip.y);
+                x1 = x1.min(clip.x.saturating_add(clip.width as i32));
+                y1 = y1.min(clip.y.saturating_add(clip.height as i32));
+            }
+
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
+
+            let stride = self.width as usize;
+            let xs = x0 as usize;
+            let xe = x1 as usize;
+            let mode = self.composite_mode;
+
+            // Specialize on composite mode so the hot loop has no inner branch.
+            match mode {
+                CompositeMode::Src => {
+                    for row in (y0 as usize)..(y1 as usize) {
+                        let start = row * stride + xs;
+                        let end = row * stride + xe;
+                        let slice = &mut self.pixels[start..end];
+                        slice.iter_mut().for_each(|p| *p = color);
+                    }
+                }
+                CompositeMode::Clear => {
+                    for row in (y0 as usize)..(y1 as usize) {
+                        let start = row * stride + xs;
+                        let end = row * stride + xe;
+                        let slice = &mut self.pixels[start..end];
+                        slice.iter_mut().for_each(|p| *p = 0);
+                    }
+                }
+                CompositeMode::SrcOver => {
+                    // Hoist alpha-shortcut decisions out of the inner loop.
+                    let sa = argb_a(color);
+                    if sa == 0 {
+                        return; // fully transparent source — no-op
+                    }
+                    if sa == 255 {
+                        // Opaque SRC_OVER == SRC; use the memset-style fast path.
+                        for row in (y0 as usize)..(y1 as usize) {
+                            let start = row * stride + xs;
+                            let end = row * stride + xe;
+                            let slice = &mut self.pixels[start..end];
+                            slice.iter_mut().for_each(|p| *p = color);
+                        }
+                    } else {
+                        for row in (y0 as usize)..(y1 as usize) {
+                            let start = row * stride + xs;
+                            let end = row * stride + xe;
+                            composite_row_src_over_solid(&mut self.pixels[start..end], color);
+                        }
+                    }
+                }
+                CompositeMode::Xor => {
+                    for row in (y0 as usize)..(y1 as usize) {
+                        let start = row * stride + xs;
+                        let end = row * stride + xe;
+                        let slice = &mut self.pixels[start..end];
+                        for p in slice.iter_mut() {
+                            *p = composite(color, *p, CompositeMode::Xor);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Slow path: arbitrary affine transform — defer to per-pixel writes.
         for dy in 0..h as i32 {
             for dx in 0..w as i32 {
                 let (tx, ty) = self.tx((x + dx) as f64, (y + dy) as f64);
@@ -611,11 +736,16 @@ impl SoftwareRenderer {
         let min_y = points.iter().map(|p| p.1).min().unwrap();
         let max_y = points.iter().map(|p| p.1).max().unwrap();
         let color = self.color;
+        let n = points.len();
+
+        // Hoisted out of the y-loop: one allocation reused via clear() per scanline.
+        // Pre-sized to the edge count to avoid early growth reallocations
+        // (a scanline can intersect at most every edge).
+        let mut intersections: Vec<f64> = Vec::with_capacity(n);
 
         for y in min_y..=max_y {
-            // Find all x-intersections with edges
-            let mut intersections = Vec::new();
-            let n = points.len();
+            // Reuse buffer; clear() keeps the capacity.
+            intersections.clear();
             for i in 0..n {
                 let j = (i + 1) % n;
                 let (x0, y0) = points[i];
@@ -660,6 +790,77 @@ impl SoftwareRenderer {
 
     /// Alpha-composited blit of source image onto this buffer.
     pub fn blit_image(&mut self, src: &[u32], src_w: u32, src_h: u32, dx: i32, dy: i32) {
+        if src_w == 0 || src_h == 0 {
+            return;
+        }
+
+        // Fast path: identity transform — clip ONCE and do per-row slice work.
+        if self.transform.is_identity() {
+            // Effective source dimensions (don't read past end of supplied slice).
+            let eff_src_h = (src.len() / src_w as usize).min(src_h as usize) as i32;
+            if eff_src_h <= 0 {
+                return;
+            }
+
+            // Destination rect in buffer space.
+            let mut dst_x0 = dx;
+            let mut dst_y0 = dy;
+            let mut dst_x1 = dx.saturating_add(src_w as i32);
+            let mut dst_y1 = dy.saturating_add(eff_src_h);
+
+            // Clip to buffer.
+            dst_x0 = dst_x0.max(0);
+            dst_y0 = dst_y0.max(0);
+            dst_x1 = dst_x1.min(self.width as i32);
+            dst_y1 = dst_y1.min(self.height as i32);
+
+            // Clip to user clip rect.
+            if let Some(ref clip) = self.clip {
+                dst_x0 = dst_x0.max(clip.x);
+                dst_y0 = dst_y0.max(clip.y);
+                dst_x1 = dst_x1.min(clip.x.saturating_add(clip.width as i32));
+                dst_y1 = dst_y1.min(clip.y.saturating_add(clip.height as i32));
+            }
+
+            if dst_x0 >= dst_x1 || dst_y0 >= dst_y1 {
+                return;
+            }
+
+            // Source origin offset corresponding to (dst_x0, dst_y0).
+            let src_off_x = dst_x0 - dx;
+            let src_off_y = dst_y0 - dy;
+            let row_w = (dst_x1 - dst_x0) as usize;
+            let dst_stride = self.width as usize;
+            let src_stride = src_w as usize;
+            let mode = self.composite_mode;
+
+            for row in 0..(dst_y1 - dst_y0) as usize {
+                let dst_row = (dst_y0 as usize + row) * dst_stride + dst_x0 as usize;
+                let src_row = (src_off_y as usize + row) * src_stride + src_off_x as usize;
+                let dst_slice = &mut self.pixels[dst_row..dst_row + row_w];
+                let src_slice = &src[src_row..src_row + row_w];
+
+                match mode {
+                    CompositeMode::Src => {
+                        dst_slice.copy_from_slice(src_slice);
+                    }
+                    CompositeMode::Clear => {
+                        dst_slice.iter_mut().for_each(|p| *p = 0);
+                    }
+                    CompositeMode::SrcOver => {
+                        composite_row_src_over(dst_slice, src_slice);
+                    }
+                    CompositeMode::Xor => {
+                        for (d, s) in dst_slice.iter_mut().zip(src_slice.iter()) {
+                            *d = composite(*s, *d, CompositeMode::Xor);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Slow path: arbitrary transform — go through put_pixel per pixel.
         for sy in 0..src_h as i32 {
             for sx in 0..src_w as i32 {
                 let src_idx = (sy as u32 * src_w + sx as u32) as usize;
@@ -707,7 +908,100 @@ impl SoftwareRenderer {
 
     /// Copy a rectangular region within the buffer.
     pub fn copy_area(&mut self, x: i32, y: i32, w: u32, h: u32, dx: i32, dy: i32) {
-        // Copy to temp buffer first to handle overlapping regions
+        if w == 0 || h == 0 || (dx == 0 && dy == 0) {
+            return;
+        }
+
+        // Compute the intersection of the source rect with the buffer.
+        let src_x0 = x.max(0);
+        let src_y0 = y.max(0);
+        let src_x1 = x.saturating_add(w as i32).min(self.width as i32);
+        let src_y1 = y.saturating_add(h as i32).min(self.height as i32);
+        if src_x0 >= src_x1 || src_y0 >= src_y1 {
+            return;
+        }
+
+        // The "valid" sub-rect of the source — those reads that yielded real
+        // pixel data. The previous implementation also wrote 0 for the
+        // out-of-source area; to preserve identical behavior we keep that path
+        // available, but the fast path is only used when the *entire* source
+        // rect is in-bounds (the common case).
+        let full_src_in_bounds = src_x0 == x
+            && src_y0 == y
+            && src_x1 == x + w as i32
+            && src_y1 == y + h as i32;
+
+        if full_src_in_bounds {
+            // Compute destination rect (matching the source offset).
+            let dst_x0 = x.saturating_add(dx);
+            let dst_y0 = y.saturating_add(dy);
+            let dst_x1 = dst_x0.saturating_add(w as i32);
+            let dst_y1 = dst_y0.saturating_add(h as i32);
+
+            // Clip destination to the buffer; compute how much to shave off each
+            // side and apply the same shave to the source so they stay aligned.
+            let clip_left = (-dst_x0).max(0);
+            let clip_top = (-dst_y0).max(0);
+            let clip_right = (dst_x1 - self.width as i32).max(0);
+            let clip_bottom = (dst_y1 - self.height as i32).max(0);
+
+            let copy_w = (w as i32 - clip_left - clip_right).max(0);
+            let copy_h = (h as i32 - clip_top - clip_bottom).max(0);
+            if copy_w <= 0 || copy_h <= 0 {
+                return;
+            }
+
+            let s_x = (x + clip_left) as usize;
+            let s_y = (y + clip_top) as usize;
+            let d_x = (dst_x0 + clip_left) as usize;
+            let d_y = (dst_y0 + clip_top) as usize;
+            let copy_w = copy_w as usize;
+            let copy_h = copy_h as usize;
+            let stride = self.width as usize;
+
+            // Non-overlap detection: the source and destination rects do not
+            // share any pixels. We can copy rows in any order without aliasing.
+            let s_x_end = s_x + copy_w;
+            let s_y_end = s_y + copy_h;
+            let d_x_end = d_x + copy_w;
+            let d_y_end = d_y + copy_h;
+            let non_overlap = s_x_end <= d_x || d_x_end <= s_x
+                || s_y_end <= d_y || d_y_end <= s_y;
+
+            if non_overlap {
+                // True memcpy per row — no aliasing, no temporary buffer.
+                // copy_within handles disjoint slices safely.
+                for r in 0..copy_h {
+                    let src_start = (s_y + r) * stride + s_x;
+                    let dst_start = (d_y + r) * stride + d_x;
+                    self.pixels.copy_within(src_start..src_start + copy_w, dst_start);
+                }
+                return;
+            }
+
+            // Overlapping in the same buffer. If they only overlap vertically
+            // we can still avoid a temp buffer by iterating rows in the right
+            // direction (memmove-style) — but only when X ranges are equal
+            // or rows don't alias each other within a single row.
+            // Within a row, copy_within handles overlap correctly (memmove
+            // semantics). Across rows we just need to pick the safe iteration
+            // direction so we don't clobber yet-to-be-read source rows.
+            let rows_iter: Box<dyn Iterator<Item = usize>> = if d_y > s_y {
+                Box::new((0..copy_h).rev())
+            } else {
+                Box::new(0..copy_h)
+            };
+
+            for r in rows_iter {
+                let src_start = (s_y + r) * stride + s_x;
+                let dst_start = (d_y + r) * stride + d_x;
+                self.pixels.copy_within(src_start..src_start + copy_w, dst_start);
+            }
+            return;
+        }
+
+        // Fallback (out-of-bounds source rect): preserve original behavior of
+        // reading 0 for out-of-source pixels via a temp buffer.
         let mut temp = Vec::with_capacity((w * h) as usize);
         for sy in 0..h as i32 {
             for sx in 0..w as i32 {

@@ -11941,27 +11941,73 @@ pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<rustjvm_types::Ob
     }
 }
 
+// =====================================================================
+// CRIT perf — sharded side-store globals for the Unsafe / Class$Atomic
+// hot path.
+//
+// All four globals below were `std::sync::Mutex<HashMap<...>>` (with
+// SipHash + per-call .lock().unwrap_or_else handshake) and a single
+// process-wide mutex.  Under heavy concurrent CAS / static-field
+// traffic (ChmStress, AQS bursts, JDK lazy-init guards on Class
+// mirrors) they collapsed onto one lock and one SipHash chain per
+// operation.
+//
+// Fix: shard each map into `UNSAFE_SHARDS = 32` parking_lot mutexes
+// indexed by FxHash of the key.  parking_lot::Mutex avoids the
+// poisoning machinery (no Result unwrap on the lock) and FxHashMap
+// removes the SipHash overhead — neither global is exposed to
+// untrusted user-input keys (they are derived from JIT/class-loader
+// state), so DoS-resistance is not required here.
+// =====================================================================
+
+const UNSAFE_SHARDS: usize = 32;
+const UNSAFE_SHARD_MASK: usize = UNSAFE_SHARDS - 1;
+
+#[inline]
+fn unsafe_shard_of<K: std::hash::Hash + ?Sized>(key: &K) -> usize {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    key.hash(&mut h);
+    (h.finish() as usize) & UNSAFE_SHARD_MASK
+}
+
+type UnsafeShardedMap<K, V> = [parking_lot::Mutex<rustc_hash::FxHashMap<K, V>>; UNSAFE_SHARDS];
+
+#[inline]
+fn new_unsafe_sharded_map<K, V>() -> UnsafeShardedMap<K, V> {
+    // [(); N].map(...) preserves the const length and produces a fully
+    // initialised array without requiring Default on the value type.
+    [(); UNSAFE_SHARDS].map(|_| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 /// Fallback store for Unsafe.{getAndAdd,CAS,get,put}Long on a null object
 /// (static-field access via absolute offset). Used to service callers like
 /// `Thread$ThreadIdentifiers.next()` which invoke `Unsafe.getAndAddLong(null,
 /// NEXT_TID_OFFSET, 1)` against a static `long` field. Without this, the
 /// unwrap on a null receiver would panic and abort the whole VM.
-fn static_long_store() -> &'static std::sync::Mutex<std::collections::HashMap<usize, i64>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, i64>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn static_long_store() -> &'static UnsafeShardedMap<usize, i64> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, i64>> = std::sync::OnceLock::new();
+    T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn static_int_store() -> &'static std::sync::Mutex<std::collections::HashMap<usize, i32>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, i32>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn static_int_store() -> &'static UnsafeShardedMap<usize, i32> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, i32>> = std::sync::OnceLock::new();
+    T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn static_obj_store() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Option<rustjvm_types::ObjectRef>>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<rustjvm_types::ObjectRef>>>> =
+fn static_obj_store() -> &'static UnsafeShardedMap<usize, Option<rustjvm_types::ObjectRef>> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, Option<rustjvm_types::ObjectRef>>> =
         std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    T.get_or_init(new_unsafe_sharded_map)
+}
+
+/// Lock the shard that owns `key` in a `usize`-keyed sharded map.
+#[inline]
+fn lock_unsafe_shard_usize<V>(
+    map: &'static UnsafeShardedMap<usize, V>,
+    key: usize,
+) -> parking_lot::MutexGuard<'static, rustc_hash::FxHashMap<usize, V>> {
+    map[unsafe_shard_of(&key)].lock()
 }
 
 // =====================================================================
@@ -12006,15 +12052,28 @@ pub(crate) fn is_synthetic_offset(off: usize) -> bool {
 /// Map a `(class_name, field_name)` pair to a stable non-zero synthetic
 /// offset.  Stable across calls so the JDK's "cache offset at <clinit>,
 /// reuse forever" pattern stays consistent.
+///
+/// Perf note: the key type is `(Arc<str>, Arc<str>)` interned via
+/// `rustjvm_types::intern_arc` so repeat lookups perform zero heap
+/// allocations (the string pool returns an existing Arc on hit).  The
+/// map is sharded across `UNSAFE_SHARDS` parking_lot mutexes to avoid
+/// the single-mutex contention point under concurrent <clinit> traffic.
 fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
-    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    static T: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), usize>>> =
-        std::sync::OnceLock::new();
+    type Key = (Arc<str>, Arc<str>);
+    static T: std::sync::OnceLock<UnsafeShardedMap<Key, usize>> = std::sync::OnceLock::new();
     static NEXT: AtomicUsize = AtomicUsize::new(SYNTHETIC_OFFSET_BASE);
-    let lock = T.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (class_name.to_string(), field_name.to_string());
+    let shards = T.get_or_init(new_unsafe_sharded_map);
+    // intern_arc: pool hit returns existing Arc<str> with no allocation;
+    // first-time miss allocates once and is amortised across the lifetime
+    // of the JIT/class-loader state that derives these names.
+    let key: Key = (
+        rustjvm_types::intern_arc(class_name),
+        rustjvm_types::intern_arc(field_name),
+    );
+    let shard_idx = unsafe_shard_of(&key);
+    let mut map = shards[shard_idx].lock();
     if let Some(off) = map.get(&key) {
         return *off;
     }

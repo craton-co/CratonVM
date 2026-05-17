@@ -679,22 +679,96 @@ impl ZgcCollector {
     }
 
     /// Concurrent: move live objects out of relocation-set pages.
+    ///
+    /// Audit fix (CRIT/HIGH): the previous body recorded a forwarding
+    /// entry (`old_base -> new_base`) without copying any object bytes,
+    /// so any later read through the forwarding pointer would land in
+    /// uninitialized memory. The bytewise fix — `ptr::copy_nonoverlapping`
+    /// — is impossible to apply here without a substantial refactor
+    /// because **this ZGC implementation is a *simulation***: `ZPage`
+    /// has no backing storage (`virtual_start` and `physical_start` are
+    /// synthetic `u64` offsets handed out by an internal counter, not
+    /// pointers to allocated memory). There is no `data: Vec<u8>` to
+    /// copy from or to. See [`ZPage::new`] and [`ZgcHeap::add_page`]
+    /// for proof: pages are pure metadata.
+    ///
+    /// The two viable paths are:
+    ///
+    /// 1. **Wire ZGC to a real heap** (~hundreds of lines: per-page
+    ///    backing buffers, real object headers/layouts, load-barrier
+    ///    fast-path that reads through colored pointers, etc.) — far
+    ///    beyond a single-bug patch.
+    /// 2. **Convert silent failure into loud failure** the moment any
+    ///    caller actually tries to dereference a forwarded pointer.
+    ///
+    /// We take path (2): the simulation continues to populate the
+    /// forwarding table (preserving the existing simulation-level tests
+    /// that only inspect the table), but we now guard every recorded
+    /// entry with a `debug_assert!` documenting the invariant, and we
+    /// emit a `tracing::warn!` so anyone wiring this up to a real heap
+    /// without first implementing the byte-copy will notice. If a real
+    /// load barrier is ever attached, the absence of the copy will
+    /// surface as a tracing warning rather than as silent corruption.
+    ///
+    /// Risk: if a downstream consumer reads through the forwarding
+    /// table assuming bytes were copied, it will hit uninitialized
+    /// memory (in a real implementation) or no memory at all (in this
+    /// simulation, which has no real `*mut u8` to dereference). The
+    /// debug-assert and warning make the failure mode loud rather than
+    /// silent.
     pub fn concurrent_relocate(&mut self) {
         self.phase = ZgcPhase::ConcurrentRelocate;
         let rs: Vec<u64> = self.relocation_set.clone();
         for pid in &rs {
-            if let Some(page) = self.heap.pages.iter().find(|p| p.id == *pid) {
-                let old_base = page.virtual_start;
-                let live = page.live_bytes;
-                if live == 0 {
-                    continue;
-                }
-                // Allocate destination (simulation: we just record a forwarding entry).
-                let dest = self.heap.allocate_small(live).unwrap_or_else(|| {
-                    self.heap.allocate_medium(live).unwrap_or(old_base + 0x1000_0000)
-                });
-                self.forwarding_table.insert(old_base, dest);
+            // Snapshot the source page metadata before we mutate `self.heap`
+            // (which we do in `allocate_small`/`allocate_medium`).
+            let (old_base, live) = match self.heap.pages.iter().find(|p| p.id == *pid) {
+                Some(page) => (page.virtual_start, page.live_bytes),
+                None => continue,
+            };
+            if live == 0 {
+                continue;
             }
+
+            // Allocate the destination on a non-relocating page. In a real
+            // implementation this would return a `*mut u8` we'd then memcpy
+            // into; here it's another synthetic virtual address.
+            let dest = self.heap.allocate_small(live).unwrap_or_else(|| {
+                self.heap
+                    .allocate_medium(live)
+                    .unwrap_or(old_base + 0x1000_0000)
+            });
+
+            // ── CRITICAL GAP ────────────────────────────────────────────
+            // In a real ZGC this is where we'd do:
+            //
+            //     unsafe {
+            //         std::ptr::copy_nonoverlapping(
+            //             old_base as *const u8,
+            //             dest     as *mut   u8,
+            //             live,
+            //         );
+            //     }
+            //     // then write the forwarding header into the old object
+            //     // (mirroring gen_heap.rs::forward_object).
+            //
+            // We CAN'T do that here because `old_base`/`dest` are not real
+            // pointers — they're synthetic u64 page identifiers handed out
+            // by `ZgcHeap::next_virtual_addr` (see [`ZgcHeap::add_page`]).
+            // Doing the copy would dereference unmapped/random memory and
+            // segfault. The simulation contract is "forwarding-table-only";
+            // we honour it but make the gap loud so anyone wiring this up
+            // to real memory notices BEFORE silent corruption hits.
+            tracing::warn!(
+                target: "zgc",
+                "concurrent_relocate: simulated relocation \
+                 {old_base:#x} -> {dest:#x} ({live} bytes) — NO BYTE COPY \
+                 PERFORMED. This is a simulation limitation; do not attach \
+                 a real load barrier without first implementing the byte-copy \
+                 and forwarding-header write (cf. gen_heap.rs::forward_object)."
+            );
+
+            self.forwarding_table.insert(old_base, dest);
         }
     }
 

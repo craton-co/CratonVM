@@ -101,6 +101,15 @@ pub enum Reason {
     RefArrayOp,
     /// An opcode we haven't enumerated yet — be safe and reject.
     UnknownOpcode(u8),
+    /// AUDIT 2026-05-16: the method has at least one array parameter
+    /// and a scalar (non-void) return — i.e. it reduces N array
+    /// elements to a single scalar (e.g. `dot([I[I)J`, `sum([I)I`).
+    /// The current emitter has no block-reduction lowering: every CUDA
+    /// thread would race-overwrite the single scalar slot with its own
+    /// per-element term, producing silently wrong results. Reject the
+    /// shape so the VM falls back to CPU execution until a proper
+    /// reduction lowering is implemented.
+    ReductionNotImplemented,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +153,17 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
             None => return OffloadVerdict::Rejected(Reason::UnsupportedReturnType),
         },
     };
+
+    // AUDIT 2026-05-16: an array-in / scalar-out signature is a
+    // reduction shape (sum, dot, max, count, …). The emitter's
+    // `scalar_return` lowering writes the value through `ret_ptr`
+    // from every CUDA thread, so each thread races to overwrite the
+    // single scalar with its per-element term — silently wrong
+    // results. Until a proper block-reduction lowering exists, refuse
+    // the shape and let the VM run the method on the CPU.
+    if return_kind.is_scalar() && param_kinds.iter().any(|k| k.is_array()) {
+        return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
+    }
 
     if let Err(reason) = scan_bytecode(code) {
         return OffloadVerdict::Rejected(reason);
@@ -340,14 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn eligible_dot_product_returns_long() {
+    fn reject_reduction_dot_product() {
+        // AUDIT 2026-05-16: previously named `eligible_dot_product_returns_long`.
+        // Array-in / scalar-out methods are reduction-shaped; the
+        // current emitter can't express a block reduction, so we
+        // reject and let the CPU run them.
         let method = load_method("EligibleDotProduct", "dot", "([I[I)J");
-        match analyze(&method) {
-            OffloadVerdict::Eligible(sig) => {
-                assert_eq!(sig.return_kind, ParamKind::I64);
-            }
-            v => panic!("expected Eligible, got {v:?}"),
-        }
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(Reason::ReductionNotImplemented)
+        );
     }
 
     #[test]

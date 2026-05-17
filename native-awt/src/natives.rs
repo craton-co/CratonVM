@@ -4,15 +4,182 @@
 //! `sun/java2d/*` classes. Each callback maps Java-side API calls to
 //! the Rust peer/renderer/EDT infrastructure in this crate.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::{ObjectRef, Value};
 
 use crate::edt;
 use crate::event::PeerId;
-use crate::image::{self, ImageType};
+use crate::graphics2d::Graphics2DState;
+use crate::image::{self, ImageId, ImageType};
 use crate::peer::{self, ComponentType};
 use crate::swing;
+
+// ---------------------------------------------------------------------------
+// Graphics2D context registry
+// ---------------------------------------------------------------------------
+//
+// Each Java `Graphics2D` object is mapped to a `Graphics2DState` (the
+// rasterizer state machine in `graphics2d.rs`) keyed by the Java object's
+// identity hash code.  Without this side-table, draw* natives have no way
+// to find the renderer state for the receiver and every draw call would
+// no-op (the bug being fixed here).
+//
+// A Graphics2D context may be backed by either a `BufferedImage` (in which
+// case `dispose` flushes its pixel buffer back to the image registry) or a
+// `ComponentPeer` (in which case `dispose` marks the peer dirty for repaint).
+
+#[derive(Debug, Clone, Copy)]
+enum GfxTarget {
+    Image(ImageId),
+    Peer(PeerId),
+    Detached,
+}
+
+struct GfxEntry {
+    state: Graphics2DState,
+    target: GfxTarget,
+}
+
+struct GfxRegistry {
+    map: HashMap<i32, GfxEntry>,
+}
+
+impl GfxRegistry {
+    fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+}
+
+fn gfx_registry() -> &'static Mutex<GfxRegistry> {
+    static INSTANCE: OnceLock<Mutex<GfxRegistry>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(GfxRegistry::new()))
+}
+
+/// Ensure a `Graphics2DState` exists for the given Java Graphics2D receiver,
+/// then run `f` against it. Lazily creates a detached context if no
+/// associated target has been registered, so misbehaving callers still get
+/// drawing semantics (writing into a throwaway buffer) instead of panics.
+fn with_gfx<F, R>(ctx: &dyn NativeContext, receiver: ObjectRef, f: F) -> R
+where
+    F: FnOnce(&mut Graphics2DState) -> R,
+    R: Default,
+{
+    let hash = ctx.identity_hash_code(receiver);
+    let mut reg = gfx_registry().lock();
+    if !reg.map.contains_key(&hash) {
+        // Lazy fallback: caller invoked a draw method on a Graphics2D that
+        // we never saw `create`/`getGraphics` for.  Allocate a default-sized
+        // detached buffer so the call doesn't panic.
+        reg.map.insert(
+            hash,
+            GfxEntry {
+                state: Graphics2DState::create(1, 1),
+                target: GfxTarget::Detached,
+            },
+        );
+    }
+    let entry = reg.map.get_mut(&hash).expect("just inserted");
+    f(&mut entry.state)
+}
+
+/// Register a freshly-created Graphics2D Java object as backing a given
+/// rendering target. Sized to the target's pixel dimensions.
+fn register_gfx_for_image(ctx: &dyn NativeContext, gfx_obj: ObjectRef, image_id: ImageId) {
+    let (w, h) = {
+        let reg = image::image_registry();
+        match reg.get(image_id) {
+            Some(img) => (img.width(), img.height()),
+            None => (1, 1),
+        }
+    };
+    let hash = ctx.identity_hash_code(gfx_obj);
+    let mut reg = gfx_registry().lock();
+    reg.map.insert(
+        hash,
+        GfxEntry {
+            state: Graphics2DState::create(w.max(1), h.max(1)),
+            target: GfxTarget::Image(image_id),
+        },
+    );
+}
+
+fn register_gfx_for_peer(ctx: &dyn NativeContext, gfx_obj: ObjectRef, peer_id: PeerId) {
+    let (w, h) = {
+        let reg = peer::peer_registry().lock();
+        match reg.get(peer_id) {
+            Some(p) => (p.width.max(1), p.height.max(1)),
+            None => (1, 1),
+        }
+    };
+    let hash = ctx.identity_hash_code(gfx_obj);
+    let mut reg = gfx_registry().lock();
+    reg.map.insert(
+        hash,
+        GfxEntry {
+            state: Graphics2DState::create(w, h),
+            target: GfxTarget::Peer(peer_id),
+        },
+    );
+}
+
+/// Flush Graphics2D pixel data back to its target (BufferedImage or peer)
+/// and remove the registry entry. Called from `dispose()`.
+fn dispose_gfx(ctx: &dyn NativeContext, receiver: ObjectRef) {
+    let hash = ctx.identity_hash_code(receiver);
+    let entry = { gfx_registry().lock().map.remove(&hash) };
+    let Some(mut entry) = entry else { return; };
+    entry.state.dispose();
+    match entry.target {
+        GfxTarget::Image(image_id) => {
+            let w = entry.state.width();
+            let h = entry.state.height();
+            let pixels = entry.state.pixels().to_vec();
+            let mut reg = image::image_registry();
+            if let Some(img) = reg.get_mut(image_id) {
+                if img.width() == w && img.height() == h {
+                    img.get_data_buffer_mut().copy_from_slice(&pixels);
+                }
+            }
+        }
+        GfxTarget::Peer(peer_id) => {
+            let reg = peer::peer_registry().lock();
+            if let Some(peer) = reg.get(peer_id) {
+                swing::swing_state()
+                    .lock()
+                    .mark_dirty(peer_id, 0, 0, peer.width, peer.height);
+            }
+        }
+        GfxTarget::Detached => {}
+    }
+}
+
+/// Read an int[] array into a Vec<i32>.
+fn read_int_array(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<i32> {
+    let len = ctx.array_length(obj);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Value::Int(v) = ctx.get_array_element(obj, i) {
+            out.push(v);
+        } else {
+            out.push(0);
+        }
+    }
+    out
+}
+
+fn get_double(args: &[Value], idx: usize) -> f64 {
+    match args.get(idx) {
+        Some(Value::Double(v)) => *v,
+        Some(Value::Float(v)) => *v as f64,
+        Some(Value::Int(v)) => *v as f64,
+        _ => 0.0,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -203,12 +370,16 @@ fn register_component_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/Component", "getGraphics", "()Ljava/awt/Graphics;", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
             let hash = ctx.identity_hash_code(this);
-            let peer_reg = peer::peer_registry().lock();
-            if let Some(pid) = peer_reg.peer_for_java(hash) {
-                if let Some(peer) = peer_reg.get(pid) {
-                    let img_id = image::image_registry().create(peer.width, peer.height, ImageType::IntArgb);
-                    return int_ok(img_id.0 as i32);
+            let pid_opt = {
+                let peer_reg = peer::peer_registry().lock();
+                peer_reg.peer_for_java(hash)
+            };
+            if let Some(pid) = pid_opt {
+                let gfx = ctx.new_object("java/awt/Graphics2D")?;
+                if let Some(Value::Object(Some(gfx_obj))) = &gfx {
+                    register_gfx_for_peer(ctx, *gfx_obj, pid);
                 }
+                return Ok(gfx);
             }
         }
         null_ok()
@@ -303,38 +474,362 @@ fn register_frame_natives(registry: &mut NativeMethodRegistry) {
 
 fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
     for class in &["java/awt/Graphics2D", "sun/java2d/SunGraphics2D", "java/awt/Graphics"] {
-        registry.register(class, "drawLine", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "drawRect", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "fillRect", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "drawOval", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "fillOval", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "drawArc", "(IIIIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "fillArc", "(IIIIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "drawString", "(Ljava/lang/String;II)V", |_ctx, _args| void_ok());
-        registry.register(class, "drawPolygon", "([I[II)V", |_ctx, _args| void_ok());
-        registry.register(class, "fillPolygon", "([I[II)V", |_ctx, _args| void_ok());
-        registry.register(class, "drawPolyline", "([I[II)V", |_ctx, _args| void_ok());
+        // ── Line / rect / oval / arc ──────────────────────────────
+        registry.register(class, "drawLine", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x1, y1, x2, y2) = (get_int(args, 1), get_int(args, 2),
+                                         get_int(args, 3), get_int(args, 4));
+                with_gfx(ctx, this, |g| g.draw_line(x1, y1, x2, y2));
+            }
+            void_ok()
+        });
+        registry.register(class, "drawRect", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y, w, h) = (get_int(args, 1), get_int(args, 2),
+                                     get_int(args, 3), get_int(args, 4));
+                with_gfx(ctx, this, |g| g.draw_rect(x, y, w, h));
+            }
+            void_ok()
+        });
+        registry.register(class, "fillRect", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y, w, h) = (get_int(args, 1), get_int(args, 2),
+                                     get_int(args, 3), get_int(args, 4));
+                with_gfx(ctx, this, |g| g.fill_rect(x, y, w, h));
+            }
+            void_ok()
+        });
+        registry.register(class, "drawOval", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y, w, h) = (get_int(args, 1), get_int(args, 2),
+                                     get_int(args, 3), get_int(args, 4));
+                with_gfx(ctx, this, |g| g.draw_oval(x, y, w, h));
+            }
+            void_ok()
+        });
+        registry.register(class, "fillOval", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y, w, h) = (get_int(args, 1), get_int(args, 2),
+                                     get_int(args, 3), get_int(args, 4));
+                with_gfx(ctx, this, |g| g.fill_oval(x, y, w, h));
+            }
+            void_ok()
+        });
+        registry.register(class, "drawArc", "(IIIIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y, w, h) = (get_int(args, 1), get_int(args, 2),
+                                     get_int(args, 3), get_int(args, 4));
+                let (start, extent) = (get_int(args, 5), get_int(args, 6));
+                with_gfx(ctx, this, |g| g.draw_arc(x, y, w, h, start, extent));
+            }
+            void_ok()
+        });
+        registry.register(class, "fillArc", "(IIIIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y, w, h) = (get_int(args, 1), get_int(args, 2),
+                                     get_int(args, 3), get_int(args, 4));
+                let (start, extent) = (get_int(args, 5), get_int(args, 6));
+                with_gfx(ctx, this, |g| g.fill_arc(x, y, w, h, start, extent));
+            }
+            void_ok()
+        });
+
+        // ── Text ──────────────────────────────────────────────────
+        registry.register(class, "drawString", "(Ljava/lang/String;II)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let text = read_string(ctx, args, 1).unwrap_or_default();
+                let (x, y) = (get_int(args, 2), get_int(args, 3));
+                with_gfx(ctx, this, |g| g.draw_string(&text, x, y));
+            }
+            void_ok()
+        });
+
+        // ── Polygons / polylines ──────────────────────────────────
+        registry.register(class, "drawPolygon", "([I[II)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let xs = get_obj(args, 1).map(|a| read_int_array(ctx, a)).unwrap_or_default();
+                let ys = get_obj(args, 2).map(|a| read_int_array(ctx, a)).unwrap_or_default();
+                let n = get_int(args, 3).max(0) as usize;
+                let n = n.min(xs.len()).min(ys.len());
+                with_gfx(ctx, this, |g| g.draw_polygon(&xs[..n], &ys[..n]));
+            }
+            void_ok()
+        });
+        registry.register(class, "fillPolygon", "([I[II)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let xs = get_obj(args, 1).map(|a| read_int_array(ctx, a)).unwrap_or_default();
+                let ys = get_obj(args, 2).map(|a| read_int_array(ctx, a)).unwrap_or_default();
+                let n = get_int(args, 3).max(0) as usize;
+                let n = n.min(xs.len()).min(ys.len());
+                with_gfx(ctx, this, |g| g.fill_polygon(&xs[..n], &ys[..n]));
+            }
+            void_ok()
+        });
+        registry.register(class, "drawPolyline", "([I[II)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let xs = get_obj(args, 1).map(|a| read_int_array(ctx, a)).unwrap_or_default();
+                let ys = get_obj(args, 2).map(|a| read_int_array(ctx, a)).unwrap_or_default();
+                let n = get_int(args, 3).max(0) as usize;
+                let n = n.min(xs.len()).min(ys.len());
+                with_gfx(ctx, this, |g| g.draw_polyline(&xs[..n], &ys[..n]));
+            }
+            void_ok()
+        });
+
+        // ── Image blit ────────────────────────────────────────────
         registry.register(class, "drawImage", "(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z",
-            |_ctx, _args| bool_ok(true));
-        registry.register(class, "setColor", "(Ljava/awt/Color;)V", |_ctx, _args| void_ok());
-        registry.register(class, "setFont", "(Ljava/awt/Font;)V", |_ctx, _args| void_ok());
-        registry.register(class, "setClip", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "getClipBounds", "()Ljava/awt/Rectangle;",
-            |ctx, _args| ctx.new_object("java/awt/Rectangle"));
-        registry.register(class, "setTransform", "(Ljava/awt/geom/AffineTransform;)V", |_ctx, _args| void_ok());
-        registry.register(class, "getTransform", "()Ljava/awt/geom/AffineTransform;",
-            |ctx, _args| ctx.new_object("java/awt/geom/AffineTransform"));
-        registry.register(class, "translate", "(II)V", |_ctx, _args| void_ok());
-        registry.register(class, "rotate", "(D)V", |_ctx, _args| void_ok());
-        registry.register(class, "scale", "(DD)V", |_ctx, _args| void_ok());
-        registry.register(class, "setRenderingHint", "(Ljava/awt/RenderingHints$Key;Ljava/lang/Object;)V",
-            |_ctx, _args| void_ok());
-        registry.register(class, "setStroke", "(Ljava/awt/Stroke;)V", |_ctx, _args| void_ok());
-        registry.register(class, "create", "()Ljava/awt/Graphics;",
-            |ctx, _args| ctx.new_object("java/awt/Graphics2D"));
-        registry.register(class, "dispose", "()V", |_ctx, _args| void_ok());
-        registry.register(class, "clearRect", "(IIII)V", |_ctx, _args| void_ok());
-        registry.register(class, "copyArea", "(IIIIII)V", |_ctx, _args| void_ok());
+            |ctx, args| {
+                if let Some(this) = get_obj(args, 0) {
+                    if let Some(img) = get_obj(args, 1) {
+                        let (x, y) = (get_int(args, 2), get_int(args, 3));
+                        if let Value::Long(id) = ctx.get_field_by_name(img, "imageId") {
+                            let (pixels, w, h) = {
+                                let reg = image::image_registry();
+                                match reg.get(ImageId(id as u64)) {
+                                    Some(bimg) => (bimg.get_data_buffer().to_vec(),
+                                                   bimg.width(), bimg.height()),
+                                    None => (Vec::new(), 0, 0),
+                                }
+                            };
+                            if !pixels.is_empty() {
+                                with_gfx(ctx, this, |g| g.draw_image(&pixels, w, h, x, y));
+                            }
+                        }
+                    }
+                }
+                bool_ok(true)
+            });
+
+        // ── Color / paint ─────────────────────────────────────────
+        registry.register(class, "setColor", "(Ljava/awt/Color;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let argb = get_obj(args, 1).map(|c| {
+                    match ctx.get_field_by_name(c, "value") {
+                        Value::Int(v) => v as u32,
+                        _ => 0xFF_000000,
+                    }
+                }).unwrap_or(0xFF_000000);
+                let a = ((argb >> 24) & 0xFF) as u8;
+                let r = ((argb >> 16) & 0xFF) as u8;
+                let g = ((argb >> 8) & 0xFF) as u8;
+                let b = (argb & 0xFF) as u8;
+                with_gfx(ctx, this, |gs| gs.set_color(r, g, b, a));
+            }
+            void_ok()
+        });
+
+        // ── Font ──────────────────────────────────────────────────
+        registry.register(class, "setFont", "(Ljava/awt/Font;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                if let Some(font) = get_obj(args, 1) {
+                    let family = ctx.read_string(font).unwrap_or_else(|| "Dialog".to_string());
+                    let style = match ctx.get_field_by_name(font, "style") {
+                        Value::Int(v) => v, _ => 0,
+                    };
+                    let size = match ctx.get_field_by_name(font, "size") {
+                        Value::Int(v) => v, _ => 12,
+                    };
+                    with_gfx(ctx, this, |g| g.set_font(&family, style, size));
+                }
+            }
+            void_ok()
+        });
+
+        // ── Clip ──────────────────────────────────────────────────
+        registry.register(class, "setClip", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y) = (get_int(args, 1), get_int(args, 2));
+                let (w, h) = (get_int(args, 3).max(0) as u32, get_int(args, 4).max(0) as u32);
+                with_gfx(ctx, this, |g| g.set_clip_rect(x, y, w, h));
+            }
+            void_ok()
+        });
+        registry.register(class, "getClipBounds", "()Ljava/awt/Rectangle;", |ctx, args| {
+            let bounds = if let Some(this) = get_obj(args, 0) {
+                let hash = ctx.identity_hash_code(this);
+                let reg = gfx_registry().lock();
+                reg.map.get(&hash).and_then(|e| e.state.get_clip_bounds())
+            } else {
+                None
+            };
+            let rect = ctx.new_object("java/awt/Rectangle")?;
+            if let Some(Value::Object(Some(obj))) = &rect {
+                if let Some(r) = bounds {
+                    ctx.set_field_by_name(*obj, "x", Value::Int(r.x));
+                    ctx.set_field_by_name(*obj, "y", Value::Int(r.y));
+                    ctx.set_field_by_name(*obj, "width", Value::Int(r.width as i32));
+                    ctx.set_field_by_name(*obj, "height", Value::Int(r.height as i32));
+                }
+            }
+            Ok(rect)
+        });
+
+        // ── Transform ─────────────────────────────────────────────
+        registry.register(class, "setTransform", "(Ljava/awt/geom/AffineTransform;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                if let Some(t) = get_obj(args, 1) {
+                    let read = |name: &str| -> f64 {
+                        match ctx.get_field_by_name(t, name) {
+                            Value::Double(v) => v,
+                            Value::Float(v) => v as f64,
+                            _ => 0.0,
+                        }
+                    };
+                    let xform = crate::renderer::AffineTransform {
+                        m00: read("m00"), m01: read("m01"), m02: read("m02"),
+                        m10: read("m10"), m11: read("m11"), m12: read("m12"),
+                    };
+                    with_gfx(ctx, this, |g| g.set_transform(xform));
+                }
+            }
+            void_ok()
+        });
+        registry.register(class, "getTransform", "()Ljava/awt/geom/AffineTransform;", |ctx, args| {
+            let xform = if let Some(this) = get_obj(args, 0) {
+                let hash = ctx.identity_hash_code(this);
+                let reg = gfx_registry().lock();
+                reg.map.get(&hash).map(|e| e.state.get_transform())
+                    .unwrap_or_else(crate::renderer::AffineTransform::identity)
+            } else {
+                crate::renderer::AffineTransform::identity()
+            };
+            let obj = ctx.new_object("java/awt/geom/AffineTransform")?;
+            if let Some(Value::Object(Some(t))) = &obj {
+                ctx.set_field_by_name(*t, "m00", Value::Double(xform.m00));
+                ctx.set_field_by_name(*t, "m01", Value::Double(xform.m01));
+                ctx.set_field_by_name(*t, "m02", Value::Double(xform.m02));
+                ctx.set_field_by_name(*t, "m10", Value::Double(xform.m10));
+                ctx.set_field_by_name(*t, "m11", Value::Double(xform.m11));
+                ctx.set_field_by_name(*t, "m12", Value::Double(xform.m12));
+            }
+            Ok(obj)
+        });
+        registry.register(class, "translate", "(II)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (dx, dy) = (get_int(args, 1) as f64, get_int(args, 2) as f64);
+                with_gfx(ctx, this, |g| g.translate(dx, dy));
+            }
+            void_ok()
+        });
+        registry.register(class, "rotate", "(D)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let theta = get_double(args, 1);
+                with_gfx(ctx, this, |g| g.rotate(theta));
+            }
+            void_ok()
+        });
+        registry.register(class, "scale", "(DD)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (sx, sy) = (get_double(args, 1), get_double(args, 2));
+                with_gfx(ctx, this, |g| g.scale(sx, sy));
+            }
+            void_ok()
+        });
+
+        // ── Rendering hints ───────────────────────────────────────
+        registry.register(class, "setRenderingHint",
+            "(Ljava/awt/RenderingHints$Key;Ljava/lang/Object;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                use crate::graphics2d::{RenderingHintKey as K, RenderingHintValue as V};
+                // Best-effort: identify by key/value identity hash.  We map
+                // anything we can read to a sensible default.  Since the JDK
+                // RenderingHints constants aren't fully modelled here we just
+                // toggle antialiasing on whenever a key is set — preserves
+                // existing behaviour for AA-enabled apps.
+                let key_hash = get_obj(args, 1).map(|o| ctx.identity_hash_code(o)).unwrap_or(0);
+                let val_hash = get_obj(args, 2).map(|o| ctx.identity_hash_code(o)).unwrap_or(0);
+                let _ = (key_hash, val_hash);
+                // TODO: RenderingHints key/value identity is not modelled —
+                // applying Antialiasing=On unconditionally.  Real mapping
+                // requires the JDK constant pool.
+                with_gfx(ctx, this, |g| g.set_rendering_hint(K::Antialiasing, V::On));
+            }
+            void_ok()
+        });
+
+        // ── Stroke ────────────────────────────────────────────────
+        registry.register(class, "setStroke", "(Ljava/awt/Stroke;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                use crate::graphics2d::{CapStyle, JoinStyle, StrokeSpec};
+                if let Some(stroke) = get_obj(args, 1) {
+                    let width = match ctx.get_field_by_name(stroke, "width") {
+                        Value::Float(v) => v,
+                        Value::Double(v) => v as f32,
+                        Value::Int(v) => v as f32,
+                        _ => 1.0,
+                    };
+                    let cap = match ctx.get_field_by_name(stroke, "cap") {
+                        Value::Int(0) => CapStyle::Butt,
+                        Value::Int(1) => CapStyle::Round,
+                        _ => CapStyle::Square,
+                    };
+                    let join = match ctx.get_field_by_name(stroke, "join") {
+                        Value::Int(1) => JoinStyle::Round,
+                        Value::Int(2) => JoinStyle::Bevel,
+                        _ => JoinStyle::Miter,
+                    };
+                    with_gfx(ctx, this, |g| g.set_stroke(StrokeSpec { width, cap, join }));
+                }
+            }
+            void_ok()
+        });
+
+        // ── Create / dispose ──────────────────────────────────────
+        registry.register(class, "create", "()Ljava/awt/Graphics;", |ctx, args| {
+            // Cloning a Graphics2D returns a new receiver that inherits
+            // current state.  We make a fresh detached Graphics2DState and
+            // copy the parent's state via save/restore through transform/
+            // clip/font/color extraction.  Simpler approximation: clone the
+            // backing target so subsequent draws still flush to the same
+            // image/peer.
+            let target = if let Some(this) = get_obj(args, 0) {
+                let hash = ctx.identity_hash_code(this);
+                let reg = gfx_registry().lock();
+                reg.map.get(&hash).map(|e| e.target).unwrap_or(GfxTarget::Detached)
+            } else {
+                GfxTarget::Detached
+            };
+            let new_gfx = ctx.new_object("java/awt/Graphics2D")?;
+            if let Some(Value::Object(Some(obj))) = &new_gfx {
+                match target {
+                    GfxTarget::Image(id) => register_gfx_for_image(ctx, *obj, id),
+                    GfxTarget::Peer(pid) => register_gfx_for_peer(ctx, *obj, pid),
+                    GfxTarget::Detached => {
+                        let hash = ctx.identity_hash_code(*obj);
+                        gfx_registry().lock().map.insert(hash, GfxEntry {
+                            state: Graphics2DState::create(1, 1),
+                            target: GfxTarget::Detached,
+                        });
+                    }
+                }
+            }
+            Ok(new_gfx)
+        });
+        registry.register(class, "dispose", "()V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                dispose_gfx(ctx, this);
+            }
+            void_ok()
+        });
+
+        // ── Clear / copy ──────────────────────────────────────────
+        registry.register(class, "clearRect", "(IIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y) = (get_int(args, 1), get_int(args, 2));
+                let (w, h) = (get_int(args, 3).max(0) as u32, get_int(args, 4).max(0) as u32);
+                with_gfx(ctx, this, |g| g.clear_rect(x, y, w, h));
+            }
+            void_ok()
+        });
+        registry.register(class, "copyArea", "(IIIIII)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let (x, y) = (get_int(args, 1), get_int(args, 2));
+                let (w, h) = (get_int(args, 3).max(0) as u32, get_int(args, 4).max(0) as u32);
+                let (dx, dy) = (get_int(args, 5), get_int(args, 6));
+                with_gfx(ctx, this, |g| g.copy_area(x, y, w, h, dx, dy));
+            }
+            void_ok()
+        });
     }
 }
 
@@ -401,9 +896,12 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "createGraphics", "()Ljava/awt/Graphics2D;", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
             if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
-                // Return the image ID as a handle — the Graphics2D operations
-                // will look up the backing image through the image registry.
-                return int_ok(id as i32);
+                let image_id = ImageId(id as u64);
+                let gfx = ctx.new_object("java/awt/Graphics2D")?;
+                if let Some(Value::Object(Some(gfx_obj))) = &gfx {
+                    register_gfx_for_image(ctx, *gfx_obj, image_id);
+                }
+                return Ok(gfx);
             }
         }
         null_ok()

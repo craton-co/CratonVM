@@ -53,21 +53,36 @@ enum FileEntry {
 ///
 /// Pre-registers fd 0/1/2 for stdin/stdout/stderr.
 /// T10.9.B: FxHashMap — fd IDs are internal u32 counters.
+///
+/// AUDIT 2026-05-16 (B3/B4 native-api): entries are wrapped in `Arc` so a
+/// caller can obtain a handle to a `FileEntry`, drop the table-level
+/// `RwLock` read guard, and *then* perform the (possibly blocking) syscall
+/// on the entry's inner `Mutex`. Holding the table read guard across a
+/// syscall would serialize every `close()` / `open_*()` / `insert_*()`
+/// against the longest-running I/O on any fd in the VM — a blocking
+/// stdin or TCP read could freeze fd-table mutations indefinitely.
 pub struct FileDescriptorTable {
-    entries: RwLock<FxHashMap<FdId, FileEntry>>,
+    entries: RwLock<FxHashMap<FdId, Arc<FileEntry>>>,
     next_fd: AtomicU32,
 }
 
 impl FileDescriptorTable {
     pub fn new() -> Self {
-        let mut entries: FxHashMap<FdId, FileEntry> = FxHashMap::default();
-        entries.insert(0, FileEntry::Stdin(Mutex::new(io::stdin())));
-        entries.insert(1, FileEntry::Stdout(Mutex::new(io::stdout())));
-        entries.insert(2, FileEntry::Stderr(Mutex::new(io::stderr())));
+        let mut entries: FxHashMap<FdId, Arc<FileEntry>> = FxHashMap::default();
+        entries.insert(0, Arc::new(FileEntry::Stdin(Mutex::new(io::stdin()))));
+        entries.insert(1, Arc::new(FileEntry::Stdout(Mutex::new(io::stdout()))));
+        entries.insert(2, Arc::new(FileEntry::Stderr(Mutex::new(io::stderr()))));
         Self {
             entries: RwLock::new(entries),
             next_fd: AtomicU32::new(3),
         }
+    }
+
+    /// AUDIT 2026-05-16 (B3/B4): clone the `Arc<FileEntry>` for `fd` and
+    /// drop the table-level `RwLock` read guard before the caller starts
+    /// any blocking I/O on the entry. Returns `None` if the fd is absent.
+    fn get_entry(&self, fd: FdId) -> Option<Arc<FileEntry>> {
+        self.entries.read().get(&fd).cloned()
     }
 
     /// Open a file for reading. Returns the fd_id.
@@ -83,7 +98,7 @@ impl FileDescriptorTable {
         let reader = BufReader::new(file);
         self.entries
             .write()
-            .insert(fd, FileEntry::FileRead(Mutex::new(reader)));
+            .insert(fd, Arc::new(FileEntry::FileRead(Mutex::new(reader))));
         Ok(fd)
     }
 
@@ -105,31 +120,31 @@ impl FileDescriptorTable {
         let writer = BufWriter::new(file);
         self.entries
             .write()
-            .insert(fd, FileEntry::FileWrite(Mutex::new(writer)));
+            .insert(fd, Arc::new(FileEntry::FileWrite(Mutex::new(writer))));
         Ok(fd)
     }
 
     /// Read a single byte. Returns 0-255 or -1 at EOF.
     pub fn read_byte(&self, fd: FdId) -> Result<i32, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::Stdin(stdin)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+        match &*entry {
+            FileEntry::Stdin(stdin) => {
                 let mut buf = [0u8; 1];
                 let n = stdin.lock().read(&mut buf)?;
                 Ok(if n == 0 { -1 } else { buf[0] as i32 })
             }
-            Some(FileEntry::FileRead(reader)) => {
+            FileEntry::FileRead(reader) => {
                 let mut buf = [0u8; 1];
                 let n = reader.lock().read(&mut buf)?;
                 Ok(if n == 0 { -1 } else { buf[0] as i32 })
             }
             // WP1.12 — subprocess stdout/stderr read.
-            Some(FileEntry::ChildStdoutPipe(p)) => {
+            FileEntry::ChildStdoutPipe(p) => {
                 let mut buf = [0u8; 1];
                 let n = p.lock().read(&mut buf)?;
                 Ok(if n == 0 { -1 } else { buf[0] as i32 })
             }
-            Some(FileEntry::ChildStderrPipe(p)) => {
+            FileEntry::ChildStderrPipe(p) => {
                 let mut buf = [0u8; 1];
                 let n = p.lock().read(&mut buf)?;
                 Ok(if n == 0 { -1 } else { buf[0] as i32 })
@@ -140,13 +155,13 @@ impl FileDescriptorTable {
 
     /// Read up to `len` bytes into `buf`. Returns count read, or 0 at EOF.
     pub fn read_bytes(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::Stdin(stdin)) => stdin.lock().read(buf),
-            Some(FileEntry::FileRead(reader)) => reader.lock().read(buf),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+        match &*entry {
+            FileEntry::Stdin(stdin) => stdin.lock().read(buf),
+            FileEntry::FileRead(reader) => reader.lock().read(buf),
             // WP1.12 — subprocess stdout/stderr bulk read.
-            Some(FileEntry::ChildStdoutPipe(p)) => p.lock().read(buf),
-            Some(FileEntry::ChildStderrPipe(p)) => p.lock().read(buf),
+            FileEntry::ChildStdoutPipe(p) => p.lock().read(buf),
+            FileEntry::ChildStderrPipe(p) => p.lock().read(buf),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
         }
     }
@@ -214,9 +229,9 @@ impl FileDescriptorTable {
             Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
         }
 
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::Stdin(stdin)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+        match &*entry {
+            FileEntry::Stdin(stdin) => {
                 // `io::Stdin` itself is not `BufRead`, but `StdinLock`
                 // — obtained via `Stdin::lock()` — is. The outer
                 // parking_lot `Mutex` guard lets us hold the
@@ -225,7 +240,7 @@ impl FileDescriptorTable {
                 let mut stdin_lock = guard.lock();
                 read_line_inner(&mut stdin_lock)
             }
-            Some(FileEntry::FileRead(reader)) => {
+            FileEntry::FileRead(reader) => {
                 // `BufReader<File>` implements `BufRead`; the
                 // parking_lot guard defers directly.
                 let mut guard = reader.lock();
@@ -237,22 +252,22 @@ impl FileDescriptorTable {
 
     /// Write a single byte.
     pub fn write_byte(&self, fd: FdId, b: u8) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::Stdout(stdout)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+        match &*entry {
+            FileEntry::Stdout(stdout) => {
                 stdout.lock().write_all(&[b])?;
                 Ok(())
             }
-            Some(FileEntry::Stderr(stderr)) => {
+            FileEntry::Stderr(stderr) => {
                 stderr.lock().write_all(&[b])?;
                 Ok(())
             }
-            Some(FileEntry::FileWrite(writer)) => {
+            FileEntry::FileWrite(writer) => {
                 writer.lock().write_all(&[b])?;
                 Ok(())
             }
             // WP1.12 — write to subprocess stdin.
-            Some(FileEntry::ChildStdinPipe(p)) => {
+            FileEntry::ChildStdinPipe(p) => {
                 p.lock().write_all(&[b])?;
                 Ok(())
             }
@@ -262,22 +277,22 @@ impl FileDescriptorTable {
 
     /// Write bytes from a slice.
     pub fn write_bytes(&self, fd: FdId, data: &[u8]) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::Stdout(stdout)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+        match &*entry {
+            FileEntry::Stdout(stdout) => {
                 stdout.lock().write_all(data)?;
                 Ok(())
             }
-            Some(FileEntry::Stderr(stderr)) => {
+            FileEntry::Stderr(stderr) => {
                 stderr.lock().write_all(data)?;
                 Ok(())
             }
-            Some(FileEntry::FileWrite(writer)) => {
+            FileEntry::FileWrite(writer) => {
                 writer.lock().write_all(data)?;
                 Ok(())
             }
             // WP1.12 — bulk write to subprocess stdin.
-            Some(FileEntry::ChildStdinPipe(p)) => {
+            FileEntry::ChildStdinPipe(p) => {
                 p.lock().write_all(data)?;
                 Ok(())
             }
@@ -292,24 +307,26 @@ impl FileDescriptorTable {
 
     /// Flush buffered output.
     pub fn flush(&self, fd: FdId) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::Stdout(stdout)) => {
+        // No fd present is a no-op (consistent with previous behavior
+        // for non-writable / nonexistent fds).
+        let Some(entry) = self.get_entry(fd) else { return Ok(()); };
+        match &*entry {
+            FileEntry::Stdout(stdout) => {
                 stdout.lock().flush()?;
                 Ok(())
             }
-            Some(FileEntry::Stderr(stderr)) => {
+            FileEntry::Stderr(stderr) => {
                 stderr.lock().flush()?;
                 Ok(())
             }
-            Some(FileEntry::FileWrite(writer)) => {
+            FileEntry::FileWrite(writer) => {
                 writer.lock().flush()?;
                 Ok(())
             }
             // WP1.12 — flushing ChildStdin pushes buffered bytes into the
             // subprocess's stdin immediately. Without this, the child may
             // block waiting for data that's sitting in our userspace buffer.
-            Some(FileEntry::ChildStdinPipe(p)) => {
+            FileEntry::ChildStdinPipe(p) => {
                 p.lock().flush()?;
                 Ok(())
             }
@@ -318,24 +335,46 @@ impl FileDescriptorTable {
     }
 
     /// Close a file descriptor. Returns an error if flushing a writer fails.
+    ///
+    /// AUDIT 2026-05-16 (B3/B4 + B7): the entry is removed from the table
+    /// *first*, releasing the write guard before any blocking I/O (flush)
+    /// runs. The previous implementation held the write guard across
+    /// `writer.lock().flush()?` — a slow flush would block every other
+    /// fd-table mutation VM-wide. The previous code also leaked the
+    /// entry on flush error: it propagated the `?` while the entry
+    /// was still in the table, so the caller could neither retry nor
+    /// release the resource. Now we always remove the entry on close
+    /// and flush the dropped copy out-of-band, returning the flush
+    /// error if any.
     pub fn close(&self, fd: FdId) -> Result<(), io::Error> {
         // Don't close stdin/stdout/stderr
-        if fd >= 3 {
-            let mut entries = self.entries.write();
-            // Flush before removing if it's a writer
-            if let Some(FileEntry::FileWrite(writer)) = entries.get(&fd) {
-                writer.lock().flush()?;
-            }
-            entries.remove(&fd);
+        if fd < 3 {
+            return Ok(());
         }
-        Ok(())
+        // Remove first (under the write guard), then drop the guard
+        // before performing any blocking I/O on the removed entry.
+        let removed = {
+            let mut entries = self.entries.write();
+            entries.remove(&fd)
+        };
+        let Some(entry) = removed else { return Ok(()); };
+        // Flush writer-style entries out of the table lock. We can't
+        // move out of an Arc (other clones could still exist
+        // theoretically — though in practice they shouldn't), so we
+        // flush through the inner Mutex on the existing Arc and let
+        // `Drop` close the OS handle when the Arc count reaches zero.
+        match &*entry {
+            FileEntry::FileWrite(writer) => writer.lock().flush(),
+            FileEntry::ChildStdinPipe(p) => p.lock().flush(),
+            _ => Ok(()),
+        }
     }
 
     /// Estimate available bytes (best-effort).
     pub fn available(&self, fd: FdId) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileRead(reader)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+        match &*entry {
+            FileEntry::FileRead(reader) => {
                 let mut buf = reader.lock();
                 let buffered = buf.buffer().len();
                 // Also account for bytes remaining in the underlying file
@@ -351,7 +390,7 @@ impl FileDescriptorTable {
                 };
                 Ok(buffered + file_remaining)
             }
-            Some(FileEntry::Stdin(_)) => Ok(0),
+            FileEntry::Stdin(_) => Ok(0),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
         }
     }
@@ -374,7 +413,7 @@ impl FileDescriptorTable {
             .open(path)?;
         self.entries
             .write()
-            .insert(fd, FileEntry::FileReadWrite(Mutex::new(file)));
+            .insert(fd, Arc::new(FileEntry::FileReadWrite(Mutex::new(file))));
         Ok(fd)
     }
 
@@ -382,9 +421,9 @@ impl FileDescriptorTable {
     /// Does not change the file's current position.
     pub fn pread_at(&self, fd: FdId, buf: &mut [u8], position: u64) -> Result<usize, io::Error> {
         use io::{Read, Seek, SeekFrom};
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for pread"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 let saved = f.stream_position()?;
                 f.seek(SeekFrom::Start(position))?;
@@ -392,7 +431,7 @@ impl FileDescriptorTable {
                 f.seek(SeekFrom::Start(saved))?;
                 Ok(n)
             }
-            Some(FileEntry::FileRead(reader)) => {
+            FileEntry::FileRead(reader) => {
                 let mut r = reader.lock();
                 let inner = r.get_mut();
                 let saved = inner.stream_position()?;
@@ -409,9 +448,9 @@ impl FileDescriptorTable {
     /// Does not change the file's current position.
     pub fn pwrite_at(&self, fd: FdId, data: &[u8], position: u64) -> Result<usize, io::Error> {
         use io::{Seek, SeekFrom, Write};
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for pwrite"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 let saved = f.stream_position()?;
                 f.seek(SeekFrom::Start(position))?;
@@ -419,7 +458,7 @@ impl FileDescriptorTable {
                 f.seek(SeekFrom::Start(saved))?;
                 Ok(data.len())
             }
-            Some(FileEntry::FileWrite(writer)) => {
+            FileEntry::FileWrite(writer) => {
                 let mut w = writer.lock();
                 let inner = w.get_mut();
                 let saved = inner.stream_position()?;
@@ -434,9 +473,9 @@ impl FileDescriptorTable {
 
     /// Sequential read from a FileReadWrite file (advances the cursor).
     pub fn rw_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_read"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 f.read(buf)
             }
@@ -447,9 +486,9 @@ impl FileDescriptorTable {
     /// Sequential write to a FileReadWrite file (advances the cursor).
     pub fn rw_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
         use io::Write;
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_write"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 f.write(data)
             }
@@ -460,9 +499,9 @@ impl FileDescriptorTable {
     /// Seek in a FileReadWrite file. Returns new position.
     pub fn rw_seek(&self, fd: FdId, pos: io::SeekFrom) -> Result<u64, io::Error> {
         use io::Seek;
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_seek"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 f.seek(pos)
             }
@@ -473,9 +512,9 @@ impl FileDescriptorTable {
     /// Get the current position in a FileReadWrite file.
     pub fn rw_position(&self, fd: FdId) -> Result<u64, io::Error> {
         use io::Seek;
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_position"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 f.stream_position()
             }
@@ -489,11 +528,11 @@ impl FileDescriptorTable {
     /// independent seek cursor, which is what `mmap` / `MapViewOfFile`
     /// require. Returns an error if the fd is not backed by a real file.
     pub fn clone_file(&self, fd: FdId) -> Result<fs::File, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => file.lock().try_clone(),
-            Some(FileEntry::FileRead(reader)) => reader.lock().get_ref().try_clone(),
-            Some(FileEntry::FileWrite(writer)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for clone_file"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => file.lock().try_clone(),
+            FileEntry::FileRead(reader) => reader.lock().get_ref().try_clone(),
+            FileEntry::FileWrite(writer) => {
                 // BufWriter::get_ref() borrows; flush first to not lose data.
                 let mut w = writer.lock();
                 w.flush().ok();
@@ -508,9 +547,9 @@ impl FileDescriptorTable {
 
     /// Set the length of a FileReadWrite file (truncate or extend).
     pub fn rw_set_length(&self, fd: FdId, len: u64) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_set_length"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let f = file.lock();
                 f.set_len(len)
             }
@@ -521,16 +560,16 @@ impl FileDescriptorTable {
     /// Get the size of a file by fd.
     pub fn file_size(&self, fd: FdId) -> Result<u64, io::Error> {
         use io::{Seek, SeekFrom};
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::FileReadWrite(file)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for size"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
                 let mut f = file.lock();
                 let saved = f.stream_position()?;
                 let size = f.seek(SeekFrom::End(0))?;
                 f.seek(SeekFrom::Start(saved))?;
                 Ok(size)
             }
-            Some(FileEntry::FileRead(reader)) => {
+            FileEntry::FileRead(reader) => {
                 let mut r = reader.lock();
                 let inner = r.get_mut();
                 let saved = inner.stream_position()?;
@@ -553,15 +592,15 @@ impl FileDescriptorTable {
         let socket = std::net::UdpSocket::bind(addr)?;
         self.entries
             .write()
-            .insert(fd, FileEntry::UdpSocket(Mutex::new(socket)));
+            .insert(fd, Arc::new(FileEntry::UdpSocket(Mutex::new(socket))));
         Ok(fd)
     }
 
     /// Send UDP datagram to a target address. Returns bytes sent.
     pub fn udp_send(&self, fd: FdId, data: &[u8], target: &str) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(sock)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp send"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => {
                 let s = sock.lock();
                 s.send_to(data, target)
             }
@@ -571,9 +610,9 @@ impl FileDescriptorTable {
 
     /// Receive a UDP datagram. Returns (bytes_read, source_addr).
     pub fn udp_recv(&self, fd: FdId, buf: &mut [u8]) -> Result<(usize, String), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(sock)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp recv"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => {
                 let s = sock.lock();
                 let (n, addr) = s.recv_from(buf)?;
                 Ok((n, addr.to_string()))
@@ -584,9 +623,9 @@ impl FileDescriptorTable {
 
     /// Set non-blocking mode on a UDP socket.
     pub fn udp_set_nonblocking(&self, fd: FdId, nonblocking: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(sock)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => {
                 sock.lock().set_nonblocking(nonblocking)
             }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
@@ -595,9 +634,9 @@ impl FileDescriptorTable {
 
     /// Get the local address of a UDP socket.
     pub fn udp_local_addr(&self, fd: FdId) -> Result<String, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(sock)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => {
                 Ok(sock.lock().local_addr()?.to_string())
             }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
@@ -614,7 +653,7 @@ impl FileDescriptorTable {
         let stream = std::net::TcpStream::connect(addr)?;
         self.entries
             .write()
-            .insert(fd, FileEntry::TcpStream(Mutex::new(stream)));
+            .insert(fd, Arc::new(FileEntry::TcpStream(Mutex::new(stream))));
         Ok(fd)
     }
 
@@ -623,7 +662,7 @@ impl FileDescriptorTable {
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         self.entries
             .write()
-            .insert(fd, FileEntry::TcpStream(Mutex::new(stream)));
+            .insert(fd, Arc::new(FileEntry::TcpStream(Mutex::new(stream))));
         fd
     }
 
@@ -634,7 +673,7 @@ impl FileDescriptorTable {
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         self.entries
             .write()
-            .insert(fd, FileEntry::ChildStdoutPipe(Mutex::new(stream)));
+            .insert(fd, Arc::new(FileEntry::ChildStdoutPipe(Mutex::new(stream))));
         fd
     }
 
@@ -643,7 +682,7 @@ impl FileDescriptorTable {
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         self.entries
             .write()
-            .insert(fd, FileEntry::ChildStderrPipe(Mutex::new(stream)));
+            .insert(fd, Arc::new(FileEntry::ChildStderrPipe(Mutex::new(stream))));
         fd
     }
 
@@ -653,7 +692,7 @@ impl FileDescriptorTable {
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         self.entries
             .write()
-            .insert(fd, FileEntry::ChildStdinPipe(Mutex::new(stream)));
+            .insert(fd, Arc::new(FileEntry::ChildStdinPipe(Mutex::new(stream))));
         fd
     }
 
@@ -667,17 +706,16 @@ impl FileDescriptorTable {
         let listener = std::net::TcpListener::bind(addr)?;
         self.entries
             .write()
-            .insert(fd, FileEntry::TcpListener(Mutex::new(listener)));
+            .insert(fd, Arc::new(FileEntry::TcpListener(Mutex::new(listener))));
         Ok(fd)
     }
 
     /// Accept a connection on a TCP listener. Returns (new_stream_fd, remote_addr).
     pub fn tcp_accept(&self, fd: FdId) -> Result<(FdId, String), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpListener(listener)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp accept"))?;
+        match &*entry {
+            FileEntry::TcpListener(listener) => {
                 let (stream, addr) = listener.lock().accept()?;
-                drop(entries);
                 let new_fd = self.insert_tcp_stream(stream);
                 Ok((new_fd, addr.to_string()))
             }
@@ -687,9 +725,9 @@ impl FileDescriptorTable {
 
     /// Read from a TCP stream. Returns bytes read.
     pub fn tcp_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(stream)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp read"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => {
                 let mut s = stream.lock();
                 s.read(buf)
             }
@@ -699,9 +737,9 @@ impl FileDescriptorTable {
 
     /// Write to a TCP stream. Returns bytes written.
     pub fn tcp_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(stream)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp write"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => {
                 let mut s = stream.lock();
                 s.write(data)
             }
@@ -711,29 +749,29 @@ impl FileDescriptorTable {
 
     /// Set non-blocking mode on a TCP stream or listener.
     pub fn tcp_set_nonblocking(&self, fd: FdId, nonblocking: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(stream)) => stream.lock().set_nonblocking(nonblocking),
-            Some(FileEntry::TcpListener(listener)) => listener.lock().set_nonblocking(nonblocking),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => stream.lock().set_nonblocking(nonblocking),
+            FileEntry::TcpListener(listener) => listener.lock().set_nonblocking(nonblocking),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Get the local address of a TCP stream or listener.
     pub fn tcp_local_addr(&self, fd: FdId) -> Result<String, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(stream)) => Ok(stream.lock().local_addr()?.to_string()),
-            Some(FileEntry::TcpListener(listener)) => Ok(listener.lock().local_addr()?.to_string()),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => Ok(stream.lock().local_addr()?.to_string()),
+            FileEntry::TcpListener(listener) => Ok(listener.lock().local_addr()?.to_string()),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Get the peer address of a TCP stream.
     pub fn tcp_peer_addr(&self, fd: FdId) -> Result<String, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(stream)) => Ok(stream.lock().peer_addr()?.to_string()),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => Ok(stream.lock().peer_addr()?.to_string()),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
@@ -741,9 +779,9 @@ impl FileDescriptorTable {
     /// Check if a fd is ready for read/write (non-blocking poll).
     /// Returns (readable, writable).
     pub fn poll_ready(&self, fd: FdId) -> (bool, bool) {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(sock)) => {
+        let Some(entry) = self.get_entry(fd) else { return (false, false); };
+        match &*entry {
+            FileEntry::UdpSocket(sock) => {
                 let s = sock.lock();
                 // Temporarily set non-blocking, peek for data, then restore.
                 // Use a 65536-byte buffer because on Windows, peek with a
@@ -763,7 +801,7 @@ impl FileDescriptorTable {
                 let _ = s.set_nonblocking(false);
                 (readable, true) // UDP sockets are always writable
             }
-            Some(FileEntry::TcpStream(stream)) => {
+            FileEntry::TcpStream(stream) => {
                 let s = stream.lock();
                 let _ = s.set_nonblocking(true);
                 let mut peek_buf = [0u8; 1];
@@ -775,7 +813,7 @@ impl FileDescriptorTable {
                 let _ = s.set_nonblocking(false);
                 (readable, true) // TCP streams are generally writable
             }
-            Some(FileEntry::TcpListener(listener)) => {
+            FileEntry::TcpListener(listener) => {
                 let l = listener.lock();
                 let _ = l.set_nonblocking(true);
                 let readable = match l.accept() {
@@ -789,14 +827,14 @@ impl FileDescriptorTable {
                 let _ = l.set_nonblocking(false);
                 (readable, false) // listeners are readable (acceptable), not writable
             }
-            Some(FileEntry::FileRead(_)) => (true, false),
-            Some(FileEntry::FileWrite(_)) => (false, true),
-            Some(FileEntry::FileReadWrite(_)) => (true, true),
-            Some(FileEntry::PipeRead(buf)) => {
+            FileEntry::FileRead(_) => (true, false),
+            FileEntry::FileWrite(_) => (false, true),
+            FileEntry::FileReadWrite(_) => (true, true),
+            FileEntry::PipeRead(buf) => {
                 let b = buf.lock();
                 (!b.is_empty(), false)
             }
-            Some(FileEntry::PipeWrite(_)) => (false, true),
+            FileEntry::PipeWrite(_) => (false, true),
             _ => (false, false),
         }
     }
@@ -807,63 +845,63 @@ impl FileDescriptorTable {
 
     /// Set TCP_NODELAY on a TCP stream.
     pub fn tcp_set_nodelay(&self, fd: FdId, nodelay: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => s.lock().set_nodelay(nodelay),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => s.lock().set_nodelay(nodelay),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Get TCP_NODELAY on a TCP stream.
     pub fn tcp_nodelay(&self, fd: FdId) -> Result<bool, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => s.lock().nodelay(),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => s.lock().nodelay(),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Set read timeout on a TCP stream.
     pub fn tcp_set_read_timeout(&self, fd: FdId, timeout: Option<Duration>) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => s.lock().set_read_timeout(timeout),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => s.lock().set_read_timeout(timeout),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Get read timeout on a TCP stream.
     pub fn tcp_read_timeout(&self, fd: FdId) -> Result<Option<Duration>, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => s.lock().read_timeout(),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => s.lock().read_timeout(),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Set write timeout on a TCP stream.
     pub fn tcp_set_write_timeout(&self, fd: FdId, timeout: Option<Duration>) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => s.lock().set_write_timeout(timeout),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => s.lock().set_write_timeout(timeout),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Set TTL on a TCP stream.
     pub fn tcp_set_ttl(&self, fd: FdId, ttl: u32) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => s.lock().set_ttl(ttl),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => s.lock().set_ttl(ttl),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
 
     /// Set SO_KEEPALIVE on a TCP stream (via socket2).
     pub fn tcp_set_keepalive(&self, fd: FdId, keepalive: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.set_keepalive(keepalive)
@@ -874,9 +912,9 @@ impl FileDescriptorTable {
 
     /// Get SO_KEEPALIVE on a TCP stream.
     pub fn tcp_keepalive(&self, fd: FdId) -> Result<bool, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.keepalive()
@@ -887,9 +925,9 @@ impl FileDescriptorTable {
 
     /// Set SO_LINGER on a TCP stream.
     pub fn tcp_set_linger(&self, fd: FdId, linger: Option<Duration>) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.set_linger(linger)
@@ -900,9 +938,9 @@ impl FileDescriptorTable {
 
     /// Get SO_LINGER on a TCP stream.
     pub fn tcp_linger(&self, fd: FdId) -> Result<Option<Duration>, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.linger()
@@ -913,9 +951,9 @@ impl FileDescriptorTable {
 
     /// Set SO_SNDBUF on a TCP stream.
     pub fn tcp_set_send_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.set_send_buffer_size(size)
@@ -926,9 +964,9 @@ impl FileDescriptorTable {
 
     /// Get SO_SNDBUF on a TCP stream.
     pub fn tcp_send_buffer_size(&self, fd: FdId) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.send_buffer_size()
@@ -939,9 +977,9 @@ impl FileDescriptorTable {
 
     /// Set SO_RCVBUF on a TCP stream.
     pub fn tcp_set_recv_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.set_recv_buffer_size(size)
@@ -952,9 +990,9 @@ impl FileDescriptorTable {
 
     /// Get SO_RCVBUF on a TCP stream.
     pub fn tcp_recv_buffer_size(&self, fd: FdId) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.recv_buffer_size()
@@ -965,14 +1003,14 @@ impl FileDescriptorTable {
 
     /// Set SO_REUSEADDR on a TCP listener (via socket2).
     pub fn tcp_set_reuse_address(&self, fd: FdId, reuse: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpListener(l)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpListener(l) => {
                 let listener = l.lock();
                 let sock = socket2::SockRef::from(&*listener);
                 sock.set_reuse_address(reuse)
             }
-            Some(FileEntry::TcpStream(s)) => {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let sock = socket2::SockRef::from(&*stream);
                 sock.set_reuse_address(reuse)
@@ -983,9 +1021,9 @@ impl FileDescriptorTable {
 
     /// Estimate available bytes on a TCP stream using peek.
     pub fn tcp_available(&self, fd: FdId) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TcpStream(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
+        match &*entry {
+            FileEntry::TcpStream(s) => {
                 let stream = s.lock();
                 let _ = stream.set_nonblocking(true);
                 let mut buf = [0u8; 8192];
@@ -1007,9 +1045,9 @@ impl FileDescriptorTable {
 
     /// Set SO_REUSEADDR on a UDP socket via socket2.
     pub fn udp_set_reuse_address(&self, fd: FdId, on: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(s)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => {
                 let sock = s.lock();
                 let sock_ref = socket2::SockRef::from(&*sock);
                 sock_ref.set_reuse_address(on)
@@ -1020,27 +1058,27 @@ impl FileDescriptorTable {
 
     /// Set SO_BROADCAST on a UDP socket.
     pub fn udp_set_broadcast(&self, fd: FdId, on: bool) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(s)) => s.lock().set_broadcast(on),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.lock().set_broadcast(on),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
 
     /// Set TTL on a UDP socket.
     pub fn udp_set_ttl(&self, fd: FdId, ttl: u32) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(s)) => s.lock().set_ttl(ttl),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.lock().set_ttl(ttl),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
 
     /// Set read timeout on a UDP socket.
     pub fn udp_set_read_timeout(&self, fd: FdId, timeout: Option<Duration>) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(s)) => s.lock().set_read_timeout(timeout),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.lock().set_read_timeout(timeout),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1052,9 +1090,9 @@ impl FileDescriptorTable {
         multiaddr: &std::net::Ipv4Addr,
         interface: &std::net::Ipv4Addr,
     ) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(s)) => s.lock().join_multicast_v4(multiaddr, interface),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.lock().join_multicast_v4(multiaddr, interface),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1066,9 +1104,9 @@ impl FileDescriptorTable {
         multiaddr: &std::net::Ipv4Addr,
         interface: &std::net::Ipv4Addr,
     ) -> Result<(), io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::UdpSocket(s)) => s.lock().leave_multicast_v4(multiaddr, interface),
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.lock().leave_multicast_v4(multiaddr, interface),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1083,16 +1121,16 @@ impl FileDescriptorTable {
         let read_fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         let write_fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.write();
-        entries.insert(read_fd, FileEntry::PipeRead(buf.clone()));
-        entries.insert(write_fd, FileEntry::PipeWrite(buf));
+        entries.insert(read_fd, Arc::new(FileEntry::PipeRead(buf.clone())));
+        entries.insert(write_fd, Arc::new(FileEntry::PipeWrite(buf)));
         (read_fd, write_fd)
     }
 
     /// Read from the read end of a pipe. Returns bytes read (0 if empty).
     pub fn pipe_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::PipeRead(pipe)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for pipe read"))?;
+        match &*entry {
+            FileEntry::PipeRead(pipe) => {
                 let mut p = pipe.lock();
                 let n = buf.len().min(p.len());
                 for (i, b) in p.drain(..n).enumerate() {
@@ -1106,9 +1144,9 @@ impl FileDescriptorTable {
 
     /// Write to the write end of a pipe. Returns bytes written.
     pub fn pipe_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::PipeWrite(pipe)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for pipe write"))?;
+        match &*entry {
+            FileEntry::PipeWrite(pipe) => {
                 let mut p = pipe.lock();
                 p.extend(data);
                 Ok(data.len())
@@ -1137,15 +1175,15 @@ impl FileDescriptorTable {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.entries
             .write()
-            .insert(fd, FileEntry::TlsStream(Mutex::new(tls_stream)));
+            .insert(fd, Arc::new(FileEntry::TlsStream(Mutex::new(tls_stream))));
         Ok(fd)
     }
 
     /// Read from a TLS stream.
     pub fn tls_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TlsStream(stream)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tls read"))?;
+        match &*entry {
+            FileEntry::TlsStream(stream) => {
                 let mut s = stream.lock();
                 s.read(buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
             }
@@ -1155,9 +1193,9 @@ impl FileDescriptorTable {
 
     /// Write to a TLS stream.
     pub fn tls_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
-        let entries = self.entries.read();
-        match entries.get(&fd) {
-            Some(FileEntry::TlsStream(stream)) => {
+        let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tls write"))?;
+        match &*entry {
+            FileEntry::TlsStream(stream) => {
                 let mut s = stream.lock();
                 s.write(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
             }

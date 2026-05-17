@@ -113,19 +113,16 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
         return Ok(None);
     }
 
-    // Primitive element-type compatibility check.
+    // Element-type compatibility.
     //
-    // FIXME(audit-2026-05-16): For *reference* arrays, JLS / `java.lang.System.arraycopy`
-    // requires a per-element assignability check between each source element's
-    // runtime class and the destination array's component class, throwing
-    // `ArrayStoreException` at the first incompatible element and copying
-    // every element *before* the offending one. We currently approximate
-    // this by checking the primitive element-type matches — that catches
-    // primitive-vs-reference and primitive-of-different-kind mismatches but
-    // misses per-element refinement for reference arrays. A proper fix
-    // needs `NativeContext::is_assignable(elem_class, dest_component_class)`
-    // or `NativeContext::array_component_class(arr) -> ClassId`, neither of
-    // which exists today (cross-crate change).
+    // Three cases:
+    //  1. Both primitive arrays of the same element type → bulk-safe copy.
+    //  2. One primitive, the other reference (or two primitives of
+    //     different kinds) → bulk-reject with ArrayStoreException.
+    //  3. Both reference arrays → per-element assignability check against
+    //     the destination component class, with prefix-commit on failure
+    //     (JLS §5.5 / `java.lang.System.arraycopy` contract).
+    use rustjvm_types::ArrayElementType;
     let src_elem = ctx.heap_element_type_of(src);
     let dest_elem = ctx.heap_element_type_of(dest);
     if src_elem != dest_elem {
@@ -147,6 +144,94 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     // helper.
     let same_array = src.as_ptr() == dest.as_ptr();
 
+    if src_elem == ArrayElementType::Reference {
+        // Reference-array path: per-element instanceof check against the
+        // destination component class. The component class id for a
+        // reference array is stored in the heap header (`alloc_array` is
+        // given the component class id directly), so
+        // `class_id_of_object(dest)` IS the dest component class.
+        let dst_elem_class = ctx.class_id_of_object(dest);
+        let object_class_id = ctx.class_id_by_name("java/lang/Object");
+
+        // Per-element assignability: matches the established pattern in
+        // `native_class_is_assignable_from` /
+        // `native_class_is_instance` — identity OR `is_subclass` (which
+        // walks both the superclass chain AND implemented interfaces, so
+        // it correctly handles dest-element-type-is-interface cases like
+        // `Runnable[]`).
+        let assignable_to_dst = |ctx: &mut dyn NativeContext, elem_class| -> bool {
+            if Some(dst_elem_class) == object_class_id {
+                // Fast path: every reference is assignable to Object.
+                return true;
+            }
+            elem_class == dst_elem_class || ctx.is_subclass(elem_class, dst_elem_class)
+        };
+
+        // For same-array overlap with `src_pos < dest_pos` the actual
+        // copy must run backward (high→low) so we don't clobber unread
+        // source slots. Doing per-element check-then-write in that
+        // direction would let an early write corrupt source data read
+        // later, breaking the type check. So in that case we do a
+        // forward type-CHECK-only pre-pass first (no writes); on failure
+        // we throw with NO elements written (an empty prefix — still
+        // satisfies the "elements [0, i) are committed" contract since
+        // i==0 means nothing was committed). If the pre-pass succeeds,
+        // we then copy backward without re-checking.
+        //
+        // For all other cases (different arrays, or `src_pos >= dest_pos`
+        // in the same array) forward direction is safe, so we do
+        // check-then-write per element and observe true partial commit
+        // on failure: indices [0, i) of dest at positions
+        // `dest_pos..dest_pos+i` are written before the throw.
+        if same_array && src_pos < dest_pos {
+            // Forward type-check pre-pass — no writes.
+            for i in 0..length {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                if let Value::Object(Some(elem)) = val {
+                    let elem_class = ctx.class_id_of_object(elem);
+                    if !assignable_to_dst(ctx, elem_class) {
+                        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+                            message: format!(
+                                "arraycopy: source element at index {} is not assignable to destination component type",
+                                src_pos + i
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+            // Pre-check passed — copy backward to handle overlap.
+            for i in (0..length).rev() {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                ctx.set_array_element(dest, (dest_pos + i) as usize, val);
+            }
+        } else {
+            // Forward direction is safe — check-then-write per element.
+            for i in 0..length {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                if let Value::Object(Some(elem)) = val {
+                    let elem_class = ctx.class_id_of_object(elem);
+                    if !assignable_to_dst(ctx, elem_class) {
+                        // Prefix [0, i) at positions `dest_pos..dest_pos+i`
+                        // has already been written. This is the spec
+                        // partial-commit behavior.
+                        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+                            message: format!(
+                                "arraycopy: source element at index {} is not assignable to destination component type",
+                                src_pos + i
+                            ),
+                        }
+                        .into());
+                    }
+                }
+                ctx.set_array_element(dest, (dest_pos + i) as usize, val);
+            }
+        }
+        return Ok(None);
+    }
+
+    // Primitive-array fast path — element types already verified equal.
+    //
     // TODO(audit-2026-05-16): replace this per-element loop with a bulk
     // intrinsic when `NativeContext` exposes one (e.g.
     // `bulk_array_copy(src, src_pos, dst, dst_pos, len)`). For large

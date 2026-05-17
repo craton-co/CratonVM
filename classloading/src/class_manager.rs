@@ -36,7 +36,101 @@ use crate::module::{
     descriptor_from_module_attribute, package_of, packages_from_module_packages_attribute,
     ModuleRegistry,
 };
+use crate::vtype::ClassHierarchy;
 use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
+
+/// Adapter implementing [`ClassHierarchy`] over the `ClassManager`'s
+/// `ClassStore` + name-to-id index. Used by the verifier (Pass 2 / Pass 3)
+/// during `define_class_with_options`. Each query is name-keyed and walks
+/// the loaded-class indexes; if a referenced class hasn't been loaded yet
+/// the query falls back to conservative defaults that keep verification
+/// permissive (treat unknown classes as `java/lang/Object` subclasses, not
+/// interfaces) — matching HotSpot's "subclass of nothing else" tolerance
+/// for unresolved references during Pass 3.
+struct ClassStoreHierarchy<'a> {
+    class_store: &'a ClassStore,
+    loaded_classes: &'a FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
+}
+
+impl<'a> ClassStoreHierarchy<'a> {
+    fn lookup(&self, name: &str) -> Option<ClassId> {
+        // T10.9.E: probe with an `Arc<str>` constructed from `&str`. This is
+        // a single allocation per probe — no worse than the prior
+        // `name.to_string()`. The win from the conversion comes from the
+        // insert side, where callers already hold an `Arc<str>` and only
+        // need a refcount bump.
+        let probe: Arc<str> = Arc::from(name);
+        for loader_id in &[
+            ClassLoaderId::Bootstrap,
+            ClassLoaderId::Extension,
+            ClassLoaderId::Application,
+        ] {
+            if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
+                return Some(id);
+            }
+        }
+        // Fall back to scanning every loader (custom loaders).
+        for ((_, class_name), &id) in self.loaded_classes.iter() {
+            if &**class_name == name {
+                return Some(id);
+            }
+        }
+        None
+    }
+}
+
+impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
+    fn is_subclass(&self, child: &str, parent: &str) -> bool {
+        if child == parent || parent == "java/lang/Object" {
+            return true;
+        }
+        let (Some(child_id), Some(parent_id)) = (self.lookup(child), self.lookup(parent)) else {
+            // Either class isn't loaded yet — be permissive so the
+            // verifier doesn't reject legitimate forward references.
+            return true;
+        };
+        match self.class_store.get(child_id) {
+            Some(c) => c.is_subclass_of(parent_id, self.class_store),
+            None => true,
+        }
+    }
+
+    fn common_superclass(&self, a: &str, b: &str) -> String {
+        if a == b {
+            return a.to_string();
+        }
+        let (Some(a_id), Some(b_id)) = (self.lookup(a), self.lookup(b)) else {
+            return "java/lang/Object".to_string();
+        };
+        let a_cls = match self.class_store.get(a_id) {
+            Some(c) => c,
+            None => return "java/lang/Object".to_string(),
+        };
+        let mut current = Some(a_cls);
+        let mut depth = 0usize;
+        while let Some(cls) = current {
+            if depth > 256 {
+                break;
+            }
+            depth += 1;
+            let cls_id = cls.id;
+            if let Some(b_cls) = self.class_store.get(b_id) {
+                if b_cls.is_subclass_of(cls_id, self.class_store) {
+                    return cls.name.to_string();
+                }
+            }
+            current = cls.superclass.and_then(|sid| self.class_store.get(sid));
+        }
+        "java/lang/Object".to_string()
+    }
+
+    fn is_interface(&self, name: &str) -> bool {
+        match self.lookup(name).and_then(|id| self.class_store.get(id)) {
+            Some(c) => c.is_interface(),
+            None => false,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // T6.3.1 — JVMTI class-lifecycle hook registry
@@ -1851,6 +1945,48 @@ impl ClassManager {
             .and_then(|sid| self.class_store.get(sid))
             .map_or(false, |parent| parent.has_finalizer);
         class.has_finalizer = self_declares || parent_has;
+
+        // Audit-fix #1 (CRITICAL): run the JVMS §5.4.1 Pass 2 / Pass 3
+        // verifier before the class is registered. Previously
+        // `define_class_with_options` recorded `skip_verification` in a
+        // side set but NEVER actually invoked the verifier, so every
+        // caller of `Unsafe.defineClass` / `MethodHandles.Lookup
+        // .defineClass` got a structurally valid but unverified class.
+        //
+        // Skip cases (each matches HotSpot's policy):
+        //   - `options.skip_verification` — trusted runtime-generated
+        //     classes (CGLIB, ByteBuddy, JDK Proxy, hidden classes) that
+        //     emit bytecode our worklist verifier cannot model. The
+        //     caller asserted trust by setting the flag.
+        //   - CDS-cached bytes — already verified at archive-creation
+        //     time; re-verifying would be redundant.
+        //   - Synthetic stubs — created in-memory with empty bodies, no
+        //     bytecode to verify (real-bytecode upgrade path runs
+        //     verification on the replacement).
+        //
+        // On failure the class is dropped (never reaches the store /
+        // loaded_classes map) and the caller receives a typed
+        // `VmError::Linkage(LinkageError::VerifyError { .. })`.
+        if !options.skip_verification
+            && !self.cds_class_cache.contains_key(name)
+            && !class.is_synthetic_stub
+            && class.state != ClassState::Verified
+        {
+            let hierarchy = ClassStoreHierarchy {
+                class_store: &self.class_store,
+                loaded_classes: &self.loaded_classes,
+            };
+            if let Err(verify_err) = crate::verifier::verify_class(
+                &class,
+                &self.class_store,
+                &hierarchy,
+            ) {
+                // Verifier rejected the bytecode. Drop the guard set
+                // entry so retry attempts are not erroneously blocked.
+                self.loading_guard.remove(name);
+                return Err(VmError::Linkage(verify_err));
+            }
+        }
 
         debug!(
             class = %class.name,

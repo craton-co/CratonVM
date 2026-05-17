@@ -48,69 +48,155 @@ fn fold_constants(graph: &mut Graph) {
 
 fn try_fold(nodes: &[Node], id: NodeId) -> Option<i64> {
     let node = &nodes[id as usize];
+    let is_int = node.ty == IrType::Int;
     match &node.op {
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::And | Op::Or | Op::Xor
         | Op::Shl | Op::Shr | Op::UShr => {
             let a = const_value(nodes, node.inputs[0])?;
             let b = const_value(nodes, node.inputs[1])?;
-            let result = match &node.op {
-                Op::Add => a.wrapping_add(b),
-                Op::Sub => a.wrapping_sub(b),
-                Op::Mul => a.wrapping_mul(b),
-                Op::Div => {
-                    if b == 0 {
-                        return None;
+            let raw = match &node.op {
+                Op::Add => {
+                    if is_int {
+                        ((a as i32).wrapping_add(b as i32)) as i64
+                    } else {
+                        a.wrapping_add(b)
                     }
-                    a.wrapping_div(b)
+                }
+                Op::Sub => {
+                    if is_int {
+                        ((a as i32).wrapping_sub(b as i32)) as i64
+                    } else {
+                        a.wrapping_sub(b)
+                    }
+                }
+                Op::Mul => {
+                    if is_int {
+                        ((a as i32).wrapping_mul(b as i32)) as i64
+                    } else {
+                        a.wrapping_mul(b)
+                    }
+                }
+                Op::Div => {
+                    if is_int {
+                        let bi = b as i32;
+                        if bi == 0 {
+                            return None;
+                        }
+                        let ai = a as i32;
+                        // Java semantics: INT_MIN / -1 == INT_MIN (no exception).
+                        // i32::wrapping_div handles this correctly.
+                        if ai == i32::MIN && bi == -1 {
+                            i32::MIN as i64
+                        } else {
+                            ai.wrapping_div(bi) as i64
+                        }
+                    } else {
+                        if b == 0 {
+                            return None;
+                        }
+                        // Java semantics: LONG_MIN / -1 == LONG_MIN (no exception).
+                        if a == i64::MIN && b == -1 {
+                            i64::MIN
+                        } else {
+                            a.wrapping_div(b)
+                        }
+                    }
                 }
                 Op::Rem => {
-                    if b == 0 {
-                        return None;
+                    if is_int {
+                        let bi = b as i32;
+                        if bi == 0 {
+                            return None;
+                        }
+                        let ai = a as i32;
+                        // Java semantics: INT_MIN % -1 == 0 (no exception).
+                        if ai == i32::MIN && bi == -1 {
+                            0
+                        } else {
+                            ai.wrapping_rem(bi) as i64
+                        }
+                    } else {
+                        if b == 0 {
+                            return None;
+                        }
+                        // Java semantics: LONG_MIN % -1 == 0 (no exception).
+                        if a == i64::MIN && b == -1 {
+                            0
+                        } else {
+                            a.wrapping_rem(b)
+                        }
                     }
-                    a.wrapping_rem(b)
                 }
                 Op::And => a & b,
                 Op::Or => a | b,
                 Op::Xor => a ^ b,
                 Op::Shl => {
-                    if node.ty == IrType::Int {
-                        ((a as i32).wrapping_shl(b as u32)) as i64
+                    if is_int {
+                        // Java: only low 5 bits of shift count for int.
+                        ((a as i32).wrapping_shl((b as u32) & 0x1f)) as i64
                     } else {
-                        a.wrapping_shl(b as u32)
+                        // Java: only low 6 bits of shift count for long.
+                        a.wrapping_shl((b as u32) & 0x3f)
                     }
                 }
                 Op::Shr => {
-                    if node.ty == IrType::Int {
-                        ((a as i32).wrapping_shr(b as u32)) as i64
+                    if is_int {
+                        ((a as i32).wrapping_shr((b as u32) & 0x1f)) as i64
                     } else {
-                        a.wrapping_shr(b as u32)
+                        a.wrapping_shr((b as u32) & 0x3f)
                     }
                 }
                 Op::UShr => {
-                    if node.ty == IrType::Int {
-                        ((a as u32).wrapping_shr(b as u32)) as i64
+                    if is_int {
+                        ((a as u32).wrapping_shr((b as u32) & 0x1f)) as i64
                     } else {
-                        (a as u64).wrapping_shr(b as u32) as i64
+                        (a as u64).wrapping_shr((b as u32) & 0x3f) as i64
                     }
                 }
                 _ => unreachable!(),
             };
+            // Defensive truncation: for i32 ops, ensure the high 32 bits are
+            // a sign-extension of the low 32 bits. (Most paths above already
+            // satisfy this, but truncating once at the end makes the
+            // invariant robust to future edits.)
+            let result = if is_int { (raw as i32) as i64 } else { raw };
             Some(result)
         }
         Op::Neg => {
             let a = const_value(nodes, node.inputs[0])?;
-            Some(a.wrapping_neg())
+            let raw = if is_int {
+                ((a as i32).wrapping_neg()) as i64
+            } else {
+                a.wrapping_neg()
+            };
+            let result = if is_int { (raw as i32) as i64 } else { raw };
+            Some(result)
         }
         Op::Cmp(cc) => {
             let a = const_value(nodes, node.inputs[0])?;
             let b = const_value(nodes, node.inputs[1])?;
-            let result = match cc {
-                CmpOp::Eq => a == b,
-                CmpOp::Ne => a != b,
-                CmpOp::Lt => a < b,
-                CmpOp::Le => a <= b,
-                CmpOp::Gt => a > b,
-                CmpOp::Ge => a >= b,
+            // Compare in the proper width so that two i32-typed constants
+            // whose i64 sign-extensions agree compare identically.
+            let result = if is_int {
+                let ai = a as i32;
+                let bi = b as i32;
+                match cc {
+                    CmpOp::Eq => ai == bi,
+                    CmpOp::Ne => ai != bi,
+                    CmpOp::Lt => ai < bi,
+                    CmpOp::Le => ai <= bi,
+                    CmpOp::Gt => ai > bi,
+                    CmpOp::Ge => ai >= bi,
+                }
+            } else {
+                match cc {
+                    CmpOp::Eq => a == b,
+                    CmpOp::Ne => a != b,
+                    CmpOp::Lt => a < b,
+                    CmpOp::Le => a <= b,
+                    CmpOp::Gt => a > b,
+                    CmpOp::Ge => a >= b,
+                }
             };
             Some(if result { 1 } else { 0 })
         }
@@ -426,5 +512,154 @@ mod tests {
         let ret = &graph.nodes[graph.exit as usize];
         let val_id = ret.inputs[1];
         assert_eq!(graph.nodes[val_id as usize].op, Op::Const(20));
+    }
+
+    // ── Unit tests for try_fold i32-truncation correctness ──────────
+
+    /// Build a 3-node graph: Const(a), Const(b), Op(a, b) of type `ty`.
+    /// Returns the binary node's id and the node arena, ready to pass to try_fold.
+    fn fold_binop(ty: IrType, op: Op, a: i64, b: i64) -> Option<i64> {
+        let mut nodes: Vec<Node> = Vec::new();
+        nodes.push(Node {
+            op: Op::Const(a),
+            ty,
+            inputs: vec![],
+            bytecode_pc: None,
+        });
+        nodes.push(Node {
+            op: Op::Const(b),
+            ty,
+            inputs: vec![],
+            bytecode_pc: None,
+        });
+        nodes.push(Node {
+            op,
+            ty,
+            inputs: vec![0, 1],
+            bytecode_pc: None,
+        });
+        try_fold(&nodes, 2)
+    }
+
+    fn fold_unop(ty: IrType, op: Op, a: i64) -> Option<i64> {
+        let mut nodes: Vec<Node> = Vec::new();
+        nodes.push(Node {
+            op: Op::Const(a),
+            ty,
+            inputs: vec![],
+            bytecode_pc: None,
+        });
+        nodes.push(Node {
+            op,
+            ty,
+            inputs: vec![0],
+            bytecode_pc: None,
+        });
+        try_fold(&nodes, 1)
+    }
+
+    #[test]
+    fn test_fold_i32_add_overflow_wraps() {
+        // Java: Integer.MIN_VALUE + (-1) == Integer.MAX_VALUE (0x7FFF_FFFF)
+        let r = fold_binop(IrType::Int, Op::Add, i32::MIN as i64, -1).unwrap();
+        assert_eq!(r, i32::MAX as i64, "INT_MIN + (-1) must wrap to INT_MAX, got {:#x}", r);
+        // High 32 bits must be sign-extension of low 32 bits (i.e. 0 here).
+        assert_eq!(r as i32 as i64, r, "result must be a clean i32 sign-extension");
+    }
+
+    #[test]
+    fn test_fold_i32_sub_overflow_wraps() {
+        // Java: Integer.MIN_VALUE - 1 == Integer.MAX_VALUE
+        let r = fold_binop(IrType::Int, Op::Sub, i32::MIN as i64, 1).unwrap();
+        assert_eq!(r, i32::MAX as i64);
+    }
+
+    #[test]
+    fn test_fold_i32_mul_overflow_wraps() {
+        // Java: 0x10000 * 0x10000 (as int) == 0 (low 32 bits of 2^32)
+        let r = fold_binop(IrType::Int, Op::Mul, 0x10000, 0x10000).unwrap();
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_fold_i32_div_intmin_neg1() {
+        // Java: Integer.MIN_VALUE / -1 == Integer.MIN_VALUE (no exception)
+        let r = fold_binop(IrType::Int, Op::Div, i32::MIN as i64, -1).unwrap();
+        assert_eq!(r, i32::MIN as i64);
+    }
+
+    #[test]
+    fn test_fold_i32_rem_intmin_neg1() {
+        // Java: Integer.MIN_VALUE % -1 == 0 (no exception)
+        let r = fold_binop(IrType::Int, Op::Rem, i32::MIN as i64, -1).unwrap();
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_fold_i32_div_by_zero_returns_none() {
+        // Cannot fold; runtime must throw ArithmeticException.
+        assert_eq!(fold_binop(IrType::Int, Op::Div, 5, 0), None);
+        assert_eq!(fold_binop(IrType::Int, Op::Rem, 5, 0), None);
+    }
+
+    #[test]
+    fn test_fold_i64_div_longmin_neg1() {
+        // Java: Long.MIN_VALUE / -1 == Long.MIN_VALUE (no exception)
+        let r = fold_binop(IrType::Long, Op::Div, i64::MIN, -1).unwrap();
+        assert_eq!(r, i64::MIN);
+        let r = fold_binop(IrType::Long, Op::Rem, i64::MIN, -1).unwrap();
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_fold_i64_div_by_zero_returns_none() {
+        assert_eq!(fold_binop(IrType::Long, Op::Div, 5, 0), None);
+        assert_eq!(fold_binop(IrType::Long, Op::Rem, 5, 0), None);
+    }
+
+    #[test]
+    fn test_fold_i32_shl_masks_to_5_bits() {
+        // Java: 1 << 33 == 1 << 1 == 2 (shift count masked to low 5 bits)
+        let r = fold_binop(IrType::Int, Op::Shl, 1, 33).unwrap();
+        assert_eq!(r, 2);
+        // 1 << 31 == INT_MIN (sign-extended to i64)
+        let r = fold_binop(IrType::Int, Op::Shl, 1, 31).unwrap();
+        assert_eq!(r, i32::MIN as i64);
+    }
+
+    #[test]
+    fn test_fold_i64_shl_masks_to_6_bits() {
+        // Java: 1L << 65 == 1L << 1 == 2
+        let r = fold_binop(IrType::Long, Op::Shl, 1, 65).unwrap();
+        assert_eq!(r, 2);
+    }
+
+    #[test]
+    fn test_fold_i32_ushr_does_not_leak_high_bits() {
+        // Java: (-1) >>> 1 == 0x7FFF_FFFF (as int), sign-extended → 0x7FFF_FFFF
+        let r = fold_binop(IrType::Int, Op::UShr, -1i64, 1).unwrap();
+        assert_eq!(r, 0x7FFF_FFFFi64);
+    }
+
+    #[test]
+    fn test_fold_i32_and_truncates() {
+        // If either operand somehow had stale high bits, AND result must
+        // still be a clean i32 sign-extension.
+        let r = fold_binop(IrType::Int, Op::And, 0xFF, 0x0F).unwrap();
+        assert_eq!(r, 0x0F);
+        assert_eq!(r as i32 as i64, r);
+    }
+
+    #[test]
+    fn test_fold_i32_neg_intmin() {
+        // Java: -Integer.MIN_VALUE == Integer.MIN_VALUE (wraps)
+        let r = fold_unop(IrType::Int, Op::Neg, i32::MIN as i64).unwrap();
+        assert_eq!(r, i32::MIN as i64);
+    }
+
+    #[test]
+    fn test_fold_i64_neg_longmin() {
+        let r = fold_unop(IrType::Long, Op::Neg, i64::MIN).unwrap();
+        assert_eq!(r, i64::MIN);
     }
 }

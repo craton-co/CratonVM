@@ -2230,13 +2230,16 @@ pub fn execute(
     if let Some(exc) = jit_early_exception {
         // The frame has been pushed. Search its exception table for a handler.
         let frame_idx = thread.frames.len() - 1;
-        // The JIT executed the entire method body, so we don't know the exact
-        // PC of the throw site. Scan the exception table in order, matching by
-        // catch_type alone. This mirrors the JVM's deopt-and-resume semantics
-        // without needing the throw-site PC: if the method's exception table
-        // has an entry whose catch_type matches the thrown exception, the
-        // first such entry (in declaration order) is the correct handler.
-        match find_exception_handler_any_pc(shared, &thread.frames[frame_idx], exc) {
+        // The JIT executed the entire method body, so we do not have the
+        // exact throw-site PC. Pass the frame's `last_instr_pc` (which on a
+        // freshly-pushed frame is 0) as a best-effort PC; the handler
+        // search still honors each entry's `[start_pc, end_pc)` range so
+        // we do not incorrectly route exceptions into a `finally` whose
+        // try region did not cover the throw site. This may cause us to
+        // miss a legitimate handler in the JIT-deopt case, but never to
+        // catch in the wrong one — propagation to the caller is correct.
+        let throw_pc = thread.frames[frame_idx].last_instr_pc;
+        match find_exception_handler_any_pc(shared, &thread.frames[frame_idx], throw_pc, exc) {
             Some((handler_pc, exc_ref)) => {
                 thread.frames[frame_idx].stack.clear();
                 let _ = thread.frames[frame_idx].stack.push(Value::Object(Some(exc_ref)));
@@ -4481,8 +4484,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 // T17.Δ — Unwind to parent frame (exception).
                                 pop_and_recycle_frame_with_reason(shared, thread, true);
                                 frame_idx -= 1;
-                                // Use last_instr_pc to point at the invoke instruction
-                                exc_pc = thread.frames[frame_idx].pc.saturating_sub(1);
+                                // Use last_instr_pc to point at the invoke opcode itself.
+                                // `pc` has already advanced past the 3-byte (invokevirtual/
+                                // static/special) or 5-byte (invokeinterface/invokedynamic)
+                                // instruction, so `pc - 1` would land inside operand bytes
+                                // and miss the handler's [start_pc, end_pc) range.
+                                // `last_instr_pc` is written by the dispatch loop (see
+                                // interpreter.rs:2358) immediately before each opcode, so
+                                // it is current at any throw site reachable from this path.
+                                exc_pc = thread.frames[frame_idx].last_instr_pc;
                             } else {
                                 // Trace exception propagation out of top frame
                                 let exc_class = shared.class_manager.read()
@@ -4741,21 +4751,34 @@ fn find_exception_handler(
     None
 }
 
-/// Scan the frame's exception table for any handler whose `catch_type`
-/// matches the thrown exception's class, ignoring the PC range check.
+/// Scan the frame's exception table for a handler that covers `pc` and
+/// whose `catch_type` matches the thrown exception's class.
 ///
-/// Used by the JIT early-exception path where we do not know the exact PC
-/// of the throw site (the method was compiled and executed as a whole).
+/// Used by the JIT early-exception path. Unlike `find_exception_handler`,
+/// callers here may not know the *exact* PC of the throw site (the JIT
+/// executed the entire bytecode method as native code). They must still
+/// supply a best-known `pc` (typically the frame's `last_instr_pc`, or 0
+/// for a freshly-pushed frame) so that handler matching honors each
+/// entry's `[start_pc, end_pc)` range — without that check, a `finally`
+/// (catch-all) entry would incorrectly swallow exceptions whose throw
+/// site is outside that try region.
+///
 /// Entries are searched in declaration order; the first matching handler
 /// wins, mirroring the JVM spec's handler precedence for nested try/catch.
 fn find_exception_handler_any_pc(
     shared: &SharedVm,
     frame: &Frame,
+    pc: usize,
     exc: ObjectRef,
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
 
     for entry in frame.exception_table().iter() {
+        // Widening: index conversion
+        if pc < entry.start_pc as usize || pc >= entry.end_pc as usize {
+            continue;
+        }
+
         // catch_type == 0 means catch-all (finally block) — always matches
         if entry.catch_type == 0 {
             return Some((entry.handler_pc as usize, exc));
@@ -12162,7 +12185,8 @@ fn execute_jit_call(
         // The JIT-executed method has its own exception table; we must try
         // to route the exception through it before propagating to the caller.
         // The JIT ran the entire method, so we do not know the exact throw-
-        // site PC — match by `catch_type` alone using `find_exception_handler_any_pc`.
+        // site PC — `route_jit_exception_through_method` does a best-effort
+        // table scan for a matching handler.
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
             return route_jit_exception_through_method(
                 shared, thread, frame_idx, cached, exc,

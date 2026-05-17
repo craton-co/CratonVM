@@ -11,8 +11,49 @@
 ///   common-case virtual dispatch is a direct call from the very first JIT execution.
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_hash::FxHashMap;
+
+// ---------------------------------------------------------------------------
+// Global profiling enable gate (perf-critical: AUDIT CRIT-3/CRIT-5/HIGH-7)
+// ---------------------------------------------------------------------------
+//
+// The interpreter calls `ProfileStore::record_branch` / `record_backedge`
+// from ~13 sites on every conditional branch / back-edge. Even with FxHashMap
+// the per-call overhead used to include a parking_lot::Mutex acquire and an
+// `Arc<str>` clone for the MethodKey — together visible in the
+// `interpreter_counting_loop` benchmark.
+//
+// The fix is twofold:
+//   1. Gate the profile-recording calls behind a single AtomicBool
+//      (`PROFILING_ENABLED`).  Default is `false` so warmup-free workloads
+//      (microbenchmarks, AOT'd JDK code) pay only one relaxed atomic load
+//      per branch.  Profilers / tiered managers flip it to `true` when
+//      they want to drive JIT promotion.
+//   2. Replace the global `Mutex<HashMap>` with a `RwLock<HashMap<Arc<...>>>`
+//      so concurrent recorders hit the read-lock path and only the rare
+//      first-time-insert path takes the write-lock.
+
+static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable profile recording globally.
+///
+/// When disabled (the default), `ProfileStore::record_branch`,
+/// `record_backedge`, `record_receiver`, and `record_trip_complete`
+/// all return immediately after a single relaxed atomic load.  This keeps
+/// the interpreter hot loop free of HashMap / lock overhead until a
+/// profiler is actively driving JIT compilation.
+#[inline]
+pub fn enable_profiling(b: bool) {
+    PROFILING_ENABLED.store(b, Ordering::Relaxed);
+}
+
+/// Returns whether profile recording is currently enabled.
+#[inline(always)]
+pub fn is_profiling_enabled() -> bool {
+    PROFILING_ENABLED.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Key type
@@ -206,8 +247,19 @@ impl MethodProfile {
 /// Global repository of all method profiles collected during interpreted execution.
 /// T10.9.B: FxHashMap — MethodKey (ClassId+name+desc, internal) and packed u64
 /// keys, hot path on every interpreter invoke.
+///
+/// **Lock strategy (AUDIT CRIT-3/CRIT-5/HIGH-7 fix):**
+/// - Outer `RwLock` so concurrent recorders share a read-lock for the common
+///   "method already exists" path.  Only the rare first-time insert escalates
+///   to a write-lock.
+/// - Each `MethodProfile` is wrapped in `Arc<parking_lot::Mutex<_>>` so the
+///   inner `FxHashMap`s can be mutated per-method without serialising every
+///   recorder on a single global Mutex.
+/// - All recording paths short-circuit on the global `PROFILING_ENABLED`
+///   atomic — interpreter hot-loops pay one relaxed load per branch when
+///   profiling is off (the default).
 pub struct ProfileStore {
-    methods: parking_lot::Mutex<FxHashMap<MethodKey, MethodProfile>>,
+    methods: parking_lot::RwLock<FxHashMap<MethodKey, Arc<parking_lot::Mutex<MethodProfile>>>>,
     /// Per-method invocation counters for JIT warmup gating.
     /// Keyed by `(class_id << 32 | method_hash)` packed into a `u64` for fast lookup.
     invocation_counts: parking_lot::Mutex<FxHashMap<u64, u32>>,
@@ -216,7 +268,7 @@ pub struct ProfileStore {
 impl ProfileStore {
     pub fn new() -> Self {
         Self {
-            methods: parking_lot::Mutex::new(FxHashMap::default()),
+            methods: parking_lot::RwLock::new(FxHashMap::default()),
             invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
         }
     }
@@ -234,64 +286,77 @@ impl ProfileStore {
         *entry
     }
 
+    /// Fetch (or insert) the per-method profile slot.  Returns a cheap `Arc`
+    /// to the inner Mutex so callers can release the outer lock immediately.
+    #[inline]
+    fn get_or_insert(&self, key: &MethodKey) -> Arc<parking_lot::Mutex<MethodProfile>> {
+        // Fast path: read-lock + lookup.  Most calls hit this branch.
+        {
+            let read = self.methods.read();
+            if let Some(slot) = read.get(key) {
+                return Arc::clone(slot);
+            }
+        }
+        // Slow path: upgrade to write-lock and double-check (another writer
+        // may have inserted between us dropping the read-lock and acquiring
+        // the write-lock).
+        let mut write = self.methods.write();
+        if let Some(slot) = write.get(key) {
+            return Arc::clone(slot);
+        }
+        let slot = Arc::new(parking_lot::Mutex::new(MethodProfile::default()));
+        write.insert(key.clone(), Arc::clone(&slot));
+        slot
+    }
+
     /// Record a branch observation.  Called from the interpreter hot-loop.
+    ///
+    /// Returns immediately when profiling is disabled (the global default),
+    /// keeping the interpreter dispatch loop free of HashMap/lock traffic.
     #[inline]
     pub fn record_branch(&self, key: &MethodKey, pc: usize, taken: bool) {
-        let mut methods = self.methods.lock();
-        // Avoid cloning the key when the method profile already exists.
-        if let Some(profile) = methods.get_mut(key) {
-            profile.record_branch(pc, taken);
-        } else {
-            let mut profile = MethodProfile::default();
-            profile.record_branch(pc, taken);
-            methods.insert(key.clone(), profile);
+        if !is_profiling_enabled() {
+            return;
         }
+        let slot = self.get_or_insert(key);
+        slot.lock().record_branch(pc, taken);
     }
 
     /// Record a receiver type observation.  Called from the interpreter hot-loop.
     #[inline]
     pub fn record_receiver(&self, key: &MethodKey, pc: usize, class_id: u32) {
-        let mut methods = self.methods.lock();
-        // Avoid cloning the key when the method profile already exists.
-        if let Some(profile) = methods.get_mut(key) {
-            profile.record_receiver(pc, class_id);
-        } else {
-            let mut profile = MethodProfile::default();
-            profile.record_receiver(pc, class_id);
-            methods.insert(key.clone(), profile);
+        if !is_profiling_enabled() {
+            return;
         }
+        let slot = self.get_or_insert(key);
+        slot.lock().record_receiver(pc, class_id);
     }
 
     /// Record a loop back-edge execution.  Called from the interpreter hot-loop.
     #[inline]
     pub fn record_backedge(&self, key: &MethodKey, backedge_pc: usize) {
-        let mut methods = self.methods.lock();
-        if let Some(profile) = methods.get_mut(key) {
-            profile.record_backedge(backedge_pc);
-        } else {
-            let mut profile = MethodProfile::default();
-            profile.record_backedge(backedge_pc);
-            methods.insert(key.clone(), profile);
+        if !is_profiling_enabled() {
+            return;
         }
+        let slot = self.get_or_insert(key);
+        slot.lock().record_backedge(backedge_pc);
     }
 
     /// Record a completed loop trip count.  Called when a loop exits.
     #[inline]
     pub fn record_trip_complete(&self, key: &MethodKey, backedge_pc: usize, trip: u32) {
-        let mut methods = self.methods.lock();
-        if let Some(profile) = methods.get_mut(key) {
-            profile.record_trip_complete(backedge_pc, trip);
-        } else {
-            let mut profile = MethodProfile::default();
-            profile.record_trip_complete(backedge_pc, trip);
-            methods.insert(key.clone(), profile);
+        if !is_profiling_enabled() {
+            return;
         }
+        let slot = self.get_or_insert(key);
+        slot.lock().record_trip_complete(backedge_pc, trip);
     }
 
     /// Retrieve a snapshot of the profile for the given method, if any.
     pub fn get_profile(&self, key: &MethodKey) -> Option<MethodProfile> {
-        let map = self.methods.lock();
-        let p = map.get(key)?;
+        let read = self.methods.read();
+        let slot = read.get(key)?;
+        let p = slot.lock();
         // Snapshot: clone branch + receiver + loop maps
         Some(MethodProfile {
             branches: p.branches.clone(),
@@ -303,9 +368,10 @@ impl ProfileStore {
     /// Snapshot all method profiles: returns (MethodKey, MethodProfile) pairs.
     /// Used by AOT training to bulk-sync JIT profile data to the AOT recorder.
     pub fn snapshot_all(&self) -> Vec<(MethodKey, MethodProfile)> {
-        let map = self.methods.lock();
-        map.iter()
-            .map(|(k, p)| {
+        let read = self.methods.read();
+        read.iter()
+            .map(|(k, slot)| {
+                let p = slot.lock();
                 (
                     k.clone(),
                     MethodProfile {
@@ -334,6 +400,19 @@ impl Default for ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests record into the global ProfileStore — gate must be on or
+    /// `record_*` is a no-op.  Each test calls this guard before driving
+    /// the store; using a closure-style helper keeps the gate transition
+    /// localised so concurrent tests in the harness don't observe a
+    /// disabled store mid-run.
+    fn with_profiling_enabled<R>(f: impl FnOnce() -> R) -> R {
+        let prev = is_profiling_enabled();
+        enable_profiling(true);
+        let r = f();
+        enable_profiling(prev);
+        r
+    }
 
     fn make_key(class_id: u32) -> MethodKey {
         MethodKey {

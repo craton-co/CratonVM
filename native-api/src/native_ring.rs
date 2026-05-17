@@ -10,13 +10,42 @@
 //!   only for a few stores).
 //! - `NativeMethodRegistry::register` calls `register_name` so we have
 //!   a `fn-ptr → "class.method desc"` map for the dump.
+//!
+//! Performance:
+//! - Recording is **off by default**. With ~3,100 registered natives,
+//!   the prior unconditional `parking_lot::Mutex<Ring>` round-trip on
+//!   every native call (twice — enter + exit) was a dominant dispatch
+//!   cost, serializing across all OS threads.
+//! - Hot path when disabled: a single `AtomicBool` relaxed load + branch.
+//! - Call [`enable`] (e.g. from the watchdog arm site) to turn recording
+//!   on. [`is_enabled`] reports current state.
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RING_SIZE: usize = 64;
+
+/// Master switch. When `false` (the default), `record_enter` and
+/// `record_exit` early-return after a single relaxed load. The watchdog
+/// (or other diagnostic code) should call `enable(true)` when arming.
+///
+/// TODO: re-arm via `native_ring::enable(true)` when watchdog wires up.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn ring-buffer recording on or off. Off by default.
+#[inline]
+pub fn enable(b: bool) {
+    ENABLED.store(b, Ordering::Relaxed);
+}
+
+/// Is ring-buffer recording currently enabled?
+#[inline]
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -65,8 +94,15 @@ fn now_ms() -> u128 {
 }
 
 /// Record a native-method entry. Returns a slot index for `record_exit`.
+///
+/// When recording is disabled (the default), this is a single relaxed
+/// atomic load + branch. Returns `usize::MAX` as a sentinel so
+/// `record_exit` can also short-circuit without touching the lock.
 #[inline]
 pub fn record_enter(cb_ptr: usize) -> usize {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return usize::MAX;
+    }
     let tid = thread_id_u64();
     let mut ring = RING.lock();
     let idx = ring.next;
@@ -82,6 +118,15 @@ pub fn record_enter(cb_ptr: usize) -> usize {
 
 #[inline]
 pub fn record_exit(idx: usize) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Sentinel returned by `record_enter` when disabled at entry time.
+    // (Recording could have been toggled on between enter and exit; in
+    // that case we skip this exit rather than write to a bogus slot.)
+    if idx == usize::MAX {
+        return;
+    }
     let now = now_ms();
     let mut ring = RING.lock();
     if let Some(slot) = ring.entries.get_mut(idx) {
@@ -90,10 +135,17 @@ pub fn record_exit(idx: usize) {
 }
 
 /// Dump the ring buffer to stderr, oldest entry first.
+///
+/// If recording was never enabled (or no native methods were recorded
+/// while it was on), prints a notice that the ring is empty rather
+/// than nothing — so the watchdog dump is still self-explanatory.
 pub fn dump_to_stderr() {
     let ring = RING.lock();
     let names = name_map().lock();
     eprintln!("--- native-call ring buffer (last {RING_SIZE} entries, oldest first) ---");
+    if !ENABLED.load(Ordering::Relaxed) {
+        eprintln!("  (recording disabled — call native_ring::enable(true) to capture)");
+    }
     let now = now_ms();
     let mut any = false;
     for i in 0..RING_SIZE {
@@ -120,10 +172,13 @@ pub fn dump_to_stderr() {
     eprintln!("--- end native-call ring buffer ---");
 }
 
+/// Per-thread stable u64 id, assigned on first call and cached for the
+/// life of the thread. Avoids the `String` allocation + SipHash that
+/// `format!("{:?}", ThreadId).hash(...)` cost per native call.
 fn thread_id_u64() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    format!("{:?}", std::thread::current().id()).hash(&mut h);
-    h.finish()
+    static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static TID: u64 = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    }
+    TID.with(|t| *t)
 }
