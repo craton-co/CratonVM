@@ -23,6 +23,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 regex = "1"
 memmap2 = "0.9"
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+# Direct-buffer cleaners and net socket / option maps are keyed by internal
+# monotonic counters (AtomicI32-generated IDs). No adversarial-input concern
+# warrants SipHash; FxHashMap removes the per-op hash overhead on the hot
+# allocate/free and getIntOption0/setIntOption0 paths. Matches the migration
+# already done in native-api (`fd_table`, `ffi`, `native_ring`, `registry`).
+rustc-hash = "1.1"
 
 # WP3.1 — real platform-backed Selector. Linux uses epoll via libc; Windows
 # uses WSAPoll via raw `#[link(name = "Ws2_32")]` FFI (same approach as

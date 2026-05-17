@@ -49,5 +49,5 @@ pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;
 pub use region::{RegionHeap, RegionType, RememberedSet};
 pub use reference::{ReferenceEntry, ReferenceProcessor, ReferenceProcessingResult, ReferenceProcessingStats, ReferenceQueue, ReferenceType};
-pub use satb::{SatbBuffer, SatbQueue};
+pub use satb::{SatbBuffer, SatbQueue, flush_thread_satb_buffer, satb_thread_local_log};
 pub use tlab::Tlab;

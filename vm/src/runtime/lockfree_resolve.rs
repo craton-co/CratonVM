@@ -14,6 +14,7 @@
 //! synchronisation.  The **SharedResolutionState** is a read-optimised global
 //! cache protected by `RwLock`s so concurrent readers never block each other.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -101,9 +102,15 @@ pub struct CacheStats {
 pub struct ThreadLocalResolveCache {
     methods: FxHashMap<ResolutionKey, ResolvedTarget>,
     fields: FxHashMap<ResolutionKey, ResolvedField>,
-    /// Insertion-order tracking for eviction when the cache is full.
-    method_order: Vec<ResolutionKey>,
-    field_order: Vec<ResolutionKey>,
+    /// HIGH — FIFO insertion-order tracking for eviction. Previously
+    /// `Vec<ResolutionKey>` with `Vec::remove(0)` on eviction, which is
+    /// O(n) per eviction (full memmove of every remaining element).
+    /// At a steady-state hot cache that re-evicts on every miss, this
+    /// degrades to O(n) per cache miss = O(n^2) total churn. `VecDeque`
+    /// gives O(1) front-pop while preserving FIFO eviction order, which
+    /// is the documented intent.
+    method_order: VecDeque<ResolutionKey>,
+    field_order: VecDeque<ResolutionKey>,
     max_entries: usize,
     hits: u64,
     misses: u64,
@@ -117,8 +124,8 @@ impl ThreadLocalResolveCache {
         Self {
             methods: fx_hashmap(),
             fields: fx_hashmap(),
-            method_order: Vec::new(),
-            field_order: Vec::new(),
+            method_order: VecDeque::new(),
+            field_order: VecDeque::new(),
             max_entries,
             hits: 0,
             misses: 0,
@@ -143,14 +150,17 @@ impl ThreadLocalResolveCache {
     /// reached `max_entries`, the oldest method entry is evicted first.
     pub fn put_method(&mut self, key: ResolutionKey, target: ResolvedTarget) {
         if !self.methods.contains_key(&key) {
-            // Evict oldest method entry if we are at capacity.
+            // Evict oldest method entry if we are at capacity. O(1)
+            // per eviction via `VecDeque::pop_front` (was O(n)
+            // `Vec::remove(0)`).
             while self.methods.len() + self.fields.len() >= self.max_entries
                 && !self.method_order.is_empty()
             {
-                let oldest = self.method_order.remove(0);
-                self.methods.remove(&oldest);
+                if let Some(oldest) = self.method_order.pop_front() {
+                    self.methods.remove(&oldest);
+                }
             }
-            self.method_order.push(key);
+            self.method_order.push_back(key);
         }
         self.methods.insert(key, target);
     }
@@ -173,13 +183,15 @@ impl ThreadLocalResolveCache {
     /// field entry if at capacity.
     pub fn put_field(&mut self, key: ResolutionKey, field: ResolvedField) {
         if !self.fields.contains_key(&key) {
+            // O(1) front-pop eviction via `VecDeque`.
             while self.methods.len() + self.fields.len() >= self.max_entries
                 && !self.field_order.is_empty()
             {
-                let oldest = self.field_order.remove(0);
-                self.fields.remove(&oldest);
+                if let Some(oldest) = self.field_order.pop_front() {
+                    self.fields.remove(&oldest);
+                }
             }
-            self.field_order.push(key);
+            self.field_order.push_back(key);
         }
         self.fields.insert(key, field);
     }

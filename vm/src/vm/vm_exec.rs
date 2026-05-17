@@ -418,7 +418,7 @@ pub fn safe_native_call(
                     .swallow_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!("Native method panic (bootstrap): {}", msg);
-                if std::env::var("RUSTJVM_STRICT_SWALLOWS").ok().as_deref() == Some("1") {
+                if crate::runtime::env_cache::strict_swallows() {
                     tracing::error!(
                         "RUSTJVM_STRICT_SWALLOWS=1: safe_native_call bootstrap panic: {}",
                         msg,
@@ -4128,7 +4128,7 @@ pub fn invoke_or_native(
         }
     }
 
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+    if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
         let bytes = effective_class.as_bytes();
         eprintln!("[invoke_or_native] effective_class={:?} (len={}) class_name={:?} method={:?} desc={:?}",
                   effective_class, bytes.len(), class_name, method_name, descriptor);
@@ -4142,13 +4142,13 @@ pub fn invoke_or_native(
         .native_methods
         .find(effective_class, method_name, descriptor)
     {
-        if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+        if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
         }
         return safe_native_call(shared, thread, callback, args)
             .map(|v| coerce_native_return(v, descriptor));
     }
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+    if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
         eprintln!("[invoke_or_native] no direct native; checking hierarchy walk");
     }
     // Also try the original class name in case the caller registered a
@@ -4178,7 +4178,7 @@ pub fn invoke_or_native(
                 .map(|cls| cls.find_method(method_name, descriptor).is_some())
                 .unwrap_or(false)
         };
-        if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+        if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] has_own_bytecode={}", has_own_bytecode);
         }
         if !has_own_bytecode {
@@ -4206,7 +4206,7 @@ pub fn invoke_or_native(
                             break;
                         }
                         if let Some(callback) = shared.native_methods.find(&parent.name, method_name, descriptor) {
-                            if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+                            if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
                                 eprintln!("[invoke_or_native] hierarchy walk hit on parent={}", parent.name);
                             }
                             drop(cm);
@@ -4219,7 +4219,7 @@ pub fn invoke_or_native(
             }
         }
     }
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+    if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
         if let Some(Value::Object(Some(recv))) = args.first() {
             eprintln!("[invoke_or_native] before invoke_on_class_shared recv={:p} args.len={}", recv.as_ptr(), args.len());
             // Read field 0,1,2,3,4 to see what's there
@@ -8160,7 +8160,7 @@ fn invoke_on_class_shared_inner(
                     }
                 }
 
-                if std::env::var_os("RUSTJVM_DBG_NSME").is_some() {
+                if crate::runtime::env_cache::nsme_dbg() {
                     // Diagnostic: when an NSME is about to be raised, capture
                     // the receiver's actual concrete class and the caller's
                     // method name so a wrong-dispatch (receiver vs. cp class
@@ -8492,7 +8492,7 @@ fn invoke_on_class_shared_inner(
             .get_class(declaring_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+        if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             let found = shared.native_methods.find(&class_name_for_override, method_name, descriptor).is_some();
             eprintln!("[invoke_on_class_shared L5271] class_name_for_override={} method={} desc={} found={}",
                       class_name_for_override, method_name, descriptor, found);

@@ -4,6 +4,7 @@
 //! and exception creation utilities.
 
 mod call_stack;
+pub mod env_cache;
 pub mod exceptions;
 pub mod frame;
 pub mod interpreter;

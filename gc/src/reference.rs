@@ -244,6 +244,41 @@ impl ReferenceProcessor {
         }
     }
 
+    /// Record an access to a SoftReference's referent, updating the LRU
+    /// timestamp used by [`Self::process_soft_refs`].
+    ///
+    /// The runtime should call this from the `SoftReference.get()` native
+    /// after confirming the referent is still live. Without this call the
+    /// LRU index forever sees `last_access_time_ms == 0`, so every
+    /// SoftReference looks infinitely stale and gets cleared on the next
+    /// major GC — defeating the whole point of memory-sensitive caches.
+    ///
+    /// Cost is O(log n) for the BTreeMap re-key plus O(1) for the entry
+    /// update; no global lock beyond the caller's existing
+    /// `Mutex<ReferenceProcessor>` is taken.
+    pub fn touch_soft_reference(&mut self, reference_obj: usize, now_ms: u64) {
+        // Linear search is acceptable here: this is called only on the
+        // SoftReference.get() path (rare compared to ordinary loads) and
+        // soft-ref populations are typically in the hundreds for caches.
+        // If profiling reveals this as a bottleneck the index can be
+        // augmented with a `FxHashMap<usize, usize>` from reference_obj
+        // to soft_refs index.
+        for (idx, entry) in self.soft_refs.iter_mut().enumerate() {
+            if entry.reference_obj == reference_obj {
+                let old_key = (entry.last_access_time_ms, idx);
+                // Only re-insert when the timestamp actually advances;
+                // many caches `get()` faster than the timer resolution.
+                if now_ms == entry.last_access_time_ms {
+                    return;
+                }
+                self.soft_ref_lru_index.remove(&old_key);
+                entry.last_access_time_ms = now_ms;
+                self.soft_ref_lru_index.insert((now_ms, idx), idx);
+                return;
+            }
+        }
+    }
+
     // -- Main entry point ---------------------------------------------------
 
     /// Process all reference types in HotSpot order.

@@ -220,12 +220,13 @@ impl FlightRecorder {
     /// Record an event from the calling thread.
     ///
     /// In the per-thread-ring design, the hot emit path pushes the event onto
-    /// the calling thread's bounded ring shard (see
+    /// the calling thread's bounded SPSC ring shard (see
     /// `repository::push_to_thread_ring`). The shard is a globally-registered
-    /// `Arc<Mutex<VecDeque<EventInstance>>>` whose mutex is uncontended on the
-    /// producer side (one shard per thread). The per-recording repositories
-    /// are populated lazily by `drain_per_thread_into_repository`, which is
-    /// invoked by the dumper before producing a snapshot.
+    /// `Arc<SpscEventRing>` — lock-free, one producer (this thread) + one
+    /// consumer (the dump thread via `drain_per_thread_into_repository`).
+    /// The per-recording repositories are populated lazily by
+    /// `drain_per_thread_into_repository`, which is invoked by the dumper
+    /// before producing a snapshot.
     ///
     /// Fast path: when no recordings are running this returns immediately
     /// after a single length check — no ring access, no allocation.
@@ -320,11 +321,14 @@ impl FlightRecorder {
     ///
     /// This method first drains all per-thread ring shards into the
     /// per-recording repositories so that pending events are reflected in
-    /// the snapshot.
+    /// the snapshot. The drained events are fanned out to every running
+    /// recording by `drain_per_thread_into_repository`, so we pass an empty
+    /// `extra_events` to `dump_to_file` — Bug 1 fix: re-draining the global
+    /// ring inside the writer would steal events from sibling recordings.
     pub fn dump_recording(&mut self, id: u64, path: &Path) -> Result<u64, JfrDumpError> {
-        // Flush any events sitting in per-thread rings into the repositories
-        // before snapshotting. This is the equivalent of the contract that
-        // `dump.rs` is responsible for on the standalone dump path.
+        // Flush any events sitting in per-thread rings into the per-recording
+        // repositories before snapshotting. After this call, every running
+        // recording owns its own copy of the just-drained events.
         self.drain_per_thread_into_repository();
 
         let rec = self.recordings.get_mut(&id).ok_or(JfrDumpError::Io(
@@ -336,7 +340,16 @@ impl FlightRecorder {
         let end_time = events.iter().map(|e| e.end_time).max().unwrap_or(0);
         let duration = end_time.saturating_sub(start_time);
 
-        dump::dump_to_file(path, rec.repository(), &self.type_registry, start_time, duration)
+        // `extra_events = Vec::new()` — the recording's repository already
+        // contains every event it should see. See Bug 1 fix in dump.rs.
+        dump::dump_to_file(
+            path,
+            rec.repository(),
+            &self.type_registry,
+            start_time,
+            duration,
+            Vec::new(),
+        )
     }
 }
 

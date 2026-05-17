@@ -169,7 +169,7 @@ impl Policy {
         actions: &str,
         code_base: Option<&str>,
     ) -> bool {
-        self.implies_full(permission_class, target, actions, code_base, &[])
+        self.implies_full::<String>(permission_class, target, actions, code_base, &[])
     }
 
     /// Same as [`Policy::implies`] but also filters grants by the calling
@@ -177,13 +177,13 @@ impl Policy {
     /// `signedBy` alias isn't present in `cert_digests` is skipped
     /// entirely — the calling code must produce a matching digest to
     /// claim the grant.
-    pub fn implies_full(
+    pub fn implies_full<S: AsRef<str>>(
         &self,
         permission_class: &str,
         target: &str,
         actions: &str,
         code_base: Option<&str>,
-        cert_digests: &[String],
+        cert_digests: &[S],
     ) -> bool {
         self.implies_full_with_principals(
             permission_class,
@@ -203,13 +203,13 @@ impl Policy {
     /// by some entry in `subject_principals` — this fixes the previous
     /// silent-downgrade where principal-restricted grants behaved as
     /// unrestricted wildcards.
-    pub fn implies_full_with_principals(
+    pub fn implies_full_with_principals<S: AsRef<str>>(
         &self,
         permission_class: &str,
         target: &str,
         actions: &str,
         code_base: Option<&str>,
-        cert_digests: &[String],
+        cert_digests: &[S],
         subject_principals: &[(String, String)],
     ) -> bool {
         let norm_class = normalize_class(permission_class);
@@ -623,7 +623,7 @@ fn ipv4_cidr_contains(base: u32, prefix: u32, addr: u32) -> bool {
 ///      semantics — `signedBy "Acme"` matches `"CN=Acme Corp"`);
 ///    - Exact case-insensitive match against any legacy alias token so
 ///      Delta's existing short-alias policies keep working.
-fn signed_by_matches(grant_signed_by: Option<&str>, cert_digests: &[String]) -> bool {
+fn signed_by_matches<S: AsRef<str>>(grant_signed_by: Option<&str>, cert_digests: &[S]) -> bool {
     let Some(alias) = grant_signed_by else {
         return true; // no signedBy filter → applies to everyone
     };
@@ -635,13 +635,17 @@ fn signed_by_matches(grant_signed_by: Option<&str>, cert_digests: &[String]) -> 
     if is_sha256_hex(alias) {
         return cert_digests
             .iter()
-            .any(|d| is_sha256_hex(d) && d.eq_ignore_ascii_case(alias));
+            .any(|d| {
+                let d = d.as_ref();
+                is_sha256_hex(d) && d.eq_ignore_ascii_case(alias)
+            });
     }
 
     // DN substring match — case-sensitive because RFC 4514 DNs are
     // case-sensitive in general, but the tokens we compare here are all
     // the canonical output of our own parser (with known casing).
     for token in cert_digests {
+        let token = token.as_ref();
         // An entry that looks like a DN contains '=' at least once —
         // cheap filter to skip SHA-256 digests in the mixed slice.
         if token.contains('=') && token.contains(alias) {
@@ -653,7 +657,7 @@ fn signed_by_matches(grant_signed_by: Option<&str>, cert_digests: &[String]) -> 
     // older tests using short hex prefixes as the `signedBy` value).
     cert_digests
         .iter()
-        .any(|d| d.eq_ignore_ascii_case(alias))
+        .any(|d| d.as_ref().eq_ignore_ascii_case(alias))
 }
 
 /// True when `s` is exactly 64 lowercase/uppercase hex characters —

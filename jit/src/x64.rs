@@ -3457,6 +3457,70 @@ impl Compiler {
         self.emit_movq_gpr_from_xmm(RAX, xmm);
     }
 
+    /// MOVQ [rbp - offset], XMMn — direct 64-bit XMM spill to a frame slot.
+    ///
+    /// Equivalent to (and replaces) the two-instruction sequence
+    /// `MOVQ RAX, XMMn ; MOV [rbp-off], RAX` used by the scratch flusher
+    /// and similar XMM-spill sites. Saves ~3 bytes per spill and frees
+    /// RAX (allowing it to keep holding the function return value
+    /// across an epilogue restore).
+    ///
+    /// Encoding: `66 [REX] 0F D6 /r` — MOVQ r/m64, xmm.
+    ///   - REX.W is NOT required (the opcode is 64-bit by definition).
+    ///   - REX.R is set when `xmm >= 8`.
+    ///   - REX.B is NOT required: r/m base is RBP (5), low 3 bits.
+    /// ModRM:
+    ///   - disp8 form (mod=01) when `-128 <= -off <= 127`.
+    ///   - disp32 form (mod=10) otherwise.
+    /// disp is the signed offset from RBP; callers pass `offset` as a
+    /// positive frame depth (matching `emit_store_local`'s convention),
+    /// so we encode `-offset`.
+    fn emit_movq_mem_rbp_from_xmm(&mut self, offset: i32, xmm: u8) {
+        self.buf.emit_byte(0x66);
+        if xmm >= 8 {
+            // REX.R only (no .W, no .B — RBP is the base, low 3 bits).
+            self.buf.emit_byte(0x44);
+        }
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(0xD6);
+        // ModRM r/m=101 (RBP), reg=xmm&7.
+        let reg = xmm & 7;
+        if (-128..=127).contains(&offset) {
+            // mod=01, disp8.  (Matches modrm_rbp_disp encoding semantics.)
+            self.buf.emit_byte(0x45 | (reg << 3));
+            self.buf.emit_byte((-offset) as u8); // Cast: x86-64 immediate encoding
+        } else {
+            // mod=10, disp32.
+            self.buf.emit_byte(0x85 | (reg << 3));
+            self.buf.emit(&(-offset).to_le_bytes());
+        }
+    }
+
+    /// MOVQ XMMn, [rbp - offset] — direct 64-bit load from a frame slot
+    /// into an XMM register. Pair to `emit_movq_mem_rbp_from_xmm` for
+    /// the epilogue restore path.
+    ///
+    /// Encoding: `F3 [REX] 0F 7E /r` — MOVQ xmm, r/m64.
+    ///   - F3 is the mandatory prefix that selects MOVQ-from-mem.
+    ///   - REX.R is set when `xmm >= 8`.
+    ///   - REX.B is NOT required (base is RBP).
+    fn emit_movq_xmm_from_mem_rbp(&mut self, xmm: u8, offset: i32) {
+        self.buf.emit_byte(0xF3);
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44);
+        }
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(0x7E);
+        let reg = xmm & 7;
+        if (-128..=127).contains(&offset) {
+            self.buf.emit_byte(0x45 | (reg << 3));
+            self.buf.emit_byte((-offset) as u8); // Cast: x86-64 immediate encoding
+        } else {
+            self.buf.emit_byte(0x85 | (reg << 3));
+            self.buf.emit(&(-offset).to_le_bytes());
+        }
+    }
+
     /// MOVSD XMMdst, XMMsrc — move scalar double between XMM registers.
     fn emit_movsd_xmm_xmm(&mut self, dst: u8, src: u8) {
         // F2 [REX] 0F 10 modrm — MOVSD dst, src
@@ -3628,6 +3692,13 @@ impl Compiler {
 
     /// MOV dst_r64, src_r64
     fn emit_mov_reg_reg(&mut self, dst: u8, src: u8) {
+        // Peephole: `mov rN, rN` is a no-op; emit nothing. Common after
+        // regalloc when a coalesced live range produces a self-move at a
+        // copy point (e.g. prologue param shuffles where the ABI register
+        // already matches the assigned local).
+        if dst == src {
+            return;
+        }
         self.rex_w_rb(dst, src);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
         self.modrm_reg(dst, src);
@@ -4634,9 +4705,8 @@ impl Compiler {
         self.emit_movq_xmm_from_rax(0);
         // ADDSD XMM0, XMM1
         self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC1]);
-        // MOVQ RAX, XMM0; store to acc
-        self.emit_movq_rax_from_xmm(0);
-        self.emit_store_local(acc_local_offset, RAX);
+        // Direct MOVQ [rbp-acc_local_offset], XMM0 — keeps RAX free.
+        self.emit_movq_mem_rbp_from_xmm(acc_local_offset, 0);
 
         // Update induction variable: i += chunks_processed * 4
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
@@ -4669,8 +4739,7 @@ impl Compiler {
         self.emit_movq_xmm_from_rax(1);
         // ADDSD XMM1, XMM0
         self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC8]);
-        self.emit_movq_rax_from_xmm(1);
-        self.emit_store_local(acc_local_offset, RAX);
+        self.emit_movq_mem_rbp_from_xmm(acc_local_offset, 1);
 
         // INC R10D
         self.buf.emit(&[0x41, 0xFF, 0xC2]);
@@ -5066,12 +5135,13 @@ impl Compiler {
         }
 
         // Save callee-saved XMM registers (used for float/double locals).
-        // We route through RAX: MOVQ RAX, XMMn; MOV [rbp-offset], RAX.
+        // Direct `MOVQ [rbp-offset], XMM` — avoids the RAX round-trip so
+        // ABI args that landed in RAX-adjacent regs aren't disturbed and
+        // the prologue is 3 bytes smaller per saved XMM.
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
             let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-            self.emit_movq_rax_from_xmm(xmm);
-            self.emit_store_local(offset, RAX);
+            self.emit_movq_mem_rbp_from_xmm(offset, xmm);
         }
 
         if self.needs_heap {
@@ -5146,12 +5216,13 @@ impl Compiler {
             self.emit_load_local(reg, offset);
         }
         // Restore callee-saved XMM registers.
-        // Use R11 (caller-saved scratch) to avoid clobbering RAX which holds the return value.
+        // Direct `MOVQ XMMn, [rbp-offset]` — no GPR scratch needed, so
+        // RAX (return value) and R11 are both preserved. Each restore
+        // shrinks from ~9 bytes (MOV+MOVQ) to ~6 bytes (single MOVQ).
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
             let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-            self.emit_load_local(R11, offset);
-            self.emit_movq_xmm_from_gpr(xmm, R11);
+            self.emit_movq_xmm_from_mem_rbp(xmm, offset);
         }
         let fs = self.frame_size;
         self.emit_add_rsp_imm(fs);
@@ -5174,8 +5245,8 @@ impl Compiler {
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
             let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-            self.emit_load_local(R11, offset);
-            self.emit_movq_xmm_from_gpr(xmm, R11);
+            // Direct `MOVQ XMMn, [rbp-offset]` (see emit_epilogue notes).
+            self.emit_movq_xmm_from_mem_rbp(xmm, offset);
         }
         let fs = self.frame_size;
         self.emit_add_rsp_imm(fs);
@@ -5196,11 +5267,56 @@ impl Compiler {
         self.buf.emit(&[0xFF, 0xE0]);
     }
 
-    /// Emit an absolute call: MOV RAX, imm64; CALL RAX
+    /// Emit a CALL to `addr` choosing the shortest valid encoding.
     ///
-    /// Used to call helper functions (jit_baload, jit_newarray, etc.) from JIT code.
-    /// Arguments must already be in the correct ABI registers before this call.
+    /// If `addr` lies within ±2GB of the byte after this call (the rel32
+    /// reference point — `current_pc + 5`), emit `E8 <rel32>` (5 bytes).
+    /// Otherwise fall back to the 12-byte `MOV RAX, imm64 ; CALL RAX`
+    /// sequence (`emit_call_imm64_via_rax`). Helper targets (registered
+    /// runtime functions in `JitRuntimeHelpers`) are typically within
+    /// ±2GB of the JIT code cache, so the rel32 form dominates and
+    /// saves 7 bytes per call site.
+    ///
+    /// Safety / correctness notes:
+    /// - The JIT buffer is allocated with a stable base for its entire
+    ///   lifetime (`JitBuf::reserve` does not relocate after `as_ptr()`
+    ///   is observed). The address `buf.as_ptr() + buf.pos()` is
+    ///   therefore the final runtime PC of the call site, and the
+    ///   rel32 displacement computed here remains valid after
+    ///   `finalize`.
+    /// - Oop maps record `native_pc_offset = buf.pos()` which is the PC
+    ///   *after* the call. Switching encodings changes the absolute PC
+    ///   of subsequent instructions, but the oop map is captured at the
+    ///   correct post-emission position, so the map stays consistent.
+    /// - The rel32 path does NOT clobber RAX. No current call site
+    ///   depends on the imm64-via-RAX side effect — every helper site
+    ///   materializes its ABI args explicitly before calling.
     fn emit_call_absolute(&mut self, addr: usize) {
+        // Reference point for the rel32 displacement is the byte after
+        // the 5-byte E8 cd encoding.
+        let call_pc = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = call_pc.wrapping_add(5);
+        // Signed delta from next_pc to target. Compute in i128 to keep
+        // the comparison free of usize-subtraction wrap concerns.
+        let delta: i128 = (addr as i128) - (next_pc as i128);
+        if delta >= i32::MIN as i128 && delta <= i32::MAX as i128 {
+            // E8 cd: CALL rel32 (5 bytes).
+            self.buf.emit_byte(0xE8);
+            self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        } else {
+            // Out of ±2GB reach — fall back to the 12-byte form.
+            self.emit_call_imm64_via_rax(addr);
+        }
+    }
+
+    /// Emit the 12-byte absolute call: `MOV RAX, imm64 ; CALL RAX`.
+    ///
+    /// Direct emission helper — `emit_call_absolute` is the preferred
+    /// entry point and will dispatch here only when the rel32 path is
+    /// out of reach. Kept as a separate function so the fallback is
+    /// explicit at the one call site that needs it (inside
+    /// `emit_call_absolute` itself).
+    fn emit_call_imm64_via_rax(&mut self, addr: usize) {
         // MOV RAX, imm64 (REX.W + B8+rd)
         self.rex_w();
         self.buf.emit_byte(0xB8); // MOV rax, imm64
@@ -5281,6 +5397,10 @@ impl Compiler {
 
     /// Emit `MOV r64, r64` (register-to-register move).
     fn emit_mov_r64_r64(&mut self, dst: u8, src: u8) {
+        // Peephole: skip self-moves (no-op). Matches `emit_mov_reg_reg`.
+        if dst == src {
+            return;
+        }
         let mut rex = 0x48u8;
         if src >= 8 { rex |= 0x04; }
         if dst >= 8 { rex |= 0x01; }
@@ -6659,8 +6779,12 @@ impl Compiler {
         for (idx, xmm) in xmm_slots {
             let off = self.next_spill_offset;
             self.next_spill_offset += 8;
-            self.emit_movq_rax_from_xmm(xmm);
-            self.emit_store_local(off, RAX);
+            // Direct MOVQ [rbp-off], XMM — saves the round-trip
+            // through RAX (3 bytes per spill, ~90 bytes across the
+            // 30 flush sites). RAX is preserved, which matters when
+            // a flush happens immediately before a return-value path
+            // that wants RAX intact.
+            self.emit_movq_mem_rbp_from_xmm(off, xmm);
             self.stack[idx] = StackSlot::Frame(off);
         }
         // Clear scratch XMM tracking — all flushed
@@ -6688,11 +6812,12 @@ impl Compiler {
                 self.stack[idx] = StackSlot::Xmm(scratch);
             }
         } else {
-            // All scratch XMMs busy — fall back to frame spill
-            self.emit_movq_gpr_from_xmm(RCX, 0);
+            // All scratch XMMs busy — fall back to frame spill.
+            // Direct MOVQ [rbp-off], XMM0 — RCX is left untouched, which
+            // helps callers that have RCX live across this flush.
             let off = self.next_spill_offset;
             self.next_spill_offset += 8;
-            self.emit_store_local(off, RCX);
+            self.emit_movq_mem_rbp_from_xmm(off, 0);
             for idx in xmm0_slots {
                 self.stack[idx] = StackSlot::Frame(off);
             }
@@ -7579,8 +7704,7 @@ impl Compiler {
 
                     // Sync accumulator XMM/register → frame slot
                     if let Some(xmm) = self.xmm_for_local(acc_local) {
-                        self.emit_movq_rax_from_xmm(xmm);
-                        self.emit_store_local(acc_offset, RAX);
+                        self.emit_movq_mem_rbp_from_xmm(acc_offset, xmm);
                     } else if let Some(acc_reg) = self.reg_for_local(acc_local) {
                         self.emit_store_local(acc_offset, acc_reg);
                     }
@@ -10488,13 +10612,64 @@ impl Compiler {
                                 // R10 = pic_ptr (imm64, up to 10 bytes)
                                 self.emit_mov_imm64(R10, pic as *const _ as i64); // Cast: function pointer for JIT call target
 
-                                // Load receiver pointer into RAX, then
-                                // class_id from ObjectHeader offset 0.
-                                let receiver_spill =
-                                    args_base_offset + ((n as i32) - 1) * 8; // Cast: x86-64 immediate encoding
-                                self.emit_load_local(RAX, receiver_spill);
-                                // MOV EAX, dword [RAX]  (2 bytes: 8B 00)
-                                self.buf.emit(&[0x8B, 0x00]);
+                                // ---- Hoist callee ABI marshalling out of
+                                // the 3-way cascade. Previously each slot
+                                // re-loaded `vm_ptr + n args` into
+                                // ARG_REGS[0..=n] (~26 bytes per slot on
+                                // x86-64 SysV with n=4), tripling the
+                                // marshalling cost. Hoisting once:
+                                //
+                                //   * Cuts ~78 bytes per PIC site (≈26B
+                                //     × 2 redundant copies).
+                                //   * Keeps the per-slot body to: type
+                                //     CMP + JNE, needs-ctx CMP + JE,
+                                //     CALL [R10+disp], JMP rel32 .done.
+                                //   * Args remain live across the inter-
+                                //     slot CMP/JNE pairs because those
+                                //     instructions touch only RAX and
+                                //     R10 (neither is in ARG_REGS).
+                                //   * On a successful CALL, ARG_REGS are
+                                //     caller-saved and may be clobbered
+                                //     by the callee — but we JMP to
+                                //     .done immediately afterwards, so
+                                //     no other slot's CALL needs them.
+                                //   * On the miss path, the slow-path
+                                //     prelude (~line 10709) overwrites
+                                //     ARG_REGS with its helper-ABI
+                                //     arguments (vm_ptr, info, buf,
+                                //     n[, mic, pic]) before the helper
+                                //     call. The hoisted values are
+                                //     already dead at that point.
+                                //
+                                // We must materialize the receiver-load
+                                // *first* (its source spill could alias
+                                // ARG_REGS[0] in degenerate frames) and
+                                // RAX holds the class_id used by every
+                                // per-slot CMP, so RAX is loaded last.
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                for j in 0..n {
+                                    let spill_off = args_base_offset
+                                        + ((n - 1 - j) as i32) * 8; // Cast: x86-64 immediate encoding
+                                    self.emit_load_local(ARG_REGS[j + 1], spill_off);
+                                }
+                                // ARG_REGS[1] now holds the receiver
+                                // (arg_slots[0]). Reuse it as the source
+                                // of the class_id load so we avoid an
+                                // extra reload from the receiver spill —
+                                // this saves an additional ~5 bytes vs
+                                // the prior `emit_load_local(RAX, ...)`.
+                                // MOV EAX, dword [ARG_REGS[1]] — load
+                                // class_id (ObjectHeader+0). Encoding
+                                // depends on whether the receiver reg is
+                                // an extended register (R8+).
+                                let recv_reg = ARG_REGS[1];
+                                if recv_reg >= 8 {
+                                    // REX.B + 8B /r, modrm = mod(00) reg(EAX=0) rm(recv&7)
+                                    self.buf.emit(&[0x41, 0x8B, recv_reg & 7]);
+                                } else {
+                                    // 8B /r, modrm = mod(00) reg(EAX=0) rm(recv)
+                                    self.buf.emit(&[0x8B, recv_reg]);
+                                }
 
                                 // Per-slot cascade. Inter-slot `jne` jumps
                                 // are rel8 and patched once we know the
@@ -10579,16 +10754,12 @@ impl Compiler {
                                     self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                     miss_patches_rel32.push(self.buf.pos() - 4);
 
-                                    // ---- Set up callee ABI: vm_ptr + n args ----
-                                    self.emit_load_local(
-                                        ARG_REGS[0],
-                                        self.heap_local_offset,
-                                    );
-                                    for j in 0..n {
-                                        let spill_off = args_base_offset
-                                            + ((n - 1 - j) as i32) * 8; // Cast: x86-64 immediate encoding
-                                        self.emit_load_local(ARG_REGS[j + 1], spill_off);
-                                    }
+                                    // Callee ABI args (vm_ptr + n) have
+                                    // already been materialised once in
+                                    // ARG_REGS[0..=n] above the cascade
+                                    // (HIGH-perf hoist; see comment at
+                                    // the top of the PIC body). Slot
+                                    // bodies must NOT touch ARG_REGS.
 
                                     // CALL qword [R10 + ENTRY_PTR_OFFS[i]]
                                     // 4 bytes: REX.B (0x41) + FF /2 + modrm
@@ -10727,8 +10898,13 @@ impl Compiler {
                                 //
                                 // On Windows x64, args 5 and 6 go on the stack
                                 // at [RSP+32] and [RSP+40] (shadow + spill).
-                                // emit_call_absolute uses RAX, so we stage
-                                // each pointer through RAX → memory.
+                                // RAX is caller-saved so we stage each
+                                // pointer through it before storing — safe
+                                // regardless of which call encoding
+                                // `emit_call_absolute` picks (rel32 leaves
+                                // RAX alone; the imm64-via-RAX fallback
+                                // would overwrite RAX anyway, but that
+                                // happens after we've already stored).
                                 let pic_arg: i64 = pic_ptr
                                     .map(|p| p as *const _ as i64)
                                     .unwrap_or(0); // Cast: function pointer for JIT call target

@@ -117,6 +117,33 @@ impl CardTable {
         }
     }
 
+    /// Bulk-mark a slice of addresses dirty in a single lock acquisition.
+    ///
+    /// Equivalent to calling [`Self::mark_dirty`] for each address but
+    /// amortises the `cells` mutex over the entire batch, which matters
+    /// when the collector re-marks every deferred cross-gen card after a
+    /// minor GC (formerly N lock acquisitions, now one).
+    ///
+    /// Addresses outside the covered region are silently ignored, matching
+    /// the behaviour of [`Self::mark_dirty`].
+    pub fn mark_dirty_bulk(&self, addrs: &[usize]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let mut cells = self.cells.lock();
+        let end = self.base_addr + self.region_size;
+        for &addr in addrs {
+            if addr < self.base_addr || addr >= end {
+                continue;
+            }
+            let index = (addr - self.base_addr) / CARD_SIZE;
+            if index < cells.cards.len() && cells.cards[index] != CARD_DIRTY {
+                cells.cards[index] = CARD_DIRTY;
+                cells.dirty_cards.push(index);
+            }
+        }
+    }
+
     /// Check if a specific card is dirty.
     pub fn is_dirty(&self, card_index: usize) -> bool {
         self.cells

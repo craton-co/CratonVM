@@ -4,6 +4,7 @@
 //! access with real get/set/CAS, and proper Lookup.find* resolution.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectKind, ObjectRef, Value};
@@ -76,7 +77,7 @@ fn vh_array_call(ctx: &dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, 
 /// raw object slot for VarHandles allocated outside our path.
 fn vh_field_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
     if let Some(m) = vh_meta_get(vh) {
-        return Cow::Owned(m.field_desc);
+        return Cow::Owned(m.field_desc.clone());
     }
     match vh_read_string(ctx, vh, VH_FIELD_DESC) {
         Some(s) => Cow::Owned(s),
@@ -144,27 +145,42 @@ pub(crate) struct VarHandleMeta {
     pub class_id: u32,
 }
 
-static VH_META_TABLE: std::sync::OnceLock<std::sync::Mutex<rustc_hash::FxHashMap<usize, VarHandleMeta>>> = std::sync::OnceLock::new();
+// `VarHandleMeta` is wrapped in `Arc<>` so the hot `get`/`set`/`CAS`
+// natives (which can pull the meta 1–3 times per op) only pay a refcount
+// bump under the Mutex instead of a full clone of three owned `String`s.
+// `vh_meta_get` returns `Option<Arc<VarHandleMeta>>` — callers destructure
+// the inner fields via `Arc::as_ref()` and copy the few primitive members
+// they actually need (`kind`, `field_index`, `class_id`).
+static VH_META_TABLE: std::sync::OnceLock<
+    std::sync::Mutex<rustc_hash::FxHashMap<usize, Arc<VarHandleMeta>>>,
+> = std::sync::OnceLock::new();
 
-fn vh_meta_table() -> &'static std::sync::Mutex<rustc_hash::FxHashMap<usize, VarHandleMeta>> {
+fn vh_meta_table()
+-> &'static std::sync::Mutex<rustc_hash::FxHashMap<usize, Arc<VarHandleMeta>>> {
     VH_META_TABLE.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 pub(crate) fn vh_meta_put(vh: ObjectRef, meta: VarHandleMeta) {
     let mut t = vh_meta_table().lock().unwrap();
-    t.insert(vh.as_ptr() as usize, meta);
+    t.insert(vh.as_ptr() as usize, Arc::new(meta));
 }
 
-pub(crate) fn vh_meta_get(vh: ObjectRef) -> Option<VarHandleMeta> {
+pub(crate) fn vh_meta_get(vh: ObjectRef) -> Option<Arc<VarHandleMeta>> {
     let t = vh_meta_table().lock().unwrap();
+    // Refcount bump only — no per-field String clone.
     t.get(&(vh.as_ptr() as usize)).cloned()
 }
 
 pub(crate) fn vh_meta_update_field_index(vh: ObjectRef, idx: i32) {
     let mut t = vh_meta_table().lock().unwrap();
-    if let Some(meta) = t.get_mut(&(vh.as_ptr() as usize)) {
-        meta.field_index = idx;
-    }
+    let Some(existing) = t.get(&(vh.as_ptr() as usize)) else {
+        return;
+    };
+    // Build a fresh Arc with the bumped field_index (Arc-immutability —
+    // the old Arc may still be held by an in-flight call site).
+    let mut updated = (**existing).clone();
+    updated.field_index = idx;
+    t.insert(vh.as_ptr() as usize, Arc::new(updated));
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +815,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             } else {
                 // Resolve by name
                 let (class, field) = match vh_meta_get(this) {
-                    Some(m) => (m.class_name, m.field_name),
+                    Some(m) => (m.class_name.clone(), m.field_name.clone()),
                     None => (
                         vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
                         vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
@@ -820,7 +836,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         VH_KIND_STATIC => {
             let (class, field) = match vh_meta_get(this) {
-                Some(m) => (m.class_name, m.field_name),
+                Some(m) => (m.class_name.clone(), m.field_name.clone()),
                 None => (
                     vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
@@ -890,7 +906,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             } else {
                 // WP4.2: prefer side-table for class+field, fall back to slot read
                 let (class, field) = match vh_meta_get(this) {
-                    Some(m) => (m.class_name, m.field_name),
+                    Some(m) => (m.class_name.clone(), m.field_name.clone()),
                     None => (
                         vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
                         vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
@@ -909,7 +925,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             let value = args.get(1).cloned().unwrap_or(Value::Int(0));
             // WP4.2: prefer side-table for class+field, fall back to slot read
             let (class, field) = match vh_meta_get(this) {
-                Some(m) => (m.class_name, m.field_name),
+                Some(m) => (m.class_name.clone(), m.field_name.clone()),
                 None => (
                     vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
@@ -980,7 +996,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         field_idx as usize
     } else {
         let (class, field) = match vh_meta_get(this) {
-            Some(m) => (m.class_name, m.field_name),
+            Some(m) => (m.class_name.clone(), m.field_name.clone()),
             None => (
                 vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
                 vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),

@@ -328,8 +328,18 @@ fn native_unsafe_put_byte_at_address(
         // arena) or the cache already covered it.  Extend the cached
         // window forward so the next iteration of the loop hits.
         refresh_arena_cache(addr, 1);
+        return Ok(None);
     }
-    Ok(None)
+    // Arena rejected the write AND the per-thread cache didn't cover
+    // the address — the target lives in no live arena. Java's
+    // `Unsafe.putByte(long, byte)` contract specifies
+    // `IllegalArgumentException` here; silently dropping the write
+    // (the previous behavior) lets buggy callers proceed against
+    // already-freed memory.
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!("Unsafe.putByte: address 0x{addr:x} is not in any live arena"),
+    }
+    .into())
 }
 
 fn native_unsafe_get_short_at_address(
@@ -362,8 +372,12 @@ fn native_unsafe_put_short_at_address(
     let ok = crate::unsafe_arena_put_short(addr, v);
     if ok || cache_hit {
         refresh_arena_cache(addr, 2);
+        return Ok(None);
     }
-    Ok(None)
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!("Unsafe.putShort: address 0x{addr:x} is not in any live arena"),
+    }
+    .into())
 }
 
 fn native_unsafe_get_int_at_address(
@@ -396,8 +410,12 @@ fn native_unsafe_put_int_at_address(
     let ok = crate::unsafe_arena_put_int(addr, v);
     if ok || cache_hit {
         refresh_arena_cache(addr, 4);
+        return Ok(None);
     }
-    Ok(None)
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!("Unsafe.putInt: address 0x{addr:x} is not in any live arena"),
+    }
+    .into())
 }
 
 fn native_unsafe_get_long_at_address(
@@ -431,8 +449,12 @@ fn native_unsafe_put_long_at_address(
     let ok = crate::unsafe_arena_put_long(addr, v);
     if ok || cache_hit {
         refresh_arena_cache(addr, 8);
+        return Ok(None);
     }
-    Ok(None)
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!("Unsafe.putLong: address 0x{addr:x} is not in any live arena"),
+    }
+    .into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,8 +1023,12 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
             };
             if crate::unsafe_arena_put_int(addr, v.to_bits() as i32) {
                 refresh_arena_cache(addr, 4);
+                return Ok(None);
             }
-            Ok(None)
+            Err(RuntimeError::IllegalArgumentException {
+                message: format!("Unsafe.putFloat: address 0x{addr:x} is not in any live arena"),
+            }
+            .into())
         });
         registry.register(class, "getDouble", "(J)D", |_ctx, args| {
             let addr = match args.get(1) {
@@ -1024,8 +1050,12 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
             };
             if crate::unsafe_arena_put_long(addr, v.to_bits() as i64) {
                 refresh_arena_cache(addr, 8);
+                return Ok(None);
             }
-            Ok(None)
+            Err(RuntimeError::IllegalArgumentException {
+                message: format!("Unsafe.putDouble: address 0x{addr:x} is not in any live arena"),
+            }
+            .into())
         });
         // getAddress / putAddress use native pointer width (8 on our 64-bit VM).
         registry.register(class, "getAddress", "(J)J", native_unsafe_get_long_at_address);

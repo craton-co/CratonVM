@@ -232,13 +232,23 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
 
     // Primitive-array fast path — element types already verified equal.
     //
-    // TODO(audit-2026-05-16): replace this per-element loop with a bulk
-    // intrinsic when `NativeContext` exposes one (e.g.
-    // `bulk_array_copy(src, src_pos, dst, dst_pos, len)`). For large
-    // primitive arrays the per-element trip through the trait object is
-    // the single biggest perf win in this crate. Adding the intrinsic is
-    // a cross-crate change (touches `native-api` + `vm`), so it is not
-    // done here — only the call site is marked.
+    // Use the `bulk_array_copy` intrinsic exposed by `NativeContext`
+    // (added round 3 — see `native-api/src/registry.rs:270`). The VM
+    // override implements this with `copy_within` / `copy_nonoverlapping`
+    // on the underlying primitive backing, which is dramatically faster
+    // than per-element trips through the trait object. The intrinsic
+    // handles same-array overlap internally.
+    //
+    // Falls back to the per-element loop if the intrinsic refuses (e.g.
+    // an unexpected element-type mismatch the pre-check above didn't
+    // catch). Element types are already verified equal at this point so
+    // failure is not expected, but the fallback preserves the original
+    // semantics defensively.
+    if ctx.bulk_array_copy(src, src_pos as usize, dest, dest_pos as usize, length as usize) {
+        return Ok(None);
+    }
+
+    // Fallback per-element loop (only reached on intrinsic failure).
     if same_array && src_pos < dest_pos {
         // Copy backward to handle overlap
         for i in (0..length).rev() {

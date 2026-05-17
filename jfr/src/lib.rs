@@ -442,15 +442,18 @@ mod tests {
         push_to_thread_ring(event);
 
         // (3) Confirm the event is reachable through the global registry —
-        // by inspecting *this* thread's shard, avoiding cross-test races on
-        // `drain_all`.
+        // by inspecting *this* thread's SPSC shard, avoiding cross-test
+        // races on `drain_all`. Bug 2 fix: the shard is now an
+        // `Arc<SpscEventRing>` instead of `Arc<Mutex<VecDeque<_>>>`, so we
+        // drain it (consumer side) and search the drained vector.
         let shard = global_ring_registry().register_current_thread();
-        let q = shard.lock().expect("shard mutex poisoned");
+        let mut drained: Vec<EventInstance> = Vec::new();
+        shard.drain_into(&mut drained);
         assert!(
-            q.iter().any(|e| e.start_time == unique_start && e.type_id == unique_type),
-            "expected event with start_time={:#x} to be present in this thread's shard (len={})",
+            drained.iter().any(|e| e.start_time == unique_start && e.type_id == unique_type),
+            "expected event with start_time={:#x} to be present in this thread's shard (drained {} events)",
             unique_start,
-            q.len(),
+            drained.len(),
         );
 
         // Also confirm the default-capacity constant is the documented value

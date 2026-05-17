@@ -4786,14 +4786,32 @@ pub(crate) fn zone_offset_for_id(ctx: &mut dyn NativeContext, zone_id_obj: Objec
 // `days_in_month` / `is_leap_year` used elsewhere in this module.
 
 // ---------------------------------------------------------------------------
-// Clock — 1-field synthetic (field 0 = ZoneId object)
+// Clock — 2-field synthetic
+//   field 0 = ZoneId object
+//   field 1 = fixed Instant object (or null for system clocks). When
+//     non-null, `Clock.instant()` returns this stored Instant instead of
+//     reading wall time — required by `Clock.fixed(Instant, ZoneId)`
+//     semantics.
 // ---------------------------------------------------------------------------
 const CLOCK_FIELD_ZONE: usize = 0;
-const CLOCK_NUM_FIELDS: usize = 1;
+const CLOCK_FIELD_FIXED_INSTANT: usize = 1;
+const CLOCK_NUM_FIELDS: usize = 2;
 
 fn alloc_clock(ctx: &mut dyn NativeContext, zone: ObjectRef) -> ObjectRef {
     let c = alloc_time_synthetic(ctx, "java/time/Clock", CLOCK_NUM_FIELDS);
     ctx.set_field(c, CLOCK_FIELD_ZONE, Value::Object(Some(zone)));
+    ctx.set_field(c, CLOCK_FIELD_FIXED_INSTANT, Value::Object(None));
+    c
+}
+
+fn alloc_fixed_clock(
+    ctx: &mut dyn NativeContext,
+    zone: ObjectRef,
+    fixed_instant: ObjectRef,
+) -> ObjectRef {
+    let c = alloc_time_synthetic(ctx, "java/time/Clock", CLOCK_NUM_FIELDS);
+    ctx.set_field(c, CLOCK_FIELD_ZONE, Value::Object(Some(zone)));
+    ctx.set_field(c, CLOCK_FIELD_FIXED_INSTANT, Value::Object(Some(fixed_instant)));
     c
 }
 
@@ -4816,11 +4834,18 @@ fn native_clock_system_default_zone(
 }
 
 /// T2.5.1: `Clock.systemUTC().instant()` / any Clock's `.instant()`.
-/// Reads the current wall-clock time from `SystemTime::now` (which is
-/// the OS monotonic-unaware real time source exactly as the roadmap
-/// called out) and converts to an Instant with full nanosecond
-/// precision.
-fn native_clock_instant(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// For Clocks created via `Clock.fixed(Instant, ZoneId)` the stored
+/// Instant is returned verbatim (the JDK spec requires the fixed
+/// instant to be the source of truth for `instant()` / `millis()`).
+/// Otherwise reads the current wall-clock time from `SystemTime::now`.
+fn native_clock_instant(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Receiver may be absent only for an internally-misregistered call —
+    // fall through to system-clock semantics in that case.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Value::Object(Some(fixed)) = ctx.get_field(*this, CLOCK_FIELD_FIXED_INSTANT) {
+            return Ok(Some(Value::Object(Some(fixed))));
+        }
+    }
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -4828,8 +4853,24 @@ fn native_clock_instant(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(obj))))
 }
 
-/// `Clock.millis()` — epoch milliseconds. Matches `System.currentTimeMillis`.
-fn native_clock_millis(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `Clock.millis()` — epoch milliseconds. For a fixed clock the value
+/// derives from the stored Instant; otherwise mirrors
+/// `System.currentTimeMillis`.
+fn native_clock_millis(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Value::Object(Some(fixed)) = ctx.get_field(*this, CLOCK_FIELD_FIXED_INSTANT) {
+            let sec = match ctx.get_field(fixed, INST_FIELD_EPOCH_SEC) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let nano = match ctx.get_field(fixed, INST_FIELD_NANO) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let millis = sec.saturating_mul(1_000).saturating_add((nano / 1_000_000) as i64);
+            return Ok(Some(Value::Long(millis)));
+        }
+    }
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0i64, |d| d.as_millis() as i64);
@@ -4843,21 +4884,24 @@ fn native_clock_get_zone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// `Clock.fixed(Instant, ZoneId)` — per the JDK spec, returns a Clock
-/// that always reports the fixed instant and the given zone. We model
-/// a "fixed" clock by storing the zone only and documenting that our
-/// Clock synthetic does not retain the instant — the fixed-clock
-/// semantics would require a second field. To remain faithful to
-/// the public API we allocate a two-field variant when this path is
-/// hit; in practice our Clock reads real wall time via `.instant()`
-/// regardless of its stored zone, which matches the behavior of
-/// every other Clock factory too. Callers that require the
-/// fixed-instant semantics should use the real JDK bytecode path.
+/// that always reports the fixed instant and the given zone. Static
+/// method, so `args[0]` = Instant, `args[1]` = ZoneId. The Instant is
+/// stored in the Clock's `CLOCK_FIELD_FIXED_INSTANT` slot and returned
+/// verbatim by `.instant()` / consulted by `.millis()`.
 fn native_clock_fixed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let zone = match args.get(1) {
         Some(Value::Object(Some(z))) => *z,
         _ => alloc_zone_id(ctx, "UTC"),
     };
-    Ok(Some(Value::Object(Some(alloc_clock(ctx, zone)))))
+    let fixed_instant = match args.first() {
+        Some(Value::Object(Some(i))) => *i,
+        // No instant supplied — fall back to a system clock that the
+        // existing `alloc_clock` shape produces (fixed-instant slot
+        // null). This preserves the historic permissive behavior for
+        // tests that pass null.
+        _ => return Ok(Some(Value::Object(Some(alloc_clock(ctx, zone))))),
+    };
+    Ok(Some(Value::Object(Some(alloc_fixed_clock(ctx, zone, fixed_instant)))))
 }
 
 // ---------------------------------------------------------------------------

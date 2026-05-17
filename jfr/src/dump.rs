@@ -503,15 +503,20 @@ fn write_header<W: Write>(
 /// event type metadata.  `start_time_ns` and `duration_ns` are used for the
 /// file header timestamps.
 ///
-/// Before writing the chunk we drain the per-thread ring registry
-/// (`crate::repository::global_ring_registry()`) so any events buffered by
-/// producer threads since the last dump are flushed into this chunk. Drained
-/// events are sorted by `start_time` (events from different threads arrive
-/// interleaved) and then serialized after the in-repository events. We filter
-/// drained events to those whose `type_id` is known to the supplied `registry`
-/// — events for unknown types can't be described by the metadata section, so
-/// we drop them rather than emit unreadable records. This filter also keeps
-/// stray events from foreign tests/registries out of small unit-test dumps.
+/// CRIT-fix (Bug 1, 2026-05-17): this function no longer drains the process-
+/// wide per-thread ring registry. With multiple concurrent recordings, the
+/// first dump would otherwise steal events that belonged to siblings (the
+/// global ring is shared). Each recording must drain its OWN snapshot of
+/// events before calling this function and pass them in via `extra_events`
+/// (the FlightRecorder's `drain_per_thread_into_repository` fans the drain
+/// out to every running recording, so the per-recording repository ALREADY
+/// contains the drained events and callers from `dump_recording` should pass
+/// `Vec::new()`). For standalone/test dumps that want a one-shot drain,
+/// callers can do `global_ring_registry().drain_all()` and forward the
+/// result as `extra_events`.
+///
+/// `extra_events` are sorted by `start_time` and filtered to known event
+/// types, then serialized AFTER the in-repository events.
 ///
 /// Returns the total number of bytes written.
 pub fn dump_to_file(
@@ -520,13 +525,15 @@ pub fn dump_to_file(
     registry: &EventTypeRegistry,
     start_time_ns: u64,
     duration_ns: u64,
+    extra_events: Vec<EventInstance>,
 ) -> Result<u64, JfrDumpError> {
-    // --- Drain per-thread rings before writing the chunk ---------------------
-    // Cold path: dump frequency is on the order of seconds. We pay one
-    // registry-mutex lock + one lock per registered shard, plus an O(n log n)
-    // sort over the drained events. This is acceptable for a dump path.
-    let mut drained: Vec<EventInstance> =
-        crate::repository::global_ring_registry().drain_all();
+    // --- Pre-process caller-supplied extra events ----------------------------
+    // Cold path: dump frequency is on the order of seconds. We pay an
+    // O(n log n) sort and a single linear filter. The events were already
+    // drained by the caller (typically `FlightRecorder::dump_recording`),
+    // which fans them out to every running recording. Re-draining here would
+    // steal events from sibling recordings — see Bug 1.
+    let mut drained: Vec<EventInstance> = extra_events;
     // Sort by start_time ascending so the per-shard interleaving is resolved
     // into a single monotonic event stream within the drained set.
     drained.sort_by_key(|e| e.start_time);
@@ -1244,7 +1251,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_dump.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 1_000_000, 3_000_000).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 1_000_000, 3_000_000, Vec::new()).unwrap();
         assert!(file_size >= HEADER_SIZE);
 
         // Verify header
@@ -1286,7 +1293,7 @@ mod tests {
         let path = dir.join("test_empty.jfr");
 
         // Empty dump is still valid (just header + checkpoint + metadata)
-        let file_size = dump_to_file(&path, &repo, &reg, 0, 0).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 0, 0, Vec::new()).unwrap();
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.magic, JFR_MAGIC);
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
@@ -1316,7 +1323,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_magic.jfr");
 
-        dump_to_file(&path, &repo, &reg, 100, 100).unwrap();
+        dump_to_file(&path, &repo, &reg, 100, 100, Vec::new()).unwrap();
 
         // Read raw bytes and verify magic
         let data = std::fs::read(&path).unwrap();
@@ -1384,7 +1391,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_fields.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 500, 300).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 500, 300, Vec::new()).unwrap();
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
@@ -1415,7 +1422,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_many.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 0, 500_000).unwrap();
+        let file_size = dump_to_file(&path, &repo, &reg, 0, 500_000, Vec::new()).unwrap();
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
@@ -1446,7 +1453,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_layout.jfr");
 
-        dump_to_file(&path, &repo, &reg, 100, 100).unwrap();
+        dump_to_file(&path, &repo, &reg, 100, 100, Vec::new()).unwrap();
         let header = read_jfr_header(&path).unwrap();
 
         // The checkpoint should sit right at HEADER_SIZE.
@@ -1523,16 +1530,17 @@ mod tests {
 
     #[test]
     fn test_dump_drains_per_thread_rings() {
-        // Verify that dump_to_file picks up events buffered in the global
-        // per-thread ring registry and writes them into the chunk alongside
-        // the repository's events.
+        // Bug 1 fix: `dump_to_file` no longer drains the global ring itself;
+        // callers (FlightRecorder::dump_recording) drain and fan out per
+        // recording, then pass the events in via `extra_events`. This test
+        // simulates that contract: push events, drain explicitly, then verify
+        // the writer emits them when handed in.
         //
         // The global ring registry is process-wide, so this test:
         //   1. Drains the registry first to start from a clean baseline.
         //   2. Registers a type in its own private registry.
         //   3. Pushes events with that type_id via `push_to_thread_ring`.
-        //   4. Dumps using the private registry (which filters out stray
-        //      events from other tests that share the global registry).
+        //   4. Drains them explicitly and passes them to `dump_to_file`.
         //   5. Reads the file back and verifies the pushed events are present.
         use crate::repository::{global_ring_registry, push_to_thread_ring};
 
@@ -1566,7 +1574,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("drain_rings.jfr");
 
-        let _file_size = dump_to_file(&path, &repo, &reg, 0, 0).unwrap();
+        // Drain the global ring and hand the events to the writer — this is
+        // the contract that `FlightRecorder::dump_recording` now follows.
+        let drained = global_ring_registry().drain_all();
+        let _file_size = dump_to_file(&path, &repo, &reg, 0, 0, drained).unwrap();
 
         // Header should be valid
         let header = read_jfr_header(&path).unwrap();
@@ -1587,10 +1598,10 @@ mod tests {
             );
         }
 
-        // A second dump should not re-emit these events (drain_all consumed them).
+        // A second dump with no extra events should not re-emit them.
         let path2 = dir.join("drain_rings_second.jfr");
         let repo2 = EventRepository::new(100);
-        dump_to_file(&path2, &repo2, &reg, 0, 0).unwrap();
+        dump_to_file(&path2, &repo2, &reg, 0, 0, Vec::new()).unwrap();
         let events2 = read_events(&path2, &reg).unwrap();
         for &expected_start in &pushed_starts {
             let still_there = events2.iter().any(|e|
@@ -1636,7 +1647,9 @@ mod tests {
         let dir = std::env::temp_dir().join("jfr_test_sort_drained");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("sort_drained.jfr");
-        dump_to_file(&path, &repo, &reg, 0, 0).unwrap();
+        // Drain the pushed events and pass them in — see Bug 1 fix.
+        let drained = global_ring_registry().drain_all();
+        dump_to_file(&path, &repo, &reg, 0, 0, drained).unwrap();
 
         let events = read_events(&path, &reg).unwrap();
         // Pull out just the ones we pushed (by tag prefix) and check they are
@@ -1696,7 +1709,7 @@ mod tests {
             dump_repo.push(event.clone());
         }
 
-        let file_size = dump_to_file(&path, &dump_repo, &fr.type_registry, start_time, duration).unwrap();
+        let file_size = dump_to_file(&path, &dump_repo, &fr.type_registry, start_time, duration, Vec::new()).unwrap();
         let header = read_jfr_header(&path).unwrap();
 
         assert_eq!(header.magic, JFR_MAGIC);

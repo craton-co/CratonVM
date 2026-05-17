@@ -124,6 +124,15 @@ pub struct MarkQueue {
 /// Number of shards for the mark queue. Must be a power of two for fast modulo.
 const MARK_QUEUE_SHARDS: usize = 8;
 
+thread_local! {
+    /// Per-thread round-robin cursor used by [`MarkQueue::pop`] to choose
+    /// the shard probe order. Bumping this on every `pop` distributes
+    /// marker threads across shards instead of stacking them all on
+    /// shard 0 (which is what the original "start at 0" loop did,
+    /// defeating the entire point of sharding under contention).
+    static POP_CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // SAFETY: The raw pointers in the queue are heap object addresses managed
 // by the GC; they are valid for the duration of the marking phase. The
 // sharded Mutex design ensures exclusive access to each shard.
@@ -153,10 +162,19 @@ impl MarkQueue {
 
     /// Pop an object from the mark queue for scanning.
     /// Returns `None` if all shards are empty.
+    ///
+    /// Each calling thread maintains its own round-robin cursor so that
+    /// concurrent markers spread contention evenly across shards instead
+    /// of always hammering shard 0 first.
     pub fn pop(&self) -> Option<*mut u8> {
-        // Try each shard in round-robin order starting from shard 0.
-        for shard in &self.shards {
-            if let Some(ptr) = shard.lock().pop_front() {
+        let start = POP_CURSOR.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(1));
+            v
+        }) & (MARK_QUEUE_SHARDS - 1);
+        for offset in 0..MARK_QUEUE_SHARDS {
+            let idx = (start + offset) & (MARK_QUEUE_SHARDS - 1);
+            if let Some(ptr) = self.shards[idx].lock().pop_front() {
                 return Some(ptr);
             }
         }

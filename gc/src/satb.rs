@@ -7,9 +7,63 @@
 //! Each application thread has its own `SatbBuffer`. When the buffer is full,
 //! it is flushed to a global queue for the marking threads to process.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
+
+thread_local! {
+    /// Per-thread SATB buffer for the write barrier fast path.
+    ///
+    /// The mutator write barrier appends overwritten reference values into
+    /// this buffer without taking any shared lock. When the buffer fills it
+    /// auto-flushes into the global [`SatbQueue`]; the collector also drains
+    /// per-thread buffers at safepoints via [`flush_thread_satb_buffer`].
+    static THREAD_SATB_BUFFER: RefCell<SatbBuffer> = RefCell::new(SatbBuffer::new());
+}
+
+/// Push an overwritten reference address into the calling thread's local
+/// SATB buffer. If the buffer is full, drain it into `queue` atomically.
+///
+/// This is the fast path called by the write barrier — no shared lock is
+/// taken unless the per-thread buffer fills (amortized one lock per 256
+/// reference stores).
+#[inline]
+pub fn satb_thread_local_log(queue: &SatbQueue, old_ref_addr: usize) {
+    if old_ref_addr == 0 {
+        return;
+    }
+    let to_flush = THREAD_SATB_BUFFER.with(|buf| {
+        let mut b = buf.borrow_mut();
+        if b.log(old_ref_addr) {
+            Some(b.drain())
+        } else {
+            None
+        }
+    });
+    if let Some(entries) = to_flush {
+        queue.flush(entries);
+    }
+}
+
+/// Drain the calling thread's SATB buffer into the global queue.
+///
+/// Called by mutators at safepoint entry and by the collector at GC start
+/// to ensure all logged-but-unflushed entries reach the global queue
+/// before marker threads consume them.
+pub fn flush_thread_satb_buffer(queue: &SatbQueue) {
+    let entries = THREAD_SATB_BUFFER.with(|buf| {
+        let mut b = buf.borrow_mut();
+        if b.is_empty() {
+            Vec::new()
+        } else {
+            b.drain()
+        }
+    });
+    if !entries.is_empty() {
+        queue.flush(entries);
+    }
+}
 
 /// Default capacity of a per-thread SATB buffer (entries, not bytes).
 const DEFAULT_SATB_CAPACITY: usize = 256;
@@ -418,5 +472,54 @@ mod tests {
 
         let entries = buf.drain();
         assert_eq!(entries, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn thread_local_log_explicit_flush() {
+        // Run inside a fresh thread so the per-thread SATB buffer starts
+        // empty regardless of test ordering.
+        let h = std::thread::spawn(|| {
+            let q = SatbQueue::new();
+            q.activate();
+            satb_thread_local_log(&q, 0x100);
+            satb_thread_local_log(&q, 0x200);
+            // Not full yet → nothing in the global queue.
+            assert!(q.is_empty());
+            // Explicit safepoint-style flush drains the per-thread buffer.
+            flush_thread_satb_buffer(&q);
+            let drained = q.drain();
+            assert_eq!(drained, vec![0x100, 0x200]);
+        });
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn thread_local_log_null_skipped() {
+        let h = std::thread::spawn(|| {
+            let q = SatbQueue::new();
+            q.activate();
+            satb_thread_local_log(&q, 0);
+            flush_thread_satb_buffer(&q);
+            assert!(q.is_empty());
+        });
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn thread_local_log_auto_flushes_at_capacity() {
+        // Each thread has its own buffer with DEFAULT_SATB_CAPACITY=256.
+        // Logging exactly 256 entries should auto-flush into the global queue.
+        let h = std::thread::spawn(|| {
+            let q = SatbQueue::new();
+            q.activate();
+            for i in 1..=DEFAULT_SATB_CAPACITY {
+                satb_thread_local_log(&q, i);
+            }
+            // Auto-flush at 256 means the global queue is non-empty without
+            // an explicit safepoint flush.
+            assert!(!q.is_empty());
+            assert_eq!(q.len(), DEFAULT_SATB_CAPACITY);
+        });
+        h.join().unwrap();
     }
 }

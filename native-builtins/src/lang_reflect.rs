@@ -42,6 +42,23 @@ use crate::lang_class::{
 };
 use crate::obj_arg;
 
+use std::sync::OnceLock;
+
+/// Cached `RUSTJVM_DBG_METHOD_INVOKE_BOX` lookup. `Method.invoke`'s
+/// defensive-box wrap-up runs on every reflective call (and ByteBuddy /
+/// CGLIB / Jackson hit this thousands of times during JDK boot). Reading
+/// `env::var_os` per call goes through the platform environ lock —
+/// avoid that by caching at first use. The env var is a debug switch;
+/// setting it after the first reflective invoke has no effect (matches
+/// the `vm::runtime::exceptions::iae_trace_enabled` convention).
+static DBG_METHOD_INVOKE_BOX: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn dbg_method_invoke_box_enabled() -> bool {
+    *DBG_METHOD_INVOKE_BOX
+        .get_or_init(|| std::env::var_os("RUSTJVM_DBG_METHOD_INVOKE_BOX").is_some())
+}
+
 // ---------------------------------------------------------------------------
 // JVM access flags used by Parameter.isImplicit / isSynthetic
 // ---------------------------------------------------------------------------
@@ -1045,7 +1062,7 @@ fn native_method_invoke_boxed(
                     ret_desc,
                     descriptor,
                 );
-                if std::env::var_os("RUSTJVM_DBG_METHOD_INVOKE_BOX").is_some() {
+                if dbg_method_invoke_box_enabled() {
                     eprintln!(
                         "[Method.invoke] recovered Class<primitive> -> default-boxed; \
                          ret_desc=`{}`",
@@ -1085,7 +1102,7 @@ fn native_method_invoke_boxed(
         boxed_kind,
         ret_desc
     );
-    if std::env::var_os("RUSTJVM_DBG_METHOD_INVOKE_BOX").is_some() {
+    if dbg_method_invoke_box_enabled() {
         eprintln!(
             "[Method.invoke] defensive box: ret_desc=`{}` boxed_kind={}",
             ret_desc, boxed_kind,

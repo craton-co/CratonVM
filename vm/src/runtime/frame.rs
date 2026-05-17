@@ -132,6 +132,27 @@ pub struct Frame {
     /// Incremented on each backward branch; triggers JIT when exceeding threshold.
     pub backward_count: u32,
 
+    /// CRIT-PERF (audit 2026-05-17): per-loop "OSR already attempted" set.
+    ///
+    /// The trigger condition used to be `bc == OSR_THRESHOLD` (exact
+    /// equality), which meant that if the OSR compile was queued but the
+    /// JIT entry trampoline wasn't ready yet, `try_osr` rejected the
+    /// attempt and **the counter immediately moved past the threshold**
+    /// — so the loop kept iterating in the interpreter forever without
+    /// ever retrying OSR.  The fix changes the trigger to `bc >=
+    /// OSR_THRESHOLD` (so we retry on every subsequent back-edge of the
+    /// same loop) and uses this Vec to suppress the case where OSR for a
+    /// given entry PC has already been attempted and failed for a
+    /// permanent reason (skip-list ban, native shadow, compile failure
+    /// returning `None` after recording the attempt). The Vec is kept
+    /// over `Option<usize>` because a method may contain multiple loops
+    /// that each hit the threshold and we want each loop's OSR attempt
+    /// to be tracked independently. Capacity stays at zero unless OSR
+    /// actually fires, so the steady-state per-frame cost is one extra
+    /// 24-byte `Vec` header — negligible next to the ~hundreds of bytes
+    /// per `Frame`.
+    pub osr_attempted_entry_pcs: Vec<usize>,
+
     /// For synchronized methods dispatched via the stackless path: the monitor
     /// object that must be released when this frame returns or is unwound by
     /// an exception.  `None` for non-synchronized methods.
@@ -335,6 +356,7 @@ impl Frame {
                 exception_table: Arc::from(exception_table.into_boxed_slice()),
             },
             backward_count: 0,
+            osr_attempted_entry_pcs: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -373,6 +395,7 @@ impl Frame {
                 exception_table,
             },
             backward_count: 0,
+            osr_attempted_entry_pcs: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -420,6 +443,7 @@ impl Frame {
                 exception_table,
             },
             backward_count: 0,
+            osr_attempted_entry_pcs: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -457,6 +481,7 @@ impl Frame {
             max_locals: eff_max_locals,
             inner: FrameInner::Cached(cached),
             backward_count: 0,
+            osr_attempted_entry_pcs: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -481,6 +506,7 @@ impl Frame {
         self.pc = 0;
         self.last_instr_pc = 0;
         self.backward_count = 0;
+        self.osr_attempted_entry_pcs.clear();
         self.code = code;
         self.max_stack = max_stack;
         let eff_max_locals = effective_max_locals(max_locals, args);
@@ -596,19 +622,33 @@ impl Frame {
 
     /// Clone method_name as Arc<str> for stack trace capture (cold path).
     pub fn method_name_arc(&self) -> Arc<str> {
+        self.method_name_arc_ref().clone()
+    }
+
+    /// Borrow the method_name `Arc<str>` without cloning. Use this from
+    /// hot paths (PGO branch / back-edge recording) that build a
+    /// `MethodKey` and want to defer the refcount bump until the
+    /// borrow is actually consumed.
+    pub fn method_name_arc_ref(&self) -> &Arc<str> {
         match &self.inner {
-            FrameInner::Owned { method_name, .. } => method_name.clone(),
-            FrameInner::Cached(cm) => cm.method_name.clone(),
+            FrameInner::Owned { method_name, .. } => method_name,
+            FrameInner::Cached(cm) => &cm.method_name,
         }
     }
 
     /// Clone method_descriptor as Arc<str> (cold path — PGO profiling, error messages).
     pub fn method_descriptor_arc(&self) -> Arc<str> {
+        self.method_descriptor_arc_ref().clone()
+    }
+
+    /// Borrow the method_descriptor `Arc<str>` without cloning. Same
+    /// rationale as `method_name_arc_ref`.
+    pub fn method_descriptor_arc_ref(&self) -> &Arc<str> {
         match &self.inner {
             FrameInner::Owned {
                 method_descriptor, ..
-            } => method_descriptor.clone(),
-            FrameInner::Cached(cm) => cm.method_descriptor.clone(),
+            } => method_descriptor,
+            FrameInner::Cached(cm) => &cm.method_descriptor,
         }
     }
 
@@ -854,6 +894,7 @@ impl Frame {
                 exception_table,
             },
             backward_count: 0,
+            osr_attempted_entry_pcs: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: false,
         }

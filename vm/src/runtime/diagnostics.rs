@@ -268,7 +268,7 @@ pub fn record_swallow(
         detail = %detail,
         "B6: silent-swallow — error suppressed to keep VM running"
     );
-    if std::env::var("RUSTJVM_STRICT_SWALLOWS").ok().as_deref() == Some("1") {
+    if crate::runtime::env_cache::strict_swallows() {
         panic!(
             "RUSTJVM_STRICT_SWALLOWS=1: swallow at {site} [{category}]: {detail}"
         );

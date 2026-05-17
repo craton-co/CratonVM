@@ -1921,6 +1921,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "regex",
+ "rustc-hash",
  "rustjvm-native-api",
  "rustjvm-types",
  "tempfile",
