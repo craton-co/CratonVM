@@ -66402,6 +66402,7 @@ public class SkippedTest {
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — none for this switch-table-only test bytecode
             Vec::new(), Vec::new(), std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             &helpers,
@@ -66461,6 +66462,7 @@ public class SkippedTest {
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — none for this switch-table-only test bytecode
             Vec::new(), Vec::new(), std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             &helpers,

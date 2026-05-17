@@ -67,6 +67,12 @@ fn register_bench_class(
         signature: None,
         code_source: None,
         array_info: None,
+        attributes: Vec::new(),
+        source_file_cache: std::sync::OnceLock::new(),
+        signature_cache: std::sync::OnceLock::new(),
+        nest_host_cache: std::sync::OnceLock::new(),
+        enclosing_method_cache: std::sync::OnceLock::new(),
+        record_components_cache: std::sync::OnceLock::new(),
     });
     cm.register_class_name(ClassLoaderId::Application, &class_name, id);
     id
@@ -313,13 +319,13 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
                     name: "main".into(),
                     descriptor: "()I".into(),
                     access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                    attributes: vec![Attribute::Code(CodeAttribute {
+                    attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
                         code: code.clone(),
                         exception_table: vec![],
                         attributes: vec![],
-                    })],
+                    }))],
                 }],
             );
             let mut thread = JvmThread::new(ThreadId(0), "main");
@@ -413,13 +419,13 @@ fn bench_interpreter_counting_loop(c: &mut Criterion) {
                 name: "count".into(),
                 descriptor: "()I".into(),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 1,
                     code,
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -448,13 +454,13 @@ fn bench_interpreter_fibonacci(c: &mut Criterion) {
             name: "fib".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 5,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }],
     );
 
@@ -486,13 +492,13 @@ fn bench_shootout_nbody(c: &mut Criterion) {
             name: "nbodyLoop".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 4,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }],
     );
 
@@ -524,13 +530,13 @@ fn bench_shootout_binary_trees(c: &mut Criterion) {
             name: "treeSum".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 3,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }],
     );
 
@@ -714,13 +720,13 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
             name: "sor".into(),
             descriptor: "(II)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 4,
                 max_locals: 7,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }],
     );
 
@@ -770,13 +776,13 @@ fn bench_dacapo_avrora_sim(c: &mut Criterion) {
             name: "simulate".into(),
             descriptor: "()I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 1,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }],
     );
 

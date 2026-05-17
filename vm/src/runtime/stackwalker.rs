@@ -201,7 +201,9 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC,
             name: Arc::from("probe"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(code)],
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(code),
+            )],
         }
     }
 
@@ -264,7 +266,9 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC,
             name: Arc::from("probe"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(code)],
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(code),
+            )],
         };
         let code = method.code().unwrap();
 

@@ -1,3 +1,13 @@
+use std::sync::Arc;
+
+use crate::buffer::ClassFileBuffer;
+use crate::class_reader_error::ClassReaderError;
+use crate::constant_pool::ConstantPool;
+
+/// Safety cap for `Vec::with_capacity` to avoid excessive pre-allocation on
+/// malformed attribute bodies. Mirrors the constant in `class_reader.rs`.
+const PREALLOC_CAP: usize = 1024;
+
 /// Attributes attached to class files, fields, methods, and code (JVM spec 4.7).
 ///
 /// Attributes provide additional metadata. Some are critical for execution (Code),
@@ -318,6 +328,839 @@ pub struct MethodParameter {
     pub name_index: u16,
     /// Access flags: ACC_FINAL (0x0010), ACC_SYNTHETIC (0x1000), ACC_MANDATED (0x8000).
     pub access_flags: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Lazy attribute decoding (T11)
+// ---------------------------------------------------------------------------
+//
+// Per the audit, ~70% of attributes on java.base bootstrap are never consumed
+// (LocalVariableTable, LocalVariableTypeTable, RuntimeInvisibleAnnotations,
+// Module, ...). `LazyAttribute` lets the class reader keep raw bytes around
+// for an attribute and only pay the parse cost when a downstream consumer
+// actually asks for the structured value.
+//
+// **Eager-decode candidates considered (final recommendation: all lazy):**
+//
+// * `Code` — needed by JIT/verifier the *first* time a method is invoked,
+//   not at class load. Lazy is a clear win: bootstrap loads thousands of
+//   methods that are never called.
+// * `ConstantValue` — `<clinit>` synthesis reads it once per static field
+//   that has one. The downstream class loader can call `decode()` then.
+// * `Exceptions` — only consulted when checking `throws` clauses at link
+//   time or during stack unwinding. Lazy.
+// * `StackMapTable` — only consumed by the verifier; we already store its
+//   contents as raw bytes inside `Attribute::StackMapTable`, so the
+//   "decode" cost is essentially a memcpy anyway.
+// * `BootstrapMethods` — only needed when an `invokedynamic` is resolved.
+//   Lazy.
+//
+// In every case the consumer (`classloading/src/class.rs` for class-level
+// attributes, the method/field record builders for member-level) can call
+// `decode()` at the exact point of need. Keeping everything lazy by default
+// gives the consumer a uniform API and avoids burning startup time on
+// attributes that are statistically rarely read.
+
+/// Lazy attribute container. Initially holds raw bytes and the attribute
+/// name; decodes to a typed [`Attribute`] on first access via
+/// [`LazyAttribute::decode`].
+///
+/// This is an *additive* wrapper around [`Attribute`]: the existing
+/// [`Attribute`] enum and its variants are unchanged. Producers (the class
+/// reader) construct `LazyAttribute::Raw` with the raw attribute body bytes;
+/// consumers (the class loader, JIT, verifier) call [`decode`] to obtain a
+/// `&Attribute` exactly when they need it. Producers that already have a
+/// parsed value (synthetic attributes, test fixtures, AOT caches) can use
+/// [`new_decoded`] to bypass parsing entirely.
+///
+/// The `name` is an `Arc<str>` rather than a `String` because UTF-8 entries
+/// in the constant pool are already interned via `rustjvm_types::intern_arc`
+/// at parse time (see T10.2); cloning the name is a single refcount bump
+/// rather than a new allocation.
+///
+/// [`decode`]: LazyAttribute::decode
+/// [`new_decoded`]: LazyAttribute::new_decoded
+#[derive(Debug, Clone)]
+pub enum LazyAttribute {
+    /// Undecoded: name + raw byte body of the attribute (the bytes that
+    /// follow the `attribute_length` field, exactly `attribute_length` of
+    /// them). The bytes are owned by the `LazyAttribute` so they outlive
+    /// the source class file buffer.
+    Raw {
+        /// The attribute name, e.g. `"Code"`, `"SourceFile"`. Shared
+        /// `Arc<str>` from the constant pool's string pool.
+        name: Arc<str>,
+        /// The raw attribute body bytes. Does NOT include the
+        /// `attribute_name_index` or `attribute_length` header fields.
+        bytes: Vec<u8>,
+    },
+    /// Decoded: parsed [`Attribute`] variant.
+    Decoded(Attribute),
+}
+
+impl LazyAttribute {
+    /// Construct from raw attribute body bytes. The `name` is the attribute
+    /// name as resolved from the constant pool; `bytes` is the attribute
+    /// body (i.e. exactly `attribute_length` bytes, *excluding* the name
+    /// index and length header fields).
+    pub fn new_raw(name: Arc<str>, bytes: Vec<u8>) -> Self {
+        LazyAttribute::Raw { name, bytes }
+    }
+
+    /// Construct from an already-decoded [`Attribute`].
+    ///
+    /// Useful for synthetic attributes (e.g. attributes added by the class
+    /// loader itself) or test fixtures, where there is never a raw byte
+    /// form.
+    pub fn new_decoded(attr: Attribute) -> Self {
+        LazyAttribute::Decoded(attr)
+    }
+
+    /// The attribute's name (cheap, no decode).
+    ///
+    /// In `Raw` form returns the stored name directly. In `Decoded` form
+    /// derives the canonical name from the [`Attribute`] variant.
+    pub fn name(&self) -> &str {
+        match self {
+            LazyAttribute::Raw { name, .. } => name,
+            LazyAttribute::Decoded(attr) => attribute_canonical_name(attr),
+        }
+    }
+
+    /// Force decode if not already decoded, then return the decoded
+    /// attribute. Transitions `Raw` → `Decoded` in place; subsequent calls
+    /// are no-ops and return the cached value.
+    ///
+    /// The constant pool is required because most attribute bodies contain
+    /// indices into the constant pool that the decoder resolves to string
+    /// values during parsing (e.g. `SourceFile`, `Signature`).
+    pub fn decode(
+        &mut self,
+        constant_pool: &ConstantPool,
+    ) -> Result<&Attribute, ClassReaderError> {
+        // Two-phase to satisfy the borrow checker: take ownership of the raw
+        // bytes, decode, then write the decoded variant back into `self`.
+        if let LazyAttribute::Raw { name, bytes } = self {
+            // `mem::take` cheaply moves the contents out, leaving empty
+            // placeholders. The Raw variant is unobservable to callers
+            // between the take and the assignment below because we have
+            // exclusive `&mut self`.
+            let name = std::mem::take(name);
+            let bytes = std::mem::take(bytes);
+            let decoded = decode_attribute(&name, &bytes, constant_pool)?;
+            *self = LazyAttribute::Decoded(decoded);
+        }
+        match self {
+            LazyAttribute::Decoded(attr) => Ok(attr),
+            LazyAttribute::Raw { .. } => unreachable!("decoded above"),
+        }
+    }
+
+    /// Get the decoded attribute if already decoded; `None` otherwise.
+    ///
+    /// This never performs decoding. Use [`decode`] if you want to force
+    /// decoding.
+    ///
+    /// [`decode`]: LazyAttribute::decode
+    pub fn as_decoded(&self) -> Option<&Attribute> {
+        match self {
+            LazyAttribute::Decoded(attr) => Some(attr),
+            LazyAttribute::Raw { .. } => None,
+        }
+    }
+
+    /// Is this attribute already decoded?
+    pub fn is_decoded(&self) -> bool {
+        matches!(self, LazyAttribute::Decoded(_))
+    }
+}
+
+/// Force-decode every [`LazyAttribute`] in the slice that is still in the
+/// `Raw` state. Already-decoded entries are skipped.
+///
+/// Intended for callers that want eager decoding semantics (cached/serialised
+/// class data, AOT pipelines, debug tooling), or for code paths that prefer
+/// to fail fast on malformed attributes at class-load time rather than at
+/// first-use time.
+pub fn force_decode_all(
+    attrs: &mut [LazyAttribute],
+    cp: &ConstantPool,
+) -> Result<(), ClassReaderError> {
+    for attr in attrs.iter_mut() {
+        attr.decode(cp)?;
+    }
+    Ok(())
+}
+
+/// Decode a single attribute body. Public so other parts of the class
+/// reader (and downstream crates) can opt into structured parsing without
+/// going through [`LazyAttribute`].
+///
+/// `name` is the attribute name (already resolved from the constant pool).
+/// `bytes` is *exactly* the attribute body — no `attribute_name_index` or
+/// `attribute_length` header. The decoder consumes the bytes via a private
+/// [`ClassFileBuffer`] and verifies it consumed all of them; trailing junk
+/// or premature EOF is reported as [`ClassReaderError::InvalidClassData`].
+///
+/// Unknown attribute names produce [`Attribute::Unknown`] with the raw
+/// bytes preserved, matching the behaviour of the eager reader.
+pub fn decode_attribute(
+    name: &str,
+    bytes: &[u8],
+    cp: &ConstantPool,
+) -> Result<Attribute, ClassReaderError> {
+    let mut buf = ClassFileBuffer::new(bytes);
+    let attr = decode_attribute_body(name, bytes.len(), &mut buf, cp)?;
+
+    // Enforce that the body parser consumed exactly `bytes.len()` bytes.
+    // Anything else indicates a malformed attribute (over-read would have
+    // already errored out of the buffer; this catches under-reads / trailing
+    // junk, which on the eager path would have mis-aligned the next
+    // attribute).
+    let consumed = buf.position();
+    if consumed != bytes.len() {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "attribute '{name}' body length {len} but parser consumed {consumed} bytes",
+                len = bytes.len()
+            ),
+        });
+    }
+    Ok(attr)
+}
+
+/// Decode dispatch — switches on attribute name. Kept separate from
+/// [`decode_attribute`] so the post-parse length check lives in exactly one
+/// place. `length` is the total body length, needed by attributes that
+/// store raw bytes (`StackMapTable`, `Unknown`).
+fn decode_attribute_body(
+    name: &str,
+    length: usize,
+    buf: &mut ClassFileBuffer<'_>,
+    cp: &ConstantPool,
+) -> Result<Attribute, ClassReaderError> {
+    let attr = match name {
+        "Code" => decode_code_body(buf, cp)?,
+        "SourceFile" => {
+            let source_file_index = buf.read_u16()?;
+            let source_file = cp
+                .get_utf8(source_file_index)
+                .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+                    index: source_file_index,
+                    message: "SourceFile must reference a valid Utf8 entry".to_string(),
+                })?
+                .to_string();
+            Attribute::SourceFile(source_file)
+        }
+        "ConstantValue" => {
+            let constant_value_index = buf.read_u16()?;
+            Attribute::ConstantValue { constant_value_index }
+        }
+        "Deprecated" => Attribute::Deprecated,
+        "Synthetic" => Attribute::Synthetic,
+        "Exceptions" => {
+            let num_exceptions = buf.read_u16()?;
+            let mut exception_indices =
+                Vec::with_capacity((num_exceptions as usize).min(PREALLOC_CAP));
+            for _ in 0..num_exceptions {
+                exception_indices.push(buf.read_u16()?);
+            }
+            Attribute::Exceptions { exception_indices }
+        }
+        "LineNumberTable" => {
+            let table_length = buf.read_u16()?;
+            let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
+            for _ in 0..table_length {
+                entries.push(LineNumberEntry {
+                    start_pc: buf.read_u16()?,
+                    line_number: buf.read_u16()?,
+                });
+            }
+            Attribute::LineNumberTable(entries)
+        }
+        "InnerClasses" => {
+            let num_classes = buf.read_u16()?;
+            let mut classes = Vec::with_capacity((num_classes as usize).min(PREALLOC_CAP));
+            for _ in 0..num_classes {
+                classes.push(InnerClassInfo {
+                    inner_class_info_index: buf.read_u16()?,
+                    outer_class_info_index: buf.read_u16()?,
+                    inner_name_index: buf.read_u16()?,
+                    inner_class_access_flags: buf.read_u16()?,
+                });
+            }
+            Attribute::InnerClasses(classes)
+        }
+        "Signature" => {
+            let signature_index = buf.read_u16()?;
+            let signature = cp
+                .get_utf8(signature_index)
+                .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+                    index: signature_index,
+                    message: "Signature must reference a valid Utf8 entry".to_string(),
+                })?
+                .to_string();
+            Attribute::Signature(signature)
+        }
+        "StackMapTable" => {
+            // The StackMapTable body is stored verbatim — verifier-time
+            // parsing happens later in the `stack_map` module.
+            let data = buf.read_bytes(length)?.to_vec();
+            Attribute::StackMapTable { entries: data }
+        }
+        "BootstrapMethods" => {
+            let num_bootstrap_methods = buf.read_u16()?;
+            let mut methods =
+                Vec::with_capacity((num_bootstrap_methods as usize).min(PREALLOC_CAP));
+            for _ in 0..num_bootstrap_methods {
+                let bootstrap_method_ref = buf.read_u16()?;
+                let num_args = buf.read_u16()?;
+                let mut bootstrap_arguments =
+                    Vec::with_capacity((num_args as usize).min(PREALLOC_CAP));
+                for _ in 0..num_args {
+                    bootstrap_arguments.push(buf.read_u16()?);
+                }
+                methods.push(BootstrapMethod {
+                    bootstrap_method_ref,
+                    bootstrap_arguments,
+                });
+            }
+            Attribute::BootstrapMethods(methods)
+        }
+        "EnclosingMethod" => Attribute::EnclosingMethod {
+            class_index: buf.read_u16()?,
+            method_index: buf.read_u16()?,
+        },
+        "NestHost" => Attribute::NestHost {
+            host_class_index: buf.read_u16()?,
+        },
+        "NestMembers" => {
+            let num = buf.read_u16()?;
+            let mut classes = Vec::with_capacity((num as usize).min(PREALLOC_CAP));
+            for _ in 0..num {
+                classes.push(buf.read_u16()?);
+            }
+            Attribute::NestMembers { classes }
+        }
+        "Record" => {
+            let num_components = buf.read_u16()?;
+            let mut components = Vec::with_capacity((num_components as usize).min(PREALLOC_CAP));
+            for _ in 0..num_components {
+                let comp_name_index = buf.read_u16()?;
+                let comp_descriptor_index = buf.read_u16()?;
+                let comp_attributes = decode_attributes_vec(buf, cp)?;
+                components.push(RecordComponent {
+                    name_index: comp_name_index,
+                    descriptor_index: comp_descriptor_index,
+                    attributes: comp_attributes,
+                });
+            }
+            Attribute::Record(components)
+        }
+        "PermittedSubclasses" => {
+            let num = buf.read_u16()?;
+            let mut classes = Vec::with_capacity((num as usize).min(PREALLOC_CAP));
+            for _ in 0..num {
+                classes.push(buf.read_u16()?);
+            }
+            Attribute::PermittedSubclasses { classes }
+        }
+        "Module" => {
+            let name_index = buf.read_u16()?;
+            let flags = buf.read_u16()?;
+            let version_index = buf.read_u16()?;
+
+            let requires_count = buf.read_u16()?;
+            let mut requires = Vec::with_capacity((requires_count as usize).min(PREALLOC_CAP));
+            for _ in 0..requires_count {
+                requires.push(ModuleRequires {
+                    requires_index: buf.read_u16()?,
+                    requires_flags: buf.read_u16()?,
+                    requires_version_index: buf.read_u16()?,
+                });
+            }
+
+            let exports_count = buf.read_u16()?;
+            let mut exports = Vec::with_capacity((exports_count as usize).min(PREALLOC_CAP));
+            for _ in 0..exports_count {
+                let exports_index = buf.read_u16()?;
+                let exports_flags = buf.read_u16()?;
+                let to_count = buf.read_u16()?;
+                let mut exports_to = Vec::with_capacity((to_count as usize).min(PREALLOC_CAP));
+                for _ in 0..to_count {
+                    exports_to.push(buf.read_u16()?);
+                }
+                exports.push(ModuleExports {
+                    exports_index,
+                    exports_flags,
+                    exports_to,
+                });
+            }
+
+            let opens_count = buf.read_u16()?;
+            let mut opens = Vec::with_capacity((opens_count as usize).min(PREALLOC_CAP));
+            for _ in 0..opens_count {
+                let opens_index = buf.read_u16()?;
+                let opens_flags = buf.read_u16()?;
+                let to_count = buf.read_u16()?;
+                let mut opens_to = Vec::with_capacity((to_count as usize).min(PREALLOC_CAP));
+                for _ in 0..to_count {
+                    opens_to.push(buf.read_u16()?);
+                }
+                opens.push(ModuleOpens {
+                    opens_index,
+                    opens_flags,
+                    opens_to,
+                });
+            }
+
+            let uses_count = buf.read_u16()?;
+            let mut uses = Vec::with_capacity((uses_count as usize).min(PREALLOC_CAP));
+            for _ in 0..uses_count {
+                uses.push(buf.read_u16()?);
+            }
+
+            let provides_count = buf.read_u16()?;
+            let mut provides = Vec::with_capacity((provides_count as usize).min(PREALLOC_CAP));
+            for _ in 0..provides_count {
+                let provides_index = buf.read_u16()?;
+                let with_count = buf.read_u16()?;
+                let mut provides_with =
+                    Vec::with_capacity((with_count as usize).min(PREALLOC_CAP));
+                for _ in 0..with_count {
+                    provides_with.push(buf.read_u16()?);
+                }
+                provides.push(ModuleProvides {
+                    provides_index,
+                    provides_with,
+                });
+            }
+
+            Attribute::Module {
+                name_index,
+                flags,
+                version_index,
+                requires,
+                exports,
+                opens,
+                uses,
+                provides,
+            }
+        }
+        "ModulePackages" => {
+            let count = buf.read_u16()?;
+            let mut packages = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
+            for _ in 0..count {
+                packages.push(buf.read_u16()?);
+            }
+            Attribute::ModulePackages { packages }
+        }
+        "ModuleMainClass" => Attribute::ModuleMainClass {
+            main_class_index: buf.read_u16()?,
+        },
+        "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations" => {
+            let num_annotations = buf.read_u16()?;
+            let mut annotations = Vec::with_capacity((num_annotations as usize).min(PREALLOC_CAP));
+            for _ in 0..num_annotations {
+                annotations.push(decode_annotation(buf)?);
+            }
+            if name == "RuntimeVisibleAnnotations" {
+                Attribute::RuntimeVisibleAnnotations(annotations)
+            } else {
+                Attribute::RuntimeInvisibleAnnotations(annotations)
+            }
+        }
+        "RuntimeVisibleParameterAnnotations" | "RuntimeInvisibleParameterAnnotations" => {
+            let num_parameters = buf.read_u8()?;
+            let mut parameter_annotations =
+                Vec::with_capacity((num_parameters as usize).min(PREALLOC_CAP));
+            for _ in 0..num_parameters {
+                let num_annotations = buf.read_u16()?;
+                let mut annotations =
+                    Vec::with_capacity((num_annotations as usize).min(PREALLOC_CAP));
+                for _ in 0..num_annotations {
+                    annotations.push(decode_annotation(buf)?);
+                }
+                parameter_annotations.push(annotations);
+            }
+            if name == "RuntimeVisibleParameterAnnotations" {
+                Attribute::RuntimeVisibleParameterAnnotations(parameter_annotations)
+            } else {
+                Attribute::RuntimeInvisibleParameterAnnotations(parameter_annotations)
+            }
+        }
+        "RuntimeVisibleTypeAnnotations" | "RuntimeInvisibleTypeAnnotations" => {
+            let num_annotations = buf.read_u16()?;
+            let mut annotations = Vec::with_capacity((num_annotations as usize).min(PREALLOC_CAP));
+            for _ in 0..num_annotations {
+                annotations.push(decode_type_annotation(buf)?);
+            }
+            if name == "RuntimeVisibleTypeAnnotations" {
+                Attribute::RuntimeVisibleTypeAnnotations(annotations)
+            } else {
+                Attribute::RuntimeInvisibleTypeAnnotations(annotations)
+            }
+        }
+        "AnnotationDefault" => {
+            let value = decode_element_value(buf)?;
+            Attribute::AnnotationDefault(value)
+        }
+        "LocalVariableTable" => {
+            let table_length = buf.read_u16()?;
+            let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
+            for _ in 0..table_length {
+                entries.push(LocalVariableEntry {
+                    start_pc: buf.read_u16()?,
+                    length: buf.read_u16()?,
+                    name_index: buf.read_u16()?,
+                    descriptor_index: buf.read_u16()?,
+                    index: buf.read_u16()?,
+                });
+            }
+            Attribute::LocalVariableTable(entries)
+        }
+        "LocalVariableTypeTable" => {
+            let table_length = buf.read_u16()?;
+            let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
+            for _ in 0..table_length {
+                entries.push(LocalVariableTypeEntry {
+                    start_pc: buf.read_u16()?,
+                    length: buf.read_u16()?,
+                    name_index: buf.read_u16()?,
+                    signature_index: buf.read_u16()?,
+                    index: buf.read_u16()?,
+                });
+            }
+            Attribute::LocalVariableTypeTable(entries)
+        }
+        "MethodParameters" => {
+            let parameters_count = buf.read_u8()?;
+            let mut parameters =
+                Vec::with_capacity((parameters_count as usize).min(PREALLOC_CAP));
+            for _ in 0..parameters_count {
+                parameters.push(MethodParameter {
+                    name_index: buf.read_u16()?,
+                    access_flags: buf.read_u16()?,
+                });
+            }
+            Attribute::MethodParameters(parameters)
+        }
+        "LoadableDescriptors" => {
+            // JEP 401 (Valhalla preview, class file 69+ with preview bit):
+            //   u2 number_of_descriptors;
+            //   u2 descriptors[number_of_descriptors];   // CONSTANT_Utf8_info
+            let number_of_descriptors = buf.read_u16()?;
+            let mut descriptors =
+                Vec::with_capacity((number_of_descriptors as usize).min(PREALLOC_CAP));
+            for _ in 0..number_of_descriptors {
+                descriptors.push(buf.read_u16()?);
+            }
+            Attribute::LoadableDescriptors { descriptors }
+        }
+        _ => {
+            // Unknown attribute — preserve raw bytes verbatim. Note we use
+            // `length` (the total body length) here, not `buf.remaining()`,
+            // because the post-parse check in `decode_attribute` would
+            // catch a mismatch anyway.
+            let data = buf.read_bytes(length)?.to_vec();
+            Attribute::Unknown {
+                name: name.to_string(),
+                data,
+            }
+        }
+    };
+    Ok(attr)
+}
+
+/// Decode a nested attributes table (used by `Code` and `Record`).
+///
+/// Format: `u2 attributes_count` followed by `attributes_count` attribute
+/// records. Each record is decoded eagerly here — nested attributes inside
+/// a Code body are typically `LineNumberTable`, `LocalVariableTable`,
+/// `StackMapTable`, etc. Lazy nesting would be future work.
+fn decode_attributes_vec(
+    buf: &mut ClassFileBuffer<'_>,
+    cp: &ConstantPool,
+) -> Result<Vec<Attribute>, ClassReaderError> {
+    let count = buf.read_u16()?;
+    let mut out = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
+    for _ in 0..count {
+        let name_index = buf.read_u16()?;
+        let name = cp
+            .get_utf8(name_index)
+            .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+                index: name_index,
+                message: "nested attribute name must reference a valid Utf8 entry".to_string(),
+            })?
+            .to_string();
+        let length = buf.read_u32()? as usize;
+        if length > buf.remaining() {
+            return Err(ClassReaderError::InvalidClassData {
+                message: format!(
+                    "nested attribute '{name}' length {length} exceeds remaining buffer size {}",
+                    buf.remaining()
+                ),
+            });
+        }
+        // Snapshot to enforce per-attribute length, mirroring class_reader.rs.
+        let start_pos = buf.position();
+        let attr = decode_attribute_body(&name, length, buf, cp)?;
+        let consumed = buf.position() - start_pos;
+        if consumed != length {
+            return Err(ClassReaderError::InvalidClassData {
+                message: format!(
+                    "nested attribute '{name}' declared length {length} but sub-parser consumed {consumed} bytes"
+                ),
+            });
+        }
+        out.push(attr);
+    }
+    Ok(out)
+}
+
+/// Decode the body of a `Code` attribute (JVM spec 4.7.3). The
+/// `attribute_length`/`attribute_name_index` header has already been
+/// consumed by the caller.
+fn decode_code_body(
+    buf: &mut ClassFileBuffer<'_>,
+    cp: &ConstantPool,
+) -> Result<Attribute, ClassReaderError> {
+    let max_stack = buf.read_u16()?;
+    let max_locals = buf.read_u16()?;
+
+    let code_length = buf.read_u32()? as usize;
+    // JVM spec 4.7.3: code_length must be > 0 and <= 65535.
+    const MAX_CODE_LENGTH: usize = 65535;
+    if code_length == 0 || code_length > MAX_CODE_LENGTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "Code attribute code_length {code_length} outside valid range 1..={MAX_CODE_LENGTH}"
+            ),
+        });
+    }
+    let code = buf.read_bytes(code_length)?.to_vec();
+
+    let exception_table_length = buf.read_u16()?;
+    let mut exception_table =
+        Vec::with_capacity((exception_table_length as usize).min(PREALLOC_CAP));
+    for _ in 0..exception_table_length {
+        exception_table.push(ExceptionTableEntry {
+            start_pc: buf.read_u16()?,
+            end_pc: buf.read_u16()?,
+            handler_pc: buf.read_u16()?,
+            catch_type: buf.read_u16()?,
+        });
+    }
+
+    let attributes = decode_attributes_vec(buf, cp)?;
+
+    Ok(Attribute::Code(CodeAttribute {
+        max_stack,
+        max_locals,
+        code,
+        exception_table,
+        attributes,
+    }))
+}
+
+/// Decode a single annotation structure (JVM spec 4.7.16).
+fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassReaderError> {
+    let type_index = buf.read_u16()?;
+    let num_element_value_pairs = buf.read_u16()?;
+    let mut element_value_pairs =
+        Vec::with_capacity((num_element_value_pairs as usize).min(PREALLOC_CAP));
+    for _ in 0..num_element_value_pairs {
+        let element_name_index = buf.read_u16()?;
+        let value = decode_element_value(buf)?;
+        element_value_pairs.push(ElementValuePair {
+            element_name_index,
+            value,
+        });
+    }
+    Ok(Annotation {
+        type_index,
+        element_value_pairs,
+    })
+}
+
+/// Decode an `element_value` structure (JVM spec 4.7.16.1).
+fn decode_element_value(
+    buf: &mut ClassFileBuffer<'_>,
+) -> Result<ElementValue, ClassReaderError> {
+    let tag = buf.read_u8()?;
+    match tag {
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
+            let const_value_index = buf.read_u16()?;
+            Ok(ElementValue::Const {
+                tag,
+                const_value_index,
+            })
+        }
+        b'e' => {
+            let type_name_index = buf.read_u16()?;
+            let const_name_index = buf.read_u16()?;
+            Ok(ElementValue::Enum {
+                type_name_index,
+                const_name_index,
+            })
+        }
+        b'c' => {
+            let class_info_index = buf.read_u16()?;
+            Ok(ElementValue::Class { class_info_index })
+        }
+        b'@' => {
+            let annotation = decode_annotation(buf)?;
+            Ok(ElementValue::AnnotationValue(annotation))
+        }
+        b'[' => {
+            let num_values = buf.read_u16()?;
+            let mut values = Vec::with_capacity((num_values as usize).min(PREALLOC_CAP));
+            for _ in 0..num_values {
+                values.push(decode_element_value(buf)?);
+            }
+            Ok(ElementValue::Array(values))
+        }
+        _ => Err(ClassReaderError::InvalidClassData {
+            message: format!("invalid element_value tag: 0x{tag:02X} ('{}')", tag as char),
+        }),
+    }
+}
+
+/// Decode a type_annotation structure (JVM spec 4.7.20).
+fn decode_type_annotation(
+    buf: &mut ClassFileBuffer<'_>,
+) -> Result<TypeAnnotation, ClassReaderError> {
+    let target_type = buf.read_u8()?;
+    let target_info = decode_target_info(buf, target_type)?;
+    let type_path = decode_type_path(buf)?;
+    let annotation = decode_annotation(buf)?;
+    Ok(TypeAnnotation {
+        target_type,
+        target_info,
+        type_path,
+        annotation,
+    })
+}
+
+/// Decode target_info bytes based on target_type (JVM spec Table 4.7.20-A/B).
+/// Stored as raw bytes — see the eager-path comment for the full rationale.
+fn decode_target_info(
+    buf: &mut ClassFileBuffer<'_>,
+    target_type: u8,
+) -> Result<Vec<u8>, ClassReaderError> {
+    match target_type {
+        0x00 | 0x01 => {
+            let b = buf.read_u8()?;
+            Ok(vec![b])
+        }
+        0x10 => {
+            let hi = buf.read_u8()?;
+            let lo = buf.read_u8()?;
+            Ok(vec![hi, lo])
+        }
+        0x11 | 0x12 => {
+            let a = buf.read_u8()?;
+            let b = buf.read_u8()?;
+            Ok(vec![a, b])
+        }
+        0x13..=0x15 => Ok(vec![]),
+        0x16 => {
+            let b = buf.read_u8()?;
+            Ok(vec![b])
+        }
+        0x17 => {
+            let hi = buf.read_u8()?;
+            let lo = buf.read_u8()?;
+            Ok(vec![hi, lo])
+        }
+        0x40 | 0x41 => {
+            let table_length = buf.read_u16()?;
+            let byte_count = 6 * table_length as usize;
+            let mut data = Vec::with_capacity(2 + byte_count);
+            data.push((table_length >> 8) as u8);
+            data.push(table_length as u8);
+            let raw = buf.read_bytes(byte_count)?;
+            data.extend_from_slice(raw);
+            Ok(data)
+        }
+        0x42 => {
+            let hi = buf.read_u8()?;
+            let lo = buf.read_u8()?;
+            Ok(vec![hi, lo])
+        }
+        0x43..=0x46 => {
+            let hi = buf.read_u8()?;
+            let lo = buf.read_u8()?;
+            Ok(vec![hi, lo])
+        }
+        0x47..=0x4B => {
+            let a = buf.read_u8()?;
+            let b = buf.read_u8()?;
+            let c = buf.read_u8()?;
+            Ok(vec![a, b, c])
+        }
+        _ => Err(ClassReaderError::InvalidClassData {
+            message: format!("unknown type annotation target_type: 0x{target_type:02X}"),
+        }),
+    }
+}
+
+/// Decode a type_path structure (JVM spec 4.7.20.2).
+fn decode_type_path(
+    buf: &mut ClassFileBuffer<'_>,
+) -> Result<Vec<TypePathEntry>, ClassReaderError> {
+    let path_length = buf.read_u8()?;
+    let mut path = Vec::with_capacity((path_length as usize).min(PREALLOC_CAP));
+    for _ in 0..path_length {
+        path.push(TypePathEntry {
+            type_path_kind: buf.read_u8()?,
+            type_argument_index: buf.read_u8()?,
+        });
+    }
+    Ok(path)
+}
+
+/// Canonical attribute name for an already-decoded [`Attribute`] variant.
+///
+/// Used by [`LazyAttribute::name`] when the lazy attribute is already in
+/// `Decoded` form (no stored `name` string). Names match those in the JVM
+/// spec §4.7.
+fn attribute_canonical_name(attr: &Attribute) -> &str {
+    match attr {
+        Attribute::Code(_) => "Code",
+        Attribute::SourceFile(_) => "SourceFile",
+        Attribute::ConstantValue { .. } => "ConstantValue",
+        Attribute::Deprecated => "Deprecated",
+        Attribute::Exceptions { .. } => "Exceptions",
+        Attribute::LineNumberTable(_) => "LineNumberTable",
+        Attribute::InnerClasses(_) => "InnerClasses",
+        Attribute::Signature(_) => "Signature",
+        Attribute::StackMapTable { .. } => "StackMapTable",
+        Attribute::BootstrapMethods(_) => "BootstrapMethods",
+        Attribute::Synthetic => "Synthetic",
+        Attribute::EnclosingMethod { .. } => "EnclosingMethod",
+        Attribute::NestHost { .. } => "NestHost",
+        Attribute::NestMembers { .. } => "NestMembers",
+        Attribute::Record(_) => "Record",
+        Attribute::PermittedSubclasses { .. } => "PermittedSubclasses",
+        Attribute::Module { .. } => "Module",
+        Attribute::ModulePackages { .. } => "ModulePackages",
+        Attribute::ModuleMainClass { .. } => "ModuleMainClass",
+        Attribute::RuntimeVisibleAnnotations(_) => "RuntimeVisibleAnnotations",
+        Attribute::RuntimeInvisibleAnnotations(_) => "RuntimeInvisibleAnnotations",
+        Attribute::RuntimeVisibleParameterAnnotations(_) => "RuntimeVisibleParameterAnnotations",
+        Attribute::RuntimeInvisibleParameterAnnotations(_) => {
+            "RuntimeInvisibleParameterAnnotations"
+        }
+        Attribute::RuntimeVisibleTypeAnnotations(_) => "RuntimeVisibleTypeAnnotations",
+        Attribute::RuntimeInvisibleTypeAnnotations(_) => "RuntimeInvisibleTypeAnnotations",
+        Attribute::AnnotationDefault(_) => "AnnotationDefault",
+        Attribute::LocalVariableTable(_) => "LocalVariableTable",
+        Attribute::LocalVariableTypeTable(_) => "LocalVariableTypeTable",
+        Attribute::MethodParameters(_) => "MethodParameters",
+        Attribute::LoadableDescriptors { .. } => "LoadableDescriptors",
+        Attribute::Unknown { name, .. } => name,
+    }
 }
 
 #[cfg(test)]
@@ -1369,6 +2212,143 @@ mod tests {
                 assert_eq!(method_index, 0);
             }
             other => panic!("Expected EnclosingMethod, got {other:?}"),
+        }
+    }
+
+    // ── LazyAttribute tests (T11) ───────────────────────────────────────
+
+    use crate::constant_pool::ConstantPoolEntry;
+
+    /// Build a constant pool with: `[0]=Tombstone, [1]=Utf8("Main.java")`.
+    /// Body for a `SourceFile` attribute is a single u16 = 1 (the index
+    /// of the Utf8 entry), so the encoded body is `[0x00, 0x01]`.
+    fn fixture_cp_and_sourcefile_body() -> (ConstantPool, Vec<u8>) {
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8(Arc::from("Main.java")),
+        ]);
+        let body = vec![0x00, 0x01];
+        (cp, body)
+    }
+
+    #[test]
+    fn lazy_attribute_raw_roundtrip() {
+        // Construct Raw, check name() returns the stored name without
+        // decoding, then decode() and verify the resulting Attribute is the
+        // SourceFile we expected.
+        let (cp, body) = fixture_cp_and_sourcefile_body();
+        let mut lazy = LazyAttribute::new_raw(Arc::from("SourceFile"), body);
+
+        // Pre-decode: name is available, body is still raw.
+        assert_eq!(lazy.name(), "SourceFile");
+        assert!(!lazy.is_decoded());
+        assert!(lazy.as_decoded().is_none());
+
+        // Decode and inspect.
+        let decoded = lazy.decode(&cp).expect("decode should succeed");
+        match decoded {
+            Attribute::SourceFile(name) => assert_eq!(name, "Main.java"),
+            other => panic!("Expected SourceFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lazy_attribute_is_decoded_after_decode() {
+        let (cp, body) = fixture_cp_and_sourcefile_body();
+        let mut lazy = LazyAttribute::new_raw(Arc::from("SourceFile"), body);
+
+        assert!(!lazy.is_decoded(), "freshly-built Raw must report not decoded");
+        let _ = lazy.decode(&cp).expect("decode should succeed");
+        assert!(lazy.is_decoded(), "post-decode must report decoded");
+        assert!(lazy.as_decoded().is_some());
+
+        // Second decode call must be a no-op and still return Ok.
+        let again = lazy.decode(&cp).expect("idempotent decode");
+        assert!(matches!(again, Attribute::SourceFile(_)));
+
+        // Name still resolves correctly via the canonical-name path.
+        assert_eq!(lazy.name(), "SourceFile");
+    }
+
+    #[test]
+    fn lazy_attribute_new_decoded_skips_parsing() {
+        // new_decoded must accept a pre-built Attribute and report
+        // is_decoded=true immediately, with name() deriving from the
+        // variant rather than a stored string.
+        let lazy = LazyAttribute::new_decoded(Attribute::Deprecated);
+        assert!(lazy.is_decoded());
+        assert_eq!(lazy.name(), "Deprecated");
+        assert!(matches!(lazy.as_decoded(), Some(Attribute::Deprecated)));
+    }
+
+    #[test]
+    fn force_decode_all_decodes_every_attr() {
+        // Build a slice with three lazy attributes: two Raw SourceFile
+        // entries and one already-Decoded marker. After force_decode_all,
+        // all three must be Decoded and the SourceFile entries must hold
+        // the expected name.
+        let (cp, body) = fixture_cp_and_sourcefile_body();
+        let mut attrs = vec![
+            LazyAttribute::new_raw(Arc::from("SourceFile"), body.clone()),
+            LazyAttribute::new_decoded(Attribute::Synthetic),
+            LazyAttribute::new_raw(Arc::from("SourceFile"), body),
+        ];
+
+        // Pre-check: the two Raw ones are undecoded.
+        assert!(!attrs[0].is_decoded());
+        assert!(attrs[1].is_decoded());
+        assert!(!attrs[2].is_decoded());
+
+        force_decode_all(&mut attrs, &cp).expect("force_decode_all should succeed");
+
+        // Post-check: every entry is decoded.
+        for (i, attr) in attrs.iter().enumerate() {
+            assert!(
+                attr.is_decoded(),
+                "entry {i} should be decoded after force_decode_all"
+            );
+        }
+        match attrs[0].as_decoded() {
+            Some(Attribute::SourceFile(name)) => assert_eq!(name, "Main.java"),
+            other => panic!("Expected SourceFile, got {other:?}"),
+        }
+        assert!(matches!(attrs[1].as_decoded(), Some(Attribute::Synthetic)));
+        match attrs[2].as_decoded() {
+            Some(Attribute::SourceFile(name)) => assert_eq!(name, "Main.java"),
+            other => panic!("Expected SourceFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_attribute_rejects_trailing_bytes() {
+        // SourceFile body must be exactly 2 bytes. A 3-byte body is
+        // malformed and the post-parse length check must reject it.
+        let (cp, mut body) = fixture_cp_and_sourcefile_body();
+        body.push(0xFF); // trailing junk
+        let err = decode_attribute("SourceFile", &body, &cp).unwrap_err();
+        match err {
+            ClassReaderError::InvalidClassData { message } => {
+                assert!(
+                    message.contains("SourceFile"),
+                    "error should name the attribute, got: {message}"
+                );
+            }
+            other => panic!("Expected InvalidClassData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_attribute_unknown_preserves_bytes() {
+        // Unknown attribute names must round-trip into Attribute::Unknown.
+        let cp = ConstantPool::new(vec![ConstantPoolEntry::Tombstone]);
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let attr = decode_attribute("MyCustomAttr", &bytes, &cp).unwrap();
+        match attr {
+            Attribute::Unknown { name, data } => {
+                assert_eq!(name, "MyCustomAttr");
+                assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("Expected Unknown, got {other:?}"),
         }
     }
 }

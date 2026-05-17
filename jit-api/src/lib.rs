@@ -82,6 +82,45 @@ pub struct JitRuntimeHelpers {
     /// T1.1.28 — `Math.fma(float, float, float)`.
     /// Signature: `extern "C" fn(a: f32, b: f32, c: f32) -> f32`.
     pub math_fma_float: usize,
+
+    // -----------------------------------------------------------------
+    // Inline TLAB bump-pointer wiring (HIGH-6 JIT audit, object_allocation)
+    //
+    // These three `usize`s are NOT function pointers — they are byte
+    // offsets the JIT bakes as immediates into the inline TLAB
+    // fast-path emitted by `jit/src/x64.rs::new` (opcode 0xbb).
+    //
+    // The helper-table populator (`vm/src/jit/helpers.rs::build_helpers`)
+    // computes them once at startup from `JvmThread::tlab_offset()` plus
+    // `Tlab::CURSOR_OFFSET` / `Tlab::END_OFFSET`. The runtime asserts in
+    // `Tlab::test_tlab_offsets` and `JvmThread::tlab_offset_matches_field_address`
+    // guard the layout — change them in lockstep.
+    // -----------------------------------------------------------------
+    /// Byte offset of `Tlab::cursor` from `&JvmThread` (i.e. the full
+    /// `JvmThread → tlab → cursor` chain). Emitted as `[thread+disp32]`
+    /// in the inline bump fast path.
+    pub tlab_cursor_offset_in_thread: usize,
+    /// Byte offset of `Tlab::end` from `&JvmThread`.
+    pub tlab_end_offset_in_thread: usize,
+    /// Byte offset of `ObjectHeader.class_id` from the object base.
+    /// Currently `0` (JIT contract enforced by `class_id_remains_at_offset_zero`
+    /// in `types/src/heap_types.rs`), exposed here so the JIT does not
+    /// hardcode the constant in a second place.
+    pub class_id_offset_in_obj: usize,
+    /// Address of the small `extern "C" fn() -> *mut JvmThread` helper
+    /// that returns the current thread's `JvmThread` pointer via the
+    /// `JIT_THREAD` thread-local. Used by the inline TLAB bump as the
+    /// first step (one CALL is cheaper than a full `jit_new_object`
+    /// dispatch). Set to `0` when not wired (JIT then falls back to the
+    /// helper-call path).
+    pub get_current_thread: usize,
+    /// Address of `extern "C" fn(vm_ptr, obj_ptr, class_id, num_fields)
+    /// -> i64`, the inline-TLAB completion helper. Called by the JIT
+    /// after a successful inline bump-pointer to finish the object
+    /// header (kind/hash/num_slots), apply primitive-typed defaults
+    /// from class metadata, and register finalizable classes. Returns
+    /// the object pointer unchanged.
+    pub tlab_post_init: usize,
 }
 
 impl JitRuntimeHelpers {
@@ -91,6 +130,13 @@ impl JitRuntimeHelpers {
     /// and aligned to at least 2 bytes (the minimum code alignment on most
     /// architectures; x86 allows 1-byte alignment but functions are never at
     /// address 0).
+    ///
+    /// NOTE: The `tlab_cursor_offset_in_thread`, `tlab_end_offset_in_thread`,
+    /// `class_id_offset_in_obj`, `get_current_thread`, and `tlab_post_init`
+    /// fields are NOT validated here. The first three are byte offsets
+    /// (zero is a valid value — `class_id_offset_in_obj` is 0 by contract);
+    /// the latter two are nullable optional helpers (the JIT falls back to
+    /// the unconditional `new_object` call when either is zero).
     pub fn validate(&self) -> bool {
         let ptrs = self.all_pointers();
         ptrs.iter().all(|&p| p != 0)
@@ -249,6 +295,11 @@ mod tests {
             uncommon_trap: 0x10E8,
             math_fma_double: 0x10F0,
             math_fma_float: 0x10F8,
+            tlab_cursor_offset_in_thread: 0,
+            tlab_end_offset_in_thread: 8,
+            class_id_offset_in_obj: 0,
+            get_current_thread: 0x1100,
+            tlab_post_init: 0x1108,
         }
     }
 
@@ -433,6 +484,11 @@ mod tests {
             uncommon_trap: 0,
             math_fma_double: 0,
             math_fma_float: 0,
+            tlab_cursor_offset_in_thread: 0,
+            tlab_end_offset_in_thread: 0,
+            class_id_offset_in_obj: 0,
+            get_current_thread: 0,
+            tlab_post_init: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);

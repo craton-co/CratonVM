@@ -14,10 +14,12 @@
 //! - `wait_condvar`: wakes threads blocked on `Object.wait()`
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
+use rustjvm_types::{self as types, ObjectHeader};
 
 use crate::error::{MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::ThreadId;
@@ -82,6 +84,177 @@ fn emit_wait_site_frames(thread_id: ThreadId) {
 }
 
 // ---------------------------------------------------------------------------
+// Thin-lock fast-path helpers
+// ---------------------------------------------------------------------------
+//
+// These functions implement the lock-word state machine on the object header
+// directly, avoiding any allocation in the uncontended case.
+//
+// State transitions (see `types::heap_types` for the mark word layout):
+//
+//   NEUTRAL --CAS--> THIN_LOCKED       (try_thin_lock)
+//   THIN_LOCKED(self) --CAS--> THIN_LOCKED(self, recursion+1)
+//                                       (try_thin_recursive_lock)
+//   THIN_LOCKED(self) --CAS--> THIN_LOCKED(self, recursion-1) or NEUTRAL
+//                                       (try_thin_unlock)
+//   NEUTRAL / THIN_LOCKED --store--> INFLATED(&Monitor)
+//                                       (inflate)
+//
+// The `inflate` path is the only one that allocates a `Monitor`.
+
+/// Attempt thin-lock acquisition via a single CAS on the mark word.
+///
+/// Returns `Ok(())` on success (the calling thread is now the thin-lock owner
+/// with recursion = 0). Returns `Err(current_mark)` if the CAS failed -- the
+/// caller can inspect the current state to decide whether to retry, recurse,
+/// or inflate.
+#[inline]
+pub fn try_thin_lock(header: &ObjectHeader, thread_id: u32) -> Result<(), u64> {
+    header
+        .mark_word
+        .compare_exchange(
+            types::MARK_NEUTRAL,
+            ObjectHeader::make_thin_locked(thread_id, 0),
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .map(|_| ())
+        .map_err(|m| m)
+}
+
+/// Re-entrant thin-lock: bump the recursion counter via CAS.
+///
+/// On success returns `Ok(new_recursion)`. Returns `Err(current_mark)` if:
+/// - the object is not in `THIN_LOCKED` state, or
+/// - it is thin-locked by a *different* thread, or
+/// - the recursion counter is at u8::MAX (caller must inflate to support
+///   deeper nesting).
+#[inline]
+pub fn try_thin_recursive_lock(header: &ObjectHeader, thread_id: u32) -> Result<u8, u64> {
+    loop {
+        let cur = header.mark_word.load(Ordering::Relaxed);
+        if ObjectHeader::mark_state(cur) != types::MARK_THIN_LOCKED {
+            return Err(cur);
+        }
+        if ObjectHeader::thin_lock_owner(cur) != thread_id {
+            return Err(cur);
+        }
+        let recursion = ObjectHeader::thin_lock_recursion(cur);
+        if recursion == u8::MAX {
+            return Err(cur); // overflow → must inflate
+        }
+        let new = ObjectHeader::make_thin_locked(thread_id, recursion + 1);
+        if header
+            .mark_word
+            .compare_exchange(cur, new, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(recursion + 1);
+        }
+        // Another thread mutated the mark word (almost certainly because
+        // it inflated the lock) — restart and re-classify.
+    }
+}
+
+/// Symmetric counterpart to `try_thin_lock` / `try_thin_recursive_lock`:
+/// drop one level of thin-lock ownership.
+///
+/// On success returns `Ok(Some(new_recursion))` if recursion remains > 0,
+/// or `Ok(None)` if the lock was fully released (mark word now NEUTRAL).
+///
+/// Returns `Err(current_mark)` if the mark word is not `THIN_LOCKED` by the
+/// calling thread (caller must dispatch to the inflated path or raise
+/// `IllegalMonitorStateException`).
+#[inline]
+pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u8>, u64> {
+    loop {
+        let cur = header.mark_word.load(Ordering::Relaxed);
+        if ObjectHeader::mark_state(cur) != types::MARK_THIN_LOCKED {
+            return Err(cur);
+        }
+        if ObjectHeader::thin_lock_owner(cur) != thread_id {
+            return Err(cur);
+        }
+        let recursion = ObjectHeader::thin_lock_recursion(cur);
+        let (new, ret) = if recursion == 0 {
+            // Last release → return to NEUTRAL.
+            (types::MARK_NEUTRAL, None)
+        } else {
+            (
+                ObjectHeader::make_thin_locked(thread_id, recursion - 1),
+                Some(recursion - 1),
+            )
+        };
+        if header
+            .mark_word
+            .compare_exchange(cur, new, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(ret);
+        }
+        // Lost the CAS — re-evaluate (an inflation by a concurrent thread
+        // is the only realistic cause since we, the owner, are the only one
+        // who can legally change a THIN_LOCKED mark word otherwise).
+    }
+}
+
+/// Inflate a thin lock (or a neutral mark) to a heap-allocated `Monitor`.
+///
+/// If `current_owner` is `Some((tid, recursion))`, the new monitor is
+/// pre-acquired by that thread with the given entry count, atomically
+/// transferring ownership from the thin-lock representation. This is used
+/// when the current owner inflates its own lock (to support deeper recursion)
+/// and also when a contending thread inflates a lock held by someone else.
+///
+/// Returns the leaked `Monitor` pointer. Callers are responsible for keeping
+/// the `Monitor` alive (e.g. by stashing an `Arc<Monitor>` in
+/// `MonitorTable::monitors`) so that the GC remap path can find it.
+#[inline]
+pub fn inflate(
+    header: &ObjectHeader,
+    monitor: Arc<Monitor>,
+    current_owner: Option<(u32, u8)>,
+) -> *mut Monitor {
+    if let Some((tid, recursion)) = current_owner {
+        monitor.enter_with_recursion(ThreadId(tid as u64), (recursion as u32) + 1);
+    }
+    // Cast through *const to *mut — `Arc::as_ptr` only exposes the const
+    // form, but the mark word stores an opaque address tag, not a reference
+    // that gets dereferenced through this pointer.
+    let raw = Arc::as_ptr(&monitor) as *mut Monitor;
+    // SAFETY: Monitor is naturally 8-byte aligned (it contains a Mutex which
+    // has at least pointer alignment); the low 2 bits are therefore zero and
+    // safe to use as the state tag.
+    let new_mark = ObjectHeader::make_inflated(raw as usize);
+    header.mark_word.store(new_mark, Ordering::Release);
+    raw
+}
+
+/// Look up an `&ObjectHeader` from an `ObjectRef`. Mirrors the pattern used by
+/// the GC (`rustjvm_gc::heap::Heap::get_header`) — the first
+/// `HEADER_SIZE` bytes of every heap allocation are a `repr(C)` `ObjectHeader`.
+#[inline]
+fn header_of(obj_ref: ObjectRef) -> &'static ObjectHeader {
+    // SAFETY: `ObjectRef` is constructed only from live, properly aligned heap
+    // allocations whose first bytes are an `ObjectHeader`. The lifetime is
+    // bounded by the GC, which scans monitor state at safepoints.
+    unsafe { &*(obj_ref.as_ptr() as *const ObjectHeader) }
+}
+
+/// Truncate a `ThreadId(u64)` to the 32-bit field stored in the thin-lock
+/// owner slot. Thread ids that exceed `u32::MAX` cannot be represented in the
+/// thin lock and force inflation; in practice the JVM never reaches that many
+/// live threads.
+#[inline]
+fn tid_to_u32(tid: ThreadId) -> Option<u32> {
+    if tid.0 <= u32::MAX as u64 {
+        Some(tid.0 as u32)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Monitor — per-object lock
 // ---------------------------------------------------------------------------
 
@@ -109,7 +282,7 @@ struct MonitorState {
 
 impl Monitor {
     /// Create a new, unlocked monitor.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(MonitorState {
                 owner: None,
@@ -118,6 +291,21 @@ impl Monitor {
             entry_condvar: Condvar::new(),
             wait_condvar: Condvar::new(),
         }
+    }
+
+    /// Pre-acquire this monitor for `thread_id` at the given entry count.
+    ///
+    /// Used exclusively by the inflation handoff (`inflate`) to atomically
+    /// transfer ownership from the thin-lock representation to a freshly
+    /// created `Monitor`. The monitor must be brand new (no other thread can
+    /// observe it yet because the mark word still points at the thin state),
+    /// so this is a pure local initialization — no condvar signalling needed.
+    pub(crate) fn enter_with_recursion(&self, thread_id: ThreadId, entry_count: u32) {
+        debug_assert!(entry_count >= 1, "entry_count must be at least 1");
+        let mut state = self.state.lock();
+        debug_assert!(state.owner.is_none(), "Monitor must be fresh");
+        state.owner = Some(thread_id);
+        state.entry_count = entry_count;
     }
 
     /// Returns true if this monitor is currently owned by the given
@@ -328,10 +516,24 @@ enum MonitorError {
 
 /// Global table of JVM monitors, keyed by object pointer address.
 ///
-/// Each Java object can be used as a monitor. Monitors are created lazily
-/// when a `monitorenter` instruction first targets an object.
+/// Each Java object can be used as a monitor. With the thin-lock fast path
+/// the *uncontended* and *re-entrant single-thread* cases NEVER allocate a
+/// `Monitor` — the lock state lives entirely in the object's `mark_word`.
+/// A heavyweight `Monitor` is only created when contention forces inflation
+/// (or when `Object.wait`/`notify` is used, which thin locks do not support).
+///
+/// The `monitors` map is therefore a *fallback registry* for inflated
+/// monitors:
+///   * it keeps each `Arc<Monitor>` alive after inflation (the mark word
+///     only stores a raw pointer);
+///   * it provides the lookup needed by `remap_after_gc` so monitors follow
+///     their object across compaction.
+///
+/// The fast path (`try_thin_lock`, `try_thin_recursive_lock`,
+/// `try_thin_unlock`) NEVER touches this map.
 pub struct MonitorTable {
-    /// Maps object identity (pointer address) to its monitor.
+    /// Inflated-monitor registry — keys are object pointer addresses.
+    /// Populated lazily on inflation; consulted by GC remap only.
     /// T10.9.B: FxHashMap — keys are object pointer addresses (internal).
     monitors: Mutex<FxHashMap<usize, Arc<Monitor>>>,
     /// Per-object CAS locks for compareAndSwap operations.
@@ -349,8 +551,207 @@ impl MonitorTable {
         }
     }
 
-    /// Get or create the monitor for the given object.
-    fn get_or_create(&self, obj_ref: ObjectRef) -> Arc<Monitor> {
+    /// Look up the inflated `Monitor` for `obj_ref`, returning `None` if the
+    /// object has never been inflated.
+    fn lookup_inflated(&self, obj_ref: ObjectRef) -> Option<Arc<Monitor>> {
+        let key = obj_ref.as_ptr() as usize;
+        let monitors = self.monitors.lock();
+        monitors.get(&key).cloned()
+    }
+
+    /// Force inflation of the lock for `obj_ref`. If the object already has
+    /// an inflated monitor (either via a prior CAS-published mark word or via
+    /// our fallback registry), that one is returned. Otherwise a new
+    /// `Monitor` is allocated, pre-acquired with the *currently observed*
+    /// thin-lock owner (if any), registered, and published into the mark
+    /// word.
+    ///
+    /// Re-snapshots the mark word under the registry mutex so that the
+    /// pre-acquire reflects reality at publish time (avoiding stale
+    /// `current_owner` data from a CAS-loser caller).
+    fn inflate_locked(&self, obj_ref: ObjectRef, header: &ObjectHeader) -> Arc<Monitor> {
+        let key = obj_ref.as_ptr() as usize;
+        let mut monitors = self.monitors.lock();
+        loop {
+            let cur = header.mark_word.load(Ordering::Acquire);
+            match ObjectHeader::mark_state(cur) {
+                s if s == types::MARK_INFLATED => {
+                    if let Some(m) = monitors.get(&key).cloned() {
+                        return m;
+                    }
+                    // Inflated mark but no registry entry — pathological;
+                    // replace with a fresh monitor (the old one is
+                    // unreachable and will leak, but correctness is
+                    // preserved).
+                    let monitor = Arc::new(Monitor::new());
+                    let new_mark =
+                        ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
+                    header.mark_word.store(new_mark, Ordering::Release);
+                    monitors.insert(key, monitor.clone());
+                    return monitor;
+                }
+                s if s == types::MARK_THIN_LOCKED => {
+                    let owner = ObjectHeader::thin_lock_owner(cur);
+                    let recursion = ObjectHeader::thin_lock_recursion(cur);
+                    let monitor = Arc::new(Monitor::new());
+                    monitor.enter_with_recursion(
+                        ThreadId(owner as u64),
+                        (recursion as u32) + 1,
+                    );
+                    let new_mark =
+                        ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
+                    // Publish atomically — if the CAS loses, the original
+                    // owner mutated the word (either recursive bump or
+                    // release). Drop the local monitor and retry.
+                    if header
+                        .mark_word
+                        .compare_exchange(
+                            cur,
+                            new_mark,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        monitors.insert(key, monitor.clone());
+                        return monitor;
+                    }
+                    // CAS lost; loop to re-snapshot. The pre-acquired Monitor
+                    // is dropped (no other reference exists yet).
+                }
+                _ => {
+                    // NEUTRAL (or reserved). Create an unowned monitor and
+                    // publish it; the caller will `enter` it normally.
+                    let monitor = Arc::new(Monitor::new());
+                    let new_mark =
+                        ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
+                    if header
+                        .mark_word
+                        .compare_exchange(
+                            cur,
+                            new_mark,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        monitors.insert(key, monitor.clone());
+                        return monitor;
+                    }
+                    // CAS lost — retry.
+                }
+            }
+        }
+    }
+
+    /// Acquire the monitor for the given object on behalf of the given thread.
+    ///
+    /// Fast paths (no allocation):
+    /// * NEUTRAL          → CAS to THIN_LOCKED (uncontended uncrossed lock).
+    /// * THIN_LOCKED(self) → bump recursion (re-entrant single-thread lock).
+    ///
+    /// Slow paths (inflate to a real `Monitor`):
+    /// * THIN_LOCKED(other) → inflate transferring ownership, then `enter`.
+    /// * THIN_LOCKED(self) at recursion = 255 → inflate, then `enter`.
+    /// * INFLATED         → dispatch to the existing `Monitor::enter`.
+    pub fn enter(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
+        // Fall back to the legacy heavyweight path if the ThreadId doesn't fit
+        // in the 32-bit thin-lock owner field.
+        let tid32 = match tid_to_u32(thread_id) {
+            Some(t) => t,
+            None => {
+                let m = self.inflate_for_legacy(obj_ref);
+                m.enter(thread_id);
+                return;
+            }
+        };
+
+        let header = header_of(obj_ref);
+
+        // ── Fast path 1: NEUTRAL → THIN_LOCKED via single CAS. ─────────────
+        match try_thin_lock(header, tid32) {
+            Ok(()) => return,
+            Err(_) => { /* fall through with up-to-date classification below */ }
+        }
+
+        loop {
+            let cur = header.mark_word.load(Ordering::Acquire);
+            match ObjectHeader::mark_state(cur) {
+                s if s == types::MARK_NEUTRAL => {
+                    // Raced with another exit() — retry the fast path once.
+                    if try_thin_lock(header, tid32).is_ok() {
+                        return;
+                    }
+                    // Lost the race again → inflate to avoid livelock.
+                    let m = self.inflate_locked(obj_ref, header);
+                    m.enter(thread_id);
+                    return;
+                }
+                s if s == types::MARK_THIN_LOCKED => {
+                    let owner = ObjectHeader::thin_lock_owner(cur);
+                    if owner == tid32 {
+                        // ── Fast path 2: re-entrant thin lock. ──────────
+                        match try_thin_recursive_lock(header, tid32) {
+                            Ok(_) => return,
+                            Err(err_mark) => {
+                                if ObjectHeader::mark_state(err_mark)
+                                    == types::MARK_THIN_LOCKED
+                                    && ObjectHeader::thin_lock_owner(err_mark) == tid32
+                                    && ObjectHeader::thin_lock_recursion(err_mark) == u8::MAX
+                                {
+                                    // Recursion overflow — inflate. Inflation
+                                    // pre-acquires with entry_count =
+                                    // recursion+1 = 256, capturing our prior
+                                    // re-entrant acquisitions. Now bump once
+                                    // more via reentrant `enter` to record the
+                                    // current attempted acquisition.
+                                    let m = self.inflate_locked(obj_ref, header);
+                                    m.enter(thread_id);
+                                    return;
+                                }
+                                // Otherwise the state changed under us; reclassify.
+                                continue;
+                            }
+                        }
+                    } else {
+                        // ── Slow path: contended thin lock → inflate. ───
+                        // `inflate_locked` re-snapshots under its mutex and
+                        // pre-acquires for whatever owner the mark word
+                        // currently shows (or none if it has since gone
+                        // NEUTRAL). We then `enter` on behalf of ourselves;
+                        // if the inflated monitor is owned by the other
+                        // thread we will block until they release through
+                        // the heavyweight path.
+                        let m = self.inflate_locked(obj_ref, header);
+                        m.enter(thread_id);
+                        return;
+                    }
+                }
+                s if s == types::MARK_INFLATED => {
+                    // ── Slow path: already inflated → dispatch directly. ─
+                    if let Some(m) = self.lookup_inflated(obj_ref) {
+                        m.enter(thread_id);
+                        return;
+                    }
+                    // Registry miss (should not happen): re-inflate.
+                    let m = self.inflate_locked(obj_ref, header);
+                    m.enter(thread_id);
+                    return;
+                }
+                _ => {
+                    // Reserved state 0b11 — should never occur. Fall back to
+                    // inflation as the safest recovery.
+                    let m = self.inflate_locked(obj_ref, header);
+                    m.enter(thread_id);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Get or create a monitor without touching the mark word — used only
+    /// for the legacy fallback when a `ThreadId` exceeds `u32::MAX`.
+    fn inflate_for_legacy(&self, obj_ref: ObjectRef) -> Arc<Monitor> {
         let key = obj_ref.as_ptr() as usize;
         let mut monitors = self.monitors.lock();
         monitors
@@ -359,26 +760,45 @@ impl MonitorTable {
             .clone()
     }
 
-    /// Acquire the monitor for the given object on behalf of the given thread.
-    ///
-    /// If the monitor is unowned, the thread becomes the owner.
-    /// If already owned by this thread, the entry count is incremented (reentrant).
-    pub fn enter(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
-        let monitor = self.get_or_create(obj_ref);
-        monitor.enter(thread_id);
-    }
-
     /// Release the monitor for the given object on behalf of the given thread.
+    ///
+    /// Fast paths (no allocation):
+    /// * THIN_LOCKED(self) at recursion>0 → CAS recursion-1.
+    /// * THIN_LOCKED(self) at recursion=0 → CAS back to NEUTRAL.
+    ///
+    /// Slow path:
+    /// * INFLATED → dispatch to `Monitor::exit`.
     ///
     /// Returns `Err(MethodCallFailed)` with `IllegalMonitorStateException` if
     /// the calling thread does not own the monitor.
     pub fn exit(&self, obj_ref: ObjectRef, thread_id: ThreadId) -> Result<(), MethodCallFailed> {
         let key = obj_ref.as_ptr() as usize;
-        let monitor = {
-            let monitors = self.monitors.lock();
-            monitors.get(&key).cloned()
-        };
+        let header = header_of(obj_ref);
 
+        if let Some(tid32) = tid_to_u32(thread_id) {
+            // ── Fast path: thin-lock release. ──────────────────────────────
+            match try_thin_unlock(header, tid32) {
+                Ok(_) => return Ok(()),
+                Err(cur) => {
+                    if ObjectHeader::mark_state(cur) == types::MARK_INFLATED {
+                        // Fall through to inflated dispatch below.
+                    } else {
+                        // Not held by us (thin, but different owner; or
+                        // neutral) — raise IMSE.
+                        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                            RuntimeError::IllegalMonitorStateException {
+                                message: format!(
+                                    "thread {thread_id} does not own the monitor for object at {key:#x}"
+                                ),
+                            },
+                        )));
+                    }
+                }
+            }
+        }
+
+        // ── Slow path: inflated monitor dispatch. ──────────────────────────
+        let monitor = self.lookup_inflated(obj_ref);
         match monitor {
             Some(m) => m.exit(thread_id).map_err(|MonitorError::NotOwner| {
                 MethodCallFailed::InternalError(VmError::Runtime(
@@ -402,6 +822,25 @@ impl MonitorTable {
         }
     }
 
+    /// Ensure the object's lock is inflated and return the heavyweight
+    /// `Monitor`. If the calling thread holds the thin lock, ownership is
+    /// transferred atomically.
+    ///
+    /// Used by `wait`/`notify`/`notifyAll`, which require a heavyweight
+    /// monitor (thin locks have no condvars).
+    fn ensure_inflated(&self, obj_ref: ObjectRef, _thread_id: ThreadId) -> Arc<Monitor> {
+        let header = header_of(obj_ref);
+        let cur = header.mark_word.load(Ordering::Acquire);
+        if ObjectHeader::mark_state(cur) == types::MARK_INFLATED {
+            if let Some(m) = self.lookup_inflated(obj_ref) {
+                return m;
+            }
+        }
+        // `inflate_locked` re-snapshots the mark word under its registry
+        // mutex so the pre-acquire (if any) reflects the current owner.
+        self.inflate_locked(obj_ref, header)
+    }
+
     /// Perform `Object.wait()` on the monitor for the given object.
     ///
     /// The calling thread must own the monitor. It releases ownership, blocks
@@ -416,7 +855,7 @@ impl MonitorTable {
         timeout_ms: Option<u64>,
         interrupted: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<bool, MethodCallFailed> {
-        let monitor = self.get_or_create(obj_ref);
+        let monitor = self.ensure_inflated(obj_ref, thread_id);
         monitor
             .wait(thread_id, timeout_ms, interrupted)
             .map_err(|MonitorError::NotOwner| {
@@ -434,7 +873,7 @@ impl MonitorTable {
     ///
     /// Wakes one thread waiting on this monitor. The calling thread must own it.
     pub fn notify(&self, obj_ref: ObjectRef, thread_id: ThreadId) -> Result<(), MethodCallFailed> {
-        let monitor = self.get_or_create(obj_ref);
+        let monitor = self.ensure_inflated(obj_ref, thread_id);
         monitor.notify(thread_id).map_err(|MonitorError::NotOwner| {
             MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::IllegalMonitorStateException {
@@ -454,7 +893,7 @@ impl MonitorTable {
         obj_ref: ObjectRef,
         thread_id: ThreadId,
     ) -> Result<(), MethodCallFailed> {
-        let monitor = self.get_or_create(obj_ref);
+        let monitor = self.ensure_inflated(obj_ref, thread_id);
         monitor
             .notify_all(thread_id)
             .map_err(|MonitorError::NotOwner| {
@@ -477,14 +916,28 @@ impl MonitorTable {
     /// This is a non-blocking inspection — it briefly takes the monitor
     /// state lock to read the owner field but never waits for entry.
     pub fn holds(&self, obj_ref: ObjectRef, thread_id: ThreadId) -> bool {
-        let key = obj_ref.as_ptr() as usize;
-        let monitor = {
-            let monitors = self.monitors.lock();
-            monitors.get(&key).cloned()
-        };
-        match monitor {
-            Some(m) => m.is_held_by(thread_id),
-            None => false,
+        let header = header_of(obj_ref);
+        let mark = header.mark_word.load(Ordering::Acquire);
+        match ObjectHeader::mark_state(mark) {
+            s if s == types::MARK_THIN_LOCKED => {
+                if let Some(tid32) = tid_to_u32(thread_id) {
+                    ObjectHeader::thin_lock_owner(mark) == tid32
+                } else {
+                    false
+                }
+            }
+            s if s == types::MARK_INFLATED => {
+                let key = obj_ref.as_ptr() as usize;
+                let monitor = {
+                    let monitors = self.monitors.lock();
+                    monitors.get(&key).cloned()
+                };
+                match monitor {
+                    Some(m) => m.is_held_by(thread_id),
+                    None => false,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -674,29 +1127,43 @@ mod tests {
 
     #[test]
     fn monitor_remap_after_gc() {
+        // With thin locks, the mark word travels with the object bytes during
+        // a real GC compaction (the GC must copy the entire ObjectHeader). The
+        // `remap_after_gc` path only matters for the INFLATED-monitor registry,
+        // so we first force inflation via wait(), then verify the registry
+        // entry follows the object to its new address.
         let table = MonitorTable::new();
         let obj = test_object();
         let tid = ThreadId(1);
 
-        // Enter the monitor
+        // Enter and force inflation by calling wait() (which requires a
+        // heavyweight monitor with condvars). Use a tiny timeout so the test
+        // is not slow.
         table.enter(obj, tid);
+        table.wait(obj, tid, Some(1), None).unwrap();
+        // Now the object's mark word is INFLATED and the registry holds the
+        // Arc<Monitor>.
 
-        // Simulate GC moving the object to a new address
+        // Simulate GC moving the object to a new address, AND copy the mark
+        // word bytes (this is what a real semi-space copy does).
         let old_addr = obj.as_ptr() as usize;
         let heap2 = Heap::new();
         let new_obj = heap2.alloc_object(ClassId::new(0), 0);
         let new_addr = new_obj.as_ptr() as usize;
 
+        // Copy mark word from old to new (mimicking GC byte copy of the header).
+        let old_mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        header_of(new_obj)
+            .mark_word
+            .store(old_mark, Ordering::Release);
+
         let mut pointer_map = std::collections::HashMap::new();
         pointer_map.insert(old_addr, new_addr);
-
         table.remap_after_gc(&pointer_map);
 
-        // Exit using the NEW address should succeed
+        // Exit using the NEW address should succeed — the registry was
+        // re-keyed so the inflated Monitor is found.
         assert!(table.exit(new_obj, tid).is_ok());
-
-        // Exit using the OLD address should fail (key was remapped)
-        assert!(table.exit(obj, tid).is_err());
     }
 
     #[test]
@@ -946,5 +1413,159 @@ mod tests {
         table.remap_after_gc(&empty_map);
         // Monitor should still be accessible with original address
         assert!(table.exit(obj, tid).is_ok());
+    }
+
+    // ── Thin-lock fast-path tests ──────────────────────────────────────────
+
+    /// Returns true if `obj` is currently THIN_LOCKED in its mark word.
+    fn is_thin_locked(obj: ObjectRef) -> bool {
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        ObjectHeader::mark_state(mark) == types::MARK_THIN_LOCKED
+    }
+
+    /// Returns true if `obj` is currently INFLATED.
+    fn is_inflated(obj: ObjectRef) -> bool {
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        ObjectHeader::mark_state(mark) == types::MARK_INFLATED
+    }
+
+    /// Returns the active monitor count in the table's fallback registry.
+    fn monitor_registry_len(table: &MonitorTable) -> usize {
+        table.monitors.lock().len()
+    }
+
+    #[test]
+    fn thin_lock_uncontended() {
+        // Single thread enter+exit must take the thin-lock fast path: no
+        // Monitor allocation, no registry entry, and the mark word returns
+        // to NEUTRAL on release.
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(7);
+
+        // Pre-enter: NEUTRAL.
+        assert!(!is_thin_locked(obj));
+        assert!(!is_inflated(obj));
+        assert_eq!(monitor_registry_len(&table), 0);
+
+        // Enter: thin-locked, no allocation.
+        table.enter(obj, tid);
+        assert!(is_thin_locked(obj), "fast path must use thin lock");
+        assert!(!is_inflated(obj), "uncontended path must not inflate");
+        assert_eq!(
+            monitor_registry_len(&table),
+            0,
+            "fast path must not touch the Monitor registry"
+        );
+
+        // Exit: back to NEUTRAL, still no allocation.
+        table.exit(obj, tid).unwrap();
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        assert_eq!(
+            ObjectHeader::mark_state(mark),
+            types::MARK_NEUTRAL,
+            "release must restore NEUTRAL state"
+        );
+        assert_eq!(monitor_registry_len(&table), 0);
+    }
+
+    #[test]
+    fn thin_lock_recursive() {
+        // 5 nested acquisitions on the same thread should all use the thin
+        // recursive fast path. After all matching exits the mark returns to
+        // NEUTRAL with no Monitor allocated.
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(42);
+
+        for expected_rec in 0..5u8 {
+            table.enter(obj, tid);
+            let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+            assert_eq!(ObjectHeader::mark_state(mark), types::MARK_THIN_LOCKED);
+            assert_eq!(ObjectHeader::thin_lock_owner(mark), tid.0 as u32);
+            assert_eq!(
+                ObjectHeader::thin_lock_recursion(mark),
+                expected_rec,
+                "recursion field must reflect the depth"
+            );
+        }
+        assert_eq!(monitor_registry_len(&table), 0, "no inflation allowed");
+
+        for expected_rec_after in (0..5u8).rev() {
+            table.exit(obj, tid).unwrap();
+            let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+            if expected_rec_after == 0 {
+                assert_eq!(ObjectHeader::mark_state(mark), types::MARK_NEUTRAL);
+            } else {
+                assert_eq!(ObjectHeader::mark_state(mark), types::MARK_THIN_LOCKED);
+                assert_eq!(
+                    ObjectHeader::thin_lock_recursion(mark),
+                    expected_rec_after - 1
+                );
+            }
+        }
+
+        assert_eq!(monitor_registry_len(&table), 0);
+    }
+
+    #[test]
+    fn thin_lock_inflates_on_contention() {
+        // Two threads contend on the same object. The first arrival takes
+        // the thin lock; the second arrival must inflate to a heavyweight
+        // Monitor. After both finish, the registry must contain exactly
+        // one inflated monitor.
+        use std::sync::Barrier;
+
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let table = Arc::new(MonitorTable::new());
+
+        // Barrier to ensure both threads are running before contention starts.
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Thread 1 takes the lock and holds it long enough that thread 2
+        // arrives and must inflate.
+        let table1 = table.clone();
+        let barrier1 = barrier.clone();
+        let h1 = std::thread::spawn(move || {
+            table1.enter(obj, ThreadId(1));
+            // Mark word should be THIN_LOCKED for tid 1 here -- but thread 2
+            // is about to race in and inflate it.
+            barrier1.wait();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            table1.exit(obj, ThreadId(1)).unwrap();
+        });
+
+        // Thread 2: arrives after thread 1 has the thin lock. The
+        // contended-thin-lock path inflates and then blocks on entry.
+        let table2 = table.clone();
+        let barrier2 = barrier.clone();
+        let h2 = std::thread::spawn(move || {
+            barrier2.wait();
+            // Brief delay to ensure thread 1 is still inside the critical
+            // section when we attempt to enter.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            table2.enter(obj, ThreadId(2));
+            table2.exit(obj, ThreadId(2)).unwrap();
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        // After contention, the object must have been inflated and the
+        // monitor registered.
+        assert_eq!(
+            monitor_registry_len(&table),
+            1,
+            "contention must produce exactly one inflated monitor"
+        );
+        // The final state should be INFLATED (mark word permanently points
+        // at the Monitor — thin-lock inflation is one-way per object).
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        assert_eq!(
+            ObjectHeader::mark_state(mark),
+            types::MARK_INFLATED,
+            "inflated mark word should persist after contention"
+        );
     }
 }

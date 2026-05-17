@@ -70,16 +70,56 @@ const TLAB_MAX_ALLOC: usize = 32 * 1024;
 /// This is a view into a slice of the young generation's from-space.
 /// The thread owns this range exclusively — no locking needed for
 /// bump-pointer allocation within the TLAB.
+///
+/// # Layout (JIT contract — DO NOT REORDER hot fields)
+///
+/// The struct is `#[repr(C)]` so the JIT-emitted inline TLAB bump-pointer
+/// fast path (`jit/src/x64.rs` `new` opcode) can address `cursor` and
+/// `end` at fixed offsets:
+///
+/// | Offset | Field    | Size |
+/// |--------|----------|------|
+/// |   0    | cursor   |   8  |
+/// |   8    | end      |   8  |
+/// |  16    | start    |   8  |
+/// |  24..  | pressure | rest |
+///
+/// `cursor` is at offset 0 so the most-common load (cursor read) is a
+/// register+0 mode (1 byte shorter on x86-64 ModR/M). `end` follows so
+/// the comparison-and-spill check uses [reg+8] (still 1-byte disp8).
+///
+/// The runtime test `test_tlab_offsets` enforces the layout — if a
+/// future edit reorders fields, the test fails and reminds the editor to
+/// update [`Self::CURSOR_OFFSET`] / [`Self::END_OFFSET`] in lockstep.
+#[repr(C)]
 pub struct Tlab {
-    /// Start of the TLAB region (inclusive).
-    start: *mut u8,
     /// Current allocation cursor within the TLAB.
+    /// JIT contract: must remain at byte offset 0.
     cursor: *mut u8,
     /// End of the TLAB region (exclusive).
+    /// JIT contract: must remain at byte offset 8.
     end: *mut u8,
+    /// Start of the TLAB region (inclusive). Cold (only used at retire).
+    start: *mut u8,
     /// T5.5.1 — per-thread adaptive-sizing state. Updated each
-    /// allocation and consulted on refill.
+    /// allocation and consulted on refill. Cold — JIT inline fast path
+    /// only updates `cursor`; the slow path (helper call) re-syncs the
+    /// pressure tracker.
     pressure: TlabPressureTracker,
+}
+
+impl Tlab {
+    /// Byte offset of the `cursor` field from the start of `Tlab`.
+    ///
+    /// Read by the JIT-emitted inline TLAB bump in `jit/src/x64.rs`
+    /// and verified at runtime by the `test_tlab_offsets` unit test.
+    pub const CURSOR_OFFSET: usize = 0;
+
+    /// Byte offset of the `end` field from the start of `Tlab`.
+    ///
+    /// Read by the JIT-emitted inline TLAB bump in `jit/src/x64.rs`
+    /// and verified at runtime by the `test_tlab_offsets` unit test.
+    pub const END_OFFSET: usize = 8;
 }
 
 // SAFETY: Tlab pointers are into arena memory owned by the GC heap.
@@ -363,6 +403,31 @@ impl std::fmt::Debug for TlabPressureTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JIT contract — `Tlab` must keep `cursor` at offset 0 and `end`
+    /// at offset 8. The JIT-emitted inline bump in `jit/src/x64.rs`
+    /// reads these directly from a thread pointer. If a future edit
+    /// reorders the struct, this test fails and the editor must
+    /// update both [`Tlab::CURSOR_OFFSET`] and [`Tlab::END_OFFSET`].
+    #[test]
+    fn test_tlab_offsets() {
+        let tlab = Tlab::empty();
+        let base = &tlab as *const _ as usize;
+        let cursor_addr = &tlab.cursor as *const _ as usize;
+        let end_addr = &tlab.end as *const _ as usize;
+        assert_eq!(
+            cursor_addr - base,
+            Tlab::CURSOR_OFFSET,
+            "Tlab::cursor moved away from offset 0 — update JIT plumbing in lockstep"
+        );
+        assert_eq!(
+            end_addr - base,
+            Tlab::END_OFFSET,
+            "Tlab::end moved away from offset 8 — update JIT plumbing in lockstep"
+        );
+        assert_eq!(Tlab::CURSOR_OFFSET, 0);
+        assert_eq!(Tlab::END_OFFSET, 8);
+    }
 
     #[test]
     fn tlab_basic_alloc() {

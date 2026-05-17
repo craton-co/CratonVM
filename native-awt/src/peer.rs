@@ -9,10 +9,10 @@
 //! peers. Java object identity is mapped to peer IDs via
 //! `register_java_mapping` / `peer_for_java`.
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 
 // Re-export PeerId from the event module to avoid duplicate types.
 pub use crate::event::PeerId;
@@ -142,19 +142,34 @@ impl ComponentPeer {
 // ── PeerRegistry ────────────────────────────────────────────────────────
 
 /// Global registry of all live component peers.
+///
+/// Storage uses [`FxHashMap`] throughout: peer IDs are sequential `u64`s and
+/// Java identity hashes are already-hashed `i32`s, so SipHash buys nothing
+/// over the much cheaper FxHash.
+///
+/// TODO(eviction): `peers` and the two java<->peer maps grow without bound.
+/// If the Java side fails to call `dispose()` (e.g. a missed finalizer or a
+/// dropped weak ref on the Java GC side) the entries leak. A weak-reference
+/// / liveness-sweep scheme is out of scope for this patch and tracked
+/// separately.
 pub struct PeerRegistry {
-    peers: HashMap<PeerId, ComponentPeer>,
+    peers: FxHashMap<PeerId, ComponentPeer>,
     next_id: u64,
     /// Maps Java object identity hash -> PeerId for reverse lookups.
-    java_to_peer: HashMap<i32, PeerId>,
+    java_to_peer: FxHashMap<i32, PeerId>,
+    /// Reverse of `java_to_peer`: PeerId -> Java identity hash. Lets
+    /// `destroy()` clean up the java mapping in O(1) instead of doing a
+    /// full `retain` walk (which made destroy() O(n^2) over a peer tree).
+    peer_to_java: FxHashMap<PeerId, i32>,
 }
 
 impl PeerRegistry {
     pub fn new() -> Self {
         Self {
-            peers: HashMap::new(),
+            peers: FxHashMap::default(),
             next_id: 1,
-            java_to_peer: HashMap::new(),
+            java_to_peer: FxHashMap::default(),
+            peer_to_java: FxHashMap::default(),
         }
     }
 
@@ -200,8 +215,14 @@ impl PeerRegistry {
             }
         }
 
-        // Remove java mapping entries that point to this peer.
-        self.java_to_peer.retain(|_, v| *v != id);
+        // Remove java mapping entries that point to this peer in O(1) via
+        // the reverse map. Previously this used `java_to_peer.retain(...)`,
+        // which is O(map size) per destroyed peer -- making destroy() of a
+        // tree O(n^2). Now it's O(1) per peer, so the whole tree teardown
+        // is O(n).
+        if let Some(java_hash) = self.peer_to_java.remove(&id) {
+            self.java_to_peer.remove(&java_hash);
+        }
 
         // Remove the peer itself.
         self.peers.remove(&id);
@@ -282,8 +303,25 @@ impl PeerRegistry {
     }
 
     /// Register a mapping from a Java object's identity hash code to a peer ID.
+    ///
+    /// Maintains both `java_to_peer` and the reverse `peer_to_java` map so
+    /// that [`destroy`] can tear down the mapping in O(1). If `peer_id` was
+    /// previously associated with a different java hash, that stale forward
+    /// entry is removed first; likewise if `java_hash` was previously bound
+    /// to a different peer, that stale reverse entry is removed.
     pub fn register_java_mapping(&mut self, java_hash: i32, peer_id: PeerId) {
-        self.java_to_peer.insert(java_hash, peer_id);
+        // Drop any prior forward mapping for this peer.
+        if let Some(old_hash) = self.peer_to_java.insert(peer_id, java_hash) {
+            if old_hash != java_hash {
+                self.java_to_peer.remove(&old_hash);
+            }
+        }
+        // Drop any prior reverse mapping for this java hash.
+        if let Some(old_peer) = self.java_to_peer.insert(java_hash, peer_id) {
+            if old_peer != peer_id {
+                self.peer_to_java.remove(&old_peer);
+            }
+        }
     }
 
     /// Look up a peer ID by Java identity hash code.

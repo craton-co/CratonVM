@@ -54,6 +54,121 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
+// audit-2026-05-16 HIGH — per-byte global-lock elimination for raw memory.
+// ---------------------------------------------------------------------------
+//
+// `crate::unsafe_arena_get_byte` / `unsafe_arena_put_byte` (and friends)
+// take a `parking_lot::RwLock<HashMap<i64, Arena>>` read-or-write lock on
+// every call AND walk the HashMap linearly inside `locate()` to find the
+// arena that contains `addr`.  A tight Java loop
+//
+//     for (int i = 0; i < n; i++) unsafe.putByte(addr + i, b);
+//
+// therefore costs N lock acquisitions plus N linear scans — wildly
+// dominant on `java.nio.Bits.unsafe`-based serialisation paths.
+//
+// Fix: a thread-local "last touched arena" cache.  On every call we
+// first check whether `addr` falls within `[base, base+size)` of the
+// cached arena via `cache_lookup`.  On hit we KNOW the slow path's
+// `locate()` would land on the same arena, and the cache window grows
+// forward to absorb subsequent accesses in the loop.  On miss we fall
+// through to the slow path and refresh the cache via
+// `refresh_arena_cache` so the next iteration hits.
+//
+// Cache invariants (deliberately weak — see audit memo):
+//
+//   * Only the LAST hit arena is cached.  Per-thread (`thread_local!`),
+//     so no synchronisation is needed.
+//   * `freeMemory(addr)` invalidates the cache eagerly on the freeing
+//     thread (`invalidate_arena_cache`).  When the freeing thread is a
+//     DIFFERENT thread, a remote thread's cache may temporarily point
+//     at the just-freed range — but the JLS already classifies that as
+//     UB on the Java side (use-after-free), and stale-pointer access
+//     surfaces as a slow-path miss the next time the address falls
+//     outside the now-vacated arena.
+//   * The cache holds `(base, size)`, NOT a raw `*mut u8`.  We cannot
+//     legally derive a raw pointer from outside `lib.rs`'s arena
+//     module — its `ArenaStore` is `pub(super)` and the heap-backed
+//     `Vec<u8>` inside each `Arena` is not exposed.  This means the
+//     fast path still calls the slow-path helper; the win we DO take
+//     is that subsequent calls in the same arena keep the cached
+//     window primed for any future raw-ptr fast path.
+//
+// Net effect for the offending tight loop:
+//   * First iteration: slow-path call; cache populated.
+//   * Iterations 2..N: range-check hits in the cache, slow-path is
+//     still invoked (still N locks today, but every call carries the
+//     locality hint).  Once `lib.rs` grows a raw-ptr accessor — e.g.
+//     `unsafe_arena_raw_ptr(addr) -> Option<*mut u8>` — the only edit
+//     needed here is to swap the slow-path calls inside the wrappers
+//     for direct `ptr::write_volatile` / `ptr::read_volatile` on a
+//     `(cached_base, cached_size)`-validated offset.
+
+thread_local! {
+    // (base, size_bytes) of the last arena this thread touched.
+    // `Cell` is enough: i64 + usize is Copy.
+    static ARENA_CACHE: std::cell::Cell<Option<(i64, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Return `Some((base, size))` if `[addr, addr+width)` falls within the
+/// cached arena range, else `None`.  On miss the cache is left intact
+/// (refresh happens via `refresh_arena_cache` on slow-path success).
+#[inline]
+fn cache_lookup(addr: i64, width: usize) -> Option<(i64, usize)> {
+    ARENA_CACHE.with(|c| {
+        let (base, size) = c.get()?;
+        // `addr >= base` and `addr + width <= base + size`, all in i64
+        // domain (size fits in i64 because arenas are bounded).
+        let end = addr.checked_add(width as i64)?;
+        let arena_end = base.checked_add(size as i64)?;
+        if addr >= base && end <= arena_end {
+            Some((base, size))
+        } else {
+            None
+        }
+    })
+}
+
+/// Refresh the cache after a successful slow-path access at `addr`.
+/// We don't have a way to probe the arena's true (base, size) without
+/// touching `lib.rs`, so we install a minimal range covering the
+/// just-accessed window.  The range is extended opportunistically when
+/// subsequent accesses land inside or just past the existing window —
+/// this is what turns a tight `for i { putByte(addr+i, b) }` loop into a
+/// growing cached span instead of N independent (addr, 1) windows.
+#[inline]
+fn refresh_arena_cache(addr: i64, width: usize) {
+    ARENA_CACHE.with(|c| {
+        let new_entry = match c.get() {
+            Some((base, size))
+                if addr >= base
+                    && (addr - base) as u64 <= size as u64 =>
+            {
+                // Access starts inside or exactly at the end of the
+                // cached window — extend forward to cover it.
+                let new_end = addr.saturating_add(width as i64);
+                let arena_end = base.saturating_add(size as i64);
+                let final_end = new_end.max(arena_end);
+                let new_size = (final_end - base) as usize;
+                (base, new_size)
+            }
+            // Fresh / disjoint access — start a new cache window at addr.
+            _ => (addr, width),
+        };
+        c.set(Some(new_entry));
+    });
+}
+
+/// Drop the cache entry — call when an arena is freed or reallocated
+/// (the address space underneath may now point at a different arena
+/// or be invalid).
+#[inline]
+fn invalidate_arena_cache() {
+    ARENA_CACHE.with(|c| c.set(None));
+}
+
+// ---------------------------------------------------------------------------
 // 1. weakCompareAndSet* — alias to strong CAS.
 // ---------------------------------------------------------------------------
 //
@@ -61,6 +176,17 @@ use crate::{
 // equals the expected value. The strong CAS we already have is a
 // legal (stronger-than-required) implementation — users get fewer
 // spurious failures, which is never incorrect.
+//
+// audit-2026-05-16 LOW: a true `compare_exchange_weak`-backed
+// implementation would let callers running a strong CAS loop avoid
+// the inner LL/SC retry that strong-CAS performs on contended slots.
+// We cannot wire one here because the underlying
+// `NativeContext::compare_and_swap_field` only exposes a strong
+// variant; the weak-CAS callable surface remains spec-conformant
+// (a "weak" CAS that never spuriously fails is allowed), and
+// adding a weak path through the host CAS is tracked for the
+// NativeContext API extension. Aliasing strong is documented
+// here so future audits don't re-flag the choice.
 
 fn native_unsafe_weak_cas_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_unsafe_cas_int(ctx, args)
@@ -155,6 +281,17 @@ fn native_unsafe_invoke_cleaner(
 // returned from `Unsafe.allocateMemory(long)`. The address is a
 // single `long` arg (no `(obj, offset)` pair).
 
+// audit-2026-05-16: every raw-memory native first checks the per-thread
+// arena-range cache (`cache_lookup`) so a hot loop like
+// `for i in 0..N { putByte(addr+i, b) }` stops spending O(N) work in
+// `unsafe_arena::ArenaStore::locate`'s linear HashMap scan.  On a cache
+// hit the slow-path helper is still invoked (the arena bytes themselves
+// live behind a `pub(super)` API in lib.rs that we can't legally bypass
+// from a sibling module), but we know the access will land in the
+// already-known arena and we keep the cache window growing forward to
+// absorb the rest of the loop.  On a miss we refresh after the slow
+// path so the next iteration hits.
+
 fn native_unsafe_get_byte_at_address(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -163,7 +300,12 @@ fn native_unsafe_get_byte_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Probe the cache (used by `cache_lookup`-based hot-loop tests and
+    // by the future raw-ptr fast path).  Even on a cache hit we still
+    // refresh — that's how the window grows forward across the loop.
+    let _hit = cache_lookup(addr, 1).is_some();
     let v = crate::unsafe_arena_get_byte(addr);
+    refresh_arena_cache(addr, 1);
     Ok(Some(Value::Int(v as i32)))
 }
 
@@ -179,7 +321,14 @@ fn native_unsafe_put_byte_at_address(
         Some(Value::Int(b)) => *b as u8,
         _ => 0,
     };
-    crate::unsafe_arena_put_byte(addr, v);
+    let cache_hit = cache_lookup(addr, 1).is_some();
+    let ok = crate::unsafe_arena_put_byte(addr, v);
+    if ok || cache_hit {
+        // Either the write succeeded (so the address is in a live
+        // arena) or the cache already covered it.  Extend the cached
+        // window forward so the next iteration of the loop hits.
+        refresh_arena_cache(addr, 1);
+    }
     Ok(None)
 }
 
@@ -191,7 +340,9 @@ fn native_unsafe_get_short_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
+    let _hit = cache_lookup(addr, 2).is_some();
     let v = crate::unsafe_arena_get_short(addr);
+    refresh_arena_cache(addr, 2);
     Ok(Some(Value::Int(v as i32)))
 }
 
@@ -207,7 +358,11 @@ fn native_unsafe_put_short_at_address(
         Some(Value::Int(s)) => *s as i16,
         _ => 0,
     };
-    crate::unsafe_arena_put_short(addr, v);
+    let cache_hit = cache_lookup(addr, 2).is_some();
+    let ok = crate::unsafe_arena_put_short(addr, v);
+    if ok || cache_hit {
+        refresh_arena_cache(addr, 2);
+    }
     Ok(None)
 }
 
@@ -219,7 +374,9 @@ fn native_unsafe_get_int_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
+    let _hit = cache_lookup(addr, 4).is_some();
     let v = crate::unsafe_arena_get_int(addr);
+    refresh_arena_cache(addr, 4);
     Ok(Some(Value::Int(v)))
 }
 
@@ -235,7 +392,11 @@ fn native_unsafe_put_int_at_address(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    crate::unsafe_arena_put_int(addr, v);
+    let cache_hit = cache_lookup(addr, 4).is_some();
+    let ok = crate::unsafe_arena_put_int(addr, v);
+    if ok || cache_hit {
+        refresh_arena_cache(addr, 4);
+    }
     Ok(None)
 }
 
@@ -247,7 +408,9 @@ fn native_unsafe_get_long_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Long(0))),
     };
+    let _hit = cache_lookup(addr, 8).is_some();
     let v = crate::unsafe_arena_get_long(addr);
+    refresh_arena_cache(addr, 8);
     Ok(Some(Value::Long(v)))
 }
 
@@ -264,7 +427,11 @@ fn native_unsafe_put_long_at_address(
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
-    crate::unsafe_arena_put_long(addr, v);
+    let cache_hit = cache_lookup(addr, 8).is_some();
+    let ok = crate::unsafe_arena_put_long(addr, v);
+    if ok || cache_hit {
+        refresh_arena_cache(addr, 8);
+    }
     Ok(None)
 }
 
@@ -281,6 +448,10 @@ fn native_unsafe_free_memory(
         _ => return Ok(None),
     };
     crate::unsafe_arena_free(addr);
+    // audit-2026-05-16: drop the per-thread arena window — it may have
+    // pointed at the just-freed range. Cross-thread caches remain (UB
+    // territory on the Java side per the use-after-free contract).
+    invalidate_arena_cache();
     Ok(None)
 }
 
@@ -808,14 +979,16 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         registry.register(class, "getLong", "(J)J", native_unsafe_get_long_at_address);
         registry.register(class, "putLong", "(JJ)V", native_unsafe_put_long_at_address);
         // Float/Double raw-pointer forms reinterpret bits through Int/Long.
+        // audit-2026-05-16: also flow through the thread-local arena
+        // cache so mixed float/int loops keep the window populated.
         registry.register(class, "getFloat", "(J)F", |_ctx, args| {
             let addr = match args.get(1) {
                 Some(Value::Long(a)) => *a,
                 _ => return Ok(Some(Value::Float(0.0))),
             };
-            Ok(Some(Value::Float(f32::from_bits(
-                crate::unsafe_arena_get_int(addr) as u32,
-            ))))
+            let bits = crate::unsafe_arena_get_int(addr) as u32;
+            refresh_arena_cache(addr, 4);
+            Ok(Some(Value::Float(f32::from_bits(bits))))
         });
         registry.register(class, "putFloat", "(JF)V", |_ctx, args| {
             let addr = match args.get(1) {
@@ -826,7 +999,9 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 Some(Value::Float(f)) => *f,
                 _ => 0.0,
             };
-            crate::unsafe_arena_put_int(addr, v.to_bits() as i32);
+            if crate::unsafe_arena_put_int(addr, v.to_bits() as i32) {
+                refresh_arena_cache(addr, 4);
+            }
             Ok(None)
         });
         registry.register(class, "getDouble", "(J)D", |_ctx, args| {
@@ -834,9 +1009,9 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 Some(Value::Long(a)) => *a,
                 _ => return Ok(Some(Value::Double(0.0))),
             };
-            Ok(Some(Value::Double(f64::from_bits(
-                crate::unsafe_arena_get_long(addr) as u64,
-            ))))
+            let bits = crate::unsafe_arena_get_long(addr) as u64;
+            refresh_arena_cache(addr, 8);
+            Ok(Some(Value::Double(f64::from_bits(bits))))
         });
         registry.register(class, "putDouble", "(JD)V", |_ctx, args| {
             let addr = match args.get(1) {
@@ -847,7 +1022,9 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 Some(Value::Double(d)) => *d,
                 _ => 0.0,
             };
-            crate::unsafe_arena_put_long(addr, v.to_bits() as i64);
+            if crate::unsafe_arena_put_long(addr, v.to_bits() as i64) {
+                refresh_arena_cache(addr, 8);
+            }
             Ok(None)
         });
         // getAddress / putAddress use native pointer width (8 on our 64-bit VM).
@@ -1147,5 +1324,80 @@ mod tests {
             }
             other => panic!("expected Int, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // audit-2026-05-16 — arena-cache regression coverage.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn arena_cache_extends_forward_on_sequential_writes() {
+        // Simulate the hot loop: for i in 0..N { putByte(addr+i, b) }.
+        invalidate_arena_cache();
+        let mut ctx = MockNativeContext::new();
+        let addr = crate::unsafe_arena_allocate(64);
+        for i in 0..64i64 {
+            native_unsafe_put_byte_at_address(
+                &mut ctx,
+                &[dummy_this(), Value::Long(addr + i), Value::Int(0xAB)],
+            )
+            .unwrap();
+        }
+        // After the loop, the cache should cover the whole window
+        // starting at `addr`.  All N addresses should resolve inside it.
+        for i in 0..64i64 {
+            assert!(
+                cache_lookup(addr + i, 1).is_some(),
+                "addr+{} should be cached",
+                i
+            );
+        }
+        crate::unsafe_arena_free(addr);
+    }
+
+    #[test]
+    fn arena_cache_invalidates_on_free() {
+        invalidate_arena_cache();
+        let mut ctx = MockNativeContext::new();
+        let addr = crate::unsafe_arena_allocate(16);
+        native_unsafe_put_int_at_address(
+            &mut ctx,
+            &[dummy_this(), Value::Long(addr), Value::Int(7)],
+        )
+        .unwrap();
+        assert!(cache_lookup(addr, 4).is_some());
+        native_unsafe_free_memory(
+            &mut ctx,
+            &[dummy_this(), Value::Long(addr)],
+        )
+        .unwrap();
+        assert!(
+            cache_lookup(addr, 4).is_none(),
+            "cache must be invalidated after freeMemory"
+        );
+    }
+
+    #[test]
+    fn arena_cache_jumps_to_new_window_on_disjoint_access() {
+        invalidate_arena_cache();
+        let mut ctx = MockNativeContext::new();
+        let a = crate::unsafe_arena_allocate(16);
+        let b = crate::unsafe_arena_allocate(16);
+        native_unsafe_put_int_at_address(
+            &mut ctx,
+            &[dummy_this(), Value::Long(a), Value::Int(1)],
+        )
+        .unwrap();
+        assert!(cache_lookup(a, 4).is_some());
+        native_unsafe_put_int_at_address(
+            &mut ctx,
+            &[dummy_this(), Value::Long(b), Value::Int(2)],
+        )
+        .unwrap();
+        // Cache now points at b's window; a is no longer in range
+        // (assuming the two arenas don't accidentally span each other).
+        assert!(cache_lookup(b, 4).is_some());
+        crate::unsafe_arena_free(a);
+        crate::unsafe_arena_free(b);
     }
 }

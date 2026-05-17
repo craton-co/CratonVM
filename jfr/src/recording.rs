@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dump::{self, JfrDumpError};
 use crate::event::{EventInstance, EventTypeId, EventTypeRegistry};
-use crate::repository::EventRepository;
+use crate::repository::{self, EventRepository};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingState {
@@ -156,10 +156,21 @@ impl Recording {
 ///
 /// Recordings are stored in an FxHashMap for O(1) lookup by ID.
 /// T10.9.B: FxHashMap — recording IDs are internal monotonic counters.
+///
+/// Performance note: `running_ids` caches the IDs of currently-running
+/// recordings so `record_event` doesn't have to walk the `recordings` map
+/// and allocate a Vec on every call. It is recomputed only when
+/// `start_recording`/`stop_recording` is called. Combined with the
+/// `crate::is_enabled()` fast-path at every `emit_*` site, this keeps
+/// per-event overhead near zero when no recordings are active.
 pub struct FlightRecorder {
     recordings: FxHashMap<u64, Recording>,
     pub type_registry: EventTypeRegistry,
     next_recording_id: u64,
+    /// Cached snapshot of running recording IDs. Recomputed by
+    /// `refresh_running_ids` after each state transition. `Vec::with_capacity(4)`
+    /// keeps it allocation-free for typical workloads (1-4 concurrent recordings).
+    running_ids: Vec<u64>,
 }
 
 impl FlightRecorder {
@@ -168,6 +179,7 @@ impl FlightRecorder {
             recordings: FxHashMap::default(),
             type_registry: EventTypeRegistry::new(),
             next_recording_id: 1,
+            running_ids: Vec::with_capacity(4),
         }
     }
 
@@ -183,39 +195,104 @@ impl FlightRecorder {
         if let Some(rec) = self.recordings.get_mut(&id) {
             rec.start();
         }
+        self.refresh_running_ids();
     }
 
     pub fn stop_recording(&mut self, id: u64) {
         if let Some(rec) = self.recordings.get_mut(&id) {
             rec.stop();
         }
+        self.refresh_running_ids();
     }
 
-    /// Record an event into all currently running recordings.
-    /// Uses `Arc<EventInstance>` to share the event across recordings without cloning.
-    pub fn record_event(&mut self, event: EventInstance) {
-        let running: Vec<u64> = self
-            .recordings
-            .iter()
-            .filter(|(_, r)| r.state == RecordingState::Running)
-            .map(|(&id, _)| id)
-            .collect();
+    /// Recompute the cached running-recording IDs and update the global
+    /// `JFR_ENABLED` flag accordingly. Called after every state transition.
+    fn refresh_running_ids(&mut self) {
+        self.running_ids.clear();
+        for (&id, rec) in &self.recordings {
+            if rec.state == RecordingState::Running {
+                self.running_ids.push(id);
+            }
+        }
+        crate::set_enabled(!self.running_ids.is_empty());
+    }
 
-        if running.is_empty() {
+    /// Record an event from the calling thread.
+    ///
+    /// In the per-thread-ring design, the hot emit path pushes the event onto
+    /// the calling thread's bounded ring shard (see
+    /// `repository::push_to_thread_ring`). The shard is a globally-registered
+    /// `Arc<Mutex<VecDeque<EventInstance>>>` whose mutex is uncontended on the
+    /// producer side (one shard per thread). The per-recording repositories
+    /// are populated lazily by `drain_per_thread_into_repository`, which is
+    /// invoked by the dumper before producing a snapshot.
+    ///
+    /// Fast path: when no recordings are running this returns immediately
+    /// after a single length check — no ring access, no allocation.
+    ///
+    /// Note on bounded capacity: each thread's ring holds at most
+    /// `repository::DEFAULT_THREAD_RING_CAPACITY` (1024) events. Long-running
+    /// threads emitting at high rates between drains will *drop their oldest
+    /// events* to keep the producer non-blocking. This is intentional: JFR
+    /// trades best-effort completeness for bounded memory and zero-blocking
+    /// emit. The dumper should drain frequently enough to keep losses
+    /// negligible for typical workloads.
+    pub fn record_event(&mut self, event: EventInstance) {
+        // Fast path: no running recordings — drop on the floor. This mirrors
+        // the previous behaviour and matches the global `JFR_ENABLED` gate
+        // maintained by `refresh_running_ids`.
+        if self.running_ids.is_empty() {
+            return;
+        }
+        // Hot path: push to this thread's bounded ring shard. The shard is
+        // drained into per-recording repositories by
+        // `drain_per_thread_into_repository`, typically called from the
+        // dumper. This keeps emit O(1) and uncontended across threads.
+        repository::push_to_thread_ring(event);
+    }
+
+    /// Drain every registered per-thread ring shard and forward the merged
+    /// event stream into each currently-running recording's repository,
+    /// applying per-recording event-enabled filters and thresholds.
+    ///
+    /// This is the bridge between the lock-free hot-path (per-thread rings)
+    /// and the legacy per-recording `EventRepository`. The dumper calls this
+    /// immediately before producing a snapshot so that any events emitted
+    /// since the last dump become visible.
+    ///
+    /// Ordering: events are emitted in thread-local order within each shard,
+    /// but no global ordering is enforced across shards. The dumper sorts by
+    /// `start_time` if a time-ordered stream is required (see `dump.rs`).
+    pub fn drain_per_thread_into_repository(&mut self) {
+        let drained = repository::global_ring_registry().drain_all();
+        if drained.is_empty() {
+            return;
+        }
+        let running_len = self.running_ids.len();
+        if running_len == 0 {
+            // No active recordings: discard. Producers may have pushed events
+            // after the last `stop_recording`; respecting the global-disabled
+            // gate, we drop them rather than retaining stale data.
             return;
         }
 
-        if running.len() == 1 {
-            // Single recording: no Arc overhead, just move
-            if let Some(rec) = self.recordings.get_mut(&running[0]) {
-                rec.record_event(event);
+        if running_len == 1 {
+            // Single recording — move each event in directly, no Arc.
+            let id = self.running_ids[0];
+            if let Some(rec) = self.recordings.get_mut(&id) {
+                for ev in drained {
+                    rec.record_event(ev);
+                }
             }
         } else {
-            // Multiple recordings: wrap in Arc to share
-            let arc_event = Arc::new(event);
-            for id in running {
-                if let Some(rec) = self.recordings.get_mut(&id) {
-                    rec.record_event_arc(Arc::clone(&arc_event));
+            // Multiple recordings — share each event via Arc to avoid clones.
+            let ids: Vec<u64> = self.running_ids.clone();
+            for ev in drained {
+                let arc_event = Arc::new(ev);
+                for &id in &ids {
+                    if let Some(rec) = self.recordings.get_mut(&id) {
+                        rec.record_event_arc(Arc::clone(&arc_event));
+                    }
                 }
             }
         }
@@ -240,7 +317,16 @@ impl FlightRecorder {
     ///
     /// The recording must exist and be in `Stopped` or `Running` state.
     /// Events are serialized using the JFR v2.0 binary format.
+    ///
+    /// This method first drains all per-thread ring shards into the
+    /// per-recording repositories so that pending events are reflected in
+    /// the snapshot.
     pub fn dump_recording(&mut self, id: u64, path: &Path) -> Result<u64, JfrDumpError> {
+        // Flush any events sitting in per-thread rings into the repositories
+        // before snapshotting. This is the equivalent of the contract that
+        // `dump.rs` is responsible for on the standalone dump path.
+        self.drain_per_thread_into_repository();
+
         let rec = self.recordings.get_mut(&id).ok_or(JfrDumpError::Io(
             std::io::Error::new(std::io::ErrorKind::NotFound, "recording not found"),
         ))?;
@@ -592,10 +678,59 @@ mod tests {
         fr.start_recording(r1);
         fr.start_recording(r2);
         // r3 is not started
+        // Drain pre-existing thread-ring contents so cross-test bleed-through
+        // doesn't pollute the per-recording event counts.
+        let _ = crate::repository::global_ring_registry().drain_all();
         fr.record_event(make_event(EventTypeId(1), 100, 200));
+        // record_event now writes to the per-thread ring; the dump path
+        // (and tests that immediately query the repository) must drain
+        // explicitly before querying.
+        fr.drain_per_thread_into_repository();
         assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
         assert_eq!(fr.get_recording(r2).unwrap().event_count(), 1);
         assert_eq!(fr.get_recording(r3).unwrap().event_count(), 0);
+    }
+
+    #[test]
+    fn record_event_writes_to_per_thread_ring() {
+        // Verify that `record_event` routes through the per-thread ring and
+        // that `drain_per_thread_into_repository` makes the event visible in
+        // the recording's repository.
+        let mut fr = FlightRecorder::new();
+        let id = fr.new_recording(RecordingSettings::new("ring"));
+        fr.start_recording(id);
+
+        // Drain any pending events from other tests on this thread before we
+        // start, so our assertion is exact.
+        let _ = crate::repository::global_ring_registry().drain_all();
+        assert_eq!(fr.get_recording(id).unwrap().event_count(), 0);
+
+        // Emit a uniquely-tagged event so we can identify it even if some
+        // other test on the same thread pushed events into the registry
+        // after our pre-drain (the global registry is process-wide).
+        let unique = 0xC0FFEE_u64;
+        fr.record_event(make_event(EventTypeId(42), unique, unique + 1));
+
+        // Before draining, the repository should still be empty — the event
+        // is sitting in this thread's ring shard.
+        assert_eq!(
+            fr.get_recording(id).unwrap().event_count(),
+            0,
+            "record_event should not have written to the repository directly"
+        );
+
+        // After draining, the repository should contain our event (and
+        // possibly stragglers from concurrent tests; assert by content).
+        fr.drain_per_thread_into_repository();
+        let rec = fr.get_recording_mut(id).unwrap();
+        let found = rec
+            .get_events()
+            .iter()
+            .any(|e| e.type_id == EventTypeId(42) && e.start_time == unique);
+        assert!(
+            found,
+            "expected drained event to appear in the recording's repository"
+        );
     }
 
     #[test]

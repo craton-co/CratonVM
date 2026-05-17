@@ -16,7 +16,7 @@
 //! Fixture location is resolved relative to `CARGO_MANIFEST_DIR` so the
 //! test runs from any working directory.
 
-use rustjvm_reader::attribute::{Attribute, ElementValue};
+use rustjvm_reader::attribute::{Attribute, ElementValue, LazyAttribute};
 use rustjvm_reader::class_file::ClassFile;
 use rustjvm_reader::read_class;
 use std::path::PathBuf;
@@ -45,11 +45,11 @@ fn utf8<'a>(cf: &'a ClassFile, idx: u16) -> &'a str {
 
 /// Extract the single `RuntimeVisibleAnnotations` attribute from a list;
 /// returns an empty slice if missing.
-fn visible<'a>(attrs: &'a [Attribute]) -> &'a [rustjvm_reader::attribute::Annotation] {
+fn visible<'a>(attrs: &'a [LazyAttribute]) -> &'a [rustjvm_reader::attribute::Annotation] {
     attrs
         .iter()
-        .find_map(|a| match a {
-            Attribute::RuntimeVisibleAnnotations(list) => Some(list.as_slice()),
+        .find_map(|a| match a.as_decoded() {
+            Some(Attribute::RuntimeVisibleAnnotations(list)) => Some(list.as_slice()),
             _ => None,
         })
         .unwrap_or(&[])
@@ -222,8 +222,8 @@ fn annotation_default_on_annotation_type_method() {
         .iter()
         .find(|m| &*m.name == "value")
         .expect("Test.value() must exist");
-    let default = method.attributes.iter().find_map(|a| match a {
-        Attribute::AnnotationDefault(ev) => Some(ev),
+    let default = method.attributes.iter().find_map(|a| match a.as_decoded() {
+        Some(Attribute::AnnotationDefault(ev)) => Some(ev),
         _ => None,
     });
     let ev = default.expect("value() must carry AnnotationDefault");

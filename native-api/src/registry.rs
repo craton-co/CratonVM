@@ -1525,10 +1525,14 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
-        let needle_suffix = format!(".{method_name}{descriptor}");
-        for (hash, triple) in self.keys.iter() {
-            if triple.ends_with(&needle_suffix) {
-                if let Some(cb) = self.methods.get(hash).copied() {
+        // T19.E (post-merge): scan the registrations log instead of the
+        // old `keys` reverse map (removed when the registry switched to
+        // 128-bit composite hash keys). Compare the (method, descriptor)
+        // tuple directly — no string concatenation needed.
+        for (class, method, desc) in self.registrations.iter() {
+            if &**method == method_name && &**desc == descriptor {
+                let key = native_method_hash(class, method, desc);
+                if let Some(cb) = self.methods.get(&key).copied() {
                     return Some(cb);
                 }
             }

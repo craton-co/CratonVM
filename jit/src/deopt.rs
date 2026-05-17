@@ -11,7 +11,7 @@
 //!   determines which methods must be invalidated when the class hierarchy
 //!   changes.
 
-use std::collections::HashMap;
+use std::mem;
 
 use rustc_hash::FxHashMap;
 
@@ -179,12 +179,23 @@ impl DeoptimizationLog {
     }
 
     /// Record a deoptimization event for a method.
+    ///
+    /// PERF-P5 (T10.9.C): avoid the per-call `String::from(method)` that
+    /// `HashMap::entry` requires by trying a `get_mut` first. The owned-key
+    /// allocation only happens on the first deopt for a given method name
+    /// (the miss path). For hot methods that deopt repeatedly this turns
+    /// every call after the first into a single hash + push.
+    ///
+    /// TODO(PERF-P5): take `&Arc<str>` once upstream call sites in
+    /// `vm/src/runtime/jit_integration.rs` and `vm/src/vm/vm_init.rs`
+    /// thread the standard `Arc<str>` method-name carrier through.
     pub fn record_deopt(&mut self, method: &str, event: DeoptEvent) {
         self.total_deopts += 1;
-        self.history
-            .entry(method.to_string())
-            .or_default()
-            .push(event);
+        if let Some(events) = self.history.get_mut(method) {
+            events.push(event);
+            return;
+        }
+        self.history.insert(method.to_string(), vec![event]);
     }
 
     /// Number of deopts recorded for `method`.
@@ -200,7 +211,7 @@ impl DeoptimizationLog {
     /// The deopt reason that has occurred most often for `method`.
     pub fn most_common_reason(&self, method: &str) -> Option<DeoptReason> {
         let events = self.history.get(method)?;
-        let mut counts: HashMap<DeoptReason, usize> = HashMap::new();
+        let mut counts: FxHashMap<DeoptReason, usize> = FxHashMap::default();
         for e in events {
             *counts.entry(e.reason).or_default() += 1;
         }
@@ -318,11 +329,19 @@ impl InvalidationManager {
     }
 
     /// Register an assumption made while compiling `method`.
+    ///
+    /// PERF-P5 (T10.9.C): same get_mut/insert pattern as `record_deopt`
+    /// — assumptions accumulate over many calls for the same method, so
+    /// skipping `method.to_string()` on the hit path is a real win.
+    ///
+    /// TODO(PERF-P5): take `&Arc<str>` once upstream call sites in
+    /// `vm/src/vm.rs` thread the standard `Arc<str>` method-name carrier.
     pub fn register_assumption(&mut self, method: &str, assumption: CompilationAssumption) {
-        self.assumptions
-            .entry(method.to_string())
-            .or_default()
-            .push(assumption);
+        if let Some(assumptions) = self.assumptions.get_mut(method) {
+            assumptions.push(assumption);
+            return;
+        }
+        self.assumptions.insert(method.to_string(), vec![assumption]);
     }
 
     /// Called when a new class is loaded. Returns the set of compiled methods
@@ -389,11 +408,22 @@ impl InvalidationManager {
     }
 
     /// Register that `method` depends on `class_id`.
+    ///
+    /// PERF-P5 (T10.9.C): the inner `Vec<String>` still owns its method
+    /// names — but at least skip the empty-vec allocation by using
+    /// `get_mut` first. (We still pay one `String::from(method)` per
+    /// call because the dependency lists may legitimately contain the
+    /// same method multiple times; we are not deduping.)
+    ///
+    /// TODO(PERF-P5): switch `class_dependencies` values to
+    /// `Vec<Arc<str>>` once upstream call sites carry `Arc<str>` keys.
     pub fn add_class_dependency(&mut self, class_id: u32, method: &str) {
+        if let Some(deps) = self.class_dependencies.get_mut(&class_id) {
+            deps.push(method.to_string());
+            return;
+        }
         self.class_dependencies
-            .entry(class_id)
-            .or_default()
-            .push(method.to_string());
+            .insert(class_id, vec![method.to_string()]);
     }
 
     /// Get the list of methods that depend on `class_id`.
@@ -421,6 +451,21 @@ pub struct ReconstructedFrame {
 }
 
 /// Reconstruct an interpreter frame from a `DeoptimizationPoint`.
+///
+/// PERF-P5 (T10.9.C): every clone here is necessary today — the
+/// `DeoptimizationPoint` is embedded in compiled code metadata and may be
+/// triggered again by another thread or another deopt at the same site, so
+/// we cannot `mem::take` out of it. The slow-path nature of deopt
+/// (interpreter resume + recompile decision dominates) makes these clones
+/// acceptable for now.
+///
+/// TODO(PERF-P5): to truly eliminate these allocations the upstream type
+/// `FrameState` would need `locals: Arc<[FrameValue]>`,
+/// `stack: Arc<[FrameValue]>`, `monitors: Arc<[MonitorInfo]>`, and
+/// `method_key: Arc<str>`. Then reconstruction degenerates to a refcount
+/// bump per slot. That requires coordinated changes to
+/// `vm/src/runtime/jit_integration.rs` and the IR emitter that builds
+/// `FrameState`, which is outside the scope of this patch.
 pub fn reconstruct_frame(deopt: &DeoptimizationPoint) -> ReconstructedFrame {
     fn unwind(state: &FrameState) -> (ReconstructedFrame, Vec<ReconstructedFrame>) {
         let frame = ReconstructedFrame {
@@ -432,7 +477,17 @@ pub fn reconstruct_frame(deopt: &DeoptimizationPoint) -> ReconstructedFrame {
             caller_frames: Vec::new(),
         };
 
-        let mut callers = Vec::new();
+        // Pre-size the caller chain in one pass so the inlining-depth Vec
+        // grows once instead of doubling.
+        let mut depth = 0usize;
+        {
+            let mut probe = state.caller.as_deref();
+            while let Some(c) = probe {
+                depth += 1;
+                probe = c.caller.as_deref();
+            }
+        }
+        let mut callers = Vec::with_capacity(depth);
         let mut next = state.caller.as_deref();
         while let Some(caller) = next {
             callers.push(ReconstructedFrame {
@@ -450,6 +505,56 @@ pub fn reconstruct_frame(deopt: &DeoptimizationPoint) -> ReconstructedFrame {
     }
 
     let (mut frame, callers) = unwind(&deopt.frame_state);
+    frame.caller_frames = callers;
+    frame
+}
+
+/// Reconstruct an interpreter frame by consuming a `DeoptimizationPoint`.
+///
+/// PERF-P5 (T10.9.C): when the caller owns the `DeoptimizationPoint` and
+/// doesn't need it again (e.g. one-shot deopt where the compiled code is
+/// being invalidated and the metadata can be dropped), use this variant
+/// to `mem::take` the Vec fields instead of cloning them. The
+/// reconstruction logic and shape are identical to `reconstruct_frame`.
+pub fn reconstruct_frame_owned(mut deopt: DeoptimizationPoint) -> ReconstructedFrame {
+    fn unwind(state: &mut FrameState) -> (ReconstructedFrame, Vec<ReconstructedFrame>) {
+        let frame = ReconstructedFrame {
+            method_key: mem::take(&mut state.method_key),
+            bci: state.bci,
+            locals: mem::take(&mut state.locals),
+            stack: mem::take(&mut state.stack),
+            monitors: mem::take(&mut state.monitors),
+            caller_frames: Vec::new(),
+        };
+
+        // Count depth without holding a mutable borrow into the chain.
+        let mut depth = 0usize;
+        {
+            let mut probe = state.caller.as_deref();
+            while let Some(c) = probe {
+                depth += 1;
+                probe = c.caller.as_deref();
+            }
+        }
+        let mut callers = Vec::with_capacity(depth);
+        let mut next = state.caller.take();
+        while let Some(mut caller) = next {
+            let following = caller.caller.take();
+            callers.push(ReconstructedFrame {
+                method_key: mem::take(&mut caller.method_key),
+                bci: caller.bci,
+                locals: mem::take(&mut caller.locals),
+                stack: mem::take(&mut caller.stack),
+                monitors: mem::take(&mut caller.monitors),
+                caller_frames: Vec::new(),
+            });
+            next = following;
+        }
+
+        (frame, callers)
+    }
+
+    let (mut frame, callers) = unwind(&mut deopt.frame_state);
     frame.caller_frames = callers;
     frame
 }

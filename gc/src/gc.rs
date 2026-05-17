@@ -637,13 +637,13 @@ mod tests {
         let new_a = roots[0];
         let b_val: Value =
             unsafe { std::ptr::read(new_a.as_ptr().add(HEADER_SIZE) as *const Value) };
-        let new_b = b_val.as_object().unwrap().unwrap();
+        let new_b = b_val.as_object().unwrap();
         let c_val: Value =
             unsafe { std::ptr::read(new_b.as_ptr().add(HEADER_SIZE) as *const Value) };
-        let new_c = c_val.as_object().unwrap().unwrap();
+        let new_c = c_val.as_object().unwrap();
         let d_val: Value =
             unsafe { std::ptr::read(new_c.as_ptr().add(HEADER_SIZE) as *const Value) };
-        let new_d = d_val.as_object().unwrap().unwrap();
+        let new_d = d_val.as_object().unwrap();
         let d_field: Value =
             unsafe { std::ptr::read(new_d.as_ptr().add(HEADER_SIZE) as *const Value) };
         assert_eq!(d_field.as_int(), Some(4));

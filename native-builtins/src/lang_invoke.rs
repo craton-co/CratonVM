@@ -3,12 +3,49 @@
 //! Session 4: Full MethodHandle invocation with type resolution, VarHandle field
 //! access with real get/set/CAS, and proper Lookup.find* resolution.
 
+use std::borrow::Cow;
+
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectKind, ObjectRef, Value};
 use rustjvm_types::error::MethodCallResult;
 
 use crate::{obj_arg, alloc_concurrent_synthetic};
 use crate::lang_class::{mirror_class_name, mirror_class_id, box_value};
+
+// ---------------------------------------------------------------------------
+// Hoisted descriptor / class-name string constants
+// ---------------------------------------------------------------------------
+//
+// These literals appeared in 30+ `.to_string()` sites scattered across the
+// invokedynamic / MethodHandle / VarHandle hot paths. Centralising them as
+// `&'static str` lets callers borrow without allocating on the per-call
+// fast path, and gives the rest of the file a single source of truth for
+// the descriptor character / wrapper-class name mapping.
+const DESC_VOID:    &str = "V";
+const DESC_INT:     &str = "I";
+const DESC_LONG:    &str = "J";
+const DESC_FLOAT:   &str = "F";
+const DESC_DOUBLE:  &str = "D";
+const DESC_BOOLEAN: &str = "Z";
+const DESC_BYTE:    &str = "B";
+const DESC_CHAR:    &str = "C";
+const DESC_SHORT:   &str = "S";
+const DESC_REF:     &str = "L";
+const DESC_OBJECT:  &str = "Ljava/lang/Object;";
+
+const NAME_VOID:    &str = "void";
+const NAME_INT:     &str = "int";
+const NAME_LONG:    &str = "long";
+const NAME_FLOAT:   &str = "float";
+const NAME_DOUBLE:  &str = "double";
+const NAME_BOOLEAN: &str = "boolean";
+const NAME_BYTE:    &str = "byte";
+const NAME_CHAR:    &str = "char";
+const NAME_SHORT:   &str = "short";
+
+const DESC_DEFAULT_METHOD: &str = "()V";
+const DESC_DEFAULT_OBJECT_RETURN: &str = "()Ljava/lang/Object;";
+const NAME_INVOKE: &str = "invoke";
 
 /// C38: Detect a real-JDK array-element VarHandle call.
 ///
@@ -37,18 +74,21 @@ fn vh_array_call(ctx: &dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, 
 /// Read the VH_FIELD_DESC string from a VarHandle object. Prefers the
 /// WP4.2 side table (see vh_meta_table comment) and falls back to the
 /// raw object slot for VarHandles allocated outside our path.
-fn vh_field_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> String {
+fn vh_field_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
     if let Some(m) = vh_meta_get(vh) {
-        return m.field_desc;
+        return Cow::Owned(m.field_desc);
     }
-    vh_read_string(ctx, vh, VH_FIELD_DESC).unwrap_or_else(|| "Ljava/lang/Object;".to_string())
+    match vh_read_string(ctx, vh, VH_FIELD_DESC) {
+        Some(s) => Cow::Owned(s),
+        None => Cow::Borrowed(DESC_OBJECT),
+    }
 }
 
 /// Convert a VarHandle field descriptor to the single-char type descriptor
 /// that `box_value` expects (e.g. "I", "J", "Ljava/lang/Object;").
-fn vh_type_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> String {
+fn vh_type_desc(ctx: &dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
     let desc = vh_field_desc(ctx, vh);
-    if desc.len() == 1 { desc } else { "L".to_string() }
+    if desc.len() == 1 { desc } else { Cow::Borrowed(DESC_REF) }
 }
 
 
@@ -133,47 +173,52 @@ pub(crate) fn vh_meta_update_field_index(vh: ObjectRef, idx: i32) {
 
 /// Convert a class name (as stored in a Class mirror) to its JVM descriptor form.
 /// "int" → "I", "java/lang/String" → "Ljava/lang/String;", "void" → "V", etc.
-fn class_name_to_descriptor(name: &str) -> String {
+///
+/// Returns `Cow<'static, str>` so the primitive / array cases (the common
+/// hot-path branches called from `descriptor_from_method_type` and
+/// `widen_descriptor`) avoid an allocation entirely; only the
+/// `L<class>;` builder produces an owned `String`.
+fn class_name_to_descriptor(name: &str) -> Cow<'static, str> {
     match name {
-        "void"    => "V".to_string(),
-        "int"     => "I".to_string(),
-        "long"    => "J".to_string(),
-        "float"   => "F".to_string(),
-        "double"  => "D".to_string(),
-        "boolean" => "Z".to_string(),
-        "byte"    => "B".to_string(),
-        "char"    => "C".to_string(),
-        "short"   => "S".to_string(),
-        _ if name.starts_with('[') => name.to_string(), // already descriptor form
-        _ => format!("L{name};"),
+        NAME_VOID    => Cow::Borrowed(DESC_VOID),
+        NAME_INT     => Cow::Borrowed(DESC_INT),
+        NAME_LONG    => Cow::Borrowed(DESC_LONG),
+        NAME_FLOAT   => Cow::Borrowed(DESC_FLOAT),
+        NAME_DOUBLE  => Cow::Borrowed(DESC_DOUBLE),
+        NAME_BOOLEAN => Cow::Borrowed(DESC_BOOLEAN),
+        NAME_BYTE    => Cow::Borrowed(DESC_BYTE),
+        NAME_CHAR    => Cow::Borrowed(DESC_CHAR),
+        NAME_SHORT   => Cow::Borrowed(DESC_SHORT),
+        _ if name.starts_with('[') => Cow::Owned(name.to_string()), // already descriptor form
+        _ => Cow::Owned(format!("L{name};")),
     }
 }
 
 /// Convert a JVM field descriptor to a class name for display.
 /// "I" → "int", "Ljava/lang/String;" → "java/lang/String", etc.
-fn descriptor_to_class_name(desc: &str) -> String {
+fn descriptor_to_class_name(desc: &str) -> Cow<'static, str> {
     match desc {
-        "V" => "void".to_string(),
-        "I" => "int".to_string(),
-        "J" => "long".to_string(),
-        "F" => "float".to_string(),
-        "D" => "double".to_string(),
-        "Z" => "boolean".to_string(),
-        "B" => "byte".to_string(),
-        "C" => "char".to_string(),
-        "S" => "short".to_string(),
+        DESC_VOID    => Cow::Borrowed(NAME_VOID),
+        DESC_INT     => Cow::Borrowed(NAME_INT),
+        DESC_LONG    => Cow::Borrowed(NAME_LONG),
+        DESC_FLOAT   => Cow::Borrowed(NAME_FLOAT),
+        DESC_DOUBLE  => Cow::Borrowed(NAME_DOUBLE),
+        DESC_BOOLEAN => Cow::Borrowed(NAME_BOOLEAN),
+        DESC_BYTE    => Cow::Borrowed(NAME_BYTE),
+        DESC_CHAR    => Cow::Borrowed(NAME_CHAR),
+        DESC_SHORT   => Cow::Borrowed(NAME_SHORT),
         _ if desc.starts_with('L') && desc.ends_with(';') => {
-            desc[1..desc.len()-1].to_string()
+            Cow::Owned(desc[1..desc.len()-1].to_string())
         }
-        _ => desc.to_string(),
+        _ => Cow::Owned(desc.to_string()),
     }
 }
 
 /// Read a Class mirror and extract its JVM descriptor character(s).
-fn mirror_to_descriptor(ctx: &dyn NativeContext, mirror: ObjectRef) -> String {
+fn mirror_to_descriptor(ctx: &dyn NativeContext, mirror: ObjectRef) -> Cow<'static, str> {
     match resolve_class_name_robust(ctx, mirror) {
         Some(name) => class_name_to_descriptor(&name),
-        None => "Ljava/lang/Object;".to_string(),
+        None => Cow::Borrowed(DESC_OBJECT),
     }
 }
 
@@ -291,7 +336,7 @@ fn descriptor_from_method_type(ctx: &dyn NativeContext, mt: ObjectRef) -> String
 }
 
 /// Build a field descriptor for a single Class mirror (used by findGetter/findSetter).
-fn field_descriptor_from_mirror(ctx: &dyn NativeContext, type_mirror: ObjectRef) -> String {
+fn field_descriptor_from_mirror(ctx: &dyn NativeContext, type_mirror: ObjectRef) -> Cow<'static, str> {
     mirror_to_descriptor(ctx, type_mirror)
 }
 
@@ -1811,7 +1856,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // so revealDirect at least returns a non-throwing InfoFromMemberName.
     let class = mh_read_class(ctx, mh).unwrap_or_default();
     let name  = mh_read_name(ctx, mh).unwrap_or_default();
-    let desc  = mh_read_desc(ctx, mh).unwrap_or_else(|| "()V".to_string());
+    let desc  = mh_read_desc(ctx, mh).unwrap_or_else(|| DESC_DEFAULT_METHOD.to_string());
     let kind  = match ctx.get_field(mh, MH_KIND) {
         Value::Int(k) => k,
         _ => MH_KIND_STATIC,
@@ -1927,7 +1972,7 @@ fn field_type_from_desc(desc: &str, ref_kind: i32) -> String {
     // For getters the field type is the return-type slice.
     if ref_kind == REF_GET_FIELD || ref_kind == REF_GET_STATIC {
         if let Some(idx) = desc.find(')') { return desc[idx + 1..].to_string(); }
-        return "V".to_string();
+        return DESC_VOID.to_string();
     }
     // For setters the field type is the LAST parameter.
     let end = desc.find(')').unwrap_or(desc.len());
@@ -2687,22 +2732,23 @@ fn widen_descriptor(
     let params_str = &inner_desc[1..close];
     let ret_str = &inner_desc[close..]; // includes ')'
     let orig_types = parse_descriptor_types(params_str);
-    let mut all: Vec<String> = orig_types
+    let mut all: Vec<Cow<'static, str>> = orig_types
         .iter()
         .map(|n| class_name_to_descriptor(n))
         .collect();
     let extra_n = ctx.array_length(extra_classes);
     let pos_c = pos.min(all.len());
-    let mut inserts: Vec<String> = Vec::with_capacity(extra_n);
+    let mut inserts: Vec<Cow<'static, str>> = Vec::with_capacity(extra_n);
     for i in 0..extra_n {
         let d = match ctx.get_array_element(extra_classes, i) {
             Value::Object(Some(mirror)) => mirror_to_descriptor(ctx, mirror),
-            _ => "Ljava/lang/Object;".to_string(),
+            _ => Cow::Borrowed(DESC_OBJECT),
         };
         inserts.push(d);
     }
     all.splice(pos_c..pos_c, inserts);
-    let mut out = String::from("(");
+    let mut out = String::with_capacity(inner_desc.len() + 8);
+    out.push('(');
     for p in &all {
         out.push_str(p);
     }
@@ -3031,24 +3077,29 @@ pub(crate) fn populate_method_type_form(
 
 /// Parse a sequence of JVM type descriptors from a parameter string.
 /// e.g. "ILjava/lang/String;D" → ["int", "java/lang/String", "double"]
-fn parse_descriptor_types(desc: &str) -> Vec<String> {
-    let mut result = Vec::new();
+///
+/// Returns `Cow<'static, str>` so the primitive descriptor branches
+/// (which dominate this hot path on the invoke/invokeExact dispatch) avoid
+/// allocating a `String` per parameter; only reference / array types
+/// produce an owned string.
+fn parse_descriptor_types(desc: &str) -> Vec<Cow<'static, str>> {
+    let mut result: Vec<Cow<'static, str>> = Vec::new();
     let bytes = desc.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'I' => { result.push("int".to_string()); i += 1; }
-            b'J' => { result.push("long".to_string()); i += 1; }
-            b'F' => { result.push("float".to_string()); i += 1; }
-            b'D' => { result.push("double".to_string()); i += 1; }
-            b'Z' => { result.push("boolean".to_string()); i += 1; }
-            b'B' => { result.push("byte".to_string()); i += 1; }
-            b'C' => { result.push("char".to_string()); i += 1; }
-            b'S' => { result.push("short".to_string()); i += 1; }
-            b'V' => { result.push("void".to_string()); i += 1; }
+            b'I' => { result.push(Cow::Borrowed(NAME_INT));     i += 1; }
+            b'J' => { result.push(Cow::Borrowed(NAME_LONG));    i += 1; }
+            b'F' => { result.push(Cow::Borrowed(NAME_FLOAT));   i += 1; }
+            b'D' => { result.push(Cow::Borrowed(NAME_DOUBLE));  i += 1; }
+            b'Z' => { result.push(Cow::Borrowed(NAME_BOOLEAN)); i += 1; }
+            b'B' => { result.push(Cow::Borrowed(NAME_BYTE));    i += 1; }
+            b'C' => { result.push(Cow::Borrowed(NAME_CHAR));    i += 1; }
+            b'S' => { result.push(Cow::Borrowed(NAME_SHORT));   i += 1; }
+            b'V' => { result.push(Cow::Borrowed(NAME_VOID));    i += 1; }
             b'L' => {
                 if let Some(semi) = desc[i..].find(';') {
-                    result.push(desc[i+1..i+semi].to_string());
+                    result.push(Cow::Owned(desc[i+1..i+semi].to_string()));
                     i += semi + 1;
                 } else { break; }
             }
@@ -3058,11 +3109,11 @@ fn parse_descriptor_types(desc: &str) -> Vec<String> {
                 if i < bytes.len() {
                     if bytes[i] == b'L' {
                         if let Some(semi) = desc[i..].find(';') {
-                            result.push(desc[start..i+semi+1].to_string());
+                            result.push(Cow::Owned(desc[start..i+semi+1].to_string()));
                             i += semi + 1;
                         } else { break; }
                     } else {
-                        result.push(desc[start..=i].to_string());
+                        result.push(Cow::Owned(desc[start..=i].to_string()));
                         i += 1;
                     }
                 }
@@ -3380,7 +3431,7 @@ fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// RustJVM extra-slot descriptor (matches `create_field_object` in
 /// `lang_class.rs`), and falls back to deriving it from the `type` Class
 /// mirror if needed.
-fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: rustjvm_types::ObjectRef) -> String {
+fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: rustjvm_types::ObjectRef) -> Cow<'static, str> {
     // The `type` field is a Class mirror — derive the descriptor from it
     // as a safe fallback (e.g. "J" for primitive long, "Ljava/lang/String;"
     // for references). This is the authoritative source in real JDK mode.
@@ -3388,21 +3439,21 @@ fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: rustjvm_type
         let name = crate::lang_class::mirror_class_name(ctx, type_mirror).unwrap_or_default();
         if !name.is_empty() {
             return match name.as_str() {
-                "boolean" => "Z".to_string(),
-                "byte" => "B".to_string(),
-                "char" => "C".to_string(),
-                "short" => "S".to_string(),
-                "int" => "I".to_string(),
-                "long" => "J".to_string(),
-                "float" => "F".to_string(),
-                "double" => "D".to_string(),
-                "void" => "V".to_string(),
-                s if s.starts_with('[') => s.to_string(),
-                s => format!("L{};", s.replace('.', "/")),
+                NAME_BOOLEAN => Cow::Borrowed(DESC_BOOLEAN),
+                NAME_BYTE    => Cow::Borrowed(DESC_BYTE),
+                NAME_CHAR    => Cow::Borrowed(DESC_CHAR),
+                NAME_SHORT   => Cow::Borrowed(DESC_SHORT),
+                NAME_INT     => Cow::Borrowed(DESC_INT),
+                NAME_LONG    => Cow::Borrowed(DESC_LONG),
+                NAME_FLOAT   => Cow::Borrowed(DESC_FLOAT),
+                NAME_DOUBLE  => Cow::Borrowed(DESC_DOUBLE),
+                NAME_VOID    => Cow::Borrowed(DESC_VOID),
+                s if s.starts_with('[') => Cow::Owned(s.to_string()),
+                s => Cow::Owned(format!("L{};", s.replace('.', "/"))),
             };
         }
     }
-    "Ljava/lang/Object;".to_string()
+    Cow::Borrowed(DESC_OBJECT)
 }
 
 fn lookup_unreflect_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3805,7 +3856,7 @@ pub(crate) fn native_mhn_link_method(
     // Extract descriptor from MethodType (args[4])
     let desc = match args.get(4) {
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
-        _ => "()V".to_string(),
+        _ => DESC_DEFAULT_METHOD.to_string(),
     };
 
     // Determine MH kind from refKind
@@ -3841,13 +3892,13 @@ pub(crate) fn native_mhn_link_call_site(
     // Extract name from args[2]
     let name = match args.get(2) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => "invoke".to_string(),
+        _ => NAME_INVOKE.to_string(),
     };
 
     // Extract MethodType from args[3]
     let desc = match args.get(3) {
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
-        _ => "()Ljava/lang/Object;".to_string(),
+        _ => DESC_DEFAULT_OBJECT_RETURN.to_string(),
     };
 
     // Allocate a virtual MH as the linked target
@@ -4011,7 +4062,7 @@ pub(crate) fn native_ibg_generate_interpreter_entry_point(
     // args[0] = MethodType mt
     let desc = match args.get(0) {
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
-        _ => "()V".to_string(),
+        _ => DESC_DEFAULT_METHOD.to_string(),
     };
     let ret_char = desc.rsplit_once(')').map(|(_, r)| r.chars().next().unwrap_or('V')).unwrap_or('V');
     let name = format!("interpret_{}", ret_char);
@@ -4038,7 +4089,7 @@ pub(crate) fn native_ibg_generate_customized_code(
     // args: LambdaForm form (0), MethodType invokerType (1)
     let desc = match args.get(1) {
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
-        _ => "()V".to_string(),
+        _ => DESC_DEFAULT_METHOD.to_string(),
     };
     let mn = alloc_resolved_member_name(
         ctx,

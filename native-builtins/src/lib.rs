@@ -10228,24 +10228,41 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if ctx.heap_kind_of(this) == rustjvm_types::ObjectKind::Array {
         let class_id = ctx.class_id_of_object(this);
         let element_type = ctx.heap_element_type_of(this);
-        let array_class_name = match element_type {
-            rustjvm_types::ArrayElementType::Boolean => "[Z".to_string(),
-            rustjvm_types::ArrayElementType::Char    => "[C".to_string(),
-            rustjvm_types::ArrayElementType::Float   => "[F".to_string(),
-            rustjvm_types::ArrayElementType::Double  => "[D".to_string(),
-            rustjvm_types::ArrayElementType::Byte    => "[B".to_string(),
-            rustjvm_types::ArrayElementType::Short   => "[S".to_string(),
-            rustjvm_types::ArrayElementType::Int     => "[I".to_string(),
-            rustjvm_types::ArrayElementType::Long    => "[J".to_string(),
+        // Primitive-array type-name constants — `&'static str` so the eight
+        // common branches do not allocate at all (the previous code called
+        // `.to_string()` on each, adding a per-call heap alloc on every
+        // `Object.getClass()` against a primitive array).
+        const ARRAY_BOOLEAN: &str = "[Z";
+        const ARRAY_CHAR:    &str = "[C";
+        const ARRAY_FLOAT:   &str = "[F";
+        const ARRAY_DOUBLE:  &str = "[D";
+        const ARRAY_BYTE:    &str = "[B";
+        const ARRAY_SHORT:   &str = "[S";
+        const ARRAY_INT:     &str = "[I";
+        const ARRAY_LONG:    &str = "[J";
+        // For primitive arrays we hold a `&'static str`; for reference
+        // arrays we synthesise the array descriptor (one alloc, unavoidable
+        // because the component class name is dynamic). `Cow` lets us pass
+        // either uniformly to `class_id_by_name` / `load_class` /
+        // `primitive_class_mirror` without an extra copy.
+        let array_class_name: std::borrow::Cow<'static, str> = match element_type {
+            rustjvm_types::ArrayElementType::Boolean => std::borrow::Cow::Borrowed(ARRAY_BOOLEAN),
+            rustjvm_types::ArrayElementType::Char    => std::borrow::Cow::Borrowed(ARRAY_CHAR),
+            rustjvm_types::ArrayElementType::Float   => std::borrow::Cow::Borrowed(ARRAY_FLOAT),
+            rustjvm_types::ArrayElementType::Double  => std::borrow::Cow::Borrowed(ARRAY_DOUBLE),
+            rustjvm_types::ArrayElementType::Byte    => std::borrow::Cow::Borrowed(ARRAY_BYTE),
+            rustjvm_types::ArrayElementType::Short   => std::borrow::Cow::Borrowed(ARRAY_SHORT),
+            rustjvm_types::ArrayElementType::Int     => std::borrow::Cow::Borrowed(ARRAY_INT),
+            rustjvm_types::ArrayElementType::Long    => std::borrow::Cow::Borrowed(ARRAY_LONG),
             rustjvm_types::ArrayElementType::Reference => {
                 // Component class_id is stored in the array header
                 let comp_name = ctx.class_name_of_id(class_id)
                     .unwrap_or_else(|| "java/lang/Object".to_string());
                 if comp_name.starts_with('[') {
                     // Multi-dimensional array: prepend another '['
-                    format!("[{comp_name}")
+                    std::borrow::Cow::Owned(format!("[{comp_name}"))
                 } else {
-                    format!("[L{comp_name};")
+                    std::borrow::Cow::Owned(format!("[L{comp_name};"))
                 }
             }
         };
@@ -10277,7 +10294,51 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(mirror))))
 }
 
+// ---------------------------------------------------------------------------
+// `Object.toString` per-class dotted-name cache (perf)
+//
+// `Object.toString` is one of the hottest natives in the VM (every implicit
+// string concatenation against a non-overriding class hits it). The naive
+// implementation allocated four times per call: `class_name_of_id`, the
+// `replace('/', ".")` of the slashed name, the `format!` of the
+// `"dotted@hash"` text, and finally `create_string`.
+//
+// We mirror the cache strategy in `lang_class.rs::dotted_class_name`: the
+// slashed → dotted derivation is pure (class names don't change once the
+// class is loaded), so we memoise the `Arc<str>` keyed by `ClassId`. After
+// the first call per class only one allocation remains (the `format!` for
+// the per-object `dotted@hash` text — unavoidable because the hash varies).
+// ---------------------------------------------------------------------------
+fn object_to_string_dotted_name(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+) -> std::sync::Arc<str> {
+    use std::sync::{Arc, OnceLock};
+    use parking_lot::RwLock;
+    use rustc_hash::FxHashMap;
+
+    static CACHE: OnceLock<RwLock<FxHashMap<u32, Arc<str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
+    let key = class_id.as_u32();
+    if let Some(arc) = cache.read().get(&key).cloned() {
+        return arc;
+    }
+    // Miss: derive the dotted form (single `replace` or `Arc::from` clone if
+    // the name has no `/`) and insert under the write lock.
+    let slashed = ctx
+        .class_name_of_id(class_id)
+        .unwrap_or_else(|| "?".to_string());
+    let dotted: Arc<str> = if slashed.contains('/') {
+        Arc::from(slashed.replace('/', "."))
+    } else {
+        Arc::from(slashed)
+    };
+    cache.write().insert(key, Arc::clone(&dotted));
+    dotted
+}
+
 fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::fmt::Write as _;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -10288,13 +10349,15 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
-    let class_name = ctx
-        .class_name_of_id(class_id)
-        .unwrap_or_else(|| "?".to_string());
-    // Convert from "java/lang/Object" to "java.lang.Object"
-    let dotted = class_name.replace('/', ".");
+    let dotted = object_to_string_dotted_name(ctx, class_id);
     let hash = ctx.identity_hash_code(this);
-    let text = format!("{dotted}@{hash:x}");
+    // Build "dotted@hash" with a single pre-sized buffer (saves the realloc
+    // that `format!` would do, but more importantly limits us to one heap
+    // alloc for this call — the per-object hash means we cannot cache this).
+    // `hash` is i32 → up to 8 hex chars; plus '@' separator.
+    let mut text = String::with_capacity(dotted.len() + 9);
+    text.push_str(&dotted);
+    let _ = write!(text, "@{hash:x}");
     let str_ref = ctx.create_string(&text);
     Ok(Some(Value::Object(Some(str_ref))))
 }
@@ -12485,7 +12548,7 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
             let nv = if let Value::Int(n) = new_val { n } else { 0 };
@@ -12518,7 +12581,7 @@ fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
             let nv = if let Value::Long(n) = new_val { n } else { 0 };
@@ -12610,7 +12673,7 @@ fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected { e } else { None };
             let nv = if let Value::Object(n) = new_val { n } else { None };
@@ -12650,7 +12713,7 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12675,7 +12738,7 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
         Some(o) => o,
         None => {
             let v = if let Value::Int(i) = val { i } else { 0 };
-            static_int_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12700,7 +12763,7 @@ fn native_unsafe_get_long_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12729,7 +12792,7 @@ fn native_unsafe_put_long_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
-            static_long_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12754,7 +12817,7 @@ fn native_unsafe_get_object_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
@@ -12783,7 +12846,7 @@ fn native_unsafe_put_object_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Object(o) = val { o } else { None };
-            static_obj_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12805,7 +12868,7 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
@@ -12829,7 +12892,7 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
         Some(o) => o,
         None => {
             let v = if let Value::Object(o) = val { o } else { None };
-            static_obj_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12851,7 +12914,7 @@ pub(crate) fn native_unsafe_get_int(ctx: &mut dyn NativeContext, args: &[Value])
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12870,7 +12933,7 @@ pub(crate) fn native_unsafe_put_int(ctx: &mut dyn NativeContext, args: &[Value])
         Some(o) => o,
         None => {
             let v = if let Value::Int(i) = val { i } else { 0 };
-            static_int_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12893,7 +12956,7 @@ pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12919,7 +12982,7 @@ pub(crate) fn native_unsafe_put_long(ctx: &mut dyn NativeContext, args: &[Value]
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
-            static_long_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -13021,7 +13084,7 @@ pub(crate) fn native_unsafe_get_and_add_int(ctx: &mut dyn NativeContext, args: &
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
             *slot = old.wrapping_add(delta);
@@ -13063,7 +13126,7 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(o) => o,
         None => {
             let nv = if let Value::Int(n) = new_val { n } else { 0 };
-            let mut map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
         }
@@ -13148,7 +13211,7 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
-            let mut map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
             *slot = old.wrapping_add(delta);
@@ -13188,7 +13251,7 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(o) => o,
         None => {
             let nv = if let Value::Long(n) = new_val { n } else { 0 };
-            let mut map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
         }
@@ -13218,7 +13281,7 @@ fn native_unsafe_get_and_set_object(ctx: &mut dyn NativeContext, args: &[Value])
         Some(o) => o,
         None => {
             let nv = if let Value::Object(n) = new_val { n } else { None };
-            let mut map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
         }

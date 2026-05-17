@@ -127,7 +127,7 @@ fn redefine_round_trip_replaces_method_body_and_bumps_generation() {
         .iter()
         .find_map(|e| e.as_ref())
         .expect("foo slot present");
-    assert_eq!(foo_slot.method_name, "foo");
+    assert_eq!(&*foo_slot.method_name, "foo");
 }
 
 #[test]

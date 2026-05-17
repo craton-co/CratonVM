@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::attribute::Attribute;
+use crate::attribute::{Attribute, LazyAttribute};
 use crate::class_access_flags::FieldAccessFlags;
 
 /// A field in a Java class file (JVM spec 4.5).
@@ -16,7 +16,7 @@ pub struct ClassFileField {
     pub access_flags: FieldAccessFlags,
     pub name: Arc<str>,
     pub descriptor: Arc<str>,
-    pub attributes: Vec<Attribute>,
+    pub attributes: Vec<LazyAttribute>,
 }
 
 impl ClassFileField {
@@ -35,8 +35,10 @@ impl ClassFileField {
     /// Returns the constant value index from the ConstantValue attribute, if present.
     /// A field with ConstantValue is a compile-time constant (JVM spec §4.7.2).
     pub fn constant_value_index(&self) -> Option<u16> {
-        self.attributes.iter().find_map(|attr| match attr {
-            Attribute::ConstantValue { constant_value_index } => Some(*constant_value_index),
+        // Only returns a value when the attribute has already been decoded.
+        // Lazy attributes must be force-decoded by the caller first.
+        self.attributes.iter().find_map(|attr| match attr.as_decoded() {
+            Some(Attribute::ConstantValue { constant_value_index }) => Some(*constant_value_index),
             _ => None,
         })
     }
@@ -121,9 +123,9 @@ mod tests {
             access_flags: FieldAccessFlags::PUBLIC,
             name: Arc::from("VALUE"),
             descriptor: Arc::from("Ljava/lang/String;"),
-            attributes: vec![Attribute::ConstantValue {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::ConstantValue {
                 constant_value_index: 5,
-            }],
+            })],
         };
         assert_eq!(f.attributes.len(), 1);
     }

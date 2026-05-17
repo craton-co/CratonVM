@@ -334,6 +334,84 @@ impl ValueStack {
         self.slots[self.len]
     }
 
+    // ── AUDIT CRIT-4: int-specialised push/pop (no Value enum round-trip) ──
+    //
+    // Hot int opcodes (`iadd`, `imul`, `iload_*`, `istore_*`, `if_icmp*` …)
+    // previously paid 3× 8-arm `match` per execution: pop → Value::Int, pop
+    // → Value::Int, push Value::Int(_). These helpers stay in CompactValue
+    // form throughout, bypassing the `to_value` / `from_value` arms.
+    //
+    // Bytecode verifier guarantees the operand types, so the unchecked
+    // helpers do not type-check — the same contract as `pop_unchecked` /
+    // `push_unchecked`.
+
+    /// Push an i32 directly as a `CompactValue::int(_)` without going
+    /// through `Value::Int(_) → from_value(_)`.
+    ///
+    /// # Panics
+    /// Panics if the stack is full.
+    #[inline(always)]
+    pub fn push_int_unchecked(&mut self, v: i32) {
+        assert!(self.len < self.max_size, "stack overflow in push_int_unchecked");
+        self.slots[self.len] = CompactValue::int(v);
+        self.len += 1;
+    }
+
+    /// Pop an i32 directly from a `CompactValue::int(_)` slot without
+    /// going through `to_value()` / `Value::Int(_)`.
+    ///
+    /// Bytecode verifier guarantees the top-of-stack is an Int slot at
+    /// every site that calls this helper.  If the slot is something else
+    /// (`Null`, `Uninitialized`) this returns 0 — matching the slow-path
+    /// `pop_int` semantics for the K1-family null/uninit coercion.
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn pop_int_unchecked(&mut self) -> i32 {
+        assert!(self.len > 0, "stack underflow in pop_int_unchecked");
+        self.len -= 1;
+        // CompactValue exposes `as_int() -> Option<i32>` (None when the slot
+        // is not an Int tag).  Verified bytecode is Int-typed at this site,
+        // so `unwrap_or(0)` matches the slow-path null/uninit coercion and
+        // compiles down to the same single payload mask + cast after
+        // inlining.
+        self.slots[self.len].as_int().unwrap_or(0)
+    }
+
+    /// Push an f32 directly as a `CompactValue::float(_)` (skip `Value` decode).
+    ///
+    /// # Panics
+    /// Panics if the stack is full.
+    #[inline(always)]
+    pub fn push_float_unchecked(&mut self, v: f32) {
+        assert!(self.len < self.max_size, "stack overflow in push_float_unchecked");
+        self.slots[self.len] = CompactValue::float(v);
+        self.len += 1;
+    }
+
+    /// Pop an f32 directly from a `CompactValue::float(_)` slot.
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn pop_float_unchecked(&mut self) -> f32 {
+        assert!(self.len > 0, "stack underflow in pop_float_unchecked");
+        self.len -= 1;
+        self.slots[self.len].as_float().unwrap_or(0.0)
+    }
+
+    /// Peek the top-of-stack as an i32 without popping.  Returns 0 for
+    /// non-Int slots (matches `pop_int_unchecked`).
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn peek_int_unchecked(&self) -> i32 {
+        assert!(self.len > 0, "stack underflow in peek_int_unchecked");
+        self.slots[self.len - 1].as_int().unwrap_or(0)
+    }
+
     /// Pop raw u64 value without decoding to Value enum.
     /// Used by JIT dispatch to avoid decode/re-encode overhead.
     #[inline(always)]
