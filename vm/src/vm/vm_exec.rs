@@ -3328,7 +3328,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn get_scoped_value(&self, key_id: u64) -> Option<Value> {
         // Search top-to-bottom for matching key_id
-        for (k, v) in self.thread.scoped_values.iter().rev() {
+        for (k, _key_ref, v) in self.thread.scoped_values.iter().rev() {
             if *k == key_id {
                 return Some(*v);
             }
@@ -3337,7 +3337,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn push_scoped_value(&mut self, key_id: u64, value: Value) {
-        self.thread.scoped_values.push((key_id, value));
+        // Legacy API: no key ObjectRef supplied. Round-9 GC fix prefers
+        // `push_scoped_value_with_key` so the key itself is GC-pinned.
+        self.thread.scoped_values.push((key_id, None, value));
+    }
+
+    fn push_scoped_value_with_key(
+        &mut self,
+        key_id: u64,
+        key_ref: Option<rustjvm_types::ObjectRef>,
+        value: Value,
+    ) {
+        self.thread.scoped_values.push((key_id, key_ref, value));
     }
 
     fn pop_scoped_value(&mut self) {

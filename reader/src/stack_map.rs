@@ -154,6 +154,16 @@ impl StackMapTable {
     /// file. Each absolute offset is bounded-checked before being
     /// downcast back to `u16` for the returned vec, preserving the
     /// caller-visible type.
+    ///
+    /// Round 8 reader HIGH fix: the `p + delta + 1` accumulator is
+    /// computed with `saturating_add` so a debug-build run on a
+    /// maliciously-crafted file whose deltas push the running total
+    /// past `u32::MAX` (theoretically impossible given `delta <=
+    /// u16::MAX`, but the explicit saturating form removes any chance
+    /// of a debug-build overflow panic firing before the explicit
+    /// `> u16::MAX` bound check rejects the input). The saturated
+    /// `u32::MAX` value still trips the bound check and produces the
+    /// same `InvalidClassData` error a release build would surface.
     pub fn absolute_offsets(&self) -> Result<Vec<u16>, ClassReaderError> {
         let mut offsets = Vec::with_capacity(self.entries.len());
         let mut prev: Option<u32> = None;
@@ -162,7 +172,7 @@ impl StackMapTable {
             let delta = frame_offset_delta(entry) as u32;
             let absolute: u32 = match prev {
                 None => delta,
-                Some(p) => p + delta + 1,
+                Some(p) => p.saturating_add(delta).saturating_add(1),
             };
             if absolute > u16::MAX as u32 {
                 return Err(ClassReaderError::InvalidClassData {
@@ -664,6 +674,29 @@ mod tests {
     fn absolute_offsets_empty() {
         let table = StackMapTable { entries: vec![] };
         assert_eq!(table.absolute_offsets().unwrap(), Vec::<u16>::new());
+    }
+
+    /// Round 8 reader HIGH: deltas that push the running absolute
+    /// offset past `u16::MAX` must be rejected with `InvalidClassData`
+    /// — and the saturating accumulator must NOT panic in debug
+    /// builds. Construct two `u16::MAX` deltas back-to-back so the
+    /// release-build sum is `2 * u16::MAX + 1 = 131_071`, well past
+    /// the bound check.
+    #[test]
+    fn absolute_offsets_overflow_rejected_not_panic() {
+        let table = StackMapTable {
+            entries: vec![
+                StackMapFrame::SameFrameExtended { offset_delta: u16::MAX },
+                StackMapFrame::SameFrameExtended { offset_delta: u16::MAX },
+            ],
+        };
+        let err = table.absolute_offsets().unwrap_err();
+        match err {
+            ClassReaderError::InvalidClassData { message } => {
+                assert!(message.contains("exceeds u16::MAX"), "got: {message}");
+            }
+            other => panic!("expected InvalidClassData, got: {other:?}"),
+        }
     }
 
     // --- Edge cases ---

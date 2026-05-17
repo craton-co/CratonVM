@@ -21,8 +21,25 @@ pub const JFR_MAGIC: [u8; 4] = [b'F', b'L', b'R', 0];
 
 /// JFR format major version
 pub const JFR_VERSION_MAJOR: u16 = 2;
-/// JFR format minor version
-pub const JFR_VERSION_MINOR: u16 = 0;
+/// JFR format minor version.
+///
+/// `0`: events store absolute `start_time` (nanos since epoch) as a
+///      compressed-long. The varint is typically 6-9 bytes since modern
+///      epoch nanos are > 2^60.
+/// `1`: round-5 Fix 3. Events store `start_time` as a delta from the
+///      chunk's `start_time_ns` (taken from the header). Within a chunk
+///      (typically < 1 second of wall time), deltas fit in 1-3 varint
+///      bytes, shrinking total event-region size by ~30-40%. `end_time`
+///      remains relative to `start_time` via the existing `duration`
+///      field — no change there.
+///
+/// Readers detect the format from the header's `minor` field and add
+/// `chunk_start_time` back when decoding `start_time`.
+pub const JFR_VERSION_MINOR: u16 = 1;
+
+/// Previous minor value that wrote absolute timestamps. Retained so the
+/// reader can still parse files produced by pre-round-5 writers.
+pub const JFR_VERSION_MINOR_ABSOLUTE_TS: u16 = 0;
 
 /// File header size in bytes.
 /// 4 (magic) + 2 (major) + 2 (minor) + 8*7 (file_size, checkpoint_offset,
@@ -280,8 +297,15 @@ fn write_string_bytes(buf: &mut Vec<u8>, bytes: &[u8], pool: Option<&StringPool>
 /// J2 (round-2): serialize one event into `scratch` (cleared first), then
 /// prefix-and-flush to `writer` — no per-event Vec allocations on the hot path.
 ///
-/// Layout: `[size: compressed_int] [type_id] [start_ticks] [duration_ticks]
+/// Layout: `[size: compressed_int] [type_id] [start_delta] [duration_ticks]
 ///          [thread_id] [fields...]`
+///
+/// Round-5 Fix 3: `start_delta = start_time - chunk_start_time` so that
+/// in-chunk timestamps (typically < 1 second apart) varint-encode to 1-3
+/// bytes instead of 6-9 bytes for absolute epoch-nanos. `chunk_start_time`
+/// comes from the header. Defensive saturating subtraction handles the
+/// (theoretically impossible) case of an event timestamped before the
+/// chunk start — it clamps to 0 rather than wrapping to a huge value.
 ///
 /// `scratch` only needs to be sized once at the call site (`Vec::with_capacity`
 /// for a typical event payload); the function reuses its existing allocation
@@ -295,10 +319,16 @@ fn serialize_event_into<W: Write>(
     thread_id: u64,
     fields: &[EventValue],
     pool: Option<&StringPool>,
+    chunk_start_time: u64,
 ) -> io::Result<()> {
     scratch.clear();
     write_compressed_int_into(scratch, type_id.0 as u64);
-    write_compressed_long_into(scratch, start_time as i64);
+    // Round-5 Fix 3: delta from chunk start. Saturating subtraction ensures
+    // we never wrap into negative i64 territory if a stray event arrives
+    // with a timestamp slightly before chunk_start_time (clock skew across
+    // threads, monotonic-clock backsteps).
+    let start_delta = start_time.saturating_sub(chunk_start_time);
+    write_compressed_long_into(scratch, start_delta as i64);
     let duration = end_time.saturating_sub(start_time);
     write_compressed_long_into(scratch, duration as i64);
     write_compressed_long_into(scratch, thread_id as i64);
@@ -657,6 +687,10 @@ pub fn dump_to_file(
 
         // Write events from the recording's repository first, preserving the
         // existing on-disk ordering relative to drained events.
+        //
+        // Round-5 Fix 3: pass `start_time_ns` as the chunk start so each
+        // event's `start_time` is written as a delta. This is the writer
+        // half of the JFR_VERSION_MINOR=1 wire-format change.
         for event in repository.iter() {
             serialize_event_into(
                 &mut scratch,
@@ -667,6 +701,7 @@ pub fn dump_to_file(
                 event.thread_id,
                 &event.fields,
                 pool_ref,
+                start_time_ns,
             )?;
         }
 
@@ -682,6 +717,7 @@ pub fn dump_to_file(
                 event.thread_id,
                 &event.fields,
                 pool_ref,
+                start_time_ns,
             )?;
         }
 
@@ -1037,6 +1073,13 @@ pub fn read_events(
             "invalid JFR magic bytes",
         )));
     }
+    // Round-5 Fix 3: pick up the minor version so we know whether the event
+    // `start_time` field encodes an absolute timestamp (minor=0) or a delta
+    // from `chunk_start_time` (minor=1). The chunk_start_time lives at bytes
+    // 32..40 (the header's `start_time_ns` field).
+    let minor = u16::from_be_bytes([data[6], data[7]]);
+    let chunk_start_time = u64::from_be_bytes(data[32..40].try_into().unwrap());
+    let timestamps_are_deltas = minor >= 1;
     let checkpoint_offset =
         u64::from_be_bytes(data[16..24].try_into().unwrap()) as usize;
     let metadata_offset =
@@ -1093,13 +1136,22 @@ pub fn read_events(
         rpos += tc;
         let type_id = EventTypeId(type_id_raw as u32);
 
-        let (start_time, sc) = decode_compressed_long(&data[rpos..]).ok_or_else(|| {
+        let (start_time_raw, sc) = decode_compressed_long(&data[rpos..]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "start_time decode failed",
             ))
         })?;
         rpos += sc;
+        // Round-5 Fix 3: minor=1 stores the on-wire field as a delta from
+        // the chunk's start_time; re-add it. minor=0 (legacy) stores
+        // absolute values — pass through unchanged so old `.jfr` files
+        // produced by pre-round-5 writers still decode correctly.
+        let start_time = if timestamps_are_deltas {
+            (start_time_raw as u64).saturating_add(chunk_start_time) as i64
+        } else {
+            start_time_raw
+        };
 
         let (duration, dc) = decode_compressed_long(&data[rpos..]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
@@ -1124,7 +1176,7 @@ pub fn read_events(
             ))
         })?;
 
-        let mut fields = Vec::with_capacity(ty.fields.len());
+        let mut fields = crate::event::EventFields::with_capacity(ty.fields.len());
         for field in &ty.fields {
             let (v, c) = decode_event_value(&data, rpos, &field.type_name, pool_ref)?;
             fields.push(v);
@@ -1149,6 +1201,7 @@ pub fn read_events(
 mod tests {
     use super::*;
     use crate::event::{EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventValue};
+    use smallvec::smallvec;
     use std::sync::Arc;
 
     // --- LEB128 encoding/decoding ---
@@ -1290,7 +1343,7 @@ mod tests {
             start_time: 1_000_000,
             end_time: 2_000_000,
             thread_id: 1,
-            fields: vec![
+            fields: smallvec![
                 EventValue::Int(42),
                 EventValue::String(Arc::from("hello")),
             ],
@@ -1300,7 +1353,7 @@ mod tests {
             start_time: 3_000_000,
             end_time: 4_000_000,
             thread_id: 2,
-            fields: vec![
+            fields: smallvec![
                 EventValue::Int(99),
                 EventValue::String(Arc::from("world")),
             ],
@@ -1375,7 +1428,7 @@ mod tests {
             start_time: 100,
             end_time: 200,
             thread_id: 1,
-            fields: vec![EventValue::Int(1), EventValue::from_str("x")],
+            fields: smallvec![EventValue::Int(1), EventValue::from_str("x")],
         });
 
         let dir = std::env::temp_dir().join("jfr_test_magic");
@@ -1422,7 +1475,7 @@ mod tests {
             start_time: 500,
             end_time: 600,
             thread_id: 0,
-            fields: vec![
+            fields: smallvec![
                 EventValue::Int(-7),
                 EventValue::Long(i64::MAX),
                 EventValue::Float(3.14),
@@ -1436,7 +1489,7 @@ mod tests {
             start_time: 700,
             end_time: 800,
             thread_id: 0,
-            fields: vec![
+            fields: smallvec![
                 EventValue::Int(0),
                 EventValue::Long(0),
                 EventValue::Float(0.0),
@@ -1470,7 +1523,7 @@ mod tests {
                 start_time: i * 1000,
                 end_time: i * 1000 + 500,
                 thread_id: i % 4,
-                fields: vec![
+                fields: smallvec![
                     EventValue::Int(i as i32),
                     EventValue::from_str(&format!("event_{}", i)),
                 ],
@@ -1505,7 +1558,7 @@ mod tests {
             start_time: 100,
             end_time: 200,
             thread_id: 1,
-            fields: vec![EventValue::Int(1), EventValue::from_str("a")],
+            fields: smallvec![EventValue::Int(1), EventValue::from_str("a")],
         });
 
         let dir = std::env::temp_dir().join("jfr_test_layout");
@@ -1622,7 +1675,7 @@ mod tests {
                 start_time: start,
                 end_time: start + 100,
                 thread_id: 7,
-                fields: vec![
+                fields: smallvec![
                     EventValue::Int(start as i32),
                     EventValue::from_str("from-ring"),
                 ],
@@ -1699,7 +1752,7 @@ mod tests {
                 start_time: start,
                 end_time: start + 1,
                 thread_id: 0,
-                fields: vec![EventValue::Int(0), EventValue::from_str("s")],
+                fields: smallvec![EventValue::Int(0), EventValue::from_str("s")],
             });
         }
 

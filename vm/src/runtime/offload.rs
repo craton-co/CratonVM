@@ -377,21 +377,47 @@ pub fn try_dispatch(
             //
             // AUDIT 2026-05-17 (round-9 misc CRIT-1): the marshal +
             // write-back dance is still pending hardware to validate,
-            // but exercise the new `CompiledKernel::launch` helper with
-            // a zero-grid no-arg config so the `launch_raw_no_sync`
-            // wiring has a real production caller. The CUDA driver
-            // tolerates a `grid=0` launch as a no-op; in the future
-            // (when the full marshal pipeline lands) this call site
-            // grows to pass real `KernelArgs` and an elementwise
-            // `LaunchConfig`, but the sync-vs-no-sync dispatch already
-            // routes through `CompiledKernel::launch` based on
-            // `signature.needs_d2h_sync`.
+            // but exercise the new `CompiledKernel::launch` helper so the
+            // `launch_raw_no_sync` wiring has a real production caller.
+            //
+            // AUDIT 2026-05-17 (round-10 PERF Fix 5): wire the autotune
+            // path. `LaunchConfig::elementwise_for_kernel` calls
+            // `DeviceModule::optimal_block_size` (which fans out to
+            // `cuOccupancyMaxPotentialBlockSize`) so the launch picks a
+            // kernel-specific block size instead of hardcoded 256.
+            //
+            // The grid is sized from the analyzer's `estimated_work`,
+            // which is the rough element count the kernel was lowered
+            // for. When the full marshal pipeline lands this becomes the
+            // real input length; for now it lets us validate the
+            // autotune query end-to-end on hardware (a grid of 0 would
+            // skip the actual launch and therefore the autotune call
+            // chain). On stub builds `optimal_block_size` returns `None`
+            // and `elementwise_for_kernel` falls back to block=256.
+            //
+            // **TODO(round-10, multi-kernel batching)**: today every
+            // launch site syncs implicitly via the post-launch event
+            // recorded by `launch_raw` (or skipped by `launch_raw_no_sync`).
+            // A multi-kernel batch — N kernels on the same compute
+            // stream, then one `ctx.synchronize()` — is strictly
+            // better when an interpreter frame issues several offloaded
+            // calls in a row. The cudarc stream model already supports
+            // this (back-to-back launches on `ctx.compute` are
+            // serialised in submission order), so the change is purely
+            // in the caller: collect N `CompiledKernel`s + arg buffers,
+            // call `launch_raw_no_sync` for each, then `synchronize()`
+            // once at the batch boundary. Plumbing that batch boundary
+            // through the interpreter dispatch hook is the missing
+            // piece — flagged here so a future bytecode-batching pass
+            // knows where to wire it.
             if let Some(ctx) = shared.offload_cache.device() {
-                let cfg = LaunchConfig {
-                    grid: (0, 1, 1),
-                    block: (1, 1, 1),
-                    shared_bytes: 0,
-                };
+                let n = kernel.signature.estimated_work.max(1) as u32;
+                let cfg = LaunchConfig::elementwise_for_kernel(
+                    &kernel.module,
+                    ctx,
+                    &kernel.kernel_name,
+                    n,
+                );
                 if let Err(e) = kernel.launch(ctx, &cfg, KernelArgs::new()) {
                     tracing::debug!(
                         "gpu offload: probe launch for {}.{}{} returned {e}; falling through",

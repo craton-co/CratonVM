@@ -76,6 +76,9 @@ libc = "0.2"
 tracing-subscriber.workspace = true
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# Round-5 JFR Fix 1: tests construct `EventInstance` literals directly and
+# the `fields` slot is now `SmallVec<[EventValue; 8]>`. Workspace-pinned.
+smallvec.workspace = true
 
 [[bench]]
 name = "vm_benchmarks"

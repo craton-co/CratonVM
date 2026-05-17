@@ -1441,6 +1441,55 @@ fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<usize> {
     None
 }
 
+/// Round-11 HIGH-2 helper — for array load/store opcodes at `pc`, try
+/// to identify the local index that sourced the *array receiver* on
+/// the operand stack. The standard javac pattern is:
+///
+///   `aload N; <push index>; <iaload/iastore/...>`
+///
+/// where `<push index>` is one of the single-byte index-loading
+/// opcodes (iload_0..3, iconst_*, bipush, sipush, iload) and the
+/// terminal opcode is the array load/store. When we recognise this
+/// pattern we return `Some(N)`; the caller consults
+/// `NullCheckInfo::is_nonnull(pc, N)` to decide whether the inline
+/// `TEST RAX, RAX; JZ stub` can be elided.
+///
+/// Returns `None` whenever the index push isn't a single-instruction
+/// form we recognise. The caller falls back to emitting the runtime
+/// check on `None` (always sound).
+fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
+    if pc == 0 {
+        return None;
+    }
+    // The instruction at `pc` is the array load/store itself. Walk
+    // backwards: the index-push is the previous instruction (1-3
+    // bytes), and the aload is the one before that.
+    let p_index = code[pc - 1];
+    let index_len: usize = match p_index {
+        // Single-byte index ops:
+        //   iconst_m1..iconst_5 (0x02..0x08), iload_0..3 (0x1A..0x1D),
+        //   dup (0x59 — when index is already on stack from a dup pair)
+        0x02..=0x08 | 0x1A..=0x1D | 0x59 => 1,
+        // Multi-byte: distinguish by the opcode byte at pc-2 / pc-3.
+        //   bipush <byte>  (0x10) — 2 bytes
+        //   iload  <u8>    (0x15) — 2 bytes
+        //   sipush <short> (0x11) — 3 bytes
+        _ if pc >= 2 && code[pc - 2] == 0x10 => 2,
+        _ if pc >= 2 && code[pc - 2] == 0x15 => 2,
+        _ if pc >= 3 && code[pc - 3] == 0x11 => 3,
+        _ => return None,
+    };
+    let aload_pc = pc.checked_sub(1 + index_len)?;
+    let aop = code[aload_pc];
+    if (0x2A..=0x2D).contains(&aop) {
+        return Some((aop - 0x2A) as usize);
+    }
+    if aop == 0x19 && aload_pc + 1 < pc {
+        return Some(code[aload_pc + 1] as usize);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Escape analysis
 // ---------------------------------------------------------------------------
@@ -3330,22 +3379,16 @@ impl Compiler {
     /// the forward-dataflow result computed by
     /// [`crate::null_check_elim::analyze`].
     ///
-    /// CRIT (round-5 review): The single forward-pass analysis in
-    /// `null_check_elim::analyze` is unsound — the mask at a forward
-    /// branch target reflects the linearly-prior path, not the actual
-    /// predecessor set (no meet-over-paths). Until a proper
-    /// dataflow/dominator analysis lands we disable the elimination by
-    /// returning `false` unconditionally; this preserves the wiring at
-    /// the call sites (ifnull/ifnonnull, getfield, invokevirtual,
-    /// arraylength) so we can re-enable it with a one-line revert once
-    /// the analysis is fixed.
-    ///
-    /// TODO(round-6-wave-2): implement meet-over-paths null check
-    /// analysis with proper dataflow (worklist + per-BB IN/OUT sets,
-    /// meet = bitwise AND across predecessors), then re-enable by
-    /// delegating to `self.null_check_info.is_nonnull(pc, local)`.
-    pub(crate) fn is_local_nonnull(&self, _pc: usize, _local: usize) -> bool {
-        false
+    /// Round-11 HIGH-1 fix: the round-7 safe-stub (`return false`)
+    /// is replaced with a real query against the meet-over-paths
+    /// dataflow result computed by [`crate::null_check_elim::analyze`].
+    /// The analysis is sound by construction (intersection at every
+    /// join point, monotone-descending lattice, fixpoint iteration
+    /// with a hard budget), so reporting `true` here is safe to use
+    /// for branch elision at `ifnull`/`ifnonnull` and for skipping
+    /// inline null-check stubs at array store/load sites.
+    pub(crate) fn is_local_nonnull(&self, pc: usize, local: usize) -> bool {
+        self.null_check_info.is_nonnull(pc, local)
     }
 
     /// Offset for local variable `idx`: [rbp - (idx+1)*8]
@@ -3413,6 +3456,43 @@ impl Compiler {
         slot
     }
 
+    /// Round-8 wave-3 HIGH fix (round-4 #15 / round-5 #9 / round-7 #5):
+    /// defensive callee-saved register spill before a safepoint.
+    ///
+    /// Any Java local assigned to a callee-saved GPR (RBX, R12-R15,
+    /// plus RSI/RDI on Windows) holds its live value EXCLUSIVELY in
+    /// the register between aload/astore opcodes. The slot-based oop
+    /// map and the conservative frame-region sweep both walk stack
+    /// memory only — they never read register values. Until per-local
+    /// oop typing lands (prerequisite for precise reg-oop encoding),
+    /// spill every register-resident local back to its canonical
+    /// frame slot `[rbp - (idx+1)*8]` immediately BEFORE the
+    /// safepoint-causing CALL. The conservative scanner will then
+    /// observe the live oop in the frame slot at GC time.
+    ///
+    /// The spill is conservative (non-oop locals are also flushed)
+    /// but correct: `conservative_roots::scan_one_frame_precise`
+    /// filters frame qwords via `heap.is_object_address`, so non-oop
+    /// values are ignored. Cost: ~3 bytes (REX + opcode + modrm/disp8)
+    /// per used callee-saved local per safepoint.
+    ///
+    /// TODO(round-12): precise reg-oop encoding to avoid spill cost.
+    /// Requires (a) per-local oop typing (currently only operand
+    /// stack has `stack_oop_marks`) and (b) `OopMapEntry::reg_oops`
+    /// bitmap consumed by the GC scanner walking saved-register slots
+    /// in the JIT prologue.
+    fn emit_pre_safepoint_spill(&mut self) {
+        if self.failed {
+            return;
+        }
+        for idx in 0..self.local_assignments.len() {
+            if let Some(reg) = self.local_assignments[idx] {
+                let off = self.local_offset(idx);
+                self.emit_store_local(off, reg);
+            }
+        }
+    }
+
     /// T1.1.a — record an oop map at the current native PC for the
     /// live frame slots that hold object references.
     ///
@@ -3439,32 +3519,6 @@ impl Compiler {
         if self.failed {
             return;
         }
-        // TODO(round-8, HIGH from round-5 #9 / round-4 #15): precise oop
-        // map currently only records `StackSlot::Frame` oops on the
-        // simulated operand stack. Java locals assigned to a callee-saved
-        // GPR (R12-R15, RBX, on Windows also RSI/RDI) hold their value
-        // exclusively in the register between aload/astore opcodes —
-        // those oops are invisible to the precise scanner. The
-        // conservative fallback in `vm/src/jit/conservative_roots.rs`
-        // does NOT read register values (it walks stack memory only),
-        // so a callee-saved register holding an oop at a safepoint can
-        // currently slip past root marking. We rely on the Rust runtime
-        // helpers' callee-saved-register preservation (the helper saves
-        // R12-R15/RBX in *its* prologue, where the conservative scan
-        // *does* find them on the Rust frame) for correctness today —
-        // any LTO inlining that erases the helper save would break
-        // this. The proper fix has two parts:
-        //   (1) Extend `OopMapEntry` with a `reg_oop_slot_offsets:
-        //       Vec<i16>` field that records the canonical frame slot
-        //       for each register-resident oop local that is live at
-        //       this safepoint;
-        //   (2) Emit `MOV [RBP - (idx+1)*8], reg` for each such local
-        //       immediately before the safepoint poll, so the
-        //       conservative sweep + the new precise slot list both
-        //       find the current value.
-        // Per-local oop-type tracking (we currently only track oop-ness
-        // of operand-stack entries via `stack_oop_marks`) is the
-        // prerequisite. Deferred to round-8.
         // T1.1.a — lazy resync. Non-instrumented `self.stack.push`
         // sites (aload local-to-CalleeSaved, inlined-callee pushes,
         // LICM hoists, XMM intermediate pushes) leave
@@ -4107,6 +4161,135 @@ impl Compiler {
     }
 
     // -----------------------------------------------------------------------
+    // Direct-call stack-arg setup (round-8 wave-3 HIGH fix)
+    //
+    // For direct CALL targets whose JIT entry uses Java-arg-in-ARG_REGS
+    // calling convention (with an optional hidden VM ctx in ARG_REGS[0]),
+    // we previously bailed when total args exceeded the register file.
+    // Now we materialize stack args using the platform ABI:
+    //
+    //   * Windows x64: caller reserves 32 bytes of shadow space *above*
+    //     stack args (the callee owns home slots for its first 4 reg
+    //     args). Stack args live at [rsp + 32], [rsp + 40], ...
+    //   * SysV (Linux/macOS): no shadow space. Stack args at [rsp],
+    //     [rsp + 8], ...
+    //
+    // Both ABIs require RSP ≡ 0 mod 16 immediately before the CALL.
+    // Our frame_size guarantees that on method entry RSP ≡ 0 mod 16
+    // (see emit_prologue alignment math). The total bytes subtracted
+    // for stack-arg setup must therefore also be 16-byte aligned: we
+    // round up by adding an 8-byte alignment pad when needed.
+    // -----------------------------------------------------------------------
+
+    /// MOV [rsp + disp32], reg — store 64-bit GPR to RSP-relative slot.
+    /// Used to materialize stack-passed args after `sub rsp, N`.
+    fn emit_mov_rsp_disp_from_reg(&mut self, disp: i32, reg: u8) {
+        // Encoding: REX.W [+R] 89 /r SIB
+        // [rsp + disp] requires a SIB byte (rm field = 100b means SIB follows).
+        // SIB: scale=00, index=100b (none), base=100b (rsp).
+        self.rex_w_r(reg);
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        if disp == 0 {
+            // mod=00, reg, r/m=100 (SIB)
+            self.buf.emit_byte(0x04 | ((reg & 7) << 3));
+            self.buf.emit_byte(0x24); // SIB: scale=00, index=100 (none), base=100 (rsp)
+        } else if (-128..=127).contains(&disp) {
+            // mod=01, reg, r/m=100 (SIB), disp8
+            self.buf.emit_byte(0x44 | ((reg & 7) << 3));
+            self.buf.emit_byte(0x24);
+            self.buf.emit_byte(disp as u8); // Cast: x86-64 immediate encoding
+        } else {
+            // mod=10, reg, r/m=100 (SIB), disp32
+            self.buf.emit_byte(0x84 | ((reg & 7) << 3));
+            self.buf.emit_byte(0x24);
+            self.buf.emit(&disp.to_le_bytes());
+        }
+    }
+
+    /// Compute the total bytes to subtract from RSP for a direct-call
+    /// stack-arg block carrying `stack_arg_count` qword args.
+    ///
+    /// Includes Win64 shadow space and 16-byte alignment pad. Returns
+    /// `(total_sub, stack_arg_disp_base)` where `stack_arg_disp_base`
+    /// is the RSP-relative displacement where arg[reg_count] lives
+    /// (subsequent args ascend by 8).
+    fn stack_arg_block_size(stack_arg_count: usize) -> (i32, i32) {
+        #[cfg(target_os = "windows")]
+        let (shadow, base) = (32i32, 32i32);
+        #[cfg(not(target_os = "windows"))]
+        let (shadow, base) = (0i32, 0i32);
+        let raw = shadow + (stack_arg_count as i32) * 8; // Cast: x86-64 immediate encoding
+        // Round up to 16 bytes to preserve RSP alignment at the CALL.
+        let total = (raw + 15) & !15;
+        (total, base)
+    }
+
+    /// Set up stack args for a direct JIT call.
+    ///
+    /// `arg_slots` are the source frame slots for the args (already
+    /// reversed, so `arg_slots[0]` is the first Java arg). `has_ctx`
+    /// indicates whether the callee expects the VM ctx pointer as a
+    /// hidden first ARG_REGS[0]; the Java args then go into
+    /// ARG_REGS[1..]. Returns the total bytes subtracted from RSP
+    /// (caller must pass this to `emit_stack_arg_cleanup` after CALL).
+    ///
+    /// Behaviour when all args fit in registers: emits no SUB RSP and
+    /// returns 0 (so callers in the small-arg fast path observe no
+    /// behavioural change).
+    fn emit_stack_arg_setup(
+        &mut self,
+        arg_slots: &[StackSlot],
+        has_ctx: bool,
+    ) -> i32 {
+        let ctx_offset = if has_ctx { 1 } else { 0 };
+        let total_regs_for_java = ARG_REGS.len() - ctx_offset;
+        let n = arg_slots.len();
+
+        // Reserve stack space first so that subsequent register loads
+        // from frame slots (via [rbp - off]) are not invalidated — RBP
+        // is unchanged by SUB RSP.
+        let stack_arg_count = n.saturating_sub(total_regs_for_java);
+        let (total_sub, base_disp) = Self::stack_arg_block_size(stack_arg_count);
+        if total_sub > 0 {
+            self.emit_sub_rsp_imm(total_sub);
+        }
+
+        // Materialize stack args first (these may use RAX as a
+        // scratch, which we restore for the reg-arg pass below).
+        // Iterate forward — order doesn't matter since each store
+        // targets a distinct RSP slot.
+        if stack_arg_count > 0 {
+            for k in 0..stack_arg_count {
+                let java_idx = total_regs_for_java + k;
+                let disp = base_disp + (k as i32) * 8; // Cast: x86-64 immediate encoding
+                self.load_slot_to_reg(RAX, arg_slots[java_idx]);
+                self.emit_mov_rsp_disp_from_reg(disp, RAX);
+            }
+        }
+
+        // Now load reg-passed args. Do the ctx load LAST so it
+        // overwrites RCX/RDI cleanly even if a Java arg happened to
+        // be sourced from that register before frame promotion.
+        let reg_arg_count = n.min(total_regs_for_java);
+        for i in 0..reg_arg_count {
+            self.load_slot_to_reg(ARG_REGS[i + ctx_offset], arg_slots[i]);
+        }
+        if has_ctx {
+            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        }
+
+        total_sub
+    }
+
+    /// Tear down the stack-arg block emitted by `emit_stack_arg_setup`.
+    /// Must be called immediately after the CALL returns.
+    fn emit_stack_arg_cleanup(&mut self, total_sub: i32) {
+        if total_sub > 0 {
+            self.emit_add_rsp_imm(total_sub);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Peephole: constant + arithmetic fusion
     // -----------------------------------------------------------------------
 
@@ -4357,6 +4540,168 @@ impl Compiler {
         self.reset_spills();
 
         Some(next_op_pc + 3)
+    }
+
+    // -----------------------------------------------------------------------
+    // peephole-cmov — Round-11 HIGH-3
+    //
+    // Detect the user-written equivalent of `Math.min` / `Math.max`:
+    //
+    //     iload a            // val1
+    //     iload b            // val2
+    //     if_icmpXX L1       // 3 bytes
+    //     iload a-or-b       // 1 byte   (INSTR_A: the "taken-false" value)
+    //     goto    L2         // 3 bytes
+    //   L1:
+    //     iload b-or-a       // 1 byte   (INSTR_B: the "taken-true" value)
+    //   L2:
+    //
+    // and lower it to `CMP / MOV / CMOV` instead of a branch. The
+    // explicit `Math.min(a,b)` invokestatic intrinsic is handled
+    // separately in the invoke dispatcher; this peephole catches the
+    // inlined source-level pattern. Conservative: only the canonical
+    // javac shape where INSTR_A and INSTR_B are 1-byte `iload_0..3`
+    // of two *different* locals X and Y, and the immediately-
+    // preceding operand loads (also `iload_0..3`) are the same two
+    // locals in some order.
+    // -----------------------------------------------------------------------
+
+    /// Lookup `iload_0..3` opcode → local index. Returns `None` for
+    /// any other opcode.
+    fn iload_short_local(op: u8) -> Option<usize> {
+        if (0x1A..=0x1D).contains(&op) {
+            Some((op - 0x1A) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Try to emit the if_icmp + iload + goto + iload min/max peephole
+    /// as a branchless CMOV sequence. Called at the start of the
+    /// if_icmp opcode handler at PC `pc`. If the peephole fires, all
+    /// 4 source instructions (if_icmp, INSTR_A, goto, INSTR_B) are
+    /// consumed; the function emits CMP+MOV+CMOV and returns
+    /// `Some(new_pc)` — the PC to resume from (= the merge point L2).
+    /// On `None` the caller emits the regular branch sequence.
+    ///
+    /// Pre-condition: `val1` and `val2` are the popped operands of
+    /// the if_icmp (val1 is the deeper one). The caller MUST NOT
+    /// have emitted the CMP or any output yet.
+    fn try_cmov_minmax_peephole(
+        &mut self,
+        code: &[u8],
+        pc: usize,
+        op: u8,
+        val1: StackSlot,
+        val2: StackSlot,
+    ) -> Option<usize> {
+        // Only handle if_icmplt / if_icmpge.
+        if !matches!(op, 0xa1 | 0xa2) {
+            return None;
+        }
+        if pc + 3 > code.len() {
+            return None;
+        }
+        // if_icmp branch offset
+        let off1 = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+        let l1_pc = (pc as i32).checked_add(off1)?;
+        if l1_pc < 0 {
+            return None;
+        }
+        let l1_pc = l1_pc as usize;
+
+        // INSTR_A at pc+3 must be iload_0..3 (1 byte).
+        let a_pc = pc + 3;
+        if a_pc >= code.len() {
+            return None;
+        }
+        let a_local = Self::iload_short_local(code[a_pc])?;
+
+        // Next instruction must be `goto` (0xa7) at pc+4.
+        let goto_pc = a_pc + 1;
+        if goto_pc + 3 > code.len() || code[goto_pc] != 0xa7 {
+            return None;
+        }
+        let goto_off = ((code[goto_pc + 1] as i16) << 8 | code[goto_pc + 2] as i16) as i32;
+        let l2_pc = (goto_pc as i32).checked_add(goto_off)?;
+        if l2_pc < 0 {
+            return None;
+        }
+        let l2_pc = l2_pc as usize;
+
+        // INSTR_B at the if_icmp branch target. Must be exactly the
+        // byte after the `goto` (i.e. pc+7).
+        let b_pc = l1_pc;
+        if b_pc != goto_pc + 3 || b_pc >= code.len() {
+            return None;
+        }
+        let b_local = Self::iload_short_local(code[b_pc])?;
+
+        // L2 must point at the byte right after INSTR_B (b_pc + 1).
+        if l2_pc != b_pc + 1 {
+            return None;
+        }
+
+        // The two inner loads must be of two *different* locals.
+        if a_local == b_local {
+            return None;
+        }
+
+        // The two if_icmp operands must come from `iload_0..3` of the
+        // same two locals (in some order). Canonical pattern:
+        //   iload_X (1 byte) ; iload_Y (1 byte) ; if_icmpXX
+        if pc < 2 {
+            return None;
+        }
+        let v1_local = Self::iload_short_local(code[pc - 2])?;
+        let v2_local = Self::iload_short_local(code[pc - 1])?;
+        let mut pair = [v1_local, v2_local];
+        pair.sort_unstable();
+        let mut inner = [a_local, b_local];
+        inner.sort_unstable();
+        if pair != inner {
+            return None;
+        }
+
+        // ---- All checks passed. Emit branchless CMOV. ------------------
+        let r1 = self.slot_to_gpr(val1, RAX);
+        let r2 = self.slot_to_gpr(val2, RCX);
+        self.emit_cmp_r32_r32(r1, r2);
+        // Load INSTR_A's value (fall-through) into RAX.
+        let a_off = self.local_offset(a_local);
+        self.emit_load_local(RAX, a_off);
+        // Load INSTR_B's value (taken) into RCX.
+        let b_off = self.local_offset(b_local);
+        self.emit_load_local(RCX, b_off);
+        // CMOVcc EAX, ECX (no REX.W; iload values are 32-bit ints):
+        //   0xa1 → JL  → CMOVL  (0x4C)
+        //   0xa2 → JGE → CMOVGE (0x4D)
+        let cmov_cc = match op {
+            0xa1 => 0x4Cu8,
+            0xa2 => 0x4Du8,
+            _ => return None,
+        };
+        // peephole-cmov: branchless lowering of user-written min/max.
+        self.buf.emit(&[0x0F, cmov_cc, 0xC1]);
+        // Push RAX as the merged result.
+        self.push_from_rax();
+
+        // Map every consumed bytecode PC to the current native offset
+        // so downstream PC-keyed lookups still find a valid destination.
+        let native = self.buf.pos() as i32;
+        for p in pc..=l2_pc {
+            if p < self.pc_to_native.len() {
+                self.pc_to_native[p] = native;
+            }
+        }
+        // Record the merge-point stack depth so the dispatch loop's
+        // merge-point canonicalization (if it kicks in at L2) sees a
+        // consistent expectation. We just pushed one value.
+        self.branch_target_stack_depth
+            .entry(l2_pc)
+            .or_insert(self.stack.len());
+
+        Some(l2_pc)
     }
 
     /// Emit optimized multiply by a known constant (result in EAX, sign-extended to RAX).
@@ -7366,6 +7711,29 @@ impl Compiler {
         self.null_check_store_stubs.push(patch_offset);
     }
 
+    /// Round-11 HIGH-2: variant of `emit_null_check_array_store` that
+    /// elides the inline TEST/JZ entirely when the null-check
+    /// elimination dataflow proves the array receiver came from a
+    /// local that is known non-null at this bytecode PC. The decision
+    /// is made by walking the bytecode 1-4 bytes back from `bc_pc` to
+    /// find the `aload N; <index>; <arraystore>` pattern via
+    /// [`array_receiver_local`]; if found AND the local is proven
+    /// non-null, the entire TEST/JZ pair is skipped (5 bytes saved
+    /// per occurrence + branch-predictor pressure reduction).
+    ///
+    /// Safe to call instead of `emit_null_check_array_store` at every
+    /// inline array-store site; the conservative path is identical.
+    fn emit_null_check_array_store_at(&mut self, code: &[u8], bc_pc: usize) {
+        if let Some(local) = array_receiver_local(code, bc_pc) {
+            if self.is_local_nonnull(bc_pc, local) {
+                // peephole-null-elim: dataflow proves non-null; skip
+                // the 8-byte TEST/JZ sequence entirely.
+                return;
+            }
+        }
+        self.emit_null_check_array_store();
+    }
+
     /// Round-9 HIGH fix (asymmetric coverage): emit an inline null check
     /// on the array receiver (assumed already in RAX) for an inline
     /// array-LOAD opcode (iaload / aaload / baload / caload / saload /
@@ -7389,6 +7757,20 @@ impl Compiler {
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
         self.null_check_store_stubs.push(patch_offset);
+    }
+
+    /// Round-11 HIGH-2 (mirrors `emit_null_check_array_store_at`):
+    /// elide the inline TEST/JZ null check on array loads when the
+    /// receiver is proven non-null at `bc_pc` by the dataflow.
+    fn emit_null_check_array_load_at(&mut self, code: &[u8], bc_pc: usize) {
+        if let Some(local) = array_receiver_local(code, bc_pc) {
+            if self.is_local_nonnull(bc_pc, local) {
+                // peephole-null-elim: dataflow proves non-null; skip
+                // the 8-byte TEST/JZ sequence entirely.
+                return;
+            }
+        }
+        self.emit_null_check_array_load();
     }
 
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
@@ -8633,7 +9015,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §iaload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.emit_int_aload_regs();
                     self.push_from_rax();
@@ -8647,7 +9029,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §aaload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.emit_ref_aload_regs();
                     self.push_from_rax();
@@ -8663,7 +9045,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §laload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.emit_long_aload_regs();
                     self.push_from_rax();
@@ -8677,7 +9059,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §faload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     // Float is 4 bytes, same as int; value is stored as bit pattern
                     self.emit_int_aload_regs();
@@ -8692,7 +9074,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §daload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     // Double is 8 bytes, same as long; value is stored as bit pattern
                     self.emit_long_aload_regs();
@@ -8707,7 +9089,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §baload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.emit_byte_aload_regs();
                     self.push_from_rax();
@@ -8721,7 +9103,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §caload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.emit_char_aload_regs();
                     self.push_from_rax();
@@ -8735,7 +9117,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-9 HIGH fix: NPE on null array (JVMS §saload).
-                    self.emit_null_check_array_load();
+                    self.emit_null_check_array_load_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.emit_short_aload_regs();
                     self.push_from_rax();
@@ -8895,7 +9277,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §iastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_int_astore_regs();
@@ -8924,7 +9306,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
                     // Inline-load the OLD reference at the slot and pipe it
@@ -8975,7 +9357,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §lastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_long_astore_regs();
@@ -8990,7 +9372,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §fastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     match val_slot {
                         StackSlot::Xmm(xmm) => {
@@ -9023,7 +9405,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §dastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     // Optimize: if value is in XMM, use MOVSD to store directly to memory
                     match val_slot {
@@ -9057,7 +9439,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §bastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_byte_astore_regs();
@@ -9072,7 +9454,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §castore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
@@ -9087,7 +9469,7 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §sastore).
-                    self.emit_null_check_array_store();
+                    self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
@@ -9839,6 +10221,23 @@ impl Compiler {
 
                     let val2 = self.pop_stack(); // value2
                     let val1 = self.pop_stack(); // value1
+
+                    // peephole-cmov (Round-11 HIGH-3): user-written
+                    // min/max pattern → CMOV. The peephole consumes
+                    // the if_icmp, the fall-through iload, the goto,
+                    // and the taken-side iload all at once; on hit
+                    // we resume at the merge PC L2.
+                    if let Some(new_pc) =
+                        self.try_cmov_minmax_peephole(code, pc, op, val1, val2)
+                    {
+                        // Map the original if_icmp PC to the start of
+                        // the CMOV sequence so downstream branch
+                        // resolution keeps working.
+                        pc = new_pc;
+                        self.reset_spills();
+                        continue;
+                    }
+
                     // Canonicalize remaining stack for forward merge points
                     if target_pc > pc && !self.stack.is_empty() {
                         self.canonicalize_stack();
@@ -10744,28 +11143,24 @@ impl Compiler {
                             let is_sibling_tail = tail_op_matches
                                 && callee_needs_ctx == self.needs_heap;
 
-                            if is_sibling_tail {
-                                // CRIT (round-5 review): the `if i+1 <
-                                // ARG_REGS.len()` / `if i < ARG_REGS.len()`
-                                // guards below silently drop arguments
-                                // past the register file, corrupting the
-                                // callee's locals. Until stack-arg setup
-                                // lands, bail the entire method back to
-                                // the interpreter when a direct call would
-                                // need stack args.
-                                //
-                                // TODO(round-6-wave-2): emit stack-arg
-                                // setup for >ARG_REGS direct calls (Win64:
-                                // 4 home slots + stack push; SysV: 16-byte
-                                // alignment + stack push).
-                                let reg_limit = if callee_needs_ctx {
-                                    ARG_REGS.len() - 1
-                                } else {
-                                    ARG_REGS.len()
-                                };
-                                if arg_slots.len() > reg_limit {
-                                    return false;
-                                }
+                            // Round-8 wave-3: sibling-tail demotion.
+                            // Tail-calling with stack args is non-trivial
+                            // — args would have to be re-materialized
+                            // *after* the epilogue restores RSP, which
+                            // requires an additional shuffle buffer.
+                            // Simpler and still correct: demote to a
+                            // non-tail CALL when the arg count would
+                            // require stack passing. The fall-through
+                            // below handles that case with the proper
+                            // stack-arg setup helper.
+                            let sibling_reg_limit = if callee_needs_ctx {
+                                ARG_REGS.len() - 1
+                            } else {
+                                ARG_REGS.len()
+                            };
+                            let sibling_tail_ok =
+                                is_sibling_tail && arg_slots.len() <= sibling_reg_limit;
+                            if sibling_tail_ok {
                                 // Load args into ABI registers, tear
                                 // down our frame, then JMP.
                                 if callee_needs_ctx {
@@ -10795,44 +11190,25 @@ impl Compiler {
                                 continue;
                             }
 
-                            // CRIT (round-5 review): the `if i+1 <
-                            // ARG_REGS.len()` / `if i < ARG_REGS.len()`
-                            // guards below silently drop arguments past
-                            // the register file. Bail the entire method
-                            // to the interpreter when a direct call would
-                            // need stack args.
-                            //
-                            // TODO(round-6-wave-2): emit stack-arg setup
-                            // for >ARG_REGS direct calls.
-                            let reg_limit = if callee_needs_ctx {
-                                ARG_REGS.len() - 1
-                            } else {
-                                ARG_REGS.len()
-                            };
-                            if arg_slots.len() > reg_limit {
-                                return false;
-                            }
-                            if callee_needs_ctx {
-                                // Callee needs VM context as hidden first arg
-                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                                for (i, slot) in arg_slots.iter().enumerate() {
-                                    if i + 1 < ARG_REGS.len() {
-                                        self.load_slot_to_reg(ARG_REGS[i + 1], *slot);
-                                    }
-                                }
-                            } else {
-                                for (i, slot) in arg_slots.iter().enumerate() {
-                                    if i < ARG_REGS.len() {
-                                        self.load_slot_to_reg(ARG_REGS[i], *slot);
-                                    }
-                                }
-                            }
+                            // Round-8 wave-3 HIGH fix: stack-arg setup
+                            // for direct calls whose total arg count
+                            // exceeds ARG_REGS. Uses platform ABI
+                            // (Win64 32-byte shadow + stack; SysV pure
+                            // stack), 16-byte aligned at the CALL site.
+                            let total_sub = self.emit_stack_arg_setup(
+                                &arg_slots,
+                                callee_needs_ctx,
+                            );
+                            // Round-8 wave-3: defensive callee-saved spill
+                            // before any GC-triggering CALL.
+                            self.emit_pre_safepoint_spill();
                             // Emit direct CALL to callee entry point
                             self.emit_call_absolute(callee_entry);
                             // T1.1.2 — direct call to a JIT-compiled
                             // callee is still a safepoint: the callee
                             // may allocate and trigger GC transitively.
                             self.emit_oop_map_for_safepoint();
+                            self.emit_stack_arg_cleanup(total_sub);
 
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {
@@ -10886,6 +11262,9 @@ impl Compiler {
                             self.emit_xor_reg_self(ARG_REGS[2]);
                         }
                         self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
+                        // Round-8 wave-3: defensive callee-saved spill
+                        // before any GC-triggering CALL.
+                        self.emit_pre_safepoint_spill();
                         self.emit_call_absolute(self.helpers.invoke_dispatch);
                         // T1.1.2 — invoke dispatch is a full safepoint:
                         // the callee may allocate, trigger GC, or throw.
@@ -10956,41 +11335,23 @@ impl Compiler {
                             continue;
                         }
 
-                        // CRIT (round-5 review): the `if i+1 <
-                        // ARG_REGS.len()` / `if i < ARG_REGS.len()`
-                        // guards below silently drop self-call args
-                        // past the register file. Bail to interpreter
-                        // when the recursive call would need stack args.
-                        //
-                        // TODO(round-6-wave-2): emit stack-arg setup
-                        // for >ARG_REGS self-recursive calls.
-                        let reg_limit = if self.needs_heap {
-                            ARG_REGS.len() - 1
-                        } else {
-                            ARG_REGS.len()
-                        };
-                        if arg_slots.len() > reg_limit {
-                            return false;
-                        }
-                        // Normal self-call via CALL
-                        if self.needs_heap {
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            for (i, slot) in arg_slots.iter().enumerate() {
-                                if i + 1 < ARG_REGS.len() {
-                                    self.load_slot_to_reg(ARG_REGS[i + 1], *slot);
-                                }
-                            }
-                        } else {
-                            for (i, slot) in arg_slots.iter().enumerate() {
-                                if i < ARG_REGS.len() {
-                                    self.load_slot_to_reg(ARG_REGS[i], *slot);
-                                }
-                            }
-                        }
+                        // Round-8 wave-3 HIGH fix: stack-arg setup for
+                        // self-recursive direct calls past ARG_REGS.
+                        let total_sub = self.emit_stack_arg_setup(
+                            &arg_slots,
+                            self.needs_heap,
+                        );
+                        // Round-8 wave-3: defensive callee-saved spill
+                        // before the recursive CALL (which transitively
+                        // can allocate and reach a GC safepoint).
+                        self.emit_pre_safepoint_spill();
+                        // Normal self-call via CALL (rel32, patched
+                        // post-emission).
                         self.buf.emit_byte(0xE8);
                         let call_patch = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.self_call_patches.push(call_patch);
+                        self.emit_stack_arg_cleanup(total_sub);
                         self.push_from_rax();
                     }
                     pc += 3;
@@ -11034,39 +11395,18 @@ impl Compiler {
                         }
                         arg_slots.reverse();
 
-                        // CRIT (round-5 review): the `if i+1 <
-                        // ARG_REGS.len()` / `if i < ARG_REGS.len()`
-                        // guards below silently drop invokespecial /
-                        // invokevirtual direct-call args past the
-                        // register file (receiver + params combined).
-                        // Bail the entire method to the interpreter when
-                        // a direct call would need stack args.
-                        //
-                        // TODO(round-6-wave-2): emit stack-arg setup
-                        // for >ARG_REGS direct invokespecial/virtual.
-                        let reg_limit = if callee_needs_ctx {
-                            ARG_REGS.len() - 1
-                        } else {
-                            ARG_REGS.len()
-                        };
-                        if arg_slots.len() > reg_limit {
-                            return false;
-                        }
-                        if callee_needs_ctx {
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            for (i, slot) in arg_slots.iter().enumerate() {
-                                if i + 1 < ARG_REGS.len() {
-                                    self.load_slot_to_reg(ARG_REGS[i + 1], *slot);
-                                }
-                            }
-                        } else {
-                            for (i, slot) in arg_slots.iter().enumerate() {
-                                if i < ARG_REGS.len() {
-                                    self.load_slot_to_reg(ARG_REGS[i], *slot);
-                                }
-                            }
-                        }
+                        // Round-8 wave-3 HIGH fix: stack-arg setup for
+                        // invokespecial/virtual direct calls whose
+                        // receiver+params exceed ARG_REGS.
+                        let total_sub = self.emit_stack_arg_setup(
+                            &arg_slots,
+                            callee_needs_ctx,
+                        );
+                        // Round-8 wave-3: defensive callee-saved spill
+                        // before any GC-triggering CALL.
+                        self.emit_pre_safepoint_spill();
                         self.emit_call_absolute(callee_entry);
+                        self.emit_stack_arg_cleanup(total_sub);
 
                         if ret_type != b'V' {
                             if matches!(ret_type, b'D' | b'F') {
@@ -11555,6 +11895,10 @@ impl Compiler {
                             }
                             self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
 
+                            // Round-8 wave-3: defensive callee-saved spill
+                            // before any GC-triggering dispatch CALL.
+                            self.emit_pre_safepoint_spill();
+
                             if let Some(mic) = mic_ptr {
                                 // MIC-optimized dispatch: pass MIC slot as 5th
                                 // arg and (CRIT-1) PIC slot as 6th arg so the
@@ -11675,6 +12019,9 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], atype);
                     // count → ARG_REGS[2]
                     self.load_slot_to_reg(ARG_REGS[2], count_slot);
+                    // Round-8 wave-3: defensive callee-saved spill
+                    // before any GC-triggering CALL.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.newarray);
                     // T1.1.a — `newarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
@@ -11741,6 +12088,11 @@ impl Compiler {
                             && total_size <= 256
                             && self.needs_heap; // need vm_ptr in heap_local slot
 
+                        // Round-8 wave-3: defensive callee-saved spill
+                        // before the `new` safepoint (both inline TLAB
+                        // and slow-path helper can reach GC via
+                        // jit_post_tlab_init / new_object).
+                        self.emit_pre_safepoint_spill();
                         if can_inline {
                             // CRIT-2 — when neither primitive-init nor
                             // finalizer registration is required, skip
@@ -11806,6 +12158,9 @@ impl Compiler {
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                     self.emit_mov_imm32_sx(ARG_REGS[1], component_class_id_raw as i32); // Cast: x86-64 immediate encoding
                     self.load_slot_to_reg(ARG_REGS[2], count_slot);
+                    // Round-8 wave-3: defensive callee-saved spill
+                    // before any GC-triggering CALL.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.anewarray_object);
                     // T1.1.a — `anewarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
@@ -11898,6 +12253,9 @@ impl Compiler {
                     self.load_slot_to_reg(ARG_REGS[1], obj_slot); // obj_ptr
                     self.emit_mov_imm64(ARG_REGS[2], name_ptr as i64); // class_name_ptr // Cast: JIT ABI convention
                     self.emit_mov_imm64(ARG_REGS[3], name_len as i64); // class_name_len // Cast: JIT ABI convention
+                    // Round-8 wave-3: defensive callee-saved spill
+                    // before any GC-triggering CALL.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.checkcast);
                     // T1.1.2 — checkcast may resolve the target class
                     // on demand (first access) which allocates a
@@ -11929,6 +12287,9 @@ impl Compiler {
                     self.load_slot_to_reg(ARG_REGS[1], obj_slot); // obj_ptr
                     self.emit_mov_imm64(ARG_REGS[2], name_ptr as i64); // class_name_ptr // Cast: JIT ABI convention
                     self.emit_mov_imm64(ARG_REGS[3], name_len as i64); // class_name_len // Cast: JIT ABI convention
+                    // Round-8 wave-3: defensive callee-saved spill
+                    // before any GC-triggering CALL.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.instanceof_check);
                     // T1.1.2 — instanceof may resolve the target class
                     // on demand, allocating a Class mirror. Emit the
@@ -11965,6 +12326,9 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], leaf_et);
                     self.load_slot_to_reg(ARG_REGS[2], dim1_slot);
                     self.load_slot_to_reg(ARG_REGS[3], dim2_slot);
+                    // Round-8 wave-3: defensive callee-saved spill
+                    // before any GC-triggering CALL.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.multianewarray_2d);
                     // T1.1.2 — multianewarray is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
@@ -12238,6 +12602,30 @@ pub fn compile(
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
     let hoist_info = find_loop_hoists(code, code_len, &loops);
+
+    // Round-8 wave-3 HIGH fix (Fix 3): generic LICM scaffold for
+    // getfield/getstatic loads. The analysis is invoked here so the
+    // pipeline links against the new `loop_analysis` module and
+    // pattern surfaces during compilation; the result is currently
+    // discarded because hoisting itself requires safepoint /
+    // oop-map / regalloc participation that is intentionally
+    // deferred to a later round (see `loop_analysis.rs` module doc).
+    //
+    // TODO(round-12+): wire the returned `InvariantLoad` records
+    // into the emitter as a pre-header hoist consumer alongside the
+    // existing `LoopHoist` (aaload) and `FpLoopHoist` (dload)
+    // mechanisms.
+    {
+        let licm_loops = crate::loop_analysis::detect_loops(code, code_len);
+        let mut total = 0usize;
+        for li in &licm_loops {
+            let v = crate::loop_analysis::find_invariant_loads(li, code);
+            total += v.len();
+        }
+        // Suppress dead_code warnings on the analysis output without
+        // changing emission behavior.
+        let _ = total;
+    }
 
     // T5.2.1 — SCEV induction variable analysis.
     //
@@ -13973,6 +14361,69 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let m3 = unsafe { compiled_max.call(&[-7, 4]) };
         assert_eq!(m3, 4, "Math.max(-7, 4) must be 4 (was {m3})");
+    }
+
+    /// Round-11 HIGH-3 — `peephole-cmov`: verify the user-written
+    /// equivalent of `Math.min(a, b)` — written as `(a < b) ? a : b`
+    /// — gets lowered to a branchless CMOV by
+    /// `try_cmov_minmax_peephole`. The bytecode is what javac emits
+    /// for that source expression:
+    ///
+    ///     [0] 0x1A             iload_0           a
+    ///     [1] 0x1B             iload_1           b
+    ///     [2] 0xa2 0x00 0x07   if_icmpge → PC 9  (taken when a >= b)
+    ///     [5] 0x1A             iload_0           "take a"
+    ///     [6] 0xa7 0x00 0x04   goto    → PC 10
+    ///     [9] 0x1B             iload_1           "take b"
+    ///     [10] 0xac            ireturn
+    #[test]
+    fn test_compile_user_written_min_idiom_cmov() {
+        let code: Vec<u8> = vec![
+            0x1A,             // 0:  iload_0
+            0x1B,             // 1:  iload_1
+            0xa2, 0x00, 0x07, // 2:  if_icmpge → PC 9
+            0x1A,             // 5:  iload_0   (fall-through: a < b → take a)
+            0xa7, 0x00, 0x04, // 6:  goto → PC 10
+            0x1B,             // 9:  iload_1   (taken: a >= b → take b)
+            0xac,             // 10: ireturn
+            0, 0,             // padding
+        ];
+        let code_len = 11;
+
+        let compiled = compile(
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        // Semantics: (a < b) ? a : b == min(a, b).
+        // SAFETY: Calling JIT-compiled machine code in a test; the
+        // CompiledMethod was produced by the JIT compiler from valid
+        // bytecode and the mmap region is executable.
+        let r1 = unsafe { compiled.call(&[3, 5]) };
+        assert_eq!(r1, 3, "user-min(3, 5) must be 3 (was {r1})");
+        // SAFETY: same as above
+        let r2 = unsafe { compiled.call(&[5, 3]) };
+        assert_eq!(r2, 3, "user-min(5, 3) must be 3 (was {r2})");
+        // SAFETY: same as above
+        let r3 = unsafe { compiled.call(&[-7, 4]) };
+        assert_eq!(r3, -7, "user-min(-7, 4) must be -7 (was {r3})");
+        // Equal inputs: (a < b) is false → take b == a.
+        // SAFETY: same as above
+        let r4 = unsafe { compiled.call(&[42, 42]) };
+        assert_eq!(r4, 42, "user-min(42, 42) must be 42 (was {r4})");
     }
 
     #[test]

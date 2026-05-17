@@ -257,16 +257,53 @@ fn native_jarfile_get_entry(
     let size = entry.size() as i64;
     let csize = entry.compressed_size() as i64;
     let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-    let method: i64 = match entry.compression() {
-        zip::CompressionMethod::Stored => 0,
-        _ => 8,
-    };
+    // Round-9 HIGH: do NOT collapse non-Deflate methods to DEFLATED(8).
+    // A previous shortcut returned 8 for every non-stored method; later
+    // code paths that select an inflate decompressor based on `method`
+    // then ran zlib on a BZIP2/LZMA payload, producing corrupt bytes.
+    // Map to the standard ZIP method codes so consumers see the real
+    // compression scheme. Unknown methods get -1 (not a valid ZIP code)
+    // so they fail loudly rather than being misinterpreted.
+    let method: i64 = compression_method_code(&entry.compression());
     drop(entry);
     drop(table);
 
     Ok(Some(Value::Object(Some(alloc_zip_entry(
         ctx, &entry_name, method, size, csize, crc,
     )))))
+}
+
+/// Map a `zip::CompressionMethod` to the standard ZIP method code (per
+/// the APPNOTE.TXT specification: 0=STORED, 8=DEFLATED, 12=BZIP2,
+/// 14=LZMA, etc).
+///
+/// Round-9 HIGH (native-misc): previously we collapsed everything that
+/// wasn't `Stored` to 8 (DEFLATED). Java callers (including the JDK's
+/// `ZipFile.getInputStream` infrastructure if it ever ran on this entry,
+/// and user code inspecting `ZipEntry.getMethod()`) then assumed a zlib
+/// payload — inflating BZIP2/LZMA bytes silently produced corrupted
+/// output. We now publish the real method code so callers can detect
+/// the unsupported scheme and throw `ZipException` instead of decoding
+/// garbage. Variants we don't have feature-compiled at all are reached
+/// via the `Unsupported(u16)` arm and we propagate the raw code as-is.
+#[allow(deprecated)]
+fn compression_method_code(m: &zip::CompressionMethod) -> i64 {
+    // We avoid `serialize_to_u16` (pub(crate)) and `to_u16` (deprecated)
+    // by pattern matching the variants present in the build. The deflate
+    // feature is always on in our workspace `Cargo.toml`; other features
+    // (bzip2, lzma, zstd, xz, deflate64, aes-crypto) are off by default,
+    // so non-Stored / non-Deflated methods come through as the catch-all.
+    match m {
+        zip::CompressionMethod::Stored => 0,
+        zip::CompressionMethod::Deflated => 8,
+        // `Unsupported(v)` carries the raw 2-byte method code from the
+        // ZIP central directory. Returning it verbatim is what the JDK
+        // does on read: `ZipEntry.method` exposes the raw value and
+        // `ZipFile.getInputStream` throws `ZipException("invalid CEN
+        // header (bad compression method: X)")`. Until we wire that
+        // path the value still warns Java code via `getMethod() != 8`.
+        other => i64::from(other.to_u16()),
+    }
 }
 
 fn alloc_zip_entry(
@@ -463,10 +500,9 @@ fn native_jarfile_entries(
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
             if let Ok(f) = state.archive.by_index_raw(i) {
-                let method: i64 = match f.compression() {
-                    zip::CompressionMethod::Stored => 0,
-                    _ => 8,
-                };
+                // Round-9 HIGH: real ZIP method code, not a DEFLATED stand-in.
+                // See `compression_method_code` for the mapping rationale.
+                let method: i64 = compression_method_code(&f.compression());
                 v.push((
                     f.name().to_string(),
                     method,

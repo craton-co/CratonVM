@@ -20,6 +20,7 @@ pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+pub mod loop_analysis;
 pub mod platform;
 pub mod profile;
 pub mod escape_analysis;
@@ -1693,6 +1694,55 @@ fn compute_jit_key_hash(class: &str, method: &str, desc: &str) -> u64 {
 /// after a hash hit — this protects against (rare) hash collisions
 /// while eliminating the three `Arc<str>` clones the prior keyed-map
 /// implementation required on every lookup (PERF-P2).
+///
+/// TODO(round-11, HIGH from round-7/9 cross-cutting): lock-free / sharded
+/// `JitCache` for the hot interpreter dispatch path.
+///
+/// Today the cache is wrapped in `parking_lot::RwLock<JitCache>` at the
+/// VM level (see `vm/src/vm/vm_init.rs::jit_cache`). Every JIT-dispatch
+/// site (~6 read sites across `interpreter.rs` + `helpers.rs`) acquires
+/// `.read()` to look up a compiled method by `(class, method, descriptor)`
+/// — fully serialised against the redefinition path that takes `.write()`.
+///
+/// Two viable migrations were considered for this round:
+///
+///   (A) **`arc-swap` snapshot**: store the methods map as
+///       `ArcSwap<FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>>`; reads
+///       do `arc.load()` + lookup (fully lock-free, no shared dirty
+///       cacheline ping); writes clone the whole map, mutate, and
+///       `arc.store(new)`. Reads scale linearly; writes go O(N) in
+///       cache size but are rare (redefinition + class invalidation).
+///
+///   (B) **16-shard `RwLock`** like `ProfileStore` (round-11 HIGH-1):
+///       partition by `compute_jit_key_hash(...) & 15`. Contention
+///       drops by ~16× under multi-thread JIT warmup but readers still
+///       pay an uncontended rwlock acquire per dispatch.
+///
+/// **Why this is deferred:** the cache also owns two `Pin<Box<...>>`
+/// arenas (`string_arena`, `invoke_info_arena`) that hand out raw
+/// pointers to JIT-emitted code (`intern_string`, `intern_invoke_info`).
+/// Those pointers MUST stay valid for the lifetime of every cached
+/// `CompiledMethod` that holds them — arc-swap's "clone the map on
+/// write" model would either (1) keep the arenas in a separate
+/// non-swappable container (extra indirection on every intern), or
+/// (2) accumulate per-snapshot arenas that can only be reclaimed once
+/// the entire prior `Arc<FxHashMap>` is dropped (real cycles possible
+/// because `CompiledMethod` stores raw `*const u8` into the arena).
+/// Sharding the cache map across 16 shards also fragments the arenas:
+/// either each shard owns its own arena (16× the VirtualAlloc
+/// granularity tax — already a known issue, see the TODO below) or all
+/// shards share a global `Mutex<Arenas>` which re-introduces the
+/// bottleneck the sharding was supposed to remove.
+///
+/// **Plan for round-12:** combine this with the per-VM code-arena
+/// rework (the existing TODO below). Once `ExecutableBuffer` is
+/// arena-backed, the per-method intern arenas can be split off into a
+/// single `parking_lot::Mutex<JitArenas>` (cold-path only — intern is
+/// invoked at compile time, not at dispatch) and the dispatch-hot
+/// methods map can switch to either `ArcSwap` (preferred for read
+/// scalability) or 16-shard `RwLock` (preferred for write latency).
+/// Both depend on `CompiledMethod` no longer transitively pinning
+/// arena slots through raw pointers.
 ///
 /// TODO(round-8, HIGH from round-7 jit #6): no pooling / LRU / coalescing
 /// of `ExecutableBuffer`s.  On Windows each compiled method calls

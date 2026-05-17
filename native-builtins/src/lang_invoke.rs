@@ -2224,6 +2224,18 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
+    // Round-9 perf: LambdaMetafactory CallSite cache. Each lambda shape
+    // (functional_interface_type, samMethodType, instantiatedMethodType,
+    // implMethod) is bootstrap-invariant — the same key always yields
+    // a `CallSite` whose target MH is identical. Hot reflective dispatch
+    // hits the same key thousands of times during request handling;
+    // without this cache every hit re-allocates a MH + ConstantCallSite.
+    //
+    // GC: cached `ObjectRef` values are reported as roots via
+    // `gc_scan_lambda_callsite_cache_roots` and remapped via
+    // `gc_update_lambda_callsite_cache_refs` after compaction — same
+    // contract as the Integer.valueOf cache in lang_math.rs.
+
     // LambdaMetafactory (static method stubs for bootstrap)
     //
     // These shims are hit when application code REFLECTIVELY invokes
@@ -2268,6 +2280,26 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // `Lookup.find*` shims we re-use it directly; otherwise we
             // synthesise a no-op MH so the CallSite's target is still
             // non-null.
+
+            // Round-9 perf: consult the bootstrap-arg cache before doing any
+            // allocation. Identical (invokedType, samType, implMethod,
+            // instantiatedType) tuples always yield the same CallSite.
+            let invoked_type = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
+            let sam_type     = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
+            let impl_method  = match args.get(4) { Some(Value::Object(o)) => *o, _ => None };
+            let inst_type    = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+            let key = LambdaKey {
+                invoked: lambda_key_of(invoked_type),
+                sam: lambda_key_of(sam_type),
+                impl_: lambda_key_of(impl_method),
+                instantiated: lambda_key_of(inst_type),
+            };
+            if key.impl_ != 0 {
+                if let Some(cached) = { let c = lambda_callsite_cache().lock(); c.get(&key).copied() } {
+                    return Ok(Some(Value::Object(Some(cached))));
+                }
+            }
+
             let invoked_name = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -2304,6 +2336,14 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
             // Some JDK code reads `target` by name as well.
             ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
+            // Round-9 perf: install in the cache so subsequent metafactory
+            // calls with the same bootstrap args skip the whole materialise
+            // dance. Only cache when we have a non-null implMethod — the
+            // null-impl path produced a NoOp stub that callers may interpret
+            // through reflection in surprising ways; safer to not share it.
+            if key.impl_ != 0 {
+                lambda_callsite_cache().lock().insert(key, ccs);
+            }
             Ok(Some(Value::Object(Some(ccs))))
         });
     r.register(lmf, "altMetafactory",
@@ -2464,6 +2504,107 @@ const MH_KIND_GUARD:       i32 = 7;
 /// slice (outer-arity minus inner-arity extras are discarded from the
 /// position encoded in MH_CLASS as a decimal pos string).
 const MH_KIND_DROP:        i32 = 8;
+/// Round-9 perf: StringConcatFactory CallSite target. MH_CLASS holds the
+/// concatenation recipe string (`\u{0001}` argument placeholder,
+/// `\u{0002}` constant placeholder), MH_BOUND is a synthetic 1-field
+/// holder whose field 0 is the Object[] of constants in recipe order.
+/// `extra_args` to mh_dispatch are the dynamic call-site arguments.
+/// Returns a `java/lang/String` ObjectRef. See `p58_make_concat*`.
+pub(crate) const MH_KIND_STRING_CONCAT: i32 = 9;
+
+// ---------------------------------------------------------------------------
+// Round-9 perf: LambdaMetafactory CallSite cache.
+// ---------------------------------------------------------------------------
+//
+// Each `(invokedType, samMethodType, implMethod, instantiatedType)` tuple
+// is bootstrap-invariant — the JDK canonicalises bootstrap arg objects so
+// repeated lookups for the same lambda site share the same ObjectRef
+// identities. The cache stores the materialised `ConstantCallSite` so the
+// (target MH + CCS) allocation pair runs at most once per shape, not once
+// per invoke.
+//
+// Cache hits skip:
+//   * `alloc_method_handle` (1 synthetic + 3 string allocations)
+//   * MH_TYPE field plumbing (1 hash-lookup + set_field_by_name)
+//   * `alloc_concurrent_synthetic` for the ConstantCallSite
+//
+// Process-global so all threads share the same cached entry (matches the
+// real JDK's per-`Lookup.lookupClass` cache scope closely enough for the
+// app-loader-dominant case — distinct lookup classes that produce the same
+// lambda shape will share, which is a strict perf win and behaviourally
+// identical from the user's standpoint).
+//
+// GC: cached `ObjectRef`s are reported as roots via
+// `gc_scan_lambda_callsite_cache_roots` and remapped via
+// `gc_update_lambda_callsite_cache_refs` — same contract as the
+// `INTEGER_CACHE` in `lang_math.rs`. Without these hooks a moving GC
+// would leave stale pointers behind after compaction.
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub(crate) struct LambdaKey {
+    invoked: usize,
+    sam: usize,
+    impl_: usize,
+    instantiated: usize,
+}
+
+static LAMBDA_CALLSITE_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<rustc_hash::FxHashMap<LambdaKey, ObjectRef>>,
+> = std::sync::OnceLock::new();
+
+fn lambda_callsite_cache(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<LambdaKey, ObjectRef>> {
+    LAMBDA_CALLSITE_CACHE.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn lambda_key_of(o: Option<ObjectRef>) -> usize {
+    o.map(|r| r.as_ptr() as usize).unwrap_or(0)
+}
+
+/// GC root scan hook — see `lang_math::gc_scan_value_of_cache_roots`.
+/// Reports every cached lambda `CallSite` ObjectRef so the GC keeps it
+/// live across compaction.
+pub fn gc_scan_lambda_callsite_cache_roots(out: &mut Vec<ObjectRef>) {
+    let cache = lambda_callsite_cache().lock();
+    for v in cache.values() {
+        out.push(*v);
+    }
+}
+
+/// GC post-compaction hook — remaps cached `CallSite` entries through the
+/// GC's pointer map. Keys (bootstrap arg ObjectRef identities) are also
+/// remapped so a post-GC lookup with the same logical bootstrap args
+/// still hits the cache. The remap rebuilds the table entry-by-entry
+/// because cache key membership is hash-sensitive to the remapped value.
+pub fn gc_update_lambda_callsite_cache_refs(
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut cache = lambda_callsite_cache().lock();
+    let old: Vec<(LambdaKey, ObjectRef)> = cache.drain().collect();
+    let remap = |addr: usize| -> usize {
+        if addr == 0 { return 0; }
+        match pointer_map.get(&addr) {
+            Some(&new_addr) => new_addr,
+            None => addr,
+        }
+    };
+    for (k, mut v) in old {
+        let k_new = LambdaKey {
+            invoked: remap(k.invoked),
+            sam: remap(k.sam),
+            impl_: remap(k.impl_),
+            instantiated: remap(k.instantiated),
+        };
+        let old_v = v.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_v) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            v = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+        cache.insert(k_new, v);
+    }
+}
 
 /// Allocate a fully-described MethodHandle.
 pub(crate) fn alloc_method_handle(
@@ -2497,6 +2638,90 @@ pub(crate) fn alloc_method_handle(
     let mt_opt = build_method_type_from_descriptor(ctx, desc)
         .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
     if let Some(mt) = mt_opt {
+        ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
+    }
+    mh
+}
+
+/// Round-9 perf: render a `Value` into its Java `String.valueOf(...)`
+/// representation for the StringConcatFactory MH dispatch. Handles the
+/// common 80% of cases — primitives and String/CharSequence/Object via
+/// `Object.toString` (best-effort).  Non-string Objects fall back to a
+/// label of the form `Class@hash` to keep concatenation lossless.
+pub(crate) fn string_concat_render_value(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Object(None) => "null".to_string(),
+        Value::Object(Some(obj)) => {
+            // Fast path: already a String.
+            if let Some(s) = ctx.read_string(obj) {
+                return s;
+            }
+            // Best-effort: call Object.toString(); if it returns a String,
+            // unwrap it. Failure modes fall through to the class@hash form.
+            let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
+            if let Ok(Some(Value::Object(Some(s_obj)))) = result {
+                if let Some(s) = ctx.read_string(s_obj) {
+                    return s;
+                }
+            }
+            let cid = ctx.class_id_of_object(obj);
+            let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
+            format!("{}@{:x}", cls, ctx.identity_hash_code(obj))
+        }
+        // ReturnAddress / Uninitialized aren't legal Java values reachable from
+        // bytecode-level concat sites, but exhaustive match avoids a future-
+        // proofing hazard. Render as a debug placeholder.
+        Value::ReturnAddress(pc) => format!("returnAddress@{}", pc),
+        Value::Uninitialized => "uninitialized".to_string(),
+    }
+}
+
+/// Round-9: build a real StringConcatFactory target MH.
+///
+/// The MH dispatches to the `MH_KIND_STRING_CONCAT` arm in `mh_dispatch`,
+/// which walks `recipe` and substitutes dynamic args (`\u{0001}`) and
+/// pre-baked constants (`\u{0002}`). `constants` may be `None` for the
+/// simple `makeConcat` form (no constants in the recipe).
+///
+/// Compromise: covers the simple-recipe path used by ~80% of javac-
+/// emitted concatenations. Complex cases involving non-default MethodType
+/// adaptations still fall back to per-arg `toString` rendering via
+/// `string_concat_render_value`, which is correct but not bit-perfect for
+/// every edge case (e.g. locale-sensitive `Float.toString`).
+pub(crate) fn alloc_string_concat_method_handle(
+    ctx: &mut dyn NativeContext,
+    recipe: &str,
+    constants: Option<rustjvm_types::ObjectRef>,
+) -> rustjvm_types::ObjectRef {
+    // Reuse the MethodHandle synthetic skeleton — same field layout as
+    // alloc_method_handle, but the class slot carries the recipe string
+    // instead of a class name.
+    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+    let cls = ctx.create_string(recipe);
+    let nm  = ctx.create_string("concat");
+    let dc  = ctx.create_string("()Ljava/lang/String;");
+    ctx.set_field(mh, MH_CLASS, Value::Object(Some(cls)));
+    ctx.set_field(mh, MH_NAME,  Value::Object(Some(nm)));
+    ctx.set_field(mh, MH_DESC,  Value::Object(Some(dc)));
+    ctx.set_field(mh, MH_KIND,  Value::Int(MH_KIND_STRING_CONCAT));
+    // Wrap the constants array in a 1-field holder so MH_BOUND is a single
+    // ObjectRef (the rest of mh_dispatch assumes that shape).
+    let holder = alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1);
+    ctx.set_field(holder, 0, match constants {
+        Some(arr) => Value::Object(Some(arr)),
+        None => Value::Object(None),
+    });
+    ctx.set_field(mh, MH_BOUND, Value::Object(Some(holder)));
+    // Populate the real-JDK `type:MethodType` field at slot 0 so JDK-internal
+    // `mh.type()` walks see a non-null MethodType.
+    if let Some(mt) = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;") {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     mh
@@ -2723,6 +2948,44 @@ pub(crate) fn mh_dispatch(
             } else {
                 mh_dispatch(ctx, fallback_mh, extra_args)
             }
+        }
+        MH_KIND_STRING_CONCAT => {
+            // Round-9: real StringConcatFactory target. Recipe is in
+            // MH_CLASS, constants Object[] is field 0 of MH_BOUND. Walk
+            // the recipe char-by-char, interpolating dynamic args
+            // (`\u{0001}`) and pre-baked constants (`\u{0002}`).
+            let recipe = mh_read_class(ctx, mh).unwrap_or_default();
+            let constants_arr: Option<rustjvm_types::ObjectRef> = match bound {
+                Value::Object(Some(holder)) => match ctx.get_field(holder, 0) {
+                    Value::Object(Some(a)) => Some(a),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut out = String::with_capacity(recipe.len() + 16);
+            let mut arg_idx: usize = 0;
+            let mut const_idx: usize = 0;
+            for ch in recipe.chars() {
+                match ch {
+                    '\u{0001}' => {
+                        let v = extra_args.get(arg_idx).copied().unwrap_or(Value::Object(None));
+                        out.push_str(&string_concat_render_value(ctx, v));
+                        arg_idx += 1;
+                    }
+                    '\u{0002}' => {
+                        if let Some(arr) = constants_arr {
+                            if const_idx < ctx.array_length(arr) {
+                                let v = ctx.get_array_element(arr, const_idx);
+                                out.push_str(&string_concat_render_value(ctx, v));
+                            }
+                        }
+                        const_idx += 1;
+                    }
+                    c => out.push(c),
+                }
+            }
+            let s = ctx.create_string(&out);
+            Ok(Some(Value::Object(Some(s))))
         }
         MH_KIND_SPECIAL => {
             // WP2.9 — invokespecial semantics: dispatch *exactly* on the

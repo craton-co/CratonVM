@@ -233,6 +233,7 @@ impl EventStream {
 mod tests {
     use super::*;
     use crate::event::{EventInstance, EventTypeId, EventValue};
+    use smallvec::smallvec;
     use std::sync::Arc;
 
     fn make_event(type_id: EventTypeId, start: u64) -> EventInstance {
@@ -241,7 +242,7 @@ mod tests {
             start_time: start,
             end_time: start + 100,
             thread_id: 1,
-            fields: vec![],
+            fields: smallvec![],
         }
     }
 
@@ -252,7 +253,7 @@ mod tests {
             start_time: start,
             end_time: start + 100,
             thread_id: 1,
-            fields: vec![EventValue::Int(val)],
+            fields: smallvec![EventValue::Int(val)],
         }
     }
 
@@ -742,7 +743,7 @@ mod tests {
             start_time: 1_000,
             end_time: 1_500,
             thread_id: 7,
-            fields: vec![
+            fields: smallvec![
                 EventValue::Int(-42),
                 EventValue::Long(1 << 40),
                 EventValue::Boolean(true),
@@ -756,7 +757,7 @@ mod tests {
             start_time: 2_000,
             end_time: 2_001,
             thread_id: 9,
-            fields: vec![
+            fields: smallvec![
                 EventValue::Int(0),
                 EventValue::Long(0),
                 EventValue::Boolean(false),
@@ -837,7 +838,7 @@ mod tests {
             start_time: 1,
             end_time: 2,
             thread_id: 1,
-            fields: vec![EventValue::Int(1)],
+            fields: smallvec![EventValue::Int(1)],
         });
 
         let dir = std::env::temp_dir().join("jfr_stream_unknown");

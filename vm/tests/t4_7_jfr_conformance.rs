@@ -39,7 +39,10 @@ fn make_event(type_id: EventTypeId, start: u64, end: u64) -> EventInstance {
         start_time: start,
         end_time: end,
         thread_id: 1,
-        fields: vec![],
+        // Round-5 JFR Fix 1: `EventInstance.fields` is now
+        // `SmallVec<[EventValue; 8]>` to avoid the per-event heap
+        // allocation; tests construct an empty one the same way.
+        fields: smallvec::SmallVec::new(),
     }
 }
 
@@ -56,7 +59,7 @@ fn make_event_with_fields(
         start_time: start,
         end_time: end,
         thread_id: 1,
-        fields,
+        fields: smallvec::SmallVec::from_vec(fields),
     }
 }
 
@@ -267,7 +270,8 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
     let major = u16::from_be_bytes([raw[4], raw[5]]);
     let minor = u16::from_be_bytes([raw[6], raw[7]]);
     assert_eq!(major, JFR_VERSION_MAJOR, "JFR major version must be 2");
-    assert_eq!(minor, JFR_VERSION_MINOR, "JFR minor version must be 0");
+    // Round-5 JFR Fix 3: minor version is now 1 (delta-encoded timestamps).
+    assert_eq!(minor, JFR_VERSION_MINOR, "JFR minor version must match crate constant");
 
     // Assertion 5: Parse the full header for structural validity.
     let header = rustjvm_jfr::read_jfr_header(&dump_path)

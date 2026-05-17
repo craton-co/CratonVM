@@ -118,6 +118,21 @@ pub fn probe() -> Result<DeviceCaps> {
     backend::probe()
 }
 
+/// Number of CUDA-capable devices visible to the driver.
+///
+/// Returns `Ok(0)` when no driver is loaded or no GPU is attached, and
+/// `Err(DeviceError::Driver)` only for genuine driver errors (e.g.
+/// version mismatch). Stub builds always return `Ok(0)` so callers
+/// can branch on the count without special-casing the no-driver case.
+///
+/// Round-10 multi-GPU enumeration entry point. The current offload
+/// pipeline binds to `gpu_device_ordinal` (a single device) — this
+/// helper lets a future scheduler enumerate over `0..device_count()`
+/// to pick the least-loaded ordinal at startup.
+pub fn device_count() -> Result<u32> {
+    backend::device_count()
+}
+
 /// A CUDA context bound to one device. Cheap to clone; the underlying
 /// driver handle is shared via Arc.
 #[derive(Clone)]
@@ -372,6 +387,14 @@ mod stub_tests {
             Err(other) => panic!("expected NoDriver, got {other:?}"),
             Ok(_) => panic!("expected NoDriver, got Ok(DeviceContext)"),
         }
+    }
+
+    #[test]
+    fn device_count_returns_zero_in_stub_mode() {
+        // Round-10 multi-GPU helper: in no-driver mode we always
+        // report zero devices so callers can branch on the count
+        // without a NoDriver special-case.
+        assert_eq!(device_count().unwrap(), 0);
     }
 
     #[test]

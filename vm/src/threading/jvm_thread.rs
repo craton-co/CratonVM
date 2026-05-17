@@ -246,8 +246,17 @@ pub struct JvmThread {
     pub pin_reason: &'static str,
 
     /// Scoped value binding stack (JEP 446, Java 25).
-    /// Each entry is (key_id, bound_value). Searched top-to-bottom.
-    pub scoped_values: Vec<(u64, Value)>,
+    /// Each entry is (key_id, key_ref, bound_value). Searched top-to-bottom.
+    ///
+    /// Round-9 GC fix: `key_ref` is the `ScopedValue` ObjectRef that owns
+    /// `key_id`. When set, the GC root scanner reports it so the key
+    /// object cannot be collected while a binding for it is live (only
+    /// the value used to be retained; the key itself could be reclaimed
+    /// while user code still observed the binding via
+    /// `ScopedValue.isBound()` / `Carrier.get`).  `None` for legacy
+    /// callers that pre-date the with-key API — those paths fall back to
+    /// the value-only behaviour and are no worse than before.
+    pub scoped_values: Vec<(u64, Option<ObjectRef>, Value)>,
 
     /// Thread-local allocation buffer for lock-free young-gen allocation.
     pub tlab: rustjvm_gc::Tlab,

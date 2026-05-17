@@ -423,7 +423,74 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(buf, 5, Value::Long(cap));         // native_size
     ctx.set_field(buf, 6, Value::Int(cleaner_id));   // cleaner id
     ctx.set_field(buf, 7, Value::Int(0));            // padding / direct flag
+
+    // Round-5 Fix 6 (HIGH): wire a real PhantomReference / Cleaner so the
+    // backing native memory is released when the DirectByteBuffer is
+    // GC-collected. Without this, the only paths that free the memory are
+    // an explicit `((DirectBuffer)buf).cleaner().clean()` Java-side call
+    // or VM-shutdown drain — DBB allocated in a tight loop would otherwise
+    // grow the bucketed pool forever.
+    //
+    // Wiring is parallel to the NEW-17 ByteBuffer.allocateDirect path in
+    // `native-builtins/src/servlet.rs`, but uses a dedicated
+    // `BucketDirectBufferDeallocator` class because servlet.rs's
+    // `DirectBufferDeallocator.run()V` is keyed to the NativeMemoryTable
+    // (alloc_id Long), whereas this `dbb_allocate_direct0` path uses our
+    // bucketed pool (keyed by cleaner_id Int from `register_cleaner`).
+    //
+    // Field layout for Cleanable: (0=action, 1=cleaned_flag, 2=ref_id).
+    // The interpreter's `run_cleaner_actions` invokes deallocator.run()V on
+    // each pending cleanable, which dispatches to our `bucket_dealloc_run`
+    // below to call `fire_cleaner(id)`.
+    if cap > 0 && cleaner_id != 0 {
+        let dealloc_cid = ctx
+            .ensure_class_initialized("jdk/internal/ref/BucketDirectBufferDeallocator")
+            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+        let dealloc = ctx.alloc_object(dealloc_cid, 2);
+        // field 0 = cleaner_id (Int) — matches our `bucket_dealloc_run` ABI
+        // field 1 = addr (Long) — diagnostics
+        ctx.set_field(dealloc, 0, Value::Int(cleaner_id));
+        ctx.set_field(dealloc, 1, Value::Long(addr as i64));
+
+        let cleanable_cid = ctx
+            .ensure_class_initialized("java/lang/ref/Cleaner$Cleanable")
+            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+        let cleanable = ctx.alloc_object(cleanable_cid, 3);
+        ctx.set_field(cleanable, 0, Value::Object(Some(dealloc))); // action
+        ctx.set_field(cleanable, 1, Value::Int(0));                // cleaned
+        ctx.set_field(cleanable, 2, Value::Int(-1));               // ref id
+
+        // ref_type = 3 (Cleaner) — see vm_exec::discover_reference dispatch.
+        // The ref processor enqueues `cleanable` into `cleaner_actions` when
+        // `buf` (the referent) becomes unreachable; `cleaner_thread` then
+        // drains, and `interpreter::run_cleaner_actions` invokes
+        // `BucketDirectBufferDeallocator.run()V` to fire the cleaner.
+        ctx.discover_reference(3, cleanable, buf, None);
+    }
+
     Ok(Some(Value::Object(Some(buf))))
+}
+
+/// `jdk.internal.ref.BucketDirectBufferDeallocator.run()V` — Cleaner
+/// dispatch target for the bucketed-pool `dbb_allocate_direct0` path.
+/// Field 0 carries the synthetic cleaner_id from `register_cleaner`;
+/// `fire_cleaner` is idempotent so concurrent GC drains and explicit
+/// `((DirectBuffer) buf).cleaner().clean()` paths never double-free.
+fn bucket_dealloc_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(None);
+    };
+    let id = match ctx.get_field(this, 0) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if id != 0 {
+        fire_cleaner(id);
+        // Zero the slot so the cleanable's idempotency + a stray re-invoke
+        // (e.g. shutdown drain after Cleaner already fired) are both no-ops.
+        ctx.set_field(this, 0, Value::Int(0));
+    }
+    Ok(None)
 }
 
 /// `jdk.internal.ref.Cleaner.create0(Object, long /*addr*/, long /*size*/) -> int`
@@ -469,10 +536,13 @@ fn directbuffer_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// behaviour. Callers that care about correct accounting should use
 /// `dbb_free_explicit` (registered as `freeMemory(JJ)V`) instead.
 ///
-/// TODO(round-8): wire a `PhantomReference<DirectByteBuffer>` queue
-/// that calls `dbb_free` on GC. Today we rely on either an explicit
-/// `cleaner.clean()` from the JDK side or VM shutdown to reclaim
-/// pool entries.
+/// Round-5 Fix 6 (HIGH): `dbb_allocate_direct0` now installs a Cleaner-
+/// typed phantom reference via `ctx.discover_reference(3, ...)` and a
+/// `BucketDirectBufferDeallocator` runnable, so GC reclaims unreachable
+/// DirectByteBuffers automatically. This `Unsafe.freeMemory` entry point
+/// still leaks if used without a matching `Unsafe.allocateMemory` (no
+/// size info is available here), but the DirectByteBuffer path is now
+/// fully GC-driven.
 fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = arg_long(args, 0) as u64;
     if addr == 0 {
@@ -704,6 +774,15 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "create0",
         "(Ljava/lang/Object;JJ)I",
         cleaner_create0,
+    );
+    // Round-5 Fix 6: GC-driven Cleaner runnable for `dbb_allocate_direct0`'s
+    // bucketed pool path. Pairs with the discover_reference call inside that
+    // function so the ref processor drains and fires this on phantom-clear.
+    r.register(
+        "jdk/internal/ref/BucketDirectBufferDeallocator",
+        "run",
+        "()V",
+        bucket_dealloc_run,
     );
     r.register(
         "jdk/internal/ref/Cleaner",

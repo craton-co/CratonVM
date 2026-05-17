@@ -10728,27 +10728,65 @@ pub(crate) fn register_p58_string_concat_factory(r: &mut NativeMethodRegistry) {
 }
 
 fn p58_make_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Return a CallSite stub (1-field: target MethodHandle).
-    // C19: allocate enough slots for the synthetic target MH to carry the
-    // real-JDK `type:MethodType` field at slot 0 without our data colliding,
-    // and populate `type` from the caller-supplied MethodType (args[2]) so
-    // downstream `mh.type()` / `parameterSlotCount` reads do not NPE.
-    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/CallSite", 1);
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+    // Round-9 perf: real StringConcatFactory CallSite. The previous no-op
+    // MH always materialised an empty string, breaking every Java
+    // expression of the form `"x=" + x`. Build a real
+    // MH_KIND_STRING_CONCAT target that walks the recipe (args[3]) and
+    // splices dynamic arg `\u{0001}` / constant `\u{0002}` placeholders.
+    //
+    // args layout (makeConcatWithConstants):
+    //   args[0] = Lookup
+    //   args[1] = String invokedName
+    //   args[2] = MethodType invokedType
+    //   args[3] = String recipe
+    //   args[4] = Object[] constants
+    let recipe = match args.get(3) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let constants = match args.get(4) {
+        Some(Value::Object(Some(arr))) => Some(*arr),
+        _ => None,
+    };
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants);
+    // Set the call-site type from the caller-supplied MethodType so JDK
+    // arity-validation reads see the real shape.
     if let Some(Value::Object(Some(mt))) = args.get(2) {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
+    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
     ctx.set_field(cs, 0, Value::Object(Some(mh)));
+    ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
 }
 
 fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/CallSite", 1);
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+    // makeConcat: no recipe, no constants. Default recipe is a sequence of
+    // arg placeholders inferred from the MethodType param count. We
+    // recover the arity from the descriptor on the MethodType.type field
+    // when available; otherwise fall back to a single `\u{0001}`.
+    let mut arity: usize = 1;
+    if let Some(Value::Object(Some(mt))) = args.get(2) {
+        // The synthetic MethodType holds the descriptor at the
+        // canonical "descriptor" extra slot — fall back to ()V on miss.
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(*mt, "descriptor") {
+            if let Some(desc) = ctx.read_string(s) {
+                let (params, _ret) =
+                    crate::lang_class::parse_descriptor_param_and_return(&desc);
+                if !params.is_empty() {
+                    arity = params.len();
+                }
+            }
+        }
+    }
+    let recipe: String = std::iter::repeat('\u{0001}').take(arity).collect();
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None);
     if let Some(Value::Object(Some(mt))) = args.get(2) {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
+    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
     ctx.set_field(cs, 0, Value::Object(Some(mh)));
+    ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
 }
 

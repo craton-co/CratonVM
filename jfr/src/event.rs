@@ -2,6 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+
+/// Inline-storage capacity for `EventInstance.fields`.
+///
+/// JFR built-in events (see `jfr/src/builtin.rs`) declare between 0 and 8
+/// fields each. Round-5 Fix 1 sets the inline capacity to 8 so every emit
+/// path avoids a heap allocation for the `fields` vector. Beyond 8 the
+/// `SmallVec` spills to the heap with the same semantics as `Vec`.
+pub const EVENT_FIELD_INLINE: usize = 8;
+
+/// Alias for the inline-storage vector used by `EventInstance.fields`.
+///
+/// Constructors should use `smallvec::smallvec![...]` or
+/// `EventFields::new()` to build values; consumers read it like any
+/// `Vec<EventValue>` slice (auto-deref).
+pub type EventFields = SmallVec<[EventValue; EVENT_FIELD_INLINE]>;
 
 /// Unique identifier for an event type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,14 +81,20 @@ pub enum EventPeriod {
     EverySecond,
 }
 
-/// A single recorded event instance
+/// A single recorded event instance.
+///
+/// `fields` uses `SmallVec<[EventValue; 8]>` (alias [`EventFields`]) so that
+/// every emit path avoids a heap allocation when the event carries ≤ 8 fields
+/// — which covers every JFR built-in event today. Beyond 8 fields the
+/// container spills to the heap with the same semantics as `Vec`. See
+/// round-5 JFR Fix 1.
 #[derive(Debug, Clone)]
 pub struct EventInstance {
     pub type_id: EventTypeId,
     pub start_time: u64,  // nanos since epoch
     pub end_time: u64,    // nanos since epoch (== start_time for instant events)
     pub thread_id: u64,
-    pub fields: Vec<EventValue>,
+    pub fields: EventFields,
 }
 
 /// Event field values.
@@ -190,6 +212,7 @@ impl Default for EventTypeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     // --- EventTypeId ---
 
@@ -333,7 +356,7 @@ mod tests {
             start_time: 1000,
             end_time: 2000,
             thread_id: 42,
-            fields: vec![EventValue::Int(10)],
+            fields: smallvec![EventValue::Int(10)],
         };
         assert_eq!(evt.type_id, EventTypeId(5));
         assert_eq!(evt.start_time, 1000);
@@ -349,7 +372,7 @@ mod tests {
             start_time: 5000,
             end_time: 5000, // instant event: start == end
             thread_id: 1,
-            fields: vec![],
+            fields: smallvec![],
         };
         assert_eq!(evt.start_time, evt.end_time);
     }
@@ -361,7 +384,7 @@ mod tests {
             start_time: 100,
             end_time: 200,
             thread_id: 1,
-            fields: vec![EventValue::String(Arc::from("test"))],
+            fields: smallvec![EventValue::String(Arc::from("test"))],
         };
         let evt2 = evt.clone();
         assert_eq!(evt.type_id, evt2.type_id);

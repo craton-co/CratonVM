@@ -3558,6 +3558,27 @@ impl Vm {
         rustjvm_jfr::builtin::emit_physical_memory_event(
             &mut jfr, total, total, now_ns,
         );
+
+        // Round-5 JFR Fix 4: emit `jdk.InitialEnvironmentVariable` for
+        // each VM-relevant env var so dumps capture the startup config
+        // surface. We restrict to `RUSTJVM_*`, `JAVA_*`, `_JAVA_OPTIONS`,
+        // `JAVA_TOOL_OPTIONS`, `CLASSPATH` to avoid leaking unrelated
+        // shell variables into the recording (and to keep the per-chunk
+        // metadata small). OpenJDK's reference snapshot includes a
+        // similar filtered set. Cost: ~N emit calls at startup, each
+        // bounded-ring push; N is typically < 10.
+        for (key, value) in std::env::vars() {
+            let interesting = key.starts_with("RUSTJVM_")
+                || key.starts_with("JAVA_")
+                || key == "_JAVA_OPTIONS"
+                || key == "JAVA_TOOL_OPTIONS"
+                || key == "CLASSPATH";
+            if interesting {
+                rustjvm_jfr::builtin::emit_initial_environment_variable_event(
+                    &mut jfr, &key, &value, now_ns,
+                );
+            }
+        }
         drop(jfr);
 
         Self {

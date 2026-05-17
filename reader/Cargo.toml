@@ -17,6 +17,13 @@ tracing.workspace = true
 bitflags = "2"
 cesu8 = "1.1"
 strum = { version = "0.26", features = ["derive"] }
+# Round-8 HIGH (reader): SIGNATURE_CACHE — generic-signature parses
+# are pure functions of the input string; Spring's `ResolvableType`
+# re-parses the same handful of signatures continuously, so a small
+# bounded FIFO cache keyed on the `Arc<str>` pointer eliminates the
+# work entirely on the hot path.
+parking_lot.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

@@ -1331,14 +1331,95 @@ fn native_br_read_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Object(None))),
     };
-    match ctx.fd_table().read_line(fd).map_err(io_err)? {
-        Some(line) => {
-            let s = ctx.create_string(&line);
+    // Round-9 HIGH-5 follow-up: drain any bytes from the BR side-table
+    // buffer first so a mix of `read()` + `readLine()` calls doesn't
+    // skip data. Construct the line from the leftover buffer up to the
+    // first '\n'/'\r'; if no terminator is found in the buffer fall
+    // through to `read_line` for the remainder.
+    let key = this.as_ptr() as usize;
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut found_terminator = false;
+    {
+        let mut table = br_buf_table().lock();
+        if let Some(state) = table.get_mut(&key) {
+            while state.pos < state.end {
+                let b = state.buf[state.pos];
+                state.pos += 1;
+                if b == b'\n' {
+                    found_terminator = true;
+                    break;
+                }
+                if b == b'\r' {
+                    // Skip an optional following '\n' for CRLF.
+                    if state.pos < state.end && state.buf[state.pos] == b'\n' {
+                        state.pos += 1;
+                    }
+                    found_terminator = true;
+                    break;
+                }
+                prefix.push(b);
+            }
+        }
+    }
+    if found_terminator {
+        let s = ctx.create_string(&String::from_utf8_lossy(&prefix));
+        return Ok(Some(Value::Object(Some(s))));
+    }
+    // No terminator in buffer (or buffer empty) — finish via the fd
+    // table's line reader, then prepend any leftover prefix bytes.
+    let tail = ctx.fd_table().read_line(fd).map_err(io_err)?;
+    match tail {
+        Some(t) => {
+            let combined = if prefix.is_empty() {
+                t
+            } else {
+                let mut s = String::from_utf8_lossy(&prefix).into_owned();
+                s.push_str(&t);
+                s
+            };
+            let s = ctx.create_string(&combined);
             Ok(Some(Value::Object(Some(s))))
         }
-        None => Ok(Some(Value::Object(None))),
+        None => {
+            // EOF on underlying — if we collected any prefix bytes,
+            // return them as the last partial line; else true EOF.
+            if prefix.is_empty() {
+                Ok(Some(Value::Object(None)))
+            } else {
+                let s = ctx.create_string(&String::from_utf8_lossy(&prefix));
+                Ok(Some(Value::Object(Some(s))))
+            }
+        }
     }
 }
+
+// Round-9 HIGH-5 (round-10 documented): per-BufferedReader side-table that
+// holds a Rust-side fill buffer. Each `read()` returns the next byte from
+// this buffer; on exhaustion we refill in 8 KiB chunks via a single bulk
+// `read_bytes(buf)` call. This cuts the per-byte cost from
+// {1 FFI dispatch + 1 fd-table RwLock + 1 entry Mutex + 1 BufReader fill}
+// down to a single hash lookup + Vec index on the common path.
+//
+// We side-table rather than store on the synthetic because the BR layout
+// only declares a single `fd` slot and changing the layout would cascade
+// through `native_br_init` / `BufferedInputStream` / sibling natives.
+struct BrBuf {
+    buf: Vec<u8>,
+    pos: usize,
+    end: usize,
+    /// Sticky EOF flag — once the underlying `read_bytes` returned 0 we
+    /// remember it and skip future refill attempts (which would otherwise
+    /// keep paying the FFI/Mutex cost).
+    eof: bool,
+}
+
+fn br_buf_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, BrBuf>> {
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, BrBuf>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+const BR_BUF_SIZE: usize = 8192;
 
 fn native_br_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -1349,19 +1430,53 @@ fn native_br_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    // TODO(round-10 native-misc HIGH-5): BufferedReader.read() currently
-    // dispatches one native call per character. The underlying
-    // `FileEntry::FileRead` is wrapped in a `BufReader`, so we do not
-    // incur a syscall per call — but we DO incur a full FFI dispatch
-    // + Mutex acquisition per character, which is dramatically slower
-    // than the JDK's in-Java buffered char[]. A proper fix routes via
-    // a synthetic Java-side `char[] cb` + `pos`/`count` fields populated
-    // by a single bulk `read_bytes(buf)` call, so that 99% of `read()`
-    // calls return from a Java-side index increment without any native
-    // crossing. Tracked separately; this single-byte path remains as
-    // the slow correctness fallback.
-    let result = ctx.fd_table().read_byte(fd).map_err(io_err)?;
-    Ok(Some(Value::Int(result)))
+
+    // Fast path: drain from the side-table buffer.
+    let key = this.as_ptr() as usize;
+    {
+        let mut table = br_buf_table().lock();
+        if let Some(state) = table.get_mut(&key) {
+            if state.pos < state.end {
+                let b = state.buf[state.pos];
+                state.pos += 1;
+                return Ok(Some(Value::Int(b as i32)));
+            }
+            if state.eof {
+                return Ok(Some(Value::Int(-1)));
+            }
+        }
+    }
+
+    // Refill path: bulk read into a fresh buffer, then return the first
+    // byte. Lock is dropped during the fd_table call to avoid holding
+    // the side-table mutex across a potentially blocking read.
+    let mut tmp = vec![0u8; BR_BUF_SIZE];
+    let n = ctx.fd_table().read_bytes(fd, &mut tmp).map_err(io_err)?;
+    if n == 0 {
+        // Mark EOF in the side-table so subsequent reads short-circuit.
+        let mut table = br_buf_table().lock();
+        let state = table.entry(key).or_insert_with(|| BrBuf {
+            buf: Vec::new(),
+            pos: 0,
+            end: 0,
+            eof: false,
+        });
+        state.eof = true;
+        return Ok(Some(Value::Int(-1)));
+    }
+    tmp.truncate(n);
+    let first = tmp[0] as i32;
+    let mut table = br_buf_table().lock();
+    table.insert(
+        key,
+        BrBuf {
+            buf: tmp,
+            pos: 1, // we just consumed byte 0
+            end: n,
+            eof: false,
+        },
+    );
+    Ok(Some(Value::Int(first)))
 }
 
 fn native_br_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1373,6 +1488,13 @@ fn native_br_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // If the side-table buffer still has bytes, we're definitely ready.
+    let key = this.as_ptr() as usize;
+    if let Some(state) = br_buf_table().lock().get(&key) {
+        if state.pos < state.end {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
     let avail = ctx.fd_table().available(fd).unwrap_or(0);
     Ok(Some(Value::Int(if avail > 0 { 1 } else { 0 })))
 }
@@ -1382,6 +1504,12 @@ fn native_br_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Drop the side-table buffer first — if we close the fd first the
+    // buffer's pending bytes become inaccessible to the legitimate
+    // `BufferedReader.read()` callers after close (which is a no-op per
+    // JDK contract, but holding a stale buffer is wasted memory).
+    let key = this.as_ptr() as usize;
+    br_buf_table().lock().remove(&key);
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
@@ -8982,24 +9110,32 @@ const FL_FIELD_TOKEN: usize = 5;
 const FL_NUM_FIELDS: usize = 6;
 
 // ---------------------------------------------------------------------------
-// In-process FileLock registry (TODO(round-8): real OS-level file locks)
+// FileLock registry — process-local + cross-process via OS primitives.
 //
-// The real JDK calls `fcntl(F_SETLK, &flock)` on POSIX and `LockFileEx` on
-// Windows so locks are honoured *across processes*. Wiring those in needs
-// (a) the `windows-sys` crate added to `Cargo.toml` for the Windows branch
-// and (b) a way to extract the underlying OS handle from our `FdTable`
-// (`as_raw_fd` / `as_raw_handle`). Both are tracked for round-8.
+// Two layers cooperate:
 //
-// For now we provide process-local locking semantics that are correct
-// across threads and across channels opened on the same FdId. The map is
-// keyed by fd_id (which uniquely identifies an open file inside our
-// `FdTable`) and stores the set of currently-held lock regions. A lock
-// request fails (returns null for `tryLock`) if it conflicts with any
-// existing region on the same fd; matching the JDK behaviour where two
-// channels on the same file cannot hold overlapping exclusive locks.
+//   1. Process-local `FILE_LOCKS` map (introduced in round-8) keyed by FdId
+//      that tracks every region currently held by *this* JVM. It rejects
+//      conflicting overlaps from sibling threads / channels in the same
+//      process *before* hitting the kernel — POSIX `fcntl(F_SETLK)` is
+//      famously per-process (two open fds on the same file in one process
+//      do NOT see each other's locks), and `LockFileEx` is per-handle, so
+//      the in-process table is what gives us the JVM-correct semantic of
+//      "two FileChannels on the same fd cannot hold overlapping exclusive
+//      locks". Without it, two threads opening the same path inside one
+//      VM would both `LockFileEx` and *both* succeed.
 //
-// Multi-process processes opening the same path go uncoordinated — that
-// is the known carryover work item.
+//   2. OS-level lock (round-9): once the in-process registry accepts the
+//      region, we additionally hold a kernel-managed advisory lock via
+//      `fcntl(F_SETLK, &flock)` on Unix or `LockFileEx` on Windows. This
+//      is what gives cross-process coordination — another OS process that
+//      tries to lock the same byte range will see EAGAIN/EWOULDBLOCK and
+//      `tryLock` returns null, matching the JDK contract.
+//
+// The OS lock is associated with a cloned `std::fs::File` (so the handle
+// outlives the original fd close) stored in `OS_LOCK_HANDLES` keyed by the
+// in-process token. `release` looks up the handle, issues F_UNLCK /
+// `UnlockFileEx`, then drops both the OS entry and the registry entry.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -9026,6 +9162,196 @@ fn file_locks() -> &'static Mutex<HashMap<i64, Vec<LockRegion>>> {
 fn next_lock_token() -> i64 {
     static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// OS-level lock-handle table (round-9 cross-process locking).
+//
+// When we successfully `fcntl(F_SETLK)` / `LockFileEx` a region we stash
+// the cloned `std::fs::File` here keyed by the in-process lock token so
+// that (a) the kernel handle stays open until `release()` runs, and
+// (b) we can find the right handle on unlock without re-cloning from the
+// original fd (which may have already been closed). Tuple stores the
+// file, the position, and the length we passed to the OS — needed by
+// `UnlockFileEx` / `F_UNLCK` to undo the exact same range.
+// ---------------------------------------------------------------------------
+
+struct OsLockHandle {
+    /// Cloned file that keeps the OS-level lock alive. Drop releases the
+    /// OS lock implicitly on Unix (close → unlock), but we still issue an
+    /// explicit unlock in `release_os_lock` to be deterministic on
+    /// Windows where the order matters.
+    file: std::fs::File,
+    position: i64,
+    /// Size as passed to the OS — `i64::MAX`/`0` means "to EOF" which we
+    /// translate platform-specifically.
+    size: i64,
+}
+
+static OS_LOCK_HANDLES: OnceLock<Mutex<HashMap<i64, OsLockHandle>>> = OnceLock::new();
+
+fn os_lock_handles() -> &'static Mutex<HashMap<i64, OsLockHandle>> {
+    OS_LOCK_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Acquire an OS-level advisory lock on the file region. Returns Ok(())
+/// on success or Err on conflict / OS error.
+///
+/// On Unix uses `fcntl(F_SETLK, &flock)` (non-blocking, matches JDK
+/// `tryLock`). On Windows uses `LockFileEx` with LOCKFILE_FAIL_IMMEDIATELY.
+#[cfg(target_family = "unix")]
+fn os_acquire_lock(file: &std::fs::File, pos: i64, size: i64, shared: bool) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let raw_fd = file.as_raw_fd();
+    let len = if size == i64::MAX { 0 } else { size };
+    // SAFETY: flock is a POD struct; we initialise every field. fcntl
+    // F_SETLK is the standard non-blocking advisory-lock interface.
+    let flock = libc::flock {
+        l_type: if shared { libc::F_RDLCK } else { libc::F_WRLCK } as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: pos as _,
+        l_len: len as _,
+        l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
+    };
+    let r = unsafe { libc::fcntl(raw_fd, libc::F_SETLK, &flock) };
+    if r < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn os_release_lock(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let raw_fd = file.as_raw_fd();
+    let len = if size == i64::MAX { 0 } else { size };
+    let flock = libc::flock {
+        l_type: libc::F_UNLCK as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: pos as _,
+        l_len: len as _,
+        l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
+    };
+    let r = unsafe { libc::fcntl(raw_fd, libc::F_SETLK, &flock) };
+    if r < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+// Windows: use LockFileEx / UnlockFileEx via raw FFI — same pattern as
+// `pipe.rs`'s `CreatePipe` declaration, avoids pulling in `windows-sys`.
+#[cfg(target_family = "windows")]
+mod win_lock {
+    use std::ffi::c_void;
+
+    pub(super) type Handle = *mut c_void;
+    pub(super) type Bool = i32;
+    pub(super) type Dword = u32;
+
+    pub(super) const LOCKFILE_EXCLUSIVE_LOCK: Dword = 0x0000_0002;
+    pub(super) const LOCKFILE_FAIL_IMMEDIATELY: Dword = 0x0000_0001;
+
+    #[repr(C)]
+    pub(super) struct Overlapped {
+        pub internal: usize,
+        pub internal_high: usize,
+        pub offset: Dword,
+        pub offset_high: Dword,
+        pub h_event: Handle,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        pub(super) fn LockFileEx(
+            h_file: Handle,
+            dw_flags: Dword,
+            dw_reserved: Dword,
+            n_bytes_low: Dword,
+            n_bytes_high: Dword,
+            lp_overlapped: *mut Overlapped,
+        ) -> Bool;
+        pub(super) fn UnlockFileEx(
+            h_file: Handle,
+            dw_reserved: Dword,
+            n_bytes_low: Dword,
+            n_bytes_high: Dword,
+            lp_overlapped: *mut Overlapped,
+        ) -> Bool;
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn os_acquire_lock(file: &std::fs::File, pos: i64, size: i64, shared: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use win_lock::*;
+
+    let handle = file.as_raw_handle() as Handle;
+    // "Rest of file" → lock the entire 64-bit range. JDK's
+    // `FileChannel.lock(0, Long.MAX_VALUE, false)` maps to a Windows
+    // lock covering the full address space, same trick the JDK uses.
+    let len = if size == i64::MAX { i64::MAX } else { size };
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: (pos as u64 & 0xFFFF_FFFF) as Dword,
+        offset_high: ((pos as u64 >> 32) & 0xFFFF_FFFF) as Dword,
+        h_event: std::ptr::null_mut(),
+    };
+    let mut flags = LOCKFILE_FAIL_IMMEDIATELY;
+    if !shared {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    let n_low = (len as u64 & 0xFFFF_FFFF) as Dword;
+    let n_high = ((len as u64 >> 32) & 0xFFFF_FFFF) as Dword;
+    // SAFETY: `handle` came from a live File, `overlapped` is fully
+    // initialised, and we pass valid flag bits documented for LockFileEx.
+    let ok = unsafe { LockFileEx(handle, flags, 0, n_low, n_high, &mut overlapped) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn os_release_lock(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use win_lock::*;
+
+    let handle = file.as_raw_handle() as Handle;
+    let len = if size == i64::MAX { i64::MAX } else { size };
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: (pos as u64 & 0xFFFF_FFFF) as Dword,
+        offset_high: ((pos as u64 >> 32) & 0xFFFF_FFFF) as Dword,
+        h_event: std::ptr::null_mut(),
+    };
+    let n_low = (len as u64 & 0xFFFF_FFFF) as Dword;
+    let n_high = ((len as u64 >> 32) & 0xFFFF_FFFF) as Dword;
+    let ok = unsafe { UnlockFileEx(handle, 0, n_low, n_high, &mut overlapped) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+// Other platforms: no-op OS lock (process-local registry still applies).
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn os_acquire_lock(_file: &std::fs::File, _pos: i64, _size: i64, _shared: bool) -> io::Result<()> {
+    Ok(())
+}
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn os_release_lock(_file: &std::fs::File, _pos: i64, _size: i64) -> io::Result<()> {
+    Ok(())
 }
 
 /// Half-open `[a_pos, a_pos + a_size)` overlaps `[b_pos, b_pos + b_size)`.
@@ -9069,11 +9395,20 @@ fn regions_overlap(a_pos: i64, a_size: i64, b_pos: i64, b_size: i64) -> bool {
 /// Conflict rules match `java.nio.channels.FileLock`:
 ///   * exclusive ∩ anything → conflict
 ///   * shared ∩ shared      → ok
+///
+/// Additionally, when `os_file` is `Some`, attempts to acquire a
+/// cross-process advisory lock via `fcntl(F_SETLK)` / `LockFileEx`.
+/// If the OS lock fails the in-process registration is rolled back and
+/// `None` is returned. The cloned file is stored in `OS_LOCK_HANDLES`
+/// so the OS lock outlives the originating fd's close (the JDK keeps
+/// FileLock objects valid across `FileChannel.close()` callers — they
+/// only release on explicit `lock.release()`).
 fn try_acquire_file_lock(
     fd_id: i64,
     position: i64,
     size: i64,
     shared: bool,
+    os_file: Option<std::fs::File>,
 ) -> Option<i64> {
     let mut map = file_locks().lock();
     let regions = map.entry(fd_id).or_default();
@@ -9092,12 +9427,50 @@ fn try_acquire_file_lock(
         size,
         shared,
     });
+    drop(map);
+
+    // Round-9 HIGH: OS-level advisory lock for cross-process coordination.
+    // Failure rolls back the in-process registration so callers see the
+    // same `None` they would for an in-process conflict.
+    if let Some(file) = os_file {
+        match os_acquire_lock(&file, position, size, shared) {
+            Ok(()) => {
+                os_lock_handles().lock().insert(
+                    token,
+                    OsLockHandle {
+                        file,
+                        position,
+                        size,
+                    },
+                );
+            }
+            Err(_) => {
+                // Roll back in-process registration on OS failure.
+                let mut map = file_locks().lock();
+                if let Some(regions) = map.get_mut(&fd_id) {
+                    if let Some(idx) = regions.iter().position(|r| r.token == token) {
+                        regions.swap_remove(idx);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+
     Some(token)
 }
 
 fn release_file_lock(token: i64) {
     if token == 0 {
         return;
+    }
+    // Round-9 HIGH: release the OS-level lock first, then drop the
+    // in-process registry entry. Order matters on Windows where
+    // UnlockFileEx must run before the handle is dropped (handle close
+    // implicitly unlocks, but we want deterministic ordering).
+    if let Some(h) = os_lock_handles().lock().remove(&token) {
+        let _ = os_release_lock(&h.file, h.position, h.size);
+        // `h.file` drops here, closing the cloned descriptor.
     }
     let mut map = file_locks().lock();
     // We don't know which fd this token belongs to (FileLock objects do
@@ -9239,14 +9612,16 @@ fn native_file_lock_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Register this lock region in the process-local registry so that
     // overlapping `lock()` calls from sibling threads / channels see
     // the conflict. If `channel` is non-null and has an fd, this is a
-    // real (synthetic-OS-level) registration; otherwise we still mint
-    // a token so `release` is a no-op rather than a silent drop.
+    // real registration; we also try to acquire a cross-process OS-level
+    // lock via `clone_file`. Without an fd we only mint a token so
+    // `release` is a no-op rather than a silent drop.
     let fd_id = match channel {
         Value::Object(Some(fc)) => fd_from_file_channel(ctx, fc),
         _ => 0,
     };
     let token = if fd_id > 0 {
-        try_acquire_file_lock(fd_id, position, size, shared != 0).unwrap_or(0)
+        let os_file = ctx.fd_table().clone_file(fd_id as FdId).ok();
+        try_acquire_file_lock(fd_id, position, size, shared != 0, os_file).unwrap_or(0)
     } else {
         next_lock_token()
     };
@@ -9479,15 +9854,12 @@ fn native_fc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let fd_id = fd_from_file_channel(ctx, this);
     let token = if fd_id > 0 {
-        // Synthetic "blocking" — we don't actually park because every
-        // other thread that may hold a region also runs in this
-        // process and would deadlock with us if they didn't release
-        // before calling lock(). Returning a fresh registration when
-        // there's no conflict is the JDK-correct fast path; on conflict
-        // we currently return null (matching tryLock semantics for now).
-        // The full blocking implementation lands with the F_SETLKW
-        // round-8 work item above.
-        match try_acquire_file_lock(fd_id, 0, i64::MAX, false) {
+        // Round-9 HIGH: the OS lock layer added in `try_acquire_file_lock`
+        // gives us cross-process coordination. Non-blocking semantics
+        // (matching `tryLock`) — true blocking via F_SETLKW is still a
+        // separate work item because it requires interrupt-safe waits.
+        let os_file = ctx.fd_table().clone_file(fd_id as FdId).ok();
+        match try_acquire_file_lock(fd_id, 0, i64::MAX, false, os_file) {
             Some(t) => t,
             None => return Ok(Some(Value::Object(None))),
         }
@@ -9507,8 +9879,8 @@ fn native_fc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// FileChannel.tryLock() -> FileLock
 ///
 /// Returns the new FileLock on success, or `null` (JDK contract) when
-/// a conflicting region is already held in this process. See the
-/// `FILE_LOCKS` registry docs for the in-process conflict semantics.
+/// a conflicting region is already held in this process *or* in another
+/// process holding an OS-level advisory lock on the same byte range.
 fn native_fc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -9516,7 +9888,8 @@ fn native_fc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let fd_id = fd_from_file_channel(ctx, this);
     let token = if fd_id > 0 {
-        match try_acquire_file_lock(fd_id, 0, i64::MAX, false) {
+        let os_file = ctx.fd_table().clone_file(fd_id as FdId).ok();
+        match try_acquire_file_lock(fd_id, 0, i64::MAX, false, os_file) {
             Some(t) => t,
             // JDK: `tryLock` returns null when another lock is held.
             None => return Ok(Some(Value::Object(None))),

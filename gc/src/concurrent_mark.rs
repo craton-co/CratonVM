@@ -17,7 +17,7 @@
 //!    back to the free list. Application threads continue running.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use parking_lot::Mutex;
 
@@ -119,6 +119,14 @@ impl std::fmt::Debug for ConcurrentGcState {
 /// different pointer ranges will typically hit different shards.
 pub struct MarkQueue {
     shards: Vec<Mutex<VecDeque<*mut u8>>>,
+    /// Round-9 gc HIGH-5 fix — set when any `push` is dropped because
+    /// its target shard hit [`MARK_QUEUE_SHARD_CAP`]. The marker checks
+    /// this flag at the end of remark and, if true, falls back to a
+    /// full re-walk of the old generation (every live object is marked
+    /// conservatively). This trades CPU for correctness: a pathological
+    /// or hostile Java app graph that would previously crash the VM via
+    /// `panic!` now just makes the mark phase longer.
+    overflowed: AtomicBool,
 }
 
 /// Number of shards for the mark queue. Must be a power of two for fast modulo.
@@ -166,7 +174,10 @@ impl MarkQueue {
         let shards = (0..MARK_QUEUE_SHARDS)
             .map(|_| Mutex::new(VecDeque::with_capacity(4096 / MARK_QUEUE_SHARDS)))
             .collect();
-        Self { shards }
+        Self {
+            shards,
+            overflowed: AtomicBool::new(false),
+        }
     }
 
     /// Select shard index from a pointer value.
@@ -178,22 +189,35 @@ impl MarkQueue {
 
     /// Push an object onto the mark queue (it becomes gray).
     ///
-    /// Round-5 HIGH #6: enforce a per-shard cap to convert silent
-    /// allocator-OOM into a deterministic panic.  See
-    /// `MARK_QUEUE_SHARD_CAP` for the long-form rationale and the
-    /// TODO note on the eventual real fix.
+    /// Round-9 gc HIGH-5 fix — replace the previous `panic!` (which
+    /// was reachable from any hostile/buggy Java program that built a
+    /// wide live graph) with a graceful overflow flag. The push is
+    /// dropped; the bitmap entry remains marked, so the object itself
+    /// isn't swept, but its outgoing edges won't be scanned via the
+    /// queue. The marker compensates by running a conservative full
+    /// re-walk of the old generation at the end of remark (see
+    /// [`Self::has_overflowed`] and the remark fallback). This trades
+    /// CPU for correctness — no crash, just longer mark.
     pub fn push(&self, obj_ptr: *mut u8) {
         let idx = Self::shard_for(obj_ptr);
         let mut shard = self.shards[idx].lock();
         if shard.len() >= MARK_QUEUE_SHARD_CAP {
-            panic!(
-                "concurrent_mark: MarkQueue shard {} exceeded cap of {} entries — \
-                 object graph pathology or marker starvation suspected. \
-                 TODO(round-5+): implement spill/fallback strategy.",
-                idx, MARK_QUEUE_SHARD_CAP
-            );
+            // Drop the push, set the overflow flag, and let the remark
+            // phase fall back to a full conservative re-walk.
+            // `Relaxed` is sufficient — the flag is read once during
+            // STW remark after every push has happened-before.
+            self.overflowed.store(true, Ordering::Relaxed);
+            return;
         }
         shard.push_back(obj_ptr);
+    }
+
+    /// Round-9 gc HIGH-5 — true iff any push since the last
+    /// [`Self::clear`] was dropped due to per-shard capacity. The
+    /// remark phase consults this and triggers a full re-walk if set.
+    #[inline]
+    pub fn has_overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Relaxed)
     }
 
     /// Pop an object from the mark queue for scanning.
@@ -239,6 +263,10 @@ impl MarkQueue {
         for shard in &self.shards {
             shard.lock().clear();
         }
+        // Round-9 gc HIGH-5: reset the overflow flag so the next
+        // cycle starts clean. Safe to clear unconditionally — `clear`
+        // is only called during STW transitions.
+        self.overflowed.store(false, Ordering::Relaxed);
     }
 }
 
@@ -366,6 +394,57 @@ impl ConcurrentMarker {
         while let Some(obj_ptr) = self.queue.pop() {
             self.scan_object(obj_ptr, old_gen);
             discovered += 1;
+        }
+
+        // Round-9 gc HIGH-5 fix — graceful overflow fallback.
+        //
+        // If any `push` during this cycle was dropped because a queue
+        // shard hit `MARK_QUEUE_SHARD_CAP`, the transitive closure
+        // above is incomplete: outgoing references from the dropped
+        // objects were never scanned. To preserve correctness we run
+        // a conservative full re-walk of the old generation, marking
+        // every reachable object found through any allocated object's
+        // outgoing references. This is O(N) instead of O(reachable)
+        // and may take many seconds on a multi-GB heap, but it
+        // **cannot** crash the VM the way the previous `panic!` did.
+        //
+        // The loop iterates because the rescan itself may overflow:
+        // each pass clears the flag, scans everything currently
+        // allocated, and repeats until a pass completes with no new
+        // overflow. In practice one or two passes suffice; the cap is
+        // generous enough that any realistic graph terminates immediately.
+        let mut rescan_passes = 0;
+        while self.queue.has_overflowed() {
+            // Reset before the rescan so a fresh overflow in this pass
+            // is observable. Push/pop happen-before this load: STW.
+            self.queue
+                .overflowed
+                .store(false, Ordering::Relaxed);
+            rescan_passes += 1;
+            if rescan_passes > 8 {
+                // Hard guard: if we somehow can't converge, abandon
+                // the queue and mark every allocated object directly.
+                // The sweep that follows will keep all live objects;
+                // garbage retention is the price of forward progress.
+                for (obj_ptr, _size) in old_gen.walk_objects() {
+                    self.bitmap.try_mark(obj_ptr as usize);
+                }
+                self.queue.clear();
+                break;
+            }
+            for (obj_ptr, _size) in old_gen.walk_objects() {
+                if self.bitmap.is_marked(obj_ptr as usize) {
+                    // Already gray/black: re-scan its outgoing refs to
+                    // pick up children we may have dropped.
+                    self.scan_object(obj_ptr, old_gen);
+                    discovered += 1;
+                }
+            }
+            // Drain anything the rescan re-enqueued.
+            while let Some(obj_ptr) = self.queue.pop() {
+                self.scan_object(obj_ptr, old_gen);
+                discovered += 1;
+            }
         }
 
         // Round-5 CRIT #4: SATB barrier was already deactivated atomically

@@ -1958,6 +1958,8 @@ version = "0.2.0"
 dependencies = [
  "bitflags 2.11.0",
  "cesu8",
+ "parking_lot",
+ "rustc-hash",
  "rustjvm-types",
  "strum",
  "thiserror",
@@ -2002,6 +2004,7 @@ dependencies = [
  "rustjvm-types",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "thiserror",
  "tracing",

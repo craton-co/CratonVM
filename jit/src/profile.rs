@@ -244,14 +244,93 @@ impl MethodProfile {
 // Global profile store
 // ---------------------------------------------------------------------------
 
+/// Number of shards for the per-method maps. Must be a power of two so
+/// the `hash & (PROFILE_SHARDS-1)` mapping is a single mask.
+///
+/// Round-11 cross-cutting HIGH-1: sharded the previously-monolithic
+/// `RwLock<FxHashMap<...>>` into 16 buckets keyed by the method's
+/// `MethodKey` hash (slow path) or the SipHash fingerprint of
+/// `(class_id, method_name, descriptor)` (borrowed-key fast path).
+/// Concurrent recorders that hash to different shards proceed without
+/// contention; the rwlock contention previously visible in
+/// `record_branch_borrowed`/`get_profile` under multi-thread JIT
+/// warmup is divided by 16.
+///
+/// Each shard preserves the same `methods` + `name_index` pair as the
+/// pre-shard design, so the round-7 CRIT-3 two-phase clone-then-lock
+/// pattern (for `snapshot_all` / `get_profile`) still applies — it now
+/// runs per-shard.
+const PROFILE_SHARDS: usize = 16;
+
+/// One shard of the per-method profile store. Each shard owns its own
+/// `methods` rwlock + `name_index` rwlock, identical in structure to
+/// the pre-sharding monolithic store.
+///
+/// Round-11 cross-cutting HIGH-1: extracted from `ProfileStore` so we
+/// can hold an array of these and dispatch by hash.
+struct ProfileShard {
+    methods: parking_lot::RwLock<FxHashMap<MethodKey, Arc<parking_lot::Mutex<MethodProfile>>>>,
+    name_index: parking_lot::RwLock<
+        FxHashMap<u64, (MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)>,
+    >,
+}
+
+impl ProfileShard {
+    fn new() -> Self {
+        Self {
+            methods: parking_lot::RwLock::new(FxHashMap::default()),
+            name_index: parking_lot::RwLock::new(FxHashMap::default()),
+        }
+    }
+}
+
+/// Compute the shard index for an owned `MethodKey`.
+#[inline]
+fn shard_for_key(key: &MethodKey) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    (h.finish() as usize) & (PROFILE_SHARDS - 1)
+}
+
+/// Compute the shard index and 64-bit fingerprint for a borrowed
+/// `(class_id, method_name, descriptor)` triple in a single hash pass.
+/// The fingerprint is used as the `name_index` key, and its low bits
+/// pick the shard — so a fingerprint hit on shard `s` is guaranteed to
+/// belong to the same shard as a `MethodKey`-hash lookup for the same
+/// triple in the slow path (verified below).
+#[inline]
+fn shard_and_fingerprint_for_borrowed(
+    class_id: u32,
+    method_name: &str,
+    descriptor: &str,
+) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    class_id.hash(&mut h);
+    method_name.hash(&mut h);
+    descriptor.hash(&mut h);
+    let fingerprint = h.finish();
+    // Shard from fingerprint low bits. The slow path computes shard
+    // via `shard_for_key` (MethodKey::hash) which uses the SAME hasher
+    // and the SAME field order, so both paths land on the same shard
+    // for the same triple.
+    let shard = (fingerprint as usize) & (PROFILE_SHARDS - 1);
+    (shard, fingerprint)
+}
+
 /// Global repository of all method profiles collected during interpreted execution.
 /// T10.9.B: FxHashMap — MethodKey (ClassId+name+desc, internal) and packed u64
 /// keys, hot path on every interpreter invoke.
 ///
-/// **Lock strategy (AUDIT CRIT-3/CRIT-5/HIGH-7 fix):**
-/// - Outer `RwLock` so concurrent recorders share a read-lock for the common
-///   "method already exists" path.  Only the rare first-time insert escalates
-///   to a write-lock.
+/// **Lock strategy (AUDIT CRIT-3/CRIT-5/HIGH-7 fix, round-11 sharded):**
+/// - Sharded across `PROFILE_SHARDS` independent rwlocks keyed by the
+///   `MethodKey` hash. Contention is divided by the shard count; threads
+///   recording into different methods land on different shards in the
+///   common case.
+/// - Per shard: outer `RwLock` so concurrent recorders share a read-lock
+///   for the common "method already exists" path. Only the rare first-time
+///   insert escalates to a write-lock.
 /// - Each `MethodProfile` is wrapped in `Arc<parking_lot::Mutex<_>>` so the
 ///   inner `FxHashMap`s can be mutated per-method without serialising every
 ///   recorder on a single global Mutex.
@@ -259,31 +338,25 @@ impl MethodProfile {
 ///   atomic — interpreter hot-loops pay one relaxed load per branch when
 ///   profiling is off (the default).
 pub struct ProfileStore {
-    methods: parking_lot::RwLock<FxHashMap<MethodKey, Arc<parking_lot::Mutex<MethodProfile>>>>,
+    /// Per-shard `(methods, name_index)` pair. Picked by hashing the
+    /// `MethodKey` (slow path) or the borrowed triple's fingerprint
+    /// (fast path).
+    shards: [ProfileShard; PROFILE_SHARDS],
     /// Per-method invocation counters for JIT warmup gating.
     /// Keyed by `(class_id << 32 | method_hash)` packed into a `u64` for fast lookup.
     invocation_counts: parking_lot::Mutex<FxHashMap<u64, u32>>,
     /// PERF (round-5 vm #7): auxiliary index keyed by a 64-bit fingerprint
-    /// of `(class_id, method_name, descriptor)`.  Lets the borrowed-key
-    /// lookup path (`get_or_insert_borrowed`) probe without first cloning
-    /// two `Arc<str>` into a fresh `MethodKey`.  Populated lazily by the
-    /// cold insert branch; entries point at the same `Arc<Mutex<...>>` as
-    /// the canonical `methods` map.
+    /// of `(class_id, method_name, descriptor)`. See `ProfileShard::name_index`
+    /// for the per-shard storage — this struct field is intentionally absent
+    /// post-sharding; each shard carries its own index.
     ///
-    /// round-7 fix (bug 2): value is now `(MethodKey, Arc<Mutex<MethodProfile>>)`
-    /// rather than the bare `Arc`.  The cached `MethodKey` is compared
+    /// round-7 fix (bug 2): the cached value is `(MethodKey,
+    /// Arc<Mutex<MethodProfile>>)`. The cached `MethodKey` is compared
     /// against the requested `(class_id, &name, &descriptor)` after every
     /// fingerprint hit; on the (extremely rare) SipHash-fingerprint
     /// collision we fall through to the canonical `methods` slow path
     /// instead of silently returning the wrong method's profile slot.
-    /// Storage cost: one extra `MethodKey` (= one `u32` + two
-    /// `Arc<str>` refcount bumps) per indexed method, paid once at
-    /// insert; lookup cost: three field compares (two `&str` equality
-    /// checks; both are SSO-friendly and short-circuit at the first
-    /// byte mismatch).
-    name_index: parking_lot::RwLock<
-        FxHashMap<u64, (MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)>,
-    >,
+    ///
     /// round-7 fix (bug 2): diagnostic counter — number of fingerprint
     /// hits that turned out to be a false positive (different
     /// `MethodKey` than the requested one) and fell through to the slow
@@ -294,22 +367,21 @@ pub struct ProfileStore {
     /// round-9 fix (HIGH): diagnostic counter — number of times the
     /// re-probe in the collision-counter path observed an entry that
     /// matched the queried key, indicating a legal concurrent insert
-    /// raced with us between our first probe (line ~410) and the
-    /// re-probe (line ~443). This is a BENIGN race (the map is
-    /// insert-only; another writer simply published the same key
-    /// we were about to look up), not a logic bug, so we soft-count
-    /// it instead of panicking via a `debug_assert!` as the previous
-    /// round-8 code did. Non-zero values here are expected under
-    /// concurrent load and do not indicate corruption.
+    /// raced with us between our first probe and the re-probe. This is
+    /// a BENIGN race (the map is insert-only; another writer simply
+    /// published the same key we were about to look up), not a logic
+    /// bug, so we soft-count it instead of panicking via a
+    /// `debug_assert!` as the previous round-8 code did. Non-zero
+    /// values here are expected under concurrent load and do not
+    /// indicate corruption.
     name_index_benign_races: std::sync::atomic::AtomicU64,
 }
 
 impl ProfileStore {
     pub fn new() -> Self {
         Self {
-            methods: parking_lot::RwLock::new(FxHashMap::default()),
+            shards: std::array::from_fn(|_| ProfileShard::new()),
             invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
-            name_index: parking_lot::RwLock::new(FxHashMap::default()),
             name_index_collisions: std::sync::atomic::AtomicU64::new(0),
             name_index_benign_races: std::sync::atomic::AtomicU64::new(0),
         }
@@ -349,11 +421,16 @@ impl ProfileStore {
 
     /// Fetch (or insert) the per-method profile slot.  Returns a cheap `Arc`
     /// to the inner Mutex so callers can release the outer lock immediately.
+    ///
+    /// Round-11 cross-cutting HIGH-1: dispatches to one of `PROFILE_SHARDS`
+    /// rwlocks based on the `MethodKey` hash. Concurrent recorders for
+    /// different methods rarely contend.
     #[inline]
     fn get_or_insert(&self, key: &MethodKey) -> Arc<parking_lot::Mutex<MethodProfile>> {
+        let shard = &self.shards[shard_for_key(key)];
         // Fast path: read-lock + lookup.  Most calls hit this branch.
         {
-            let read = self.methods.read();
+            let read = shard.methods.read();
             if let Some(slot) = read.get(key) {
                 return Arc::clone(slot);
             }
@@ -361,7 +438,7 @@ impl ProfileStore {
         // Slow path: upgrade to write-lock and double-check (another writer
         // may have inserted between us dropping the read-lock and acquiring
         // the write-lock).
-        let mut write = self.methods.write();
+        let mut write = shard.methods.write();
         if let Some(slot) = write.get(key) {
             return Arc::clone(slot);
         }
@@ -394,20 +471,15 @@ impl ProfileStore {
         method_name: &Arc<str>,
         descriptor: &Arc<str>,
     ) -> Arc<parking_lot::Mutex<MethodProfile>> {
-        // Compute a 64-bit fingerprint mixing class_id and the two name
-        // bytes so the auxiliary index is well-distributed.  Uses Rust's
-        // default SipHash via `Hasher` (the same algorithm `MethodKey`
-        // uses), so collisions are extremely rare in practice.
-        use std::hash::{Hash, Hasher};
-        let fingerprint = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            class_id.hash(&mut h);
-            let mn: &str = method_name;
-            let md: &str = descriptor;
-            mn.hash(&mut h);
-            md.hash(&mut h);
-            h.finish()
-        };
+        // Compute shard + 64-bit fingerprint in a single hash pass.
+        // Round-11 cross-cutting HIGH-1: fingerprint low bits also pick
+        // the shard, ensuring borrowed-key fast-path lookups land on
+        // the same shard the slow `MethodKey`-keyed path would (both
+        // use the same `DefaultHasher` over the same `(class_id,
+        // method_name, descriptor)` tuple in the same order).
+        let (shard_idx, fingerprint) =
+            shard_and_fingerprint_for_borrowed(class_id, method_name, descriptor);
+        let shard = &self.shards[shard_idx];
 
         // Lock-order discipline (round-7 CRIT-2): the canonical order
         // is `methods` > `name_index` (see `docs/lock-order.md`). All
@@ -429,7 +501,7 @@ impl ProfileStore {
         // hot-path cost) and no `MethodKey` clone.  Verification
         // itself is u32 compare + two `&str` equality short-circuits.
         let cached: Option<Arc<parking_lot::Mutex<MethodProfile>>> = {
-            let idx = self.name_index.read();
+            let idx = shard.name_index.read();
             match idx.get(&fingerprint) {
                 Some((cached_key, slot))
                     if cached_key.class_id == class_id
@@ -451,7 +523,7 @@ impl ProfileStore {
         // either is so low this re-probe never shows up in a profile.
         //
         // LOAD-BEARING: this re-probe assumes the index is INSERT-ONLY
-        // (no eviction).  Between the first read at line 410 and this
+        // (no eviction).  Between the first read above and this
         // second read, the only legal transition is "absent -> present"
         // (handled by the slow path below).  If a future change adds
         // eviction or fingerprint-slot replacement, an entry that
@@ -461,14 +533,14 @@ impl ProfileStore {
         // swap this counter for an atomic increment INSIDE the first
         // read's `Some(_)` collision arm above.
         {
-            let idx = self.name_index.read();
+            let idx = shard.name_index.read();
             if let Some((cached_key, _)) = idx.get(&fingerprint) {
                 // Round-9 fix (HIGH): the previous `debug_assert!` here
                 // panicked on a perfectly legal benign race — between
-                // our first probe (line ~410) and this re-probe, another
-                // writer can legitimately publish an entry for the SAME
-                // key we were looking up (insert-only map, slow path
-                // wins the race). The assertion was guarding against
+                // our first probe and this re-probe, another writer
+                // can legitimately publish an entry for the SAME key
+                // we were looking up (insert-only map, slow path wins
+                // the race). The assertion was guarding against
                 // eviction (which the map does not perform), but the
                 // matching-entry-after-mismatch case it tripped on IS
                 // the benign race the comment itself describes.
@@ -493,16 +565,17 @@ impl ProfileStore {
             }
         }
 
-        // Slow path: take `methods.write()` FIRST, then `name_index.write()`
-        // nested inside it.  Build the owned `MethodKey` (one-time per
-        // triple) for canonical insertion into `methods`.
+        // Slow path: take `shard.methods.write()` FIRST, then
+        // `shard.name_index.write()` nested inside it.  Build the
+        // owned `MethodKey` (one-time per triple) for canonical
+        // insertion into `methods`.
         let slot = Arc::new(parking_lot::Mutex::new(MethodProfile::default()));
         let key = MethodKey {
             class_id,
             method_name: Arc::clone(method_name),
             descriptor: Arc::clone(descriptor),
         };
-        let mut write = self.methods.write();
+        let mut write = shard.methods.write();
         // Race: another writer may have inserted between us dropping the
         // index read-lock and acquiring `methods.write()`.  Re-probe
         // under the exclusive lock and return the existing slot if so.
@@ -519,7 +592,7 @@ impl ProfileStore {
             // *other* method will hit, verify, and return correctly,
             // while lookups for *this* method will collide-then-fall-
             // through to here, which is correct (if slow).
-            let mut idx = self.name_index.write();
+            let mut idx = shard.name_index.write();
             let should_insert = match idx.get(&fingerprint) {
                 None => true,
                 Some((existing_key, _)) => existing_key == &key,
@@ -535,7 +608,7 @@ impl ProfileStore {
         //
         // round-7 fix (bug 2): same conflict check as above before
         // inserting our key into the auxiliary index.
-        let mut idx = self.name_index.write();
+        let mut idx = shard.name_index.write();
         let should_insert = match idx.get(&fingerprint) {
             None => true,
             Some((existing_key, _)) => existing_key == &key,
@@ -650,8 +723,10 @@ impl ProfileStore {
     /// independently.  Prevents the per-slot lock from being acquired
     /// while `methods.read()` is held.
     pub fn get_profile(&self, key: &MethodKey) -> Option<MethodProfile> {
+        // Round-11 cross-cutting HIGH-1: dispatch to the owning shard.
+        let shard = &self.shards[shard_for_key(key)];
         let slot_arc = {
-            let read = self.methods.read();
+            let read = shard.methods.read();
             Arc::clone(read.get(key)?)
         };
         let p = slot_arc.lock();
@@ -672,13 +747,21 @@ impl ProfileStore {
     /// holding a slot lock can deadlock against a writer trying to take
     /// `methods.write()`.
     pub fn snapshot_all(&self) -> Vec<(MethodKey, MethodProfile)> {
-        // Phase 1: snapshot the (key, Arc<Mutex<...>>) pairs.  Holding only
-        // the outer read-lock — no per-slot lock taken yet.
-        let arcs: Vec<(MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)> = {
-            let read = self.methods.read();
-            read.iter().map(|(k, slot)| (k.clone(), Arc::clone(slot))).collect()
-        };
-        // Phase 2: outer lock released; iterate locking each slot
+        // Round-11 cross-cutting HIGH-1: walk every shard. The
+        // two-phase clone-then-lock pattern still applies per shard so
+        // no per-slot Mutex is held while the shard's outer rwlock is
+        // also held.
+        let mut arcs: Vec<(MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)> = Vec::new();
+        for shard in self.shards.iter() {
+            // Phase 1: snapshot the (key, Arc<Mutex<...>>) pairs.
+            // Holding only the shard's outer read-lock — no per-slot
+            // lock taken yet.
+            let read = shard.methods.read();
+            arcs.extend(read.iter().map(|(k, slot)| (k.clone(), Arc::clone(slot))));
+            // Outer shard lock drops at end of scope; next iteration
+            // moves to a different shard's lock entirely.
+        }
+        // Phase 2: outer locks released; iterate locking each slot
         // independently.  Slot lock is now leaf-level.
         arcs.into_iter()
             .map(|(k, slot)| {

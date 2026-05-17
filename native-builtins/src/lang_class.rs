@@ -4114,6 +4114,57 @@ pub(crate) fn native_method_get_parameter_count(
 
 // --- Method.invoke ---
 
+/// Fast-path predicate for `Method.invoke`: returns true iff every entry in
+/// `args` already matches its target descriptor *exactly* (no widening,
+/// unboxing, or subtype check needed). The common Spring-DI / Jackson hot
+/// path passes call-sites whose arg types match the formal parameter types
+/// 1:1; in that case the per-arg `coerce_arg_strict` work (descriptor
+/// re-parse, wrapper-class lookup, widening table walk) is pure overhead.
+///
+/// Conservative on purpose: we only fast-path obvious matches. Anything
+/// less clear-cut (boxed primitive, subtype reference, array-of-subtype)
+/// falls through to the existing strict-coercion path.
+fn args_match_descriptor_exactly(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    param_descs: &[String],
+) -> bool {
+    if args.len() != param_descs.len() {
+        return false;
+    }
+    for (arg, pdesc) in args.iter().zip(param_descs.iter()) {
+        match (arg, pdesc.as_str()) {
+            // Primitive tags must match the descriptor exactly. The
+            // wrapper-class boxed forms always arrive as `Value::Object`
+            // and fall through to coercion.
+            (Value::Int(_), "I") | (Value::Int(_), "Z") | (Value::Int(_), "B")
+            | (Value::Int(_), "S") | (Value::Int(_), "C") => {}
+            (Value::Long(_), "J") => {}
+            (Value::Float(_), "F") => {}
+            (Value::Double(_), "D") => {}
+            // Reference parameter:
+            //   * null is assignable to any reference type — fast-path OK.
+            //   * non-null: runtime class name must equal the descriptor's
+            //     declared inner class. Subtype assignability requires the
+            //     slow path's class-hierarchy walk.
+            (Value::Object(None), d) if d.starts_with('L') || d.starts_with('[') => {}
+            (Value::Object(Some(obj)), d) if d.starts_with('L') && d.ends_with(';') => {
+                let inner = &d[1..d.len() - 1];
+                let cid = ctx.class_id_of_object(*obj);
+                match ctx.class_name_of_id(cid) {
+                    Some(name) if name == inner => {}
+                    _ => return false,
+                }
+            }
+            // Array descriptors: trust only the obvious null case above; a
+            // non-null array of a possibly-subtype element requires the
+            // slow path's covariant assignability check.
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4218,16 +4269,33 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         )));
     }
 
-    // Coerce each argument strictly, raising IllegalArgumentException on
-    // type mismatch (per java.lang.reflect.Method.invoke javadoc).
-    for (i, pdesc) in param_descs.iter().enumerate() {
-        let arg_val = if let Some(arr) = args_array {
-            ctx.get_array_element(arr, i)
-        } else {
-            Value::Object(None)
-        };
-        let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument")?;
-        invoke_args.push(coerced);
+    // Round-9 perf: fast-path when supplied arg types match the descriptor
+    // exactly. Spring DI / Jackson hot paths hit `Method.invoke` thousands
+    // of times per request with call-sites whose arg types already match
+    // the formal parameter types 1:1; in that case `coerce_arg_strict`'s
+    // wrapper-class / widening machinery is pure overhead.
+    //
+    // Pre-materialise the raw args (cheap — single array load each) so the
+    // fast-path predicate can inspect them without a second pass.
+    let raw_args: Vec<Value> = (0..param_descs.len())
+        .map(|i| match args_array {
+            Some(arr) => ctx.get_array_element(arr, i),
+            None => Value::Object(None),
+        })
+        .collect();
+    if args_match_descriptor_exactly(ctx, &raw_args, &param_descs) {
+        // No coercion needed — push each arg straight through.
+        for v in raw_args {
+            invoke_args.push(v);
+        }
+    } else {
+        // Coerce each argument strictly, raising IllegalArgumentException on
+        // type mismatch (per java.lang.reflect.Method.invoke javadoc).
+        for (i, pdesc) in param_descs.iter().enumerate() {
+            let arg_val = raw_args[i];
+            let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument")?;
+            invoke_args.push(coerced);
+        }
     }
 
     // Invoke the method. Any Java exception thrown by the callee must be

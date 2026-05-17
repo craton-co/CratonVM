@@ -33,6 +33,17 @@ fn map_err<E: std::fmt::Display>(stage: &str) -> impl FnOnce(E) -> DeviceError +
     move |e| DeviceError::Driver(format!("{stage}: {e}"))
 }
 
+/// Round-10 multi-GPU enumeration. Queries `cuDeviceGetCount` via
+/// cudarc's `result::device::get_count`. `cuInit` is idempotent so
+/// calling it here costs only a per-process atomic check after the
+/// first call (and `CudaContext::new` already calls it).
+pub(crate) fn device_count() -> Result<u32> {
+    cudarc::driver::result::init().map_err(map_err("cuInit"))?;
+    let n = cudarc::driver::result::device::get_count()
+        .map_err(map_err("cuDeviceGetCount"))?;
+    Ok(n.max(0) as u32)
+}
+
 pub(crate) fn probe() -> Result<DeviceCaps> {
     let ctx = CudaContext::new(0).map_err(map_err("CudaContext::new(0)"))?;
     let name = ctx.name().map_err(map_err("device name"))?;
@@ -340,35 +351,53 @@ impl DeviceModuleInner {
 
 /// Round-5: H→D upload helper.
 ///
-/// Attempts to upload via a pinned (page-locked) host staging buffer for the
-/// PCIe-bandwidth win, falling back to the pageable path on any allocator
-/// failure. Today this is a thin wrapper around the pageable path; the
-/// pinned codepath is gated behind `cfg(cudarc_pinned_api)` so a future
-/// cudarc upgrade (or a build with the pinned-API feature) can flip it on
-/// without touching `from_host`.
+/// Attempts to upload via a pinned (page-locked) host staging buffer for
+/// the PCIe-bandwidth win, falling back to the pageable path on any
+/// allocator failure. The pinned codepath is gated behind
+/// `cfg(cudarc_pinned_api)` so the cudarc upgrade that exposes
+/// `CudaContext::alloc_pinned` + `CudaStream::htod_copy_pinned` flips
+/// it on without touching `from_host`.
 ///
-/// The wrapper exists today so:
-///   * `from_host` has a single call site to upgrade,
-///   * the fallback semantics are explicit (returning `Err` from the pinned
-///     path must transparently retry pageable, not bubble up), and
-///   * the documented behaviour matches the comment at the call site.
+/// **cudarc version check (round-10 PERF Fix 6).** We pin cudarc 0.13;
+/// in that release the pinned API lives on `CudaDevice` (the legacy
+/// type) but not on `CudaContext` (the type the rest of this backend
+/// holds via `ctx.ctx`). Until cudarc lands the `CudaContext::alloc_pinned`
+/// counterpart upstream we cannot enable `cudarc_pinned_api` by
+/// default — doing so would simply fail to compile on the supported
+/// version. The cfg flag is the explicit opt-in for forks built against
+/// a cudarc that *does* expose it.
+///
+/// The wrapper still exists today so:
+///   * `from_host` has a single call site to upgrade once the flag is
+///     enabled,
+///   * the fallback semantics are explicit (any error from the pinned
+///     path silently retries pageable, never bubbles up), and
+///   * the call-site comment in `from_host` stays accurate.
 #[inline]
 fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static>(
     ctx: &DeviceContextInner,
     host: &[T],
 ) -> Result<CudaSlice<T>> {
-    // Future: when the cudarc pinned-host API is stable on our pinned
-    // cudarc version, the body here becomes:
-    //
-    //   if let Ok(mut pinned) = ctx.ctx.alloc_pinned::<T>(host.len()) {
-    //       pinned.as_mut_slice().copy_from_slice(host);
-    //       if let Ok(slice) = ctx.copy_h2d.memcpy_stod(&pinned) {
-    //           return Ok(slice);
-    //       }
-    //   }
-    //
-    // For now, the pageable path is functionally correct; the only cost
-    // is the implicit driver-side bounce buffer.
+    #[cfg(cudarc_pinned_api)]
+    {
+        // SAFETY: `alloc_pinned` is unsafe in cudarc because the buffer
+        // is returned uninitialised; we fully overwrite it via
+        // `copy_from_slice` below before any read.
+        if let Ok(mut pinned) = unsafe { ctx.ctx.alloc_pinned::<T>(host.len()) } {
+            // `as_mut_slice` returns a `&mut [T]` view over the page-
+            // locked region — same shape as the source `host`, so a
+            // straight memcpy is safe and zero-overhead.
+            pinned.as_mut_slice().copy_from_slice(host);
+            if let Ok(slice) = ctx.copy_h2d.htod_copy_pinned(&pinned) {
+                return Ok(slice);
+            }
+            // Pinned upload failed (cudarc returned Err): fall through
+            // to the pageable path below rather than bubbling up.
+        }
+    }
+    // Pageable fallback — also the only path on cudarc 0.13 today.
+    // Functionally correct; the only cost is the implicit driver-side
+    // bounce buffer.
     ctx.copy_h2d
         .memcpy_stod(host)
         .map_err(map_err("memcpy host→device"))

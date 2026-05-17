@@ -1063,6 +1063,21 @@ pub trait NativeContext {
     /// Push a scoped value binding onto the current thread's stack.
     fn push_scoped_value(&mut self, key_id: u64, value: Value);
 
+    /// Round-9 GC fix: push a scoped value binding AND remember the
+    /// ScopedValue key object so the GC keeps it live for the duration of
+    /// the binding. Default impl forwards to the legacy
+    /// `push_scoped_value` for backward compatibility — callers that have
+    /// the key ObjectRef (e.g. `Carrier.run`) should call this overload
+    /// instead so the key cannot be reclaimed while bindings exist.
+    fn push_scoped_value_with_key(
+        &mut self,
+        key_id: u64,
+        _key_ref: Option<ObjectRef>,
+        value: Value,
+    ) {
+        self.push_scoped_value(key_id, value);
+    }
+
     /// Pop the most recent scoped value binding from the current thread's stack.
     fn pop_scoped_value(&mut self);
 

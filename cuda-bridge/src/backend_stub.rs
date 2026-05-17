@@ -12,6 +12,13 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
     Err(DeviceError::NoDriver)
 }
 
+/// No-driver counterpart to the cuda backend's `device_count`.
+/// Always reports zero devices so callers branching on the count
+/// don't need to special-case `NoDriver`.
+pub(crate) fn device_count() -> Result<u32> {
+    Ok(0)
+}
+
 #[derive(Clone)]
 pub(crate) struct DeviceContextInner;
 

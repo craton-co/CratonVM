@@ -40,6 +40,56 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `rustc-hash.workspace = true`.
 parking_lot = "0.12"
 rustc-hash = "1.1"
+# Round-5 JFR Fix 1: workspace-hoisted SmallVec so jfr + downstream consumers
+# (vm tests, vm benches) all resolve to a single version. Inline-N=8 covers
+# the field-count of every built-in JFR event in `jfr/src/builtin.rs`.
+smallvec = { version = "1", features = ["union"] }
+
+# -----------------------------------------------------------------------
+# Round-11 cross-cutting HIGH-5: transitive dep duplicates
+# -----------------------------------------------------------------------
+#
+# `cargo tree --duplicates` currently reports three families of duplicate
+# resolutions, each pulled by *different* transitive dependency chains:
+#
+#   hashbrown   0.14.5  (pulled by indexmap 1.x / our older interner code)
+#               0.15.5  (rustc-hash 1.x downstream)
+#               0.16.1  (modern std fallback used by some recent crates)
+#
+#   getrandom   0.2.17  (p12 — PKCS#12 reader for keystore tests, locked)
+#               0.3.4   (rand_core 0.9 line — current `rand` major)
+#               0.4.2   (newer `rand_chacha`/`uuid` pre-release line)
+#
+#   windows-sys 0.48.0  (deeply pinned by older `mio` / `socket2` lines)
+#               0.52.0  (parking_lot_core 0.9 current)
+#               0.61.2  (newest direct deps that bumped to follow)
+#
+# **Why we are NOT issuing `[patch.crates-io]` overrides:** each pair of
+# duplicate majors is a HARD API break:
+#
+#   * `hashbrown` 0.14 -> 0.15 swapped the default-hasher API; downstream
+#     consumers built against 0.14 use `RawTable::reserve` taking a
+#     different signature. 0.15 -> 0.16 added a `BuildHasher::default`
+#     bound that 0.14 code does not provide. A force-unify to either 0.15
+#     or 0.16 would refuse to link consumers of the other majors.
+#   * `getrandom` 0.2 -> 0.3 dropped the `try_fill` shim; 0.3 -> 0.4
+#     reorganised the error type. p12 specifically pins 0.2 because its
+#     PKCS#12 cryptographic constructions assume the 0.2 error variants.
+#   * `windows-sys` MUST stay multi-versioned: every minor (0.48 / 0.52 /
+#     0.61) wraps a DIFFERENT shape of the Win32 metadata; collapsing
+#     them to "the newest" deletes structs that older callers still
+#     reference. Cargo's own dependency-resolver docs flag this crate
+#     family as "expected to coexist".
+#
+# **The right fix is upstream:** wait for the older transitive consumers
+# to migrate to the newer majors (most are 1-2 releases behind). Until
+# then the binary cost is ~80 KB per duplicate × 3 = ~240 KB, which is
+# well under the size budget. Re-evaluate next round once the upstream
+# `mio`, `p12`, and `indexmap` consumers have shipped their major-bump
+# releases.
+#
+# Round-9 MED-8 / round-10 / round-11 audits all concur: no [patch] this
+# round, revisit in round-12. Issue tracker: #2317 (cratonvm/internal).
 
 # RJ.4 — silence lints that do not represent real defects so
 # `cargo doc --workspace --no-deps` stays at zero warnings (the

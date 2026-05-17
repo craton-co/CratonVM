@@ -140,7 +140,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     }
 
     // 12. Scoped value bindings (JEP 446)
-    for (_key, val) in &thread.scoped_values {
+    //
+    // Round-9 GC fix: also push the ScopedValue KEY ObjectRef when present.
+    // The previous version only pushed VALUEs, so the key object itself
+    // (which JDK-internal code reaches via Carrier.get(ScopedValue)) could
+    // be reclaimed while the binding was still live — a use-after-free on
+    // the next reflective `Carrier.get` traversal.
+    for (_key_id, key_ref, val) in &thread.scoped_values {
+        if let Some(obj_ref) = key_ref {
+            roots.push(*obj_ref);
+        }
         if let Value::Object(Some(obj_ref)) = val {
             roots.push(*obj_ref);
         }
@@ -169,6 +178,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     cached ObjectRefs would point at relocated or reclaimed memory
     //     after the first compaction.
     rustjvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
+
+    // 16. Round-9 perf + GC fix: process-global LambdaMetafactory CallSite
+    //     cache. Cached CallSites and their bootstrap-arg ObjectRef keys
+    //     must stay live across collections; the matching post-compaction
+    //     remap lives in `gc.rs` (`gc_update_lambda_callsite_cache_refs`).
+    rustjvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
 
     roots
 }
