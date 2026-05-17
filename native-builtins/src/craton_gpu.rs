@@ -1,0 +1,638 @@
+//! Native shims for `craton.gpu.internal.Native` (Phase 3 — Item P3-4).
+//!
+//! These are the Rust-side handlers behind every `Native.*` method the
+//! Phase-3 Java surface declares (see `docs/gpu/phase3-spec.md` §2.2).
+//!
+//! The whole module is gated behind the `gpu-offload` Cargo feature. On
+//! a default build it compiles down to an empty `register()` that does
+//! nothing, so the CPU path is byte-identical to before the GPU work
+//! began.
+//!
+//! ## Design notes for the stub-friendly Phase-3 implementation
+//!
+//! We don't have a CUDA device on the dev box. Every handler is therefore
+//! a **synthetic stand-in**: it stores its state in a process-wide
+//! `OnceLock<Mutex<NativeState>>` (counters + maps for executor / future /
+//! array handles) and returns either a synthetic handle, a synthetic
+//! `GpuFuture` that immediately fails with `"no CUDA device"`, or a
+//! plausible value drawn from the in-memory state.
+//!
+//! The aim is for the Java side to be able to call
+//! `Native.openExecutor` → `submit` → `futureGetResult` and have it
+//! round-trip via a synthetic future whose `futureGetErrorMessage`
+//! returns `"no CUDA device"`.
+//!
+//! ## What is genuinely incomplete (`PHASE3-GUESS`)
+//!
+//! Anywhere we need to **return a freshly-constructed Java object** of
+//! a known interface type (`GpuExecutor`, `GpuFuture`, `GpuStream`) we
+//! hit a wall: `NativeContext::new_object` requires a *concrete* class
+//! name, and the concrete impl classes (`GpuExecutorImpl`, etc.) do not
+//! exist on the Java side yet — they're owned by another Phase-3 item
+//! (P3-1/P3-2). For Phase 3 we return `Value::Object(None)` (the JVM
+//! sees a `null`) and mark the call site with a `PHASE3-GUESS` comment
+//! so the integration agent can fix it once the impl classes land.
+//!
+//! Handlers carrying a `PHASE3-GUESS` today:
+//!   * `builtin_open_executor`  — needs `craton/gpu/internal/GpuExecutorImpl`
+//!   * `builtin_submit`         — needs `craton/gpu/internal/GpuFutureImpl`
+//!   * `builtin_launch`         — same
+//!   * `builtin_new_stream`     — needs `craton/gpu/internal/GpuStreamImpl`
+//!   * `builtin_future_get_result` — needs a way to round-trip an
+//!     arbitrary boxed primitive back as a Java mirror. For now returns
+//!     `null` for the synthetic failed future.
+//!
+//! All other handlers operate purely on `long` handles, which is
+//! sufficient for the Java side to drive them.
+
+#![cfg_attr(not(feature = "gpu-offload"), allow(dead_code))]
+
+use rustjvm_native_api::NativeMethodRegistry;
+
+#[cfg(feature = "gpu-offload")]
+use std::collections::HashMap;
+#[cfg(feature = "gpu-offload")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(feature = "gpu-offload")]
+use rustjvm_types::{ArrayElementType, Value};
+
+// ---------------------------------------------------------------------------
+// Public entry point: stub when feature is off, real registration when on
+// ---------------------------------------------------------------------------
+
+/// Register every `craton/gpu/internal/Native` native shim.
+///
+/// Called once from `lib.rs::register_essential_natives`. On a default
+/// (no-feature) build this is a no-op.
+#[cfg(feature = "gpu-offload")]
+pub(crate) fn register(registry: &mut NativeMethodRegistry) {
+    const KLASS: &str = "craton/gpu/internal/Native";
+
+    registry.register(KLASS, "openExecutor", "(I)Lcraton/gpu/GpuExecutor;", builtin_open_executor);
+    registry.register(KLASS, "submit",       "(JLcraton/gpu/GpuCallable;)Lcraton/gpu/GpuFuture;", builtin_submit);
+    registry.register(KLASS, "launch",       "(JLcraton/gpu/GpuRunnable;)Lcraton/gpu/GpuFuture;", builtin_launch);
+    registry.register(KLASS, "newStream",    "(J)Lcraton/gpu/GpuStream;", builtin_new_stream);
+    registry.register(KLASS, "closeStream",  "(J)V", builtin_close_stream);
+
+    registry.register(KLASS, "futureStatus",            "(J)I", builtin_future_status);
+    registry.register(KLASS, "futureSynchronize",       "(J)V", builtin_future_synchronize);
+    registry.register(KLASS, "futureGetResult",         "(J)Ljava/lang/Object;", builtin_future_get_result);
+    registry.register(KLASS, "futureGetErrorMessage",   "(J)Ljava/lang/String;", builtin_future_get_error_message);
+
+    registry.register(KLASS, "arrayWrapInt",    "([I)J", builtin_array_wrap_int);
+    registry.register(KLASS, "arrayWrapLong",   "([J)J", builtin_array_wrap_long);
+    registry.register(KLASS, "arrayWrapFloat",  "([F)J", builtin_array_wrap_float);
+    registry.register(KLASS, "arrayWrapDouble", "([D)J", builtin_array_wrap_double);
+    registry.register(KLASS, "arrayToHost",     "(J)Ljava/lang/Object;", builtin_array_to_host);
+    registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
+
+    registry.register(KLASS, "releaseFuture",   "(J)V", builtin_release_future);
+    registry.register(KLASS, "releaseArray",    "(J)V", builtin_release_array);
+    registry.register(KLASS, "releaseExecutor", "(J)V", builtin_release_executor);
+}
+
+/// No-op registration when the `gpu-offload` feature is disabled.
+#[cfg(not(feature = "gpu-offload"))]
+pub(crate) fn register(_registry: &mut NativeMethodRegistry) {}
+
+// ---------------------------------------------------------------------------
+// Process-wide synthetic state (gpu-offload only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-offload")]
+mod state {
+    use super::*;
+
+    /// Synthetic host-side storage for one `arrayWrap*` upload.
+    ///
+    /// Holds the element bytes as a `Vec<u8>` plus an `ArrayElementType`
+    /// tag so `arrayToHost` can rebuild a fresh Java primitive array of
+    /// the right shape. When the real `ResidencyTracker` (Item P3-7)
+    /// lands this struct is replaced by a tracker-handle field.
+    #[derive(Debug)]
+    pub(super) struct ArrayEntry {
+        pub element_type: ArrayElementType,
+        pub element_count: usize,
+        pub bytes: Vec<u8>,
+        pub resident: bool,
+    }
+
+    /// Synthetic future state. Phase-3 stub-mode always lands in `Failed`
+    /// because there is no real device behind `submit` / `launch`.
+    #[derive(Debug)]
+    pub(super) enum FutureState {
+        Pending,
+        Done { result_obj: Option<rustjvm_types::ObjectRef> },
+        Failed { message: String },
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct NativeState {
+        pub next_handle: u64,
+        pub executors: HashMap<u64, i32>, // handle -> device ordinal
+        pub futures: HashMap<u64, FutureState>,
+        pub arrays: HashMap<u64, ArrayEntry>,
+        pub streams: HashMap<u64, u64>, // stream handle -> owning exec handle
+    }
+
+    impl NativeState {
+        pub fn fresh_handle(&mut self) -> u64 {
+            self.next_handle += 1;
+            self.next_handle
+        }
+    }
+
+    pub(super) static STATE: OnceLock<Mutex<NativeState>> = OnceLock::new();
+
+    pub(super) fn with<R>(f: impl FnOnce(&mut NativeState) -> R) -> R {
+        let m = STATE.get_or_init(|| Mutex::new(NativeState::default()));
+        let mut guard = m.lock().expect("craton_gpu state mutex poisoned");
+        f(&mut guard)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-offload")]
+const STUB_FAILURE_MESSAGE: &str = "no CUDA device";
+
+#[cfg(feature = "gpu-offload")]
+fn arg_long(args: &[Value], idx: usize) -> i64 {
+    match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
+fn arg_int(args: &[Value], idx: usize) -> i32 {
+    match args.get(idx) {
+        Some(Value::Int(v)) => *v,
+        Some(Value::Long(v)) => *v as i32,
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
+fn arg_object(args: &[Value], idx: usize) -> Option<rustjvm_types::ObjectRef> {
+    match args.get(idx) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    }
+}
+
+/// Materialize a fresh primitive Java array from a host byte buffer.
+///
+/// `element_type` selects the array kind. The buffer is interpreted as a
+/// flat little-endian sequence (native order on x86/x64; matches the
+/// `arrayWrap*` upload path below).
+#[cfg(feature = "gpu-offload")]
+fn rebuild_java_array(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    element_type: ArrayElementType,
+    element_count: usize,
+    bytes: &[u8],
+) -> rustjvm_types::ObjectRef {
+    let obj = ctx.new_array(element_type, element_count);
+    match element_type {
+        ArrayElementType::Int => {
+            for i in 0..element_count {
+                let off = i * 4;
+                if off + 4 > bytes.len() { break; }
+                let v = i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
+                ctx.set_array_element(obj, i, Value::Int(v));
+            }
+        }
+        ArrayElementType::Long => {
+            for i in 0..element_count {
+                let off = i * 8;
+                if off + 8 > bytes.len() { break; }
+                let v = i64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap());
+                ctx.set_array_element(obj, i, Value::Long(v));
+            }
+        }
+        ArrayElementType::Float => {
+            for i in 0..element_count {
+                let off = i * 4;
+                if off + 4 > bytes.len() { break; }
+                let v = f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
+                ctx.set_array_element(obj, i, Value::Float(v));
+            }
+        }
+        ArrayElementType::Double => {
+            for i in 0..element_count {
+                let off = i * 8;
+                if off + 8 > bytes.len() { break; }
+                let v = f64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap());
+                ctx.set_array_element(obj, i, Value::Double(v));
+            }
+        }
+        _ => {
+            // Reference / Boolean / Char / Byte / Short — Phase 3 surface
+            // only declares int/long/float/double wraps. If a caller ever
+            // lands here, leave the array zero-initialized.
+        }
+    }
+    obj
+}
+
+/// Read every element of a Java primitive array into a flat byte buffer.
+/// Returns `(element_type, element_count, bytes)`.
+#[cfg(feature = "gpu-offload")]
+fn snapshot_java_array(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    array: rustjvm_types::ObjectRef,
+) -> (ArrayElementType, usize, Vec<u8>) {
+    let element_type = ctx.heap_element_type_of(array);
+    let length = ctx.array_length(array);
+    let mut bytes = Vec::new();
+    match element_type {
+        ArrayElementType::Int => {
+            bytes.reserve_exact(length * 4);
+            for i in 0..length {
+                if let Value::Int(v) = ctx.get_array_element(array, i) {
+                    bytes.extend_from_slice(&v.to_ne_bytes());
+                } else {
+                    bytes.extend_from_slice(&0i32.to_ne_bytes());
+                }
+            }
+        }
+        ArrayElementType::Long => {
+            bytes.reserve_exact(length * 8);
+            for i in 0..length {
+                if let Value::Long(v) = ctx.get_array_element(array, i) {
+                    bytes.extend_from_slice(&v.to_ne_bytes());
+                } else {
+                    bytes.extend_from_slice(&0i64.to_ne_bytes());
+                }
+            }
+        }
+        ArrayElementType::Float => {
+            bytes.reserve_exact(length * 4);
+            for i in 0..length {
+                if let Value::Float(v) = ctx.get_array_element(array, i) {
+                    bytes.extend_from_slice(&v.to_ne_bytes());
+                } else {
+                    bytes.extend_from_slice(&0f32.to_ne_bytes());
+                }
+            }
+        }
+        ArrayElementType::Double => {
+            bytes.reserve_exact(length * 8);
+            for i in 0..length {
+                if let Value::Double(v) = ctx.get_array_element(array, i) {
+                    bytes.extend_from_slice(&v.to_ne_bytes());
+                } else {
+                    bytes.extend_from_slice(&0f64.to_ne_bytes());
+                }
+            }
+        }
+        _ => {
+            // Reference arrays are out-of-scope for the Phase-3 surface.
+        }
+    }
+    (element_type, length, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Executor lifecycle
+// ---------------------------------------------------------------------------
+
+/// `Native.openExecutor(int device) -> GpuExecutor`
+///
+/// PHASE3-GUESS: Returns `null` to the JVM. To return a real `GpuExecutor`
+/// we need a concrete impl class (e.g. `craton/gpu/internal/GpuExecutorImpl`)
+/// owned by P3-1 / P3-2 that the test harness can drive. Once that class
+/// lands the body becomes:
+///
+/// ```ignore
+/// let obj = ctx.new_object("craton/gpu/internal/GpuExecutorImpl")?;
+/// ctx.set_field_by_name(obj_ref, "handle", Value::Long(handle as i64));
+/// Ok(Some(Value::Object(Some(obj_ref))))
+/// ```
+#[cfg(feature = "gpu-offload")]
+fn builtin_open_executor(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let device = arg_int(args, 0);
+    let handle = state::with(|s| {
+        let h = s.fresh_handle();
+        s.executors.insert(h, device);
+        h
+    });
+    // We record the handle in our state so `releaseExecutor` can find it,
+    // but cannot return a constructed Java object yet (see module docs).
+    let _ = handle;
+    // PHASE3-GUESS: see module docs — return a null GpuExecutor until the
+    // impl class exists.
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Native.releaseExecutor(long handle)`
+#[cfg(feature = "gpu-offload")]
+fn builtin_release_executor(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    state::with(|s| {
+        s.executors.remove(&handle);
+    });
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Submission / launch — both lead to a synthetic Failed future
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-offload")]
+fn record_failed_future() -> u64 {
+    state::with(|s| {
+        let h = s.fresh_handle();
+        s.futures.insert(
+            h,
+            state::FutureState::Failed { message: STUB_FAILURE_MESSAGE.to_string() },
+        );
+        h
+    })
+}
+
+/// `Native.submit(long execHandle, GpuCallable c) -> GpuFuture`
+///
+/// PHASE3-GUESS: records a Failed future in our state but returns `null`
+/// because we cannot instantiate `GpuFutureImpl` yet (see module docs).
+#[cfg(feature = "gpu-offload")]
+fn builtin_submit(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let _exec = arg_long(args, 0) as u64;
+    let _callable = arg_object(args, 1);
+    let _future_handle = record_failed_future();
+    // PHASE3-GUESS: needs craton/gpu/internal/GpuFutureImpl
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Native.launch(long execHandle, GpuRunnable r) -> GpuFuture`
+///
+/// Same shape as `submit`. PHASE3-GUESS for the same reason.
+#[cfg(feature = "gpu-offload")]
+fn builtin_launch(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let _exec = arg_long(args, 0) as u64;
+    let _runnable = arg_object(args, 1);
+    let _future_handle = record_failed_future();
+    // PHASE3-GUESS: needs craton/gpu/internal/GpuFutureImpl
+    Ok(Some(Value::Object(None)))
+}
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+
+/// `Native.newStream(long execHandle) -> GpuStream`
+///
+/// PHASE3-GUESS: records the stream in state, returns `null` until
+/// `GpuStreamImpl` lands.
+#[cfg(feature = "gpu-offload")]
+fn builtin_new_stream(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let exec = arg_long(args, 0) as u64;
+    let _handle = state::with(|s| {
+        let h = s.fresh_handle();
+        s.streams.insert(h, exec);
+        h
+    });
+    // PHASE3-GUESS: needs craton/gpu/internal/GpuStreamImpl
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Native.closeStream(long streamHandle)`
+#[cfg(feature = "gpu-offload")]
+fn builtin_close_stream(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    state::with(|s| {
+        s.streams.remove(&handle);
+    });
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Futures — these are the only Native.* surface that round-trips entirely
+// through `long` handles, so they work end-to-end in stub mode.
+// ---------------------------------------------------------------------------
+
+/// `Native.futureStatus(long futureHandle) -> int`
+///
+/// Status codes (mirrors the Java side enum-ordinal layout in the spec):
+///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_status(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let code = state::with(|s| match s.futures.get(&handle) {
+        Some(state::FutureState::Pending) => 0i32,
+        Some(state::FutureState::Done { .. }) => 1,
+        Some(state::FutureState::Failed { .. }) => 2,
+        None => 3,
+    });
+    Ok(Some(Value::Int(code)))
+}
+
+/// `Native.futureSynchronize(long futureHandle)`
+///
+/// In stub mode futures are never `Pending` after construction, so this
+/// is a no-op. With a real device we would `cuStreamSynchronize` here.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_synchronize(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    Ok(None)
+}
+
+/// `Native.futureGetResult(long futureHandle) -> Object`
+///
+/// PHASE3-GUESS: for `Done` futures with a stored mirror this returns it;
+/// for `Failed` / unknown returns `null`. A future Phase will need a way
+/// to wrap primitive results back into the right boxed mirrors — for now
+/// the synthetic future is always `Failed`, so callers see `null`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_get_result(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let result = state::with(|s| match s.futures.get(&handle) {
+        Some(state::FutureState::Done { result_obj }) => *result_obj,
+        _ => None,
+    });
+    Ok(Some(Value::Object(result)))
+}
+
+/// `Native.futureGetErrorMessage(long futureHandle) -> String`
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_get_error_message(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let msg = state::with(|s| match s.futures.get(&handle) {
+        Some(state::FutureState::Failed { message }) => Some(message.clone()),
+        _ => None,
+    });
+    let value = match msg {
+        Some(text) => {
+            let s = ctx.create_string(&text);
+            Value::Object(Some(s))
+        }
+        None => Value::Object(None),
+    };
+    Ok(Some(value))
+}
+
+/// `Native.releaseFuture(long futureHandle)`
+#[cfg(feature = "gpu-offload")]
+fn builtin_release_future(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    state::with(|s| {
+        s.futures.remove(&handle);
+    });
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Array wrap / readback — pure-handle interface, works end-to-end in stub
+// mode. When the real `ResidencyTracker` lands these are rewritten to call
+// `shared_vm.residency.upload(...)` / `.download(...)` instead of holding
+// the bytes locally.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-offload")]
+fn wrap_primitive_array(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let array = match arg_object(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let (element_type, element_count, bytes) = snapshot_java_array(ctx, array);
+    let handle = state::with(|s| {
+        let h = s.fresh_handle();
+        s.arrays.insert(
+            h,
+            state::ArrayEntry {
+                element_type,
+                element_count,
+                bytes,
+                resident: true,
+            },
+        );
+        h
+    });
+    Ok(Some(Value::Long(handle as i64)))
+}
+
+/// `Native.arrayWrapInt(int[]) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_wrap_int(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    wrap_primitive_array(ctx, args)
+}
+
+/// `Native.arrayWrapLong(long[]) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_wrap_long(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    wrap_primitive_array(ctx, args)
+}
+
+/// `Native.arrayWrapFloat(float[]) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_wrap_float(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    wrap_primitive_array(ctx, args)
+}
+
+/// `Native.arrayWrapDouble(double[]) -> long`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_wrap_double(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    wrap_primitive_array(ctx, args)
+}
+
+/// `Native.arrayToHost(long arrayHandle) -> Object`
+///
+/// Looks up the handle in our state and rebuilds a fresh Java primitive
+/// array of the same shape from the stored bytes.
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_to_host(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let snapshot = state::with(|s| {
+        s.arrays.get(&handle).map(|entry| {
+            (entry.element_type, entry.element_count, entry.bytes.clone())
+        })
+    });
+    match snapshot {
+        Some((etype, count, bytes)) => {
+            let arr = rebuild_java_array(ctx, etype, count, &bytes);
+            Ok(Some(Value::Object(Some(arr))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Native.arrayIsResident(long arrayHandle) -> boolean`
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_is_resident(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let resident = state::with(|s| {
+        s.arrays.get(&handle).map(|e| e.resident).unwrap_or(false)
+    });
+    Ok(Some(Value::Int(if resident { 1 } else { 0 })))
+}
+
+/// `Native.releaseArray(long arrayHandle)`
+#[cfg(feature = "gpu-offload")]
+fn builtin_release_array(
+    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    state::with(|s| {
+        s.arrays.remove(&handle);
+    });
+    Ok(None)
+}

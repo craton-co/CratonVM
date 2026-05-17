@@ -462,6 +462,10 @@ pub mod deprecated_verify;
 pub mod net_phase_e;
 // T16.8: Reference types (Reference / Weak / Soft / Phantom / ReferenceQueue)
 pub mod reference;
+// Phase 3 (Item P3-4): `craton.gpu.internal.Native` shims. The whole
+// module is feature-gated; with `gpu-offload` off the registrar is a
+// no-op and no GPU code is compiled.
+pub mod craton_gpu;
 // T16.9: Stream terminal / Flow.Subscriber overrides
 pub mod streams;
 // T16.7: Concurrent extras — real ForkJoinPool + condvar-backed SynchronousQueue
@@ -4303,6 +4307,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Ensure full Reference/Weak/Soft/Phantom constructor + queue surface is
     // present in real-JDK mode too (needed by Spring Boot launcher paths).
     reference::register_reference_natives(registry);
+
+    // Phase 3 (Item P3-4): `craton.gpu.internal.Native.*` shims. With the
+    // `gpu-offload` feature off this is a no-op; the registrar's body is
+    // a `#[cfg(not(feature = "gpu-offload"))]` empty function.
+    craton_gpu::register(registry);
 
     // T15: java/lang/ref/Finalizer
     registry.register("java/lang/ref/Finalizer", "register", "(Ljava/lang/Object;)V", lang_system::native_finalizer_register);

@@ -23,6 +23,9 @@ legacy-synthetic-crypto = []
 experimental-jmx = []
 experimental-serialization = []
 experimental-aot = []
+# Phase 3 — Java-side GPU surface (craton.gpu.internal.Native shims).
+# When off, native-builtins emits no GPU code; the registrar is a no-op.
+gpu-offload = []
 
 [dependencies]
 rustjvm-types = { path = "../types" }
