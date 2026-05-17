@@ -568,8 +568,8 @@ fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &rustjvm_types
         }
         HPROF_OBJECT => {
             match val.as_object() {
-                Some(Some(r)) => seg.push_u64(r.as_ptr() as u64),
-                _ => seg.push_u64(0),
+                Some(r) => seg.push_u64(r.as_ptr() as u64),
+                None => seg.push_u64(0),
             }
         }
         _ => seg.push_u64(0),
@@ -674,8 +674,8 @@ fn write_value_to_vec(buf: &mut Vec<u8>, htype: u8, val: &rustjvm_types::Value) 
         }
         HPROF_OBJECT => {
             match val.as_object() {
-                Some(Some(r)) => buf.extend_from_slice(&(r.as_ptr() as u64).to_be_bytes()),
-                _ => buf.extend_from_slice(&0u64.to_be_bytes()),
+                Some(r) => buf.extend_from_slice(&(r.as_ptr() as u64).to_be_bytes()),
+                None => buf.extend_from_slice(&0u64.to_be_bytes()),
             }
         }
         _ => buf.extend_from_slice(&0u64.to_be_bytes()),

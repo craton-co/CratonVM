@@ -7,6 +7,13 @@
 //!
 //! During a minor GC, only dirty cards need to be scanned for old→young
 //! references, avoiding a full scan of the old generation.
+//!
+//! T5.5.2 wiring (HIGH-1 fix): all `&self` methods (the mutator fast
+//! path) are fully concurrent — they only touch the per-thread buffer
+//! and the `Mutex<Vec<usize>>` of pending offsets. The authoritative
+//! `cards` / `dirty_cards` state is protected by a separate
+//! `Mutex<CardCells>` inside the table so the collector can safely
+//! mark/clear/drain while mutators continue to enqueue dirty offsets.
 
 use parking_lot::Mutex;
 use std::cell::RefCell;
@@ -35,24 +42,38 @@ thread_local! {
     static THREAD_DIRTY_BUFFER: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Authoritative card-bitmap state. Locked exclusively by the collector
+/// during GC; never touched by the mutator fast path.
+struct CardCells {
+    /// One byte per card (CARD_CLEAN or CARD_DIRTY).
+    cards: Vec<u8>,
+    /// Tracking list of card indices that have been dirtied since the last scan.
+    dirty_cards: Vec<usize>,
+}
+
 /// A byte-map card table for tracking old→young cross-generation references.
 ///
 /// Each byte covers `CARD_SIZE` bytes of the old generation's address space.
 /// The write barrier marks cards dirty; the minor GC scans dirty cards and
 /// then clears them.
+///
+/// All public methods take `&self`. Internally, the bitmap is locked
+/// (`cells`) and the pending-offset queue is locked
+/// (`pending_offsets`). The mutator fast path
+/// ([`Self::thread_local_dirty_addr`]) writes only to a per-thread
+/// buffer; the global state is updated lazily either when the buffer
+/// hits its auto-flush threshold or when the collector calls
+/// [`Self::drain_pending`] at GC start.
 pub struct CardTable {
-    /// One byte per card (CARD_CLEAN or CARD_DIRTY).
-    cards: Vec<u8>,
-    /// Base address of the memory region this table covers.
+    /// Base address of the memory region this table covers (immutable).
     base_addr: usize,
-    /// Total size of the covered region in bytes.
+    /// Total size of the covered region in bytes (immutable).
     region_size: usize,
-    /// Tracking list of card indices that have been dirtied since the last scan.
-    /// Updated on `mark_dirty`, cleared on `clear_all` or `take_dirty_cards`.
-    dirty_cards: Vec<usize>,
+    /// Exclusive bitmap state — touched only by collector-side methods.
+    cells: Mutex<CardCells>,
     /// T5.5.2 — pending byte offsets submitted by thread-local buffers
     /// via [`CardTable::flush_dirty_buffer`], waiting to be folded into
-    /// `cards`/`dirty_cards` at the next safepoint.
+    /// `cards` / `dirty_cards` at the next safepoint.
     pending_offsets: Mutex<Vec<usize>>,
 }
 
@@ -62,10 +83,12 @@ impl CardTable {
     pub fn new(base_addr: usize, region_size: usize) -> Self {
         let num_cards = region_size.div_ceil(CARD_SIZE);
         Self {
-            cards: vec![CARD_CLEAN; num_cards],
             base_addr,
             region_size,
-            dirty_cards: Vec::new(),
+            cells: Mutex::new(CardCells {
+                cards: vec![CARD_CLEAN; num_cards],
+                dirty_cards: Vec::new(),
+            }),
             pending_offsets: Mutex::new(Vec::new()),
         }
     }
@@ -75,50 +98,70 @@ impl CardTable {
     /// Addresses outside the covered region are silently ignored. This is safe
     /// because the write barrier may fire for allocations that straddle region
     /// boundaries during concurrent GC promotion.
+    ///
+    /// This is the *slow* path — used by GC-internal code paths that
+    /// have already established exclusive access (e.g. re-marking cards
+    /// for promoted objects). The mutator write barrier MUST NOT call
+    /// this directly; it should route through
+    /// [`Self::thread_local_dirty_addr`].
     #[inline]
-    pub fn mark_dirty(&mut self, addr: usize) {
+    pub fn mark_dirty(&self, addr: usize) {
         if addr < self.base_addr || addr >= self.base_addr + self.region_size {
             return;
         }
         let index = (addr - self.base_addr) / CARD_SIZE;
-        if index < self.cards.len() {
-            if self.cards[index] != CARD_DIRTY {
-                self.cards[index] = CARD_DIRTY;
-                self.dirty_cards.push(index);
-            }
+        let mut cells = self.cells.lock();
+        if index < cells.cards.len() && cells.cards[index] != CARD_DIRTY {
+            cells.cards[index] = CARD_DIRTY;
+            cells.dirty_cards.push(index);
         }
     }
 
     /// Check if a specific card is dirty.
     pub fn is_dirty(&self, card_index: usize) -> bool {
-        self.cards.get(card_index).copied() == Some(CARD_DIRTY)
+        self.cells
+            .lock()
+            .cards
+            .get(card_index)
+            .copied()
+            == Some(CARD_DIRTY)
     }
 
-    /// Clear all cards (set to CARD_CLEAN).
-    pub fn clear_all(&mut self) {
-        self.cards.fill(CARD_CLEAN);
-        self.dirty_cards.clear();
-        self.pending_offsets.get_mut().clear();
+    /// Clear all cards (set to CARD_CLEAN). Also drops any pending
+    /// thread-local offsets that have been flushed into the shared
+    /// queue — they would be applied to a now-clean bitmap and
+    /// represent stale work from before the clear.
+    pub fn clear_all(&self) {
+        let mut cells = self.cells.lock();
+        cells.cards.fill(CARD_CLEAN);
+        cells.dirty_cards.clear();
+        drop(cells);
+        self.pending_offsets.lock().clear();
     }
 
-    /// Iterate over indices of dirty cards.
+    /// Collect indices of currently-dirty cards into a `Vec`.
     ///
-    /// Note: For bulk processing, prefer [`take_dirty_cards`] which uses the
-    /// O(dirty) tracking list instead of scanning all cards.
-    pub fn dirty_card_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.cards
+    /// Returns a snapshot under the cells lock — callers can iterate
+    /// freely without holding the lock. For bulk processing prefer
+    /// [`Self::take_dirty_cards`] which uses the O(dirty) tracking
+    /// list rather than scanning the whole bitmap.
+    pub fn dirty_card_indices(&self) -> Vec<usize> {
+        let cells = self.cells.lock();
+        cells
+            .cards
             .iter()
             .enumerate()
             .filter(|(_, &card)| card == CARD_DIRTY)
             .map(|(i, _)| i)
+            .collect()
     }
 
     /// Return the tracked list of dirty card indices and clear the tracking list.
     ///
     /// This is O(dirty cards) rather than O(total cards), making it much faster
     /// when only a small fraction of cards are dirty.
-    pub fn take_dirty_cards(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.dirty_cards)
+    pub fn take_dirty_cards(&self) -> Vec<usize> {
+        std::mem::take(&mut self.cells.lock().dirty_cards)
     }
 
     /// Get the start address of the region covered by `card_index`.
@@ -155,7 +198,7 @@ impl CardTable {
 
     /// The number of cards in this table.
     pub fn num_cards(&self) -> usize {
-        self.cards.len()
+        self.cells.lock().cards.len()
     }
 
     /// The base address of the covered region.
@@ -181,9 +224,9 @@ impl CardTable {
     /// [`THREAD_BUFFER_FLUSH_THRESHOLD`] entries it auto-flushes into
     /// the shared pending list via [`Self::flush_dirty_buffer`].
     ///
-    /// The final update to the shared [`cards`](Self::cards) bitmap is
-    /// deferred to a safepoint, where a GC thread calls
-    /// [`Self::drain_pending`] with `&mut self`.
+    /// The final update to the shared bitmap is deferred to a safepoint,
+    /// where the collector calls [`Self::drain_pending`] (or
+    /// [`Self::flush_all`] then [`Self::drain_pending`]).
     pub fn thread_local_dirty(&self, offset: usize) {
         let should_flush = THREAD_DIRTY_BUFFER.with(|buf| {
             let mut b = buf.borrow_mut();
@@ -200,7 +243,7 @@ impl CardTable {
     /// a per-thread buffer hits the auto-flush threshold.
     ///
     /// The offsets themselves are *not* yet resolved to card indices —
-    /// that happens in [`Self::drain_pending`] under `&mut self`, so
+    /// that happens in [`Self::drain_pending`] under the cells lock, so
     /// the hot-path cost remains a single lock acquisition.
     pub fn flush_dirty_buffer(&self) {
         THREAD_DIRTY_BUFFER.with(|buf| {
@@ -214,6 +257,24 @@ impl CardTable {
         });
     }
 
+    /// T5.5.2 — Public alias used by the collector at GC start.
+    ///
+    /// **The collector MUST call this (or `flush_dirty_buffer`) on the
+    /// safepoint thread before scanning dirty cards.** Each mutator is
+    /// responsible for flushing its OWN buffer at the safepoint — this
+    /// call only drains the *current* thread's buffer.
+    ///
+    /// In CratonVM's stop-the-world model the safepoint sync barrier
+    /// guarantees every mutator has either stopped at a safepoint or
+    /// flushed before parking, so a single collector-side
+    /// `drain_pending` after each mutator's own flush is sufficient to
+    /// merge every queued offset into the authoritative bitmap before
+    /// the dirty-card scan.
+    #[inline]
+    pub fn flush_all(&self) {
+        self.flush_dirty_buffer();
+    }
+
     /// T5.5.2 — Fold any thread-submitted offsets from
     /// [`Self::pending_offsets`] into the authoritative `cards` bitmap
     /// and the tracking `dirty_cards` list.
@@ -223,8 +284,16 @@ impl CardTable {
     /// update in O(pending) time.
     ///
     /// Returns the number of distinct new cards that became dirty.
-    pub fn drain_pending(&mut self) -> usize {
-        let pending = std::mem::take(&mut *self.pending_offsets.get_mut());
+    pub fn drain_pending(&self) -> usize {
+        // Snapshot pending offsets under the pending lock, then release
+        // the pending lock before acquiring the cells lock so concurrent
+        // mutators can continue enqueueing into `pending_offsets` while
+        // we update the bitmap.
+        let pending = std::mem::take(&mut *self.pending_offsets.lock());
+        if pending.is_empty() {
+            return 0;
+        }
+        let mut cells = self.cells.lock();
         let mut newly_dirtied = 0usize;
         for offset in pending {
             let addr = self.base_addr.wrapping_add(offset);
@@ -232,9 +301,9 @@ impl CardTable {
                 continue;
             }
             let index = (addr - self.base_addr) / CARD_SIZE;
-            if index < self.cards.len() && self.cards[index] != CARD_DIRTY {
-                self.cards[index] = CARD_DIRTY;
-                self.dirty_cards.push(index);
+            if index < cells.cards.len() && cells.cards[index] != CARD_DIRTY {
+                cells.cards[index] = CARD_DIRTY;
+                cells.dirty_cards.push(index);
                 newly_dirtied += 1;
             }
         }
@@ -252,6 +321,7 @@ impl CardTable {
     ///
     /// Out-of-range addresses are silently dropped, matching the
     /// behaviour of [`Self::mark_dirty`].
+    #[inline]
     pub fn thread_local_dirty_addr(&self, addr: usize) {
         if addr < self.base_addr || addr >= self.base_addr + self.region_size {
             return;
@@ -262,9 +332,10 @@ impl CardTable {
 
 impl std::fmt::Debug for CardTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let dirty_count = self.cards.iter().filter(|&&c| c == CARD_DIRTY).count();
+        let cells = self.cells.lock();
+        let dirty_count = cells.cards.iter().filter(|&&c| c == CARD_DIRTY).count();
         f.debug_struct("CardTable")
-            .field("num_cards", &self.cards.len())
+            .field("num_cards", &cells.cards.len())
             .field("dirty_cards", &dirty_count)
             .field("base_addr", &format_args!("{:#x}", self.base_addr))
             .field("region_size", &self.region_size)
@@ -291,7 +362,7 @@ mod tests {
 
     #[test]
     fn mark_dirty_and_check() {
-        let mut ct = CardTable::new(0x1000, 4096);
+        let ct = CardTable::new(0x1000, 4096);
         // Mark card covering address 0x1000 (card 0)
         ct.mark_dirty(0x1000);
         assert!(ct.is_dirty(0));
@@ -304,7 +375,7 @@ mod tests {
 
     #[test]
     fn mark_dirty_last_byte_of_card() {
-        let mut ct = CardTable::new(0x0, 2048);
+        let ct = CardTable::new(0x0, 2048);
         // Last byte of card 0: offset 511
         ct.mark_dirty(511);
         assert!(ct.is_dirty(0));
@@ -317,14 +388,14 @@ mod tests {
 
     #[test]
     fn clear_all() {
-        let mut ct = CardTable::new(0x0, 2048);
+        let ct = CardTable::new(0x0, 2048);
         ct.mark_dirty(0);
         ct.mark_dirty(512);
         ct.mark_dirty(1024);
-        assert_eq!(ct.dirty_card_indices().count(), 3);
+        assert_eq!(ct.dirty_card_indices().len(), 3);
 
         ct.clear_all();
-        assert_eq!(ct.dirty_card_indices().count(), 0);
+        assert_eq!(ct.dirty_card_indices().len(), 0);
         for i in 0..ct.num_cards() {
             assert!(!ct.is_dirty(i));
         }
@@ -332,12 +403,12 @@ mod tests {
 
     #[test]
     fn dirty_card_indices() {
-        let mut ct = CardTable::new(0x0, 4096);
+        let ct = CardTable::new(0x0, 4096);
         ct.mark_dirty(0); // card 0
         ct.mark_dirty(1536); // card 3 (1536 / 512 = 3)
         ct.mark_dirty(3584); // card 7 (3584 / 512 = 7)
 
-        let dirty: Vec<usize> = ct.dirty_card_indices().collect();
+        let dirty: Vec<usize> = ct.dirty_card_indices();
         assert_eq!(dirty, vec![0, 3, 7]);
     }
 
@@ -374,7 +445,7 @@ mod tests {
 
     #[test]
     fn mark_dirty_outside_region_is_ignored() {
-        let mut ct = CardTable::new(0x1000, 1024);
+        let ct = CardTable::new(0x1000, 1024);
         // Address below base
         ct.mark_dirty(0x0);
         // Address above region
@@ -382,12 +453,12 @@ mod tests {
         ct.mark_dirty(0xFFFF);
 
         // No cards should be dirty
-        assert_eq!(ct.dirty_card_indices().count(), 0);
+        assert_eq!(ct.dirty_card_indices().len(), 0);
     }
 
     #[test]
     fn mark_dirty_first_card() {
-        let mut ct = CardTable::new(0x0, 4096);
+        let ct = CardTable::new(0x0, 4096);
         ct.mark_dirty(0);
         assert!(ct.is_dirty(0));
         assert!(!ct.is_dirty(1));
@@ -395,7 +466,7 @@ mod tests {
 
     #[test]
     fn mark_dirty_last_card() {
-        let mut ct = CardTable::new(0x0, 4096);
+        let ct = CardTable::new(0x0, 4096);
         // Last card covers bytes 3584..4095
         ct.mark_dirty(4095);
         let last_card = ct.num_cards() - 1;
@@ -404,30 +475,30 @@ mod tests {
 
     #[test]
     fn dirty_multiple_regions() {
-        let mut ct = CardTable::new(0x0, 8192);
+        let ct = CardTable::new(0x0, 8192);
         // Dirty cards 0, 3, 7, 15
         ct.mark_dirty(0);       // card 0
         ct.mark_dirty(1536);    // card 3
         ct.mark_dirty(3584);    // card 7
         ct.mark_dirty(7680);    // card 15
 
-        let dirty: Vec<usize> = ct.dirty_card_indices().collect();
+        let dirty: Vec<usize> = ct.dirty_card_indices();
         assert_eq!(dirty, vec![0, 3, 7, 15]);
     }
 
     #[test]
     fn clear_then_dirty_again() {
-        let mut ct = CardTable::new(0x0, 2048);
+        let ct = CardTable::new(0x0, 2048);
         ct.mark_dirty(0);
         ct.mark_dirty(512);
-        assert_eq!(ct.dirty_card_indices().count(), 2);
+        assert_eq!(ct.dirty_card_indices().len(), 2);
 
         ct.clear_all();
-        assert_eq!(ct.dirty_card_indices().count(), 0);
+        assert_eq!(ct.dirty_card_indices().len(), 0);
 
         // Re-dirty after clear
         ct.mark_dirty(1024);
-        let dirty: Vec<usize> = ct.dirty_card_indices().collect();
+        let dirty: Vec<usize> = ct.dirty_card_indices();
         assert_eq!(dirty, vec![2]);
     }
 
@@ -444,23 +515,23 @@ mod tests {
 
     #[test]
     fn mark_same_card_idempotent() {
-        let mut ct = CardTable::new(0x0, 4096);
+        let ct = CardTable::new(0x0, 4096);
         ct.mark_dirty(100);
         ct.mark_dirty(200);
         ct.mark_dirty(300);
         // All within card 0 (offsets 0..511)
         assert!(ct.is_dirty(0));
-        assert_eq!(ct.dirty_card_indices().count(), 1);
+        assert_eq!(ct.dirty_card_indices().len(), 1);
     }
 
     #[test]
     fn all_cards_dirty() {
-        let mut ct = CardTable::new(0x0, 2048);
+        let ct = CardTable::new(0x0, 2048);
         let num = ct.num_cards();
         for i in 0..num {
             ct.mark_dirty(i * CARD_SIZE);
         }
-        assert_eq!(ct.dirty_card_indices().count(), num);
+        assert_eq!(ct.dirty_card_indices().len(), num);
     }
 
     #[test]
@@ -488,14 +559,14 @@ mod tests {
 
     #[test]
     fn mark_dirty_at_exact_base() {
-        let mut ct = CardTable::new(0x5000, 4096);
+        let ct = CardTable::new(0x5000, 4096);
         ct.mark_dirty(0x5000);
         assert!(ct.is_dirty(0));
     }
 
     #[test]
     fn mark_dirty_at_region_end_minus_one() {
-        let mut ct = CardTable::new(0x5000, 4096);
+        let ct = CardTable::new(0x5000, 4096);
         ct.mark_dirty(0x5000 + 4095);
         let last = ct.num_cards() - 1;
         assert!(ct.is_dirty(last));
@@ -503,10 +574,10 @@ mod tests {
 
     #[test]
     fn mark_dirty_at_exact_region_end_is_ignored() {
-        let mut ct = CardTable::new(0x5000, 4096);
+        let ct = CardTable::new(0x5000, 4096);
         // Exactly at base + region_size is out of range
         ct.mark_dirty(0x5000 + 4096);
-        assert_eq!(ct.dirty_card_indices().count(), 0);
+        assert_eq!(ct.dirty_card_indices().len(), 0);
     }
 
     // -----------------------------------------------------------------
@@ -515,13 +586,13 @@ mod tests {
 
     #[test]
     fn thread_local_dirty_accumulates_without_touching_cards() {
-        let mut ct = CardTable::new(0x0, 8192);
+        let ct = CardTable::new(0x0, 8192);
         // Dirty one offset via the fast path — stays in the thread-local
         // buffer; the shared table sees nothing until a flush.
         ct.thread_local_dirty(0);
         // Not enough to auto-flush.
         assert_eq!(ct.pending_count(), 0);
-        assert_eq!(ct.dirty_card_indices().count(), 0);
+        assert_eq!(ct.dirty_card_indices().len(), 0);
 
         // Explicit flush + drain.
         ct.flush_dirty_buffer();
@@ -535,7 +606,7 @@ mod tests {
     fn thread_local_dirty_auto_flushes_at_threshold() {
         // Use a large region so the threshold-worth of distinct card
         // offsets is well-defined.
-        let mut ct = CardTable::new(
+        let ct = CardTable::new(
             0x0,
             CARD_SIZE * THREAD_BUFFER_FLUSH_THRESHOLD * 2,
         );
@@ -564,7 +635,7 @@ mod tests {
 
     #[test]
     fn drain_pending_deduplicates_same_card() {
-        let mut ct = CardTable::new(0x0, 4096);
+        let ct = CardTable::new(0x0, 4096);
         // All offsets within card 0.
         ct.thread_local_dirty(0);
         ct.thread_local_dirty(100);
@@ -574,12 +645,12 @@ mod tests {
         // Three offsets but only one new card.
         assert_eq!(newly, 1);
         assert!(ct.is_dirty(0));
-        assert_eq!(ct.dirty_card_indices().count(), 1);
+        assert_eq!(ct.dirty_card_indices().len(), 1);
     }
 
     #[test]
     fn drain_pending_rejects_out_of_range_offset() {
-        let mut ct = CardTable::new(0x0, 1024);
+        let ct = CardTable::new(0x0, 1024);
         // Offset past region_size — should be silently dropped.
         ct.thread_local_dirty(1024);
         ct.thread_local_dirty(99999);
@@ -590,7 +661,7 @@ mod tests {
 
     #[test]
     fn thread_local_dirty_addr_wraps_address_to_offset() {
-        let mut ct = CardTable::new(0x10_0000, 4096);
+        let ct = CardTable::new(0x10_0000, 4096);
         ct.thread_local_dirty_addr(0x10_0000 + 513); // card 1
         ct.flush_dirty_buffer();
         let newly = ct.drain_pending();
@@ -600,11 +671,26 @@ mod tests {
 
     #[test]
     fn clear_all_also_resets_pending() {
-        let mut ct = CardTable::new(0x0, 4096);
+        let ct = CardTable::new(0x0, 4096);
         ct.thread_local_dirty(0);
         ct.flush_dirty_buffer();
         assert_eq!(ct.pending_count(), 1);
         ct.clear_all();
         assert_eq!(ct.pending_count(), 0);
+    }
+
+    #[test]
+    fn flush_all_is_alias_for_flush_dirty_buffer() {
+        // T5.5.2 — `flush_all` is documented as the GC-entry hook. It
+        // should be functionally identical to `flush_dirty_buffer` for
+        // the current thread.
+        let ct = CardTable::new(0x0, 4096);
+        ct.thread_local_dirty(0);
+        assert_eq!(ct.pending_count(), 0);
+        ct.flush_all();
+        assert_eq!(ct.pending_count(), 1);
+        let newly = ct.drain_pending();
+        assert_eq!(newly, 1);
+        assert!(ct.is_dirty(0));
     }
 }

@@ -1,33 +1,155 @@
 //! Throwable, StackTraceElement, Enum, and Record native method implementations.
 
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use rustjvm_types::{ClassId, ObjectRef, Value};
 use rustjvm_types::error::MethodCallResult;
 
 use crate::obj_arg;
 
+// ---------------------------------------------------------------------------
+// Per-throw allocation caches.
+//
+// `new Exception(msg)` and `printStackTrace` are extremely hot — on a
+// `printStackTrace` of a 30-deep trace we allocate one StackTraceElement,
+// three Strings (class/method/file), and look up the StackTraceElement class
+// id per frame. The audit (audit-2026-05-16) flagged three sources of
+// per-throw overhead worth eliminating:
+//
+//   1. `set_field_by_name(this, "detailMessage", ...)` walks the Throwable
+//      class hierarchy on every call to resolve the slot index. Cache the
+//      resolved index once and reuse across all `Throwable.<init>` paths.
+//   2. `ClassId::new(0)` was hard-coded for the StackTraceElement class id
+//      in `build_ste` — `getClass()` on the returned STE then surfaced the
+//      Object class (id 0) instead of `java/lang/StackTraceElement`. Cache
+//      the real class id on first use.
+//   3. The dotted-form class name (`java.lang.Foo` from `java/lang/Foo`) is
+//      already cached per ClassId by `lang_class::dotted_class_name`. The
+//      audit suggests reusing that cache to share the `Arc<str>` across the
+//      STE-build path and the `Class.getName()` path.
+//
+// All caches use sentinel values rather than `OnceLock<Option<…>>` so that
+// a failed lookup on early boot (Throwable class not yet loaded) does not
+// poison the cache permanently — the next call will retry.
+// ---------------------------------------------------------------------------
+
+/// Sentinel meaning "field index not yet resolved." `resolve_field_index`
+/// returns `usize`, so any real index will be far below this. We use
+/// `AtomicUsize` because the index is read on every Throwable ctor call
+/// and stored at most once per process lifetime — relaxed ordering is fine
+/// (write races are idempotent and the bounds-check on every use guards
+/// against stale snapshots).
+const UNRESOLVED_FIELD_INDEX: usize = usize::MAX;
+static THROWABLE_DETAIL_MESSAGE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_CAUSE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+
+/// Sentinel meaning "STE class id not yet resolved." `ClassId::new(0)` is
+/// the legacy fallback (java/lang/Object) — using it as a sentinel would
+/// be ambiguous with the audit-flagged bug it replaces, so we use
+/// `u32::MAX` instead and treat any non-MAX value as cached.
+const UNRESOLVED_CLASS_ID: u32 = u32::MAX;
+static STE_CLASS_ID: AtomicU32 = AtomicU32::new(UNRESOLVED_CLASS_ID);
+
+/// Resolve & cache a Throwable field's slot index, falling back to
+/// name-based set on cache miss / out-of-bounds.
+///
+/// `resolve_field_index` walks the class hierarchy each call; caching the
+/// result eliminates that walk on the hot path. We bounds-check the cached
+/// index against the actual object's field count because synthetic-stub
+/// Throwable subclasses use a smaller layout (only 2 slots) than the
+/// real-JDK Throwable layout (3 slots) — if the cache was populated from
+/// the real layout but the runtime object is a synthetic stub, we must
+/// fall back to the by-name path which handles both layouts.
+#[inline]
+fn cached_throwable_field_index(
+    ctx: &dyn NativeContext,
+    cache: &AtomicUsize,
+    field_name: &str,
+) -> Option<usize> {
+    let cached = cache.load(Ordering::Relaxed);
+    if cached != UNRESOLVED_FIELD_INDEX {
+        return Some(cached);
+    }
+    let idx = ctx.resolve_field_index("java/lang/Throwable", field_name)?;
+    // Race-safe: any concurrent resolver will compute the same index since
+    // the class layout is immutable once loaded. Last-write-wins is fine.
+    cache.store(idx, Ordering::Relaxed);
+    Some(idx)
+}
+
+/// Write a Throwable field, preferring the cached slot index and falling
+/// back to name-based lookup if the cached index is stale (object has
+/// fewer slots than expected — synthetic-stub layout).
+#[inline]
+fn write_throwable_field_cached(
+    ctx: &mut dyn NativeContext,
+    cache: &AtomicUsize,
+    field_name: &str,
+    this: ObjectRef,
+    value: Value,
+) {
+    if let Some(idx) = cached_throwable_field_index(ctx, cache, field_name) {
+        if idx < ctx.object_num_fields(this) {
+            ctx.set_field(this, idx, value);
+            return;
+        }
+    }
+    ctx.set_field_by_name(this, field_name, value);
+}
+
+/// Resolve & cache the `java/lang/StackTraceElement` class id. Falls back
+/// to `ClassId::new(0)` only if the class still isn't loaded — that's the
+/// pre-fix behaviour, preserved here so we don't regress on early-boot
+/// callers that pre-date class loading. Once the class loads, every
+/// subsequent build_ste call gets the correct id.
+#[inline]
+fn cached_ste_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    let cached = STE_CLASS_ID.load(Ordering::Relaxed);
+    if cached != UNRESOLVED_CLASS_ID {
+        return ClassId::new(cached);
+    }
+    if let Some(cid) = ctx.class_id_by_name("java/lang/StackTraceElement") {
+        STE_CLASS_ID.store(cid.as_u32(), Ordering::Relaxed);
+        return cid;
+    }
+    // Class not loaded yet — return the legacy fallback but DO NOT cache,
+    // so a later call (after the class loads) can re-resolve correctly.
+    ClassId::new(0)
+}
+
 /// Helper: write Throwable.detailMessage on a Throwable subclass.
 ///
 /// Real-JDK Throwable layout: slot 0 = `backtrace` (an internal Object
-/// reference), slot 1 = `detailMessage`, slot 2 = `cause`. Resolve by
-/// name so we always hit `detailMessage` regardless of declared subclass
-/// fields. The previous implementation also mirrored to slot 0 to support
-/// a now-removed synthetic-stub layout — that mirror clobbered
-/// Throwable.backtrace with a String reference and corrupted any
-/// downstream consumer that read backtrace as an Object[].
+/// reference), slot 1 = `detailMessage`, slot 2 = `cause`. We resolve the
+/// slot index once per process (cached in `THROWABLE_DETAIL_MESSAGE_INDEX`)
+/// and reuse it; falls back to name-based resolution if the cached index
+/// is out of bounds for `this` (synthetic-stub layout). The previous
+/// implementation also mirrored to slot 0 to support a now-removed
+/// synthetic-stub layout — that mirror clobbered Throwable.backtrace with
+/// a String reference and corrupted any downstream consumer that read
+/// backtrace as an Object[].
 fn write_throwable_detail_message(ctx: &mut dyn NativeContext, this: ObjectRef, msg: Value) {
-    ctx.set_field_by_name(this, "detailMessage", msg);
+    write_throwable_field_cached(
+        ctx,
+        &THROWABLE_DETAIL_MESSAGE_INDEX,
+        "detailMessage",
+        this,
+        msg,
+    );
 }
 
 /// Helper: write Throwable.cause on a Throwable subclass.
 ///
-/// Real-JDK Throwable layout: `cause` is at slot 2. Resolve by name. The
+/// Real-JDK Throwable layout: `cause` is at slot 2. We resolve the slot
+/// index once per process (cached in `THROWABLE_CAUSE_INDEX`) and reuse
+/// it; falls back to name-based resolution on bounds mismatch. The
 /// previous implementation also mirrored to slot 1 (the synthetic-stub
 /// cause slot), but slot 1 in the real-JDK layout is `detailMessage` —
 /// the mirror clobbered the message field whenever both helpers ran
 /// (e.g. via `<init>(String, Throwable)`).
 fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
-    ctx.set_field_by_name(this, "cause", cause);
+    write_throwable_field_cached(ctx, &THROWABLE_CAUSE_INDEX, "cause", this, cause);
 }
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
@@ -153,14 +275,23 @@ pub(crate) fn native_throwable_get_stack_trace_element(
         .and_then(|t| t.get(index as usize))
         .cloned();
 
-    // Helper: build a StackTraceElement with 4 fields
+    // Helper: build a StackTraceElement with 4 fields.
+    //
+    // audit-2026-05-16: the STE class id was hard-coded to
+    // `ClassId::new(0)` (java/lang/Object's id), which caused
+    // `getClass()` on the returned STE to surface Object instead of
+    // StackTraceElement. We now resolve & cache the real class id via
+    // `cached_ste_class_id`, falling back to id 0 only if the class
+    // hasn't been loaded yet (preserves previous behaviour on early
+    // boot).
     let build_ste = |ctx: &mut dyn NativeContext,
                      class_name: &str,
                      method_name: &str,
                      file_name: Option<&str>,
                      line: i32|
      -> ObjectRef {
-        let ste_obj = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let ste_cid = cached_ste_class_id(ctx);
+        let ste_obj = ctx.alloc_object(ste_cid, 4);
         let cs = ctx.create_string(class_name);
         ctx.set_field(ste_obj, 0, Value::Object(Some(cs)));
         let ms = ctx.create_string(method_name);
@@ -177,9 +308,16 @@ pub(crate) fn native_throwable_get_stack_trace_element(
 
     match entry_data {
         Some(ste) => {
+            // Use the shared `dotted_class_name` cache so repeat traces
+            // that hit the same class (e.g. recursive frames) reuse the
+            // existing `Arc<str>` instead of re-running `replace('/', ".")`.
+            let dotted = match ctx.class_id_by_name(&ste.class_name) {
+                Some(cid) => crate::lang_class::dotted_class_name(cid, &ste.class_name),
+                None => std::sync::Arc::from(ste.class_name.replace('/', ".")),
+            };
             let obj = build_ste(
                 ctx,
-                &ste.class_name,
+                &dotted,
                 &ste.method_name,
                 ste.source_file.as_deref(),
                 ste.line_number,
@@ -538,16 +676,19 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         }
     };
     let hash = ctx.identity_hash_code(this);
-    // Clone trace data to avoid borrow conflict with ctx
+    // Clone trace data to avoid borrow conflict with ctx. We keep the
+    // slashed `class_name` Arc<str> (not the dotted form) so we can pass
+    // it back through the cached `dotted_class_name` helper below and
+    // share the `Arc<str>` across repeat traces of the same class.
     let trace_data: Vec<_> = ctx
         .get_stack_trace(hash)
         .map(|t| {
             t.iter()
                 .map(|e| {
                     (
-                        e.class_name.replace('/', "."),
-                        e.method_name.to_string(),
-                        e.source_file.as_ref().map(|f| f.to_string()),
+                        std::sync::Arc::clone(&e.class_name),
+                        std::sync::Arc::clone(&e.method_name),
+                        e.source_file.as_ref().map(std::sync::Arc::clone),
                         e.line_number,
                     )
                 })
@@ -557,9 +698,16 @@ pub(crate) fn native_throwable_get_stack_trace_array(
 
     let len = trace_data.len();
     let arr = ctx.new_ref_array(ClassId::new(0), len);
-    for (i, (cls, meth, file, line)) in trace_data.iter().enumerate() {
+    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
-        let cls_str = ctx.create_string(cls);
+        // Reuse the dotted-name cache shared with `Class.getName()` so
+        // repeat frames in the same trace (recursion) hit the cached
+        // Arc<str> instead of re-allocating.
+        let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
+            Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
+            None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
+        };
+        let cls_str = ctx.create_string(&cls_dotted);
         let meth_str = ctx.create_string(meth);
         ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
         ctx.set_field(ste, 1, Value::Object(Some(meth_str)));

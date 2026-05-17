@@ -25,6 +25,7 @@ use rustjvm_reader::class_file_version::ClassFileVersion;
 use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use rustjvm_types::{ClassId, ClassLoaderId};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -248,5 +249,11 @@ fn make_minimal_class(name: &str, id: ClassId) -> Class {
         has_finalizer: false,
         code_source: None,
         array_info: None,
+        attributes: Vec::new(),
+        source_file_cache: OnceLock::new(),
+        signature_cache: OnceLock::new(),
+        nest_host_cache: OnceLock::new(),
+        enclosing_method_cache: OnceLock::new(),
+        record_components_cache: OnceLock::new(),
     }
 }

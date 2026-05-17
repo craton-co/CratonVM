@@ -2301,10 +2301,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let exceptions: Vec<String> = m
                     .attributes
                     .iter()
-                    .find_map(|a| match a {
-                        rustjvm_reader::attribute::Attribute::Exceptions {
+                    .find_map(|a| match a.as_decoded() {
+                        Some(rustjvm_reader::attribute::Attribute::Exceptions {
                             exception_indices,
-                        } => Some(
+                        }) => Some(
                             exception_indices
                                 .iter()
                                 .filter_map(|idx| {
@@ -2595,7 +2595,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             proxies.get(&receiver_class_id).cloned()
         };
 
-        if let Some(lcs) = call_site.filter(|lcs| method_name == lcs.sam_method_name) {
+        if let Some(lcs) = call_site.filter(|lcs| method_name == &*lcs.sam_method_name) {
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
@@ -2650,9 +2650,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                                 .read()
                                 .get_class(rcv_id)
                                 .map(|c| c.name.to_string())
-                                .unwrap_or_else(|| lcs.impl_handle.class_name.clone())
+                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string())
                         }
-                        _ => lcs.impl_handle.class_name.clone(),
+                        _ => lcs.impl_handle.class_name.to_string(),
                     };
                     let result = self.invoke_or_native(
                         &target_class,
@@ -2667,7 +2667,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     match &result {
                         Err(MethodCallFailed::InternalError(VmError::Linkage(
                             LinkageError::NoSuchMethodError { .. },
-                        ))) if target_class != lcs.impl_handle.class_name => self.invoke_or_native(
+                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name => self.invoke_or_native(
                             &lcs.impl_handle.class_name,
                             &lcs.impl_handle.member_name,
                             &lcs.impl_handle.descriptor,
@@ -2751,7 +2751,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let class_name = {
                 let lambda_iface = {
                     let proxies = self.shared.lambda_proxies.read();
-                    proxies.get(&receiver_class_id).map(|lcs| lcs.functional_interface.clone())
+                    proxies.get(&receiver_class_id).map(|lcs| lcs.functional_interface.to_string())
                 };
                 lambda_iface.unwrap_or_else(|| {
                     self.shared
@@ -2855,7 +2855,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let rustjvm_reader::attribute::Attribute::Signature(s) = attr {
+                    if let Some(rustjvm_reader::attribute::Attribute::Signature(s)) =
+                        attr.as_decoded()
+                    {
                         return Some(s.clone());
                     }
                 }
@@ -2879,7 +2881,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let rustjvm_reader::attribute::Attribute::MethodParameters(params) = attr {
+                    if let Some(rustjvm_reader::attribute::Attribute::MethodParameters(params)) =
+                        attr.as_decoded()
+                    {
                         // JVMS 4.7.24: name_index == 0 means an anonymous /
                         // synthetic parameter вЂ” surface it as an empty
                         // string so the caller can fall back to "argN".
@@ -2912,7 +2916,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for f in &class.fields {
             if &*f.name == field_name {
                 for attr in &f.attributes {
-                    if let rustjvm_reader::attribute::Attribute::Signature(s) = attr {
+                    if let Some(rustjvm_reader::attribute::Attribute::Signature(s)) =
+                        attr.as_decoded()
+                    {
                         return Some(s.clone());
                     }
                 }
@@ -2955,7 +2961,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let rustjvm_reader::attribute::Attribute::AnnotationDefault(ev) = attr {
+                    if let Some(rustjvm_reader::attribute::Attribute::AnnotationDefault(ev)) =
+                        attr.as_decoded()
+                    {
                         return convert_element_value(ev, &class.constant_pool);
                     }
                 }
@@ -2979,9 +2987,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let rustjvm_reader::attribute::Attribute::Exceptions {
+                    if let Some(rustjvm_reader::attribute::Attribute::Exceptions {
                         exception_indices,
-                    } = attr
+                    }) = attr.as_decoded()
                     {
                         return exception_indices
                             .iter()
@@ -3678,12 +3686,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
 /// Extract annotation data from a list of attributes.
 pub(super) fn extract_annotations_from_attributes(
-    attributes: &[rustjvm_reader::attribute::Attribute],
+    attributes: &[rustjvm_reader::attribute::LazyAttribute],
     cp: &rustjvm_reader::constant_pool::ConstantPool,
 ) -> Vec<crate::native::registry::AnnotationData> {
     use rustjvm_reader::attribute::Attribute;
     let mut result = Vec::new();
-    for attr in attributes {
+    for lazy in attributes {
+        let attr = match lazy.as_decoded() {
+            Some(a) => a,
+            None => continue,
+        };
         match attr {
             Attribute::RuntimeVisibleAnnotations(annotations)
             | Attribute::RuntimeInvisibleAnnotations(annotations) => {
@@ -3701,11 +3713,15 @@ pub(super) fn extract_annotations_from_attributes(
 
 /// Extract parameter annotation data from a list of attributes.
 pub(super) fn extract_parameter_annotations(
-    attributes: &[rustjvm_reader::attribute::Attribute],
+    attributes: &[rustjvm_reader::attribute::LazyAttribute],
     cp: &rustjvm_reader::constant_pool::ConstantPool,
 ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
     use rustjvm_reader::attribute::Attribute;
-    for attr in attributes {
+    for lazy in attributes {
+        let attr = match lazy.as_decoded() {
+            Some(a) => a,
+            None => continue,
+        };
         match attr {
             Attribute::RuntimeVisibleParameterAnnotations(params)
             | Attribute::RuntimeInvisibleParameterAnnotations(params) => {
@@ -8728,6 +8744,12 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            attributes: Vec::new(),
+            source_file_cache: std::sync::OnceLock::new(),
+            signature_cache: std::sync::OnceLock::new(),
+            nest_host_cache: std::sync::OnceLock::new(),
+            enclosing_method_cache: std::sync::OnceLock::new(),
+            record_components_cache: std::sync::OnceLock::new(),
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)

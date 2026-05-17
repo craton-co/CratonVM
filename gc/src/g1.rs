@@ -232,6 +232,22 @@ pub struct G1Collector {
     marking_complete: AtomicBool,
     /// Remaining mixed GC cycles after a marking cycle.
     mixed_gc_remaining: AtomicU64,
+
+    /// Address-to-region lookup table for O(log R) `region_for_ptr` queries.
+    ///
+    /// Each entry is `(base_addr, region_idx)`, sorted ascending by
+    /// `base_addr`. Built once in [`G1Collector::new`] and never mutated
+    /// afterward: the outer `regions: Vec<G1Region>` is constructed with a
+    /// fixed length and never `push`/`pop`ed, and each region's `data` Vec
+    /// is allocated once with `region_size` capacity — `G1Region::reset`
+    /// only zero-fills, it does not reallocate — so the backing-buffer
+    /// addresses are stable for the entire lifetime of the collector.
+    ///
+    /// This replaces the previous O(R) linear scan inside
+    /// `scan_and_evacuate_refs` and the write barrier, which was an
+    /// audit-flagged hot-path bottleneck (CRIT-P4): with 256 regions, a
+    /// 100-slot object incurred ~25k linear probes during evacuation.
+    region_lookup: Vec<(usize, usize)>,
 }
 
 // SAFETY: All fields are either atomic, behind Mutex, or Arc. Raw pointers
@@ -248,6 +264,16 @@ impl G1Collector {
         let regions: Vec<G1Region> = (0..num_regions)
             .map(|_| G1Region::new(config.region_size))
             .collect();
+
+        // Build the address-to-region lookup table (sorted by base addr).
+        // Each region's `data` Vec was just allocated; its `as_ptr()` is
+        // stable for the lifetime of the collector (see field doc).
+        let mut region_lookup: Vec<(usize, usize)> = regions
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.data.as_ptr() as usize, i))
+            .collect();
+        region_lookup.sort_unstable_by_key(|(base, _)| *base);
 
         // Compute a dummy base address for the bitmap. Since regions have
         // independent Vec<u8> backing, we use 0 as base and a large range.
@@ -273,6 +299,7 @@ impl G1Collector {
             gc_log_enabled: AtomicBool::new(false),
             marking_complete: AtomicBool::new(false),
             mixed_gc_remaining: AtomicU64::new(0),
+            region_lookup,
         }
     }
 
@@ -745,18 +772,20 @@ impl G1Collector {
     // -----------------------------------------------------------------------
 
     /// Find which region a raw pointer belongs to.
-    fn region_for_ptr(&self, regions: &[G1Region], ptr: *mut u8) -> Option<usize> {
-        let addr = ptr as usize;
-        for (i, r) in regions.iter().enumerate() {
-            if r.region_type == RegionType::Free {
-                continue;
-            }
-            let base = r.data.as_ptr() as usize;
-            if addr >= base && addr < base + r.data.len() {
-                return Some(i);
-            }
-        }
-        None
+    ///
+    /// O(log R) via binary search on the cached `region_lookup` table.
+    /// The `regions` parameter is retained for signature compatibility but
+    /// is no longer scanned linearly — the per-slot evacuation hot path
+    /// (CRIT-P4) used to incur an O(R) probe per reference slot, dragging
+    /// scan cost to O(objects × refs × regions). Lookup is now independent
+    /// of the live-region count.
+    ///
+    /// Note: this no longer skips `Free` regions (matching
+    /// [`Self::region_for_ptr_with_regions`]). All callers either filter
+    /// via the CSet (which excludes Free regions by construction) or are
+    /// inherently safe against the case.
+    fn region_for_ptr(&self, _regions: &[G1Region], ptr: *mut u8) -> Option<usize> {
+        self.lookup_region_for_addr(ptr as usize)
     }
 
     /// Evacuate a single object from its current region to Survivor or Old.
@@ -1236,19 +1265,14 @@ impl G1Collector {
         let total_size = HEADER_SIZE + num_fields.checked_mul(SLOT_SIZE)?;
         let (ptr, _region) = self.alloc_in_region(total_size)?;
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: 0,
-            num_slots: u32::try_from(num_fields).ok()?,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).ok()?,
+        );
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
             Some(ObjectRef::from_raw(ptr))
@@ -1308,19 +1332,14 @@ impl G1Collector {
         let total_size = HEADER_SIZE.checked_add(data_size)?;
         let (ptr, _region) = self.alloc_in_region(total_size)?;
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Array,
+            ObjectKind::Array,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: u32::try_from(length).ok()?,
-            num_slots: 0,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            self.next_hash(),
+            u32::try_from(length).ok()?,
+            0,
+        );
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
             Some(ObjectRef::from_raw(ptr))
@@ -1403,15 +1422,42 @@ impl G1Collector {
     }
 
     /// Find which region contains the given address (by raw address).
-    fn region_for_ptr_with_regions(&self, regions: &[G1Region], addr: usize) -> Option<usize> {
-        for (i, r) in regions.iter().enumerate() {
-            let base = r.data.as_ptr() as usize;
-            let end = base + r.data.len();
-            if addr >= base && addr < end {
-                return Some(i);
-            }
+    ///
+    /// O(log R) via the cached `region_lookup` table. See
+    /// [`Self::region_for_ptr`] for the rationale; this variant is the
+    /// hot path for the write barrier in
+    /// [`Self::post_write_barrier_rset`], where it is called twice per
+    /// reference store.
+    fn region_for_ptr_with_regions(&self, _regions: &[G1Region], addr: usize) -> Option<usize> {
+        self.lookup_region_for_addr(addr)
+    }
+
+    /// Binary-search the cached `(base_addr, region_idx)` table to find
+    /// which region (if any) owns `addr`.
+    ///
+    /// Complexity: O(log R) — independent of the number of live regions.
+    ///
+    /// Returns `Some(idx)` iff `addr` falls within `[base, base + region_size)`
+    /// for some region. The check uses `self.config.region_size` instead of
+    /// the per-region `data.len()` because every region's backing buffer is
+    /// allocated at exactly `region_size` bytes (see [`G1Region::new`]).
+    #[inline]
+    fn lookup_region_for_addr(&self, addr: usize) -> Option<usize> {
+        // Find the largest base address that is <= addr.
+        // `partition_point` returns the first index where the predicate is
+        // false; subtracting 1 gives the last index where it is true.
+        let pp = self
+            .region_lookup
+            .partition_point(|(base, _)| *base <= addr);
+        if pp == 0 {
+            return None;
         }
-        None
+        let (base, idx) = self.region_lookup[pp - 1];
+        if addr < base.wrapping_add(self.config.region_size) {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     /// Conservative validity check for a *raw address* — see
@@ -1527,19 +1573,14 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: 0,
-            num_slots: u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
+        );
 
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
@@ -1561,19 +1602,14 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Array,
+            ObjectKind::Array,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: u32::try_from(length).expect("array length exceeds u32::MAX"),
-            num_slots: 0,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            self.next_hash(),
+            u32::try_from(length).expect("array length exceeds u32::MAX"),
+            0,
+        );
 
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
@@ -3186,5 +3222,140 @@ mod tests {
         assert_eq!(r.garbage_bytes(), 700);
         let full = make_old_region(0, 1000, 1000);
         assert_eq!(full.garbage_bytes(), 0);
+    }
+
+    // -- CRIT-P4: address-to-region lookup table --
+
+    /// Every region's `data` base appears in `region_lookup` exactly once,
+    /// and the table is sorted by base address.
+    #[test]
+    fn region_lookup_table_built_for_every_region() {
+        let gc = make_collector();
+        let num = gc.num_regions();
+        assert_eq!(gc.region_lookup.len(), num);
+
+        // Sorted by base
+        for w in gc.region_lookup.windows(2) {
+            assert!(w[0].0 < w[1].0, "lookup table must be strictly sorted");
+        }
+
+        // Every region index represented
+        let mut idxs: Vec<usize> = gc.region_lookup.iter().map(|(_, i)| *i).collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, (0..num).collect::<Vec<_>>());
+
+        // Each entry's base matches the live region's data ptr.
+        let regions = gc.regions.lock();
+        for &(base, idx) in &gc.region_lookup {
+            assert_eq!(base, regions[idx].data.as_ptr() as usize);
+        }
+    }
+
+    /// Pointers into each region resolve to the correct region index;
+    /// pointers outside the heap return None.
+    #[test]
+    fn region_for_ptr_returns_correct_index_for_each_region() {
+        let gc = make_collector();
+        let regions = gc.regions.lock();
+        let region_size = gc.config.region_size;
+
+        // Sample three offsets per region: start, middle, last byte.
+        for (expected_idx, r) in regions.iter().enumerate() {
+            let base = r.data.as_ptr() as usize;
+            for offset in [0usize, region_size / 2, region_size - 1] {
+                let ptr = (base + offset) as *mut u8;
+                let got = gc.region_for_ptr(&regions, ptr);
+                assert_eq!(
+                    got,
+                    Some(expected_idx),
+                    "ptr {:#x} (region {} offset {}) lookup mismatch",
+                    ptr as usize,
+                    expected_idx,
+                    offset,
+                );
+            }
+        }
+
+        // One-past-the-end of a region is OUT of that region. If it lands
+        // exactly on the next region's base it should resolve to that next
+        // region; otherwise None.
+        for (i, r) in regions.iter().enumerate() {
+            let just_past = r.data.as_ptr() as usize + region_size;
+            let got = gc.region_for_ptr(&regions, just_past as *mut u8);
+            // The byte at base+region_size belongs to no region unless
+            // another region happens to start there.
+            if let Some(idx) = got {
+                assert_ne!(idx, i, "ptr {:#x} should not resolve back to region {}", just_past, i);
+            }
+        }
+    }
+
+    /// Addresses outside every region's `[base, base + region_size)` band
+    /// must return None — neither very small addresses nor very large ones
+    /// should false-positively match.
+    #[test]
+    fn region_for_ptr_returns_none_outside_heap() {
+        let gc = make_collector();
+        let regions = gc.regions.lock();
+
+        // Trivially-low addresses
+        for addr in [0usize, 8, 0x1000, 0x1_0000] {
+            // Filter out the (extremely unlikely) case the OS allocated a
+            // region near zero — skip if it would actually land in one.
+            if gc.lookup_region_for_addr(addr).is_none() {
+                assert_eq!(
+                    gc.region_for_ptr(&regions, addr as *mut u8),
+                    None,
+                    "addr {:#x} should not resolve to any region",
+                    addr,
+                );
+            }
+        }
+
+        // High addresses well above any plausible region base.
+        let max_base = gc
+            .region_lookup
+            .iter()
+            .map(|(b, _)| *b)
+            .max()
+            .unwrap();
+        let well_above = max_base + gc.config.region_size + 0x10_0000;
+        assert_eq!(
+            gc.region_for_ptr(&regions, well_above as *mut u8),
+            None,
+            "addr {:#x} above all regions should not resolve",
+            well_above,
+        );
+    }
+
+    /// `region_for_ptr_with_regions` (write-barrier hot path) must agree
+    /// with `region_for_ptr` for every probe.
+    #[test]
+    fn region_for_ptr_with_regions_matches_region_for_ptr() {
+        let gc = make_collector();
+        let regions = gc.regions.lock();
+        let region_size = gc.config.region_size;
+
+        for (expected_idx, r) in regions.iter().enumerate() {
+            let base = r.data.as_ptr() as usize;
+            for offset in [0usize, 1, 64, region_size / 3, region_size - 1] {
+                let addr = base + offset;
+                let by_addr = gc.region_for_ptr_with_regions(&regions, addr);
+                let by_ptr = gc.region_for_ptr(&regions, addr as *mut u8);
+                assert_eq!(by_addr, by_ptr);
+                assert_eq!(by_addr, Some(expected_idx));
+            }
+        }
+    }
+
+    /// End-to-end: allocating an object and looking up its pointer must
+    /// return the same region index the allocator placed it in.
+    #[test]
+    fn region_for_ptr_agrees_with_allocator() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 2);
+        let regions = gc.regions.lock();
+        let idx = gc.region_for_ptr(&regions, obj.as_ptr()).unwrap();
+        assert_eq!(regions[idx].region_type, RegionType::Eden);
     }
 }

@@ -1181,19 +1181,15 @@ mod tests {
 
     #[test]
     fn migrate_preserves_class_and_age() {
-        let old = crate::heap::ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(77),
-            kind: crate::heap::ObjectKind::Object,
-            element_type: crate::heap::ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 0,
-            num_slots: 2,
-            gc_age: 9,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let mut old = crate::heap::ObjectHeader::new(
+            rustjvm_types::ClassId::new(77),
+            crate::heap::ObjectKind::Object,
+            crate::heap::ArrayElementType::Reference,
+            0,
+            0,
+            2,
+        );
+        old.gc_age = 9;
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 77, &ht, 0x4000);
         assert_eq!(compact.narrow_klass(), 77);
@@ -1204,19 +1200,14 @@ mod tests {
 
     #[test]
     fn migrate_array_preserves_element_type() {
-        let old = crate::heap::ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(10),
-            kind: crate::heap::ObjectKind::Array,
-            element_type: crate::heap::ArrayElementType::Int,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 5,
-            num_slots: 5,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let old = crate::heap::ObjectHeader::new(
+            rustjvm_types::ClassId::new(10),
+            crate::heap::ObjectKind::Array,
+            crate::heap::ArrayElementType::Int,
+            0,
+            5,
+            5,
+        );
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 10, &ht, 0x5000);
         assert!(compact.is_array());
@@ -1225,19 +1216,14 @@ mod tests {
 
     #[test]
     fn migrate_hash_code_to_side_table() {
-        let old = crate::heap::ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(1),
-            kind: crate::heap::ObjectKind::Object,
-            element_type: crate::heap::ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: 42,
-            array_length: 0,
-            num_slots: 0,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let old = crate::heap::ObjectHeader::new(
+            rustjvm_types::ClassId::new(1),
+            crate::heap::ObjectKind::Object,
+            crate::heap::ArrayElementType::Reference,
+            42,
+            0,
+            0,
+        );
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 1, &ht, 0x6000);
         assert!(compact.has_hash_code());
@@ -1377,19 +1363,15 @@ mod tests {
 
     #[test]
     fn s54_header_view_from_legacy() {
-        let old = crate::heap::ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(10),
-            kind: crate::heap::ObjectKind::Object,
-            element_type: crate::heap::ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: 42,
-            array_length: 0,
-            num_slots: 3,
-            gc_age: 5,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let mut old = crate::heap::ObjectHeader::new(
+            rustjvm_types::ClassId::new(10),
+            crate::heap::ObjectKind::Object,
+            crate::heap::ArrayElementType::Reference,
+            42,
+            0,
+            3,
+        );
+        old.gc_age = 5;
         let view = HeaderView::from_legacy(&old);
         assert!(!view.is_array());
         assert_eq!(view.gc_age(), 5);
@@ -1410,19 +1392,15 @@ mod tests {
 
     #[test]
     fn s54_header_view_legacy_forwarded() {
-        let old = crate::heap::ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(1),
-            kind: crate::heap::ObjectKind::Object,
-            element_type: crate::heap::ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 0,
-            num_slots: 0,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: 0x1234 as *mut u8,
-        };
+        let mut old = crate::heap::ObjectHeader::new(
+            rustjvm_types::ClassId::new(1),
+            crate::heap::ObjectKind::Object,
+            crate::heap::ArrayElementType::Reference,
+            0,
+            0,
+            0,
+        );
+        old.forwarding_ptr = 0x1234 as *mut u8;
         let view = HeaderView::from_legacy(&old);
         assert!(view.is_forwarded());
     }
@@ -1597,8 +1575,8 @@ mod tests {
     #[test]
     fn s54_compact_header_8_vs_legacy_32() {
         assert_eq!(CompactHeader::SIZE, 8);
-        assert_eq!(crate::heap::HEADER_SIZE, 32);
-        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 24);
+        assert_eq!(crate::heap::HEADER_SIZE, 40);
+        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 32);
     }
 
     #[test]

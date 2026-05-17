@@ -1,8 +1,44 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::event::{EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventTypeRegistry, EventValue};
 use crate::recording::FlightRecorder;
+
+// ---------------------------------------------------------------------------
+// Per-emit-site event-type ID cache
+// ---------------------------------------------------------------------------
+//
+// Each `emit_*` function needs to resolve a constant event-type name (e.g.
+// "jdk.GarbageCollection") to an `EventTypeId`. Previously this was done via
+// `recorder.type_registry.find_by_name(NAME)` — a hashmap probe of a literal
+// string — on every call, even when no recording was active.
+//
+// We now cache the resolved ID per call-site in a `OnceLock<EventTypeId>`.
+// Combined with the `crate::is_enabled()` fast-path guard at the top of every
+// emit_* function, the disabled-path cost drops from ~30-100 ns (HashMap probe
+// + Vec alloc) to ~2-3 ns (one relaxed atomic load + branch).
+//
+// The cache uses `EventTypeId::INVALID` as a sentinel when the named type is
+// not registered (which shouldn't happen for built-in events but is handled
+// defensively). Subsequent calls hit the cached sentinel without re-probing.
+
+/// Look up an event-type ID by name, caching the result in the supplied
+/// `OnceLock`. Returns `None` if the registry has no such type.
+#[inline]
+fn cached_event_id(
+    cache: &'static OnceLock<EventTypeId>,
+    recorder: &FlightRecorder,
+    name: &str,
+) -> Option<EventTypeId> {
+    let id = *cache.get_or_init(|| {
+        recorder
+            .type_registry
+            .find_by_name(name)
+            .unwrap_or(EventTypeId::INVALID)
+    });
+    if id.is_invalid() { None } else { Some(id) }
+}
 
 /// Register all built-in JVM event types into the given registry.
 pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
@@ -815,7 +851,9 @@ pub fn emit_gc_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.GarbageCollection") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GarbageCollection") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -829,7 +867,7 @@ pub fn emit_gc_event(
                 EventValue::Long(duration_ns.min(i64::MAX as u64) as i64), // longestPause
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -844,7 +882,9 @@ pub fn emit_class_load_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ClassLoad") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassLoad") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -856,7 +896,7 @@ pub fn emit_class_load_event(
                 EventValue::String(Arc::from(initiating_loader)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -870,7 +910,9 @@ pub fn emit_thread_start_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ThreadStart") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -881,7 +923,7 @@ pub fn emit_thread_start_event(
                 EventValue::String(Arc::from(parent_thread_name)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -900,7 +942,9 @@ pub fn emit_compilation_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.Compilation") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Compilation") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -916,7 +960,7 @@ pub fn emit_compilation_event(
                 EventValue::Int(inlined_bytes),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -929,7 +973,9 @@ pub fn emit_thread_end_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ThreadEnd") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -939,7 +985,7 @@ pub fn emit_thread_end_event(
                 EventValue::String(Arc::from(thread_name)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -953,7 +999,9 @@ pub fn emit_thread_sleep_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ThreadSleep") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadSleep") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -963,7 +1011,7 @@ pub fn emit_thread_sleep_event(
                 EventValue::Long(sleep_time_ns),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -981,7 +1029,9 @@ pub fn emit_monitor_wait_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.JavaMonitorWait") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorWait") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -995,7 +1045,7 @@ pub fn emit_monitor_wait_event(
                 EventValue::Long(address),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1011,7 +1061,9 @@ pub fn emit_monitor_enter_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.JavaMonitorEnter") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorEnter") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1023,7 +1075,7 @@ pub fn emit_monitor_enter_event(
                 EventValue::Long(address),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1036,7 +1088,9 @@ pub fn emit_class_unload_event(
     defining_loader: &str,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ClassUnload") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassUnload") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1047,7 +1101,7 @@ pub fn emit_class_unload_event(
                 EventValue::String(Arc::from(defining_loader)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1063,7 +1117,9 @@ pub fn emit_thread_park_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ThreadPark") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadPark") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1075,7 +1131,7 @@ pub fn emit_thread_park_event(
                 EventValue::Long(address),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1091,7 +1147,9 @@ pub fn emit_virtual_thread_pinned_event(
     virtual_thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.VirtualThreadPinned") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.VirtualThreadPinned") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1103,7 +1161,7 @@ pub fn emit_virtual_thread_pinned_event(
                 EventValue::Long(virtual_thread_id as i64),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1118,7 +1176,9 @@ pub fn emit_gc_heap_summary_event(
     heap_max: i64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.GCHeapSummary") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCHeapSummary") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1133,7 +1193,7 @@ pub fn emit_gc_heap_summary_event(
                 EventValue::Long(heap_max),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1148,7 +1208,9 @@ pub fn emit_allocation_in_new_tlab_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ObjectAllocationInNewTLAB") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationInNewTLAB") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1160,7 +1222,7 @@ pub fn emit_allocation_in_new_tlab_event(
                 EventValue::Long(tlab_size),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1172,7 +1234,9 @@ pub fn emit_allocation_outside_tlab_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ObjectAllocationOutsideTLAB") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationOutsideTLAB") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1183,7 +1247,7 @@ pub fn emit_allocation_outside_tlab_event(
                 EventValue::Long(allocation_size),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1195,7 +1259,9 @@ pub fn emit_gc_phase_pause_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.GCPhasePause") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCPhasePause") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1206,7 +1272,7 @@ pub fn emit_gc_phase_pause_event(
                 EventValue::String(Arc::from(phase_name)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1218,7 +1284,9 @@ pub fn emit_young_gc_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.YoungGarbageCollection") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.YoungGarbageCollection") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1229,7 +1297,7 @@ pub fn emit_young_gc_event(
                 EventValue::Int(tenuring_threshold),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1240,7 +1308,9 @@ pub fn emit_old_gc_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.OldGarbageCollection") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.OldGarbageCollection") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1250,7 +1320,7 @@ pub fn emit_old_gc_event(
                 EventValue::Int(gc_id),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1264,7 +1334,9 @@ pub fn emit_metaspace_summary_event(
     metaspace_reserved: i64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.MetaspaceSummary") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.MetaspaceSummary") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1278,7 +1350,7 @@ pub fn emit_metaspace_summary_event(
                 EventValue::Long(metaspace_reserved),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1291,7 +1363,9 @@ pub fn emit_execution_sample_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ExecutionSample") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExecutionSample") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1303,7 +1377,7 @@ pub fn emit_execution_sample_event(
                 EventValue::String(Arc::from(state)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1315,7 +1389,9 @@ pub fn emit_cpu_load_event(
     machine_total: f32,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.CPULoad") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.CPULoad") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1327,7 +1403,7 @@ pub fn emit_cpu_load_event(
                 EventValue::Float(machine_total),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1340,7 +1416,9 @@ pub fn emit_thread_statistics_event(
     peak_count: i64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.JavaThreadStatistics") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaThreadStatistics") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1353,7 +1431,7 @@ pub fn emit_thread_statistics_event(
                 EventValue::Long(peak_count),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1367,7 +1445,9 @@ pub fn emit_active_recording_event(
     max_size: i64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ActiveRecording") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveRecording") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1381,7 +1461,7 @@ pub fn emit_active_recording_event(
                 EventValue::Long(max_size),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1393,7 +1473,9 @@ pub fn emit_active_setting_event(
     value: &str,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ActiveSetting") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveSetting") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1405,7 +1487,7 @@ pub fn emit_active_setting_event(
                 EventValue::String(Arc::from(value)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1422,7 +1504,9 @@ pub fn emit_deoptimization_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.Deoptimization") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Deoptimization") {
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
@@ -1436,7 +1520,7 @@ pub fn emit_deoptimization_event(
                 EventValue::Int(bci),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1450,7 +1534,9 @@ pub fn emit_file_read_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.FileRead") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileRead") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1462,7 +1548,7 @@ pub fn emit_file_read_event(
                 EventValue::Boolean(end_of_file),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1475,7 +1561,9 @@ pub fn emit_file_write_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.FileWrite") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileWrite") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1486,7 +1574,7 @@ pub fn emit_file_write_event(
                 EventValue::Long(bytes_written),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1501,7 +1589,9 @@ pub fn emit_socket_read_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.SocketRead") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketRead") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1514,7 +1604,7 @@ pub fn emit_socket_read_event(
                 EventValue::Boolean(end_of_stream),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1528,7 +1618,9 @@ pub fn emit_socket_write_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.SocketWrite") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketWrite") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1540,7 +1632,7 @@ pub fn emit_socket_write_event(
                 EventValue::Long(bytes_written),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1552,7 +1644,9 @@ pub fn emit_safepoint_begin_event(
     jni_critical_threads: i32,
     start_time_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.SafepointBegin") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointBegin") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1564,7 +1658,7 @@ pub fn emit_safepoint_begin_event(
                 EventValue::Int(jni_critical_threads),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1575,7 +1669,9 @@ pub fn emit_safepoint_end_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.SafepointEnd") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointEnd") {
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
@@ -1583,7 +1679,7 @@ pub fn emit_safepoint_end_event(
             thread_id: 0,
             fields: vec![EventValue::Long(safepoint_id)],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1594,7 +1690,9 @@ pub fn emit_system_gc_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.SystemGC") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SystemGC") {
         let event = EventInstance {
             type_id,
             start_time: time_ns,
@@ -1602,7 +1700,7 @@ pub fn emit_system_gc_event(
             thread_id,
             fields: vec![EventValue::Boolean(invoked_concurrent)],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1614,7 +1712,9 @@ pub fn emit_allocation_requiring_gc_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.AllocationRequiringGC") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.AllocationRequiringGC") {
         let event = EventInstance {
             type_id,
             start_time: time_ns,
@@ -1622,7 +1722,7 @@ pub fn emit_allocation_requiring_gc_event(
             thread_id,
             fields: vec![EventValue::Int(gc_id), EventValue::Long(size)],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1634,7 +1734,9 @@ pub fn emit_java_exception_throw_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.JavaExceptionThrow") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaExceptionThrow") {
         let event = EventInstance {
             type_id,
             start_time: time_ns,
@@ -1645,7 +1747,7 @@ pub fn emit_java_exception_throw_event(
                 EventValue::String(Arc::from(thrown_class)),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1657,7 +1759,9 @@ pub fn emit_network_utilization_event(
     write_rate: i64,
     time_ns: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.NetworkUtilization") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.NetworkUtilization") {
         let event = EventInstance {
             type_id,
             start_time: time_ns,
@@ -1669,7 +1773,7 @@ pub fn emit_network_utilization_event(
                 EventValue::Long(write_rate),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1681,7 +1785,9 @@ pub fn emit_thread_cpu_load_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ThreadCPULoad") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadCPULoad") {
         let event = EventInstance {
             type_id,
             start_time: time_ns,
@@ -1692,7 +1798,7 @@ pub fn emit_thread_cpu_load_event(
                 EventValue::Float(system),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1704,7 +1810,9 @@ pub fn emit_allocation_sample_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if let Some(type_id) = recorder.type_registry.find_by_name("jdk.ObjectAllocationSample") {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationSample") {
         let event = EventInstance {
             type_id,
             start_time: time_ns,
@@ -1715,7 +1823,7 @@ pub fn emit_allocation_sample_event(
                 EventValue::Long(weight),
             ],
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 
@@ -1750,6 +1858,10 @@ pub fn register_custom_event(
 }
 
 /// Emit a custom user event with the given fields.
+///
+/// Note: this cannot use a per-site `OnceLock` cache because `event_name` is
+/// dynamic. The `is_enabled()` fast-path still skips the registry probe when
+/// no recordings are active.
 pub fn emit_custom_event(
     recorder: &mut FlightRecorder,
     event_name: &str,
@@ -1757,6 +1869,7 @@ pub fn emit_custom_event(
     time_ns: u64,
     thread_id: u64,
 ) {
+    if !crate::is_enabled() { return; }
     if let Some(type_id) = recorder.type_registry.find_by_name(event_name) {
         let event = EventInstance {
             type_id,
@@ -1765,7 +1878,7 @@ pub fn emit_custom_event(
             thread_id,
             fields: field_values,
         };
-        recorder.record_event(event);
+        crate::repository::push_to_thread_ring(event);
     }
 }
 

@@ -34,6 +34,7 @@ pub mod method_descriptor;
 pub mod signature;
 pub mod stack_map;
 
+pub use attribute::{LazyAttribute, decode_attribute, force_decode_all};
 pub use class_file::ClassFile;
 pub use class_reader::read_class;
 pub use class_reader_error::ClassReaderError;

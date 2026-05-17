@@ -1,4 +1,4 @@
-use crate::attribute::Attribute;
+use crate::attribute::{Attribute, LazyAttribute};
 use crate::class_access_flags::ClassAccessFlags;
 use crate::class_file_version::ClassFileVersion;
 use crate::constant_pool::ConstantPool;
@@ -16,14 +16,18 @@ pub struct ClassFile {
     pub interfaces: Vec<String>,
     pub fields: Vec<ClassFileField>,
     pub methods: Vec<ClassFileMethod>,
-    pub attributes: Vec<Attribute>,
+    pub attributes: Vec<LazyAttribute>,
 }
 
 impl ClassFile {
     /// Returns the source file name, if the SourceFile attribute is present.
+    /// Only returns a value when the attribute has already been decoded (the
+    /// reader builds `LazyAttribute::Raw` by default; consumers must call
+    /// `decode(&cp)` first to force decode). Returns `None` for both
+    /// "attribute absent" and "attribute still raw".
     pub fn source_file(&self) -> Option<&str> {
-        self.attributes.iter().find_map(|a| match a {
-            Attribute::SourceFile(name) => Some(name.as_str()),
+        self.attributes.iter().find_map(|a| match a.as_decoded() {
+            Some(Attribute::SourceFile(name)) => Some(name.as_str()),
             _ => None,
         })
     }
@@ -121,7 +125,7 @@ mod tests {
     fn source_file_present() {
         let mut cf = make_class_file(ClassAccessFlags::PUBLIC);
         cf.attributes
-            .push(Attribute::SourceFile("Test.java".to_string()));
+            .push(LazyAttribute::new_decoded(Attribute::SourceFile("Test.java".to_string())));
         assert_eq!(cf.source_file(), Some("Test.java"));
     }
 

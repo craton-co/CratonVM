@@ -223,11 +223,14 @@ fn native_jarfile_get_entry(
     };
 
     if state.name_index.is_none() {
+        // Perf fix (audit MED): avoid per-entry `by_index`, which re-reads
+        // and re-validates the central-directory record (and would set up a
+        // decompressor) for every entry just to grab the name. `file_names`
+        // walks the already-parsed central directory in O(n) and yields
+        // `&str` slices into the archive's metadata — no I/O, no inflate.
         let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
-        for i in 0..state.archive.len() {
-            if let Ok(f) = state.archive.by_index(i) {
-                idx.insert(f.name().to_string(), i);
-            }
+        for (i, name) in state.archive.file_names().enumerate() {
+            idx.insert(name.to_string(), i);
         }
         state.name_index = Some(idx);
     }
@@ -338,13 +341,11 @@ fn native_jarfile_get_input_stream(
         let idx = match state.name_index.as_ref().and_then(|m| m.get(&name)) {
             Some(i) => *i,
             None => {
-                // Lazy fill.
+                // Lazy fill — same O(n) `file_names` path as `getEntry`.
                 let mut idx: HashMap<String, usize> =
                     HashMap::with_capacity(state.archive.len());
-                for i in 0..state.archive.len() {
-                    if let Ok(f) = state.archive.by_index(i) {
-                        idx.insert(f.name().to_string(), i);
-                    }
+                for (i, n) in state.archive.file_names().enumerate() {
+                    idx.insert(n.to_string(), i);
                 }
                 let got = idx.get(&name).copied();
                 state.name_index = Some(idx);
@@ -361,7 +362,21 @@ fn native_jarfile_get_input_stream(
                 ),
             })
         })?;
-        let mut buf: Vec<u8> = Vec::with_capacity(zf.size() as usize);
+        // Audit fix: ZIP entries can declare uncompressed sizes >=4 GiB
+        // (ZIP64). On 32-bit targets `as usize` would silently truncate
+        // the capacity hint to its low 32 bits, leaving us under-reserved
+        // and — worse — masking a genuinely-too-big entry as a benign
+        // small allocation. Fail loudly instead.
+        let raw_size = zf.size();
+        let size: usize = raw_size.try_into().map_err(|_| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!(
+                    "JarFile.getInputStream({name}): entry uncompressed size \
+                     {raw_size} exceeds usize::MAX on this target",
+                ),
+            })
+        })?;
+        let mut buf: Vec<u8> = Vec::with_capacity(size);
         zf.read_to_end(&mut buf).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("JarFile.getInputStream({name}): read failed: {e}"),
@@ -379,6 +394,20 @@ fn build_byte_array_input_stream(
     data: &[u8],
 ) -> Result<ObjectRef, MethodCallFailed> {
     let array = ctx.new_array(ArrayElementType::Byte, data.len());
+    // TODO(audit MED, perf): this per-byte boxing loop dominates JAR class
+    // loading from fat jars — a 4 MiB class-bytes entry requires 4M
+    // `Value::Int` allocations plus 4M `set_array_element` dispatches just
+    // to fill a fresh `byte[]`. The right fix is a bulk copy API on
+    // `NativeContext` (e.g. `set_byte_array_slice(arr, off, &[u8])` or
+    // `byte_array_data_mut(arr) -> &mut [u8]` for fresh allocations) so we
+    // can `copy_from_slice`. No such API exists today, and plumbing one
+    // through `native-api` + the `Vm` impl is out of scope for this file.
+    // Tracked: native-io audit "build_byte_array_input_stream per-byte".
+    // For now the loop stays — every other byte-array materialiser in the
+    // codebase (charset.rs `write_byte_array`, net_phase_e
+    // `copy_bytes_into_java_array`, base64 `b64_write_byte_array`) uses
+    // the same pattern, so fixing this one in isolation would not move the
+    // needle until the cross-crate API lands.
     for (i, b) in data.iter().enumerate() {
         ctx.set_array_element(array, i, Value::Int(*b as i8 as i32));
     }
@@ -496,7 +525,17 @@ fn native_jarfile_get_manifest(
                 message: format!("manifest read by_index({idx}): {e}"),
             })
         })?;
-        let mut buf = Vec::with_capacity(zf.size() as usize);
+        // Same ZIP64 truncation guard as `getInputStream`.
+        let raw_size = zf.size();
+        let cap: usize = raw_size.try_into().map_err(|_| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!(
+                    "manifest read: uncompressed size {raw_size} exceeds \
+                     usize::MAX on this target",
+                ),
+            })
+        })?;
+        let mut buf = Vec::with_capacity(cap);
         zf.read_to_end(&mut buf).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("manifest read body: {e}"),

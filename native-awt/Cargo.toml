@@ -18,6 +18,7 @@ rustjvm-native-api = { path = "../native-api" }
 tracing = "0.1"
 parking_lot = "0.12"
 bitflags = "2"
+rustc-hash = "1.1"
 
 # Platform-specific windowing backends
 [target.'cfg(target_os = "windows")'.dependencies]

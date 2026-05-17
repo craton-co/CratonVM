@@ -360,6 +360,16 @@ fn write_header<W: Write>(
 /// event type metadata.  `start_time_ns` and `duration_ns` are used for the
 /// file header timestamps.
 ///
+/// Before writing the chunk we drain the per-thread ring registry
+/// (`crate::repository::global_ring_registry()`) so any events buffered by
+/// producer threads since the last dump are flushed into this chunk. Drained
+/// events are sorted by `start_time` (events from different threads arrive
+/// interleaved) and then serialized after the in-repository events. We filter
+/// drained events to those whose `type_id` is known to the supplied `registry`
+/// — events for unknown types can't be described by the metadata section, so
+/// we drop them rather than emit unreadable records. This filter also keeps
+/// stray events from foreign tests/registries out of small unit-test dumps.
+///
 /// Returns the total number of bytes written.
 pub fn dump_to_file(
     path: &Path,
@@ -368,6 +378,20 @@ pub fn dump_to_file(
     start_time_ns: u64,
     duration_ns: u64,
 ) -> Result<u64, JfrDumpError> {
+    // --- Drain per-thread rings before writing the chunk ---------------------
+    // Cold path: dump frequency is on the order of seconds. We pay one
+    // registry-mutex lock + one lock per registered shard, plus an O(n log n)
+    // sort over the drained events. This is acceptable for a dump path.
+    let mut drained: Vec<EventInstance> =
+        crate::repository::global_ring_registry().drain_all();
+    // Sort by start_time ascending so the per-shard interleaving is resolved
+    // into a single monotonic event stream within the drained set.
+    drained.sort_by_key(|e| e.start_time);
+    // Filter to events whose type_id is registered. Unknown type_ids cannot be
+    // round-tripped through `read_events` (which looks up the type to decode
+    // fields), so writing them would produce unreadable records.
+    drained.retain(|e| registry.get(e.type_id).is_some());
+
     // Write to a sibling `<name>.jfr.part` file and atomically rename on
     // success.  If anything fails partway through, the prior `.jfr` file is
     // left intact and the `.part` scratch file is best-effort removed by the
@@ -401,8 +425,22 @@ pub fn dump_to_file(
         // Write placeholder header (will be updated at the end)
         write_header(&mut writer, 0, 0, 0, start_time_ns, duration_ns, FILE_STATE_WRITING)?;
 
-        // Write events
+        // Write events from the recording's repository first, preserving the
+        // existing on-disk layout for callers that have no per-thread rings.
         for event in repository.iter() {
+            let record = serialize_event(
+                event.type_id,
+                event.start_time,
+                event.end_time,
+                event.thread_id,
+                &event.fields,
+            );
+            writer.write_all(&record)?;
+        }
+
+        // Then write the drained per-thread events (already sorted by
+        // start_time, already filtered to known types).
+        for event in &drained {
             let record = serialize_event(
                 event.type_id,
                 event.start_time,
@@ -908,6 +946,14 @@ mod tests {
 
     #[test]
     fn test_dump_empty_events() {
+        // Drain any per-thread ring residue from earlier tests so this test's
+        // "empty" invariant (checkpoint immediately after header) is not
+        // perturbed by the dump-path drain we now perform. We cannot guarantee
+        // no concurrent test pushes between the drain and the dump call (the
+        // ring registry is process-wide), so the checkpoint_offset assertion
+        // is intentionally `>=` rather than `==`.
+        let _ = crate::repository::global_ring_registry().drain_all();
+
         let (reg, _type_id) = make_registry_with_one_type();
         let repo = EventRepository::new(100);
 
@@ -921,8 +967,10 @@ mod tests {
         assert_eq!(header.magic, JFR_MAGIC);
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
-        // Checkpoint immediately after header when no events
-        assert_eq!(header.checkpoint_offset, HEADER_SIZE);
+        // Checkpoint at or after header (could be after if a concurrent test
+        // pushed compatible-typed events into the global ring just before our
+        // dump path drained).
+        assert!(header.checkpoint_offset >= HEADER_SIZE);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -1138,6 +1186,149 @@ mod tests {
         // After size, the type ID should be 5
         let (type_id, _) = decode_compressed_int(&record[consumed..]).unwrap();
         assert_eq!(type_id, 5);
+    }
+
+    #[test]
+    fn test_dump_drains_per_thread_rings() {
+        // Verify that dump_to_file picks up events buffered in the global
+        // per-thread ring registry and writes them into the chunk alongside
+        // the repository's events.
+        //
+        // The global ring registry is process-wide, so this test:
+        //   1. Drains the registry first to start from a clean baseline.
+        //   2. Registers a type in its own private registry.
+        //   3. Pushes events with that type_id via `push_to_thread_ring`.
+        //   4. Dumps using the private registry (which filters out stray
+        //      events from other tests that share the global registry).
+        //   5. Reads the file back and verifies the pushed events are present.
+        use crate::repository::{global_ring_registry, push_to_thread_ring};
+
+        // Baseline drain — discard anything left over from prior tests.
+        let _baseline = global_ring_registry().drain_all();
+
+        let (reg, type_id) = make_registry_with_one_type();
+        let repo = EventRepository::new(100);
+
+        // Push three events with distinctive start_times. They will go through
+        // the calling thread's shard in the global registry.
+        let pushed_starts: [u64; 3] = [
+            0xA0A0_0000_0011,
+            0xA0A0_0000_0022,
+            0xA0A0_0000_0033,
+        ];
+        for &start in &pushed_starts {
+            push_to_thread_ring(EventInstance {
+                type_id,
+                start_time: start,
+                end_time: start + 100,
+                thread_id: 7,
+                fields: vec![
+                    EventValue::Int(start as i32),
+                    EventValue::from_str("from-ring"),
+                ],
+            });
+        }
+
+        let dir = std::env::temp_dir().join("jfr_test_drain_rings");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("drain_rings.jfr");
+
+        let _file_size = dump_to_file(&path, &repo, &reg, 0, 0).unwrap();
+
+        // Header should be valid
+        let header = read_jfr_header(&path).unwrap();
+        assert_eq!(header.file_state, FILE_STATE_COMPLETE);
+        assert!(header.checkpoint_offset > HEADER_SIZE,
+            "events region should be non-empty after draining rings");
+
+        // Read events back and verify each pushed event is present.
+        let events = read_events(&path, &reg).unwrap();
+        for &expected_start in &pushed_starts {
+            let found = events.iter().any(|e|
+                e.type_id == type_id && e.start_time == expected_start);
+            assert!(
+                found,
+                "expected drained event with start_time {:#x} in file, got {} events",
+                expected_start,
+                events.len(),
+            );
+        }
+
+        // A second dump should not re-emit these events (drain_all consumed them).
+        let path2 = dir.join("drain_rings_second.jfr");
+        let repo2 = EventRepository::new(100);
+        dump_to_file(&path2, &repo2, &reg, 0, 0).unwrap();
+        let events2 = read_events(&path2, &reg).unwrap();
+        for &expected_start in &pushed_starts {
+            let still_there = events2.iter().any(|e|
+                e.type_id == type_id && e.start_time == expected_start);
+            assert!(
+                !still_there,
+                "drained events must not reappear in a second dump (start={:#x})",
+                expected_start,
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_dump_sorts_drained_events_by_start_time() {
+        // Push events with out-of-order start_times into a single thread shard
+        // (which preserves push order). Verify the file emits them sorted.
+        use crate::repository::{global_ring_registry, push_to_thread_ring};
+
+        // Baseline drain.
+        let _ = global_ring_registry().drain_all();
+
+        let (reg, type_id) = make_registry_with_one_type();
+        let repo = EventRepository::new(100);
+
+        // Push in non-monotonic order — unique tag prefix so we can filter
+        // out any other events that happen to share type_id.
+        let tag: u64 = 0xB0B0_0000_0000;
+        let push_order: [u64; 4] = [tag | 30, tag | 10, tag | 40, tag | 20];
+        for &start in &push_order {
+            push_to_thread_ring(EventInstance {
+                type_id,
+                start_time: start,
+                end_time: start + 1,
+                thread_id: 0,
+                fields: vec![EventValue::Int(0), EventValue::from_str("s")],
+            });
+        }
+
+        let dir = std::env::temp_dir().join("jfr_test_sort_drained");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sort_drained.jfr");
+        dump_to_file(&path, &repo, &reg, 0, 0).unwrap();
+
+        let events = read_events(&path, &reg).unwrap();
+        // Pull out just the ones we pushed (by tag prefix) and check they are
+        // strictly increasing in start_time on disk.
+        let ours: Vec<u64> = events
+            .iter()
+            .filter(|e| e.type_id == type_id && (e.start_time & 0xFFFF_FFFF_FFFF_FF00) == tag)
+            .map(|e| e.start_time)
+            .collect();
+        assert_eq!(ours.len(), push_order.len(),
+            "expected all {} pushed events back, got {}: {:?}",
+            push_order.len(), ours.len(), ours);
+        let sorted = {
+            let mut v = ours.clone();
+            v.sort();
+            v
+        };
+        assert_eq!(ours, sorted, "drained events should be written in start_time order");
+        // Make sure the test actually exercises sorting (i.e. the push order
+        // was not already monotonically increasing).
+        assert_ne!(push_order.to_vec(), sorted,
+            "test setup bug: push_order happens to equal sorted order");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

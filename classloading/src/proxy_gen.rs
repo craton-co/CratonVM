@@ -1499,8 +1499,8 @@ mod tests {
                 let code = m
                     .attributes
                     .iter()
-                    .find_map(|a| match a {
-                        Attribute::Code(c) => Some(c),
+                    .find_map(|a| match a.as_decoded() {
+                        Some(Attribute::Code(c)) => Some(c),
                         _ => None,
                     })
                     .unwrap_or_else(|| panic!("method {} missing Code attr", m.name));

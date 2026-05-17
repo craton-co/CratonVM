@@ -433,10 +433,29 @@ fn build_interference(code: &[u8], blocks: &[BasicBlock], num_locals: usize) -> 
     interference
 }
 
-/// Maximum loop weight multiplier to prevent overflow in use counting.
-const MAX_LOOP_WEIGHT: u32 = 10;
+/// Per-level loop weight multiplier (HotSpot-style). A use at nesting depth `d`
+/// contributes `LOOP_WEIGHT_PER_DEPTH^d`, capped at `MAX_LOOP_DEPTH_WEIGHT` to
+/// keep saturating arithmetic well-behaved and bound the influence of
+/// pathologically deep loops on register-allocation priorities.
+const LOOP_WEIGHT_PER_DEPTH: u32 = 10;
+/// Cap on the loop-depth weight contributed by a single use.
+///
+/// Corresponds to depth = 6 with `LOOP_WEIGHT_PER_DEPTH = 10` (=> 10^6).
+/// At this cap a deeply-nested use still dominates a non-loop use by 1e6×,
+/// which is more than enough for the graph-coloring spill heuristic.
+const MAX_LOOP_DEPTH_WEIGHT: u32 = 1_000_000;
 
-/// Count uses of each local in the bytecode, with loop-awareness.
+/// Count uses of each local in the bytecode, weighted by loop-nesting depth.
+///
+/// For each use we compute `depth` = the number of distinct loop ranges in
+/// `loops` whose `[header, back_edge]` interval contains the use's PC, and
+/// contribute `LOOP_WEIGHT_PER_DEPTH^depth` (capped) to the local's count.
+/// This mirrors HotSpot's C2 frequency model where each enclosing loop
+/// multiplies the perceived execution frequency, making locals that live in
+/// the hottest part of the method strongly prefer callee-saved registers.
+///
+/// Loop ranges that are malformed (header > back_edge) or out of bounds
+/// (back_edge >= code_len) are ignored for safety.
 fn count_uses(
     code: &[u8],
     code_len: usize,
@@ -449,14 +468,22 @@ fn count_uses(
     while pc < code_len {
         if let Some((idx, _, _)) = local_access(code, pc) {
             if idx < num_locals {
-                // Weight uses inside loops higher, with range validation
-                let in_loop = loops
+                // Loop-nesting depth = number of valid enclosing loop ranges.
+                let depth: u32 = loops
                     .iter()
-                    .any(|&(header, back_edge)| {
-                        header <= back_edge && back_edge < code_len
-                            && pc >= header && pc <= back_edge
-                    });
-                let weight = if in_loop { MAX_LOOP_WEIGHT } else { 1 };
+                    .filter(|&&(header, back_edge)| {
+                        header <= back_edge
+                            && back_edge < code_len
+                            && pc >= header
+                            && pc <= back_edge
+                    })
+                    .count() as u32;
+                // Exponential weight by depth, capped to avoid overflow.
+                // depth == 0 -> weight == 1 (out-of-loop use).
+                let weight = LOOP_WEIGHT_PER_DEPTH
+                    .checked_pow(depth)
+                    .unwrap_or(MAX_LOOP_DEPTH_WEIGHT)
+                    .min(MAX_LOOP_DEPTH_WEIGHT);
                 counts[idx] = counts[idx].saturating_add(weight);
             }
         }

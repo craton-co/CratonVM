@@ -5,11 +5,126 @@ use rustjvm_types::{ClassId, ObjectRef, Value};
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use crate::obj_arg;
 use crate::lang_math::alloc_wrapper;
 use crate::alloc_concurrent_synthetic;
+
+// ---------------------------------------------------------------------------
+// Class-name derivation caches (perf)
+//
+// Many hot `Class.*` natives derive a string form from the internal slashed
+// class name returned by `NativeContext::class_name_of_id`:
+//   * `Class.getName()` / `Object.toString()` callees — dotted form
+//     (`java/lang/Object` → `java.lang.Object`).
+//   * `Class.getPackageName()` / `Class.getPackage()` — dotted package
+//     prefix (the substring before the final `/`, with `/` → `.`).
+//   * `Class.getSimpleName()` — last segment after `/`, `.`, or `$`.
+//   * `Class.getCanonicalName()` — dotted form with `$` → `.` too.
+//   * `Class.getTypeName()` — same as `getName()` for non-array (dotted).
+//
+// Every one of these derivations is pure: the slashed internal name of a
+// given `ClassId` never changes for the lifetime of the program, classes
+// are never renamed, and these natives are called from hot paths (every
+// `Object.toString()` in user code lands on at least one of these). Each
+// derivation otherwise allocates a fresh `String` per call.
+//
+// We cache the derived `Arc<str>` keyed by `ClassId`. The cache grows only
+// to the number of loaded classes (~10k for a fully-loaded JDK boot) and
+// never needs invalidation. Reads take a `parking_lot::RwLock` shared lock
+// and clone the `Arc`; first-touch fills the entry under the write lock.
+// `Arc<str>` is one heap word (the str data) plus the strong/weak counts,
+// already lighter than `String` for read-only sharing.
+// ---------------------------------------------------------------------------
+
+type ClassNameCache = OnceLock<RwLock<FxHashMap<u32, Arc<str>>>>;
+
+static DOTTED_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
+static SIMPLE_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
+static CANONICAL_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
+static PACKAGE_NAME_CACHE: ClassNameCache = OnceLock::new();
+
+#[inline]
+fn cache_get_or_init(cache: &ClassNameCache) -> &RwLock<FxHashMap<u32, Arc<str>>> {
+    cache.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
+#[inline]
+fn cache_get(cache: &ClassNameCache, class_id: ClassId) -> Option<Arc<str>> {
+    let map = cache_get_or_init(cache);
+    map.read().get(&class_id.as_u32()).cloned()
+}
+
+#[inline]
+fn cache_insert(cache: &ClassNameCache, class_id: ClassId, value: Arc<str>) -> Arc<str> {
+    let map = cache_get_or_init(cache);
+    map.write().insert(class_id.as_u32(), Arc::clone(&value));
+    value
+}
+
+/// Dotted form of a class's internal slashed name (`java/lang/Object` →
+/// `java.lang.Object`). Cached per `ClassId`. Used by `Class.getName()` and
+/// any other native that needs the dotted name.
+///
+/// For names with no `/` (primitives like `int`, `void`, or arrays of
+/// primitives like `[I`) the dotted form equals the slashed form and we
+/// still cache the `Arc<str>` clone of the input.
+pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+        return arc;
+    }
+    let dotted: Arc<str> = if slashed.contains('/') {
+        Arc::from(slashed.replace('/', "."))
+    } else {
+        Arc::from(slashed)
+    };
+    cache_insert(&DOTTED_CLASS_NAME_CACHE, class_id, dotted)
+}
+
+/// Last segment of a class's name after `/`, `.`, or `$` (the
+/// `Class.getSimpleName()` rule). Cached per `ClassId`.
+pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+        return arc;
+    }
+    let after_slash_or_dot = raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw);
+    let after_dollar = after_slash_or_dot.rsplit('$').next().unwrap_or(after_slash_or_dot);
+    let simple: Arc<str> = Arc::from(after_dollar);
+    cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
+}
+
+/// Canonical name: dotted form plus inner-class `$` → `.` substitution.
+/// Cached per `ClassId`.
+pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+        return arc;
+    }
+    let canonical: Arc<str> = if slashed.contains('/') || slashed.contains('$') {
+        Arc::from(slashed.replace(['/', '$'], "."))
+    } else {
+        Arc::from(slashed)
+    };
+    cache_insert(&CANONICAL_CLASS_NAME_CACHE, class_id, canonical)
+}
+
+/// Package name (dotted) for a class. For `java/lang/Object` returns
+/// `java.lang`; for default-package or array-of-primitive classes returns
+/// the empty string. Cached per `ClassId`.
+pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        return arc;
+    }
+    let pkg: Arc<str> = if let Some(pos) = slashed.rfind('/') {
+        Arc::from(slashed[..pos].replace('/', "."))
+    } else {
+        Arc::from("")
+    };
+    cache_insert(&PACKAGE_NAME_CACHE, class_id, pkg)
+}
 
 // ---------------------------------------------------------------------------
 // Access control constants (JVM access flags)
@@ -340,10 +455,35 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
     // JDK layouts).
     match mirror_class_id(ctx, this) {
         Some(class_id) => {
+            // Fast path: use the cache only when the VM reverse map
+            // (`class_id_from_mirror`) resolved the mirror to its ClassId
+            // — i.e. this is a real-VM class that the class manager
+            // owns. The synthetic field-0-Int fallback path used by unit
+            // tests can collide many distinct names onto ClassId(0); we
+            // bypass the cache for those to preserve byte-identical
+            // behaviour.
+            if ctx.class_id_from_mirror(this).is_some() {
+                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+                    let name_obj = ctx.create_string(&arc);
+                    return Ok(Some(Value::Object(Some(name_obj))));
+                }
+                if let Some(name) = ctx.class_name_of_id(class_id) {
+                    let dotted = dotted_class_name(class_id, &name);
+                    let name_obj = ctx.create_string(&dotted);
+                    return Ok(Some(Value::Object(Some(name_obj))));
+                }
+            }
+            // Legacy fallback path (test fixtures, primitive mirrors that
+            // happen to have a numeric field-0): replicate the old
+            // behaviour exactly.
             let name = ctx
                 .class_name_of_id(class_id)
                 .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
-            let dotted_name = name.replace('/', ".");
+            let dotted_name = if name.contains('/') {
+                name.replace('/', ".")
+            } else {
+                name
+            };
             let name_obj = ctx.create_string(&dotted_name);
             Ok(Some(Value::Object(Some(name_obj))))
         }
@@ -356,8 +496,17 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
             // against the expected component class name (which is dotted).
             // Plain primitive names like "int"/"void" contain no '/', so the
             // replace is a no-op for them.
+            //
+            // No `ClassId` here to cache against — primitive mirrors don't
+            // have one — so this path still allocates per call. In practice
+            // this is rare (only primitive `getName()` calls; user code
+            // usually goes through the `Some(class_id)` arm above).
             if let Some(prim_name) = mirror_class_name(ctx, this) {
-                let dotted_name = prim_name.replace('/', ".");
+                let dotted_name = if prim_name.contains('/') {
+                    prim_name.replace('/', ".")
+                } else {
+                    prim_name
+                };
                 let name_obj = ctx.create_string(&dotted_name);
                 Ok(Some(Value::Object(Some(name_obj))))
             } else {
@@ -1401,10 +1550,25 @@ pub(crate) fn native_class_get_simple_name(ctx: &mut dyn NativeContext, args: &[
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Cache the simple-name derivation per `ClassId` only when the VM's
+    // reverse mirror map owns this mirror. Test-fixture mirrors that
+    // encode ClassId only via field-0 are excluded to avoid cross-test
+    // pollution on ClassId(0).
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+            let result = ctx.create_string(&arc);
+            return Ok(Some(Value::Object(Some(result))));
+        }
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            let simple = simple_class_name(class_id, &name);
+            let result = ctx.create_string(&simple);
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
+    // Fallback: original per-call derivation. Used by test fixtures and
+    // primitive mirrors that fall outside the reverse map.
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    // Strip everything up to the last '/' or '.'
     let simple = name.rsplit(&['/', '.'][..]).next().unwrap_or(&name);
-    // Also strip inner class prefix ($)
     let simple = simple.rsplit('$').next().unwrap_or(simple);
     let result = ctx.create_string(simple);
     Ok(Some(Value::Object(Some(result))))
@@ -7064,6 +7228,19 @@ pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Cache the dotted package prefix per `ClassId` — invariant for the
+    // program's lifetime. Cache-eligible mirrors are those owned by the
+    // VM reverse map (rules out test-fixture ClassId(0) collisions).
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
+        }
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            let pkg = package_name_of(class_id, &name);
+            return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
+        }
+    }
+    // Fallback (test fixtures, primitives) — original per-call derivation.
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     let pkg = if let Some(pos) = name.rfind('/') {
         name[..pos].replace('/', ".")
@@ -7306,13 +7483,22 @@ pub(crate) fn native_class_get_package(
     if name.is_empty() || (name.starts_with('[') && !name.contains('/')) {
         return Ok(Some(Value::Object(None)));
     }
-    let pkg_name = if let Some(pos) = name.rfind('/') {
-        name[..pos].replace('/', ".")
+    // Cache the dotted package prefix per `ClassId` for VM-registered
+    // mirrors (class_id_from_mirror = Some). Synthetic / test mirrors
+    // derive on-call so tests are not contaminated.
+    let pkg_name: Arc<str> = if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+            arc
+        } else {
+            package_name_of(class_id, &name)
+        }
+    } else if let Some(pos) = name.rfind('/') {
+        Arc::from(name[..pos].replace('/', "."))
     } else {
         // Default package — return a Package object whose name is the empty
         // string, matching JDK 25 (`Class.forName("Foo").getPackage()`
         // yields a Package with `getName().equals("")`).
-        String::new()
+        Arc::from("")
     };
     // Read manifest attributes (best-effort).
     let (impl_title, impl_version, spec_title, spec_version, spec_vendor, impl_vendor) =
@@ -7481,10 +7667,18 @@ pub(crate) fn i2_classloader_define_package_class(
     if class_name.is_empty() || (class_name.starts_with('[') && !class_name.contains('/')) {
         return Ok(Some(Value::Object(None)));
     }
-    let pkg_name = if let Some(pos) = class_name.rfind('/') {
-        class_name[..pos].replace('/', ".")
+    // Cache the dotted package prefix per `ClassId` for VM-registered
+    // mirrors only — same rationale as `native_class_get_package`.
+    let pkg_name: Arc<str> = if let Some(class_id) = ctx.class_id_from_mirror(class_arg) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+            arc
+        } else {
+            package_name_of(class_id, &class_name)
+        }
+    } else if let Some(pos) = class_name.rfind('/') {
+        Arc::from(class_name[..pos].replace('/', "."))
     } else {
-        String::new()
+        Arc::from("")
     };
     // Read manifest attributes (best-effort) from the class's source jar.
     let (impl_title, impl_version, spec_title, spec_version, spec_vendor, impl_vendor) =
@@ -7622,6 +7816,15 @@ pub(crate) fn native_class_get_canonical_name(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
+        }
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            let canonical = canonical_class_name(class_id, &name);
+            return Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))));
+        }
+    }
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     let canonical = name.replace(['/', '$'], ".");
     Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))))
@@ -7632,8 +7835,22 @@ pub(crate) fn native_class_get_type_name(ctx: &mut dyn NativeContext, args: &[Va
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `Class.getTypeName()` returns the dotted form for non-array refs and
+    // the dotted form of the descriptor for arrays. Both forms are pure
+    // derivations from the slashed internal name and equal what
+    // `dotted_class_name` produces — share the same cache as
+    // `Class.getName()`.
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
+        }
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            let type_name = dotted_class_name(class_id, &name);
+            return Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))));
+        }
+    }
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    let type_name = name.replace('/', ".");
+    let type_name = if name.contains('/') { name.replace('/', ".") } else { name };
     Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
 }
 

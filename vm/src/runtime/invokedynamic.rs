@@ -9,6 +9,8 @@
 //!    references to invokedynamic, producing lightweight proxy objects that implement
 //!    a functional interface and delegate to the implementation method.
 
+use std::sync::Arc;
+
 use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 use crate::classloading::resolution::{
@@ -139,8 +141,8 @@ pub fn execute_invokedynamic(
         // 4. Resolve the MethodHandle to determine which bootstrap method it is
         let bsm_handle =
             resolve_method_handle_full(&class.constant_pool, bsm.bootstrap_method_ref)?;
-        let bsm_class = bsm_handle.class_name;
-        let bsm_method = bsm_handle.member_name;
+        let bsm_class = bsm_handle.class_name.to_string();
+        let bsm_method = bsm_handle.member_name.to_string();
 
         // 5. Extract recipe and constant args (if StringConcatFactory)
         let recipe = if let Some(&arg_index) = bsm.bootstrap_arguments.first() {
@@ -172,9 +174,9 @@ pub fn execute_invokedynamic(
     if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT_WITH_CONSTANTS {
         // Cache the StringConcat call site
         let site = ResolvedCallSite::StringConcat {
-            recipe: info.recipe.clone(),
-            constant_args: info.constant_args.clone(),
-            target_descriptor: info.target_descriptor.clone(),
+            recipe: Arc::from(info.recipe.clone()),
+            constant_args: info.constant_args.iter().map(|s| Arc::from(s.as_str())).collect(),
+            target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
         shared
             .resolution_cache
@@ -199,9 +201,9 @@ pub fn execute_invokedynamic(
         };
 
         let site = ResolvedCallSite::StringConcat {
-            recipe: synthetic_recipe,
+            recipe: Arc::from(synthetic_recipe),
             constant_args: vec![],
-            target_descriptor: info.target_descriptor.clone(),
+            target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
         shared
             .resolution_cache
@@ -315,9 +317,9 @@ fn execute_cached_call_site(
                 bsm_class: String::new(),
                 bsm_method: String::new(),
                 target_name: String::new(),
-                target_descriptor: target_descriptor.clone(),
-                recipe: recipe.clone(),
-                constant_args: constant_args.clone(),
+                target_descriptor: target_descriptor.to_string(),
+                recipe: recipe.to_string(),
+                constant_args: constant_args.iter().map(|s| s.to_string()).collect(),
                 bootstrap_arg_indices: vec![],
             };
             execute_string_concat(shared, thread, frame_idx, &info)
@@ -416,11 +418,11 @@ fn bootstrap_lambda(
 
     // Build the LambdaCallSite
     let call_site = LambdaCallSite {
-        functional_interface: functional_interface.clone(),
-        sam_method_name: info.target_name.clone(),
-        sam_descriptor: sam_erased_desc,
+        functional_interface: Arc::from(functional_interface),
+        sam_method_name: Arc::from(info.target_name.clone()),
+        sam_descriptor: Arc::from(sam_erased_desc),
         impl_handle,
-        instantiated_descriptor: instantiated_desc,
+        instantiated_descriptor: Arc::from(instantiated_desc),
         capture_types: capture_types.clone(),
         proxy_class_id,
     };
@@ -585,9 +587,9 @@ pub fn resolve_method_handle_full(
 
     Ok(MethodHandle {
         kind,
-        class_name,
-        member_name: member_name.to_string(),
-        descriptor: descriptor.to_string(),
+        class_name: Arc::from(class_name),
+        member_name: Arc::from(member_name.to_string()),
+        descriptor: Arc::from(descriptor.to_string()),
     })
 }
 
@@ -964,7 +966,7 @@ fn bootstrap_type_switch(
             RawSwitchLabel::Type(name) => {
                 let cid = shared.load_class_concurrent(&name)?;
                 labels.push(SwitchLabel::Type {
-                    class_name: name,
+                    class_name: Arc::from(name),
                     class_id: cid,
                 });
             }
@@ -972,9 +974,9 @@ fn bootstrap_type_switch(
             RawSwitchLabel::Long(v) => labels.push(SwitchLabel::Long(v)),
             RawSwitchLabel::Float(v) => labels.push(SwitchLabel::Float(v)),
             RawSwitchLabel::Double(v) => labels.push(SwitchLabel::Double(v)),
-            RawSwitchLabel::Str(s) => labels.push(SwitchLabel::Str(s)),
+            RawSwitchLabel::Str(s) => labels.push(SwitchLabel::Str(Arc::from(s))),
             RawSwitchLabel::PrimitiveClass(desc) => {
-                labels.push(SwitchLabel::PrimitiveClass(desc));
+                labels.push(SwitchLabel::PrimitiveClass(Arc::from(desc)));
             }
         }
     }
@@ -1046,25 +1048,25 @@ pub fn execute_type_switch(
             labels,
             start_index,
             |l| matches!(l, SwitchLabel::Int(e) if *e == v)
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "I" || d == "Z" || d == "B" || d == "S" || d == "C"),
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "I" || &**d == "Z" || &**d == "B" || &**d == "S" || &**d == "C"),
         ),
         Value::Long(v) => primitive_match(
             labels,
             start_index,
             |l| matches!(l, SwitchLabel::Long(e) if *e == v)
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "J"),
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "J"),
         ),
         Value::Float(v) => primitive_match(
             labels,
             start_index,
             |l| matches!(l, SwitchLabel::Float(e) if e.to_bits() == v.to_bits())
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "F"),
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "F"),
         ),
         Value::Double(v) => primitive_match(
             labels,
             start_index,
             |l| matches!(l, SwitchLabel::Double(e) if e.to_bits() == v.to_bits())
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if d == "D"),
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "D"),
         ),
         _ => -1,
     };
@@ -1107,11 +1109,11 @@ fn type_switch_match(
             SwitchLabel::Double(expected) => unbox_double(shared, obj_ref, obj_class_name)
                 .is_some_and(|v| v.to_bits() == expected.to_bits()),
             SwitchLabel::Str(expected) => {
-                read_java_string(&shared.heap, obj_ref).as_deref() == Some(expected.as_str())
+                read_java_string(&shared.heap, obj_ref).as_deref() == Some(&**expected)
             }
             SwitchLabel::PrimitiveClass(desc) => {
                 // JEP 507: primitive type pattern matches boxed wrapper types.
-                match desc.as_str() {
+                match &**desc {
                     "I" | "Z" | "B" | "S" | "C" => matches!(obj_class_name,
                         "java/lang/Integer" | "java/lang/Boolean" | "java/lang/Byte"
                         | "java/lang/Short" | "java/lang/Character"),
@@ -1363,19 +1365,19 @@ fn bootstrap_record_object_method(
         } else {
             String::new()
         };
-        let component_names: Vec<String> = names_str
+        let component_names: Vec<Arc<str>> = names_str
             .split(';')
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(Arc::from)
             .collect();
 
         // arg[2..] = MethodHandle getters — extract field descriptors from them.
         // Each MethodHandle is a REF_getField for the record component.
-        let mut field_descriptors = Vec::with_capacity(component_names.len());
+        let mut field_descriptors: Vec<Arc<str>> = Vec::with_capacity(component_names.len());
         for &arg_idx in info.bootstrap_arg_indices.iter().skip(2) {
             let desc = resolve_method_handle_field_descriptor(&class.constant_pool, arg_idx)
                 .unwrap_or_else(|| "I".to_string());
-            field_descriptors.push(desc);
+            field_descriptors.push(Arc::from(desc));
         }
 
         // Field indices: record components are stored in order starting from the
@@ -1468,9 +1470,9 @@ fn execute_record_object_method(
     thread: &mut JvmThread,
     frame_idx: usize,
     method: RecordMethodKind,
-    component_names: &[String],
+    component_names: &[Arc<str>],
     field_indices: &[usize],
-    field_descriptors: &[String],
+    field_descriptors: &[Arc<str>],
 ) -> Result<(), MethodCallFailed> {
     match method {
         RecordMethodKind::Equals => {
@@ -1548,7 +1550,7 @@ fn execute_record_object_method(
                             result.push_str(", ");
                         }
                         let fi = field_indices.get(i).copied().unwrap_or(i);
-                        let desc = field_descriptors.get(i).map(|s| s.as_str()).unwrap_or("I");
+                        let desc = field_descriptors.get(i).map(|s| &**s).unwrap_or("I");
                         let v = shared.heap.get_field(obj, fi);
                         let vs = format_field_value(shared, &v, desc);
                         result.push_str(name);
@@ -1686,10 +1688,10 @@ fn bootstrap_enum_switch(
                 message: format!("enumSwitch: class {current_class_id} not found"),
             })?;
 
-        let mut labels = Vec::with_capacity(info.bootstrap_arg_indices.len());
+        let mut labels: Vec<Arc<str>> = Vec::with_capacity(info.bootstrap_arg_indices.len());
         for &arg_idx in &info.bootstrap_arg_indices {
             let s = resolve_string_constant(&class.constant_pool, arg_idx).unwrap_or_default();
-            labels.push(s);
+            labels.push(Arc::from(s));
         }
         labels
     };
@@ -1713,7 +1715,7 @@ pub fn execute_enum_switch(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
-    labels: &[String],
+    labels: &[Arc<str>],
 ) -> Result<(), MethodCallFailed> {
     let start_index = match thread.frames[frame_idx].stack.pop()? {
         Value::Int(i) => i.max(0) as usize,
@@ -1734,7 +1736,7 @@ pub fn execute_enum_switch(
             let mut match_index: i32 = -1;
             if let Some(name) = name {
                 for (i, label) in labels.iter().enumerate().skip(start_index) {
-                    if *label == name {
+                    if &**label == name.as_str() {
                         match_index = i as i32;
                         break;
                     }
@@ -1853,9 +1855,9 @@ mod tests {
         let cp = make_method_handle_cp(6); // InvokeStatic
         let mh = resolve_method_handle_full(&cp, 7).unwrap();
         assert_eq!(mh.kind, MethodHandleKind::InvokeStatic);
-        assert_eq!(mh.class_name, "com/example/Foo");
-        assert_eq!(mh.member_name, "doStuff");
-        assert_eq!(mh.descriptor, "(I)Ljava/lang/String;");
+        assert_eq!(&*mh.class_name, "com/example/Foo");
+        assert_eq!(&*mh.member_name, "doStuff");
+        assert_eq!(&*mh.descriptor, "(I)Ljava/lang/String;");
     }
 
     #[test]
@@ -1896,9 +1898,9 @@ mod tests {
         let cp = ConstantPool::new(entries);
         let mh = resolve_method_handle_full(&cp, 7).unwrap();
         assert_eq!(mh.kind, MethodHandleKind::GetField);
-        assert_eq!(mh.class_name, "com/example/Bar");
-        assert_eq!(mh.member_name, "value");
-        assert_eq!(mh.descriptor, "I");
+        assert_eq!(&*mh.class_name, "com/example/Bar");
+        assert_eq!(&*mh.member_name, "value");
+        assert_eq!(&*mh.descriptor, "I");
     }
 
     #[test]

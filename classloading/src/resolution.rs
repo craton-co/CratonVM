@@ -108,16 +108,22 @@ impl fmt::Display for MethodHandleKind {
 ///
 /// Does not correspond to a real `java.lang.invoke.MethodHandle` object on the heap.
 /// Instead, the VM uses this to dispatch calls from invokedynamic / lambda proxies.
+///
+/// The string fields use `Arc<str>` so that cloning a `LambdaCallSite` (which
+/// happens on every lambda invocation via `Arc<CachedInvokeTarget>` clone)
+/// is a cheap refcount bump rather than three heap allocations. Source data
+/// (`Class.name`, `Method.name`, descriptor pool) is already `Arc<str>`, so
+/// producers pass refcount-bumped clones directly.
 #[derive(Debug, Clone)]
 pub struct MethodHandle {
     /// The kind of reference (invoke virtual, static, etc.).
     pub kind: MethodHandleKind,
     /// Class that owns the target member.
-    pub class_name: String,
+    pub class_name: Arc<str>,
     /// Member name (method name or field name).
-    pub member_name: String,
+    pub member_name: Arc<str>,
     /// Method descriptor or field descriptor.
-    pub descriptor: String,
+    pub descriptor: Arc<str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +131,15 @@ pub struct MethodHandle {
 // ---------------------------------------------------------------------------
 
 /// A label in a pattern-matching switch (SwitchBootstraps.typeSwitch).
+///
+/// String fields use `Arc<str>` so cloning a `ResolvedCallSite::TypeSwitch`
+/// (which happens on every `CachedInvokeTarget` populate path) is a cheap
+/// refcount bump rather than a heap allocation per label.
 #[derive(Debug, Clone)]
 pub enum SwitchLabel {
     /// Match by type (`instanceof` check). ClassId pre-resolved at bootstrap.
     Type {
-        class_name: String,
+        class_name: Arc<str>,
         class_id: ClassId,
     },
     /// Match by exact integer value (for constant case labels).
@@ -141,37 +151,43 @@ pub enum SwitchLabel {
     /// Match by exact double value.
     Double(f64),
     /// Match by string equality.
-    Str(String),
+    Str(Arc<str>),
     /// Match by primitive type class (JDK 25 primitive patterns, JEP 507).
     /// Descriptor is the JVM type descriptor: "I", "J", "F", "D", "Z", "B", "S", "C".
-    PrimitiveClass(String),
+    PrimitiveClass(Arc<str>),
 }
 
 /// A resolved invokedynamic call site, cached after first bootstrap.
+///
+/// String fields use `Arc<str>` so cloning a cached entry (which happens on
+/// every lambda/condy/typeswitch invocation) is a refcount bump rather than
+/// a fan-out of `String` allocations. The pool of source strings
+/// (`Class.name`, descriptor strings, constant-pool UTF-8 entries) is
+/// already `Arc<str>` upstream.
 #[derive(Debug, Clone)]
 pub enum ResolvedCallSite {
     /// String concatenation (StringConcatFactory.makeConcatWithConstants).
     StringConcat {
-        recipe: String,
-        constant_args: Vec<String>,
-        target_descriptor: String,
+        recipe: Arc<str>,
+        constant_args: Vec<Arc<str>>,
+        target_descriptor: Arc<str>,
     },
     /// Lambda / method reference (LambdaMetafactory.metafactory).
     Lambda(LambdaCallSite),
     /// Pattern-matching type switch (SwitchBootstraps.typeSwitch, JEP 441).
     TypeSwitch { labels: Vec<SwitchLabel> },
     /// Pattern-matching enum switch (SwitchBootstraps.enumSwitch, JEP 441).
-    EnumSwitch { labels: Vec<String> },
+    EnumSwitch { labels: Vec<Arc<str>> },
     /// Record ObjectMethods bootstrap (equals/hashCode/toString, JEP 395).
     RecordObjectMethod {
         /// Which method: "equals", "hashCode", or "toString"
         method: RecordMethodKind,
         /// Component names (e.g. ["x", "y"]).
-        component_names: Vec<String>,
+        component_names: Vec<Arc<str>>,
         /// Field indices for each component.
         field_indices: Vec<usize>,
         /// Field descriptors for each component (e.g. ["I", "Ljava/lang/String;"]).
-        field_descriptors: Vec<String>,
+        field_descriptors: Vec<Arc<str>>,
     },
 }
 
@@ -184,18 +200,23 @@ pub enum RecordMethodKind {
 }
 
 /// Lambda-specific call site data produced by LambdaMetafactory bootstrap.
+///
+/// String fields use `Arc<str>` so a `LambdaCallSite` clone — which happens
+/// every time the cached `Arc<CachedInvokeTarget>` is rebound or the lambda
+/// proxy is reconstructed — costs four refcount bumps rather than four heap
+/// allocations.
 #[derive(Debug, Clone)]
 pub struct LambdaCallSite {
     /// Functional interface class name (e.g. "java/util/function/Consumer").
-    pub functional_interface: String,
+    pub functional_interface: Arc<str>,
     /// SAM (Single Abstract Method) name (e.g. "accept").
-    pub sam_method_name: String,
+    pub sam_method_name: Arc<str>,
     /// SAM erased descriptor (e.g. "(Ljava/lang/Object;)V").
-    pub sam_descriptor: String,
+    pub sam_descriptor: Arc<str>,
     /// The actual implementation method handle.
     pub impl_handle: MethodHandle,
     /// Instantiated method type descriptor (concrete types after generics are resolved).
-    pub instantiated_descriptor: String,
+    pub instantiated_descriptor: Arc<str>,
     /// Type chars for captured values (from the invokedynamic factory descriptor params).
     pub capture_types: Vec<char>,
     /// Synthetic proxy ClassId allocated for this lambda form.
@@ -898,14 +919,14 @@ mod tests {
     fn method_handle_construction() {
         let mh = MethodHandle {
             kind: MethodHandleKind::InvokeStatic,
-            class_name: "com/example/Foo".to_string(),
-            member_name: "bar".to_string(),
-            descriptor: "(I)V".to_string(),
+            class_name: Arc::from("com/example/Foo"),
+            member_name: Arc::from("bar"),
+            descriptor: Arc::from("(I)V"),
         };
         assert_eq!(mh.kind, MethodHandleKind::InvokeStatic);
-        assert_eq!(mh.class_name, "com/example/Foo");
-        assert_eq!(mh.member_name, "bar");
-        assert_eq!(mh.descriptor, "(I)V");
+        assert_eq!(&*mh.class_name, "com/example/Foo");
+        assert_eq!(&*mh.member_name, "bar");
+        assert_eq!(&*mh.descriptor, "(I)V");
     }
 
     #[test]
@@ -920,9 +941,9 @@ mod tests {
             class_id,
             cp_index,
             ResolvedCallSite::StringConcat {
-                recipe: "Hello, \u{0001}!".to_string(),
+                recipe: Arc::from("Hello, \u{0001}!"),
                 constant_args: vec![],
-                target_descriptor: "(Ljava/lang/String;)Ljava/lang/String;".to_string(),
+                target_descriptor: Arc::from("(Ljava/lang/String;)Ljava/lang/String;"),
             },
         );
 
@@ -940,16 +961,16 @@ mod tests {
             class_id,
             10,
             ResolvedCallSite::Lambda(LambdaCallSite {
-                functional_interface: "java/lang/Runnable".to_string(),
-                sam_method_name: "run".to_string(),
-                sam_descriptor: "()V".to_string(),
+                functional_interface: Arc::from("java/lang/Runnable"),
+                sam_method_name: Arc::from("run"),
+                sam_descriptor: Arc::from("()V"),
                 impl_handle: MethodHandle {
                     kind: MethodHandleKind::InvokeStatic,
-                    class_name: "com/example/App".to_string(),
-                    member_name: "lambda$main$0".to_string(),
-                    descriptor: "()V".to_string(),
+                    class_name: Arc::from("com/example/App"),
+                    member_name: Arc::from("lambda$main$0"),
+                    descriptor: Arc::from("()V"),
                 },
-                instantiated_descriptor: "()V".to_string(),
+                instantiated_descriptor: Arc::from("()V"),
                 capture_types: vec![],
                 proxy_class_id: proxy_id,
             }),
@@ -958,8 +979,8 @@ mod tests {
         let site = cache.get_call_site(class_id, 10).unwrap();
         match site {
             ResolvedCallSite::Lambda(lcs) => {
-                assert_eq!(lcs.functional_interface, "java/lang/Runnable");
-                assert_eq!(lcs.sam_method_name, "run");
+                assert_eq!(&*lcs.functional_interface, "java/lang/Runnable");
+                assert_eq!(&*lcs.sam_method_name, "run");
                 assert_eq!(lcs.proxy_class_id, proxy_id);
             }
             _ => panic!("Expected Lambda call site"),

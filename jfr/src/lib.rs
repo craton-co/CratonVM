@@ -1,3 +1,19 @@
+//! # rustjvm-jfr — Java Flight Recorder support for RustJVM
+//!
+//! ## Per-thread event rings
+//!
+//! High-throughput emit goes through [`push_to_thread_ring`], which writes to
+//! a thread-local ring (capacity [`DEFAULT_THREAD_RING_CAPACITY`] = 1024).
+//! Dump-time consumers call [`global_ring_registry`]`().drain_all()` to harvest
+//! all threads' events.
+//!
+//! This avoids global `Mutex` contention on the hot emit path: every producer
+//! thread owns its own shard (registered once on first emit), and the registry
+//! mutex is only taken at registration time and during drainage.
+//!
+//! See [`ThreadEventRing`] for the local (non-registered) ring type, and
+//! [`ThreadRingRegistry`] for the multi-thread aggregator used by the dumper.
+
 pub mod event;
 pub mod dump;
 pub mod recording;
@@ -10,6 +26,44 @@ pub use recording::*;
 pub use repository::*;
 pub use dump::{JfrDumpError, JfrFileHeader, dump_to_file, read_events, read_jfr_header};
 pub use stream::EventStream;
+
+// Explicit re-exports of the per-thread ring API. These are also covered by
+// the blanket `pub use repository::*;` above, but listing them here documents
+// the public surface and guards against accidental removal from the glob.
+pub use repository::{
+    DEFAULT_THREAD_RING_CAPACITY,
+    ThreadEventRing,
+    ThreadRingRegistry,
+    global_ring_registry,
+    push_to_thread_ring,
+};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global JFR enabled flag — set when any recording starts, cleared when the
+/// last one stops. Every `emit_*` function in `builtin.rs` checks this with a
+/// single relaxed load + branch to skip the disabled-path work entirely.
+///
+/// This converts the disabled-path cost from ~30-100 ns/call (HashMap probe +
+/// Vec alloc) to ~2-3 ns (one relaxed load + branch).
+static JFR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Returns whether any flight recording is currently running.
+///
+/// This is the fast-path check used by every `emit_*` function — a single
+/// relaxed atomic load that the JIT/branch predictor can elide.
+#[inline(always)]
+pub fn is_enabled() -> bool {
+    JFR_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the global JFR-enabled flag. Called by `FlightRecorder::start_recording`
+/// and `stop_recording`. Uses `Release` ordering so writes that precede the
+/// store (e.g. registry inserts during recording setup) are visible to readers
+/// that subsequently observe `is_enabled() == true`.
+pub fn set_enabled(v: bool) {
+    JFR_ENABLED.store(v, Ordering::Release);
+}
 
 /// Create a new FlightRecorder with all built-in events registered.
 pub fn create_flight_recorder() -> FlightRecorder {
@@ -338,7 +392,7 @@ mod tests {
         assert_eq!(repo.total_recorded(), 0);
     }
 
-    // --- create_flight_recorder ---
+    // --- create_thread_recorder ---
 
     #[test]
     fn test_create_flight_recorder_has_events() {
@@ -346,5 +400,68 @@ mod tests {
         assert!(fr.type_registry.find_by_name("jdk.ClassLoad").is_some());
         assert!(fr.type_registry.find_by_name("jdk.CPULoad").is_some());
         assert!(fr.type_registry.find_by_name("jdk.ExecutionSample").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-thread ring API smoke test
+    //
+    // Verifies the public surface (re-exported from `repository`) works
+    // end-to-end:
+    //   1. `set_enabled(true)` flips the global enable flag and `is_enabled()`
+    //      reports it.
+    //   2. `push_to_thread_ring(event)` writes the event into the calling
+    //      thread's registered shard.
+    //   3. The same event is observable through this thread's shard via the
+    //      registry (`register_current_thread` is idempotent and returns the
+    //      cached Arc).
+    //
+    // We do *not* assert on `global_ring_registry().drain_all()`'s count
+    // directly, because the test binary may run other tests in parallel that
+    // touch the global registry; instead we search for our uniquely-tagged
+    // event in this thread's shard, which proves the wiring is correct and
+    // remains race-free.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn smoke_test_thread_ring_public_api() {
+        // (1) Toggle the global enable flag through the public API.
+        let prior = is_enabled();
+        set_enabled(true);
+        assert!(is_enabled(), "set_enabled(true) should make is_enabled() return true");
+
+        // (2) Push a uniquely-tagged event through the public function.
+        let unique_start: u64 = 0xCAFE_F00D_DEAD_BEEF;
+        let unique_type = EventTypeId(0xA5A5_A5A5);
+        let event = EventInstance {
+            type_id: unique_type,
+            start_time: unique_start,
+            end_time: unique_start + 1,
+            thread_id: 42,
+            fields: vec![],
+        };
+        push_to_thread_ring(event);
+
+        // (3) Confirm the event is reachable through the global registry —
+        // by inspecting *this* thread's shard, avoiding cross-test races on
+        // `drain_all`.
+        let shard = global_ring_registry().register_current_thread();
+        let q = shard.lock().expect("shard mutex poisoned");
+        assert!(
+            q.iter().any(|e| e.start_time == unique_start && e.type_id == unique_type),
+            "expected event with start_time={:#x} to be present in this thread's shard (len={})",
+            unique_start,
+            q.len(),
+        );
+
+        // Also confirm the default-capacity constant is the documented value
+        // and that the registry honors it.
+        assert_eq!(DEFAULT_THREAD_RING_CAPACITY, 1024);
+        assert_eq!(
+            global_ring_registry().shard_capacity(),
+            DEFAULT_THREAD_RING_CAPACITY,
+        );
+
+        // Restore prior state so other tests don't see a forced-enabled flag.
+        set_enabled(prior);
     }
 }

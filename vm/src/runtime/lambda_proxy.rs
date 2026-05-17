@@ -123,9 +123,9 @@ mod tests {
     fn mk_handle(kind: MethodHandleKind) -> MethodHandle {
         MethodHandle {
             kind,
-            class_name: "com/example/Foo".to_string(),
-            member_name: "bar".to_string(),
-            descriptor: "()V".to_string(),
+            class_name: std::sync::Arc::from("com/example/Foo"),
+            member_name: std::sync::Arc::from("bar"),
+            descriptor: std::sync::Arc::from("()V"),
         }
     }
 

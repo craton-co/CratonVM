@@ -1164,7 +1164,9 @@ fn verify_code_attribute_presence(class: &Class) -> Result<(), LinkageError> {
 mod tests {
     use super::*;
     use crate::class::{ClassId, ClassLoaderId, ClassState};
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+    use std::sync::OnceLock;
+
+    use rustjvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
     use rustjvm_reader::class_access_flags::ClassAccessFlags;
     use rustjvm_reader::class_file_version::ClassFileVersion;
     use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -1212,6 +1214,12 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            attributes: Vec::new(),
+            source_file_cache: OnceLock::new(),
+            signature_cache: OnceLock::new(),
+            nest_host_cache: OnceLock::new(),
+            enclosing_method_cache: OnceLock::new(),
+            record_components_cache: OnceLock::new(),
         });
         id
     }
@@ -1223,13 +1231,13 @@ mod tests {
         has_code: bool,
     ) -> ClassFileMethod {
         let attributes = if has_code {
-            vec![Attribute::Code(CodeAttribute {
+            vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
                 code: vec![0xB1], // return
                 exception_table: vec![],
                 attributes: vec![],
-            })]
+            }))]
         } else {
             vec![]
         };
@@ -1634,13 +1642,13 @@ mod tests {
                 access_flags: MethodAccessFlags::PUBLIC,
                 name: Arc::from(method_name),
                 descriptor: Arc::from(descriptor),
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack,
                     max_locals,
                     code,
                     exception_table,
                     attributes: vec![],
-                })],
+                }))],
             }],
             first_field_index: 0,
             num_total_fields: 0,
@@ -1659,6 +1667,12 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            attributes: Vec::new(),
+            source_file_cache: OnceLock::new(),
+            signature_cache: OnceLock::new(),
+            nest_host_cache: OnceLock::new(),
+            enclosing_method_cache: OnceLock::new(),
+            record_components_cache: OnceLock::new(),
         }
     }
 
@@ -1872,13 +1886,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("typeStateBug"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
                 code: vec![0xac], // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         });
         let res = verify_class_bytecode(&class, &PermissiveHierarchy);
         assert!(
@@ -1916,13 +1930,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("typeStateBug"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
                 code: vec![0xac], // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         });
         let res = verify_class_bytecode(&class, &PermissiveHierarchy);
         assert!(
@@ -1960,13 +1974,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("malformed"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0xb2, 0x00], // getstatic with truncated index
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         });
         let res = verify_class_bytecode(&class, &PermissiveHierarchy);
         assert!(
@@ -2019,13 +2033,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("withSwitch"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         };
         // Scanner-level assertion only вЂ” we don't care whether the full
         // verifier accepts the synthetic switch.

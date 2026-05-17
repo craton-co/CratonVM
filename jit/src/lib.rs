@@ -393,6 +393,18 @@ pub struct CompiledMethod {
     /// Owned monomorphic inline cache slots. JIT code references these via raw
     /// pointers; they are freed when this `CompiledMethod` is dropped.
     pub _jit_mic_slots: Vec<Box<JitMICSlot>>,
+    /// Owned polymorphic inline cache slots. JIT code references these via
+    /// raw pointers (embedded as imm64 in the inline 3-way cascade emitted
+    /// by `Compiler::compile_op_invokevirtual`); they are freed when this
+    /// `CompiledMethod` is dropped.
+    ///
+    /// HIGH-7 — populated eagerly at first compile for every
+    /// invokevirtual / invokeinterface bci. Slots start empty (all 3
+    /// `cached_class_id` entries == 0), so the inline cascade falls
+    /// straight through to the slow-path helper on cold sites; once the
+    /// helper has populated a slot, subsequent dispatches take the
+    /// inline fast path.
+    pub _jit_pic_slots: Vec<Box<JitPICSlot>>,
     /// OSR metadata: bytecode PC → native offset mapping.
     pub osr_pc_to_native: Option<Vec<i32>>,
     /// OSR metadata: number of locals in the compiled frame.
@@ -479,6 +491,7 @@ impl CompiledMethod {
             _jit_strings: Vec::new(),
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
+            _jit_pic_slots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
             osr_num_reg_locals: 0,
@@ -507,6 +520,7 @@ impl CompiledMethod {
             _jit_strings: Vec::new(),
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
+            _jit_pic_slots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
             osr_num_reg_locals: 0,
@@ -1099,32 +1113,75 @@ pub struct JitDirectCall {
 ///   - Update all cached fields atomically
 ///
 /// Hit/miss counters support adaptive recompilation decisions.
+///
+/// # Memory layout (CRIT-8 prerequisite)
+///
+/// `#[repr(C)]` plus a fixed field order with explicit padding pins the
+/// JIT-hot fields at known offsets at the *start* of the struct so the
+/// x86-64 codegen in `jit/src/x64.rs` can safely emit instructions like
+/// `MOV eax, [mic_ptr + JitMICSlot::CACHED_CLASS_ID_OFFSET]` for inline
+/// MIC dispatch. The `Mutex<Option<String>>` field — whose internal
+/// representation is not guaranteed stable across `parking_lot`
+/// versions — is moved to the **tail** so its layout cannot disturb
+/// the hot-path offsets.
+///
+/// Offsets are asserted to match the constants in
+/// [`JitMICSlot::CACHED_CLASS_ID_OFFSET`] et al. via a runtime test
+/// (`test_jit_mic_slot_offsets`). A compile-time assert would require
+/// `core::mem::offset_of!` (Rust 1.77+); the workspace MSRV is 1.75.
+#[repr(C)]
 pub struct JitMICSlot {
     /// Cached receiver ClassId (0 = empty/unpopulated).
+    /// **JIT-hot — offset 0.**
     pub cached_class_id: std::sync::atomic::AtomicU32,
-    /// Cached receiver class name (avoids class_manager read lock on hit).
-    pub cached_class_name: parking_lot::Mutex<Option<String>>,
+    /// Padding so `cached_entry_ptr` lands at an 8-byte aligned offset
+    /// regardless of host alignment rules.
+    _pad0: u32,
     /// Cached method entry pointer for direct call on hit (0 = not resolved).
     /// This is the address of a compiled native/JIT function that can be called
     /// directly with the same calling convention as `invoke_or_native`.
+    /// **JIT-hot — offset 8.**
     pub cached_entry_ptr: std::sync::atomic::AtomicU64,
     /// Whether the cached entry needs the VM context pointer as first arg.
+    /// **JIT-hot — offset 16.**
     pub cached_needs_context: std::sync::atomic::AtomicBool,
+    /// Padding so the following `AtomicU64` counters land at an 8-byte
+    /// aligned offset.
+    _pad1: [u8; 7],
     /// Cache hit counter (diagnostic).
     pub hits: std::sync::atomic::AtomicU64,
     /// Cache miss counter (diagnostic).
     pub misses: std::sync::atomic::AtomicU64,
+    /// Cached receiver class name (avoids class_manager read lock on hit).
+    /// Moved to the tail: `parking_lot::Mutex<Option<String>>` has an
+    /// unstable layout we must not expose to JIT codegen.
+    pub cached_class_name: parking_lot::Mutex<Option<String>>,
 }
 
 impl JitMICSlot {
+    /// Byte offset of [`Self::cached_class_id`] from the start of the
+    /// struct. JIT codegen uses this to emit
+    /// `MOV eax, [mic_ptr + CACHED_CLASS_ID_OFFSET]`.
+    pub const CACHED_CLASS_ID_OFFSET: usize = 0;
+    /// Byte offset of [`Self::cached_entry_ptr`] from the start of the
+    /// struct. JIT codegen uses this to emit the indirect call target
+    /// load on a cache hit.
+    pub const CACHED_ENTRY_PTR_OFFSET: usize = 8;
+    /// Byte offset of [`Self::cached_needs_context`] from the start of
+    /// the struct. JIT codegen reads this to decide whether to thread
+    /// the VM context pointer through the inline dispatch.
+    pub const CACHED_NEEDS_CONTEXT_OFFSET: usize = 16;
+
     pub fn new() -> Self {
         Self {
             cached_class_id: std::sync::atomic::AtomicU32::new(0),
-            cached_class_name: parking_lot::Mutex::new(None),
+            _pad0: 0,
             cached_entry_ptr: std::sync::atomic::AtomicU64::new(0),
             cached_needs_context: std::sync::atomic::AtomicBool::new(false),
+            _pad1: [0; 7],
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
+            cached_class_name: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1245,24 +1302,48 @@ pub const JIT_PIC_ENTRIES: usize = 3;
 /// RAX, [RBX+16]; JE entry1; ...`. Each entry is 24 bytes
 /// (`class_id` + padding + `entry_ptr` + flags) — well within an L1
 /// line for the whole slot.
+///
+/// # Stable layout (CRIT-8 prerequisite)
+///
+/// Marked `#[repr(C)]` and laid out so the JIT codegen in
+/// `jit/src/x64.rs` can emit raw `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]`
+/// for inline 3-way PIC dispatch. The `Mutex<Option<String>>` array —
+/// whose internal representation is not guaranteed stable across
+/// `parking_lot` versions — is moved to the **tail** so its layout
+/// cannot disturb the hot-path offsets.
+///
+/// Offsets are asserted to match the constants in
+/// [`JitPICSlot::CLASS_ID_OFFSETS`] et al. via a runtime test
+/// (`test_jit_pic_slot_offsets`).
+#[repr(C)]
 pub struct JitPICSlot {
     /// Cached ClassIds, parallel to `entry_ptrs`. `0` means the slot
     /// is empty (ClassId 0 is reserved for `java.lang.Object`, which
     /// cannot be a dispatch target here because invokevirtual on an
     /// Object reference goes through the vtable directly).
+    /// **JIT-hot — offsets 0, 4, 8.**
     pub class_ids: [std::sync::atomic::AtomicU32; JIT_PIC_ENTRIES],
-    /// Cached class names (mutex-protected). Parallel to `class_ids`.
-    pub class_names: [parking_lot::Mutex<Option<String>>; JIT_PIC_ENTRIES],
+    /// Padding so `entry_ptrs` lands at an 8-byte aligned offset.
+    _pad0: u32,
     /// Cached method entry pointers, parallel to `class_ids`.
+    /// **JIT-hot — offsets 16, 24, 32.**
     pub entry_ptrs: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
     /// Whether the cached entry needs the VM context pointer as the
     /// first argument. Parallel to `class_ids`.
+    /// **JIT-hot — offsets 40, 41, 42.**
     pub needs_context: [std::sync::atomic::AtomicBool; JIT_PIC_ENTRIES],
+    /// Padding so the following `AtomicU64` counters land at an 8-byte
+    /// aligned offset.
+    _pad1: [u8; 5],
     /// Per-entry hit counter. Used to pick an eviction victim when a
     /// fourth receiver type arrives.
     pub hits: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
     /// Total cache misses (receiver not in any entry).
     pub misses: std::sync::atomic::AtomicU64,
+    /// Cached class names (mutex-protected). Parallel to `class_ids`.
+    /// Moved to the tail: `parking_lot::Mutex<Option<String>>` has an
+    /// unstable layout we must not expose to JIT codegen.
+    pub class_names: [parking_lot::Mutex<Option<String>>; JIT_PIC_ENTRIES],
 }
 
 /// Miss count on a `JitMICSlot` at which the adaptive recompiler
@@ -1275,6 +1356,20 @@ pub const MIC_TO_PIC_THRESHOLD: u64 = 3;
 pub const PIC_TO_MEGA_THRESHOLD: u64 = 20;
 
 impl JitPICSlot {
+    /// Byte offsets of [`Self::class_ids`] entries from the start of
+    /// the struct. JIT codegen uses these to emit
+    /// `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]` for the inline 3-way
+    /// class comparisons.
+    pub const CLASS_ID_OFFSETS: [usize; JIT_PIC_ENTRIES] = [0, 4, 8];
+    /// Byte offsets of [`Self::entry_ptrs`] entries from the start of
+    /// the struct. JIT codegen uses these to emit the indirect call
+    /// target load on a PIC hit.
+    pub const ENTRY_PTR_OFFSETS: [usize; JIT_PIC_ENTRIES] = [16, 24, 32];
+    /// Byte offsets of [`Self::needs_context`] entries from the start
+    /// of the struct. JIT codegen reads these to decide whether to
+    /// thread the VM context pointer through the inline dispatch.
+    pub const NEEDS_CONTEXT_OFFSETS: [usize; JIT_PIC_ENTRIES] = [40, 41, 42];
+
     /// Create an empty PIC slot.
     pub fn new() -> Self {
         // Can't use `Default::default()` inside a const array literal
@@ -1286,11 +1381,7 @@ impl JitPICSlot {
                 std::sync::atomic::AtomicU32::new(0),
                 std::sync::atomic::AtomicU32::new(0),
             ],
-            class_names: [
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-                parking_lot::Mutex::new(None),
-            ],
+            _pad0: 0,
             entry_ptrs: [
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
@@ -1301,12 +1392,18 @@ impl JitPICSlot {
                 std::sync::atomic::AtomicBool::new(false),
                 std::sync::atomic::AtomicBool::new(false),
             ],
+            _pad1: [0; 5],
             hits: [
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
             ],
             misses: std::sync::atomic::AtomicU64::new(0),
+            class_names: [
+                parking_lot::Mutex::new(None),
+                parking_lot::Mutex::new(None),
+                parking_lot::Mutex::new(None),
+            ],
         }
     }
 
@@ -1605,18 +1702,37 @@ impl JitCache {
         ptr
     }
 
+    /// Look up a compiled method by (class, method, descriptor).
+    ///
+    /// Hot path: this is called on every invoke of a JIT-compiled
+    /// method via the call-site cache. To avoid three `Arc<str>`
+    /// clones per probe (each = an atomic refcount increment), the
+    /// lookup is keyed by a precomputed u64 hash and the full string
+    /// key is verified after the hash hit (collision check).
+    ///
+    /// On a hash collision (extremely rare; the caller will fall
+    /// through to the slow path and re-JIT), this returns `None`.
+    /// That is a correctness-safe but slightly suboptimal outcome —
+    /// see [`compute_jit_key_hash`] for the rationale.
+    ///
+    /// Callers holding an `&Arc<str>` can pass it directly: deref
+    /// coercion turns it into `&str`.
     pub fn get(
         &self,
-        class_name: &Arc<str>,
-        method_name: &Arc<str>,
-        descriptor: &Arc<str>,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
     ) -> Option<Arc<CompiledMethod>> {
-        let key = JitKey {
-            class_name: class_name.clone(),
-            method_name: method_name.clone(),
-            descriptor: descriptor.clone(),
-        };
-        self.methods.get(&key).cloned()
+        let h = compute_jit_key_hash(class_name, method_name, descriptor);
+        let (key, method) = self.methods.get(&h)?;
+        if &*key.class_name == class_name
+            && &*key.method_name == method_name
+            && &*key.descriptor == descriptor
+        {
+            Some(method.clone())
+        } else {
+            None
+        }
     }
 
     pub fn put(
@@ -1626,12 +1742,13 @@ impl JitCache {
         descriptor: Arc<str>,
         compiled: CompiledMethod,
     ) {
+        let h = compute_jit_key_hash(&class_name, &method_name, &descriptor);
         let key = JitKey {
             class_name,
             method_name,
             descriptor,
         };
-        self.methods.insert(key, Arc::new(compiled));
+        self.methods.insert(h, (key, Arc::new(compiled)));
     }
 
     pub fn len(&self) -> usize {
@@ -1643,18 +1760,25 @@ impl JitCache {
     }
 
     /// Remove a compiled method from the cache (for invalidation).
+    ///
+    /// Verifies the full string key matches before removing, so a
+    /// (rare) hash collision can't cause an unrelated cached entry to
+    /// be evicted.
     pub fn remove(
         &mut self,
         class_name: &str,
         method_name: &str,
         descriptor: &str,
     ) {
-        let key = JitKey {
-            class_name: Arc::from(class_name),
-            method_name: Arc::from(method_name),
-            descriptor: Arc::from(descriptor),
-        };
-        self.methods.remove(&key);
+        let h = compute_jit_key_hash(class_name, method_name, descriptor);
+        if let Some((key, _)) = self.methods.get(&h) {
+            if &*key.class_name == class_name
+                && &*key.method_name == method_name
+                && &*key.descriptor == descriptor
+            {
+                self.methods.remove(&h);
+            }
+        }
     }
 
     /// T5.4.4 — Class hierarchy change invalidation.
@@ -1668,7 +1792,7 @@ impl JitCache {
     /// Returns the number of evicted entries.
     pub fn invalidate_for_class_change(&mut self, changed_class: &str) -> usize {
         let before = self.methods.len();
-        self.methods.retain(|_key, cm| {
+        self.methods.retain(|_h, (_key, cm)| {
             // Keep the entry iff it does NOT inline from the changed class.
             !cm.inlined_methods
                 .iter()
@@ -1680,20 +1804,20 @@ impl JitCache {
     /// Invalidate all compiled methods that inlined code from `class_name`.
     /// Returns the number of methods evicted.
     pub fn invalidate_for_class(&mut self, class_name: &str) -> usize {
-        let keys_to_remove: Vec<JitKey> = self
+        let hashes_to_remove: Vec<u64> = self
             .methods
             .iter()
-            .filter(|(_, compiled)| {
+            .filter(|(_, (_key, compiled))| {
                 compiled
                     .inlined_methods
                     .iter()
                     .any(|(cn, _, _)| cn == class_name)
             })
-            .map(|(k, _)| k.clone())
+            .map(|(h, _)| *h)
             .collect();
-        let count = keys_to_remove.len();
-        for key in keys_to_remove {
-            self.methods.remove(&key);
+        let count = hashes_to_remove.len();
+        for h in hashes_to_remove {
+            self.methods.remove(&h);
         }
         count
     }
@@ -2132,6 +2256,27 @@ pub fn try_compile(
     let mut direct_calls: Vec<(usize, JitDirectCall)> = Vec::new();
     let mut mic_slots: Vec<(usize, *const JitMICSlot)> = Vec::new();
     let mut owned_mic_slots: Vec<Box<JitMICSlot>> = Vec::new();
+    // HIGH-7 — Eager PIC allocation strategy.
+    //
+    // At first JIT compile we optimistically allocate one
+    // `Box<JitPICSlot>` for every invokevirtual / invokeinterface
+    // bci in the method, regardless of MIC miss history. Rationale:
+    //   * The cost is small (≈64 B per call site; typical methods
+    //     have <5 virtual call sites).
+    //   * The 3-way inline cascade is silent on empty slots: each
+    //     entry's `cached_class_id == 0` fails the CMP and falls
+    //     through to the helper, so cold sites pay zero extra cycles.
+    //   * Once the runtime helper populates a slot, the inline
+    //     cascade starts hitting — no recompile required, which
+    //     sidesteps the adaptive-recompile machinery entirely.
+    //
+    // This is the "simpler approach" from the HIGH-7 design doc.
+    // The adaptive MIC→PIC promotion path
+    // (`JitMICSlot::needs_pic_promotion` → `promote_mic_to_pic`)
+    // remains available for future tiered-recompile use, but is
+    // currently unused on the hot path.
+    let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
+    let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
     let mut inline_budget_remaining: usize = MAX_INLINE_BUDGET;
     let mut inlined_methods: Vec<(String, String, String)> = Vec::new();
@@ -2268,9 +2413,32 @@ pub fn try_compile(
                         }
                     }
                 }
+
+                // HIGH-7 — Eager PIC slot allocation alongside the
+                // MIC. See the strategy comment at the `pic_slots`
+                // declaration above. The PIC starts empty (all 3
+                // entries have class_id == 0), so the inline cascade
+                // falls through to the helper on cold sites. The
+                // helper (`jit_invoke_virtual_mic`) populates entries
+                // on miss, after which subsequent dispatches take
+                // the inline fast path.
+                //
+                // `seed_from_mic` carries forward any profile-driven
+                // pre-population we just applied to the MIC, so a
+                // site with a known dominant receiver lands in PIC
+                // slot 0 with class_id only (entry_ptr stays 0 →
+                // first dispatch still rings the helper, which
+                // installs entry_ptr; thereafter the cascade hits).
+                let pic = Box::new(JitPICSlot::new());
+                pic.seed_from_mic(&mic);
+
                 let mic_ptr: *const JitMICSlot = &*mic;
                 owned_mic_slots.push(mic);
                 mic_slots.push((pc, mic_ptr));
+
+                let pic_ptr: *const JitPICSlot = &*pic;
+                owned_pic_slots.push(pic);
+                pic_slots.push((pc, pic_ptr));
             }
         }
     }
@@ -2321,6 +2489,7 @@ pub fn try_compile(
         invoke_info,
         direct_calls,
         mic_slots,
+        pic_slots,
         ldc_info,
         ldc2w_info,
         branch_hints,
@@ -2333,6 +2502,7 @@ pub fn try_compile(
     compiled._jit_strings = owned_strings;
     compiled._jit_invoke_infos = owned_invoke_infos;
     compiled._jit_mic_slots = owned_mic_slots;
+    compiled._jit_pic_slots = owned_pic_slots;
     compiled.inlined_methods = inlined_methods;
 
     Some(compiled)
@@ -2530,6 +2700,89 @@ pub fn return_type(descriptor: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── JitMICSlot layout tests (CRIT-8 prerequisite) ──────────────
+    //
+    // The JIT codegen in `jit/src/x64.rs` emits raw `MOV` instructions
+    // against a `JitMICSlot*` using the `CACHED_*_OFFSET` constants.
+    // If the struct layout drifts (e.g. someone reorders a field,
+    // changes padding, or `parking_lot::Mutex` grows), those MOVs will
+    // silently read the wrong bytes. Pin the offsets here.
+    //
+    // We don't use `core::mem::offset_of!` because the workspace MSRV
+    // (see `Cargo.toml: rust-version`) is 1.75; the macro stabilized
+    // in 1.77.
+
+    #[test]
+    fn test_jit_mic_slot_offsets() {
+        let slot = JitMICSlot::new();
+        let base = &slot as *const JitMICSlot as usize;
+        let off_class_id =
+            (&slot.cached_class_id as *const _ as usize) - base;
+        let off_entry_ptr =
+            (&slot.cached_entry_ptr as *const _ as usize) - base;
+        let off_needs_context =
+            (&slot.cached_needs_context as *const _ as usize) - base;
+        assert_eq!(
+            off_class_id,
+            JitMICSlot::CACHED_CLASS_ID_OFFSET,
+            "cached_class_id offset drift: expected {}, got {}",
+            JitMICSlot::CACHED_CLASS_ID_OFFSET,
+            off_class_id
+        );
+        assert_eq!(
+            off_entry_ptr,
+            JitMICSlot::CACHED_ENTRY_PTR_OFFSET,
+            "cached_entry_ptr offset drift: expected {}, got {}",
+            JitMICSlot::CACHED_ENTRY_PTR_OFFSET,
+            off_entry_ptr
+        );
+        assert_eq!(
+            off_needs_context,
+            JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET,
+            "cached_needs_context offset drift: expected {}, got {}",
+            JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET,
+            off_needs_context
+        );
+    }
+
+    // ── JitPICSlot layout tests (CRIT-8 prerequisite) ──────────────
+    //
+    // The JIT codegen emits raw `MOV` instructions against a
+    // `JitPICSlot*` using the `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS`
+    // / `NEEDS_CONTEXT_OFFSETS` constants for inline 3-way PIC
+    // dispatch. Pin the offsets here so any layout drift (field
+    // reorder, padding change, `parking_lot::Mutex` resize) fails
+    // loudly instead of silently misreading bytes.
+
+    #[test]
+    fn test_jit_pic_slot_offsets() {
+        let slot = JitPICSlot::new();
+        let base = &slot as *const JitPICSlot as usize;
+        for i in 0..JIT_PIC_ENTRIES {
+            let actual = (&slot.class_ids[i] as *const _ as usize) - base;
+            assert_eq!(
+                actual,
+                JitPICSlot::CLASS_ID_OFFSETS[i],
+                "CLASS_ID_OFFSETS[{i}] drift: {actual} vs {}",
+                JitPICSlot::CLASS_ID_OFFSETS[i]
+            );
+            let actual = (&slot.entry_ptrs[i] as *const _ as usize) - base;
+            assert_eq!(
+                actual,
+                JitPICSlot::ENTRY_PTR_OFFSETS[i],
+                "ENTRY_PTR_OFFSETS[{i}] drift: {actual} vs {}",
+                JitPICSlot::ENTRY_PTR_OFFSETS[i]
+            );
+            let actual = (&slot.needs_context[i] as *const _ as usize) - base;
+            assert_eq!(
+                actual,
+                JitPICSlot::NEEDS_CONTEXT_OFFSETS[i],
+                "NEEDS_CONTEXT_OFFSETS[{i}] drift: {actual} vs {}",
+                JitPICSlot::NEEDS_CONTEXT_OFFSETS[i]
+            );
+        }
+    }
 
     // ── JitCodeRegion tests ─────────────────────────────────────────
 

@@ -17,7 +17,9 @@ pub use intern::{intern, intern_arc, StringPool};
 pub use heap_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
     ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
-    HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK,
+    MARK_THIN_LOCKED, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK,
+    THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
 };
 pub use compact_value::{CompactTag, CompactValue};
 pub use value::{
@@ -74,7 +76,7 @@ mod tests {
 
     #[test]
     fn reexport_heap_constants() {
-        assert_eq!(HEADER_SIZE, 32);
+        assert_eq!(HEADER_SIZE, 40);
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
         assert!(ARRAY_LENGTH_OFFSET > 0);
@@ -100,19 +102,14 @@ mod tests {
 
     #[test]
     fn reexport_object_header() {
-        let header = ObjectHeader {
-            class_id: ClassId::new(0),
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Boolean,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 0,
-            num_slots: 0,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Boolean,
+            0,
+            0,
+            0,
+        );
         assert!(!header.is_forwarded());
         assert!(!header.is_old_gen());
     }

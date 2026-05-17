@@ -7,6 +7,20 @@ use rustc_hash::FxHashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventTypeId(pub u32);
 
+impl EventTypeId {
+    /// Sentinel value used by per-emit-site caches when a built-in event type
+    /// is not yet registered (or registration failed). `emit_*` functions
+    /// treat this as "skip emission" without re-probing the registry on
+    /// subsequent calls.
+    pub const INVALID: Self = EventTypeId(u32::MAX);
+
+    /// Returns true if this is the `INVALID` sentinel.
+    #[inline]
+    pub fn is_invalid(self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
 /// Describes a field in an event
 #[derive(Debug, Clone)]
 pub struct EventField {
@@ -102,7 +116,12 @@ impl EventTypeRegistry {
 
     /// Register a new event type. The `id` field of the passed `EventType` is
     /// overwritten with the auto-assigned id.
+    ///
+    /// `EventTypeId(u32::MAX)` is reserved as the `INVALID` sentinel and will
+    /// never be assigned to a real event type.
     pub fn register(&mut self, mut event_type: EventType) -> EventTypeId {
+        // Guard against ever assigning the INVALID sentinel value.
+        assert!(self.next_id < u32::MAX, "event type ID overflow (reached INVALID sentinel)");
         let id = EventTypeId(self.next_id);
         self.next_id = self.next_id.checked_add(1).expect("event type ID overflow");
         event_type.id = id;

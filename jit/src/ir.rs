@@ -1008,15 +1008,76 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
 
 /// Check if a method (from its JitScanResult) is suitable for IR compilation.
 ///
-/// Initially very conservative: integer-only, no heap, no invokes.
+/// STUB-S7 widening: previously this rejected every method with any heap op,
+/// invoke, or allocation — which excluded virtually all real-world methods and
+/// left the IR-resident optimization passes (escape analysis, GVN, fold,
+/// schedule, lower) effectively unreachable. We now admit methods with a
+/// bounded number of common heap-touching opcodes; the IR builder itself
+/// returns `None` when it encounters an opcode it doesn't yet lower, and the
+/// caller in `lib.rs` (`try_compile`) falls through to the x64 single-pass
+/// backend on either `build()` or `lower()` returning `None`. That fallback is
+/// the safety net that lets us widen gradually without crashing.
+///
+/// Invokedynamic is filtered earlier in `jit_scan` (it returns `None`), and
+/// there is no exception-table-aware IR codegen yet (STUB-S8) — the IR builder
+/// has no path that constructs exception edges, so methods with try/catch are
+/// naturally rejected either there or at the bytecode-parse level.
+///
+/// TODO(IR widening): increase caps once differential tests validate.
 pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
-    scan.field_ops.is_empty()
-        && scan.static_field_ops.is_empty()
-        && scan.invoke_ops.is_empty()
-        && scan.typecheck_ops.is_empty()
-        && scan.multianewarray_ops.is_empty()
-        && scan.new_ops.is_empty()
-        && scan.anewarray_ops.is_empty()
+    // Caps below are deliberately conservative. A method that exceeds a cap is
+    // still compilable via the x64 single-pass backend; we just decline to
+    // route it through the IR pipeline until we've gained more confidence.
+
+    // Cap simple invokes (invokestatic / invokevirtual / invokespecial /
+    // invokeinterface). Invokedynamic is rejected upstream by `jit_scan`.
+    if scan.invoke_ops.len() > 5 {
+        return false;
+    }
+    // Cap getfield/putfield.
+    if scan.field_ops.len() > 5 {
+        return false;
+    }
+    // Cap getstatic/putstatic (same shape as instance field ops for IR).
+    if scan.static_field_ops.len() > 5 {
+        return false;
+    }
+    // Cap `new` allocations.
+    if scan.new_ops.len() > 3 {
+        return false;
+    }
+    // Cap `anewarray` allocations.
+    if scan.anewarray_ops.len() > 3 {
+        return false;
+    }
+
+    // Still rejected outright — IR has no lowering for these yet:
+    //  * `multianewarray` — multi-dim allocation needs a resolver-shaped helper
+    //    call sequence that the IR lowerer does not synthesize.
+    //  * `checkcast` / `instanceof` — runtime type checks need polymorphic
+    //    inline caches that the IR pipeline does not yet emit.
+    if !scan.multianewarray_ops.is_empty() {
+        return false;
+    }
+    if !scan.typecheck_ops.is_empty() {
+        return false;
+    }
+
+    true
+}
+
+/// Variant of [`ir_compatible`] that also enforces a hard cap on bytecode
+/// length. Kept as a separate entry point so the existing call site and tests
+/// stay source-compatible while callers that know the method size can opt into
+/// the extra guard.
+///
+/// TODO(IR widening): fold into `ir_compatible` once `try_compile` plumbs
+/// `code_len` through and once we've validated larger methods.
+pub fn ir_compatible_sized(scan: &super::x64::JitScanResult, code_len: usize) -> bool {
+    if code_len > 200 {
+        return false;
+    }
+    ir_compatible(scan)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1131,5 +1192,71 @@ mod tests {
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
+    }
+
+    /// STUB-S7: confirm the widened filter admits a method with bounded
+    /// field/invoke/new ops, where the previous filter would have rejected.
+    #[test]
+    fn test_ir_compatible_widened_admits_simple_heap_ops() {
+        let scan = super::super::x64::JitScanResult {
+            needs_heap: true,
+            multianewarray_ops: vec![],
+            field_ops: vec![(0, 1), (3, 2)],
+            typecheck_ops: vec![],
+            static_field_ops: vec![(6, 3)],
+            invoke_ops: vec![(9, 4, 0xb8), (12, 5, 0xb6)],
+            new_ops: vec![(15, 6)],
+            anewarray_ops: vec![],
+            non_escaping_new: std::collections::HashSet::new(),
+            ldc2w_ops: vec![],
+            ldc_ops: vec![],
+        };
+        assert!(ir_compatible(&scan));
+    }
+
+    /// STUB-S7: confirm caps still reject over-budget methods so we don't
+    /// route huge heap-heavy methods through an under-tested IR pipeline.
+    #[test]
+    fn test_ir_compatible_rejects_over_cap() {
+        let mut scan = super::super::x64::JitScanResult {
+            needs_heap: true,
+            multianewarray_ops: vec![],
+            field_ops: vec![],
+            typecheck_ops: vec![],
+            static_field_ops: vec![],
+            invoke_ops: vec![],
+            new_ops: vec![],
+            anewarray_ops: vec![],
+            non_escaping_new: std::collections::HashSet::new(),
+            ldc2w_ops: vec![],
+            ldc_ops: vec![],
+        };
+        // Too many invokes.
+        scan.invoke_ops = (0..6).map(|i| (i, i as u16, 0xb8)).collect();
+        assert!(!ir_compatible(&scan));
+        scan.invoke_ops.clear();
+        // checkcast still rejected outright.
+        scan.typecheck_ops = vec![(0, 1)];
+        assert!(!ir_compatible(&scan));
+    }
+
+    /// STUB-S7: size-aware variant rejects oversized methods.
+    #[test]
+    fn test_ir_compatible_sized_rejects_large_methods() {
+        let scan = super::super::x64::JitScanResult {
+            needs_heap: false,
+            multianewarray_ops: vec![],
+            field_ops: vec![],
+            typecheck_ops: vec![],
+            static_field_ops: vec![],
+            invoke_ops: vec![],
+            new_ops: vec![],
+            anewarray_ops: vec![],
+            non_escaping_new: std::collections::HashSet::new(),
+            ldc2w_ops: vec![],
+            ldc_ops: vec![],
+        };
+        assert!(ir_compatible_sized(&scan, 200));
+        assert!(!ir_compatible_sized(&scan, 201));
     }
 }

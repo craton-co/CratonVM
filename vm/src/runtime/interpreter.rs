@@ -678,6 +678,7 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
         gc_flags: 0,
         _gc_reserved: [0; 2],
         forwarding_ptr: std::ptr::null_mut(),
+        mark_word: std::sync::atomic::AtomicU64::new(rustjvm_types::MARK_NEUTRAL),
     };
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
@@ -1837,7 +1838,18 @@ pub fn execute(
                     anewarray_info,
                     invoke_info,
                     direct_calls_early,
-                    Vec::new(),
+                    Vec::new(), // mic_slots — this early-compile path does
+                                // not yet allocate MICs (see existing TODO);
+                                // dispatch goes through the slow-path helper.
+                    Vec::new(), // pic_slots (HIGH-7) — eager PIC allocation
+                                // is wired in `jit::try_compile` (the main
+                                // hot-path entry). This early-compile path
+                                // emits the slow-path helper for every
+                                // invokevirtual/invokeinterface; promoting
+                                // it to inline PIC dispatch is a follow-up
+                                // (would mirror the MIC TODO above and
+                                // allocate `Box<JitPICSlot>` per
+                                // polymorphic call site in `invoke_info`).
                     ldc_info_early,
                     ldc2w_info_early,
                     std::collections::HashMap::new(), // branch_hints
@@ -2143,7 +2155,13 @@ pub fn execute(
 ///
 /// Called only at branch/invoke sites during warmup — the Arc clones are
 /// acceptable overhead before JIT compilation takes over.
-#[inline(never)]
+///
+/// AUDIT CRIT-3 fix: removed `#[inline(never)]`.  In the hot-loop branch
+/// sites this is guarded by `jit_profile::is_profiling_enabled()`, so it
+/// only executes during active warmup; allowing inlining lets LLVM CSE
+/// the two `Arc<str>` clones across adjacent record_branch/record_backedge
+/// pairs (e.g. `if_icmp*` + back-edge `record_backedge`).
+#[inline]
 fn make_method_key(frame: &crate::runtime::frame::Frame) -> MethodKey {
     MethodKey {
         class_id: frame.class_id.as_u32(),
@@ -2151,6 +2169,7 @@ fn make_method_key(frame: &crate::runtime::frame::Frame) -> MethodKey {
         descriptor: frame.method_descriptor_arc(),
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Frame pop helper (releases synchronized monitor if present)
@@ -2220,6 +2239,14 @@ pub fn pop_and_recycle_frame_with_reason(
 fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult {
     let initial_frame_idx = thread.frames.len() - 1;
     let mut frame_idx = initial_frame_idx;
+    // AUDIT CRIT-3 fix: hoist the PGO-enabled atomic load ONCE per
+    // execute_frame invocation.  Branch sites in the interpreter hot loop
+    // (~13 of them) test this local instead of doing an atomic load + 2
+    // `Arc<str>` clones (for make_method_key) every iteration.  Profiling
+    // state observed at frame entry — the next `execute_frame` invocation
+    // re-reads the global gate, so newly-enabled profiling picks up on the
+    // next call rather than mid-loop.
+    let pgo_enabled = crate::jit::profile::is_profiling_enabled();
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -2419,17 +2446,19 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 let ob1 = unsafe { *code_ptr.add(saved_pc + 3) };
                                 let ob2 = unsafe { *code_ptr.add(saved_pc + 4) };
                                 let taken = vx < vy;
-                                shared.profile_store.record_branch(
-                                    &make_method_key(frame),
-                                    saved_pc + 2, // profile at the if_icmplt pc
-                                    taken,
-                                );
+                                if pgo_enabled {
+                                    shared.profile_store.record_branch(
+                                        &make_method_key(frame),
+                                        saved_pc + 2, // profile at the if_icmplt pc
+                                        taken,
+                                    );
+                                }
                                 if taken {
                                     let offset = ((ob1 as i16) << 8) | (ob2 as i16); // Cast: bytecode operand decoding
                                     // Cast: signed branch offset arithmetic
                                     frame.pc = ((saved_pc + 2) as isize + offset as isize) as usize;
                                     if offset < 0 {
-                                        shared.profile_store.record_backedge(&make_method_key(frame), saved_pc + 2);
+                                        if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc + 2); }
                                         frame.backward_count += 1;
                                         let bc = frame.backward_count;
                                         let entry_pc = frame.pc;
@@ -2596,117 +2625,104 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // iadd
+                // iadd — AUDIT CRIT-4: int-typed pop/push, no Value enum round-trip.
                 0x60 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(va.wrapping_add(vb)));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va.wrapping_add(vb));
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // isub
                 0x64 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(va.wrapping_sub(vb)));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va.wrapping_sub(vb));
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // imul
                 0x68 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(va.wrapping_mul(vb)));
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va.wrapping_mul(vb));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                // idiv — needs to fall back to slow path on division by zero
+                // so the spec-mandated ArithmeticException is thrown.  Push
+                // raw bits back onto the stack and break out of the fast match.
+                0x6c => {
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    if vb != 0 {
+                        frame.stack.push_int_unchecked(va.wrapping_div(vb));
                         frame.pc = saved_pc + 1;
                         continue;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    // Restore stack for the slow path.
+                    frame.stack.push_int_unchecked(va);
+                    frame.stack.push_int_unchecked(vb);
                 }
-                // idiv
-                0x6c => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        if vb != 0 {
-                            frame.stack.push_unchecked(Value::Int(va.wrapping_div(vb)));
-                            frame.pc = saved_pc + 1;
-                            continue;
-                        }
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
-                }
-                // irem
+                // irem — same fallback policy as idiv.
                 0x70 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        if vb != 0 {
-                            frame.stack.push_unchecked(Value::Int(va.wrapping_rem(vb)));
-                            frame.pc = saved_pc + 1;
-                            continue;
-                        }
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    if vb != 0 {
+                        frame.stack.push_int_unchecked(va.wrapping_rem(vb));
+                        frame.pc = saved_pc + 1;
+                        continue;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    frame.stack.push_int_unchecked(va);
+                    frame.stack.push_int_unchecked(vb);
                 }
-                // iconst_m1..5
+                // iconst_m1..5 — AUDIT CRIT-4: direct CompactValue push, no Value enum.
                 0x02 => {
-                    frame.stack.push_unchecked(Value::Int(-1));
+                    frame.stack.push_int_unchecked(-1);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x03 => {
-                    frame.stack.push_unchecked(Value::Int(0));
+                    frame.stack.push_int_unchecked(0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x04 => {
-                    frame.stack.push_unchecked(Value::Int(1));
+                    frame.stack.push_int_unchecked(1);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x05 => {
-                    frame.stack.push_unchecked(Value::Int(2));
+                    frame.stack.push_int_unchecked(2);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x06 => {
-                    frame.stack.push_unchecked(Value::Int(3));
+                    frame.stack.push_int_unchecked(3);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x07 => {
-                    frame.stack.push_unchecked(Value::Int(4));
+                    frame.stack.push_int_unchecked(4);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x08 => {
-                    frame.stack.push_unchecked(Value::Int(5));
+                    frame.stack.push_int_unchecked(5);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // bipush
+                // bipush — AUDIT CRIT-4: int-typed push.
                 0x10 => {
                     let val = b1 as i8 as i32; // Cast: bytecode operand decoding
-                    frame.stack.push_unchecked(Value::Int(val));
+                    frame.stack.push_int_unchecked(val);
                     frame.pc = saved_pc + 2;
                     continue;
                 }
-                // sipush
+                // sipush — AUDIT CRIT-4: int-typed push.
                 0x11 => {
                     let val = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                    frame.stack.push_unchecked(Value::Int(val as i32)); // Cast: bytecode operand decoding
+                    frame.stack.push_int_unchecked(val as i32); // Cast: bytecode operand decoding
                     frame.pc = saved_pc + 3;
                     continue;
                 }
@@ -2726,7 +2742,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                     if offset < 0 {
                         // Backward branch — record back-edge for PGO loop trip profiling
-                        shared.profile_store.record_backedge(&make_method_key(frame), saved_pc);
+                        if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); }
                         // Backward branch — increment OSR counter
                         frame.backward_count += 1;
                         let bc = frame.backward_count;
@@ -2754,157 +2770,133 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     }
                     continue;
                 }
-                // if_icmpge
+                // if_icmpge — AUDIT CRIT-4: int-typed pop, no Value enum match.
                 0xa2 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        let taken = va >= vb;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 {
-                                shared.profile_store.record_backedge(&make_method_key(frame), saved_pc);
-                                frame.backward_count += 1;
-                                let bc = frame.backward_count;
-                                let entry_pc = frame.pc;
-                                let _ = frame;
-                                if bc == OSR_THRESHOLD {
-                                    let osr_class_id = thread.frames[frame_idx].class_id;
-                                    if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
-                                        if frame_idx > initial_frame_idx {
-                                            pop_and_recycle_frame(shared, thread);
-                                            frame_idx -= 1;
-                                            if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
-                                            continue;
-                                        }
-                                        return Ok(osr_val);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    let taken = va >= vb;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 {
+                            if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); }
+                            frame.backward_count += 1;
+                            let bc = frame.backward_count;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            if bc == OSR_THRESHOLD {
+                                let osr_class_id = thread.frames[frame_idx].class_id;
+                                if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
+                                    if frame_idx > initial_frame_idx {
+                                        pop_and_recycle_frame(shared, thread);
+                                        frame_idx -= 1;
+                                        if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
+                                        continue;
                                     }
+                                    return Ok(osr_val);
                                 }
-                                safepoint_check(shared, thread);
                             }
-                        } else {
-                            frame.pc = saved_pc + 3;
+                            safepoint_check(shared, thread);
                         }
-                        continue;
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    continue;
                 }
                 // if_icmplt
                 0xa1 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        let taken = va < vb;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 {
-                                shared.profile_store.record_backedge(&make_method_key(frame), saved_pc);
-                                frame.backward_count += 1;
-                                let bc = frame.backward_count;
-                                let entry_pc = frame.pc;
-                                let _ = frame;
-                                if bc == OSR_THRESHOLD {
-                                    let osr_class_id = thread.frames[frame_idx].class_id;
-                                    if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
-                                        if frame_idx > initial_frame_idx {
-                                            pop_and_recycle_frame(shared, thread);
-                                            frame_idx -= 1;
-                                            if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
-                                            continue;
-                                        }
-                                        return Ok(osr_val);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    let taken = va < vb;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 {
+                            if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); }
+                            frame.backward_count += 1;
+                            let bc = frame.backward_count;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            if bc == OSR_THRESHOLD {
+                                let osr_class_id = thread.frames[frame_idx].class_id;
+                                if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
+                                    if frame_idx > initial_frame_idx {
+                                        pop_and_recycle_frame(shared, thread);
+                                        frame_idx -= 1;
+                                        if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
+                                        continue;
                                     }
+                                    return Ok(osr_val);
                                 }
-                                safepoint_check(shared, thread);
                             }
-                        } else {
-                            frame.pc = saved_pc + 3;
+                            safepoint_check(shared, thread);
                         }
-                        continue;
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    continue;
                 }
                 // if_icmple
                 0xa4 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        let taken = va <= vb;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    let taken = va <= vb;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    continue;
                 }
                 // if_icmpgt
                 0xa3 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        let taken = va > vb;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    let taken = va > vb;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    continue;
                 }
                 // if_icmpne
                 0xa0 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        let taken = va != vb;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    let taken = va != vb;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    continue;
                 }
                 // if_icmpeq
                 0x9f => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        let taken = va == vb;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    let taken = va == vb;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    continue;
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
@@ -2990,122 +2982,101 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     }
                     return Ok(None);
                 }
-                // ifle
+                // ifle — AUDIT CRIT-4
                 0x9e => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        let taken = val <= 0;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let val = frame.stack.pop_int_unchecked();
+                    let taken = val <= 0;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(v);
+                    continue;
                 }
                 // ifge
                 0x9c => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        let taken = val >= 0;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let val = frame.stack.pop_int_unchecked();
+                    let taken = val >= 0;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(v);
+                    continue;
                 }
                 // ifgt
                 0x9d => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        let taken = val > 0;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let val = frame.stack.pop_int_unchecked();
+                    let taken = val > 0;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(v);
+                    continue;
                 }
                 // iflt
                 0x9b => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        let taken = val < 0;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let val = frame.stack.pop_int_unchecked();
+                    let taken = val < 0;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(v);
+                    continue;
                 }
                 // ifne
                 0x9a => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        let taken = val != 0;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let val = frame.stack.pop_int_unchecked();
+                    let taken = val != 0;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(v);
+                    continue;
                 }
                 // ifeq
                 0x99 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        let taken = val == 0;
-                        shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken);
-                        if taken {
-                            let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                            frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                            if offset < 0 { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
-                        } else {
-                            frame.pc = saved_pc + 3;
-                        }
-                        continue;
+                    let val = frame.stack.pop_int_unchecked();
+                    let taken = val == 0;
+                    if pgo_enabled { shared.profile_store.record_branch(&make_method_key(frame), saved_pc, taken); }
+                    if taken {
+                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
+                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                    } else {
+                        frame.pc = saved_pc + 3;
                     }
-                    frame.stack.push_unchecked(v);
+                    continue;
                 }
-                // i2l
+                // i2l — AUDIT CRIT-4: int-typed pop avoids the 8-arm Value match.
                 0x85 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        // JVM spec: i2l sign-extends int → long (lossless).
-                        // Direct CompactValue push avoids any Value → CompactValue
-                        // boundary tagging drift on long slots.
-                        frame
-                            .stack
-                            .push_compact(CompactValue::long(i64::from(val)));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    // JVM spec: i2l sign-extends int → long (lossless).
+                    // Direct CompactValue push avoids any Value → CompactValue
+                    // boundary tagging drift on long slots.
+                    frame
+                        .stack
+                        .push_compact(CompactValue::long(i64::from(val)));
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // ladd — WP4.3: use as_long_unchecked to bypass tag-erasure.
                 // `pop_unchecked()` decodes a CompactValue::long(N) (untagged
@@ -3231,93 +3202,62 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // iand (0x7e)
+                // iand (0x7e) — AUDIT CRIT-4
                 0x7e => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(va & vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va & vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // ior (0x80)
                 0x80 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(va | vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va | vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // ixor (0x82)
                 0x82 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(va ^ vb));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va ^ vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
-                // ishl (0x78)
+                // ishl (0x78) — JVM spec: shift amount masked to 5 bits
                 0x78 => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame
-                            .stack
-                            .push_unchecked(Value::Int(va.wrapping_shl(vb as u32 & 0x1f))); // JVM spec: shift amount masked to 5/6 bits
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va.wrapping_shl(vb as u32 & 0x1f));
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // ishr (0x7a)
                 0x7a => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame
-                            .stack
-                            .push_unchecked(Value::Int(va.wrapping_shr(vb as u32 & 0x1f))); // JVM spec: shift amount masked to 5/6 bits
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(va.wrapping_shr(vb as u32 & 0x1f));
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
-                // iushr (0x7c)
+                // iushr (0x7c) — unsigned shift right
                 0x7c => {
-                    let b = frame.stack.pop_unchecked();
-                    let a = frame.stack.pop_unchecked();
-                    if let (Value::Int(va), Value::Int(vb)) = (a, b) {
-                        frame.stack.push_unchecked(Value::Int(
-                            ((va as u32).wrapping_shr(vb as u32 & 0x1f)) as i32, // JVM spec: shift amount masked to 5/6 bits
-                        ));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(a);
-                    frame.stack.push_unchecked(b);
+                    let vb = frame.stack.pop_int_unchecked();
+                    let va = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(
+                        ((va as u32).wrapping_shr(vb as u32 & 0x1f)) as i32,
+                    );
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // ineg (0x74)
                 0x74 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        frame.stack.push_unchecked(Value::Int(val.wrapping_neg()));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    frame.stack.push_int_unchecked(val.wrapping_neg());
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // lneg (0x75) — WP4.3 tag-erasure bypass.
                 0x75 => {
@@ -3585,61 +3525,46 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.stack.push_unchecked(a);
                     frame.stack.push_unchecked(b);
                 }
-                // i2b (0x91), i2c (0x92), i2s (0x93)
+                // i2b (0x91), i2c (0x92), i2s (0x93) — AUDIT CRIT-4
                 0x91 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        // JVM spec: i2b narrows int to byte via sign-extension
-                        frame.stack.push_unchecked(Value::Int(val as i8 as i32));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    // JVM spec: i2b narrows int to byte via sign-extension
+                    frame.stack.push_int_unchecked(val as i8 as i32);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 0x92 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        // JVM spec: i2c narrows int to char (unsigned 16-bit)
-                        frame.stack.push_unchecked(Value::Int(val as u16 as i32));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    // JVM spec: i2c narrows int to char (unsigned 16-bit)
+                    frame.stack.push_int_unchecked(val as u16 as i32);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 0x93 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        // JVM spec: i2s narrows int to short via sign-extension
-                        frame.stack.push_unchecked(Value::Int(val as i16 as i32));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    // JVM spec: i2s narrows int to short via sign-extension
+                    frame.stack.push_int_unchecked(val as i16 as i32);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
-                // i2f (0x86), i2d (0x87)
+                // i2f (0x86), i2d (0x87) — AUDIT CRIT-4 pop side
                 0x86 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        // JVM spec: i2f converts int to float (may lose precision)
-                        frame.stack.push_unchecked(Value::Float(val as f32));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    // JVM spec: i2f converts int to float (may lose precision)
+                    frame.stack.push_float_unchecked(val as f32);
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 0x87 => {
-                    let v = frame.stack.pop_unchecked();
-                    if let Value::Int(val) = v {
-                        // JVM spec: i2d widens int to double (lossless).
-                        // Direct CompactValue push keeps the 8-byte slot
-                        // tagged with the Double NaN-box encoding.
-                        frame
-                            .stack
-                            .push_compact(CompactValue::double(f64::from(val)));
-                        frame.pc = saved_pc + 1;
-                        continue;
-                    }
-                    frame.stack.push_unchecked(v);
+                    let val = frame.stack.pop_int_unchecked();
+                    // JVM spec: i2d widens int to double (lossless).
+                    // Direct CompactValue push keeps the 8-byte slot
+                    // tagged with the Double NaN-box encoding.
+                    frame
+                        .stack
+                        .push_compact(CompactValue::double(f64::from(val)));
+                    frame.pc = saved_pc + 1;
+                    continue;
                 }
                 // l2i (0x88) — WP4.3 tag-erasure bypass.
                 0x88 => {
@@ -4673,6 +4598,14 @@ fn find_exception_handler_any_pc(
 /// the JIT'd method's exception table to see whether the throw should be
 /// caught there instead of propagated to the caller.
 ///
+/// `throw_pc` is the bytecode PC of the throw site within the JIT'd method,
+/// if known. Pass `usize::MAX` when the throw-site PC cannot be recovered
+/// (the JIT currently does not record one in `JIT_PENDING_EXCEPTION`); in
+/// that case, catch-all (`catch_type == 0`, i.e. `finally`) entries are
+/// skipped because they would otherwise unconditionally swallow exceptions
+/// thrown from outside the protected region. Typed handlers still match by
+/// exception class since that is safe regardless of the throw site.
+///
 /// If a matching handler is found, a bytecode frame for the JIT'd method
 /// is pushed with `pc` at the handler and the exception on the operand
 /// stack; the interpreter resumes the catch block. Otherwise the exception
@@ -4682,6 +4615,7 @@ fn route_jit_exception_through_method(
     thread: &mut JvmThread,
     caller_frame_idx: usize,
     cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
     exc: ObjectRef,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     // Fast path: no exception table at all — propagate.
@@ -4689,10 +4623,31 @@ fn route_jit_exception_through_method(
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
 
-    // Search the table by catch_type alone (we don't know the throw PC).
+    let pc_unknown = throw_pc == usize::MAX;
     let exc_class_id = shared.heap.class_id_of(exc);
     let mut handler_pc: Option<usize> = None;
     for entry in cached.exception_table.iter() {
+        // Mirror the PC-range check used by `find_exception_handler_any_pc`:
+        // a handler only applies when the throw site is inside its
+        // `[start_pc, end_pc)` protected region. Without this check, the
+        // first catch-all entry would swallow exceptions thrown anywhere
+        // in the method (the original bug here).
+        //
+        // When the throw PC is unknown (`usize::MAX`, sentinel), we cannot
+        // verify range membership. In that case we conservatively skip
+        // catch-all entries (they would catch anything) but still allow
+        // typed handlers to match on exception class — wrong-type
+        // exceptions cannot be silently swallowed that way.
+        if pc_unknown {
+            if entry.catch_type == 0 {
+                continue;
+            }
+        } else if throw_pc < entry.start_pc as usize
+            || throw_pc >= entry.end_pc as usize
+        {
+            continue;
+        }
+
         if entry.catch_type == 0 {
             handler_pc = Some(entry.handler_pc as usize);
             break;
@@ -8095,7 +8050,7 @@ fn execute_invoke_kind(
                         // interface class so the native default method is found.
                         let lambda_iface = {
                             let proxies = shared.lambda_proxies.read();
-                            proxies.get(&cid).map(|lcs| Arc::from(lcs.functional_interface.as_str()))
+                            proxies.get(&cid).map(|lcs| lcs.functional_interface.clone())
                         };
                         if let Some(iface) = lambda_iface {
                             iface
@@ -8739,7 +8694,7 @@ pub(crate) fn try_lambda_dispatch(
     // methods on the functional interface (e.g. Function.andThen,
     // Predicate.and) are dispatched directly via the native registry on
     // the functional interface class.
-    if method_name != call_site.sam_method_name {
+    if method_name != &*call_site.sam_method_name {
         // RScala.1 bridge: Scala 3 produces lambdas whose functional
         // interface is `scala/runtime/java8/JFunctionN$mcXYZ$sp`, which
         // declares the SAM as a primitive-specialized method (e.g.
@@ -8850,9 +8805,9 @@ pub(crate) fn try_lambda_dispatch(
                                     .read()
                                     .get_class(rcv)
                                     .map(|c| c.name.to_string())
-                                    .unwrap_or_else(|| lcs.impl_handle.class_name.clone())
+                                    .unwrap_or_else(|| lcs.impl_handle.class_name.to_string())
                             }
-                            _ => lcs.impl_handle.class_name.clone(),
+                            _ => lcs.impl_handle.class_name.to_string(),
                         };
                         invoke_or_native(
                             shared,
@@ -9046,9 +9001,9 @@ pub(crate) fn try_lambda_dispatch(
                         .read()
                         .get_class(rcv_class_id)
                         .map(|c| c.name.to_string())
-                        .unwrap_or_else(|| call_site.impl_handle.class_name.clone())
+                        .unwrap_or_else(|| call_site.impl_handle.class_name.to_string())
                 }
-                _ => call_site.impl_handle.class_name.clone(),
+                _ => call_site.impl_handle.class_name.to_string(),
             };
             let result = invoke_or_native(
                 shared,
@@ -9064,7 +9019,7 @@ pub(crate) fn try_lambda_dispatch(
             let result = match &result {
                 Err(MethodCallFailed::InternalError(VmError::Linkage(
                     LinkageError::NoSuchMethodError { .. },
-                ))) if receiver_class != call_site.impl_handle.class_name => invoke_or_native(
+                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name => invoke_or_native(
                     shared,
                     thread,
                     &call_site.impl_handle.class_name,
@@ -10382,8 +10337,8 @@ fn try_osr(
                 .iter()
                 .find(|m| &*m.name == method_name_check)
                 .and_then(|m| {
-                    m.attributes.iter().find_map(|a| match a {
-                        rustjvm_reader::attribute::Attribute::Code(ca) => Some(&ca.code),
+                    m.attributes.iter().find_map(|a| match a.as_decoded() {
+                        Some(rustjvm_reader::attribute::Attribute::Code(ca)) => Some(&ca.code),
                         _ => None,
                     })
                 })
@@ -10731,7 +10686,12 @@ fn try_osr(
             anewarray_info2,
             invoke_info,
             direct_calls2,
-            Vec::new(),
+            Vec::new(), // mic_slots — OSR-recompile path; dispatch still
+                        // goes through the slow-path helper.
+            Vec::new(), // pic_slots (HIGH-7) — OSR-recompile path. Eager
+                        // PIC allocation is wired in `jit::try_compile`;
+                        // this codepath emits the slow-path helper for
+                        // every invokevirtual/invokeinterface.
             ldc_info2,
             ldc2w_info2,
             std::collections::HashMap::new(), // branch_hints
@@ -11920,11 +11880,16 @@ fn execute_jit_call(
         // The JIT-executed method has its own exception table; we must try
         // to route the exception through it before propagating to the caller.
         // The JIT ran the entire method, so we do not know the exact throw-
-        // site PC — `route_jit_exception_through_method` does a best-effort
-        // table scan for a matching handler.
+        // site PC inside the JIT'd method (it has no live bytecode frame
+        // and `JIT_PENDING_EXCEPTION` does not carry a PC). Pass
+        // `usize::MAX` as the sentinel for "PC unknown" — the routing
+        // function will then skip catch-all (`finally`) entries so they
+        // cannot spuriously swallow exceptions thrown outside their
+        // protected region, while still allowing typed handlers to match
+        // by exception class.
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
             return route_jit_exception_through_method(
-                shared, thread, frame_idx, cached, exc,
+                shared, thread, frame_idx, cached, usize::MAX, exc,
             );
         }
         match jit_result {
@@ -12227,11 +12192,13 @@ fn execute_invokevirtual_vtable_fast(
         )));
     }
 
-    shared.profile_store.record_receiver(
-        &make_method_key(&thread.frames[frame_idx]),
-        site_pc,
-        receiver_class_id.as_u32(),
-    );
+    if crate::jit::profile::is_profiling_enabled() {
+        shared.profile_store.record_receiver(
+            &make_method_key(&thread.frames[frame_idx]),
+            site_pc,
+            receiver_class_id.as_u32(),
+        );
+    }
 
     let total_args = num_params + 1;
     const MAX_INLINE_ARGS: usize = 16;
@@ -12394,11 +12361,13 @@ fn execute_invokevirtual_cached(
             match receiver_val {
                 Value::Object(Some(obj_ref)) => {
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
-                    shared.profile_store.record_receiver(
-                        &make_method_key(&thread.frames[frame_idx]),
-                        site_pc,
-                        actual_class_id.as_u32(),
-                    );
+                    if crate::jit::profile::is_profiling_enabled() {
+                        shared.profile_store.record_receiver(
+                            &make_method_key(&thread.frames[frame_idx]),
+                            site_pc,
+                            actual_class_id.as_u32(),
+                        );
+                    }
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
@@ -12544,11 +12513,13 @@ fn execute_invokevirtual_cached(
             match receiver_val {
                 Value::Object(Some(obj_ref)) => {
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
-                    shared.profile_store.record_receiver(
-                        &make_method_key(&thread.frames[frame_idx]),
-                        site_pc,
-                        actual_class_id.as_u32(),
-                    );
+                    if crate::jit::profile::is_profiling_enabled() {
+                        shared.profile_store.record_receiver(
+                            &make_method_key(&thread.frames[frame_idx]),
+                            site_pc,
+                            actual_class_id.as_u32(),
+                        );
+                    }
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
@@ -13730,16 +13701,16 @@ mod tests {
         // Register a lambda proxy with 3 capture types
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-            functional_interface: "test/Func".to_string(),
-            sam_method_name: "apply".to_string(),
-            sam_descriptor: "()V".to_string(),
+            functional_interface: Arc::from("test/Func"),
+            sam_method_name: Arc::from("apply"),
+            sam_descriptor: Arc::from("()V"),
             impl_handle: MethodHandle {
                 kind: MethodHandleKind::InvokeStatic,
-                class_name: "test/Impl".to_string(),
-                member_name: "target".to_string(),
-                descriptor: "(IIJ)V".to_string(),
+                class_name: Arc::from("test/Impl"),
+                member_name: Arc::from("target"),
+                descriptor: Arc::from("(IIJ)V"),
             },
-            instantiated_descriptor: "()V".to_string(),
+            instantiated_descriptor: Arc::from("()V"),
             capture_types: vec!['I', 'I', 'J'],
             proxy_class_id,
         };
@@ -13762,8 +13733,8 @@ mod tests {
         // Verify the proxy is recognized as a lambda
         let proxies = shared.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
-        assert_eq!(lcs.functional_interface, "test/Func");
-        assert_eq!(lcs.sam_method_name, "apply");
+        assert_eq!(&*lcs.functional_interface, "test/Func");
+        assert_eq!(&*lcs.sam_method_name, "apply");
         assert_eq!(lcs.impl_handle.kind, MethodHandleKind::InvokeStatic);
         assert_eq!(lcs.capture_types.len(), 3);
     }
