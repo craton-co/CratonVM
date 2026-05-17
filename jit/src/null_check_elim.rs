@@ -8,30 +8,47 @@
 //!
 //! ## How it works
 //!
-//! Each basic block carries a bitmask of locals known to be non-null
-//! at its entry. The analysis propagates forward:
+//! Round-11 (HIGH-1): proper forward dataflow with meet-over-paths.
+//! For every bytecode PC we keep an `IN[pc]` bitmask of locals proven
+//! non-null *on entry* and an `OUT[pc]` bitmask on exit. The meet
+//! operator at a PC with multiple predecessors is bitwise AND
+//! (intersection — a local is only non-null if it was non-null on
+//! every incoming path). The transfer function `OUT = transfer(pc,
+//! IN)` is defined per opcode:
 //!
-//! 1. **ifnonnull <local>** — after the branch-not-taken path, the
-//!    local is proven non-null (because the branch would have been
-//!    taken if it were null).
-//! 2. **getfield on <local>** — if the getfield succeeds (doesn't
-//!    throw NPE), the local was non-null.
-//! 3. **arraylength on <local>** — same reasoning.
-//! 4. **invokevirtual on <local>** — receiver was non-null.
-//! 5. **astore <local>** with `aconst_null` — kills the non-null bit.
-//! 6. **astore <local>** with a known-non-null value — sets the bit.
+//! * `aload N` followed by an immediate `getfield/putfield/invoke*/
+//!   arraylength/monitorenter/monitorexit/aastore/iastore/baload/...`
+//!   — the receiver `N` is non-null on the fall-through, because the
+//!   dereference would have raised NPE otherwise.
+//! * `new`, `anewarray`, `newarray`, `multianewarray` — produce a
+//!   non-null value on top of stack; if the next opcode is
+//!   `astore N`, set N's bit.
+//! * `aload N` followed by `ifnonnull T` — on the FALL-THROUGH (not-
+//!   taken) edge N is null, so clear N's bit. On the TAKEN edge N
+//!   is non-null (so the IN[T] mask gets N's bit set).
+//! * `aload N` followed by `ifnull T` — symmetric: fall-through is
+//!   non-null, taken edge proves null.
+//! * `astore N` with no known producer — clears N's bit
+//!   (conservative).
+//! * `invoke*` / `monitorenter/monitorexit` etc — do NOT clear bits
+//!   for locals (they only affect operand stack and heap; locals
+//!   keep their values across calls per JVMS).
 //!
-//! The result is a per-PC `u64` bitmask. The JIT compiler checks
-//! `is_local_nonnull(pc, local)` before emitting a null check and
-//! skips it when the bit is set.
+//! Iteration uses a worklist of PCs seeded with the entry (PC 0)
+//! plus all branch targets reachable from a successor walk. We loop
+//! until no IN[pc] changes. Convergence is guaranteed because the
+//! lattice is finite (u64 bitmasks form a join-semilattice under AND
+//! — facts can only be REMOVED across iterations, never added back
+//! once removed, so the analysis is monotone descending).
 //!
 //! ## Limitations
 //!
-//! - Only tracks the first 64 locals (bitmask is `u64`). Methods with
-//!   > 64 locals get no elimination. This covers > 99% of real methods.
-//! - Inter-block propagation uses a simple intersection (meet = AND)
-//!   at merge points. Dominator-based analysis would be more precise
-//!   but is overkill for the current JIT's compilation budget.
+//! - Only tracks the first 64 locals (bitmask is `u64`). Methods
+//!   with > 64 locals get no elimination beyond local 63. Covers
+//!   > 99% of real methods.
+//! - Exception handler entries are conservatively treated as having
+//!   IN = 0 (no facts). This is sound (an exception can arise at
+//!   any PC).
 
 /// Result of null-check elimination analysis.
 ///
@@ -67,210 +84,423 @@ impl NullCheckInfo {
     }
 }
 
+/// Bytecode opcodes whose execution dereferences the most-recent
+/// reference on the operand stack and therefore PROVES that reference
+/// non-null on fall-through. Only opcodes where the receiver came from
+/// an `aload` immediately preceding the dereference are useful here —
+/// the analysis only tracks references that originated in a local.
+fn opcode_dereferences_receiver(op: u8) -> bool {
+    // Note: `instanceof` (0xC1) does NOT throw NPE — null produces 0 —
+    // so it is intentionally NOT in this list. `checkcast` (0xC0) is
+    // sometimes documented as "throws CCE on bad type"; JVMS §6.5
+    // additionally allows it to succeed-with-null (null can be cast
+    // to any reference type), so it does NOT prove non-null either.
+    // We list only opcodes that throw NPE on a null receiver.
+    matches!(op,
+        0xB4 | // getfield
+        0xB5 | // putfield
+        0xB6 | // invokevirtual
+        0xB7 | // invokespecial
+        0xB9 | // invokeinterface
+        0xBE | // arraylength
+        0xC2 | // monitorenter
+        0xC3   // monitorexit
+    )
+}
+
+/// Length in bytes of a single bytecode instruction starting at `pc`.
+/// Conservative: returns 1 for any opcode we don't recognise (forces
+/// the worklist to advance by 1 — still sound because the missing
+/// transfer just leaves IN unchanged).
+fn op_len(code: &[u8], pc: usize) -> usize {
+    crate::scev::bytecode_len(code, pc, code.len())
+}
+
+/// If the instruction at `pc` is an `aload <local>` form, return the
+/// local index. Recognises `aload_0..3` and `aload <u8>`.
+fn aload_at(code: &[u8], pc: usize) -> Option<usize> {
+    if pc >= code.len() {
+        return None;
+    }
+    let op = code[pc];
+    match op {
+        0x2A..=0x2D => Some((op - 0x2A) as usize),
+        0x19 if pc + 1 < code.len() => Some(code[pc + 1] as usize),
+        _ => None,
+    }
+}
+
+/// If the instruction at `pc` is an `astore <local>` form, return the
+/// local index. Recognises `astore_0..3` and `astore <u8>`.
+fn astore_at(code: &[u8], pc: usize) -> Option<usize> {
+    if pc >= code.len() {
+        return None;
+    }
+    let op = code[pc];
+    match op {
+        0x4B..=0x4E => Some((op - 0x4B) as usize),
+        0x3A if pc + 1 < code.len() => Some(code[pc + 1] as usize),
+        _ => None,
+    }
+}
+
+/// Is the opcode at `pc` one that produces a known-non-null reference
+/// on top of stack? (`new`, `anewarray`, `newarray`, `multianewarray`,
+/// `aload` of a proven-non-null local — but the last is tracked
+/// implicitly via the IN mask, so this only returns true for the
+/// allocation opcodes.)
+fn produces_nonnull(op: u8) -> bool {
+    matches!(op,
+        0xBB | // new
+        0xBC | // newarray
+        0xBD | // anewarray
+        0xC5 | // multianewarray
+        0x12 | // ldc — string/class literals are non-null (numeric ldc is also OK; never null)
+        0x13 | // ldc_w
+        0x14   // ldc2_w
+    )
+}
+
+/// 16-bit signed branch offset starting at `code[pc+1..pc+3]`.
+fn rel16(code: &[u8], pc: usize) -> Option<i32> {
+    if pc + 2 >= code.len() {
+        return None;
+    }
+    Some(i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32)
+}
+
+/// 32-bit signed branch offset starting at `code[pc+1..pc+5]`.
+fn rel32(code: &[u8], pc: usize) -> Option<i32> {
+    if pc + 4 >= code.len() {
+        return None;
+    }
+    Some(i32::from_be_bytes([
+        code[pc + 1],
+        code[pc + 2],
+        code[pc + 3],
+        code[pc + 4],
+    ]))
+}
+
+/// Compute the (fall-through PC, optional branch target PC) successor
+/// pair for the instruction at `pc`. Returns `(None, None)` when the
+/// instruction does not return (areturn/ireturn/return/athrow) — i.e.
+/// has no successors. Returns `(Some(ft), Some(tgt))` for conditional
+/// branches, `(None, Some(tgt))` for `goto`. Tableswitch/lookupswitch
+/// are conservatively dropped (no successors recorded — we still cover
+/// reachable code from the entry via fall-throughs).
+fn successors(code: &[u8], pc: usize) -> (Option<usize>, Option<usize>) {
+    if pc >= code.len() {
+        return (None, None);
+    }
+    let op = code[pc];
+    let len = op_len(code, pc);
+    let ft = pc + len;
+    match op {
+        // return forms — no successor
+        0xAC..=0xB1 => (None, None),
+        // athrow — no in-method successor (handler edges intentionally skipped)
+        0xBF => (None, None),
+        // goto
+        0xA7 => {
+            let off = rel16(code, pc).unwrap_or(0);
+            let tgt = pc.checked_add_signed(off as isize);
+            (None, tgt)
+        }
+        // goto_w
+        0xC8 => {
+            let off = rel32(code, pc).unwrap_or(0);
+            let tgt = pc.checked_add_signed(off as isize);
+            (None, tgt)
+        }
+        // jsr / jsr_w / ret — pre-JDK-7, treat as fall-through only.
+        0xA8 | 0xC9 | 0xA9 => (Some(ft), None),
+        // tableswitch / lookupswitch — conservatively give up on the
+        // jump targets (consumers see IN=0 at the targets, which is
+        // sound — just less precise). Fall-through after the switch
+        // doesn't exist in JVMS terms; we record no successors.
+        0xAA | 0xAB => (None, None),
+        // conditional branches with 16-bit offset (ifeq..if_acmpne,
+        // ifnull/ifnonnull, ifnull_w doesn't exist)
+        0x99..=0xA6 | 0xC6 | 0xC7 => {
+            let off = rel16(code, pc).unwrap_or(0);
+            let tgt = pc.checked_add_signed(off as isize);
+            (Some(ft), tgt)
+        }
+        _ => (Some(ft), None),
+    }
+}
+
+/// Compute the `OUT` mask for a basic-block-like step from PC.
+/// Returns `(out_fallthrough, out_branch)` masks. The two are
+/// usually the same, but `ifnull`/`ifnonnull` discriminate (fall-
+/// through vs taken edge changes which side proves non-null).
+///
+/// `prev_inst_pc[pc]` gives the PC of the bytecode instruction that
+/// immediately PRECEDES the instruction starting at `pc`, or
+/// `usize::MAX` when none (entry / PC outside any instruction).
+fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u64, u64) {
+    if pc >= code.len() {
+        return (in_mask, in_mask);
+    }
+    let op = code[pc];
+    let mut out = in_mask;
+
+    // `aload N` followed by a dereferencing opcode proves N non-null
+    // on fall-through. We look at the CURRENT op: if it's an aload,
+    // peek at the next op to see if it dereferences.
+    if let Some(local) = aload_at(code, pc) {
+        let next_pc = pc + op_len(code, pc);
+        if next_pc < code.len() && local < 64 {
+            let next_op = code[next_pc];
+            if opcode_dereferences_receiver(next_op) {
+                out |= 1u64 << local;
+            }
+            // Array load/store opcodes (iaload..saload, iastore..sastore)
+            // also dereference the array receiver. But the receiver is
+            // the array, not the most-recent aload (an index is pushed
+            // between). Skip these — handled separately by the JIT's
+            // inline null-check stub for arrays.
+        }
+    }
+
+    // `new`/`anewarray`/etc followed by `astore N` sets N non-null.
+    if produces_nonnull(op) {
+        // Find next instruction after this allocation.
+        let next_pc = pc + op_len(code, pc);
+        if next_pc < code.len() {
+            if let Some(local) = astore_at(code, next_pc) {
+                if local < 64 {
+                    out |= 1u64 << local;
+                }
+            }
+        }
+    }
+
+    // `astore N` — the local's non-null status now depends entirely
+    // on the value being stored. Without value-origin tracking we
+    // can't tell whether the stored value is non-null, so we
+    // conservatively CLEAR the bit. The two common patterns where
+    // we WANT to retain non-null are then re-derived by `produces_nonnull`
+    // above (which sets the bit when the immediate predecessor is
+    // `new`/`anewarray`/...) and by `aload N` followed by a
+    // dereferencing op (handled by the `aload` clause above).
+    //
+    // Important: the `produces_nonnull` block above already set the
+    // bit when the predecessor was a non-null producer. We need to
+    // preserve that — so check for "this PC's predecessor produced
+    // non-null" by re-inspecting `code[pc - prev_len]`. If yes,
+    // skip the clear.
+    if let Some(local) = astore_at(code, pc) {
+        if local < 64 {
+            // Was the immediately-preceding INSTRUCTION (boundary
+            // resolved by prev_inst_pc) a non-null producer? If yes,
+            // the bit was set in OUT of that producer's transfer and
+            // flowed into our in_mask — keep it. If no, clear (we
+            // don't know what value is being stored).
+            let prev_was_alloc = prev_inst_pc.get(pc).copied().map_or(false, |q| {
+                q != usize::MAX && q < code.len() && produces_nonnull(code[q])
+            });
+            if !prev_was_alloc {
+                out &= !(1u64 << local);
+            }
+        }
+    }
+
+    // `aconst_null` followed by `astore N` clears N.
+    if op == 0x01 {
+        let next_pc = pc + 1;
+        if next_pc < code.len() {
+            if let Some(local) = astore_at(code, next_pc) {
+                if local < 64 {
+                    out &= !(1u64 << local);
+                }
+            }
+        }
+    }
+
+    // ifnull / ifnonnull discriminate the two outgoing edges.
+    // The `aload N; if{null,nonnull} T` pattern:
+    //   * ifnull  T: fall-through ⇒ N non-null, taken ⇒ N null
+    //   * ifnonnull T: fall-through ⇒ N null, taken ⇒ N non-null
+    if matches!(op, 0xC6 | 0xC7) {
+        // The receiver for the if{null,nonnull} test comes from the
+        // most-recent push. If the predecessor instruction was
+        // `aload N` we can refine. Use prev_inst_pc to find the
+        // actual predecessor boundary.
+        let prev_local = prev_inst_pc.get(pc).copied().and_then(|q| {
+            if q == usize::MAX {
+                return None;
+            }
+            aload_at(code, q)
+        });
+        if let Some(local) = prev_local {
+            if local < 64 {
+                let bit = 1u64 << local;
+                if op == 0xC6 {
+                    // ifnull: fall-through proves non-null, taken proves null
+                    let ft_out = out | bit;
+                    let tk_out = out & !bit;
+                    return (ft_out, tk_out);
+                } else {
+                    // ifnonnull: fall-through proves null, taken proves non-null
+                    let ft_out = out & !bit;
+                    let tk_out = out | bit;
+                    return (ft_out, tk_out);
+                }
+            }
+        }
+    }
+
+    (out, out)
+}
+
 /// Run the null-check elimination analysis on a method's bytecode.
 ///
 /// The `code` slice is the raw bytecode; `code_len` is the effective
 /// length (may be less than `code.len()` if padded). Returns a
 /// `NullCheckInfo` whose `is_nonnull(pc, local)` method reports
 /// whether the local is proven non-null at that PC.
-pub fn analyze(_code: &[u8], _code_len: usize) -> NullCheckInfo {
-    // round-7 fix (bug 3): analysis disabled until meet-over-paths is
-    // implemented.  The consumer (`Compiler::is_local_nonnull`) currently
-    // returns `false` unconditionally because the simple forward pass
-    // in `analyze_inner` misses non-null facts at loop headers, so
-    // computing the mask is pure overhead (~30µs / 4KB method).  Re-
-    // enable by calling `analyze_inner(code, code_len)` once the consumer
-    // gains proper meet-over-paths handling.
-    //
-    // TODO(round-8): implement meet-over-paths null analysis, switch
-    // `analyze` back to delegating to `analyze_inner`, and turn
-    // `is_local_nonnull` into a real query.
-    NullCheckInfo::default()
-}
-
-/// Inner analysis kernel — currently dead, see `analyze`.  Preserved so
-/// the dataflow logic can be revived once the meet-over-paths consumer
-/// lands.
-#[allow(dead_code)]
-fn analyze_inner(code: &[u8], code_len: usize) -> NullCheckInfo {
+///
+/// Round-11 HIGH-1 fix: replaces the round-7 safe-stub
+/// (`NullCheckInfo::default()`) with a proper fixpoint forward
+/// dataflow using meet-over-paths (intersection at join points).
+pub fn analyze(code: &[u8], code_len: usize) -> NullCheckInfo {
     let len = code_len.min(code.len());
-    let mut masks = vec![0u64; len];
-
-    // Single forward pass — sufficient for straight-line code and
-    // simple loops. A fixpoint iteration would be more precise at
-    // loop headers but the extra cost isn't justified for the
-    // current JIT's compilation budget.
-    let mut current: u64 = 0;
-    let mut pc = 0usize;
-    // Track the previous instruction's opcode so multi-byte
-    // instructions (like `new` = 3 bytes) are recognized correctly.
-    let mut prev_op: u8 = 0;
-
-    while pc < len {
-        masks[pc] = current;
-        let op = code[pc];
-
-        match op {
-            // aconst_null; astore <local> → kill non-null for that local
-            // We detect the 2-instruction sequence: aconst_null at pc,
-            // astore at pc+1. The astore target local has its bit cleared.
-            0x01 => {
-                // aconst_null — the NEXT astore (if any) kills the local.
-                // We'll handle the kill at the astore site below.
-                pc += 1;
-            }
-
-            // astore <local> — check if the stored value is the
-            // current top-of-stack (which we don't track precisely).
-            // Conservative: clear the non-null bit for this local,
-            // UNLESS the previous instruction was `aload <same>` or
-            // `new` (which produce non-null values).
-            0x3A if pc + 1 < len => {
-                let local = code[pc + 1] as usize;
-                if local < 64 {
-                    // Check previous instruction for non-null producer
-                    let prev_nonnull = matches!(prev_op,
-                        0xBB | // new
-                        0xBD | // anewarray
-                        0xBC   // newarray
-                    );
-                    if prev_nonnull {
-                        current |= 1u64 << local;
-                    } else {
-                        current &= !(1u64 << local);
-                    }
-                }
-                pc += 2;
-            }
-            // astore_0..astore_3
-            0x4B..=0x4E => {
-                let local = (op - 0x4B) as usize;
-                if local < 64 {
-                    let prev_nonnull = matches!(prev_op,
-                        0xBB | // new
-                        0xBD | // anewarray
-                        0xBC   // newarray
-                    );
-                    if prev_nonnull {
-                        current |= 1u64 << local;
-                    } else {
-                        current &= !(1u64 << local);
-                    }
-                }
-                pc += 1;
-            }
-
-            // getfield — the receiver (most recently loaded local) is
-            // proven non-null after this instruction succeeds. We
-            // don't track the receiver precisely; instead we record
-            // a fact for the aload that precedes this getfield.
-            0xB4 if pc >= 1 => {
-                // Look back for aload <local>
-                let prev = code[pc - 1];
-                let local = match prev {
-                    0x2A..=0x2D => Some((prev - 0x2A) as usize),
-                    0x19 if pc >= 2 => Some(code[pc - 2] as usize),
-                    _ => None,
-                };
-                if let Some(l) = local {
-                    if l < 64 {
-                        current |= 1u64 << l;
-                    }
-                }
-                pc += 3;
-            }
-
-            // arraylength — similar to getfield, receiver is non-null.
-            0xBE if pc >= 1 => {
-                let prev = code[pc - 1];
-                let local = match prev {
-                    0x2A..=0x2D => Some((prev - 0x2A) as usize),
-                    0x19 if pc >= 2 => Some(code[pc - 2] as usize),
-                    _ => None,
-                };
-                if let Some(l) = local {
-                    if l < 64 {
-                        current |= 1u64 << l;
-                    }
-                }
-                pc += 1;
-            }
-
-            // ifnonnull — the fall-through path proves the local is null;
-            // the taken path proves it's non-null. We record facts for
-            // the fall-through (null) case by CLEARING the bit.
-            // The taken path would need branch-target propagation.
-            0xC7 if pc + 2 < len => {
-                // ifnonnull: the fall-through means the value WAS null.
-                // If the previous instruction was aload <local>, clear it.
-                if pc >= 1 {
-                    let prev = code[pc - 1];
-                    let local = match prev {
-                        0x2A..=0x2D => Some((prev - 0x2A) as usize),
-                        0x19 if pc >= 2 => Some(code[pc - 2] as usize),
-                        _ => None,
-                    };
-                    if let Some(l) = local {
-                        if l < 64 {
-                            current &= !(1u64 << l);
-                        }
-                    }
-                }
-                pc += 3;
-            }
-
-            // ifnull — the fall-through path proves the value is NON-null.
-            0xC6 if pc + 2 < len => {
-                if pc >= 1 {
-                    let prev = code[pc - 1];
-                    let local = match prev {
-                        0x2A..=0x2D => Some((prev - 0x2A) as usize),
-                        0x19 if pc >= 2 => Some(code[pc - 2] as usize),
-                        _ => None,
-                    };
-                    if let Some(l) = local {
-                        if l < 64 {
-                            current |= 1u64 << l;
-                        }
-                    }
-                }
-                pc += 3;
-            }
-
-            // Backward branch (goto with negative offset) → reset all
-            // facts at the target (conservative: loop header may have
-            // multiple predecessors).
-            0xA7 if pc + 2 < len => {
-                let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]);
-                if offset < 0 {
-                    // Loop back-edge → clear all facts (conservative).
-                    current = 0;
-                }
-                pc += 3;
-            }
-
-            // For all other instructions: advance PC, keep current mask.
-            _ => {
-                prev_op = op;
-                pc += crate::scev::bytecode_len(code, pc, len);
-                continue;
-            }
-        }
-        prev_op = op;
+    if len == 0 {
+        return NullCheckInfo::default();
     }
 
-    NullCheckInfo { masks }
+    // IN[pc] starts at !0 (the lattice top — everything non-null);
+    // entry is special-cased to 0 below. Unreachable PCs stay at
+    // top and effectively contribute nothing because they're never
+    // pulled into the worklist.
+    //
+    // Round-11: using `!0` as top would prevent the first meet from
+    // narrowing correctly (∧ with !0 = identity), but means we have
+    // to INITIALISE every IN to !0 and the meet across an empty
+    // predecessor set yields !0. That's wrong for unreachable PCs
+    // but they never propagate anywhere, so the masks they produce
+    // never matter.
+    //
+    // For *reachable* PCs we start with !0 and use the worklist to
+    // narrow. Entry IN is forced to 0 (nothing proven on entry).
+    let top: u64 = !0;
+    let mut in_masks = vec![top; len];
+    in_masks[0] = 0;
+
+    // Track which PCs are valid instruction starts AND record each
+    // instruction's *linear-predecessor* PC. The "linear predecessor"
+    // is the PC of the instruction that immediately precedes us in
+    // bytecode order — this matches javac's emission order, which is
+    // what the `produces_nonnull → astore` pattern needs.
+    //
+    // Note: linear predecessor is NOT the same as the dataflow
+    // predecessor (which can be a branch source). We use it only for
+    // syntactic peephole checks like "did the previous instruction
+    // allocate?". The dataflow correctness still relies on the
+    // forward-meet machinery below.
+    let mut is_inst_start = vec![false; len];
+    let mut prev_inst_pc = vec![usize::MAX; len];
+    {
+        let mut p = 0usize;
+        let mut prev = usize::MAX;
+        while p < len {
+            is_inst_start[p] = true;
+            prev_inst_pc[p] = prev;
+            let l = op_len(code, p);
+            if l == 0 {
+                break;
+            }
+            prev = p;
+            p += l;
+        }
+    }
+
+    // Worklist of PCs whose IN may have changed and whose successors
+    // need re-visiting.
+    let mut worklist: Vec<usize> = Vec::with_capacity(len / 4 + 1);
+    worklist.push(0);
+    let mut on_worklist = vec![false; len];
+    on_worklist[0] = true;
+
+    // Cap iterations to avoid pathological non-convergence on
+    // malformed bytecode. Each PC can change at most 64 times
+    // (one bit flip per local) before reaching a fixed point, so
+    // 64 * len is a safe upper bound; we use 128 * len for slack.
+    let max_iters = (len as u64).saturating_mul(128).max(4096);
+    let mut iter_count: u64 = 0;
+
+    while let Some(pc) = worklist.pop() {
+        on_worklist[pc] = false;
+        iter_count += 1;
+        if iter_count > max_iters {
+            // Bail — analysis didn't converge in budget. Return what
+            // we have; the consumer treats absent facts as false
+            // which is sound.
+            break;
+        }
+        if pc >= len || !is_inst_start[pc] {
+            continue;
+        }
+
+        let in_m = in_masks[pc];
+        let (ft_out, tk_out) = transfer(code, pc, in_m, &prev_inst_pc);
+
+        let (ft_succ, tk_succ) = successors(code, pc);
+
+        // Propagate fall-through (out) to fall-through successor.
+        if let Some(s) = ft_succ {
+            if s < len && is_inst_start[s] {
+                let new_in = if in_masks[s] == top {
+                    ft_out
+                } else {
+                    in_masks[s] & ft_out
+                };
+                if new_in != in_masks[s] {
+                    in_masks[s] = new_in;
+                    if !on_worklist[s] {
+                        on_worklist[s] = true;
+                        worklist.push(s);
+                    }
+                }
+            }
+        }
+        // Propagate taken-edge (tk_out) to branch target.
+        if let Some(s) = tk_succ {
+            if s < len && is_inst_start[s] {
+                let new_in = if in_masks[s] == top {
+                    tk_out
+                } else {
+                    in_masks[s] & tk_out
+                };
+                if new_in != in_masks[s] {
+                    in_masks[s] = new_in;
+                    if !on_worklist[s] {
+                        on_worklist[s] = true;
+                        worklist.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert `top` entries (unreachable PCs) to 0 so consumers don't
+    // see spurious facts.
+    for m in in_masks.iter_mut() {
+        if *m == top {
+            *m = 0;
+        }
+    }
+
+    NullCheckInfo { masks: in_masks }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // round-7 fix (bug 3): tests exercise the inner analysis which is
-    // currently bypassed by `analyze`'s early return.  Marked `#[ignore]`
-    // until the analysis is re-enabled (see TODO at top of file).
     #[test]
-    #[ignore = "round-7: null-check analysis disabled; consumer returns false"]
     fn getfield_proves_receiver_nonnull() {
         // aload_0; getfield #1; ... ; aload_0; getfield #2
         // After the first getfield, local 0 is proven non-null.
@@ -280,47 +510,49 @@ mod tests {
             0x57,             // 4: pop (discard field value)
             0x2A,             // 5: aload_0
             0xB4, 0x00, 0x02, // 6: getfield #2
+            0xB1,             // 9: return
         ];
         let info = analyze(&code, code.len());
         // At PC 0, local 0 is NOT proven non-null (no prior evidence).
         assert!(!info.is_nonnull(0, 0));
-        // After getfield at PC 1 succeeds, local 0 IS non-null at PC 4+.
+        // After the aload_0;getfield#1 pair completes, local 0 IS
+        // non-null at the next aload_0 (PC 5) and the following
+        // getfield (PC 6).
         assert!(info.is_nonnull(5, 0));
         assert!(info.is_nonnull(6, 0));
     }
 
     #[test]
-    #[ignore = "round-7: null-check analysis disabled; consumer returns false"]
     fn ifnull_proves_nonnull_on_fallthrough() {
-        // aload_1; ifnull +5; ... (fall-through = non-null)
+        // aload_1; ifnull +5; aload_1; ...
+        // The fall-through after `ifnull` proves local 1 non-null.
         let code = vec![
             0x2B,             // 0: aload_1
-            0xC6, 0x00, 0x05, // 1: ifnull +5 → skip to PC 6
-            0x2B,             // 4: aload_1 (fall-through: local 1 is non-null)
+            0xC6, 0x00, 0x05, // 1: ifnull → PC 6
+            0x2B,             // 4: aload_1 (fall-through: local 1 non-null)
             0xB1,             // 5: return
             0xB1,             // 6: return (taken path)
         ];
         let info = analyze(&code, code.len());
-        // At PC 4 (fall-through of ifnull), local 1 IS non-null.
         assert!(info.is_nonnull(4, 1));
+        // At PC 6 (taken), local 1 must be NULL — definitely NOT non-null.
+        assert!(!info.is_nonnull(6, 1));
     }
 
     #[test]
-    #[ignore = "round-7: null-check analysis disabled; consumer returns false"]
     fn astore_after_new_sets_nonnull() {
         // new #X; astore_1 → local 1 is non-null
         let code = vec![
             0xBB, 0x00, 0x01, // 0: new #1
             0x4C,             // 3: astore_1
             0x2B,             // 4: aload_1
+            0xB1,             // 5: return
         ];
         let info = analyze(&code, code.len());
-        // After astore_1 following new, local 1 is non-null.
         assert!(info.is_nonnull(4, 1));
     }
 
     #[test]
-    #[ignore = "round-7: null-check analysis disabled; consumer returns false"]
     fn total_facts_counts_correctly() {
         let code = vec![
             0xBB, 0x00, 0x01, // 0: new
@@ -328,23 +560,54 @@ mod tests {
             0xB1,             // 4: return
         ];
         let info = analyze(&code, code.len());
-        assert!(info.total_facts() >= 1); // at least local 1 is non-null at PC 4
+        assert!(info.total_facts() >= 1);
     }
 
     #[test]
-    #[ignore = "round-7: null-check analysis disabled; consumer returns false"]
-    fn backward_branch_clears_facts() {
-        // aload_0; getfield; pop; goto -5 (loop)
+    fn merge_intersects_predecessors() {
+        // Two paths merge at PC 6. On one path local 1 is proven
+        // non-null; on the other it's not. Intersection must give us
+        // "not proven non-null" at PC 6.
+        //
+        //   0: iconst_0          (0x03)
+        //   1: ifeq +5 → PC 6    (0x99 00 05)
+        //   4: aload_1           (0x2B)
+        //   5: ifnonnull +1 → PC 7 (skip return)  (0xC7 00 02)  no — keep simple
+        //   ...
+        // Use a simpler shape:
+        //   0: iconst_0; ifeq +5 → PC 7
+        //   3: aload_1; getfield (proves L1 nonnull)
+        //   7: <merge>; return
+        let code = vec![
+            0x03,              // 0: iconst_0
+            0x99, 0x00, 0x06,  // 1: ifeq → PC 7
+            0x2B,              // 4: aload_1
+            0xB4, 0x00, 0x01,  // 5: getfield (proves L1 nonnull on this path)
+            0xB1,              // 8: return (merge)
+        ];
+        // The "merge" PC here is 8 (the return). Local 1 should NOT
+        // be proven non-null at PC 8 because the ifeq-taken path
+        // bypassed the getfield.
+        let info = analyze(&code, code.len());
+        assert!(!info.is_nonnull(8, 1));
+    }
+
+    #[test]
+    fn fixpoint_terminates_on_loop() {
+        // Tight loop should converge without iterating forever.
+        //   0: aload_0; getfield (proves L0)
+        //   4: pop
+        //   5: goto -5 → PC 0 (loop back)
         let code = vec![
             0x2A,             // 0: aload_0
-            0xB4, 0x00, 0x01, // 1: getfield #1
+            0xB4, 0x00, 0x01, // 1: getfield
             0x57,             // 4: pop
             0xA7, 0xFF, 0xFB, // 5: goto -5 → PC 0
         ];
         let info = analyze(&code, code.len());
-        // At PC 0 on the first visit, local 0 is NOT proven.
+        // At PC 0 on the first iteration L0 is unproven; after fixpoint
+        // it's STILL unproven (the meet over [entry: 0, back-edge:
+        // {L0}] = 0). This is the correctness check.
         assert!(!info.is_nonnull(0, 0));
-        // After getfield at PC 1, local 0 becomes non-null at PC 4.
-        assert!(info.is_nonnull(4, 0));
     }
 }

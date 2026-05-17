@@ -12668,7 +12668,7 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe, obj, offset(long), expected(long), new(long)]
     let offset = unsafe_offset(args, 2);
     let expected = args.get(3).copied().unwrap_or(Value::Long(0));
@@ -12736,7 +12736,7 @@ fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// either constraint cannot be a live ObjectRef and is mapped to null —
 /// matching the verifier's "primitive in reference slot" recovery for
 /// `Int(0)`/`Long(0)`.
-fn recover_object_arg(value: Value) -> Value {
+pub(crate) fn recover_object_arg(value: Value) -> Value {
     match value {
         Value::Object(_) => value,
         Value::Double(d) => {
@@ -12760,7 +12760,7 @@ fn recover_object_arg(value: Value) -> Value {
     }
 }
 
-fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe, obj, offset(long), expected(Object), new(Object)]
     let offset = unsafe_offset(args, 2);
     // WP4.1 closer — recover Object from a tag-lost Double pattern at the
@@ -33309,8 +33309,10 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
         let runnable = obj_arg(args, 1)?;
         let bindings = pd_collect_carrier_bindings(ctx, this);
         let binding_count = bindings.len();
-        for (key_id, value) in &bindings {
-            ctx.push_scoped_value(*key_id, *value);
+        for (key_id, key_ref, value) in &bindings {
+            // Round-9 GC fix: pass the ScopedValue key ObjectRef so the
+            // GC root scanner pins it for the binding's lifetime.
+            ctx.push_scoped_value_with_key(*key_id, *key_ref, *value);
         }
         let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
         // Always pop bindings, even on error (exception safety)
@@ -33331,8 +33333,8 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
             let callable = obj_arg(args, 1)?;
             let bindings = pd_collect_carrier_bindings(ctx, this);
             let binding_count = bindings.len();
-            for (key_id, value) in &bindings {
-                ctx.push_scoped_value(*key_id, *value);
+            for (key_id, key_ref, value) in &bindings {
+                ctx.push_scoped_value_with_key(*key_id, *key_ref, *value);
             }
             let result = ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[]);
             for _ in 0..binding_count {
@@ -33351,7 +33353,7 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
             let scoped_val = obj_arg(args, 1)?;
             let target_key = ctx.identity_hash_code(scoped_val) as u64;
             let bindings = pd_collect_carrier_bindings(ctx, this);
-            for (key_id, value) in bindings {
+            for (key_id, _key_ref, value) in bindings {
                 if key_id == target_key {
                     return Ok(Some(value));
                 }
@@ -33367,14 +33369,17 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
 fn pd_collect_carrier_bindings(
     ctx: &mut dyn NativeContext,
     carrier: ObjectRef,
-) -> Vec<(u64, Value)> {
+) -> Vec<(u64, Option<ObjectRef>, Value)> {
+    // Round-9 GC fix: also carry the ScopedValue key ObjectRef so the
+    // GC root scanner can pin it for the lifetime of the binding (was
+    // missing — the JEP 446 key could be reclaimed while bound).
     let mut bindings = Vec::new();
     let mut current = Some(carrier);
     while let Some(c) = current {
         if let Value::Object(Some(sv_ref)) = ctx.get_field(c, 0) {
             let key_id = ctx.identity_hash_code(sv_ref) as u64;
             let value = ctx.get_field(c, 1);
-            bindings.push((key_id, value));
+            bindings.push((key_id, Some(sv_ref), value));
         }
         current = match ctx.get_field(c, 2) {
             Value::Object(Some(prev)) => Some(prev),

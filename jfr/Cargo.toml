@@ -16,12 +16,13 @@ categories.workspace = true
 # register per thread-lifetime, many drains).
 parking_lot.workspace = true
 rustc-hash.workspace = true
-# J5 (round-2): SmallVec for inline EventInstance.fields storage. Most events
-# carry <= 4 fields, so this avoids a heap allocation per event on the hot path.
-# TODO(round-4-wave-3): wire SmallVec into `EventInstance.fields`. The current
-# `Vec<EventValue>` allocates per emit; changing the field type cascades into
-# every constructor across the workspace (vm tests, recording, stream, etc.).
-smallvec = "1"
+# J5 (round-2 / round-5 fix 1): SmallVec for inline EventInstance.fields
+# storage. Inline N=8 covers every built-in JFR event (max field count is
+# 5–8 in `jfr/src/builtin.rs`), eliminating the per-event heap allocation
+# on the emit hot path. The `union` feature halves the inline footprint
+# (no length-vs-pointer tag) and is the standard configuration for
+# performance-sensitive use.
+smallvec = { workspace = true, features = ["union"] }
 
 [lints]
 workspace = true

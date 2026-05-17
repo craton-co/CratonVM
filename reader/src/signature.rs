@@ -380,6 +380,172 @@ pub fn parse_field_signature(sig: &str) -> Option<TypeSig> {
     SigParser::new(sig).parse_type_sig()
 }
 
+// ---------------------------------------------------------------------------
+// Cached parse API — round-8 HIGH reader finding
+// ---------------------------------------------------------------------------
+//
+// Generic signature parsing is pure: the AST produced for a given
+// signature string never changes. Spring's `ResolvableType` (and any
+// reflective generics consumer) walks the same signatures over and over
+// — e.g. `Ljava/util/List<Ljava/lang/String;>;` re-parsed on every
+// `Class.getGenericSuperclass()` probe. Caching the parsed forms keyed
+// on the signature string eliminates the per-probe parse cost.
+//
+// The cache is bounded with a simple FIFO eviction (capacity ~8 K) to
+// keep memory cost predictable: the parsed AST is a few hundred bytes
+// at most per signature, so 8 K entries ≈ a few MB worst-case. Below
+// the cap inserts are O(1); at the cap we evict the oldest entry.
+
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
+
+const SIGNATURE_CACHE_CAP: usize = 8192;
+
+/// Parsed forms returned by the cached parse APIs. Mirrors the three
+/// grammar entry points (class / method / field) so the cache can be
+/// shared across all signature kinds without losing the parsed AST
+/// type.
+#[derive(Clone)]
+pub enum ParsedSignature {
+    Class(Arc<ClassSig>),
+    Method(Arc<MethodSig>),
+    Field(Arc<TypeSig>),
+    /// The signature string failed to parse. Cached so a hot loop of
+    /// "is this signature valid?" probes (verifier, JVMTI agents) does
+    /// not re-walk the parser every call.
+    Invalid,
+}
+
+struct SignatureCacheInner {
+    map: FxHashMap<Arc<str>, ParsedSignature>,
+    /// FIFO order for eviction; the front is the oldest entry.
+    order: VecDeque<Arc<str>>,
+}
+
+impl SignatureCacheInner {
+    fn new() -> Self {
+        Self {
+            map: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            order: VecDeque::with_capacity(256),
+        }
+    }
+
+    fn insert(&mut self, key: Arc<str>, value: ParsedSignature) {
+        if self.map.len() >= SIGNATURE_CACHE_CAP {
+            if let Some(victim) = self.order.pop_front() {
+                self.map.remove(&victim);
+            }
+        }
+        self.order.push_back(Arc::clone(&key));
+        self.map.insert(key, value);
+    }
+}
+
+fn signature_cache() -> &'static Mutex<SignatureCacheInner> {
+    static SIGNATURE_CACHE: OnceLock<Mutex<SignatureCacheInner>> = OnceLock::new();
+    SIGNATURE_CACHE.get_or_init(|| Mutex::new(SignatureCacheInner::new()))
+}
+
+/// Internal probe — returns the cached entry as an owned value (so the
+/// lock is released before any further work). `None` means "no entry
+/// for this signature"; `Some(ParsedSignature::Invalid)` means "we
+/// have previously parsed this string and it was invalid".
+fn cache_probe(sig: &Arc<str>) -> Option<ParsedSignature> {
+    let cache = signature_cache().lock();
+    cache.map.get(sig).cloned()
+}
+
+/// Parse a class signature, consulting the global signature cache.
+///
+/// Callers that already hold the signature as `Arc<str>` (the
+/// constant-pool path) should prefer this — the cache key is the same
+/// allocation, so a hit is a single hash + pointer compare with no
+/// extra allocations.
+pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
+    match cache_probe(sig) {
+        Some(ParsedSignature::Class(c)) => return Some(c),
+        Some(ParsedSignature::Invalid) => return None,
+        // Same signature was previously parsed as a different shape —
+        // extremely unusual; fall through and re-parse without
+        // updating the cache to avoid thrash.
+        Some(_) => return parse_class_signature(sig).map(Arc::new),
+        None => {}
+    }
+    let parsed = SigParser::new(sig).parse_class_sig();
+    let mut cache = signature_cache().lock();
+    match &parsed {
+        Some(c) => {
+            let arc = Arc::new(c.clone());
+            cache.insert(Arc::clone(sig), ParsedSignature::Class(Arc::clone(&arc)));
+            Some(arc)
+        }
+        None => {
+            cache.insert(Arc::clone(sig), ParsedSignature::Invalid);
+            None
+        }
+    }
+}
+
+/// Parse a method signature, consulting the global signature cache.
+pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
+    match cache_probe(sig) {
+        Some(ParsedSignature::Method(m)) => return Some(m),
+        Some(ParsedSignature::Invalid) => return None,
+        Some(_) => return parse_method_signature(sig).map(Arc::new),
+        None => {}
+    }
+    let parsed = SigParser::new(sig).parse_method_sig();
+    let mut cache = signature_cache().lock();
+    match &parsed {
+        Some(m) => {
+            let arc = Arc::new(m.clone());
+            cache.insert(Arc::clone(sig), ParsedSignature::Method(Arc::clone(&arc)));
+            Some(arc)
+        }
+        None => {
+            cache.insert(Arc::clone(sig), ParsedSignature::Invalid);
+            None
+        }
+    }
+}
+
+/// Parse a field signature, consulting the global signature cache.
+pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
+    match cache_probe(sig) {
+        Some(ParsedSignature::Field(t)) => return Some(t),
+        Some(ParsedSignature::Invalid) => return None,
+        Some(_) => return parse_field_signature(sig).map(Arc::new),
+        None => {}
+    }
+    let parsed = SigParser::new(sig).parse_type_sig();
+    let mut cache = signature_cache().lock();
+    match &parsed {
+        Some(t) => {
+            let arc = Arc::new(t.clone());
+            cache.insert(Arc::clone(sig), ParsedSignature::Field(Arc::clone(&arc)));
+            Some(arc)
+        }
+        None => {
+            cache.insert(Arc::clone(sig), ParsedSignature::Invalid);
+            None
+        }
+    }
+}
+
+/// Clear the signature cache. Exposed for tests and shutdown.
+pub fn clear_signature_cache() {
+    let mut cache = signature_cache().lock();
+    cache.map.clear();
+    cache.order.clear();
+}
+
+/// Current size of the signature cache — exposed for diagnostics/tests.
+pub fn signature_cache_len() -> usize {
+    signature_cache().lock().map.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +568,29 @@ mod tests {
         let sig = parse_method_signature("()V").unwrap();
         assert!(sig.param_types.is_empty());
         assert!(matches!(sig.return_type, TypeSig::Base('V')));
+    }
+
+    #[test]
+    fn cached_parse_round_trips() {
+        // Use a signature unique to this test so we don't race with
+        // sibling tests that share the global signature cache.
+        let key: Arc<str> = Arc::from("()Lround_trips_marker;");
+        let m = parse_method_signature_cached(&key).expect("cached parse");
+        assert!(m.param_types.is_empty());
+        // Hit returns the same Arc (refcount > 1 because the cache
+        // holds one reference too).
+        let m2 = parse_method_signature_cached(&key).expect("cached hit");
+        assert!(Arc::ptr_eq(&m, &m2));
+    }
+
+    #[test]
+    fn cached_invalid_is_remembered() {
+        // Use a unique invalid signature so we don't race with other
+        // tests on the shared cache.
+        let bad: Arc<str> = Arc::from("not a sig // invalid_remembered_marker");
+        assert!(parse_field_signature_cached(&bad).is_none());
+        // Second call still returns None — the cache should record
+        // the Invalid verdict and short-circuit.
+        assert!(parse_field_signature_cached(&bad).is_none());
     }
 }

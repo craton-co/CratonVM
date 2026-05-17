@@ -589,6 +589,17 @@ impl LinkResolver {
     /// (name_arc, desc_arc, ResolvedMember::...) */ })`. Subsequent
     /// hits return immediately with a single hash + key compare and
     /// zero Arc clones.
+    ///
+    /// Round 9 audit fix (vm LOW #11): under contention two threads
+    /// that both miss the cache, both run the (potentially expensive)
+    /// hierarchy walk, and both arrive at `insert()` — the loser's
+    /// walk result is wasted *and* its `insert()` clobbers the
+    /// winner's entry with a freshly-allocated duplicate. After the
+    /// expensive compute, we re-acquire the write lock and use a
+    /// raw-entry probe to detect a race-winner; if one is already
+    /// present we discard our computation and clone the existing
+    /// value. Sub-microsecond extra work on the hit path; eliminates
+    /// the duplicate-insert + wasted-walk on the loser path.
     pub fn resolve_or_compute<F>(
         &self,
         class_id: ClassId,
@@ -603,7 +614,23 @@ impl LinkResolver {
             return hit;
         }
         let (name_arc, desc_arc, resolved) = compute();
-        self.insert(class_id, name_arc, desc_arc, resolved.clone());
+        // Race-loser check: re-probe under the write lock. If another
+        // thread populated the same key while we were computing,
+        // discard our result and return theirs.
+        let mut guard = self.cache.write();
+        let hash = Self::hash_key(guard.hasher(), class_id, &name_arc, &desc_arc);
+        let race_winner = guard
+            .raw_entry()
+            .from_hash(hash, |(k_cid, k_name, k_desc)| {
+                *k_cid == class_id
+                    && k_name.as_ref() == name_arc.as_ref()
+                    && k_desc.as_ref() == desc_arc.as_ref()
+            })
+            .map(|(_, v)| v.clone());
+        if let Some(existing) = race_winner {
+            return existing;
+        }
+        guard.insert((class_id, name_arc, desc_arc), resolved.clone());
         resolved
     }
 
@@ -1460,5 +1487,63 @@ mod tests {
         resolver.invalidate_class(class_a);
         assert!(resolver.get(class_a, &missing_name, &desc).is_none());
         assert!(resolver.is_empty());
+    }
+
+    /// Round 9 audit fix (vm LOW #11): `resolve_or_compute` must detect
+    /// a race-winner that populated the same key while we were
+    /// computing, and return the winner's entry instead of clobbering
+    /// it. Simulate the race by populating the cache from outside
+    /// inside the closure (which models another thread winning).
+    #[test]
+    fn resolve_or_compute_handles_race_loser() {
+        let resolver = LinkResolver::new();
+        let class_a = ClassId::new(1);
+        let class_winner = ClassId::new(99);
+        let class_loser = ClassId::new(42);
+
+        // Loser computes a result, but the closure simulates a winner
+        // by inserting into the cache mid-compute. The race-loser
+        // check must spot the winner and return it.
+        let got = resolver.resolve_or_compute(class_a, "m", "()V", || {
+            // Simulate a different thread winning: insert under the
+            // same key with `class_winner` as the declaring class.
+            resolver.insert(
+                class_a,
+                Arc::from("m"),
+                Arc::from("()V"),
+                ResolvedMember::Method {
+                    declaring_class_id: class_winner,
+                    index: 7,
+                },
+            );
+            // The "loser" returns a different declaring class.
+            (
+                Arc::from("m"),
+                Arc::from("()V"),
+                ResolvedMember::Method {
+                    declaring_class_id: class_loser,
+                    index: 99,
+                },
+            )
+        });
+        match got {
+            ResolvedMember::Method { declaring_class_id, index } => {
+                assert_eq!(
+                    declaring_class_id, class_winner,
+                    "race loser should have returned the winner's entry"
+                );
+                assert_eq!(index, 7);
+            }
+            other => panic!("expected Method, got {other:?}"),
+        }
+        // Cache must still hold the winner's entry, not the loser's.
+        match resolver.get(class_a, "m", "()V").expect("entry present") {
+            ResolvedMember::Method { declaring_class_id, index } => {
+                assert_eq!(declaring_class_id, class_winner);
+                assert_eq!(index, 7);
+            }
+            other => panic!("expected Method, got {other:?}"),
+        }
+        assert_eq!(resolver.len(), 1);
     }
 }

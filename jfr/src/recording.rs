@@ -453,6 +453,7 @@ impl Default for FlightRecorder {
 mod tests {
     use super::*;
     use crate::event::{EventInstance, EventTypeId, EventValue};
+    use smallvec::smallvec;
     use std::sync::Arc;
 
     fn make_event(type_id: EventTypeId, start: u64, end: u64) -> EventInstance {
@@ -461,7 +462,7 @@ mod tests {
             start_time: start,
             end_time: end,
             thread_id: 1,
-            fields: vec![],
+            fields: smallvec![],
         }
     }
 
@@ -706,7 +707,7 @@ mod tests {
             start_time: 100,
             end_time: 200,
             thread_id: 42,
-            fields: vec![EventValue::Int(10), EventValue::String(Arc::from("gc"))],
+            fields: smallvec![EventValue::Int(10), EventValue::String(Arc::from("gc"))],
         };
         rec.record_event(evt);
         let events = rec.get_events();

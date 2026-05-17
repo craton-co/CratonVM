@@ -263,13 +263,13 @@ fn t7_3_4_affine_transforms() {
 
 #[test]
 fn t7_3_5_image_rendering_bilinear() {
-    use rustjvm_native_awt::renderer::SoftwareRenderer;
+    use rustjvm_native_awt::renderer::{InterpolationKind, SoftwareRenderer};
 
     // Create a 2x2 source image: red, green, blue, white
     let src = [0xFFFF0000u32, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF];
 
     let mut r = SoftwareRenderer::new(100, 100);
-    r.blit_image_scaled(&src, 2, 2, 10, 10, 40, 40, true);
+    r.blit_image_scaled(&src, 2, 2, 10, 10, 40, 40, InterpolationKind::Bilinear);
 
     let pixels = r.pixels();
     let center_idx = (30 * 100 + 30) as usize;

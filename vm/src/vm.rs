@@ -53881,16 +53881,16 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         assert!(thread.scoped_values.is_empty());
 
-        thread.scoped_values.push((42, Value::Int(100)));
-        thread.scoped_values.push((43, Value::Int(200)));
+        thread.scoped_values.push((42, None, Value::Int(100)));
+        thread.scoped_values.push((43, None, Value::Int(200)));
 
         // Search from top
         let found = thread
             .scoped_values
             .iter()
             .rev()
-            .find(|(k, _)| *k == 42)
-            .map(|(_, v)| *v);
+            .find(|(k, _, _)| *k == 42)
+            .map(|(_, _, v)| *v);
         assert_eq!(found, Some(Value::Int(100)));
 
         thread.scoped_values.pop();
@@ -54733,16 +54733,16 @@ mod tests {
         // Test that inner binding shadows outer binding with same key
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        thread.scoped_values.push((100, Value::Int(1)));
-        thread.scoped_values.push((100, Value::Int(2))); // shadows
+        thread.scoped_values.push((100, None, Value::Int(1)));
+        thread.scoped_values.push((100, None, Value::Int(2))); // shadows
 
         // Should find the inner (most recent) binding
         let found = thread
             .scoped_values
             .iter()
             .rev()
-            .find(|(k, _)| *k == 100)
-            .map(|(_, v)| *v);
+            .find(|(k, _, _)| *k == 100)
+            .map(|(_, _, v)| *v);
         assert_eq!(found, Some(Value::Int(2)));
 
         // Pop inner binding
@@ -54753,8 +54753,8 @@ mod tests {
             .scoped_values
             .iter()
             .rev()
-            .find(|(k, _)| *k == 100)
-            .map(|(_, v)| *v);
+            .find(|(k, _, _)| *k == 100)
+            .map(|(_, _, v)| *v);
         assert_eq!(found2, Some(Value::Int(1)));
 
         thread.scoped_values.pop();
@@ -54765,9 +54765,9 @@ mod tests {
     fn scoped_value_multiple_keys() {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        thread.scoped_values.push((1, Value::Int(10)));
-        thread.scoped_values.push((2, Value::Int(20)));
-        thread.scoped_values.push((3, Value::Int(30)));
+        thread.scoped_values.push((1, None, Value::Int(10)));
+        thread.scoped_values.push((2, None, Value::Int(20)));
+        thread.scoped_values.push((3, None, Value::Int(30)));
 
         // Each key returns its own value
         for (key, expected) in [(1, 10), (2, 20), (3, 30)] {
@@ -54775,8 +54775,8 @@ mod tests {
                 .scoped_values
                 .iter()
                 .rev()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| *v);
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, _, v)| *v);
             assert_eq!(found, Some(Value::Int(expected)));
         }
 
@@ -54785,8 +54785,8 @@ mod tests {
             .scoped_values
             .iter()
             .rev()
-            .find(|(k, _)| *k == 999)
-            .map(|(_, v)| *v);
+            .find(|(k, _, _)| *k == 999)
+            .map(|(_, _, v)| *v);
         assert_eq!(missing, None);
     }
 
@@ -54799,7 +54799,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Pre-push a binding to simulate Carrier.run setup
-        thread.scoped_values.push((42, Value::Int(100)));
+        thread.scoped_values.push((42, None, Value::Int(100)));
         assert_eq!(thread.scoped_values.len(), 1);
 
         // Simulate the pop that Carrier.run always does (even on error)
@@ -54807,16 +54807,16 @@ mod tests {
         assert_eq!(thread.scoped_values.len(), 0);
 
         // Direct push/pop cycle
-        thread.scoped_values.push((77, Value::Int(42)));
+        thread.scoped_values.push((77, None, Value::Int(42)));
         let found = thread
             .scoped_values
             .iter()
             .rev()
-            .find(|(k, _)| *k == 77)
-            .map(|(_, v)| *v);
+            .find(|(k, _, _)| *k == 77)
+            .map(|(_, _, v)| *v);
         assert_eq!(found, Some(Value::Int(42)));
         thread.scoped_values.pop();
-        let not_found = thread.scoped_values.iter().rev().find(|(k, _)| *k == 77);
+        let not_found = thread.scoped_values.iter().rev().find(|(k, _, _)| *k == 77);
         assert!(not_found.is_none());
     }
 

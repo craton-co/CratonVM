@@ -1157,25 +1157,20 @@ impl SoftwareRenderer {
         }
     }
 
-    /// Scaled blit with optional bilinear interpolation.
+    /// Scaled blit with the requested interpolation mode.
     ///
-    /// When `bilinear` is `false`, sampling is nearest-neighbour: each output
-    /// pixel reads exactly one source pixel (chosen by rounding). When
-    /// `bilinear` is `true`, the four surrounding source pixels are linearly
-    /// interpolated — smoother for arbitrary scale factors, but more
-    /// expensive. Callers select the mode via Graphics2D's
-    /// `RenderingHints.VALUE_INTERPOLATION_{NEAREST_NEIGHBOR,BILINEAR}`.
+    /// `InterpolationKind::Nearest` → each output pixel reads exactly one
+    /// source pixel (chosen by rounding).
     ///
-    /// **TODO(round-8, MED): real bicubic for `VALUE_INTERPOLATION_BICUBIC`.**
-    /// Java's `RenderingHints.VALUE_INTERPOLATION_BICUBIC` (the third
-    /// option) is currently rendered with the bilinear branch — visibly
-    /// softer than a real 4×4 cubic-convolution kernel (Mitchell / Catmull-
-    /// Rom). The full bicubic path needs a 4×4 sample grid with the Keys
-    /// cubic-convolution coefficients (b=0, c=0.5) plus edge clamping, so
-    /// it's tracked separately rather than bolted onto this branch. The
-    /// public Graphics2D plumbing should grow a tri-state
-    /// `InterpolationHint::{Nearest, Bilinear, Bicubic}` rather than the
-    /// current bool so the call site can request the third tier.
+    /// `InterpolationKind::Bilinear` → the four surrounding source pixels
+    /// are linearly interpolated — smoother for arbitrary scale factors,
+    /// but more expensive.
+    ///
+    /// `InterpolationKind::Bicubic` → 4×4 source neighbourhood with the
+    /// Catmull-Rom cubic-convolution kernel (a = -0.5). Slowest but
+    /// preserves edges/detail noticeably better than bilinear when
+    /// upscaling; corresponds to `RenderingHints.VALUE_INTERPOLATION_
+    /// BICUBIC` on the Java side.
     ///
     /// Round-7 fast path: when the requested destination size matches the
     /// source size and the transform is identity, dispatch to the unscaled
@@ -1186,7 +1181,7 @@ impl SoftwareRenderer {
         &mut self,
         src: &[u32], src_w: u32, src_h: u32,
         dx: i32, dy: i32, dw: u32, dh: u32,
-        bilinear: bool,
+        kind: InterpolationKind,
     ) {
         if dw == 0 || dh == 0 || src_w == 0 || src_h == 0 {
             return;
@@ -1205,14 +1200,20 @@ impl SoftwareRenderer {
                 let src_xf = out_x as f64 * (src_w as f64 - 1.0) / (dw as f64 - 1.0).max(1.0);
                 let src_yf = out_y as f64 * (src_h as f64 - 1.0) / (dh as f64 - 1.0).max(1.0);
 
-                let color = if bilinear {
-                    bilinear_sample(src, src_w, src_h, src_xf, src_yf)
-                } else {
-                    let sx = src_xf.round() as u32;
-                    let sy = src_yf.round() as u32;
-                    let sx = sx.min(src_w - 1);
-                    let sy = sy.min(src_h - 1);
-                    src[(sy * src_w + sx) as usize]
+                let color = match kind {
+                    InterpolationKind::Bilinear => {
+                        bilinear_sample(src, src_w, src_h, src_xf, src_yf)
+                    }
+                    InterpolationKind::Bicubic => {
+                        bicubic_sample(src, src_w, src_h, src_xf, src_yf)
+                    }
+                    InterpolationKind::Nearest => {
+                        let sx = src_xf.round() as u32;
+                        let sy = src_yf.round() as u32;
+                        let sx = sx.min(src_w - 1);
+                        let sy = sy.min(src_h - 1);
+                        src[(sy * src_w + sx) as usize]
+                    }
                 };
 
                 let (tx, ty) = self.tx((dx + out_x) as f64, (dy + out_y) as f64);
@@ -1440,6 +1441,21 @@ impl SoftwareRenderer {
     }
 }
 
+// ── Interpolation kind ────────────────────────────────────────────────
+
+/// Sampling mode for [`SoftwareRenderer::blit_image_scaled`].
+///
+/// Mirrors the three `RenderingHints.VALUE_INTERPOLATION_*` constants
+/// (`NEAREST_NEIGHBOR`, `BILINEAR`, `BICUBIC`). The Java side maps the
+/// active rendering hint to one of these via Graphics2DState's
+/// dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpolationKind {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+
 // ── Bilinear interpolation ────────────────────────────────────────────
 
 fn bilinear_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
@@ -1470,6 +1486,79 @@ fn bilinear_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
     };
 
     make_argb(lerp_ch(24), lerp_ch(16), lerp_ch(8), lerp_ch(0))
+}
+
+// ── Bicubic interpolation ─────────────────────────────────────────────
+
+/// Catmull-Rom cubic-convolution kernel (a = -0.5). Standard "Keys"
+/// reconstruction filter — smooth, edge-preserving when upscaling and
+/// the conventional choice for AWT's `VALUE_INTERPOLATION_BICUBIC`.
+#[inline]
+fn cubic_weight(t: f32) -> f32 {
+    let a = -0.5_f32;
+    let abs_t = t.abs();
+    if abs_t < 1.0 {
+        (a + 2.0) * abs_t.powi(3) - (a + 3.0) * abs_t.powi(2) + 1.0
+    } else if abs_t < 2.0 {
+        a * abs_t.powi(3) - 5.0 * a * abs_t.powi(2) + 8.0 * a * abs_t - 4.0 * a
+    } else {
+        0.0
+    }
+}
+
+/// Sample `src` at fractional `(x, y)` using a 4×4 Catmull-Rom bicubic
+/// neighbourhood with edge clamping. Channels are independently
+/// reconstructed (ARGB), then clamped to `[0, 255]`.
+fn bicubic_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
+    let ix = x.floor() as i32;
+    let iy = y.floor() as i32;
+    let fx = (x - ix as f64) as f32;
+    let fy = (y - iy as f64) as f32;
+
+    // Precompute the four x and y weights so the inner loop is
+    // 16 weighted samples (vs. 16 weight evaluations).
+    let wx = [
+        cubic_weight(-1.0 - fx),
+        cubic_weight(0.0 - fx),
+        cubic_weight(1.0 - fx),
+        cubic_weight(2.0 - fx),
+    ];
+    let wy = [
+        cubic_weight(-1.0 - fy),
+        cubic_weight(0.0 - fy),
+        cubic_weight(1.0 - fy),
+        cubic_weight(2.0 - fy),
+    ];
+
+    let clamp_x = |c: i32| c.max(0).min(w as i32 - 1) as u32;
+    let clamp_y = |c: i32| c.max(0).min(h as i32 - 1) as u32;
+
+    let mut acc_a = 0.0_f32;
+    let mut acc_r = 0.0_f32;
+    let mut acc_g = 0.0_f32;
+    let mut acc_b = 0.0_f32;
+
+    for j in 0..4 {
+        let sy = clamp_y(iy + j as i32 - 1);
+        let wj = wy[j];
+        for i in 0..4 {
+            let sx = clamp_x(ix + i as i32 - 1);
+            let wi = wx[i];
+            let weight = wi * wj;
+            let px = src[(sy * w + sx) as usize];
+            let a = ((px >> 24) & 0xFF) as f32;
+            let r = ((px >> 16) & 0xFF) as f32;
+            let g = ((px >> 8) & 0xFF) as f32;
+            let b = (px & 0xFF) as f32;
+            acc_a += a * weight;
+            acc_r += r * weight;
+            acc_g += g * weight;
+            acc_b += b * weight;
+        }
+    }
+
+    let clamp_u8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    make_argb(clamp_u8(acc_a), clamp_u8(acc_r), clamp_u8(acc_g), clamp_u8(acc_b))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -1765,7 +1854,7 @@ mod tests {
             0xFF_0000FF, 0xFF_FFFFFF,
         ];
         let mut r = SoftwareRenderer::new(10, 10);
-        r.blit_image_scaled(&src, 2, 2, 0, 0, 4, 4, true);
+        r.blit_image_scaled(&src, 2, 2, 0, 0, 4, 4, InterpolationKind::Bilinear);
 
         // Corners should match source
         assert_eq!(r.pixels()[0], 0xFF_FF0000); // top-left
@@ -1776,6 +1865,38 @@ mod tests {
         let a = argb_a(mid);
         assert_eq!(a, 255); // fully opaque
         // The middle should have contributions from all four source pixels
+    }
+
+    #[test]
+    fn test_blit_image_scaled_bicubic() {
+        // Round-10 PERF Fix 1: bicubic mode must (a) hit the
+        // bicubic_sample path (compile-time check via the enum), and
+        // (b) produce a fully-opaque blended midpoint when the source
+        // is fully opaque (the Catmull-Rom kernel weights sum to ~1).
+        let src = vec![
+            0xFF_FF0000, 0xFF_00FF00,
+            0xFF_0000FF, 0xFF_FFFFFF,
+        ];
+        let mut r = SoftwareRenderer::new(10, 10);
+        r.blit_image_scaled(&src, 2, 2, 0, 0, 4, 4, InterpolationKind::Bicubic);
+        assert_eq!(r.pixels()[0], 0xFF_FF0000);
+        let mid = r.pixels()[(1 * 10 + 1) as usize];
+        assert_eq!(argb_a(mid), 255);
+    }
+
+    #[test]
+    fn test_cubic_weight_continuity() {
+        // Catmull-Rom kernel is C¹ at t=0, t=±1, t=±2. The strongest
+        // invariant we can cheaply assert is the symmetry and the
+        // explicit zero at |t|=2 + the unit-impulse at t=0.
+        let eps = 1e-5;
+        assert!((cubic_weight(0.0) - 1.0).abs() < eps);
+        assert!(cubic_weight(2.0).abs() < eps);
+        assert!(cubic_weight(-2.0).abs() < eps);
+        // Symmetric: w(t) == w(-t)
+        for &t in &[0.25_f32, 0.5, 0.75, 1.0, 1.5] {
+            assert!((cubic_weight(t) - cubic_weight(-t)).abs() < eps);
+        }
     }
 
     #[test]

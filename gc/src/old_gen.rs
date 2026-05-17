@@ -145,10 +145,22 @@ impl OldGen {
     /// best-fit, but bucket sizes mean the worst-case scan touches only
     /// blocks roughly the right size — not the entire free list.
     /// Amortised O(1).
+    ///
+    /// Round-9 gc CRIT-3 fix: a request of `size == 0` previously
+    /// returned `self.data.as_mut_ptr()` (i.e. the start of the backing
+    /// buffer) without reserving any bytes. The caller would treat that
+    /// pointer as a fresh, non-aliasing allocation while it actually
+    /// aliased whatever was already living at offset 0 — typically the
+    /// header of the first old-gen object. A subsequent write through
+    /// the bogus pointer corrupted live state. Round up zero-sized
+    /// requests to the smallest plausible object footprint
+    /// (`HEADER_SIZE`-or-larger, 8-byte aligned) so every call returns
+    /// a fresh, non-aliasing block.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
-        if size == 0 {
-            return Some(self.data.as_mut_ptr());
-        }
+        // Round-9 gc CRIT-3: reserve at least HEADER_SIZE bytes (and
+        // never less than 8 for alignment headroom) so an `alloc(0)`
+        // can't alias an existing allocation.
+        let size = size.max(HEADER_SIZE.max(8));
 
         let base = self.data.as_ptr() as usize;
         let start_bucket = min_satisfying_bucket(size + align - 1);
@@ -320,6 +332,15 @@ impl OldGen {
         while offset < end_offset {
             let ptr = (base + offset) as *mut u8;
             let header = unsafe { &*(ptr as *const ObjectHeader) };
+            // Round-9 gc CRIT-1: HumongousFiller is a synthetic walker
+            // sentinel installed by the regional GC (see `g1.rs` and
+            // `region.rs`). It should never appear in the non-regional
+            // old-gen layout, but defensively skip the rest of the
+            // current scan stripe instead of mis-parsing it as a real
+            // object (which would corrupt the offset cursor).
+            if header.kind == ObjectKind::HumongousFiller {
+                break;
+            }
             let total_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
                     .expect("array_data_size overflow in old_gen scan")

@@ -5,7 +5,7 @@
 //! state: paint, font, stroke, rendering hints, clip, transform, and a
 //! save/restore stack.
 
-use crate::renderer::{AffineTransform, CompositeMode, Rect, SoftwareRenderer};
+use crate::renderer::{AffineTransform, CompositeMode, InterpolationKind, Rect, SoftwareRenderer};
 
 // ── Supporting types ──────────────────────────────────────────────────
 
@@ -84,6 +84,20 @@ impl Default for StrokeSpec {
 pub enum Interpolation {
     NearestNeighbor,
     Bilinear,
+    Bicubic,
+}
+
+impl Interpolation {
+    /// Project the Java-side hint onto the renderer's interpolation
+    /// kind. Kept here so the natives layer doesn't need to know about
+    /// the renderer's internal type.
+    fn to_kind(self) -> InterpolationKind {
+        match self {
+            Interpolation::NearestNeighbor => InterpolationKind::Nearest,
+            Interpolation::Bilinear => InterpolationKind::Bilinear,
+            Interpolation::Bicubic => InterpolationKind::Bicubic,
+        }
+    }
 }
 
 /// Rendering hints (maps to `java.awt.RenderingHints`).
@@ -120,6 +134,7 @@ pub enum RenderingHintValue {
     Default,
     BilinearInterpolation,
     NearestNeighborInterpolation,
+    BicubicInterpolation,
 }
 
 /// Snapshot of graphics state for save/restore.
@@ -235,6 +250,7 @@ impl Graphics2DState {
             RenderingHintKey::Interpolation => {
                 self.rendering_hints.interpolation = match value {
                     RenderingHintValue::BilinearInterpolation => Interpolation::Bilinear,
+                    RenderingHintValue::BicubicInterpolation => Interpolation::Bicubic,
                     _ => Interpolation::NearestNeighbor,
                 };
             }
@@ -461,8 +477,8 @@ impl Graphics2DState {
         if self.disposed {
             return;
         }
-        let bilinear = self.rendering_hints.interpolation == Interpolation::Bilinear;
-        self.renderer.blit_image_scaled(pixels, w, h, x, y, dw, dh, bilinear);
+        let kind = self.rendering_hints.interpolation.to_kind();
+        self.renderer.blit_image_scaled(pixels, w, h, x, y, dw, dh, kind);
     }
 
     // ── Clear / copy ──────────────────────────────────────────────
@@ -984,6 +1000,33 @@ mod tests {
         assert_eq!(g.pixels()[3], 0xFF_00FF00);
         let mid = g.pixels()[(1 * 10 + 1) as usize];
         let a = (mid >> 24) & 0xFF;
+        assert_eq!(a, 255);
+        let r = (mid >> 16) & 0xFF;
+        assert!(r < 255 && r > 0, "midpoint red should be blended, got {}", r);
+    }
+
+    #[test]
+    fn test_bicubic_interpolation_scaled_blit() {
+        // Round-10 PERF Fix 1: bicubic interpolation should produce a
+        // fully opaque, blended midpoint distinct from the source corner
+        // colours (real 4×4 cubic-convolution, not the old "alias for
+        // bilinear" fallback).
+        let mut g = Graphics2DState::create(10, 10);
+        g.set_rendering_hint(
+            RenderingHintKey::Interpolation,
+            RenderingHintValue::BicubicInterpolation,
+        );
+        let src = vec![
+            0xFF_FF0000, 0xFF_00FF00,
+            0xFF_0000FF, 0xFF_FFFFFF,
+        ];
+        g.draw_image_scaled(&src, 2, 2, 0, 0, 4, 4);
+
+        assert_eq!(g.pixels()[0], 0xFF_FF0000);
+        let mid = g.pixels()[(1 * 10 + 1) as usize];
+        let a = (mid >> 24) & 0xFF;
+        // Cubic weights sum to ~1 so a fully-opaque input produces a
+        // fully-opaque output after clamping.
         assert_eq!(a, 255);
         let r = (mid >> 16) & 0xFF;
         assert!(r < 255 && r > 0, "midpoint red should be blended, got {}", r);

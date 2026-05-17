@@ -50,6 +50,31 @@ const MMAP_THRESHOLD_BYTES: u64 = 64 * 1024;
 /// — is deferred (it requires changing the `ClassPathEntry` storage
 /// type and the `archive: Mutex<ZipArchive<...>>` generic argument
 /// everywhere, which exceeds the scope of this fix).
+///
+/// TODO(round-8 HIGH classloading): the mmap path always
+/// heap-doubles. Two viable cascades:
+///
+/// 1. Return `Arc<[u8]>` so callers share the allocation. Most
+///    consumers already take `&[u8]` and would only need an `&*arc`
+///    deref; the JAR consumers want `Cursor<Vec<u8>>` for
+///    `ZipArchive` and would need an adapter cursor type.
+/// 2. Return an `enum Bytes { Mmap(Mmap), Vec(Vec<u8>) }` with
+///    `Deref<Target = [u8]>` so producers keep ownership of the
+///    mmap. Same `ZipArchive` cursor cascade applies — the archive
+///    holds `ZipArchive<Cursor<Bytes>>` which transitively becomes
+///    generic across `ClassPathEntry` storage. Approximately 20
+///    call sites in this file plus the `Mutex<ZipArchive<…>>`
+///    fields. Round-8 deferred this for the same reason round-7
+///    did (cascading generics).
+///
+/// Round-8 HIGH (ZipArchive deep mmap): same cascade — `ZipArchive`
+/// is `ZipArchive<R: Read + Seek>`, so swapping the cursor type
+/// requires generic plumbing through every helper in this file.
+/// When this cascade is undertaken (likely as a dedicated work
+/// package), define `enum JarReader { Mmap(Cursor<Arc<Mmap>>),
+/// Vec(Cursor<Arc<[u8]>>) }` with `Read + Seek` forwarding, swap
+/// the type alias once at the top of the file, and let the type
+/// checker drive the cascade.
 fn read_file_for_classpath(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;

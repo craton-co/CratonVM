@@ -192,6 +192,34 @@ impl Default for SatbBuffer {
 /// throughput at mutator counts up to ~16 active flushers.
 const SHARDS: usize = 16;
 
+// TODO(round-11, HIGH from round-7/9 cross-cutting): swap each shard's
+// `parking_lot::Mutex<Vec<usize>>` for `crossbeam_queue::SegQueue<usize>`
+// to make `flush()` fully lock-free (push is wait-free MPSC).
+//
+// Why deferred to a later round:
+//   1. `deactivate_and_drain` (round-9 gc HIGH-4 fix above) leans on the
+//      mutex to GUARANTEE no late writer is mid-`extend` when the drain
+//      transitions ACTIVE→INACTIVE. With SegQueue we'd need a per-shard
+//      `AtomicBool drain_in_progress` + spin/yield on the writer side
+//      (or a sequence-number scheme like seqlock) to recover the same
+//      happens-before edge. That's an extra atomic on the hot mutator
+//      flush path — possibly net-negative versus the mutex.
+//   2. Per the round-7/9 benchmarks, the per-shard mutex is NOT a
+//      measured bottleneck: with 16 shards the contention is already
+//      ~1/16 of the pre-sharding single-mutex bottleneck the round-7
+//      HIGH-3 fix targeted, and the actual `flush()` critical section
+//      is a single `Vec::extend` (typically ~256 entries, ~2µs). The
+//      OS scheduler rarely contends.
+//   3. SegQueue allocates a 32-entry segment per push burst, which
+//      would push allocator traffic up considerably on workloads with
+//      many small flushes.
+//
+// Revisit if perf telemetry shows mutator threads stalling on
+// `shards[s].lock()` during concurrent mark; the migration is
+// mechanical (push: `shard.push(p)`; drain: `while let Some(p) =
+// shard.pop() { out.push(p); }`) once we have a safe replacement
+// for the drain-side mutex barrier in `deactivate_and_drain`.
+
 /// Global SATB queue shared by all threads and the concurrent marker.
 ///
 /// Application threads flush their per-thread `SatbBuffer` into this queue.

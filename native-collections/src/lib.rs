@@ -10146,6 +10146,15 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register(c, "<init>", "()V", native_lhm_init);
     registry.register(c, "<init>", "(I)V", native_lhm_init_capacity);
+    registry.register(c, "<init>", "(IF)V", native_lhm_init_capacity_lf);
+    // Round-9 HIGH: the access-ordered ctor — when the `boolean accessOrder`
+    // argument is true, `get(k)` must move the accessed entry to the tail
+    // of the insertion-order list. This is what makes LinkedHashMap usable
+    // as the underlying store for LRU caches (e.g. `removeEldestEntry`
+    // overrides in Guava / Caffeine fallbacks). Without this ctor the
+    // accessOrder flag silently defaults to false and `get` is read-only,
+    // corrupting LRU eviction policies.
+    registry.register(c, "<init>", "(IFZ)V", native_lhm_init_capacity_lf_access);
     registry.register(c, "<init>", "(Ljava/util/Map;)V", native_lhm_init_from_map);
     registry.register(c, "size", "()I", native_lhm_size);
     registry.register(c, "isEmpty", "()Z", native_lhm_is_empty);
@@ -10293,6 +10302,67 @@ fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
+/// `LinkedHashMap(int initialCapacity, float loadFactor)` — loadFactor is
+/// accepted but only used for the capacity adjustment; we ignore the actual
+/// f32 value beyond that.
+fn native_lhm_init_capacity_lf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_lhm_init_capacity(ctx, args)
+}
+
+/// `LinkedHashMap(int initialCapacity, float loadFactor, boolean accessOrder)`
+/// — when accessOrder is true, subsequent `get(k)` calls reorder the entry
+/// to the tail of the insertion-order list (LRU-style). The flag is stashed
+/// in the LHM overlay under the name `accessOrder` so `native_lhm_get` can
+/// consult it without a Java field read.
+fn native_lhm_init_capacity_lf_access(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    // Reuse the (I)V capacity adjustment path.
+    native_lhm_init_capacity(ctx, args)?;
+    let access_order = match args.get(3) {
+        Some(Value::Int(v)) => *v != 0,
+        _ => false,
+    };
+    if access_order {
+        // Use LHM_FIELD_TAIL+1 as a dummy fallback index — `lhm_set` writes
+        // the value primarily under the string-name slot in the overlay,
+        // which is what `lhm_is_access_order` reads back.
+        lhm_set(
+            ctx,
+            this,
+            "accessOrder",
+            LHM_FIELD_TAIL + 1,
+            Value::Int(1),
+        );
+    }
+    // Also write through to the real-JDK field name in case the receiver
+    // is a real-JDK LinkedHashMap with a slot for `accessOrder`.
+    ctx.set_field_by_name(
+        this,
+        "accessOrder",
+        Value::Int(if access_order { 1 } else { 0 }),
+    );
+    Ok(None)
+}
+
+/// Read the access-order flag for `this`. Defaults to false (insertion-order)
+/// when no IFZ ctor ran. Consults both the overlay (where our ctor writes it)
+/// and the real-JDK `accessOrder` field by name so a real-JDK LHM instance
+/// initialised via Java bytecode still reports correctly.
+fn lhm_is_access_order(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if let Value::Int(v) = lhm_get(ctx, this, "accessOrder", LHM_FIELD_TAIL + 1) {
+        if v != 0 {
+            return true;
+        }
+    }
+    matches!(ctx.get_field_by_name(this, "accessOrder"), Value::Int(v) if v != 0)
+}
+
 // S111r14: LinkedHashMap copy-constructor — see `native_map_init_from_map`
 // for the rationale. DateTimeFormatterBuilder.appendText reaches us via
 // `new LinkedHashMap<>(map)`.
@@ -10398,10 +10468,42 @@ fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(node) = lhm_find_node(ctx, this, &key) {
-        Ok(Some(ctx.get_field(node, LHM_NODE_VALUE)))
+        let value = ctx.get_field(node, LHM_NODE_VALUE);
+        // Round-9 HIGH: access-order semantics. When the LHM was
+        // constructed with `(IFZ)V` accessOrder=true, `get` must move
+        // the accessed entry to the tail of the insertion-order list
+        // so that iteration order reflects LRU. With insertion-order
+        // (the default) this is a read-only operation.
+        if lhm_is_access_order(ctx, this) {
+            lhm_move_to_tail(ctx, this, node);
+        }
+        Ok(Some(value))
     } else {
         Ok(Some(Value::Object(None)))
     }
+}
+
+/// Move `node` to the tail of the insertion-order linked list. Used by
+/// access-order LinkedHashMaps to implement LRU semantics on `get`. Pure
+/// pointer surgery: unlink + relink at tail; the bucket-chain pointers
+/// (`LHM_NODE_NEXT`) are untouched so lookup remains correct.
+fn lhm_move_to_tail(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
+    // If already at tail, no-op.
+    let current_tail = lhm_get(ctx, this, "tail", LHM_FIELD_TAIL);
+    if let Value::Object(Some(t)) = current_tail {
+        if t.as_ptr() == node.as_ptr() {
+            return;
+        }
+    }
+    // Unlink from current position.
+    lhm_unlink(ctx, this, node);
+    // The unlink above clears the head/tail entries when relevant, but it
+    // leaves `node.before` / `node.after` populated with stale pointers.
+    // Clear them before relinking at tail so `lhm_link_tail` sees a fresh
+    // node.
+    ctx.set_field(node, LHM_NODE_BEFORE, Value::Object(None));
+    ctx.set_field(node, LHM_NODE_AFTER, Value::Object(None));
+    lhm_link_tail(ctx, this, node);
 }
 
 fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10591,7 +10693,14 @@ fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     if let Some(node) = lhm_find_node(ctx, this, &key) {
-        Ok(Some(ctx.get_field(node, LHM_NODE_VALUE)))
+        let value = ctx.get_field(node, LHM_NODE_VALUE);
+        // Round-9 HIGH: `getOrDefault` is also an access for access-order
+        // semantics — same reorder as `get`. The JDK's `LinkedHashMap`
+        // explicitly documents this in `Map.getOrDefault`'s contract.
+        if lhm_is_access_order(ctx, this) {
+            lhm_move_to_tail(ctx, this, node);
+        }
+        Ok(Some(value))
     } else {
         Ok(Some(default))
     }
@@ -12336,7 +12445,27 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 // ===========================================================================
-// TreeMap — sorted map backed by sorted array (binary-search for O(log n) lookup)
+// TreeMap — sorted map.
+//
+// Round-9 HIGH (MED-8 carryover): the original implementation was a sorted
+// `Object[]` with binary-search lookup and `tm_insert_at`/`tm_remove_at`
+// shifting, giving O(log N) `get` but O(N) `put`/`remove`. The JDK's
+// `TreeMap` is a red-black tree at O(log N) for all operations.
+//
+// We adopt a hybrid: for the common case (no custom Comparator, keys are
+// String / Integer / Long / wrapped primitive) we maintain a Rust-side
+// `BTreeMap<TreeKey, Value>` as the authoritative store (O(log N) on all
+// ops). For custom Comparator we fall through to the array path, because
+// keying a Rust BTreeMap on Java's `Comparator.compare` requires invoking
+// Java code from comparison — that's a re-entrancy and lifetime hazard
+// (the BTreeMap holds a mutable borrow during compare while the Comparator
+// might trigger arbitrary VM code, including class loading).
+//
+// The fast-mode flag is stored in the LHM-style overlay (`tm_overlay`).
+// When fast-mode is active the array slot stays empty; size is mirrored
+// to the synthetic slot so legacy size readers still work. Iteration-style
+// natives (`keySet`, `values`, `entrySet`, `forEach`) populate their output
+// from the BTreeMap when active.
 // ===========================================================================
 
 const TM_FIELD_DATA: usize = 0; // Object[] interleaved [k0, v0, k1, v1, ...]
@@ -12344,6 +12473,171 @@ const TM_FIELD_SIZE: usize = 1; // Int: number of entries
 const TM_FIELD_COMPARATOR: usize = 2; // Comparator object or null
 const TM_NUM_FIELDS: usize = 3;
 const TM_DEFAULT_CAPACITY: usize = 16; // initial entry slots (array len = 32)
+
+/// Natural-order key supported by the fast-mode TreeMap. Variants are
+/// ordered so the derived `Ord` matches Java's natural ordering for
+/// homogeneous-typed maps (String, Integer, Long). Mixed-type maps
+/// disable fast mode (the array path handles them via `natural_compare`).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TreeKey {
+    Str(String),
+    I32(i32),
+    I64(i64),
+}
+
+/// Try to extract a fast-mode key from a Java value. Returns None for
+/// types that need a Java-side `compareTo` callback (custom Comparable
+/// objects, non-primitive wrappers, etc.); the caller falls back to the
+/// array path.
+fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
+    match v {
+        Value::Int(i) => Some(TreeKey::I32(*i)),
+        Value::Long(l) => Some(TreeKey::I64(*l)),
+        Value::Object(Some(o)) => {
+            // String fast path
+            if let Some(s) = ctx.read_string(*o) {
+                return Some(TreeKey::Str(s));
+            }
+            // Integer / Long boxes: field 0 is the wrapped primitive.
+            match ctx.get_field(*o, 0) {
+                Value::Int(i) => Some(TreeKey::I32(i)),
+                Value::Long(l) => Some(TreeKey::I64(l)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Per-TreeMap fast-mode side-table. The outer key is the synthetic
+/// receiver's address; the inner BTreeMap is the authoritative store
+/// for fast-mode maps (mirroring is avoided — when fast mode is active,
+/// the array slot is left empty and we read from the BTreeMap).
+fn tm_fast_table() -> &'static Mutex<StdHashMap<usize, std::collections::BTreeMap<TreeKey, Value>>>
+{
+    static T: std::sync::OnceLock<
+        Mutex<StdHashMap<usize, std::collections::BTreeMap<TreeKey, Value>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+fn tm_obj_key(this: ObjectRef) -> usize {
+    this.as_ptr() as usize
+}
+
+/// Returns true if this TreeMap is currently using the BTreeMap fast path.
+/// Determined by:
+///   1. comparator field is null/absent (custom Comparator → array path), AND
+///   2. a fast-mode entry exists in `tm_fast_table` (set on first put when
+///      the first key is extractable into a TreeKey).
+///
+/// Empty TreeMaps with null comparator are tentatively "fast-eligible" —
+/// the first non-extractable key flips them to array mode.
+fn tm_is_fast_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_fast_table().lock().unwrap().contains_key(&tm_obj_key(this))
+}
+
+/// True if the comparator slot is null. Custom Comparator forces array mode
+/// because we can't replicate user-defined ordering in a Rust BTreeMap.
+fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field(this, TM_FIELD_COMPARATOR), Value::Object(None))
+}
+
+/// Borrow the fast-mode BTreeMap mutably and call `f`. Creates the entry
+/// if missing. Caller must ensure they only invoke this when fast mode
+/// is applicable (no comparator, etc.).
+fn tm_fast_with<R>(
+    this: ObjectRef,
+    f: impl FnOnce(&mut std::collections::BTreeMap<TreeKey, Value>) -> R,
+) -> R {
+    let mut map = tm_fast_table().lock().unwrap();
+    let bt = map.entry(tm_obj_key(this)).or_default();
+    f(bt)
+}
+
+/// "Sticky" flag side-table — once a TreeMap is forced to array mode
+/// (e.g. by a non-extractable key) it stays there for its lifetime so
+/// we never split state across both stores.
+fn tm_force_array_set() -> &'static Mutex<StdHashMap<usize, ()>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, ()>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+fn tm_force_array_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_force_array_set().lock().unwrap().contains_key(&tm_obj_key(this))
+}
+fn tm_set_force_array(_ctx: &dyn NativeContext, this: ObjectRef) {
+    tm_force_array_set().lock().unwrap().insert(tm_obj_key(this), ());
+}
+
+/// Migrate any fast-mode entries to the array store, then remove the
+/// fast-mode side-table entry. Called when a non-extractable key arrives
+/// at a map that previously had fast-mode entries — keeps state coherent
+/// across the mode flip without losing data.
+fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // Snapshot fast-mode entries first, then drop the side-table entry.
+    let entries: Vec<(TreeKey, Value)> = tm_fast_with(this, |bt| {
+        bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    });
+    tm_fast_table().lock().unwrap().remove(&tm_obj_key(this));
+    if entries.is_empty() {
+        return;
+    }
+    // Box keys back to Java wrappers and insert via the array path.
+    let boxed: Vec<(Value, Value)> = entries
+        .into_iter()
+        .map(|(k, v)| (tree_key_to_value(ctx, &k), v))
+        .collect();
+    // Reset size counter — the array put loop will re-establish it.
+    ctx.set_field(this, TM_FIELD_SIZE, Value::Int(0));
+    // Ensure data array exists.
+    if matches!(ctx.get_field(this, TM_FIELD_DATA), Value::Object(None)) {
+        let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+        ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    }
+    // Now insert each entry through the array path. The fast-mode check
+    // in `native_tm_put` will skip because `tm_force_array_set` is set
+    // before we get here (caller's responsibility).
+    for (k, v) in boxed {
+        let _ = native_tm_put(ctx, &[Value::Object(Some(this)), k, v]);
+    }
+}
+
+/// Convert a TreeKey back to a Java `Value` for return values that need
+/// the original key (firstKey, ceilingKey, etc.). Boxes primitives to
+/// the corresponding wrapper class; reuses the standard `Integer.valueOf`
+/// / `Long.valueOf` / `String` paths via the NativeContext.
+fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
+    match k {
+        TreeKey::Str(s) => Value::Object(Some(ctx.create_string(s))),
+        TreeKey::I32(i) => {
+            // Box via Integer.valueOf
+            let boxed = ctx
+                .invoke(
+                    "java/lang/Integer",
+                    "valueOf",
+                    "(I)Ljava/lang/Integer;",
+                    &[Value::Int(*i)],
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            boxed
+        }
+        TreeKey::I64(l) => {
+            let boxed = ctx
+                .invoke(
+                    "java/lang/Long",
+                    "valueOf",
+                    "(J)Ljava/lang/Long;",
+                    &[Value::Long(*l)],
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            boxed
+        }
+    }
+}
 
 // TreeSet — sorted set backed by sorted array
 const TS_FIELD_DATA: usize = 0; // Object[] sorted elements
@@ -12580,6 +12874,37 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    // Round-9 HIGH (MED-8 carryover): fast-mode BTreeMap path. Eligible
+    // when no custom Comparator was supplied AND the key extracts into
+    // a TreeKey (String / Integer / Long). For an empty map this also
+    // *enables* fast mode by creating the side-table entry.
+    if tm_has_no_comparator(ctx, this) && !tm_force_array_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            // If the map already has entries in array mode (e.g. from an
+            // earlier non-extractable key), fall through to the array
+            // path to avoid splitting state across two stores.
+            let already_in_array = matches!(ctx.get_field(this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
+                && !tm_is_fast_mode(ctx, this);
+            if !already_in_array {
+                let (old, new_size) = tm_fast_with(this, |bt| {
+                    let old = bt.insert(tk, value).unwrap_or(Value::Object(None));
+                    (old, bt.len() as i32)
+                });
+                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                return Ok(Some(old));
+            }
+        } else {
+            // Non-extractable key → force array mode permanently for this map.
+            // If fast-mode had accumulated entries, migrate them first so
+            // we don't split state across two stores.
+            tm_set_force_array(ctx, this);
+            if tm_is_fast_mode(ctx, this) {
+                tm_migrate_fast_to_array(ctx, this);
+            }
+        }
+    }
+
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12613,6 +12938,14 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let v = tm_fast_with(this, |bt| bt.get(&tk).copied().unwrap_or(Value::Object(None)));
+            return Ok(Some(v));
+        }
+        // Fast-mode map asked for a non-extractable key → not present.
+        return Ok(Some(Value::Object(None)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12630,6 +12963,17 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let (old, new_size) = tm_fast_with(this, |bt| {
+                let old = bt.remove(&tk).unwrap_or(Value::Object(None));
+                (old, bt.len() as i32)
+            });
+            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+            return Ok(Some(old));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12652,6 +12996,13 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let found = tm_fast_with(this, |bt| bt.contains_key(&tk));
+            return Ok(Some(Value::Int(i32::from(found))));
+        }
+        return Ok(Some(Value::Int(0)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12667,6 +13018,15 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        let values: Vec<Value> = tm_fast_with(this, |bt| bt.values().copied().collect());
+        for v in values {
+            if values_equal(ctx, &v, &target) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        return Ok(Some(Value::Int(0)));
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12710,6 +13070,9 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Fast-mode side-table needs clearing too — without this an iter
+    // helper would return stale entries from before the clear.
+    tm_fast_with(this, |bt| bt.clear());
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, TM_FIELD_SIZE, Value::Int(0));
@@ -12726,6 +13089,18 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
+    if tm_is_fast_mode(ctx, this) {
+        let first = tm_fast_with(this, |bt| bt.keys().next().cloned());
+        match first {
+            Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
+            None => {
+                return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                    message: "TreeMap is empty".to_string(),
+                }
+                .into())
+            }
+        }
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
         return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
@@ -12747,6 +13122,18 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
+    if tm_is_fast_mode(ctx, this) {
+        let last = tm_fast_with(this, |bt| bt.keys().next_back().cloned());
+        match last {
+            Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
+            None => {
+                return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                    message: "TreeMap is empty".to_string(),
+                }
+                .into())
+            }
+        }
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
         return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
@@ -12765,6 +13152,13 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let res = tm_fast_with(this, |bt| bt.range(tk..).next().map(|(k, _)| k.clone()));
+            return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12789,6 +13183,15 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let res = tm_fast_with(this, |bt| {
+                bt.range(..=tk).next_back().map(|(k, _)| k.clone())
+            });
+            return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12813,6 +13216,18 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            use std::ops::Bound;
+            let res = tm_fast_with(this, |bt| {
+                bt.range((Bound::Excluded(tk), Bound::Unbounded))
+                    .next()
+                    .map(|(k, _)| k.clone())
+            });
+            return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12844,6 +13259,18 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            use std::ops::Bound;
+            let res = tm_fast_with(this, |bt| {
+                bt.range((Bound::Unbounded, Bound::Excluded(tk)))
+                    .next_back()
+                    .map(|(k, _)| k.clone())
+            });
+            return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -12879,6 +13306,17 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if tm_is_fast_mode(ctx, this) {
+        let first = tm_fast_with(this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
+        match first {
+            Some((tk, v)) => {
+                let k = tree_key_to_value(ctx, &tk);
+                let entry = tm_make_entry(ctx, k, v);
+                return Ok(Some(Value::Object(Some(entry))));
+            }
+            None => return Ok(Some(Value::Object(None))),
+        }
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
         return Ok(Some(Value::Object(None)));
@@ -12895,6 +13333,17 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if tm_is_fast_mode(ctx, this) {
+        let last = tm_fast_with(this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
+        match last {
+            Some((tk, v)) => {
+                let k = tree_key_to_value(ctx, &tk);
+                let entry = tm_make_entry(ctx, k, v);
+                return Ok(Some(Value::Object(Some(entry))));
+            }
+            None => return Ok(Some(Value::Object(None))),
+        }
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
         return Ok(Some(Value::Object(None)));
@@ -12912,6 +13361,22 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if tm_is_fast_mode(ctx, this) {
+        let removed = tm_fast_with(this, |bt| {
+            let first = bt.iter().next().map(|(k, _)| k.clone())?;
+            let v = bt.remove(&first)?;
+            Some((first, v, bt.len() as i32))
+        });
+        match removed {
+            Some((tk, v, new_size)) => {
+                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                let k = tree_key_to_value(ctx, &tk);
+                let entry = tm_make_entry(ctx, k, v);
+                return Ok(Some(Value::Object(Some(entry))));
+            }
+            None => return Ok(Some(Value::Object(None))),
+        }
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
         return Ok(Some(Value::Object(None)));
@@ -12930,6 +13395,22 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if tm_is_fast_mode(ctx, this) {
+        let removed = tm_fast_with(this, |bt| {
+            let last = bt.iter().next_back().map(|(k, _)| k.clone())?;
+            let v = bt.remove(&last)?;
+            Some((last, v, bt.len() as i32))
+        });
+        match removed {
+            Some((tk, v, new_size)) => {
+                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                let k = tree_key_to_value(ctx, &tk);
+                let entry = tm_make_entry(ctx, k, v);
+                return Ok(Some(Value::Object(Some(entry))));
+            }
+            None => return Ok(Some(Value::Object(None))),
+        }
+    }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
         return Ok(Some(Value::Object(None)));
@@ -12950,20 +13431,45 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, comparator) = tm_state(ctx, this);
-    // Return a TreeSet with the same comparator and keys in order
+    let pairs = tm_collect_pairs(ctx, this);
+    let size = pairs.len() as i32;
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
-    let buf = alloc_ref_array(ctx, std::cmp::max(size as usize, TS_DEFAULT_CAPACITY));
-    if let Some(data) = data_opt {
-        for i in 0..(size as usize) {
-            let k = ctx.get_array_element(data, i * 2);
-            ctx.set_array_element(buf, i, k);
-        }
+    let buf = alloc_ref_array(ctx, std::cmp::max(pairs.len(), TS_DEFAULT_CAPACITY));
+    for (i, (k, _)) in pairs.iter().enumerate() {
+        ctx.set_array_element(buf, i, *k);
     }
     ctx.set_field(ts, TS_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(ts, TS_FIELD_SIZE, Value::Int(size));
+    let comparator = ctx.get_field(this, TM_FIELD_COMPARATOR);
     ctx.set_field(ts, TS_FIELD_COMPARATOR, comparator);
     Ok(Some(Value::Object(Some(ts))))
+}
+
+/// Collect (key, value) pairs in sorted order for both fast and array modes.
+/// Boxes fast-mode primitive keys back to Java wrapper objects after
+/// releasing the side-table lock (boxing may re-enter the VM).
+fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    if tm_is_fast_mode(ctx, this) {
+        let raw: Vec<(TreeKey, Value)> = tm_fast_with(this, |bt| {
+            bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        });
+        raw.into_iter()
+            .map(|(k, v)| (tree_key_to_value(ctx, &k), v))
+            .collect()
+    } else {
+        let (data_opt, size, _) = tm_state(ctx, this);
+        let data = match data_opt {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(size as usize);
+        for i in 0..(size as usize) {
+            let k = ctx.get_array_element(data, i * 2);
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            out.push((k, v));
+        }
+        out
+    }
 }
 
 fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12971,17 +13477,14 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, _) = tm_state(ctx, this);
-    // Return an ArrayList with values in order
+    let pairs = tm_collect_pairs(ctx, this);
+    let size = pairs.len() as i32;
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
-    if let Some(data) = data_opt {
-        for i in 0..(size as usize) {
-            let v = ctx.get_array_element(data, i * 2 + 1);
-            ctx.set_array_element(buf, i, v);
-        }
+    for (i, (_, v)) in pairs.iter().enumerate() {
+        ctx.set_array_element(buf, i, *v);
     }
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, size);
@@ -12993,19 +13496,15 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, _) = tm_state(ctx, this);
-    // Return an ArrayList of Map$Entry objects in sorted order
+    let pairs = tm_collect_pairs(ctx, this);
+    let size = pairs.len() as i32;
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
-    if let Some(data) = data_opt {
-        for i in 0..(size as usize) {
-            let k = ctx.get_array_element(data, i * 2);
-            let v = ctx.get_array_element(data, i * 2 + 1);
-            let entry = tm_make_entry(ctx, k, v);
-            ctx.set_array_element(buf, i, Value::Object(Some(entry)));
-        }
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
+        let entry = tm_make_entry(ctx, k, v);
+        ctx.set_array_element(buf, i, Value::Object(Some(entry)));
     }
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, size);
@@ -13021,14 +13520,8 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let (data_opt, size, _) = tm_state(ctx, this);
-    let data = match data_opt {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    for i in 0..(size as usize) {
-        let k = ctx.get_array_element(data, i * 2);
-        let v = ctx.get_array_element(data, i * 2 + 1);
+    let pairs = tm_collect_pairs(ctx, this);
+    for (k, v) in pairs {
         ctx.invoke_virtual(
             action,
             "accept",
@@ -13046,6 +13539,13 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let v = tm_fast_with(this, |bt| bt.get(&tk).copied());
+            return Ok(Some(v.unwrap_or(default)));
+        }
+        return Ok(Some(default));
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -13064,6 +13564,32 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // Fast-mode eligibility check mirrors `native_tm_put`.
+    if tm_has_no_comparator(ctx, this) && !tm_force_array_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let already_in_array = matches!(ctx.get_field(this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
+                && !tm_is_fast_mode(ctx, this);
+            if !already_in_array {
+                let (existing, new_size) = tm_fast_with(this, |bt| {
+                    use std::collections::btree_map::Entry;
+                    match bt.entry(tk) {
+                        Entry::Occupied(o) => (Some(*o.get()), bt.len() as i32),
+                        Entry::Vacant(v) => {
+                            v.insert(value);
+                            (None, bt.len() as i32)
+                        }
+                    }
+                });
+                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                return Ok(Some(existing.unwrap_or(Value::Object(None))));
+            }
+        } else {
+            tm_set_force_array(ctx, this);
+            if tm_is_fast_mode(ctx, this) {
+                tm_migrate_fast_to_array(ctx, this);
+            }
+        }
+    }
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -13138,19 +13664,15 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, _) = tm_state(ctx, this);
+    let pairs = tm_collect_pairs(ctx, this);
     let mut buf = String::from("{");
-    if let Some(data) = data_opt {
-        for i in 0..(size as usize) {
-            if i > 0 {
-                buf.push_str(", ");
-            }
-            let k = ctx.get_array_element(data, i * 2);
-            let v = ctx.get_array_element(data, i * 2 + 1);
-            buf.push_str(&obj_to_display_string(ctx, &k));
-            buf.push('=');
-            buf.push_str(&obj_to_display_string(ctx, &v));
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
         }
+        buf.push_str(&obj_to_display_string(ctx, k));
+        buf.push('=');
+        buf.push_str(&obj_to_display_string(ctx, v));
     }
     buf.push('}');
     let s = ctx.create_string(&buf);
@@ -13260,35 +13782,25 @@ fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, comparator) = tm_state(ctx, this);
-    let data = match data_opt {
-        Some(d) => d,
-        None => {
-            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-            ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
-            buf
-        }
-    };
-    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
-    match search {
-        Ok(idx) => {
-            let existing = ctx.get_array_element(data, idx * 2 + 1);
-            Ok(Some(existing))
-        }
-        Err(pos) => {
-            let result = ctx.invoke_virtual(
-                mapper,
-                "apply",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[key],
-            )?;
-            let val = result.unwrap_or(Value::Object(None));
-            let data = tm_ensure_capacity(ctx, this, size, data);
-            tm_insert_at(ctx, data, size, pos, key, val);
-            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size + 1));
-            Ok(Some(val))
-        }
+    // Round-9 HIGH: route through `native_tm_get` / `native_tm_put` so the
+    // fast-mode BTreeMap path applies for natural-ordering maps.
+    let existing = native_tm_get(ctx, &[Value::Object(Some(this)), key])?
+        .unwrap_or(Value::Object(None));
+    if !matches!(existing, Value::Object(None)) {
+        return Ok(Some(existing));
     }
+    let result = ctx.invoke_virtual(
+        mapper,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key],
+    )?;
+    let val = result.unwrap_or(Value::Object(None));
+    if matches!(val, Value::Object(None)) {
+        return Ok(Some(Value::Object(None)));
+    }
+    native_tm_put(ctx, &[Value::Object(Some(this)), key, val])?;
+    Ok(Some(val))
 }
 
 fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13302,36 +13814,28 @@ fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, comparator) = tm_state(ctx, this);
-    let data = match data_opt {
-        Some(d) => d,
-        None => {
-            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-            ctx.set_field(this, TM_FIELD_DATA, Value::Object(Some(buf)));
-            buf
-        }
+    // Round-9 HIGH: route through `native_tm_get` / `native_tm_put` so the
+    // fast-mode BTreeMap path applies for natural-ordering maps.
+    let existing = native_tm_get(ctx, &[Value::Object(Some(this)), key])?
+        .unwrap_or(Value::Object(None));
+    let new_val = if matches!(existing, Value::Object(None)) {
+        value
+    } else {
+        let merged = ctx.invoke_virtual(
+            remap_fn,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[existing, value],
+        )?;
+        merged.unwrap_or(Value::Object(None))
     };
-    let search = tm_binary_search(ctx, data, size, &comparator, &key)?;
-    match search {
-        Ok(idx) => {
-            let old_val = ctx.get_array_element(data, idx * 2 + 1);
-            let merged = ctx.invoke_virtual(
-                remap_fn,
-                "apply",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                &[old_val, value],
-            )?;
-            let new_val = merged.unwrap_or(Value::Object(None));
-            ctx.set_array_element(data, idx * 2 + 1, new_val);
-            Ok(Some(new_val))
-        }
-        Err(pos) => {
-            let data = tm_ensure_capacity(ctx, this, size, data);
-            tm_insert_at(ctx, data, size, pos, key, value);
-            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(size + 1));
-            Ok(Some(value))
-        }
+    if matches!(new_val, Value::Object(None)) {
+        // JDK Map.merge contract: null result removes the mapping.
+        native_tm_remove(ctx, &[Value::Object(Some(this)), key])?;
+        return Ok(Some(Value::Object(None)));
     }
+    native_tm_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    Ok(Some(new_val))
 }
 
 // TreeMap key iterator: snapshot-based, returns keys in sorted order
@@ -13340,13 +13844,12 @@ fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, _) = tm_state(ctx, this);
-    let snap = alloc_ref_array(ctx, size as usize);
-    if let Some(data) = data_opt {
-        for i in 0..(size as usize) {
-            let k = ctx.get_array_element(data, i * 2);
-            ctx.set_array_element(snap, i, k);
-        }
+    // Both fast and array modes go through the shared snapshot helper so
+    // the iterator sees sorted-order keys regardless of backing store.
+    let pairs = tm_collect_pairs(ctx, this);
+    let snap = alloc_ref_array(ctx, pairs.len().max(1));
+    for (i, (k, _)) in pairs.iter().enumerate() {
+        ctx.set_array_element(snap, i, *k);
     }
     let itr = alloc_synthetic(ctx, "java/util/TreeMap$KeyItr", 2);
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
@@ -16377,13 +16880,21 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
         native_lbq_iterator,
     );
 
-    // ConcurrentLinkedQueue
+    // ConcurrentLinkedQueue — thread-safety wrappers (round-5 Fix 2 HIGH).
+    //
+    // The raw `native_lbq_offer_bool` / `native_lbq_poll` do unsynchronised
+    // array shifts that corrupt under concurrent producer+consumer load
+    // (read-modify-write of LBQ_FIELD_SIZE races; element-shift in `poll`
+    // races against `offer` appending at `size`). Real CLQ is lock-free
+    // (Michael-Scott queue); we approximate the *correctness* guarantee
+    // by serialising every op on the `this` monitor. Not lock-free in
+    // throughput, but at least no torn updates.
     let clq = "java/util/concurrent/ConcurrentLinkedQueue";
     r.register(clq, "<init>", "()V", native_lbq_init);
-    r.register(clq, "offer", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
-    r.register(clq, "add", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
-    r.register(clq, "poll", "()Ljava/lang/Object;", native_lbq_poll);
-    r.register(clq, "peek", "()Ljava/lang/Object;", native_lbq_peek);
+    r.register(clq, "offer", "(Ljava/lang/Object;)Z", native_clq_offer);
+    r.register(clq, "add", "(Ljava/lang/Object;)Z", native_clq_offer);
+    r.register(clq, "poll", "()Ljava/lang/Object;", native_clq_poll);
+    r.register(clq, "peek", "()Ljava/lang/Object;", native_clq_peek);
     r.register(clq, "size", "()I", native_lbq_size);
     r.register(clq, "isEmpty", "()Z", native_lbq_is_empty);
     r.register(
@@ -16400,34 +16911,34 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
         native_lbq_iterator,
     );
 
-    // ConcurrentLinkedDeque
+    // ConcurrentLinkedDeque — same synchronisation rationale as CLQ.
     let cld = "java/util/concurrent/ConcurrentLinkedDeque";
     r.register(cld, "<init>", "()V", native_lbq_init);
     r.register(
         cld,
         "offerFirst",
         "(Ljava/lang/Object;)Z",
-        native_lbq_offer_bool,
+        native_cld_offer_first,
     );
     r.register(
         cld,
         "offerLast",
         "(Ljava/lang/Object;)Z",
-        native_lbq_offer_bool,
+        native_clq_offer,
     );
-    r.register(cld, "pollFirst", "()Ljava/lang/Object;", native_lbq_poll);
+    r.register(cld, "pollFirst", "()Ljava/lang/Object;", native_clq_poll);
     r.register(
         cld,
         "pollLast",
         "()Ljava/lang/Object;",
-        native_lbq_poll_last,
+        native_cld_poll_last,
     );
-    r.register(cld, "peekFirst", "()Ljava/lang/Object;", native_lbq_peek);
+    r.register(cld, "peekFirst", "()Ljava/lang/Object;", native_clq_peek);
     r.register(
         cld,
         "peekLast",
         "()Ljava/lang/Object;",
-        native_lbq_peek_last,
+        native_cld_peek_last,
     );
     r.register(cld, "size", "()I", native_lbq_size);
     r.register(cld, "isEmpty", "()Z", native_lbq_is_empty);
@@ -16437,6 +16948,105 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Iterator;",
         native_lbq_iterator,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round-5 Fix 2 (HIGH): synchronised CLQ/CLD wrappers
+// ---------------------------------------------------------------------------
+//
+// Real JDK ConcurrentLinkedQueue/Deque are lock-free (Michael-Scott /
+// concurrent doubly-linked-list). Our synthetic backing is an ArrayList,
+// which the LBQ helpers mutate with unsynchronised read-modify-write
+// sequences. Producer+consumer racing would tear the size counter and
+// drop or duplicate elements.
+//
+// These wrappers acquire the `this`-object monitor around each op so the
+// observable behaviour is serialisable. monitor_enter/exit on `this` is
+// also what real JDK code would synchronise on for
+// `Collections.synchronizedQueue(queue)`, so semantically identical from
+// the bytecode side. NOT lock-free in the throughput sense; treat as a
+// correctness-only stopgap until a real Michael-Scott port lands.
+
+fn native_clq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    ctx.monitor_enter(this);
+    let r = native_lbq_offer_bool(ctx, args);
+    ctx.monitor_exit(this);
+    r
+}
+
+fn native_clq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    ctx.monitor_enter(this);
+    let r = native_lbq_poll(ctx, args);
+    ctx.monitor_exit(this);
+    r
+}
+
+fn native_clq_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    ctx.monitor_enter(this);
+    let r = native_lbq_peek(ctx, args);
+    ctx.monitor_exit(this);
+    r
+}
+
+fn native_cld_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    ctx.monitor_enter(this);
+    let r = native_lbq_poll_last(ctx, args);
+    ctx.monitor_exit(this);
+    r
+}
+
+fn native_cld_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    ctx.monitor_enter(this);
+    let r = native_lbq_peek_last(ctx, args);
+    ctx.monitor_exit(this);
+    r
+}
+
+/// offerFirst — prepend element; ArrayList backing means O(n) shift but
+/// correctness is preserved under concurrent access via the `this` monitor.
+fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let elem = args.get(1).cloned().unwrap_or(Value::Object(None));
+    ctx.monitor_enter(this);
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    lbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(0)));
+        }
+    };
+    // Shift elements right to make room at index 0.
+    if size > 0 {
+        for i in (1..=(size as usize)).rev() {
+            ctx.set_array_element(arr, i, ctx.get_array_element(arr, i - 1));
+        }
+    }
+    ctx.set_array_element(arr, 0, elem);
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size + 1));
+    ctx.monitor_exit(this);
+    Ok(Some(Value::Int(1)))
 }
 
 // Blocking queue implementations — backed by ArrayList internally for simplicity

@@ -840,6 +840,7 @@ pub fn push_to_thread_ring(ev: EventInstance) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     fn make_event(type_id: EventTypeId, start: u64, end: u64) -> EventInstance {
         EventInstance {
@@ -847,7 +848,7 @@ mod tests {
             start_time: start,
             end_time: end,
             thread_id: 1,
-            fields: vec![],
+            fields: smallvec![],
         }
     }
 

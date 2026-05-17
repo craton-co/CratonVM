@@ -187,7 +187,19 @@ pub fn update_all_roots(
     }
 
     // 12. Scoped value bindings (JEP 446)
-    for (_key, val) in &mut thread.scoped_values {
+    //
+    // Round-9 GC fix: also remap the ScopedValue KEY ObjectRef when present
+    // (previous code only remapped values). Without this, a moving GC
+    // would leave the key pointing at a stale post-compaction address —
+    // a use-after-free on the next `Carrier.get` traversal.
+    for (_key_id, key_ref, val) in &mut thread.scoped_values {
+        if let Some(obj_ref) = key_ref {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
         update_value_ref(val, pointer_map);
     }
 
@@ -215,6 +227,11 @@ pub fn update_all_roots(
     //     remap them here, otherwise the next cache lookup returns a
     //     stale pointer.
     rustjvm_native_builtins::lang_math::gc_update_value_of_cache_refs(pointer_map);
+
+    // 16. Round-9 perf + GC fix: re-point the process-global LambdaMetafactory
+    //     CallSite cache living in `native-builtins/src/lang_invoke.rs`.
+    //     Same scan/update contract as the Integer.valueOf cache.
+    rustjvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);

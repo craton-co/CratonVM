@@ -49,8 +49,41 @@ fn compile_files(files: &[PathBuf], out_dir: &Path, extra_args: &[&str], log_fai
     true
 }
 
+/// Round-11 cross-cutting HIGH-6 (round-9 MED-10): cache the result of
+/// the `javac -version` availability probe in `OUT_DIR`. Without the
+/// cache this `Command::new("javac")` fork/exec runs on EVERY
+/// incremental build of the `rustjvm-vm` crate — even when no .java
+/// source changed. On Windows the `CreateProcess` + JVM startup cost
+/// alone is ~200ms; on macOS the toolchain shim adds another ~100ms.
+///
+/// Cache strategy: write `present` or `absent` to
+/// `$OUT_DIR/javac-version.txt` after the first probe. Subsequent
+/// builds read the cache and skip the shell-out. The cache is
+/// invalidated automatically when:
+///   * `OUT_DIR` is wiped (`cargo clean`).
+///   * The user updates their `PATH` and triggers a rerun via the
+///     `cargo:rerun-if-env-changed=PATH` directive we emit below.
+///   * The Java sources change (existing `cargo:rerun-if-changed`).
+fn javac_available_cached(out_dir: &Path) -> bool {
+    let cache_path = out_dir.join("javac-version.txt");
+    if let Ok(prev) = std::fs::read_to_string(&cache_path) {
+        return prev.trim() == "present";
+    }
+    let javac_check = Command::new("javac").arg("-version").output();
+    let present = javac_check.is_ok_and(|o| o.status.success());
+    // Best-effort cache write; if the FS is read-only we'll just
+    // shell out again next build (no correctness impact).
+    let _ = std::fs::write(
+        &cache_path,
+        if present { "present" } else { "absent" },
+    );
+    present
+}
+
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir_var = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+    let out_dir = Path::new(&out_dir_var);
     // Java files live under `tests/resources/rustjvm/`; the classpath
     // used by the integration tests is `tests/resources/`, so every
     // `.class` must land one level up from the sources (output dir =
@@ -59,8 +92,18 @@ fn main() {
     let sources_dir = Path::new(&manifest_dir).join("tests/resources/rustjvm");
     let output_dir = Path::new(&manifest_dir).join("tests/resources");
 
-    // Re-run if any Java source changes
+    // Round-11 cross-cutting HIGH-6: declare an explicit allow-list of
+    // rerun triggers so cargo does not re-execute this build script on
+    // every unrelated change in the crate.
+    //   * .java sources: existing trigger (preserved).
+    //   * build.rs itself: cargo emits this implicitly, but listing it
+    //     keeps the contract obvious.
+    //   * PATH env var: if the user adds/removes a JDK from PATH, the
+    //     `javac_available_cached` result must be re-probed.
     println!("cargo:rerun-if-changed=tests/resources/rustjvm/");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=JAVA_HOME");
 
     // Collect all .java files
     let java_files: Vec<PathBuf> = std::fs::read_dir(&sources_dir)
@@ -75,9 +118,11 @@ fn main() {
         return;
     }
 
-    // Check if javac is available
-    let javac_check = Command::new("javac").arg("-version").output();
-    let javac_available = javac_check.is_ok_and(|o| o.status.success());
+    // Round-11 cross-cutting HIGH-6: cached javac availability probe.
+    // The first incremental build runs `javac -version` once; every
+    // subsequent build reads $OUT_DIR/javac-version.txt and avoids the
+    // 100-200 ms fork/exec.
+    let javac_available = javac_available_cached(out_dir);
 
     if !javac_available {
         println!(

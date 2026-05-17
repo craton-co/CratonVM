@@ -1063,10 +1063,23 @@ impl GenerationalHeap {
     ///    marks the card table entry dirty (for minor GC).
     /// 2. **SATB logging:** If concurrent marking is active, logs the *old*
     ///    reference value to the SATB queue (for concurrent GC correctness).
+    ///
+    /// Round-5 #11 (perf) — the previous implementation dereferenced the
+    /// object header twice on the hot path: once to inspect
+    /// `header.gc_flags` on the *source*, then a second time on the
+    /// *target*. Each dereference is a cache-line load on a separate
+    /// object and both are pure waste — the same information is already
+    /// encoded in the address ranges of the old-gen arena. The card
+    /// table caches those bounds (it must, in order to compute card
+    /// indices), so we route the gen-check through it and skip both
+    /// header reads entirely. The cost on the common path drops from
+    /// "two L1/L2 misses + two flag tests" to "two integer range
+    /// comparisons" — the same pattern that round-10 used for
+    /// `post_write_barrier_rset` (per-thread region cache).
     #[inline]
     pub fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
         // FAST PATH: only reference stores can produce a cross-gen edge.
-        // Bail out BEFORE touching the object header for primitive/null
+        // Bail out BEFORE touching either object header for primitive/null
         // stores so the barrier cost on the common (primitive) path is
         // a single tag check.
         let target_ref = match stored_value {
@@ -1074,29 +1087,43 @@ impl GenerationalHeap {
             _ => return,
         };
 
-        let obj_ptr = obj.as_ptr();
-        // SAFETY: `obj` is a live heap ObjectRef, so its pointer targets a valid
-        // ObjectHeader within a heap arena.
-        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        let src_addr = obj.as_ptr() as usize;
+        let dst_addr = target_ref.as_ptr() as usize;
 
-        // Card table barrier: source in old gen, target in young gen.
-        if header.gc_flags & GC_FLAG_OLD_GEN != 0 {
-            // SAFETY: `target_ref` is a live heap ObjectRef (the value just stored),
-            // so its pointer targets a valid ObjectHeader.
-            let target_header = unsafe { &*(target_ref.as_ptr() as *const ObjectHeader) };
-            if target_header.gc_flags & GC_FLAG_OLD_GEN == 0 {
-                // T5.5.2 — route through the thread-local batched dirty
-                // path instead of taking the global card_table mutex on
-                // every reference store. The offset is queued in this
-                // mutator's per-thread buffer (no shared lock) and
-                // flushed into the shared `pending_offsets` either when
-                // the buffer hits THREAD_BUFFER_FLUSH_THRESHOLD entries
-                // or when the collector drains at GC start. The shared
-                // `cards` bitmap is updated by `drain_pending` while the
-                // GC holds the card_table mutex exclusively.
-                self.card_table.thread_local_dirty_addr(obj_ptr as usize);
-            }
+        // Round-5 #11 fix: replace the two header dereferences with two
+        // pure address-range comparisons against the cached old-gen
+        // bounds. The card table already stores `base_addr` and
+        // `region_size` for the old-gen arena (it has to — every dirty
+        // entry is indexed by `(addr - base) / CARD_SIZE`). Reading
+        // those two `usize` fields touches one already-hot cache line
+        // (`self.card_table`) instead of two cold object headers.
+        let old_base = self.card_table.base_addr();
+        let old_end = old_base.wrapping_add(self.card_table.region_size());
+
+        // Source must live in the old-gen arena. If it doesn't, this is
+        // either a young→young store (no card needed) or a write into
+        // GC-internal scratch space; either way, nothing to record.
+        if src_addr < old_base || src_addr >= old_end {
+            return;
         }
+
+        // Target must live OUTSIDE the old-gen arena (i.e. in young) for
+        // the edge to be cross-generational. Old→old refs are followed
+        // by full-heap marking, not the card table.
+        if dst_addr >= old_base && dst_addr < old_end {
+            return;
+        }
+
+        // T5.5.2 — route through the thread-local batched dirty path
+        // instead of taking the global card_table mutex on every
+        // reference store. The offset is queued in this mutator's
+        // per-thread buffer (no shared lock) and flushed into the shared
+        // `pending_offsets` either when the buffer hits
+        // THREAD_BUFFER_FLUSH_THRESHOLD entries or when the collector
+        // drains at GC start. The shared `cards` bitmap is updated by
+        // `drain_pending` while the GC holds the card_table mutex
+        // exclusively.
+        self.card_table.thread_local_dirty_addr(src_addr);
     }
 
     /// SATB write barrier — called BEFORE a reference field is overwritten.
@@ -2501,6 +2528,15 @@ impl GenerationalHeap {
                 let ptr = (base + offset) as *mut u8;
                 // SAFETY: `ptr` is within `young_from.used()` region; reading the header is valid.
                 let header = unsafe { &*(ptr as *const ObjectHeader) };
+                // Round-9 gc CRIT-1: HumongousFiller is a walker sentinel
+                // installed by the regional GC. The generational heap
+                // never allocates humongous, but defensively stop the
+                // scan if the kind byte is the sentinel value (treating
+                // it as a real object would mis-parse the rest of the
+                // stripe).
+                if header.kind == ObjectKind::HumongousFiller {
+                    break;
+                }
                 let total_size = if header.kind == ObjectKind::Array {
                     HEADER_SIZE
                         + array_data_size(header.array_length as usize, header.element_type)

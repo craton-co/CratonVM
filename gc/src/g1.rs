@@ -292,6 +292,15 @@ pub struct G1Collector {
     /// gymnastics for `*mut u8`.
     mark_worklist: Mutex<Vec<usize>>,
 
+    /// Round-9 gc HIGH-5 — set when any `mark_worklist` push is
+    /// dropped because the cap was hit. The marker checks this flag at
+    /// the end of remark and falls back to a conservative full re-walk
+    /// of all live regions: every already-marked object is re-scanned
+    /// and its outgoing references are pushed again. This replaces the
+    /// previous `panic!` (which a hostile Java app could trip) with a
+    /// time/correctness trade — no crash, just longer mark.
+    mark_worklist_overflowed: AtomicBool,
+
     /// Address-to-region lookup table for O(log R) `region_for_ptr` queries.
     ///
     /// Each entry is `(base_addr, region_idx)`, sorted ascending by
@@ -359,6 +368,7 @@ impl G1Collector {
             marking_complete: AtomicBool::new(false),
             mixed_gc_remaining: AtomicU64::new(0),
             mark_worklist: Mutex::new(Vec::new()),
+            mark_worklist_overflowed: AtomicBool::new(false),
             region_lookup,
         }
     }
@@ -659,6 +669,42 @@ impl G1Collector {
             bytes_freed += regions[cset_idx].cursor;
             regions[cset_idx].reset();
         }
+
+        // TODO(round-9 gc HIGH-9, humongous-reclaim-young):
+        // ----------------------------------------------------
+        // Today humongous regions are reclaimed only by the full GC
+        // path. A young-only collection cannot tell whether a
+        // humongous span is unreachable, because:
+        //
+        //   * The humongous start region's RSet records inbound
+        //     cross-region references from *other regions*, but young
+        //     collections don't scan every region's outgoing edges —
+        //     only the CSet's, plus their RSet sources.
+        //   * Continuation regions don't carry their own RSets; the
+        //     HumongousFiller sentinel parks them outside the walker.
+        //   * Roots may pin a humongous span directly (no other
+        //     region in the heap references it), and the young phase
+        //     evacuates roots into Eden/Survivor but doesn't surface
+        //     "this humongous is now unreferenced".
+        //
+        // A correct young-time humongous reclaim would need:
+        //   1. Extend the RSet on the HumongousStart region to track
+        //      inbound refs from *all* regions, not just non-young.
+        //   2. Track root pins per-humongous (e.g. a per-region
+        //      `root_refcount: AtomicU32` updated as roots are
+        //      evacuated, decremented when a slot stops pointing at
+        //      this region's start address).
+        //   3. After phase 5 (CSet free), iterate humongous starts
+        //      and reclaim any whose `rset.is_empty() && root_refcount
+        //      == 0`. Reclamation must zero both the start region
+        //      and every contiguous continuation region.
+        //
+        // None of (1)..(3) are local edits; they touch the RSet
+        // schema and the root-evacuation loop. Deferred to a focused
+        // change. Until then, humongous garbage is only collected on
+        // full GC, which is functionally correct but means long-lived
+        // mutators that churn humongous allocations will see
+        // unnecessary heap growth between full GCs.
 
         // Reset current eden if it was in the CSet
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -1362,6 +1408,9 @@ impl G1Collector {
             }
         }
         self.mark_worklist.lock().clear();
+        // Round-9 gc HIGH-5: reset overflow indicator at cycle start so
+        // a previous cycle's overflow doesn't trigger a needless rescan.
+        self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
         self.gc_state
             .set_phase(ConcurrentGcPhase::ConcurrentMark);
     }
@@ -1398,7 +1447,7 @@ impl G1Collector {
         while remaining > 0 {
             let obj_addr = match worklist.pop() {
                 Some(a) => a,
-                None => return true, // gray set empty: marking complete
+                None => break, // gray set empty for now — see overflow handling below
             };
             remaining -= 1;
 
@@ -1428,8 +1477,58 @@ impl G1Collector {
             self.scan_object_refs(obj_ptr, header, &regions, &mut worklist);
         }
 
-        // Ran out of budget but still have work — caller should call again.
-        worklist.is_empty()
+        if !worklist.is_empty() {
+            // Ran out of budget but still have work — caller should call again.
+            return false;
+        }
+
+        // Round-9 gc HIGH-5 — graceful overflow handling. If any push
+        // was dropped earlier in this cycle, the transitive closure is
+        // incomplete: dropped objects were never scanned, so their
+        // children may be unmarked despite being live. Run a
+        // conservative re-walk: for every marked object in every live
+        // region, re-scan its outgoing references and push any unmarked
+        // targets. The loop bounds the number of recovery passes; once
+        // a full pass causes no new pushes the worklist drains and we
+        // declare marking complete. The bitmap monotonically grows, so
+        // this terminates after a bounded number of passes.
+        if self.mark_worklist_overflowed.load(Ordering::Relaxed) {
+            // Reset the flag so we can detect re-overflow during recovery.
+            self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
+            for region in regions.iter() {
+                if region.region_type == RegionType::Free {
+                    continue;
+                }
+                let base = region.data.as_ptr() as usize;
+                let mut offset = 0usize;
+                while offset < region.cursor {
+                    let obj_addr = base + offset;
+                    // SAFETY: offset < cursor; header is within the region.
+                    let header = unsafe { &*(obj_addr as *const ObjectHeader) };
+                    if is_humongous_filler(header) {
+                        break;
+                    }
+                    let obj_size = object_total_size(header);
+                    if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+                        break;
+                    }
+                    if region.mark_bitmap.is_marked(obj_addr) {
+                        let obj_ptr = obj_addr as *mut u8;
+                        self.scan_object_refs(obj_ptr, header, &regions, &mut worklist);
+                    }
+                    offset += obj_size;
+                }
+            }
+            // Tell the caller to keep stepping — the rescan likely
+            // refilled the worklist with newly-discovered references.
+            // Returning `false` causes the marking loop to call us
+            // again, which will drain whatever the rescan produced.
+            return worklist.is_empty()
+                && !self.mark_worklist_overflowed.load(Ordering::Relaxed);
+        }
+
+        // Worklist empty and no overflow: marking complete.
+        true
     }
 
     /// Scan an object's reference slots; for each in-heap, not-yet-marked
@@ -1478,15 +1577,15 @@ impl G1Collector {
                     let ref_ptr = raw as usize as *mut u8;
                     if let Some(idx) = region_for(ref_ptr) {
                         if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
-                            // Round-5 HIGH #6 — see MARK_WORKLIST_CAP doc.
-                            assert!(
-                                worklist.len() < MARK_WORKLIST_CAP,
-                                "g1: mark_worklist exceeded cap of {} entries — \
-                                 object graph pathology or marker starvation suspected. \
-                                 TODO(round-5+): implement spill/fallback strategy.",
-                                MARK_WORKLIST_CAP
-                            );
-                            worklist.push(ref_ptr as usize);
+                            // Round-9 gc HIGH-5: graceful overflow — drop
+                            // the push and record the event so remark
+                            // can run a conservative full re-walk.
+                            if worklist.len() >= MARK_WORKLIST_CAP {
+                                self.mark_worklist_overflowed
+                                    .store(true, Ordering::Relaxed);
+                            } else {
+                                worklist.push(ref_ptr as usize);
+                            }
                         }
                     }
                 }
@@ -1503,15 +1602,15 @@ impl G1Collector {
                     let ref_ptr = ref_obj.as_ptr();
                     if let Some(idx) = region_for(ref_ptr) {
                         if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
-                            // Round-5 HIGH #6 — see MARK_WORKLIST_CAP doc.
-                            assert!(
-                                worklist.len() < MARK_WORKLIST_CAP,
-                                "g1: mark_worklist exceeded cap of {} entries — \
-                                 object graph pathology or marker starvation suspected. \
-                                 TODO(round-5+): implement spill/fallback strategy.",
-                                MARK_WORKLIST_CAP
-                            );
-                            worklist.push(ref_ptr as usize);
+                            // Round-9 gc HIGH-5: graceful overflow — drop
+                            // the push and record the event so remark
+                            // can run a conservative full re-walk.
+                            if worklist.len() >= MARK_WORKLIST_CAP {
+                                self.mark_worklist_overflowed
+                                    .store(true, Ordering::Relaxed);
+                            } else {
+                                worklist.push(ref_ptr as usize);
+                            }
                         }
                     }
                 }
@@ -1563,16 +1662,17 @@ impl G1Collector {
             }
         };
 
-        // Round-5 HIGH #6 — defensive cap on the gray-set worklist.
-        // See the module-level `MARK_WORKLIST_CAP` for the long-form rationale.
+        // Round-9 gc HIGH-5 — graceful overflow. The previous panic was
+        // reachable from any wide-graph workload (hostile or otherwise);
+        // we now drop the push and set the overflow flag. The marker
+        // (see `concurrent_mark_step` / `cleanup` and the rescan in
+        // `finish_marking`) consults the flag and re-walks all live
+        // regions conservatively before the sweep transition.
+        let overflow_flag = &self.mark_worklist_overflowed;
         let push_with_cap = |worklist: &mut Vec<usize>, addr: usize| {
             if worklist.len() >= MARK_WORKLIST_CAP {
-                panic!(
-                    "g1: mark_worklist exceeded cap of {} entries — object \
-                     graph pathology or marker starvation suspected. \
-                     TODO(round-5+): implement spill/fallback strategy.",
-                    MARK_WORKLIST_CAP
-                );
+                overflow_flag.store(true, Ordering::Relaxed);
+                return;
             }
             worklist.push(addr);
         };
@@ -1670,6 +1770,9 @@ impl G1Collector {
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
         self.mark_worklist.lock().clear();
+        // Round-9 gc HIGH-5: clear the overflow indicator so the next
+        // cycle starts in a clean state.
+        self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
         // Round-5 CRIT #4: close the SATB barrier with a drain-then-flip
         // protocol so no mutator log push that observed the gate as
         // active can be stranded after the cycle ends. The drained

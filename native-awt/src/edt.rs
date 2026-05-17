@@ -84,6 +84,37 @@ pub fn get_edt() -> &'static EventDispatchThread {
 }
 
 // ---------------------------------------------------------------------------
+// invokeAndWait errors
+// ---------------------------------------------------------------------------
+
+/// Error type returned by [`EventDispatchThread::invoke_and_wait`] and
+/// [`EventDispatchThread::invoke_and_wait_runnable`].
+///
+/// Prior to round-9 misc fix, calling `invokeAndWait` from the EDT
+/// triggered an `assert!`, which panicked across the JNI boundary — UB
+/// on most VMs and observable as a process abort. The native bridge in
+/// `natives.rs` now converts this into a Java-visible
+/// `IllegalStateException` whose message matches the JDK:
+/// `"Cannot call invokeAndWait from the event dispatcher thread"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvokeAndWaitError {
+    /// The caller is already running on the EDT — would deadlock.
+    OnEdt,
+}
+
+impl InvokeAndWaitError {
+    /// JDK-spec'd error message. Kept as a single accessor so the
+    /// native bridge and any tests stay in sync on wording.
+    pub fn jdk_message(&self) -> &'static str {
+        match self {
+            InvokeAndWaitError::OnEdt => {
+                "Cannot call invokeAndWait from the event dispatcher thread"
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EventDispatchThread
 // ---------------------------------------------------------------------------
 
@@ -293,9 +324,14 @@ impl EventDispatchThread {
 
     /// Post an `InvocationEvent` and block until the EDT has dispatched it.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called from the EDT (would deadlock).
+    /// Returns `Err(InvokeAndWaitError::OnEdt)` if called from the EDT
+    /// itself — calling `invokeAndWait` from the dispatch thread would
+    /// deadlock, so the JDK rejects it with an `Error`. The native-side
+    /// callers turn this into an `IllegalStateException` on the Java
+    /// thread (see `natives.rs::invokeAndWait`) rather than panicking
+    /// across the JNI boundary.
     ///
     /// # Semantics
     ///
@@ -312,11 +348,17 @@ impl EventDispatchThread {
     /// registering the Runnable via [`Self::register_runnable`] before
     /// invoking this — use [`Self::invoke_and_wait_runnable`] for the
     /// runnable-first convenience form.
-    pub fn invoke_and_wait(&self, callback_id: u64, peer_id: PeerId) {
-        assert!(
-            !is_edt(),
-            "invoke_and_wait must not be called on the EDT"
-        );
+    pub fn invoke_and_wait(
+        &self,
+        callback_id: u64,
+        peer_id: PeerId,
+    ) -> Result<(), InvokeAndWaitError> {
+        if is_edt() {
+            // Don't panic — propagate so the native layer can raise the
+            // JDK-spec'd error on the Java thread instead of unwinding
+            // across the JNI boundary (which is UB on most VMs).
+            return Err(InvokeAndWaitError::OnEdt);
+        }
 
         // Register a completion handle BEFORE posting the event, otherwise
         // an extremely fast EDT could dispatch and try to signal an entry
@@ -339,16 +381,29 @@ impl EventDispatchThread {
         while !*done {
             cv.wait(&mut done);
         }
+        Ok(())
     }
 
     /// High-level form of [`Self::invoke_and_wait`]: registers `runnable`
     /// under a fresh callback id, posts the invocation event, blocks
     /// until the `dispatch()V` native finishes running it.
-    pub fn invoke_and_wait_runnable(&self, runnable: ObjectRef, peer_id: PeerId) -> u64 {
+    ///
+    /// Returns the allocated callback id on success; surfaces
+    /// [`InvokeAndWaitError::OnEdt`] when called from the EDT so the
+    /// native bridge can throw `IllegalStateException` instead of
+    /// panicking across the JNI boundary.
+    pub fn invoke_and_wait_runnable(
+        &self,
+        runnable: ObjectRef,
+        peer_id: PeerId,
+    ) -> Result<u64, InvokeAndWaitError> {
+        if is_edt() {
+            return Err(InvokeAndWaitError::OnEdt);
+        }
         let id = self.next_callback_id();
         self.register_runnable(id, runnable);
-        self.invoke_and_wait(id, peer_id);
-        id
+        self.invoke_and_wait(id, peer_id)?;
+        Ok(id)
     }
 
     /// Signal that the invocation registered under `callback_id` has
@@ -462,6 +517,30 @@ impl EventDispatchThread {
     /// either lands before the lock (and gets coalesced) or after
     /// the drain returns (and is processed on the next EDT cycle) —
     /// never half-and-half.
+    ///
+    /// **TODO(round-10, double-buffered EDT)**: after coalescing, the
+    /// coalesced paint events should render into the per-Frame back-
+    /// buffer (already allocated on the peer as `image_id` — see
+    /// [`crate::peer::ComponentPeer::image_id`]) and then submit a
+    /// single `blit_buffer` to the platform window. The current code
+    /// path lets Java-side paint() draw directly through Graphics2D
+    /// natives onto whatever the peer's `image_id` points to, which is
+    /// already the back-buffer for components that opt into it; the
+    /// front/back swap (a `PlatformBackend::blit_buffer` call) happens
+    /// when Java calls `Toolkit.sync()` or when the OS issues an
+    /// `expose`/`WM_PAINT`. That is the JDK's
+    /// "draw-then-present" model and matches the current behaviour.
+    ///
+    /// True double-buffering with an atomic swap inside this method
+    /// would require either (a) the platform backend exposing a swap-
+    /// chain primitive (Win32: separate compatible-DC blit; X11:
+    /// XdbeSwapBuffers; Cocoa: CALayer contents swap), or (b) holding
+    /// the back-buffer here and `blit_buffer`-ing it after every paint
+    /// batch. (a) is invasive across all three backends; (b) duplicates
+    /// the peer's `image_id` buffer in Rust just to issue the blit.
+    /// Both are out of scope for the round-10 EDT-only pass — flagged
+    /// here so the platform-backend refactor that adds the swap-chain
+    /// primitive knows to wire it through this drain point.
     pub fn coalesce_and_drain(&self) -> Vec<AwtEvent> {
         let mut q = self.queue.lock();
 
@@ -758,6 +837,25 @@ mod tests {
     }
 
     #[test]
+    fn invoke_and_wait_from_edt_returns_error_instead_of_panicking() {
+        // Round-9 misc fix regression test: calling invokeAndWait from
+        // the EDT must NOT panic (which previously unwound across the
+        // JNI boundary). It must surface InvokeAndWaitError::OnEdt so
+        // the native bridge can throw IllegalStateException on the
+        // Java thread instead.
+        let edt = make_edt();
+        mark_as_edt();
+        let result = edt.invoke_and_wait(1, PeerId(0));
+        // Clean up for other tests on this thread before asserting.
+        IS_EDT.set(false);
+        assert_eq!(result, Err(InvokeAndWaitError::OnEdt));
+        assert_eq!(
+            InvokeAndWaitError::OnEdt.jdk_message(),
+            "Cannot call invokeAndWait from the event dispatcher thread"
+        );
+    }
+
+    #[test]
     fn invoke_and_wait_from_non_edt() {
         let edt = Arc::new(make_edt());
         edt.start();
@@ -776,7 +874,7 @@ mod tests {
 
         // This should complete once the consumer dequeues the event and
         // poll_event signals the completion handle.
-        edt.invoke_and_wait(99, PeerId(1));
+        edt.invoke_and_wait(99, PeerId(1)).expect("non-EDT caller must succeed");
         consumer.join().unwrap();
         edt.stop();
     }
@@ -794,7 +892,7 @@ mod tests {
             edt2.stop();
         });
 
-        edt.invoke_and_wait(7777, PeerId(2));
+        edt.invoke_and_wait(7777, PeerId(2)).expect("must release once EDT stops");
         stopper.join().unwrap();
     }
 
@@ -902,7 +1000,7 @@ mod tests {
             }
         });
 
-        edt.invoke_and_wait(id, PeerId(0));
+        edt.invoke_and_wait(id, PeerId(0)).expect("non-EDT caller must succeed");
         dispatcher.join().unwrap();
         edt.stop();
     }

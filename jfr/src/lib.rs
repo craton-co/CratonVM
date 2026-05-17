@@ -98,7 +98,7 @@ mod tests {
             start_time: start,
             end_time: end,
             thread_id: 1,
-            fields: vec![],
+            fields: smallvec::SmallVec::new(),
         }
     }
 
@@ -108,7 +108,7 @@ mod tests {
             start_time: 1000,
             end_time: 2000,
             thread_id: 1,
-            fields,
+            fields: smallvec::SmallVec::from_vec(fields),
         }
     }
 
@@ -452,7 +452,7 @@ mod tests {
             start_time: unique_start,
             end_time: unique_start + 1,
             thread_id: 42,
-            fields: vec![],
+            fields: smallvec::SmallVec::new(),
         };
         push_to_thread_ring(event);
 

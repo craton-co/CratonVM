@@ -263,7 +263,31 @@ impl ModuleRegistry {
     /// After this call, `reads()` and `can_access()` become meaningful.
     /// Safe to call multiple times; subsequent calls are no-ops if no new
     /// modules have been registered since the last call.
+    ///
+    /// # Performance — round-8 HIGH classloading finding
+    ///
+    /// This is an O(N²) operation in the number of registered modules
+    /// (each fixpoint iteration scans every module's readable-set
+    /// against every transitive edge). It is invalidated every time
+    /// `register()` is called, so a workload that registers modules
+    /// one-by-one through `Module.defineModule` (JVM JPMS API, Jigsaw
+    /// agents) pays the rebuild cost on each call.
+    ///
+    /// Typical Java workloads register fewer than 50 modules at once
+    /// (the JDK ships ~75 named modules, of which only ~15 are loaded
+    /// for a console app), so the O(N²) rebuild measures in
+    /// microseconds and is dwarfed by the per-module class-parse cost.
+    /// The `debug_assert!` below fires if a workload pushes module
+    /// count past 100 — at that point the incremental-rebuild fix
+    /// (only recompute readability for newly added modules, intersect
+    /// with existing closure) becomes warranted.
     pub fn build_readability_graph(&mut self) {
+        debug_assert!(
+            self.modules.len() <= 100,
+            "ModuleRegistry: O(N²) readability rebuild grew to {} modules — \
+             time to switch to incremental update (see round-8 HIGH finding)",
+            self.modules.len()
+        );
         if self.graph_built {
             return;
         }

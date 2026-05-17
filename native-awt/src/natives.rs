@@ -9,10 +9,11 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
+use rustjvm_types::error::{MethodCallResult, RuntimeError};
 use rustjvm_types::{ObjectRef, Value};
 
 use crate::edt;
+use crate::edt::InvokeAndWaitError;
 use crate::event::PeerId;
 use crate::graphics2d::Graphics2DState;
 use crate::image::{self, ImageId, ImageType};
@@ -659,6 +660,33 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
         });
 
         // ── Image blit ────────────────────────────────────────────
+        //
+        // ImageObserver-notification status (round-8/9 deferred → round-10):
+        //
+        // The Java API's `ImageObserver` is designed for *asynchronous*
+        // image loading: when Toolkit.createImage/getImage returns, the
+        // pixels may not be available yet, and `imageUpdate(image, flags,
+        // x, y, w, h)` fires as progress is made (`WIDTH | HEIGHT`,
+        // `SOMEBITS`, `FRAMEBITS`, `ALLBITS`). Once `ALLBITS` arrives, the
+        // observer can stop redrawing.
+        //
+        // In this implementation, image loading is fully *synchronous*:
+        //   * `BufferedImage` is constructed with all pixels materialised
+        //     on the Java side before any `drawImage` can be called.
+        //   * There is no async createImage/getImage path that returns
+        //     before the bytes are ready — see `register_toolkit_natives`,
+        //     which intentionally has no `createImage` / `getImage` /
+        //     `prepareImage` natives.
+        //
+        // Because every blit here sees a fully-resolved pixel buffer, the
+        // `ImageObserver` argument has nothing to observe — by the AWT
+        // spec, when the image is already loaded the only meaningful
+        // notification is `ALLBITS` and the return value of `drawImage`
+        // is `true` (which is what we return below). The asynchronous
+        // notification machinery becomes load-bearing only if the
+        // Toolkit grows an async loader; this comment is the
+        // deliberately-left-in-place record of that path so a future
+        // async-loader change knows where to wire `imageUpdate(...)`.
         registry.register(class, "drawImage", "(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z",
             |ctx, args| {
                 if let Some(this) = get_obj(args, 0) {
@@ -685,6 +713,9 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                         }
                     }
                 }
+                // Sync-load contract: image is fully available, no
+                // ImageObserver follow-up needed; return true per AWT
+                // spec for "drawing has been completed".
                 bool_ok(true)
             });
 
@@ -852,6 +883,7 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                     2 | 10 => Some(V::Off),                         // VALUE_*_OFF
                     195    => Some(V::BilinearInterpolation),       // VALUE_INTERPOLATION_BILINEAR
                     196    => Some(V::NearestNeighborInterpolation),// VALUE_INTERPOLATION_NEAREST_NEIGHBOR
+                    197    => Some(V::BicubicInterpolation),         // VALUE_INTERPOLATION_BICUBIC
                     0 | -1 => None,
                     _      => Some(V::Default),
                 };
@@ -1053,9 +1085,19 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)V", |_ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
             // Block until the Runnable's `dispatch()V` native finishes
-            // calling `run()`.  Panics if called on the EDT (matches the
-            // real `EventQueue.invokeAndWait` contract).
-            edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0));
+            // calling `run()`. Round-9 misc fix: when called from the
+            // EDT itself this previously panicked across the JNI
+            // boundary (UB on most VMs). Convert the structured error
+            // into the JDK-spec'd `IllegalStateException` so the Java
+            // caller observes the documented behaviour instead.
+            if let Err(InvokeAndWaitError::OnEdt) =
+                edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0))
+            {
+                return Err(RuntimeError::IllegalStateException {
+                    message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
+                }
+                .into());
+            }
         }
         void_ok()
     });
@@ -1300,7 +1342,19 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
     registry.register("javax/swing/SwingUtilities", "invokeAndWait",
         "(Ljava/lang/Runnable;)V", |_ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
-            edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0));
+            // Round-9 misc fix: surface the EDT-from-EDT case as an
+            // `IllegalStateException` on the Java thread instead of
+            // panicking across the JNI boundary. The wording matches
+            // the JDK exactly so existing exception filters keep
+            // working.
+            if let Err(InvokeAndWaitError::OnEdt) =
+                edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0))
+            {
+                return Err(RuntimeError::IllegalStateException {
+                    message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
+                }
+                .into());
+            }
         }
         void_ok()
     });
