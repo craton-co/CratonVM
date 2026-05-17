@@ -816,3 +816,207 @@ pub(crate) fn maybe_warmup_gpu(
         .offload_cache
         .warmup_class(class, class_id, enable.warmup as usize);
 }
+
+// ── P3-6: async dispatch + submission registry ──────────────────────
+//
+// Appendix-only additions for Phase 3 (Item P3-6). These types and
+// helpers back the `dispatch_async` / `futureGetResult` API surface
+// exposed to the Java layer. Everything below is gated on
+// `gpu-offload` and is fully decoupled from the existing
+// `try_dispatch` / `OffloadCache::lookup_or_compile` paths.
+//
+// `cuda_bridge` does not (yet) expose a `Stream` type — the real
+// path is gated behind PHASE3-CUDA-TODO comments. We define a local
+// placeholder `cuda_bridge::Stream` equivalent here so the
+// surrounding signatures land in their final shape and can be wired
+// up by the Phase 3 Java glue. When the bridge gains a real
+// `Stream`, replace the local type alias with the import.
+
+/// Stand-in for a future `cuda_bridge::Stream`. The real CUDA
+/// stream wrapper will live in `cuda-bridge` and carry the cudarc
+/// `CudaStream` handle. Today this is an opaque marker that lets the
+/// async API land in its final shape.
+///
+/// PHASE3-CUDA-TODO: replace with `pub use cuda_bridge::Stream` (or a
+/// re-export) once the bridge exposes the type.
+#[cfg(feature = "gpu-offload")]
+pub struct Stream {
+    /// Logical stream id. Zero is reserved for the "default" stream.
+    pub id: u64,
+}
+
+#[cfg(feature = "gpu-offload")]
+impl Stream {
+    /// Construct a placeholder stream with the given id. The real
+    /// implementation will take a `cuda_bridge::DeviceContext` and
+    /// create a fresh `CudaStream`.
+    pub fn new(id: u64) -> Self {
+        Self { id }
+    }
+}
+
+/// Result of a kernel dispatch, serialised in a form the Java layer
+/// can unmarshal without touching device memory directly. Today only
+/// the four primitive-array shapes plus `Void` are needed; the
+/// analyzer rejects every other return shape long before we get
+/// here.
+#[cfg(feature = "gpu-offload")]
+pub enum SerializedResult {
+    /// The kernel had a void return — nothing to copy back beyond
+    /// the host-side output array, which the caller already owns.
+    Void,
+    /// Raw little-endian `i32` bytes copied back from device memory.
+    PrimitiveArrayI32 { bytes: Vec<u8> },
+    /// Raw little-endian `i64` bytes copied back from device memory.
+    PrimitiveArrayI64 { bytes: Vec<u8> },
+    /// Raw little-endian `f32` bytes copied back from device memory.
+    PrimitiveArrayF32 { bytes: Vec<u8> },
+    /// Raw little-endian `f64` bytes copied back from device memory.
+    PrimitiveArrayF64 { bytes: Vec<u8> },
+}
+
+/// Lifecycle of a `StreamSubmission`. Starts as `Running`; a host
+/// callback (or polling) transitions it to `Completed` or `Failed`.
+///
+/// The variants are deliberately owned (not `&'static`) so the Java
+/// glue can move a `SerializedResult` or error message out of the
+/// submission without keeping the registry locked.
+#[cfg(feature = "gpu-offload")]
+pub enum SubmissionStatus {
+    /// Dispatch accepted, kernel may or may not have completed.
+    Running,
+    /// Kernel finished; payload is ready for the Java side to consume.
+    Completed { result: SerializedResult },
+    /// Dispatch or launch failed. The Java layer surfaces `message`
+    /// as `GpuException`.
+    Failed { message: String },
+}
+
+/// Async kernel submission handle.
+///
+/// Returned by [`OffloadCache::dispatch_async`] and stored in the
+/// global submission registry under [`StreamSubmission::handle`].
+/// Cheap to share via `Arc<StreamSubmission>` — the status mutex is
+/// taken only at transition points (dispatch, completion callback,
+/// `futureGetResult` poll).
+#[cfg(feature = "gpu-offload")]
+pub struct StreamSubmission {
+    /// Monotonically-increasing identifier used by the Java layer to
+    /// look the submission up later via `futureGetResult`.
+    pub handle: u64,
+    /// Stream this submission was queued on. Held so the kernel
+    /// completion callback can fire on the same stream that the
+    /// launch went out on.
+    pub stream: std::sync::Arc<Stream>,
+    /// Current lifecycle state. `Running` until the host observes
+    /// completion or failure.
+    pub status: parking_lot::Mutex<SubmissionStatus>,
+}
+
+#[cfg(feature = "gpu-offload")]
+impl OffloadCache {
+    /// Async kernel dispatch. Returns a [`StreamSubmission`] whose
+    /// [`handle`](StreamSubmission::handle) identifies it for
+    /// `futureGetResult` lookup. The submission's status starts in
+    /// [`SubmissionStatus::Running`]; transitions to `Completed` or
+    /// `Failed` when the host observes kernel completion.
+    ///
+    /// Today on a no-GPU box this immediately constructs a
+    /// [`SubmissionStatus::Failed`] submission with message
+    /// "no CUDA device". The Phase 3 Java layer surfaces this as
+    /// `GpuException`.
+    pub fn dispatch_async(
+        &self,
+        stream: std::sync::Arc<Stream>,
+        class_id: ClassId,
+        method_index: u16,
+        args: cuda_bridge::KernelArgs,
+    ) -> std::sync::Arc<StreamSubmission> {
+        let handle = NEXT_SUBMISSION_HANDLE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if !self.has_device() {
+            return std::sync::Arc::new(StreamSubmission {
+                handle,
+                stream,
+                status: parking_lot::Mutex::new(SubmissionStatus::Failed {
+                    message: format!(
+                        "no CUDA device available (class_id={:?}, method={})",
+                        class_id, method_index
+                    ),
+                }),
+            });
+        }
+
+        // PHASE3-CUDA-TODO: real path performs the dispatch on the
+        // provided stream, registers a host callback (or polls via
+        // event), and writes the SubmissionStatus transition. Until
+        // then we record a synthetic "submitted" Running state and
+        // return.
+        let _ = args;
+        std::sync::Arc::new(StreamSubmission {
+            handle,
+            stream,
+            status: parking_lot::Mutex::new(SubmissionStatus::Failed {
+                message: "dispatch_async: real CUDA path not yet implemented"
+                    .into(),
+            }),
+        })
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
+static NEXT_SUBMISSION_HANDLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+// ── Submission registry ──────────────────────────────────────────────
+//
+// Global handle → `Arc<StreamSubmission>` table. The Java layer
+// receives a `long` handle from `dispatch_async` and later passes it
+// back to `futureGetResult`; the registry is how we get from the
+// opaque handle back to the live submission. Lazily initialised via
+// `OnceLock` so the static does not pay any allocation cost when the
+// gpu-offload feature is compiled in but the VM never offloads.
+
+#[cfg(feature = "gpu-offload")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "gpu-offload")]
+static SUBMISSIONS: OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u64, std::sync::Arc<StreamSubmission>>>,
+> = OnceLock::new();
+
+#[cfg(feature = "gpu-offload")]
+fn submissions(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, std::sync::Arc<StreamSubmission>>>
+{
+    SUBMISSIONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Register `sub` in the global submission table and return its
+/// handle. The caller (typically the Java glue right after
+/// `dispatch_async`) keeps the handle and hands it back when the Java
+/// side polls for completion.
+#[cfg(feature = "gpu-offload")]
+pub fn register_submission(sub: std::sync::Arc<StreamSubmission>) -> u64 {
+    let h = sub.handle;
+    submissions().write().insert(h, sub);
+    h
+}
+
+/// Look up a previously-registered submission by handle. Returns
+/// `None` if the handle was never registered or has already been
+/// released. The returned `Arc` is a fresh clone — releasing the
+/// registry entry afterwards does not invalidate it.
+#[cfg(feature = "gpu-offload")]
+pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>> {
+    submissions().read().get(&handle).cloned()
+}
+
+/// Drop the registry's reference to the submission with this handle.
+/// Safe to call on an unknown handle (no-op). Idempotent. Once
+/// released, [`lookup_submission`] returns `None`.
+#[cfg(feature = "gpu-offload")]
+pub fn release_submission(handle: u64) {
+    submissions().write().remove(&handle);
+}
