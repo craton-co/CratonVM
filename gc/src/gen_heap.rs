@@ -2282,6 +2282,31 @@ impl GenerationalHeap {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
         }
 
+        // Round-2 fix (T2-4): explicit atomic load+store for the mark_word
+        // field. The bulk memcpy above is technically UB for `AtomicU64`:
+        // even under STW (no mutator is racing), the memory model still
+        // requires that reads/writes of atomic locations go through atomic
+        // ops. Replicating the mark word atomically materializes the
+        // correct happens-before edge for any observer that may later
+        // perform a CAS on the new copy (monitor inflation, etc.).
+        //
+        // NOTE for future concurrent-GC support: this STW-only protocol is
+        // not sufficient for a concurrent collector. A concurrent
+        // forwarding protocol must instead CAS-install the forwarding
+        // pointer and re-read the mark word if a mutator raced.
+        // SAFETY: both `old_ptr` and `new_ptr` point at a fully written
+        // ObjectHeader whose `mark_word` field lives at MARK_WORD_OFFSET.
+        unsafe {
+            let old_header_ptr = old_ptr as *const ObjectHeader;
+            let new_header_ptr = new_ptr as *mut ObjectHeader;
+            let mark = (*old_header_ptr)
+                .mark_word
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (*new_header_ptr)
+                .mark_word
+                .store(mark, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Update the new header
         // SAFETY: `new_ptr` was just allocated and the object was copied there; its header is valid and mutable.
         let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };

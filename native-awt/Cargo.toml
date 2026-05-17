@@ -19,6 +19,11 @@ tracing = "0.1"
 parking_lot = "0.12"
 bitflags = "2"
 rustc-hash = "1.1"
+# fontdue is pure Rust — used by the X11 and Cocoa backends for glyph
+# rasterization. Declared at the top level so it is available on all
+# target platforms that need it (Linux, macOS). The Windows backend uses
+# DirectWrite and does not pull this dep.
+fontdue = "0.9"
 
 # Platform-specific windowing backends
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -36,7 +41,6 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
-fontdue = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"

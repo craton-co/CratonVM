@@ -1620,7 +1620,7 @@ fn plan_scalar_replacement(
     code: &[u8],
     code_len: usize,
     non_escaping_new: &std::collections::HashSet<usize>,
-    new_info: &[(usize, u32, usize)],
+    new_info: &[(usize, u32, usize, bool, bool)],
     invoke_info: &[(usize, *const JitInvokeInfo)],
     scalar_base: usize,
 ) -> ScalarReplacementPlan {
@@ -1640,7 +1640,9 @@ fn plan_scalar_replacement(
     let mut sorted_pcs: Vec<usize> = non_escaping_new.iter().copied().collect();
     sorted_pcs.sort();
     for &new_pc in &sorted_pcs {
-        if let Some(&(_, _, num_fields)) = new_info.iter().find(|(p, _, _)| *p == new_pc) {
+        if let Some(&(_, _, num_fields, _, _)) =
+            new_info.iter().find(|(p, _, _, _, _)| *p == new_pc)
+        {
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
                 objects.insert(new_pc, ScalarReplacedObject { num_fields, field_base_offset });
@@ -2889,8 +2891,18 @@ struct Compiler {
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
-    /// Resolved `new` (0xbb) metadata: (bytecode_pc, class_id_raw, num_fields).
-    new_info: Vec<(usize, u32, usize)>,
+    /// Resolved `new` (0xbb) metadata.
+    ///
+    /// Tuple layout (CRIT-2):
+    ///   (bytecode_pc, class_id_raw, num_fields,
+    ///    has_primitive_init,
+    ///    has_finalizer)
+    ///
+    /// The last two flags gate whether the inline TLAB fast path must
+    /// invoke `jit_post_tlab_init`. When both are `false`, the JIT
+    /// inlines the header completion (identity-hash + num_slots) and
+    /// skips the helper call entirely. See `emit_inline_tlab_new`.
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
     /// Resolved `anewarray` (0xbd) metadata: (bytecode_pc, component_class_id_raw).
     anewarray_info: Vec<(usize, u32)>,
     /// Invoke dispatch info: (bytecode_pc, pointer to leaked JitInvokeInfo).
@@ -5369,7 +5381,20 @@ impl Compiler {
     ///
     /// Returns the bumped object pointer (or the slow-path result) in RAX.
     /// Caller emits the safepoint oop map and pushes RAX.
-    fn emit_inline_tlab_new(&mut self, class_id_raw: u32, num_fields: usize) {
+    fn emit_inline_tlab_new(
+        &mut self,
+        class_id_raw: u32,
+        num_fields: usize,
+        // CRIT-2 — when both `has_primitive_init` and `has_finalizer`
+        // are statically known false at the call site, the post-init
+        // helper has nothing meaningful to do beyond writing the
+        // identity-hash and num_slots header words. We can emit those
+        // inline and skip the helper call (which otherwise costs a
+        // class_manager.read() and a finalizer-queue lock). When
+        // unknown (the conservative default in `try_compile`), we
+        // still issue the helper call.
+        skip_post_init_helper: bool,
+    ) {
         // Object total size (header + fields*8). Computed at compile time.
         let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
         let cursor_off = self.helpers.tlab_cursor_offset_in_thread as i32;
@@ -5415,12 +5440,43 @@ impl Compiler {
             class_id_raw as i32, // Cast: ClassId immediate fits in 32 bits
         );
 
-        // Hand off to post-init: tlab_post_init(vm_ptr, obj_ptr, cid, nf).
-        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-        self.emit_mov_r64_r64(ARG_REGS[1], R11);
-        self.emit_mov_imm32_sx(ARG_REGS[2], class_id_raw as i32); // Cast: ClassId fits in 32 bits
-        self.emit_mov_imm32_sx(ARG_REGS[3], num_fields as i32); // Cast: x86-64 immediate encoding
-        self.emit_call_absolute(self.helpers.tlab_post_init);
+        if skip_post_init_helper {
+            // CRIT-2 fast path — no primitive defaults to apply and no
+            // finalizer to register. Inline the only remaining
+            // header-completion work that `jit_post_tlab_init` would
+            // perform: writing `num_slots` at offset 16.
+            //
+            // `identity_hash_code` (offset 8) is left at the TLAB-zeroed
+            // value (0). The contract is lazy mint: `System.
+            // identityHashCode()` and the mark-word lock path detect
+            // hash == 0 and atomically mint a fresh non-zero value on
+            // demand. This matches HotSpot's "displaced hash" treatment
+            // and avoids a `vm.heap.next_identity_hash()` call here that
+            // would touch the global hash counter on every allocation.
+            //
+            // All other header fields (kind=0/Object,
+            // element_type=0/Reference, padding, array_length=0, gc_age=0,
+            // gc_flags=0, forwarding_ptr=null, mark_word=MARK_NEUTRAL)
+            // are already the correct values from the TLAB-zeroed refill.
+            //
+            // Layout reminder (from `types/src/heap_types.rs`):
+            //   off 16: num_slots (u32)
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                16,
+                num_fields as i32, // Cast: x86-64 immediate encoding
+            );
+            // RAX = obj_ptr — both arms converge with RAX holding the
+            // freshly-allocated object pointer.
+            self.emit_mov_r64_r64(RAX, R11);
+        } else {
+            // Hand off to post-init: tlab_post_init(vm_ptr, obj_ptr, cid, nf).
+            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+            self.emit_mov_r64_r64(ARG_REGS[1], R11);
+            self.emit_mov_imm32_sx(ARG_REGS[2], class_id_raw as i32); // Cast: ClassId fits in 32 bits
+            self.emit_mov_imm32_sx(ARG_REGS[3], num_fields as i32); // Cast: x86-64 immediate encoding
+            self.emit_call_absolute(self.helpers.tlab_post_init);
+        }
 
         // Jump over the slow path; both arms converge with RAX = obj_ptr.
         let done_patch = self.emit_jmp_rel32_patch();
@@ -10364,6 +10420,18 @@ impl Compiler {
                                 // inter-slot `jne` rel8 that needs to land
                                 // at the start of slot `target_slot_index`.
                                 let mut next_slot_patches: Vec<(usize, usize)> = Vec::new();
+                                // CRIT-3 — miss branches use rel32 form
+                                // unconditionally. With n>=5 args on Linux
+                                // the cumulative body across all three
+                                // slots + slow-path prelude can exceed 127
+                                // bytes, overflowing the previous rel8
+                                // encoding (`0x74`/`0x75`). The rel32
+                                // forms (`0x0F 0x84`/`0x0F 0x85` + 4-byte
+                                // disp) always fit. `miss_patches_rel32`
+                                // stores the byte offset of the 4-byte
+                                // displacement immediate, patched at the
+                                // shared `.miss` label below.
+                                let mut miss_patches_rel32: Vec<usize> = Vec::new();
 
                                 for i in 0..3usize {
                                     slot_starts[i] = self.buf.pos();
@@ -10379,13 +10447,27 @@ impl Compiler {
                                         // JNE rel8 → start of slot i+1
                                         // (patched below once slot i+1's
                                         // start position is known).
+                                        // Inter-slot distances stay small
+                                        // (a single slot body is ~30
+                                        // bytes for n<=5), so rel8 is
+                                        // sufficient here — only the
+                                        // miss/needs_ctx branches need
+                                        // rel32 (see CRIT-3 comment above).
                                         self.buf.emit(&[0x75, 0x00]);
                                         let patch = self.buf.pos() - 1;
                                         next_slot_patches.push((patch, i + 1));
                                     } else {
-                                        // Final slot: JNE → .miss
-                                        self.buf.emit(&[0x75, 0x00]);
-                                        miss_patches.push(self.buf.pos() - 1);
+                                        // Final slot: JNE rel32 → .miss
+                                        // (6 bytes: 0x0F 0x85 + i32 disp).
+                                        // Slot 2's miss target sits past
+                                        // slots 0..2 cascades is reachable
+                                        // in rel8 but we keep rel32 for
+                                        // consistency with slot 0/1 and
+                                        // because the slow-path prelude
+                                        // following the cascade can push
+                                        // the distance over 127 bytes.
+                                        self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                                        miss_patches_rel32.push(self.buf.pos() - 4);
                                     }
 
                                     // CMP BYTE [R10 + NEEDS_CTX_OFFS[i]], 0
@@ -10396,9 +10478,14 @@ impl Compiler {
                                     self.buf
                                         .emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
 
-                                    // JE rel8 → .miss
-                                    self.buf.emit(&[0x74, 0x00]);
-                                    miss_patches.push(self.buf.pos() - 1);
+                                    // JE rel32 → .miss (6 bytes:
+                                    // 0x0F 0x84 + i32 disp).  CRIT-3:
+                                    // rel8 here overflowed in release
+                                    // builds for n>=5 args, silently
+                                    // wrapping into the next slot — UB
+                                    // dispatch. rel32 always fits.
+                                    self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                    miss_patches_rel32.push(self.buf.pos() - 4);
 
                                     // ---- Set up callee ABI: vm_ptr + n args ----
                                     self.emit_load_local(
@@ -10447,18 +10534,25 @@ impl Compiler {
                                 // .miss: patch all `je needs_ctx → .miss`
                                 // and (for slot 2) `jne → .miss` to land
                                 // HERE — the start of the slow-path block
-                                // emitted below.
+                                // emitted below.  CRIT-3: these are all
+                                // rel32 form, so the patch site holds a
+                                // 4-byte signed displacement computed
+                                // from the byte AFTER the immediate
+                                // (patch + 4) to the target.
                                 let miss_off = self.buf.pos();
-                                for patch in &miss_patches {
-                                    let rel = (miss_off as i64) - (*patch as i64 + 1);
+                                for patch in &miss_patches_rel32 {
+                                    let rel = (miss_off as i64) - (*patch as i64 + 4);
                                     debug_assert!(
-                                        (-128..=127).contains(&rel),
-                                        "inline PIC miss branch overflowed rel8 ({} bytes)",
+                                        (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+                                        "inline PIC miss branch overflowed rel32 ({} bytes)",
                                         rel
                                     );
-                                    self.buf.patch_byte(*patch, rel as u8); // Cast: rel8 displacement
+                                    self.buf.patch_i32(*patch, rel as i32); // Cast: rel32 displacement
                                 }
-                                miss_patches.clear();
+                                // `miss_patches` (the legacy rel8 vector)
+                                // remains in scope for the MIC arm below;
+                                // PIC inline does not push into it any
+                                // more, so nothing to clear here.
                             } else if mic_inline {
                                 let mic = mic_ptr.expect("mic_inline ⇒ mic_ptr Some");
                                 // R10 = mic_ptr (imm64, 10 bytes)
@@ -10532,22 +10626,38 @@ impl Compiler {
                             self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
 
                             if let Some(mic) = mic_ptr {
-                                // MIC-optimized dispatch: pass MIC slot as 5th arg.
-                                // On Windows x64, 5th arg goes on the stack at [RSP+32].
-                                // We use a 5-arg helper via emit_call_absolute which
-                                // uses RAX for the call — so we pass mic via stack slot.
+                                // MIC-optimized dispatch: pass MIC slot as 5th
+                                // arg and (CRIT-1) PIC slot as 6th arg so the
+                                // helper can populate the inline 3-way cascade
+                                // via `JitPICSlot::install` on every successful
+                                // resolution. A `pic_ptr == 0` tells the helper
+                                // no PIC is installed for this site.
+                                //
+                                // On Windows x64, args 5 and 6 go on the stack
+                                // at [RSP+32] and [RSP+40] (shadow + spill).
+                                // emit_call_absolute uses RAX, so we stage
+                                // each pointer through RAX → memory.
+                                let pic_arg: i64 = pic_ptr
+                                    .map(|p| p as *const _ as i64)
+                                    .unwrap_or(0); // Cast: function pointer for JIT call target
                                 #[cfg(target_os = "windows")]
                                 {
-                                    // 5th arg at [RSP + 32] (shadow space slot)
+                                    // 5th arg at [RSP + 32]
                                     self.emit_mov_imm64(RAX, mic as *const _ as i64); // Cast: function pointer for JIT call target
                                     // MOV [RSP + 32], RAX
                                     self.rex_w();
                                     self.buf.emit(&[0x89, 0x44, 0x24, 0x20]);
+                                    // 6th arg at [RSP + 40]
+                                    self.emit_mov_imm64(RAX, pic_arg);
+                                    // MOV [RSP + 40], RAX
+                                    self.rex_w();
+                                    self.buf.emit(&[0x89, 0x44, 0x24, 0x28]);
                                 }
                                 #[cfg(not(target_os = "windows"))]
                                 {
-                                    // SysV: 5th arg in R8 (already have 4 in RDI,RSI,RDX,RCX)
+                                    // SysV: 5th arg in R8, 6th in R9.
                                     self.emit_mov_imm64(R8, mic as *const _ as i64); // Cast: function pointer for JIT call target
+                                    self.emit_mov_imm64(R9, pic_arg);
                                 }
                                 self.emit_call_absolute(
                                     self.helpers.invoke_virtual_mic,
@@ -10660,14 +10770,15 @@ impl Compiler {
                         let resolved = self
                             .new_info
                             .iter()
-                            .find(|(p, _, _)| *p == pc)
+                            .find(|(p, _, _, _, _)| *p == pc)
                             .copied();
-                        let (_, class_id_raw, num_fields) = match resolved {
-                            Some(info) => info,
-                            None => {
-                                return false;
-                            }
-                        };
+                        let (_, class_id_raw, num_fields, has_prim_init, has_finalizer) =
+                            match resolved {
+                                Some(info) => info,
+                                None => {
+                                    return false;
+                                }
+                            };
 
                         // HIGH-6 JIT audit (object_allocation/1000 3-5x gap):
                         // emit an inline TLAB bump-pointer fast path when the
@@ -10696,7 +10807,24 @@ impl Compiler {
                             && self.needs_heap; // need vm_ptr in heap_local slot
 
                         if can_inline {
-                            self.emit_inline_tlab_new(class_id_raw, num_fields);
+                            // CRIT-2 — when neither primitive-init nor
+                            // finalizer registration is required, skip
+                            // the `jit_post_tlab_init` helper and write
+                            // identity_hash/num_slots inline. Most JDK
+                            // micro-objects (HashMap.Node, ArrayList$Itr,
+                            // Iterator chains, all-reference field
+                            // bearers) hit this fast path. The
+                            // resolution of these flags currently
+                            // requires extending `cp_new_resolver` (see
+                            // the `new_info` doc in `jit/src/lib.rs`),
+                            // so the conservative default `(true,true)`
+                            // keeps the helper call in place for now.
+                            let skip_helper = !has_prim_init && !has_finalizer;
+                            self.emit_inline_tlab_new(
+                                class_id_raw,
+                                num_fields,
+                                skip_helper,
+                            );
                         } else {
                             // Slow path: full helper-call dispatch. Used when
                             //   - the helper table is partial (tests),
@@ -11089,7 +11217,8 @@ pub fn compile(
     field_info: Vec<(usize, usize, u8)>,
     typecheck_info: Vec<(usize, *const u8, usize)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
-    new_info: Vec<(usize, u32, usize)>,
+    // CRIT-2 — see `new_info` field doc on the compiler struct.
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
     anewarray_info: Vec<(usize, u32)>,
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     direct_calls: Vec<(usize, super::JitDirectCall)>,
@@ -16792,7 +16921,9 @@ mod tests {
         // Method: new #1; astore_1; aload_1; areturn (cls=42, fields=3).
         let code: Vec<u8> = vec![0xbb, 0x00, 0x01, 0x4c, 0x2b, 0xb0, 0, 0];
         let code_len = 6;
-        let new_info: Vec<(usize, u32, usize)> = vec![(0, 42, 3)];
+        // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
+        // Tests use conservative `(true, true)` so the helper path is exercised.
+        let new_info: Vec<(usize, u32, usize, bool, bool)> = vec![(0, 42, 3, true, true)];
 
         let compiled = compile(
             &code,
@@ -16846,7 +16977,9 @@ mod tests {
         let code_len = 6;
 
         // Provide new_info: class_id=42, num_fields=3
-        let new_info: Vec<(usize, u32, usize)> = vec![(0, 42, 3)];
+        // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
+        // Tests use conservative `(true, true)` so the helper path is exercised.
+        let new_info: Vec<(usize, u32, usize, bool, bool)> = vec![(0, 42, 3, true, true)];
         let compiled = compile(
             &code,
             code_len,
@@ -17797,7 +17930,8 @@ mod tests {
         let code_len = 18;
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
-        let new_info = vec![(0usize, 1u32, 2usize)]; // 2 fields
+        // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
+        let new_info = vec![(0usize, 1u32, 2usize, true, true)]; // 2 fields
         // Create invoke_info for <init>()V at PC=4
         let init_info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -17833,7 +17967,8 @@ mod tests {
         ];
         // NOT in non_escaping_new → should produce empty plan
         let non_escaping = std::collections::HashSet::new();
-        let new_info = vec![(0usize, 1u32, 2usize)];
+        // CRIT-2 tuple shape: see compiler struct doc.
+        let new_info = vec![(0usize, 1u32, 2usize, true, true)];
         let plan = plan_scalar_replacement(&code, 8, &non_escaping, &new_info, &[], 0);
         assert!(plan.objects.is_empty());
         assert!(plan.field_ops.is_empty());
@@ -17853,7 +17988,8 @@ mod tests {
         ];
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
-        let new_info = vec![(0usize, 1u32, 2usize)];
+        // CRIT-2 tuple shape: see compiler struct doc.
+        let new_info = vec![(0usize, 1u32, 2usize, true, true)];
         let init_info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
             method_name: Box::leak("<init>".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo

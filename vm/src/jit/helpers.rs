@@ -6,7 +6,7 @@
 use std::cell::Cell;
 
 use rustjvm_jit::{
-    DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitRuntimeHelpers,
+    DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitPICSlot, JitRuntimeHelpers,
 };
 use rustjvm_types::{
     ArrayElementType, ClassId, ObjectRef, Value,
@@ -1481,6 +1481,9 @@ unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usi
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo. args_ptr/num_args form a valid i64 slice.
 // mic_ptr must point to a live JitMICSlot used for monomorphic inline cache dispatch.
+// pic_ptr, when non-zero, must point to a live JitPICSlot co-allocated with the MIC at
+// the same call site; the helper populates its 3-way entries via `install` so the next
+// invocation hits the inline cascade emitted in `jit/src/x64.rs`.
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // matching the compiled method's extern "C" calling convention.
 #[allow(clippy::too_many_arguments)]
@@ -1490,6 +1493,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     args_ptr: i64,
     num_args: i64,
     mic_ptr: i64,
+    pic_ptr: i64,
 ) -> i64 {
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
@@ -1629,6 +1633,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
             mic.cached_needs_context
                 .store(needs_ctx, std::sync::atomic::Ordering::Release);
+            // CRIT-1 — also populate the co-allocated PIC so the
+            // inline 3-way cascade in `jit/src/x64.rs` hits on the
+            // next invocation. Without this the cascade's empty
+            // (class_id == 0) slots always fail and every dispatch
+            // pays the full helper cost. We only install when we
+            // actually have an entry_ptr to publish; a 0 entry_ptr
+            // in a PIC slot would force the inline cascade to call
+            // through a null function pointer.
+            if pic_ptr != 0 && entry_ptr != 0 {
+                let pic = &*(pic_ptr as *const JitPICSlot);
+                pic.install(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
+            }
         }
 
         let invoke_res = crate::vm::invoke_or_native(
@@ -1698,6 +1714,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
     mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
+
+    // CRIT-1 — Populate the co-allocated PIC so the inline 3-way
+    // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
+    // dispatches. Eager allocation made `pic_inline` always-true at
+    // codegen, so the cascade is always emitted but stays cold until
+    // the helper publishes entries here. Mirror the MIC update with
+    // a `pic.install(...)` so the next call with the same receiver
+    // class takes the inline fast path (5 cycles slot-0 hit vs the
+    // full helper call). LFU eviction inside `install` handles
+    // megamorphic spillover automatically.
+    if pic_ptr != 0 && entry_ptr != 0 {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        pic.install(receiver_cid, &class_name, entry_ptr, needs_ctx);
+    }
 
     let method_args: Vec<Value> = values[1..].to_vec();
     let mut full_args = Vec::with_capacity(1 + method_args.len());

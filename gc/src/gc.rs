@@ -260,6 +260,33 @@ fn forward_object(
         std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
     }
 
+    // Round-2 fix (T2-4): explicit atomic load+store for the mark_word field.
+    // The bulk memcpy above is technically UB for `AtomicU64`: even under STW
+    // (no mutator is racing), the C++/Rust memory model requires that any read
+    // or write of an atomic location go through an atomic operation. The
+    // memcpy reads/writes the bytes but does not produce a happens-before
+    // edge with respect to any concurrent observer (e.g. a future
+    // concurrent-GC marker thread or an inflate-monitor CAS racing the
+    // copy). Replicating the mark word as a real atomic load+store
+    // materializes the correct ordering.
+    //
+    // NOTE for future concurrent-GC support: this STW-only protocol won't
+    // suffice. A concurrent collector must instead use a CAS-based forwarding
+    // protocol that stalls or retries when the mutator inflates the monitor
+    // concurrently with the copy.
+    // SAFETY: both `old_ptr` and `new_ptr` point at a fully written
+    // ObjectHeader whose `mark_word` field lives at MARK_WORD_OFFSET (32).
+    unsafe {
+        let old_header_ptr = old_ptr as *const ObjectHeader;
+        let new_header_ptr = new_ptr as *mut ObjectHeader;
+        let mark = (*old_header_ptr)
+            .mark_word
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (*new_header_ptr)
+            .mark_word
+            .store(mark, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // SAFETY: new_ptr was just allocated in to_space with at least HEADER_SIZE bytes.
     // Clear the forwarding pointer in the NEW copy (it's a fresh object)
     let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };

@@ -1851,7 +1851,11 @@ pub fn execute(
                 // Resolve new/anewarray info (Phase 39: correct ClassId + field count for JIT new)
                 // Only resolve for non-synthetic classes (real JDK bytecode) to avoid
                 // expensive class loading cascades during JIT of synthetic code.
-                let mut new_info: Vec<(usize, u32, usize)> = Vec::new();
+                // Tuple: (pc, class_id, num_fields, has_primitive_init, has_finalizer).
+                // The last two are conservative true/true here so the JIT goes through
+                // the post-init helper — matches pre-CRIT-2 behavior. A follow-up should
+                // extract the real flags from class metadata to enable the skip path.
+                let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
                 let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
                 let is_real_class = shared.class_manager.read()
                     .get_class(class_id)
@@ -1887,9 +1891,9 @@ pub fn execute(
                                 let num_fields = shared.class_manager.read()
                                     .get_class(target_id)
                                     .map(|c| c.num_total_fields).unwrap_or(0);
-                                new_info.push((pc_new, target_id.as_u32(), num_fields));
+                                new_info.push((pc_new, target_id.as_u32(), num_fields, true, true));
                             } else {
-                                new_info.push((pc_new, 0, 0));
+                                new_info.push((pc_new, 0, 0, true, true));
                             }
                         }
                     }
@@ -10905,7 +10909,7 @@ fn try_osr(
         }
 
         // Resolve new/anewarray info for stackless path (mirrors first JIT site)
-        let mut new_info2: Vec<(usize, u32, usize)> = Vec::new();
+        let mut new_info2: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
         let mut anewarray_info2: Vec<(usize, u32)> = Vec::new();
         let is_real_class2 = shared.class_manager.read()
             .get_class(class_id)
@@ -10939,9 +10943,9 @@ fn try_osr(
                         let num_fields = shared.class_manager.read()
                             .get_class(target_id)
                             .map(|c| c.num_total_fields).unwrap_or(0);
-                        new_info2.push((pc_new, target_id.as_u32(), num_fields));
+                        new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
                     } else {
-                        new_info2.push((pc_new, 0, 0));
+                        new_info2.push((pc_new, 0, 0, true, true));
                     }
                 }
             }
