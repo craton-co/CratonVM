@@ -9716,7 +9716,10 @@ fn execute_invokestatic(
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
-            && shared.offload_cache.has_device()
+            && shared
+                .offload_registry
+                .get_or_create(shared.config.gpu_device_ordinal, &shared.config)
+                .has_device()
         {
             match crate::runtime::offload::try_dispatch(
                 shared,

@@ -813,7 +813,8 @@ pub(crate) fn maybe_warmup_gpu(
         return;
     }
     shared
-        .offload_cache
+        .offload_registry
+        .get_or_create(shared.config.gpu_device_ordinal, &shared.config)
         .warmup_class(class, class_id, enable.warmup as usize);
 }
 
