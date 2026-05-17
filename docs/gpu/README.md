@@ -17,6 +17,7 @@ it, or extend the feature, read on.
 | [`plan.md`](plan.md) | The original execution plan with per-part status, deviations from spec, and known follow-ups. |
 | [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) | Why [cuda-oxide](https://nvlabs.github.io/cuda-oxide/) (the project that prompted this work) is not on the critical path, and the precise conditions under which we would re-evaluate. |
 | [`first-results.md`](first-results.md) | Acceptance-criteria scaffold for the GPU-equipped verification machine. Empty results table until real numbers land. |
+| [`annotations.md`](annotations.md) | Phase 1 reference: `@GpuKernel`, `@GpuExclude`, `@EnableGpuAsync` directives for user-facing offload control. |
 
 ## At a glance
 
