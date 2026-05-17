@@ -8338,25 +8338,11 @@ fn execute_invoke_kind(
                             return Ok(CachedCallResult::Handled);
                         }
                     }
-                    // Gradle bootstrap: `ClasspathUtil$1.visitClassPath(URL[])`
-                    // iterates `URL[]` returned by `ClassLoaderVisitor.
-                    // extractJava9Classpath()`. That helper allocates
-                    // `new URL[paths.length]` (all-null), then populates each
-                    // slot via `new File(p).toURI().toURL()`. When our
-                    // synthetic `URI.toURL()` returns null (because the URI's
-                    // raw string field wasn't populated under our heap
-                    // layout), the slot stays null. The iterator's very
-                    // first op is `url.getProtocol()` with an `ifnull` check
-                    // immediately after, so the bytecode is null-tolerant
-                    // by design — but only if `getProtocol()` returns null
-                    // instead of throwing NPE. Mirror that contract for the
-                    // small family of `URL` accessors that return reference
-                    // types: a null receiver yields null (which the bytecode
-                    // tests for and treats as "skip this entry"). This
-                    // unblocks the Gradle `--version` boot path (NPE was at
-                    // `getProtocol on null` deep in `DefaultModuleRegistry`
-                    // <init>'s classpath enumeration) without altering any
-                    // non-null code path.
+                    // Gradle bootstrap: URL.getProtocol on null URL needs
+                    // null-tolerance (null-tolerant bytecode pattern with
+                    // ifnull guard after the call). Same family for
+                    // File accessors (Sonar/Liberty install-root resolution)
+                    // and the narrow String.length() Liberty case.
                     if &*method_class_name == "java/net/URL"
                         && matches!(
                             &*method_name,
@@ -8373,6 +8359,67 @@ fn execute_invoke_kind(
                         thread.frames[frame_idx]
                             .stack
                             .push(Value::Object(None))?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+                    if &*method_class_name == "java/io/File" {
+                        if matches!(
+                            &*method_name,
+                            "getParentFile"
+                                | "getAbsoluteFile"
+                                | "getCanonicalFile"
+                                | "getParent"
+                                | "getName"
+                                | "getPath"
+                                | "getAbsolutePath"
+                                | "getCanonicalPath"
+                                | "toURI"
+                                | "toURL"
+                                | "toPath"
+                                | "listFiles"
+                                | "list"
+                        ) {
+                            thread.frames[frame_idx]
+                                .stack
+                                .push(Value::Object(None))?;
+                            return Ok(CachedCallResult::Handled);
+                        }
+                        if matches!(
+                            &*method_name,
+                            "length" | "lastModified" | "getTotalSpace"
+                                | "getFreeSpace" | "getUsableSpace"
+                        ) {
+                            thread.frames[frame_idx]
+                                .stack
+                                .push(Value::Long(0))?;
+                            return Ok(CachedCallResult::Handled);
+                        }
+                        if matches!(
+                            &*method_name,
+                            "exists"
+                                | "isDirectory"
+                                | "isFile"
+                                | "isAbsolute"
+                                | "isHidden"
+                                | "canRead"
+                                | "canWrite"
+                                | "canExecute"
+                                | "delete"
+                                | "mkdir"
+                                | "mkdirs"
+                        ) {
+                            thread.frames[frame_idx]
+                                .stack
+                                .push(Value::Int(0))?;
+                            return Ok(CachedCallResult::Handled);
+                        }
+                    }
+                    if &*method_class_name == "java/lang/String"
+                        && &*method_name == "length"
+                        && &*method_descriptor == "()I"
+                    {
+                        thread.frames[frame_idx]
+                            .stack
+                            .push(Value::Int(0))?;
                         return Ok(CachedCallResult::Handled);
                     }
                     return Err(RuntimeError::NullPointerException {
