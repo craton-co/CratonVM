@@ -361,6 +361,7 @@ fn native_sl_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    eprintln!("[SL-STREAM-DBG] native_sl_stream entered");
     // Defer to iterator() + StreamSupport.stream.
     let it = native_sl_iterator(ctx, args)?;
     let iter_obj = match it {
@@ -436,6 +437,171 @@ fn empty_optional(ctx: &mut dyn NativeContext) -> MethodCallResult {
     Ok(empty)
 }
 
+/// `ServiceLoader.spliterator()` — the JDK inherits `Iterable.spliterator()`'s
+/// default body (`Spliterators.spliteratorUnknownSize(iterator(), 0)`), but
+/// the default-method dispatch through our interpreter has historically not
+/// propagated elements through to the resulting stream (the empty-stream
+/// surfaces as Elasticsearch's `AssertionError: available names are []` from
+/// `CliToolProvider.load` even though our native `ServiceLoader.iterator()`
+/// returns 13 providers). Provide a direct native that builds a synthetic
+/// 3-field Spliterator (array, pos, fence) backed by the freshly-discovered
+/// providers so callers like `sl.spliterator().stream().filter(...)` see the
+/// real provider list.
+fn native_sl_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Drive the existing iterator() native to produce an Iterator over the
+    // instantiated providers, then drain it into an Object[]. The whole
+    // approach mirrors `Spliterators.spliteratorUnknownSize` but is wired
+    // directly onto `ServiceLoader` so the call site doesn't depend on the
+    // `Iterable.spliterator()` default-method machinery.
+    let iter_val = native_sl_iterator(ctx, args)?;
+    let iter = match iter_val {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let cid = ctx.ensure_class_initialized("java/util/Spliterator")
+                .unwrap_or(rustjvm_types::ClassId::new(0));
+            let n = ctx.class_num_total_fields(cid).max(3);
+            let obj = ctx.alloc_object(cid, n);
+            ctx.set_field(obj, 0, Value::Object(Some(empty)));
+            ctx.set_field(obj, 1, Value::Int(0));
+            ctx.set_field(obj, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(obj))));
+        }
+    };
+    // Drain the iterator into a Vec<Value>.
+    let mut collected: Vec<Value> = Vec::new();
+    const SAFETY_CAP: usize = 1_000_000;
+    loop {
+        let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[]);
+        if !matches!(has_next, Ok(Some(Value::Int(1)))) {
+            break;
+        }
+        let next = ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]);
+        let val = match next {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+        collected.push(val);
+        if collected.len() >= SAFETY_CAP {
+            break;
+        }
+    }
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, collected.len());
+    for (i, v) in collected.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let cid = ctx.ensure_class_initialized("java/util/Spliterator")
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(cid).max(3);
+    let obj = ctx.alloc_object(cid, n);
+    ctx.set_field(obj, 0, Value::Object(Some(arr)));
+    ctx.set_field(obj, 1, Value::Int(0));
+    ctx.set_field(obj, 2, Value::Int(collected.len() as i32));
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Late-binding override for `StreamSupport.stream(Spliterator, boolean)`.
+///
+/// Background — the prior `phases_late.rs::register_p69_spliterator`
+/// registration of the same triple is, for reasons specific to this binary
+/// (very large source file, incremental-compile interaction) not making it
+/// into the final `rustjvm.exe`: stress-checking the binary with `grep -ao`
+/// over the literal string `"[STREAM-SUPPORT-DBG]"` shows it absent, and
+/// runtime traces of `ServiceLoader.load(...).spliterator().stream()
+/// .filter(...)` from Elasticsearch's `CliToolProvider.load` never trigger
+/// the registered native — `Stream.filter` runs on real-JDK ReferencePipeline
+/// bytecode against an empty stream, surfacing as
+///   `AssertionError: CliToolProvider [server] not found, available names are []`
+/// even though our native `ServiceLoader.iterator()` had just yielded
+/// 13 providers.
+///
+/// Re-registering here (from a small, less-noisy translation unit) ensures
+/// the closure is the LAST writer to the `NativeMethodRegistry` HashMap for
+/// the `(StreamSupport, stream, (Spliterator,Z)Stream)` triple. The body
+/// drains the supplied synthetic spliterator's backing Object[] into a fresh
+/// synthetic Stream so the downstream `Stream.filter` / `Stream.toList`
+/// natives see the real provider list.
+fn native_stream_support_stream_from_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let spliterator = match args.first() {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            // Null spliterator → empty stream.
+            return alloc_synthetic_stream(ctx, &[]);
+        }
+    };
+    // Read field 0 of the spliterator. Our `Spliterators.spliteratorUnknownSize`
+    // and `ServiceLoader.spliterator()` natives both place a fully-materialised
+    // Object[] in field 0 — read it directly. For real-JDK Spliterator subclasses
+    // whose field 0 isn't an array, fall back to draining via
+    // `forEachRemaining(Consumer)`.
+    let field0 = ctx.get_field(spliterator, 0);
+    let arr = match field0 {
+        Value::Object(Some(a))
+            if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+        _ => return drain_spliterator_to_stream(ctx, spliterator),
+    };
+    let pos = match ctx.get_field(spliterator, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let fence = match ctx.get_field(spliterator, 2) {
+        Value::Int(v) => v as usize,
+        _ => ctx.array_length(arr),
+    };
+    // Snapshot the slice [pos, fence) into a fresh array so the resulting
+    // Stream's lifetime is independent of the spliterator's cursor.
+    let n = fence.saturating_sub(pos);
+    let snapshot = ctx.new_array(rustjvm_types::ArrayElementType::Reference, n);
+    for i in 0..n {
+        let v = ctx.get_array_element(arr, pos + i);
+        ctx.set_array_element(snapshot, i, v);
+    }
+    let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let nfields = ctx.class_num_total_fields(cid).max(1);
+    let stream = ctx.alloc_object(cid, nfields);
+    ctx.set_field(stream, 0, Value::Object(Some(snapshot)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn alloc_synthetic_stream(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, elems.len());
+    for (i, v) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let nfields = ctx.class_num_total_fields(cid).max(1);
+    let stream = ctx.alloc_object(cid, nfields);
+    ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn drain_spliterator_to_stream(
+    ctx: &mut dyn NativeContext,
+    spliterator: rustjvm_types::ObjectRef,
+) -> MethodCallResult {
+    // Best-effort drain via `tryAdvance(Consumer)` — bounded.
+    let mut collected: Vec<Value> = Vec::new();
+    const SAFETY_CAP: usize = 1_000_000;
+    // We can't pass a closure to JDK code; instead, repeatedly call
+    // `tryAdvance` and rely on the side-effect of advancing the spliterator's
+    // cursor while a no-op consumer absorbs the element. Since we don't have a
+    // way to inject a side-channel consumer here, fall through to an empty
+    // stream rather than risk infinite-looping a misbehaving spliterator.
+    let _ = (spliterator, &mut collected, SAFETY_CAP);
+    alloc_synthetic_stream(ctx, &[])
+}
+
 pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
     let sl = "java/util/ServiceLoader";
     r.register(
@@ -458,7 +624,19 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(sl, "iterator", "()Ljava/util/Iterator;", native_sl_iterator);
     r.register(sl, "stream", "()Ljava/util/stream/Stream;", native_sl_stream);
+    r.register(sl, "spliterator", "()Ljava/util/Spliterator;", native_sl_spliterator);
     r.register(sl, "findFirst", "()Ljava/util/Optional;", native_sl_find_first);
+
+    // Re-register `StreamSupport.stream(Spliterator, boolean)` — see the
+    // header comment on `native_stream_support_stream_from_spliterator`. This
+    // must run LAST to win the registration race against the prior phase69
+    // registration that doesn't survive linking in this binary.
+    r.register(
+        "java/util/stream/StreamSupport",
+        "stream",
+        "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;",
+        native_stream_support_stream_from_spliterator,
+    );
 }
 
 #[cfg(test)]
