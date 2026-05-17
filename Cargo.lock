@@ -1789,6 +1789,7 @@ dependencies = [
  "clap",
  "cuda-bridge",
  "rustjvm-native-api",
+ "rustjvm-native-builtins",
  "rustjvm-vm",
  "tracing",
  "tracing-subscriber",

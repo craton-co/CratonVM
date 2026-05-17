@@ -57,11 +57,7 @@ struct ClassStoreHierarchy<'a> {
 
 impl<'a> ClassStoreHierarchy<'a> {
     fn lookup(&self, name: &str) -> Option<ClassId> {
-        // T10.9.E: probe with an `Arc<str>` constructed from `&str`. This is
-        // a single allocation per probe — no worse than the prior
-        // `name.to_string()`. The win from the conversion comes from the
-        // insert side, where callers already hold an `Arc<str>` and only
-        // need a refcount bump.
+        // Probe with `Arc<str>` to match the storage map's key type.
         let probe: Arc<str> = Arc::from(name);
         for loader_id in &[
             ClassLoaderId::Bootstrap,
