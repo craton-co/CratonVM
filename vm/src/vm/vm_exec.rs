@@ -1181,6 +1181,171 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // write_barrier fires automatically inside set_array_element for ref arrays
     }
 
+    // -- Bulk primitive-array intrinsics (perf override) --------------------
+    //
+    // The trait defaults loop via `set_array_element` / `get_array_element`,
+    // each iteration doing a virtual dispatch + Value boxing + element-type
+    // match. For multi-KB byte/char copies (ZipFile entry reads, file I/O,
+    // String construction from char[]) that's the round-2 review's largest
+    // unfixed hotspot. Here we replace the loop with a single
+    // `ptr::copy_nonoverlapping` against the compact array payload exposed
+    // by `VmHeap::array_data_ptr`. Bounds + element-type are verified up
+    // front; on mismatch we fall through to `false` / `0` to match the
+    // documented contract — callers fall back to the per-element path.
+
+    fn write_byte_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u8]) -> bool {
+        // Verify destination is a byte/boolean array (both store 1 byte per element).
+        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+            return false;
+        }
+        let et = self.shared.heap.element_type_of(arr);
+        if !matches!(et, ArrayElementType::Byte | ArrayElementType::Boolean) {
+            return false;
+        }
+        let len = self.shared.heap.array_length(arr);
+        let end = match dst_off.checked_add(src.len()) {
+            Some(e) => e,
+            None => return false,
+        };
+        if end > len {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: bounds checked above (`dst_off + src.len() <= array_length`).
+        // `array_data_ptr` returns a pointer to the compact 1-byte-per-element
+        // payload immediately after the object header. `src` is a borrowed
+        // slice that cannot overlap with the heap arena (Rust borrow rules
+        // — we hold `&mut self`, and the heap arena's data is not aliased
+        // by a Rust-side `&mut [u8]`). The destination range is
+        // `[dst_off, dst_off + src.len())` which lies wholly within the
+        // array's payload of `len` bytes.
+        unsafe {
+            let base = self.shared.heap.array_data_ptr(arr);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(dst_off), src.len());
+        }
+        true
+    }
+
+    fn read_byte_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u8]) -> usize {
+        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+            return 0;
+        }
+        let et = self.shared.heap.element_type_of(arr);
+        if !matches!(et, ArrayElementType::Byte | ArrayElementType::Boolean) {
+            return 0;
+        }
+        let len = self.shared.heap.array_length(arr);
+        if src_off > len {
+            return 0;
+        }
+        let available = len - src_off;
+        let n = available.min(dst.len());
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: bounds checked above (`src_off + n <= array_length`,
+        // `n <= dst.len()`). Source pointer comes from `array_data_ptr`
+        // (compact 1-byte-per-element payload). Destination is a caller-
+        // owned `&mut [u8]` which cannot alias the heap arena.
+        unsafe {
+            let base = self.shared.heap.array_data_ptr(arr);
+            std::ptr::copy_nonoverlapping(base.add(src_off), dst.as_mut_ptr(), n);
+        }
+        n
+    }
+
+    fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
+        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+            return 0;
+        }
+        if self.shared.heap.element_type_of(arr) != ArrayElementType::Char {
+            return 0;
+        }
+        let len = self.shared.heap.array_length(arr);
+        if src_off > len {
+            return 0;
+        }
+        let available = len - src_off;
+        let n = available.min(dst.len());
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: bounds checked above. Char arrays are stored as 2 bytes
+        // per element (see `read_prim_element` Char branch / `element_byte_size`).
+        // We copy `n * 2` bytes from `base + src_off*2` into `dst.as_mut_ptr()`.
+        // Same host-endian convention as `VmHeap::read_char_array_bulk`,
+        // which already uses `copy_nonoverlapping` between this payload and
+        // a host `[u16]`.
+        unsafe {
+            let base = self.shared.heap.array_data_ptr(arr);
+            std::ptr::copy_nonoverlapping(
+                base.add(src_off * 2),
+                dst.as_mut_ptr() as *mut u8,
+                n * 2,
+            );
+        }
+        n
+    }
+
+    fn bulk_array_copy(
+        &mut self,
+        src: ObjectRef,
+        src_off: usize,
+        dst: ObjectRef,
+        dst_off: usize,
+        len: usize,
+    ) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if self.shared.heap.kind_of(src) != ObjectKind::Array
+            || self.shared.heap.kind_of(dst) != ObjectKind::Array
+        {
+            return false;
+        }
+        let src_et = self.shared.heap.element_type_of(src);
+        let dst_et = self.shared.heap.element_type_of(dst);
+        // Primitive arrays only — reference arrays need per-element store
+        // checks (ArrayStoreException) and the GC write barrier, which we
+        // intentionally do not bypass here.
+        if src_et != dst_et || src_et == ArrayElementType::Reference {
+            return false;
+        }
+        let stride = match src_et {
+            ArrayElementType::Byte | ArrayElementType::Boolean => 1usize,
+            ArrayElementType::Char | ArrayElementType::Short => 2,
+            ArrayElementType::Int | ArrayElementType::Float => 4,
+            ArrayElementType::Long | ArrayElementType::Double => 8,
+            ArrayElementType::Reference => return false, // unreachable, guarded above
+        };
+        let src_len = self.shared.heap.array_length(src);
+        let dst_len = self.shared.heap.array_length(dst);
+        let src_end = match src_off.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        let dst_end = match dst_off.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        if src_end > src_len || dst_end > dst_len {
+            return false;
+        }
+        // SAFETY: bounds checked above for both source and destination.
+        // For same-array overlap we use `copy` (memmove semantics); for
+        // distinct arrays the ranges cannot overlap (different heap
+        // allocations) so `copy_nonoverlapping` is also valid, but `copy`
+        // is fine in either case and lets us share one branch.
+        unsafe {
+            let src_ptr = self.shared.heap.array_data_ptr(src).add(src_off * stride);
+            let dst_ptr = self.shared.heap.array_data_ptr(dst).add(dst_off * stride);
+            std::ptr::copy(src_ptr, dst_ptr, len * stride);
+        }
+        true
+    }
+
     fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind {
         self.shared.heap.kind_of(obj)
     }
@@ -9164,12 +9329,6 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
-            attributes: Vec::new(),
-            source_file_cache: std::sync::OnceLock::new(),
-            signature_cache: std::sync::OnceLock::new(),
-            nest_host_cache: std::sync::OnceLock::new(),
-            enclosing_method_cache: std::sync::OnceLock::new(),
-            record_components_cache: std::sync::OnceLock::new(),
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)

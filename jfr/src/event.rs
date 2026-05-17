@@ -79,6 +79,11 @@ pub struct EventInstance {
 ///
 /// `String` variant uses `Arc<str>` to allow cheap cloning and sharing across
 /// multiple recordings without per-recording heap allocation.
+///
+/// J6 (round-2): `Str` holds a `&'static str` directly so emit sites that
+/// pass literal cause/name strings (e.g. "G1 Young", "Allocation Failure")
+/// avoid the `Arc::from(&str)` heap allocation per event. The dumper treats
+/// `Str` and `String` identically — both encode as a UTF-8 byte slice.
 #[derive(Debug, Clone)]
 pub enum EventValue {
     Long(i64),
@@ -87,6 +92,7 @@ pub enum EventValue {
     Double(f64),
     Boolean(bool),
     String(Arc<str>),
+    Str(&'static str),
     Null,
 }
 
@@ -94,6 +100,29 @@ impl EventValue {
     /// Convenience constructor for string values from a `&str`.
     pub fn from_str(s: &str) -> Self {
         EventValue::String(Arc::from(s))
+    }
+
+    /// Zero-allocation constructor for static string literals.
+    ///
+    /// Prefer this over `from_str` when the input is a `&'static str` (e.g.
+    /// a literal in source code), to avoid the per-event `Arc::from` heap
+    /// allocation on emit.
+    #[inline]
+    pub const fn from_static(s: &'static str) -> Self {
+        EventValue::Str(s)
+    }
+
+    /// Borrow the underlying bytes of a string-typed value, if any.
+    ///
+    /// Returns `Some(&[u8])` for `String`, `Str`; `None` otherwise (including
+    /// `Null`, which encodes as a null tag, not a byte slice).
+    #[inline]
+    pub fn as_str_bytes(&self) -> Option<&[u8]> {
+        match self {
+            EventValue::String(s) => Some(s.as_bytes()),
+            EventValue::Str(s) => Some(s.as_bytes()),
+            _ => None,
+        }
     }
 }
 

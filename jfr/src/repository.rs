@@ -330,8 +330,15 @@ pub fn global_ring_registry() -> &'static ThreadRingRegistry {
 /// Push an event onto the calling thread's ring shard, registering it with
 /// the global registry on first call.
 ///
+/// J7 (round-2): the steady-state hot path borrows the thread-local `Arc`
+/// shard reference *in place* instead of cloning it on every call. The
+/// previous implementation did `cell.borrow().clone()` per emit, which is a
+/// refcount bump (atomic RMW + branch). We now hold a `Ref<'_, …>` borrow
+/// only long enough to take the ring lock; the lock is independent of the
+/// outer borrow so it's safe to drop the borrow afterward.
+///
 /// Hot-path cost (steady state, no contention):
-///   - 1 thread-local access to fetch the cached `Arc` clone
+///   - 1 thread-local access + borrow (no atomic operations)
 ///   - 1 uncontended mutex lock + `VecDeque::push_back` + unlock
 ///   - possible `VecDeque::pop_front` if the ring is at capacity
 ///
@@ -339,19 +346,37 @@ pub fn global_ring_registry() -> &'static ThreadRingRegistry {
 ///   - 1 `Arc::new` + `Mutex::new` + `VecDeque::with_capacity` allocation
 ///   - 1 global-registry mutex lock to publish the new shard
 pub fn push_to_thread_ring(ev: EventInstance) {
-    // Try the thread-local fast path first to avoid even touching the registry
-    // on every call. The thread-local cell holds an `Arc` clone of the shard.
-    let ring = THREAD_REGISTERED_RING.with(|cell| cell.borrow().clone());
-    let ring = match ring {
-        Some(r) => r,
-        None => global_ring_registry().register_current_thread(),
-    };
+    // Fast path: borrow the thread-local shard reference in place and push
+    // by value. The closure takes `Option<EventInstance>` so we can move the
+    // event into the queue (preserving its Arc<str> fields without cloning)
+    // and signal back whether the push happened.
+    //
+    // If the cell is empty (first call on this thread), the closure returns
+    // the event unmoved, and we fall through to the slow path that registers
+    // a new shard and pushes via the freshly-returned Arc.
+    let leftover = THREAD_REGISTERED_RING.with(|cell| {
+        if let Some(ring) = cell.borrow().as_ref() {
+            push_one(ring, ev);
+            None
+        } else {
+            Some(ev)
+        }
+    });
+    if let Some(ev) = leftover {
+        // Slow path: register, install in thread-local, and push.
+        let shard = global_ring_registry().register_current_thread();
+        push_one(&shard, ev);
+    }
+}
+
+/// Inner push helper: lock the shard, evict head if full, push tail. Pulled
+/// out so the fast path and the slow path share one place that does the lock
+/// dance. Takes `EventInstance` by value so its `Arc<str>` payloads are
+/// moved (not cloned) into the queue.
+#[inline]
+fn push_one(ring: &Arc<Mutex<VecDeque<EventInstance>>>, ev: EventInstance) {
     let capacity = global_ring_registry().shard_capacity();
-    // Bind the lock result to a named let so its PoisonError variant's
-    // destructor (which holds the MutexGuard borrowing from `ring`) drops
-    // before `ring` itself at end-of-function — avoids E0597.
-    let lock_result = ring.lock();
-    if let Ok(mut q) = lock_result {
+    if let Ok(mut q) = ring.lock() {
         if q.len() >= capacity {
             let _ = q.pop_front();
         }

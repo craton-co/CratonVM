@@ -6397,6 +6397,13 @@ impl Compiler {
                 }
 
                 // getstatic (0xb2) — use callee's static_field_info
+                //
+                // MED-2 bail (round-2 JIT review): same gap as the top-level
+                // 0xb2 handler at line ~9620 — see the long comment there
+                // for the full unblocking plan. Briefly: `SharedVm.statics`
+                // slot addresses aren't stable (Vec resize, lazy entry),
+                // so we can't bake them as `imm64` and emit `MOV reg,
+                // [imm64]`. Stay on the helper-call path.
                 0xb2 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
                     self.flush_scratch_registers();
@@ -6421,6 +6428,11 @@ impl Compiler {
                 }
 
                 // putstatic (0xb3) — use callee's static_field_info
+                //
+                // MED-2 bail (round-2 JIT review): same gap as the top-level
+                // 0xb3 handler — slot pointer not stable, no VM-crate access
+                // from `jit`. See the comment on the top-level 0xb2 handler
+                // for the full unblocking plan.
                 0xb3 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
                     self.flush_scratch_registers();
@@ -9546,6 +9558,76 @@ impl Compiler {
                 }
 
                 // getstatic (0xb2) — always call helper for thread safety
+                //
+                // MED-2 (round-2 JIT review) — HotSpot inlines non-volatile
+                // getstatic as a single `MOV reg, [imm64]` against the class's
+                // static-area slot, because both the class_id and the slot
+                // address are known at JIT compile time. CratonVM cannot
+                // currently emit that form. Bail rationale (see round-1 TLAB
+                // bail at 10783-10807 for the same pattern):
+                //
+                //   1. Slot storage is `SharedVm.statics:
+                //      RwLock<HashMap<ClassId, Vec<Value>>>` (see
+                //      `vm/src/vm/vm_object.rs::get_static_shared` at line
+                //      472). The slot address is NOT stable:
+                //        * the `Vec<Value>` is grown by `resize` in
+                //          `set_static_shared` (vm_object.rs:498) — any prior
+                //          `&v[idx]` pointer dangles after the grow,
+                //        * the HashMap entry is created lazily on first
+                //          write (line 485), so a getstatic at warmup time
+                //          may see no entry at all,
+                //        * concurrent writers hold the RwLock write guard;
+                //          a JIT inline `MOV [imm64]` would race the
+                //          interpreter's `set_static_shared`.
+                //      The slot pointer would therefore have to be embedded
+                //      as an immediate yet remain valid across the program's
+                //      lifetime — neither holds today.
+                //
+                //   2. Even if the storage were a stably-addressed array,
+                //      the `Value` enum is a tagged union (Int/Long/Float/
+                //      Double/Object), not a raw machine word. The JIT would
+                //      have to read both the tag and the payload to know
+                //      how to push to its operand stack — multi-step,
+                //      atomicity-fragile, and dependent on the enum layout.
+                //
+                //   3. The `jit` crate has no dependency on the `vm` crate
+                //      (see `jit/Cargo.toml` — only types, reader, jit-api).
+                //      So even doing the resolution at JIT compile time
+                //      would require either (a) a new field on
+                //      `JitRuntimeHelpers` that exposes a fn-pointer
+                //      `resolve_static_slot(class_id, field_index) ->
+                //      *const Value`, or (b) plumbing the resolved slot
+                //      addresses into the per-bci `static_field_info` from
+                //      the caller in vm/src/jit/. Both require edits beyond
+                //      this file; this task is constrained to `jit/src/x64.rs`
+                //      only.
+                //
+                // To wire inlining later, the prerequisites are:
+                //   * Change `SharedVm.statics` to use a stable allocation
+                //     for each class's static area (e.g. `Box<[AtomicU64]>`
+                //     allocated once per `<clinit>` and pinned for the
+                //     class's life). Volatile fields then use
+                //     `MOV [imm64]` + MFENCE; non-volatile use plain
+                //     `MOV [imm64]` (x86 already gives acquire ordering
+                //     for aligned 8-byte loads).
+                //   * Add a `JitRuntimeHelpers` field exposing the slot
+                //     resolver, or pre-resolve at JIT compile time and
+                //     extend `static_field_info` to carry the slot ptr.
+                //   * Match the static slot type to the field's JVM type
+                //     (use type_tag) so the inline MOV writes the right
+                //     width (32 for int/float, 64 for long/double/ref).
+                //
+                // Expected speedup once wired: a JIT-compiled hot loop with
+                // a getstatic+putstatic pair drops from ~2 CALLs + arg
+                // marshalling (~12-18 cycles round trip) to two MOVs
+                // (~3-4 cycles). HotSpot publishes this as the dominant
+                // static-field-access optimization; we expect a 4-6x
+                // speedup on static-field-heavy microbenchmarks
+                // (Counter.increment(), shared lazy-init flags, etc.).
+                //
+                // Until then, every static access stays on the helper
+                // path below. This is correct (the helper takes the
+                // RwLock and reads `Value` properly) but slow.
                 0xb2 => {
                     let (_, class_id_raw, field_index, _type_tag, is_volatile) = self
                         .static_field_info
@@ -9568,6 +9650,16 @@ impl Compiler {
                 }
 
                 // putstatic (0xb3) — write static field via type-specific helper
+                //
+                // MED-2 (round-2 JIT review): same bail as 0xb2 above. The
+                // symmetric inline form would be `MOV [imm64], reg`, but
+                // (a) `SharedVm.statics` slot addresses aren't stable
+                // (the Vec resizes; the HashMap entry is created lazily),
+                // (b) writes need to go through `set_static_shared` so the
+                // GC and finalizer paths see the new object reference, and
+                // (c) the `jit` crate has no `vm` dependency to resolve the
+                // slot pointer at JIT compile time. See the long bail comment
+                // on the 0xb2 handler above for the full unblocking plan.
                 0xb3 => {
                     self.flush_scratch_registers();
                     let (_, class_id_raw, field_index, type_tag, is_volatile) = self

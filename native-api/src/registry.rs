@@ -204,6 +204,84 @@ pub trait NativeContext {
     /// Write an array element by index.
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value);
 
+    // -- Bulk primitive-array intrinsics (perf path) -----------------------
+    //
+    // These default to the per-element loop so existing mock contexts compile
+    // unchanged. The VM override (`NativeContextImpl`) replaces the loop with
+    // a single `ptr::copy_nonoverlapping` against the compact array payload,
+    // eliminating ~N virtual dispatches + Value boxes per byte/char copy.
+    //
+    // Callers in native-io / native-builtins / native-collections (e.g.
+    // ZipFile entry reads, FileInputStream/OutputStream, String construction
+    // from char[]) currently loop element-by-element through
+    // `set_array_element` / `get_array_element`; migrating those callers to
+    // these intrinsics is the round-2 perf win.
+
+    /// Bulk copy from a host byte slice into a Java `byte[]` array at the given offset.
+    /// Returns `true` on success, `false` on bounds error / wrong array kind.
+    ///
+    /// The default impl loops via `set_array_element` (correct but slow). The
+    /// VM override uses `ptr::copy_nonoverlapping` against the array's raw
+    /// payload, which is ~50-100x faster for multi-KB copies.
+    fn write_byte_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u8]) -> bool {
+        for (i, b) in src.iter().enumerate() {
+            self.set_array_element(arr, dst_off + i, Value::Int(*b as i8 as i32));
+        }
+        true
+    }
+
+    /// Bulk read from a Java `byte[]` array into a host buffer at the given offset.
+    /// Returns the number of bytes actually copied (0 on bounds error / wrong array kind).
+    ///
+    /// The default impl loops via `get_array_element`; the VM override
+    /// `memcpy`s from the array's raw payload.
+    fn read_byte_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u8]) -> usize {
+        for i in 0..dst.len() {
+            match self.get_array_element(arr, src_off + i) {
+                Value::Int(v) => dst[i] = v as u8,
+                _ => return i,
+            }
+        }
+        dst.len()
+    }
+
+    /// Bulk read from a Java `char[]` array into a host `u16` buffer.
+    ///
+    /// Default: per-element loop. VM override: single `copy_nonoverlapping`
+    /// of `len * 2` bytes from the compact char-array payload (chars are
+    /// stored as little-endian `u16` matching host order on supported
+    /// targets — same convention `read_char_array_bulk` in `vm_heap`).
+    fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
+        for i in 0..dst.len() {
+            match self.get_array_element(arr, src_off + i) {
+                Value::Int(v) => dst[i] = v as u16,
+                _ => return i,
+            }
+        }
+        dst.len()
+    }
+
+    /// Bulk copy of array elements (primitive arrays only — for ref arrays
+    /// the caller must do per-element typecheck). `src` and `dst` may alias
+    /// (the VM override uses `copy_within` for same-array overlap, falling
+    /// back to `copy_nonoverlapping` for distinct backings).
+    ///
+    /// Returns `true` on success, `false` on bounds / element-type mismatch.
+    fn bulk_array_copy(
+        &mut self,
+        src: ObjectRef,
+        src_off: usize,
+        dst: ObjectRef,
+        dst_off: usize,
+        len: usize,
+    ) -> bool {
+        for i in 0..len {
+            let v = self.get_array_element(src, src_off + i);
+            self.set_array_element(dst, dst_off + i, v);
+        }
+        true
+    }
+
     /// Get the ObjectKind (Object or Array) of a heap object.
     fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind;
 

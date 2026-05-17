@@ -401,6 +401,73 @@ impl ValueStack {
         self.slots[self.len].as_float().unwrap_or(0.0)
     }
 
+    /// Push an f64 directly as a `CompactValue::double(_)` (skip `Value` decode).
+    ///
+    /// Round-2 VM review: mirrors `push_float_unchecked` for the d-arithmetic
+    /// hot path (`dadd`, `dsub`, `dmul`, `ddiv`).
+    ///
+    /// # Panics
+    /// Panics if the stack is full.
+    #[inline(always)]
+    pub fn push_double_unchecked(&mut self, v: f64) {
+        assert!(self.len < self.max_size, "stack overflow in push_double_unchecked");
+        self.slots[self.len] = CompactValue::double(v);
+        self.len += 1;
+    }
+
+    /// Pop an f64 directly from a `CompactValue::double(_)` slot.
+    ///
+    /// Doubles are stored as raw f64 bits in the CompactValue (with NaN-tag
+    /// collisions canonicalised on write).  Verified bytecode guarantees this
+    /// slot was produced by a Double-producing opcode (dconst, dload, dadd …),
+    /// so reading the raw bits is the JVMS-correct decode.
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn pop_double_unchecked(&mut self) -> f64 {
+        assert!(self.len > 0, "stack underflow in pop_double_unchecked");
+        self.len -= 1;
+        // CompactValue::double(v) stores `v.to_bits()` verbatim (or canonical
+        // NaN on collision), and there is no separate Double sub-tag — the
+        // slot's raw u64 IS the double's bit pattern. Same decode policy as
+        // pop_double's CompactTag::Double arm.
+        f64::from_bits(self.slots[self.len].to_bits())
+    }
+
+    /// Push an i64 directly as a `CompactValue::long(_)` (skip `Value` decode).
+    ///
+    /// Round-2 VM review: mirrors `push_int_unchecked` for long ops where the
+    /// caller has the raw i64 in hand.
+    ///
+    /// # Panics
+    /// Panics if the stack is full.
+    #[inline(always)]
+    pub fn push_long_unchecked(&mut self, v: i64) {
+        assert!(self.len < self.max_size, "stack overflow in push_long_unchecked");
+        self.slots[self.len] = CompactValue::long(v);
+        self.len += 1;
+    }
+
+    /// Pop an i64 directly from the top stack slot.
+    ///
+    /// Verified bytecode guarantees the slot is a long (either tagged Long or
+    /// untagged Double — both store raw i64 bits in the CompactValue
+    /// representation). Mirrors `pop_long`'s fast-path arms without the
+    /// per-slot tag-match overhead.
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn pop_long_unchecked(&mut self) -> i64 {
+        assert!(self.len > 0, "stack underflow in pop_long_unchecked");
+        self.len -= 1;
+        // Both CompactTag::Long (NaN-tag collision) and CompactTag::Double
+        // (untagged) store the raw i64 bits directly in self.0 — see
+        // `pop_long`'s Long|Double arm.
+        self.slots[self.len].as_long_unchecked()
+    }
+
     /// Peek the top-of-stack as an i32 without popping.  Returns 0 for
     /// non-Int slots (matches `pop_int_unchecked`).
     ///

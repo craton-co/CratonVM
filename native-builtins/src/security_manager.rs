@@ -11,11 +11,11 @@
 
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use rustjvm_types::{ClassId, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -196,10 +196,17 @@ pub fn policy_allows_full(
 /// One entry on the per-thread privileged-frame stack.  Carries both the
 /// codeBase URL (for `grant codeBase "..."` matching) and the SHA-256
 /// digests of the JAR-signer blocks (for `grant signedBy "..."` matching).
-#[derive(Debug, Clone, Default)]
+///
+/// Storage uses `Arc<str>` / `Arc<[Arc<str>]>` so the doPrivileged hot
+/// path (~50k calls during JDK boot) reduces to a refcount bump on push
+/// instead of cloning per-class signer-token strings on every frame.
+/// The signer-token arc is interned per-ClassId in
+/// [`SIGNER_TOKENS_CACHE`]; the codeBase fallback string is interned
+/// per-ClassId in [`CLASS_CODE_BASE_CACHE`].
+#[derive(Debug, Clone)]
 struct PrivilegedFrame {
-    code_base: Option<String>,
-    cert_digests: Vec<String>,
+    code_base: Option<Arc<str>>,
+    cert_digests: Arc<[Arc<str>]>,
 }
 
 thread_local! {
@@ -210,17 +217,28 @@ thread_local! {
     static PRIVILEGED_STACK: RefCell<Vec<PrivilegedFrame>> = const { RefCell::new(Vec::new()) };
 }
 
-fn push_privileged_frame(code_base: Option<String>) {
-    push_privileged_frame_full(code_base, Vec::new());
-}
-
-fn push_privileged_frame_full(code_base: Option<String>, cert_digests: Vec<String>) {
+/// Internal: push a frame already shaped as `Arc<str>` / `Arc<[Arc<str>]>`.
+/// The doPrivileged callees use this to avoid per-call allocation.
+fn push_privileged_frame_arc(code_base: Option<Arc<str>>, cert_digests: Arc<[Arc<str>]>) {
     PRIVILEGED_STACK.with(|s| {
         s.borrow_mut().push(PrivilegedFrame {
             code_base,
             cert_digests,
         })
     });
+}
+
+/// Push a frame with just a codeBase URL (no signer digests).  Kept for
+/// tests and any non-hot caller that doesn't have cert tokens to push.
+fn push_privileged_frame(code_base: Option<String>) {
+    push_privileged_frame_arc(code_base.map(Arc::from), Arc::from(Vec::<Arc<str>>::new()));
+}
+
+/// Push a frame from owned `Vec<String>` tokens. Used by tests; converts
+/// to the Arc-backed shape before pushing.
+fn push_privileged_frame_full(code_base: Option<String>, cert_digests: Vec<String>) {
+    let arc_tokens: Vec<Arc<str>> = cert_digests.into_iter().map(Arc::from).collect();
+    push_privileged_frame_arc(code_base.map(Arc::from), arc_tokens.into());
 }
 
 fn pop_privileged_frame() -> Option<PrivilegedFrame> {
@@ -232,7 +250,7 @@ pub fn current_privileged_code_base() -> Option<String> {
     PRIVILEGED_STACK.with(|s| {
         s.borrow()
             .last()
-            .and_then(|frame| frame.code_base.clone())
+            .and_then(|frame| frame.code_base.as_ref().map(|a| a.to_string()))
     })
 }
 
@@ -242,7 +260,11 @@ pub fn current_privileged_code_base() -> Option<String> {
 /// code on the privileged frame.
 pub fn current_privileged_cert_digests() -> Vec<String> {
     PRIVILEGED_STACK
-        .with(|s| s.borrow().last().map(|frame| frame.cert_digests.clone()))
+        .with(|s| {
+            s.borrow()
+                .last()
+                .map(|frame| frame.cert_digests.iter().map(|a| a.to_string()).collect())
+        })
         .unwrap_or_default()
 }
 
@@ -560,6 +582,88 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
 // java.security.AccessController
 // ---------------------------------------------------------------------------
 
+/// Per-ClassId memoisation of [`action_code_base`].
+///
+/// The hot path is the synthetic-`class:<name>` fallback, which used to
+/// `format!` a fresh `String` on every doPrivileged call.  JDK boot
+/// hits doPrivileged ~50k times; caching the formatted `Arc<str>`
+/// turns those allocations into a hashmap probe + refcount bump.
+///
+/// `None` is also cached (as a sentinel `OnceLock`-style miss) — see
+/// the `Option<Arc<str>>` value type — so unknown classes don't keep
+/// re-querying the class manager.  Cert digests don't change at runtime
+/// so no invalidation is needed.
+static CLASS_CODE_BASE_CACHE: OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u32, Option<Arc<str>>>>> =
+    OnceLock::new();
+
+/// Per-ClassId memoisation of [`action_cert_digests`].
+///
+/// `class_code_source_cert_digests` returns an owned `Vec<String>` and
+/// every `parse_signer_dn` call walks PKCS#7 DER on every invocation —
+/// per-class data that's stable for the lifetime of the JVM.  Stored
+/// as `Arc<[Arc<str>]>` so the doPrivileged push reduces to two
+/// refcount bumps (`Arc::clone` on the slice header + Arc tokens reused
+/// by-reference).
+static SIGNER_TOKENS_CACHE: OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u32, Arc<[Arc<str>]>>>> =
+    OnceLock::new();
+
+/// Cached form of [`action_code_base`] keyed by ClassId.  Returns the
+/// same `Arc<str>` on every hit so the doPrivileged push is a refcount
+/// bump.  See [`CLASS_CODE_BASE_CACHE`] for the rationale.
+fn cached_action_code_base(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+) -> Option<Arc<str>> {
+    let cache = CLASS_CODE_BASE_CACHE
+        .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
+    if let Some(slot) = cache.read().get(&class_id.as_u32()) {
+        return slot.clone();
+    }
+    // Slow path: derive the URL the same way `action_code_base` did.
+    let computed: Option<Arc<str>> = if let Some(url) = ctx.class_code_base(class_id) {
+        Some(Arc::from(url))
+    } else {
+        ctx.class_name_of_id(class_id)
+            .map(|name| Arc::from(format!("class:{name}")))
+    };
+    // Insert (clone the Arc, not the str body).
+    cache
+        .write()
+        .insert(class_id.as_u32(), computed.clone());
+    computed
+}
+
+/// Cached form of [`action_cert_digests`] keyed by ClassId.  The
+/// PKCS#7 DER walk in [`x509::parse_signer_dn`] runs at most once per
+/// class for the lifetime of the JVM; subsequent doPrivileged calls
+/// reuse the same `Arc<[Arc<str>]>`.
+fn cached_signer_tokens(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+) -> Arc<[Arc<str>]> {
+    let cache = SIGNER_TOKENS_CACHE
+        .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
+    if let Some(arc) = cache.read().get(&class_id.as_u32()).cloned() {
+        return arc;
+    }
+    // Slow path: build the tokens via the original logic.
+    let mut tokens: Vec<Arc<str>> = ctx
+        .class_code_source_cert_digests(class_id)
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    for pkcs7 in ctx.class_code_source_certs(class_id) {
+        if let Ok(dn) = x509::parse_signer_dn(&pkcs7) {
+            tokens.push(Arc::from(dn));
+        }
+    }
+    let arc: Arc<[Arc<str>]> = tokens.into();
+    cache
+        .write()
+        .insert(class_id.as_u32(), Arc::clone(&arc));
+    arc
+}
+
 /// Derive the codeBase URL from the action object's declaring class.
 ///
 /// Real HotSpot walks the stack and reads the `ProtectionDomain` of the
@@ -573,20 +677,15 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
 /// When no real URL is available (synthetic / stub classes, JDK internals
 /// from a jimage), we fall back to the synthetic `class:` URI so tests
 /// and legacy policy entries that use `class:com/acme/-` still work.
+///
+/// Tests still call this directly — production doPrivileged uses
+/// [`cached_action_code_base`] which is hot-path-optimised.
 fn action_code_base(
     ctx: &mut dyn NativeContext,
     action: ObjectRef,
 ) -> Option<String> {
     let cid = ctx.class_id_of_object(action);
-    // Preferred: real per-class CodeSource URL set at class-load time.
-    if let Some(url) = ctx.class_code_base(cid) {
-        return Some(url);
-    }
-    // Fallback: synthetic `class:<internal name>` for classes that lack a
-    // real CodeSource (JDK boot classes loaded from jimage, synthetic
-    // stubs, mock-context tests).
-    let name = ctx.class_name_of_id(cid)?;
-    Some(format!("class:{name}"))
+    cached_action_code_base(ctx, cid).map(|a| a.to_string())
 }
 
 /// Return a mixed slice of signer-identifier tokens for the action
@@ -600,18 +699,19 @@ fn action_code_base(
 /// The policy engine's `signed_by_matches` distinguishes the two
 /// formats by tag-shape: 64 hex chars → digest; contains `=` → DN.
 /// Empty when the class is unsigned or has no CodeSource.
+///
+/// Production callers go through [`cached_signer_tokens`]; this helper
+/// remains for any non-hot caller that wants the `Vec<String>` shape.
+#[allow(dead_code)]
 fn action_cert_digests(
     ctx: &mut dyn NativeContext,
     action: ObjectRef,
 ) -> Vec<String> {
     let cid = ctx.class_id_of_object(action);
-    let mut tokens = ctx.class_code_source_cert_digests(cid);
-    for pkcs7 in ctx.class_code_source_certs(cid) {
-        if let Ok(dn) = x509::parse_signer_dn(&pkcs7) {
-            tokens.push(dn);
-        }
-    }
-    tokens
+    cached_signer_tokens(ctx, cid)
+        .iter()
+        .map(|a| a.to_string())
+        .collect()
 }
 
 fn register_access_controller(r: &mut NativeMethodRegistry) {
@@ -628,19 +728,20 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;",
         |ctx, args| {
             let action = obj_arg(args, 0)?;
-            let cb = action_code_base(ctx, action);
-            let digests = action_cert_digests(ctx, action);
+            // Single class_id_of_object lookup, then everything is keyed by
+            // the cached ClassId — no per-call format!() or PKCS#7 walk.
+            let cid = ctx.class_id_of_object(action);
+            let cb = cached_action_code_base(ctx, cid);
+            let digests = cached_signer_tokens(ctx, cid);
             let dbg = std::env::var_os("RUSTJVM_DBG_DOPRIV").is_some();
             if dbg {
-                let cid = ctx.class_id_of_object(action);
                 let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
                 eprintln!("[doPriv] ENTER action class={cls}");
             }
-            push_privileged_frame_full(cb, digests);
+            push_privileged_frame_arc(cb, digests);
             let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
             if dbg {
-                let cid = ctx.class_id_of_object(action);
                 let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
                 eprintln!("[doPriv] EXIT action class={cls} ok={}", result.is_ok());
             }
@@ -656,9 +757,10 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PrivilegedExceptionAction;)Ljava/lang/Object;",
         |ctx, args| {
             let action = obj_arg(args, 0)?;
-            let cb = action_code_base(ctx, action);
-            let digests = action_cert_digests(ctx, action);
-            push_privileged_frame_full(cb, digests);
+            let cid = ctx.class_id_of_object(action);
+            let cb = cached_action_code_base(ctx, cid);
+            let digests = cached_signer_tokens(ctx, cid);
+            push_privileged_frame_arc(cb, digests);
             let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
             result
@@ -674,9 +776,10 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;)Ljava/lang/Object;",
         |ctx, args| {
             let action = obj_arg(args, 0)?;
-            let cb = action_code_base(ctx, action);
-            let digests = action_cert_digests(ctx, action);
-            push_privileged_frame_full(cb, digests);
+            let cid = ctx.class_id_of_object(action);
+            let cb = cached_action_code_base(ctx, cid);
+            let digests = cached_signer_tokens(ctx, cid);
+            push_privileged_frame_arc(cb, digests);
             let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
             result
@@ -1438,6 +1541,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         PRIVILEGED_STACK.with(|s| s.borrow_mut().clear());
+        // Tests reuse small `ClassId` values across `MockNativeContext`
+        // instances (each fresh ctx starts at id=1), so the per-ClassId
+        // caches from prior tests would leak across the test boundary.
+        // Clear them under the same gate as the privileged stack.
+        if let Some(cache) = CLASS_CODE_BASE_CACHE.get() {
+            cache.write().clear();
+        }
+        if let Some(cache) = SIGNER_TOKENS_CACHE.get() {
+            cache.write().clear();
+        }
     }
 
     #[test]

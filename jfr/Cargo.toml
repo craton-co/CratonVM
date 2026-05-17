@@ -14,6 +14,9 @@ categories.workspace = true
 # (declared but unused; crate is single-threaded, sync via plain Mutex
 # where present).
 rustc-hash = "1.1"
+# J5 (round-2): SmallVec for inline EventInstance.fields storage. Most events
+# carry <= 4 fields, so this avoids a heap allocation per event on the hot path.
+smallvec = "1"
 
 [lints]
 workspace = true
