@@ -117,8 +117,17 @@ impl<'a> Lowerer<'a> {
             }
             self.buf.emit_byte(prefix);
             self.buf.emit_byte(0x89);
-            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-            self.buf.emit(&neg.to_le_bytes());
+            // Prefer the shorter disp8 form when neg fits in i8 — for the
+            // first 16 params we know neg ∈ [-128, -8], well within range.
+            if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
+                // mod=01, reg=reg&7, r/m=RBP(101) → 0x45 | (reg<<3)
+                self.buf.emit_byte(0x45 | ((reg & 7) << 3));
+                self.buf.emit_byte(neg as u8);
+            } else {
+                // mod=10, disp32 fallback
+                self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+                self.buf.emit(&neg.to_le_bytes());
+            }
         }
     }
 
@@ -133,24 +142,48 @@ impl<'a> Lowerer<'a> {
     }
 
     /// MOV RAX, [RBP - offset]
+    ///
+    /// Emits the shorter disp8 form (mod=01, 4 bytes) when `neg`
+    /// fits in a signed 8-bit value, falling back to disp32 (mod=10,
+    /// 7 bytes) otherwise. Most spill slots for typical methods sit
+    /// within ±128 bytes of RBP, so the disp8 form is the common case
+    /// and saves 3 bytes per frame access.
     fn load_to_rax(&mut self, offset: i32) {
         let neg = -(offset as i32);
-        self.buf.emit(&[0x48, 0x8B, 0x85]);
-        self.buf.emit(&neg.to_le_bytes());
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
+            // 48 8B 45 disp8  — mod=01, reg=RAX(0), r/m=RBP(101)
+            self.buf.emit(&[0x48, 0x8B, 0x45, neg as u8]);
+        } else {
+            // 48 8B 85 disp32 — mod=10
+            self.buf.emit(&[0x48, 0x8B, 0x85]);
+            self.buf.emit(&neg.to_le_bytes());
+        }
     }
 
     /// MOV RCX, [RBP - offset]
     fn load_to_rcx(&mut self, offset: i32) {
         let neg = -(offset as i32);
-        self.buf.emit(&[0x48, 0x8B, 0x8D]);
-        self.buf.emit(&neg.to_le_bytes());
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
+            // 48 8B 4D disp8  — mod=01, reg=RCX(1), r/m=RBP(101)
+            self.buf.emit(&[0x48, 0x8B, 0x4D, neg as u8]);
+        } else {
+            // 48 8B 8D disp32 — mod=10
+            self.buf.emit(&[0x48, 0x8B, 0x8D]);
+            self.buf.emit(&neg.to_le_bytes());
+        }
     }
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
         let neg = -(offset as i32);
-        self.buf.emit(&[0x48, 0x89, 0x85]);
-        self.buf.emit(&neg.to_le_bytes());
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
+            // 48 89 45 disp8  — mod=01, reg=RAX(0), r/m=RBP(101)
+            self.buf.emit(&[0x48, 0x89, 0x45, neg as u8]);
+        } else {
+            // 48 89 85 disp32 — mod=10
+            self.buf.emit(&[0x48, 0x89, 0x85]);
+            self.buf.emit(&neg.to_le_bytes());
+        }
     }
 
     /// MOV RAX, imm64

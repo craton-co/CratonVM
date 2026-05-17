@@ -837,6 +837,57 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-thread JFR thread-id helper
+// ---------------------------------------------------------------------------
+//
+// Round-4 (2026-05-17) fix: emit_* helpers that previously hardcoded
+// `thread_id: 0` (16 sites — GC bookkeeping, periodic samples, recording
+// metadata, etc.) now plumb a stable per-OS-thread id. The id is generated
+// on first use per thread by an atomic counter and cached in a thread-local
+// `Cell<u64>` so subsequent reads are a single TLS load.
+//
+// JFR semantics: `0` is conventionally "no thread" / "VM-internal".
+// `JFR_THREAD_INTERNAL` (== 0) is exported for emit sites that intentionally
+// represent VM-internal threads (e.g. GC worker, JIT compiler thread) whose
+// real OS thread id is not yet plumbed through. The new id helper preserves
+// 0 as the unused sentinel by starting the counter at 1.
+
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Sentinel value meaning "no thread / VM internal".
+pub const JFR_THREAD_INTERNAL: u64 = 0;
+
+static NEXT_JFR_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// 0 = uninitialised (the first call lazily assigns from
+    /// `NEXT_JFR_THREAD_ID`). Subsequent calls return the cached value.
+    static JFR_THREAD_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Return a stable JFR thread id for the calling OS thread.
+///
+/// The id is allocated lazily on first call and is unique across the process
+/// lifetime. It is guaranteed non-zero so the `JFR_THREAD_INTERNAL == 0`
+/// sentinel remains distinct.
+///
+/// Round-4 hot-path cost (steady state): one TLS read + branch (no atomics).
+/// First-call cost: one Relaxed `fetch_add` on the global counter.
+#[inline]
+pub fn current_jfr_thread_id() -> u64 {
+    JFR_THREAD_ID.with(|cell| {
+        let id = cell.get();
+        if id != 0 {
+            return id;
+        }
+        let new_id = NEXT_JFR_THREAD_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        cell.set(new_id);
+        new_id
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Emission helper functions
 // ---------------------------------------------------------------------------
 
@@ -846,26 +897,31 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
 pub fn emit_gc_event(
     recorder: &mut FlightRecorder,
     gc_id: i32,
-    name: &str,
-    cause: &str,
+    name: &'static str,
+    cause: &'static str,
     start_time_ns: u64,
     duration_ns: u64,
 ) {
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GarbageCollection") {
+        // Round-4: name/cause are now `&'static str` (every caller passes
+        // a string literal — GC collector name and pause cause are part of
+        // a fixed taxonomy). `EventValue::Str` avoids the per-event
+        // `Arc::from(&str)` heap allocation.
+        let mut fields = Vec::with_capacity(5);
+        fields.push(EventValue::Int(gc_id));
+        fields.push(EventValue::Str(name));
+        fields.push(EventValue::Str(cause));
+        let pause_ns = duration_ns.min(i64::MAX as u64) as i64;
+        fields.push(EventValue::Long(pause_ns)); // sumOfPauses
+        fields.push(EventValue::Long(pause_ns)); // longestPause
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0, // GC thread
-            fields: vec![
-                EventValue::Int(gc_id),
-                EventValue::String(Arc::from(name)),
-                EventValue::String(Arc::from(cause)),
-                EventValue::Long(duration_ns.min(i64::MAX as u64) as i64), // sumOfPauses
-                EventValue::Long(duration_ns.min(i64::MAX as u64) as i64), // longestPause
-            ],
+            thread_id: current_jfr_thread_id(), // GC manager thread
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -885,16 +941,21 @@ pub fn emit_class_load_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassLoad") {
+        // class_name is dynamic (any Java class name). Loaders are *usually*
+        // literals ("bootstrap", "app", "platform") but callers may also
+        // pass user-loader-class names, so keep `&str`. Round-4: still
+        // route the thread id through the per-thread cache instead of
+        // hardcoding 0 — class loading happens on the loading thread.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::String(Arc::from(class_name)));
+        fields.push(EventValue::String(Arc::from(defining_loader)));
+        fields.push(EventValue::String(Arc::from(initiating_loader)));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0,
-            fields: vec![
-                EventValue::String(Arc::from(class_name)),
-                EventValue::String(Arc::from(defining_loader)),
-                EventValue::String(Arc::from(initiating_loader)),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -913,15 +974,16 @@ pub fn emit_thread_start_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
+        // Both names are user-supplied / Java-thread-name; Arc.
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::String(Arc::from(thread_name)));
+        fields.push(EventValue::String(Arc::from(parent_thread_name)));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns, // instant event
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(thread_name)),
-                EventValue::String(Arc::from(parent_thread_name)),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -945,20 +1007,22 @@ pub fn emit_compilation_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Compilation") {
+        // `method` is a fully-qualified Java method descriptor, dynamic — Arc.
+        // Round-4: thread_id from per-thread cache (JIT compiler thread).
+        let mut fields = Vec::with_capacity(7);
+        fields.push(EventValue::String(Arc::from(method)));
+        fields.push(EventValue::Int(compile_id));
+        fields.push(EventValue::Int(compile_level));
+        fields.push(EventValue::Boolean(succeeded));
+        fields.push(EventValue::Boolean(is_osr));
+        fields.push(EventValue::Int(code_size));
+        fields.push(EventValue::Int(inlined_bytes));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0,
-            fields: vec![
-                EventValue::String(Arc::from(method)),
-                EventValue::Int(compile_id),
-                EventValue::Int(compile_level),
-                EventValue::Boolean(succeeded),
-                EventValue::Boolean(is_osr),
-                EventValue::Int(code_size),
-                EventValue::Int(inlined_bytes),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -976,14 +1040,14 @@ pub fn emit_thread_end_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
+        let mut fields = Vec::with_capacity(1);
+        fields.push(EventValue::String(Arc::from(thread_name)));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns, // instant event
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(thread_name)),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1032,18 +1096,21 @@ pub fn emit_monitor_wait_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorWait") {
+        // TODO(round-4-wave-3): `monitor_class` is often a Java class name
+        // looked up from a runtime constant pool — plumb the pre-interned
+        // `Arc<str>` to skip the per-event `Arc::from(&str)` reallocation.
+        let mut fields = Vec::with_capacity(5);
+        fields.push(EventValue::String(Arc::from(monitor_class)));
+        fields.push(EventValue::String(Arc::from(notifier_thread)));
+        fields.push(EventValue::Long(timeout_ns));
+        fields.push(EventValue::Boolean(timed_out));
+        fields.push(EventValue::Long(address));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(monitor_class)),
-                EventValue::String(Arc::from(notifier_thread)),
-                EventValue::Long(timeout_ns),
-                EventValue::Boolean(timed_out),
-                EventValue::Long(address),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1064,16 +1131,19 @@ pub fn emit_monitor_enter_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorEnter") {
+        // TODO(round-4-wave-3): `monitor_class` is the synchronized object's
+        // runtime class name (dynamic). Plumb a pre-interned `Arc<str>` from
+        // the class metadata to skip the per-event `Arc::from(&str)`.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::String(Arc::from(monitor_class)));
+        fields.push(EventValue::String(Arc::from(previous_owner)));
+        fields.push(EventValue::Long(address));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(monitor_class)),
-                EventValue::String(Arc::from(previous_owner)),
-                EventValue::Long(address),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1091,15 +1161,17 @@ pub fn emit_class_unload_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassUnload") {
+        // class_name and defining_loader are dynamic (caller is GC unloading
+        // path); Arc. Round-4: thread_id from per-thread cache.
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::String(Arc::from(class_name)));
+        fields.push(EventValue::String(Arc::from(defining_loader)));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns, // instant event
-            thread_id: 0,
-            fields: vec![
-                EventValue::String(Arc::from(class_name)),
-                EventValue::String(Arc::from(defining_loader)),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1110,7 +1182,7 @@ pub fn emit_class_unload_event(
 /// Called when LockSupport.park() is invoked.
 pub fn emit_thread_park_event(
     recorder: &mut FlightRecorder,
-    parked_class: &str,
+    parked_class: &'static str,
     timeout_ns: i64,
     address: i64,
     thread_id: u64,
@@ -1120,16 +1192,17 @@ pub fn emit_thread_park_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadPark") {
+        // Round-4: `parked_class` is always a literal class name (`LockSupport`).
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::Str(parked_class));
+        fields.push(EventValue::Long(timeout_ns));
+        fields.push(EventValue::Long(address));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(parked_class)),
-                EventValue::Long(timeout_ns),
-                EventValue::Long(address),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1142,7 +1215,7 @@ pub fn emit_thread_park_event(
 pub fn emit_virtual_thread_pinned_event(
     recorder: &mut FlightRecorder,
     thread_name: &str,
-    pin_reason: &str,
+    pin_reason: &'static str,
     carrier_thread_id: u64,
     virtual_thread_id: u64,
     timestamp_ns: u64,
@@ -1150,16 +1223,18 @@ pub fn emit_virtual_thread_pinned_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.VirtualThreadPinned") {
+        // Round-4: `pin_reason` is a JEP-491 enum literal (e.g. "Synchronized",
+        // "Native"). Thread name is dynamic.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::String(Arc::from(thread_name)));
+        fields.push(EventValue::Str(pin_reason));
+        fields.push(EventValue::Long(virtual_thread_id as i64));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
             thread_id: carrier_thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(thread_name)),
-                EventValue::String(Arc::from(pin_reason)),
-                EventValue::Long(virtual_thread_id as i64),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1169,8 +1244,8 @@ pub fn emit_virtual_thread_pinned_event(
 pub fn emit_gc_heap_summary_event(
     recorder: &mut FlightRecorder,
     gc_id: i32,
-    when: &str,
-    heap_space: &str,
+    when: &'static str,
+    heap_space: &'static str,
     heap_used: i64,
     heap_committed: i64,
     heap_max: i64,
@@ -1179,19 +1254,21 @@ pub fn emit_gc_heap_summary_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCHeapSummary") {
+        // Round-4: `when` is "Before GC" / "After GC", `heap_space` is "Eden",
+        // "Survivor", "Old", etc. — fixed enum-like literals.
+        let mut fields = Vec::with_capacity(6);
+        fields.push(EventValue::Int(gc_id));
+        fields.push(EventValue::Str(when));
+        fields.push(EventValue::Str(heap_space));
+        fields.push(EventValue::Long(heap_used));
+        fields.push(EventValue::Long(heap_committed));
+        fields.push(EventValue::Long(heap_max));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Int(gc_id),
-                EventValue::String(Arc::from(when)),
-                EventValue::String(Arc::from(heap_space)),
-                EventValue::Long(heap_used),
-                EventValue::Long(heap_committed),
-                EventValue::Long(heap_max),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1211,16 +1288,20 @@ pub fn emit_allocation_in_new_tlab_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationInNewTLAB") {
+        // `object_class` is a Java class name — fully dynamic.
+        // TODO(round-4-wave-3): callers in the allocation hot path could pass
+        // a pre-interned `Arc<str>` from the runtime constant pool to skip
+        // the per-event `Arc::from(&str)` reallocation.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::String(Arc::from(object_class)));
+        fields.push(EventValue::Long(allocation_size));
+        fields.push(EventValue::Long(tlab_size));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns, // instant event
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(object_class)),
-                EventValue::Long(allocation_size),
-                EventValue::Long(tlab_size),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1237,15 +1318,18 @@ pub fn emit_allocation_outside_tlab_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationOutsideTLAB") {
+        // TODO(round-4-wave-3): plumb a pre-interned `Arc<str>` for the
+        // object class. Same allocator-hot-path comment as
+        // `emit_allocation_in_new_tlab_event`.
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::String(Arc::from(object_class)));
+        fields.push(EventValue::Long(allocation_size));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(object_class)),
-                EventValue::Long(allocation_size),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1255,22 +1339,24 @@ pub fn emit_allocation_outside_tlab_event(
 pub fn emit_gc_phase_pause_event(
     recorder: &mut FlightRecorder,
     gc_id: i32,
-    phase_name: &str,
+    phase_name: &'static str,
     start_time_ns: u64,
     duration_ns: u64,
 ) {
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCPhasePause") {
+        // Round-4: `phase_name` is from the fixed GC-phase taxonomy
+        // ("Pause Init Mark", "Pause Remark", etc.) — always a literal.
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::Int(gc_id));
+        fields.push(EventValue::Str(phase_name));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0,
-            fields: vec![
-                EventValue::Int(gc_id),
-                EventValue::String(Arc::from(phase_name)),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1287,15 +1373,15 @@ pub fn emit_young_gc_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.YoungGarbageCollection") {
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::Int(gc_id));
+        fields.push(EventValue::Int(tenuring_threshold));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0,
-            fields: vec![
-                EventValue::Int(gc_id),
-                EventValue::Int(tenuring_threshold),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1311,14 +1397,14 @@ pub fn emit_old_gc_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.OldGarbageCollection") {
+        let mut fields = Vec::with_capacity(1);
+        fields.push(EventValue::Int(gc_id));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0,
-            fields: vec![
-                EventValue::Int(gc_id),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1328,7 +1414,7 @@ pub fn emit_old_gc_event(
 pub fn emit_metaspace_summary_event(
     recorder: &mut FlightRecorder,
     gc_id: i32,
-    when: &str,
+    when: &'static str,
     metaspace_used: i64,
     metaspace_committed: i64,
     metaspace_reserved: i64,
@@ -1337,18 +1423,19 @@ pub fn emit_metaspace_summary_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.MetaspaceSummary") {
+        // Round-4: `when` is "Before GC" / "After GC" — literal.
+        let mut fields = Vec::with_capacity(5);
+        fields.push(EventValue::Int(gc_id));
+        fields.push(EventValue::Str(when));
+        fields.push(EventValue::Long(metaspace_used));
+        fields.push(EventValue::Long(metaspace_committed));
+        fields.push(EventValue::Long(metaspace_reserved));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Int(gc_id),
-                EventValue::String(Arc::from(when)),
-                EventValue::Long(metaspace_used),
-                EventValue::Long(metaspace_committed),
-                EventValue::Long(metaspace_reserved),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1359,23 +1446,26 @@ pub fn emit_execution_sample_event(
     recorder: &mut FlightRecorder,
     sampled_thread: &str,
     stack_trace: &str,
-    state: &str,
+    state: &'static str,
     thread_id: u64,
     timestamp_ns: u64,
 ) {
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExecutionSample") {
+        // Round-4: `state` is a fixed JVM thread-state enum
+        // ("RUNNABLE", "BLOCKED", ...) — literal. Thread name and stack
+        // trace are dynamic.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::String(Arc::from(sampled_thread)));
+        fields.push(EventValue::String(Arc::from(stack_trace)));
+        fields.push(EventValue::Str(state));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(sampled_thread)),
-                EventValue::String(Arc::from(stack_trace)),
-                EventValue::String(Arc::from(state)),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1392,16 +1482,16 @@ pub fn emit_cpu_load_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.CPULoad") {
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::Float(jvm_user));
+        fields.push(EventValue::Float(jvm_system));
+        fields.push(EventValue::Float(machine_total));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Float(jvm_user),
-                EventValue::Float(jvm_system),
-                EventValue::Float(machine_total),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1419,17 +1509,17 @@ pub fn emit_thread_statistics_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaThreadStatistics") {
+        let mut fields = Vec::with_capacity(4);
+        fields.push(EventValue::Long(active_count));
+        fields.push(EventValue::Long(daemon_count));
+        fields.push(EventValue::Long(accumulated_count));
+        fields.push(EventValue::Long(peak_count));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Long(active_count),
-                EventValue::Long(daemon_count),
-                EventValue::Long(accumulated_count),
-                EventValue::Long(peak_count),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1448,18 +1538,20 @@ pub fn emit_active_recording_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveRecording") {
+        // Recording metadata: `name` and `destination` are user-supplied —
+        // keep `&str` + Arc. Round-4: thread_id from per-thread cache.
+        let mut fields = Vec::with_capacity(5);
+        fields.push(EventValue::Long(recording_id));
+        fields.push(EventValue::String(Arc::from(name)));
+        fields.push(EventValue::String(Arc::from(destination)));
+        fields.push(EventValue::Long(max_age_ns));
+        fields.push(EventValue::Long(max_size));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Long(recording_id),
-                EventValue::String(Arc::from(name)),
-                EventValue::String(Arc::from(destination)),
-                EventValue::Long(max_age_ns),
-                EventValue::Long(max_size),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1476,16 +1568,17 @@ pub fn emit_active_setting_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveSetting") {
+        // `name` and `value` are user/config-supplied — Arc.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::Long(recording_id));
+        fields.push(EventValue::String(Arc::from(name)));
+        fields.push(EventValue::String(Arc::from(value)));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Long(recording_id),
-                EventValue::String(Arc::from(name)),
-                EventValue::String(Arc::from(value)),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1498,8 +1591,8 @@ pub fn emit_deoptimization_event(
     recorder: &mut FlightRecorder,
     method: &str,
     compile_id: i32,
-    reason: &str,
-    action: &str,
+    reason: &'static str,
+    action: &'static str,
     bci: i32,
     thread_id: u64,
     timestamp_ns: u64,
@@ -1507,18 +1600,20 @@ pub fn emit_deoptimization_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Deoptimization") {
+        // Round-4: `reason` and `action` are fixed JIT taxonomies
+        // ("class_check", "reinterpret", etc.). Method is dynamic.
+        let mut fields = Vec::with_capacity(5);
+        fields.push(EventValue::String(Arc::from(method)));
+        fields.push(EventValue::Int(compile_id));
+        fields.push(EventValue::Str(reason));
+        fields.push(EventValue::Str(action));
+        fields.push(EventValue::Int(bci));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,
             end_time: timestamp_ns,
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(method)),
-                EventValue::Int(compile_id),
-                EventValue::String(Arc::from(reason)),
-                EventValue::String(Arc::from(action)),
-                EventValue::Int(bci),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1647,16 +1742,17 @@ pub fn emit_safepoint_begin_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointBegin") {
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::Long(safepoint_id));
+        fields.push(EventValue::Int(total_threads));
+        fields.push(EventValue::Int(jni_critical_threads));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::Long(safepoint_id),
-                EventValue::Int(total_threads),
-                EventValue::Int(jni_critical_threads),
-            ],
+            // Round-4: VM thread that initiated the safepoint.
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1672,12 +1768,14 @@ pub fn emit_safepoint_end_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointEnd") {
+        let mut fields = Vec::with_capacity(1);
+        fields.push(EventValue::Long(safepoint_id));
         let event = EventInstance {
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
-            thread_id: 0,
-            fields: vec![EventValue::Long(safepoint_id)],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1737,15 +1835,16 @@ pub fn emit_java_exception_throw_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaExceptionThrow") {
+        // message and thrown_class are dynamic; Arc.
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::String(Arc::from(message)));
+        fields.push(EventValue::String(Arc::from(thrown_class)));
         let event = EventInstance {
             type_id,
             start_time: time_ns,
             end_time: time_ns,
             thread_id,
-            fields: vec![
-                EventValue::String(Arc::from(message)),
-                EventValue::String(Arc::from(thrown_class)),
-            ],
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }
@@ -1762,16 +1861,17 @@ pub fn emit_network_utilization_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.NetworkUtilization") {
+        // `interface` is dynamic ("eth0", "wlan0"); Arc.
+        let mut fields = Vec::with_capacity(3);
+        fields.push(EventValue::String(Arc::from(interface)));
+        fields.push(EventValue::Long(read_rate));
+        fields.push(EventValue::Long(write_rate));
         let event = EventInstance {
             type_id,
             start_time: time_ns,
             end_time: time_ns,
-            thread_id: 0,
-            fields: vec![
-                EventValue::String(Arc::from(interface)),
-                EventValue::Long(read_rate),
-                EventValue::Long(write_rate),
-            ],
+            thread_id: current_jfr_thread_id(),
+            fields,
         };
         crate::repository::push_to_thread_ring(event);
     }

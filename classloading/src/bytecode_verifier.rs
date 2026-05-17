@@ -8,9 +8,9 @@
 //! Pre-Java-7 classes (version < 51) without StackMapTable use a simplified
 //! type inference pass (JVM spec 4.10.2) with a worklist-based dataflow algorithm.
 
-use std::collections::{HashMap, HashSet};
-#[cfg(test)]
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use rustjvm_reader::attribute::Attribute;
 use rustjvm_reader::class_file_version::ClassFileVersion;
@@ -169,19 +169,20 @@ fn verify_method(
 
     let declared_frames = match &parsed_table {
         Some(table) => build_declared_frames(table, &compact_frame, cp, class_name, &method.name)?,
-        None => HashMap::with_capacity(32),
+        None => FxHashMap::with_capacity_and_hasher(32, Default::default()),
     };
 
     // Build exception handler target set
-    let mut handler_targets: HashMap<u16, VType> = HashMap::with_capacity(8);
+    let mut handler_targets: FxHashMap<u16, VType> =
+        FxHashMap::with_capacity_and_hasher(8, Default::default());
     for entry in &code_attr.exception_table {
         let catch_type = if entry.catch_type == 0 {
             // catch_type 0 means catch-all (finally)
-            VType::ObjectRef("java/lang/Throwable".to_string())
+            VType::ObjectRef(Arc::from("java/lang/Throwable"))
         } else {
-            match cp.get_class_name(entry.catch_type) {
-                Some(name) => VType::ObjectRef(name.to_string()),
-                None => VType::ObjectRef("java/lang/Throwable".to_string()),
+            match cp.get_class_name_arc(entry.catch_type) {
+                Some(name) => VType::ObjectRef(name),
+                None => VType::ObjectRef(Arc::from("java/lang/Throwable")),
             }
         };
         handler_targets.insert(entry.handler_pc, catch_type);
@@ -420,7 +421,8 @@ fn bytecode_has_branches(bytecode: &[u8]) -> bool {
 fn find_stack_map_table(attributes: &[Attribute]) -> Option<&[u8]> {
     for attr in attributes {
         if let Attribute::StackMapTable { entries } = attr {
-            return Some(entries);
+            // `entries: &Arc<[u8]>` — deref to `&[u8]` for the return type.
+            return Some(&**entries);
         }
     }
     None
@@ -433,8 +435,8 @@ fn build_declared_frames(
     cp: &ConstantPool,
     class_name: &str,
     method_name: &str,
-) -> Result<HashMap<u16, VerificationFrame>, LinkageError> {
-    let mut frames = HashMap::with_capacity(32);
+) -> Result<FxHashMap<u16, VerificationFrame>, LinkageError> {
+    let mut frames = FxHashMap::with_capacity_and_hasher(32, Default::default());
     let offsets = table.absolute_offsets();
 
     let mut prev_frame = initial_frame.clone();
@@ -488,13 +490,14 @@ fn verify_by_inference(
     );
 
     // Map from bytecode offset -> verified frame state at that offset
-    let mut frame_at: HashMap<usize, VerificationFrame> = HashMap::with_capacity(32);
+    let mut frame_at: FxHashMap<usize, VerificationFrame> =
+        FxHashMap::with_capacity_and_hasher(32, Default::default());
     frame_at.insert(0, initial_frame);
 
     // Worklist of offsets to (re-)visit
     let mut worklist: Vec<usize> = vec![0];
     // Set of offsets already enqueued in this round (avoids duplicates on the worklist)
-    let mut enqueued: HashSet<usize> = HashSet::new();
+    let mut enqueued: FxHashSet<usize> = FxHashSet::default();
     enqueued.insert(0);
 
     // Safety: limit iterations to prevent pathological bytecode from hanging the verifier
@@ -593,11 +596,11 @@ fn verify_by_inference(
         for entry in &code_attr.exception_table {
             if pc >= entry.start_pc as usize && pc < entry.end_pc as usize {
                 let catch_type = if entry.catch_type == 0 {
-                    VType::ObjectRef("java/lang/Throwable".to_string())
+                    VType::ObjectRef(Arc::from("java/lang/Throwable"))
                 } else {
-                    match cp.get_class_name(entry.catch_type) {
-                        Some(name) => VType::ObjectRef(name.to_string()),
-                        None => VType::ObjectRef("java/lang/Throwable".to_string()),
+                    match cp.get_class_name_arc(entry.catch_type) {
+                        Some(name) => VType::ObjectRef(name),
+                        None => VType::ObjectRef(Arc::from("java/lang/Throwable")),
                     }
                 };
                 let mut handler_frame = current.clone();
@@ -625,7 +628,7 @@ fn verify_by_inference(
 /// Merge `incoming` frame into the frame at `target_pc` in the map.
 /// Returns `true` if the target's frame changed (caller should re-enqueue).
 fn merge_inference_frame(
-    frame_at: &mut HashMap<usize, VerificationFrame>,
+    frame_at: &mut FxHashMap<usize, VerificationFrame>,
     target_pc: usize,
     incoming: &VerificationFrame,
     hierarchy: &dyn ClassHierarchy,
@@ -741,7 +744,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xB1], // return
+                code: vec![0xB1].into(), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -762,7 +765,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x03, 0xAC], // iconst_0, ireturn
+                code: vec![0x03, 0xAC].into(), // iconst_0, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -811,7 +814,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x03, 0x60, 0xAC], // iconst_0, iadd, ireturn
+                code: vec![0x03, 0x60, 0xAC].into(), // iconst_0, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -833,7 +836,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x04, 0x05, 0x60, 0xAC], // iconst_1, iconst_2, iadd, ireturn
+                code: vec![0x04, 0x05, 0x60, 0xAC].into(), // iconst_1, iconst_2, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -854,7 +857,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xB1], // return
+                code: vec![0xB1].into(), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -876,7 +879,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
-                code: vec![0x03, 0x3B, 0x1A, 0xAC], // iconst_0, istore_0, iload_0, ireturn
+                code: vec![0x03, 0x3B, 0x1A, 0xAC].into(), // iconst_0, istore_0, iload_0, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -900,7 +903,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![],
+                code: vec![].into(),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -921,7 +924,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x57, 0xB1], // pop, return
+                code: vec![0x57, 0xB1].into(), // pop, return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -942,7 +945,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x59, 0xB1], // dup, return
+                code: vec![0x59, 0xB1].into(), // dup, return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -963,7 +966,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x04, 0x59, 0x60, 0xAC], // iconst_1, dup, iadd, ireturn
+                code: vec![0x04, 0x59, 0x60, 0xAC].into(), // iconst_1, dup, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -984,7 +987,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x09, 0xAD], // lconst_0, lreturn
+                code: vec![0x09, 0xAD].into(), // lconst_0, lreturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1005,7 +1008,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x0B, 0xAE], // fconst_0, freturn
+                code: vec![0x0B, 0xAE].into(), // fconst_0, freturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1026,7 +1029,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x0E, 0xAF], // dconst_0, dreturn
+                code: vec![0x0E, 0xAF].into(), // dconst_0, dreturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1047,7 +1050,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x01, 0xB0], // aconst_null, areturn
+                code: vec![0x01, 0xB0].into(), // aconst_null, areturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1068,7 +1071,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x04, 0x64, 0xAC], // iconst_1, isub, ireturn
+                code: vec![0x04, 0x64, 0xAC].into(), // iconst_1, isub, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1089,7 +1092,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x10, 0x2A, 0xAC], // bipush 42, ireturn
+                code: vec![0x10, 0x2A, 0xAC].into(), // bipush 42, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1110,7 +1113,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x11, 0x03, 0xE8, 0xAC], // sipush 1000, ireturn
+                code: vec![0x11, 0x03, 0xE8, 0xAC].into(), // sipush 1000, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1132,7 +1135,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
-                    code: vec![0xB1], // return
+                    code: vec![0xB1].into(), // return
                     exception_table: vec![],
                     attributes: vec![],
                 }))],
@@ -1144,7 +1147,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 0,
-                    code: vec![0x03, 0x60, 0xAC], // iconst_0, iadd (underflow), ireturn
+                    code: vec![0x03, 0x60, 0xAC].into(), // iconst_0, iadd (underflow), ireturn
                     exception_table: vec![],
                     attributes: vec![],
                 }))],
@@ -1214,7 +1217,7 @@ mod tests {
                     0xAC,             // 5: ireturn
                     0x05,             // 6: iconst_2
                     0xAC,             // 7: ireturn
-                ],
+                ].into(),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1401,7 +1404,7 @@ mod tests {
                     0x99, 0x00, 0x05, // ifeq +5
                     0x04, 0xAC,       // iconst_1, ireturn
                     0x05, 0xAC,       // iconst_2, ireturn
-                ],
+                ].into(),
                 exception_table: vec![],
                 attributes: vec![], // no StackMapTable!
             }))],
@@ -1680,7 +1683,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x03, 0x04, 0x60, 0xAC], // iconst_0, iconst_1, iadd, ireturn
+                code: vec![0x03, 0x04, 0x60, 0xAC].into(), // iconst_0, iconst_1, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1700,7 +1703,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: vec![0x03, 0xAF], // iconst_0; dreturn (needs double)
+                code: vec![0x03, 0xAF].into(), // iconst_0; dreturn (needs double)
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1814,7 +1817,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: vec![0x04, 0x05, 0x60, 0xAC],
+                code: vec![0x04, 0x05, 0x60, 0xAC].into(),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1832,7 +1835,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: vec![0xB1], // return
+                code: vec![0xB1].into(), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1884,10 +1887,10 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 1,
-                code,
+                code: code.into(),
                 exception_table: vec![],
                 attributes: vec![Attribute::StackMapTable {
-                    entries: stack_map_bytes,
+                    entries: stack_map_bytes.into(),
                 }],
             }))],
         }]);

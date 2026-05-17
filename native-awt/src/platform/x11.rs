@@ -713,29 +713,45 @@ fn fontdue_settings(family: &str, _size: f32, bold: bool, italic: bool) -> Fontd
     }
 }
 
+/// Load (and cache) a system TrueType font for fontdue.
+///
+/// The result is cached in a process-global `OnceLock` because reading and
+/// parsing a font file is expensive and the bytes never change for the
+/// lifetime of the process. Mirrors the Cocoa backend's caching strategy.
+///
+/// TODO: respect `FontdueSettings.family/bold/italic` and pick a matching
+/// face. For now we return a single fallback font for every (family, style)
+/// combination, which is enough to make text appear instead of blank rectangles.
 fn load_fontdue_font(_settings: &FontdueSettings) -> Option<fontdue::Font> {
-    // Attempt to load a system font. On Linux, fonts live in
-    // /usr/share/fonts or ~/.local/share/fonts. We try common
-    // locations for a sans-serif font.
-    static FONT_SEARCH_PATHS: &[&str] = &[
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
-    ];
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<fontdue::Font>> = OnceLock::new();
 
-    for path in FONT_SEARCH_PATHS {
-        if let Ok(data) = std::fs::read(path) {
-            if let Ok(font) = fontdue::Font::from_bytes(
-                data,
-                fontdue::FontSettings::default(),
-            ) {
-                return Some(font);
+    CACHED
+        .get_or_init(|| {
+            // Attempt to load a system font. On Linux, fonts live in
+            // /usr/share/fonts or ~/.local/share/fonts. We try common
+            // locations for a sans-serif font.
+            static FONT_SEARCH_PATHS: &[&str] = &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+            ];
+
+            for path in FONT_SEARCH_PATHS {
+                if let Ok(data) = std::fs::read(path) {
+                    if let Ok(font) = fontdue::Font::from_bytes(
+                        data,
+                        fontdue::FontSettings::default(),
+                    ) {
+                        return Some(font);
+                    }
+                }
             }
-        }
-    }
 
-    warn!("fontdue: no system font found");
-    None
+            warn!("fontdue: no system font found");
+            None
+        })
+        .clone()
 }

@@ -3,8 +3,9 @@
 //! Each pass takes `&mut Graph` and transforms it in place.
 //! Passes are safe to compose in any order (idempotent).
 
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use super::ir::{CmpOp, Graph, IrType, Node, NodeId, Op, NO_NODE};
 
@@ -339,7 +340,11 @@ fn find_const(nodes: &[Node], val: i64) -> Option<NodeId> {
 /// Uses a pre-computed hash of (op, ty, inputs) as the map key to avoid
 /// cloning the inputs Vec on every lookup.
 fn gvn(graph: &mut Graph) {
-    let mut value_map: HashMap<u64, NodeId> = HashMap::new();
+    // Hot-path: use FxHashMap (rustc_hash) instead of the std SipHash-backed
+    // HashMap. The keys are 64-bit value-number hashes (no adversarial input),
+    // so the faster FxHasher gives ≈2x lookup throughput with the same
+    // collision behavior in practice.
+    let mut value_map: FxHashMap<u64, NodeId> = FxHashMap::default();
     let len = graph.nodes.len();
     for id in 0..len {
         let node = &graph.nodes[id];
@@ -365,8 +370,12 @@ fn gvn(graph: &mut Graph) {
 }
 
 /// Compute a hash of (op, ty, inputs) for GVN without cloning the inputs Vec.
+///
+/// Uses `FxHasher` rather than the std default (SipHash) — GVN runs on every
+/// JIT compile and the values are non-adversarial node identifiers, so the
+/// 2-3x faster Fx hash is a strict win.
 fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     op.hash(&mut hasher);
     ty.hash(&mut hasher);
     inputs.hash(&mut hasher);
@@ -381,7 +390,7 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
         return;
     }
 
-    let mut reachable = HashSet::new();
+    let mut reachable: FxHashSet<NodeId> = FxHashSet::default();
     let mut worklist = vec![graph.exit];
 
     // Also keep all control nodes reachable from exit

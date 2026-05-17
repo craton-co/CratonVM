@@ -394,23 +394,12 @@ fn build_byte_array_input_stream(
     data: &[u8],
 ) -> Result<ObjectRef, MethodCallFailed> {
     let array = ctx.new_array(ArrayElementType::Byte, data.len());
-    // TODO(audit MED, perf): this per-byte boxing loop dominates JAR class
-    // loading from fat jars — a 4 MiB class-bytes entry requires 4M
-    // `Value::Int` allocations plus 4M `set_array_element` dispatches just
-    // to fill a fresh `byte[]`. The right fix is a bulk copy API on
-    // `NativeContext` (e.g. `set_byte_array_slice(arr, off, &[u8])` or
-    // `byte_array_data_mut(arr) -> &mut [u8]` for fresh allocations) so we
-    // can `copy_from_slice`. No such API exists today, and plumbing one
-    // through `native-api` + the `Vm` impl is out of scope for this file.
-    // Tracked: native-io audit "build_byte_array_input_stream per-byte".
-    // For now the loop stays — every other byte-array materialiser in the
-    // codebase (charset.rs `write_byte_array`, net_phase_e
-    // `copy_bytes_into_java_array`, base64 `b64_write_byte_array`) uses
-    // the same pattern, so fixing this one in isolation would not move the
-    // needle until the cross-crate API lands.
-    for (i, b) in data.iter().enumerate() {
-        ctx.set_array_element(array, i, Value::Int(*b as i8 as i32));
-    }
+    // AUDIT 2026-05-17: migrated to NativeContext::write_byte_array_from
+    // bulk intrinsic (round-3 perf path). The VM override uses
+    // `ptr::copy_nonoverlapping` against the array's raw payload, so
+    // a 4 MiB class-bytes entry is one memcpy instead of 4M
+    // `Value::Int` allocations + 4M dispatches.
+    ctx.write_byte_array_from(array, 0, data);
     let bais_class = "java/io/ByteArrayInputStream";
     let cid = ctx.ensure_class_initialized(bais_class).map_err(|_| {
         MethodCallFailed::InternalError(VmError::Internal {

@@ -9,6 +9,7 @@
 
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -175,11 +176,17 @@ pub fn decode_compressed_long(data: &[u8]) -> Option<(i64, usize)> {
 ///
 /// Lookups are by byte-slice value so the `String` and `Str` variants share
 /// one pool entry when they carry the same payload.
+///
+/// Round-4 (2026-05-17): storage is now `Arc<[u8]>` instead of `Vec<u8>` —
+/// one `Box`-style heap allocation per unique entry plus an inline 16-byte
+/// shared `Arc` header, instead of the previous two `Vec<u8>` clones (one
+/// for the hashmap key, one for the order vector). The `Arc` makes both the
+/// map key and the order vector cheap to share without re-copying the bytes.
 struct StringPool {
-    /// Index lookup, keyed by interned byte content.
-    by_bytes: FxHashMap<Vec<u8>, u32>,
+    /// Index lookup, keyed by interned byte content (Arc-shared with `order`).
+    by_bytes: FxHashMap<Arc<[u8]>, u32>,
     /// Insertion-ordered entries — emitted to the checkpoint section.
-    order: Vec<Vec<u8>>,
+    order: Vec<Arc<[u8]>>,
 }
 
 impl StringPool {
@@ -188,14 +195,19 @@ impl StringPool {
     }
 
     /// Look up or insert `bytes`, returning its pool index.
+    ///
+    /// Round-4 fix: previously allocated `bytes.to_vec()` plus a second
+    /// `.clone()` on every unique insert (two `Vec<u8>` allocations per
+    /// unique string). Now we allocate `Arc<[u8]>` once and stash a single
+    /// shared handle in both the index map and the order vector.
     fn intern(&mut self, bytes: &[u8]) -> u32 {
         if let Some(&idx) = self.by_bytes.get(bytes) {
             return idx;
         }
         let idx = self.order.len() as u32;
-        let owned = bytes.to_vec();
-        self.by_bytes.insert(owned.clone(), idx);
-        self.order.push(owned);
+        let shared: Arc<[u8]> = Arc::from(bytes);
+        self.by_bytes.insert(Arc::clone(&shared), idx);
+        self.order.push(shared);
         idx
     }
 
@@ -209,7 +221,7 @@ impl StringPool {
         self.order.len()
     }
 
-    fn entries(&self) -> &[Vec<u8>] {
+    fn entries(&self) -> &[Arc<[u8]>] {
         &self.order
     }
 }
@@ -454,10 +466,12 @@ fn write_checkpoint_section<W: Write>(
         // Entry count.
         write_compressed_int_into(&mut body, pool.len() as u64);
         for (idx, bytes) in pool.entries().iter().enumerate() {
-            // (idx, len-prefixed UTF-8 bytes)
+            // (idx, len-prefixed UTF-8 bytes). `bytes: &Arc<[u8]>` derefs to
+            // `&[u8]` for both `.len()` and the slice borrow.
+            let slice: &[u8] = bytes;
             write_compressed_int_into(&mut body, idx as u64);
-            write_compressed_int_into(&mut body, bytes.len() as u64);
-            body.extend_from_slice(bytes);
+            write_compressed_int_into(&mut body, slice.len() as u64);
+            body.extend_from_slice(slice);
         }
     }
 
@@ -528,14 +542,23 @@ pub fn dump_to_file(
     extra_events: Vec<EventInstance>,
 ) -> Result<u64, JfrDumpError> {
     // --- Pre-process caller-supplied extra events ----------------------------
-    // Cold path: dump frequency is on the order of seconds. We pay an
-    // O(n log n) sort and a single linear filter. The events were already
-    // drained by the caller (typically `FlightRecorder::dump_recording`),
-    // which fans them out to every running recording. Re-draining here would
-    // steal events from sibling recordings — see Bug 1.
+    // Cold path: dump frequency is on the order of seconds (typically at
+    // recording stop). We pay an O(n log n) sort and a single linear filter.
+    // The events were already drained by the caller (typically
+    // `FlightRecorder::dump_recording`), which fans them out to every running
+    // recording. Re-draining here would steal events from sibling recordings —
+    // see Bug 1.
+    //
+    // Round-4 (2026-05-17) — sort rationale:
+    //   The JFR v2 file format does NOT require global timestamp ordering
+    //   within a chunk: consumers reconstruct order from the per-event
+    //   `start_time` field on read. The sort here is purely a courtesy to
+    //   human readers / older JMC versions that don't re-sort. Because dumps
+    //   are cold-path, we keep it — but note that skipping it would still
+    //   produce a spec-compliant file and would save the O(n log n) cost on
+    //   very large drained sets. (Per-thread blocks remain monotonic in this
+    //   sort because `sort_by_key` is stable.)
     let mut drained: Vec<EventInstance> = extra_events;
-    // Sort by start_time ascending so the per-shard interleaving is resolved
-    // into a single monotonic event stream within the drained set.
     drained.sort_by_key(|e| e.start_time);
     // Filter to events whose type_id is registered. Unknown type_ids cannot be
     // round-tripped through `read_events` (which looks up the type to decode

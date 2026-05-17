@@ -33907,7 +33907,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
-                    code: vec![0xB1], // return (void)
+                    code: vec![0xB1].into(), // return (void)
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -33971,7 +33971,7 @@ mod tests {
                     code: vec![
                         0x10, 42,  // bipush 42
                         0xAC,      // ireturn
-                    ],
+                    ].into(),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34042,7 +34042,7 @@ mod tests {
                         0x1A,       // iload_0
                         0x60,       // iadd
                         0xAC,       // ireturn
-                    ],
+                    ].into(),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34134,7 +34134,7 @@ mod tests {
                     code: vec![
                         0x1B,  // iload_1 (first int param)
                         0xAC,  // ireturn
-                    ],
+                    ].into(),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34217,7 +34217,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1], // return
+                    code: vec![0xB1].into(), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34281,7 +34281,7 @@ mod tests {
                         0x1B, // iload_1
                         0x60, // iadd
                         0xAC, // ireturn
-                    ],
+                    ].into(),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34367,7 +34367,7 @@ mod tests {
                     code: vec![
                         0x0A, // lconst_1
                         0xAD, // lreturn
-                    ],
+                    ].into(),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34572,7 +34572,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1], // return
+                    code: vec![0xB1].into(), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34637,7 +34637,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1], // return
+                    code: vec![0xB1].into(), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34675,7 +34675,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1], // return
+                    code: vec![0xB1].into(), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -55426,7 +55426,7 @@ mod tests {
                 0x2A,             // aload_0 (String, local 0)
                 0xB6, 0x00, 0x01, // invokevirtual #1  Pattern.matcher(CharSequence)
                 0xB0,             // areturn (return Matcher)
-            ],
+            ].into(),
             exception_table: vec![],
             attributes: vec![],
         };
@@ -64756,7 +64756,7 @@ mod tests {
                     rustjvm_reader::attribute::CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
-                        code: vec![0x04, 0xAC], // iconst_1; ireturn
+                        code: vec![0x04, 0xAC].into(), // iconst_1; ireturn
                         exception_table: vec![],
                         attributes: vec![],
                     },
@@ -68121,7 +68121,7 @@ public class SkippedTest {
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 1,
-                code: vec![0xb1], // return
+                code: vec![0xb1].into(), // return
                 exception_table: vec![],
                 attributes: vec![],
             })],

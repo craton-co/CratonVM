@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // ---------------------------------------------------------------------------
 // Module flag constants (from JVMS 4.7.25)
@@ -170,26 +170,26 @@ pub struct DynamicExport {
 /// pre-computed readability graph.
 pub struct ModuleRegistry {
     /// module name → descriptor
-    modules: HashMap<String, ModuleDescriptor>,
+    modules: FxHashMap<String, ModuleDescriptor>,
 
     /// package (slash format) → module name that owns it.
-    package_to_module: HashMap<String, String>,
+    package_to_module: FxHashMap<String, String>,
 
     /// Readability graph after transitive closure: module → set of modules it
     /// can read.  Only populated after `build_readability_graph()`.
-    readable: HashMap<String, HashSet<String>>,
+    readable: FxHashMap<String, FxHashSet<String>>,
 
     /// True once `build_readability_graph` has been called.
     graph_built: bool,
 
     /// Dynamic read edges added at runtime (`Module.addReads`, `--add-reads`).
-    extra_reads: HashMap<String, HashSet<String>>,
+    extra_reads: FxHashMap<String, FxHashSet<String>>,
 
     /// Dynamic exports added at runtime (`Module.addExports`, `--add-exports`).
-    extra_exports: HashMap<String, Vec<DynamicExport>>,
+    extra_exports: FxHashMap<String, Vec<DynamicExport>>,
 
     /// Dynamic opens added at runtime (`Module.addOpens`, `--add-opens`).
-    extra_opens: HashMap<String, Vec<DynamicExport>>,
+    extra_opens: FxHashMap<String, Vec<DynamicExport>>,
 }
 
 impl Default for ModuleRegistry {
@@ -202,13 +202,13 @@ impl ModuleRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            modules: HashMap::with_capacity(16),
-            package_to_module: HashMap::with_capacity(16),
-            readable: HashMap::with_capacity(16),
+            modules: FxHashMap::with_capacity_and_hasher(16, Default::default()),
+            package_to_module: FxHashMap::with_capacity_and_hasher(16, Default::default()),
+            readable: FxHashMap::with_capacity_and_hasher(16, Default::default()),
             graph_built: false,
-            extra_reads: HashMap::new(),
-            extra_exports: HashMap::new(),
-            extra_opens: HashMap::new(),
+            extra_reads: FxHashMap::default(),
+            extra_exports: FxHashMap::default(),
+            extra_opens: FxHashMap::default(),
         }
     }
 
@@ -271,7 +271,7 @@ impl ModuleRegistry {
         // Step 1 — seed each module's readable set with direct requires
         // and dynamic addReads edges.
         let module_names: Vec<String> = self.modules.keys().cloned().collect();
-        let mut readable: HashMap<String, HashSet<String>> = HashMap::with_capacity(16);
+        let mut readable: FxHashMap<String, FxHashSet<String>> = FxHashMap::with_capacity_and_hasher(16, Default::default());
 
         for name in &module_names {
             let set = readable.entry(name.clone()).or_default();
@@ -305,7 +305,7 @@ impl ModuleRegistry {
         // clones inside the fixpoint loop.
         let transitive_edges: Vec<(usize, Vec<usize>)> = {
             // Build name-to-index map for compact representation
-            let name_to_idx: HashMap<&str, usize> = module_names
+            let name_to_idx: FxHashMap<&str, usize> = module_names
                 .iter()
                 .enumerate()
                 .map(|(i, n)| (n.as_str(), i))
@@ -380,7 +380,7 @@ impl ModuleRegistry {
     /// detecting them is useful for diagnostics and spec conformance testing.
     pub fn detect_cycles(&self) -> Vec<Vec<String>> {
         let names: Vec<&str> = self.modules.keys().map(|s| s.as_str()).collect();
-        let name_to_idx: HashMap<&str, usize> = names
+        let name_to_idx: FxHashMap<&str, usize> = names
             .iter()
             .enumerate()
             .map(|(i, n)| (*n, i))

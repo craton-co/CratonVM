@@ -2264,14 +2264,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn emit_virtual_thread_pinned_jfr(&mut self, reason: &str) {
+    fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {
+        // Round-4: pin_reason is a JEP-491 enum-like literal — the underlying
+        // `emit_virtual_thread_pinned_event` now requires `&'static str`.
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         let carrier_id = self.thread.thread_id.0;
         // Virtual threads currently share their carrier's id; this is fine
-        // for JFR classification вЂ” what matters is the `pin_reason` string.
+        // for JFR classification — what matters is the `pin_reason` string.
         let vt_id = carrier_id;
         let mut jfr = self.shared.flight_recorder.lock();
         rustjvm_jfr::builtin::emit_virtual_thread_pinned_event(
@@ -3023,7 +3025,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     if let Some(rustjvm_reader::attribute::Attribute::Signature(s)) =
                         attr.as_decoded()
                     {
-                        return Some(s.clone());
+                        // `s: &Arc<str>` (round 4 reader). Caller wants
+                        // an owned `String`; materialise once.
+                        return Some(s.to_string());
                     }
                 }
                 return None;
@@ -3084,7 +3088,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     if let Some(rustjvm_reader::attribute::Attribute::Signature(s)) =
                         attr.as_decoded()
                     {
-                        return Some(s.clone());
+                        // `s: &Arc<str>` (round 4 reader). Caller wants
+                        // an owned `String`; materialise once.
+                        return Some(s.to_string());
                     }
                 }
                 return None;

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use tracing::{debug, warn};
 
@@ -39,7 +40,11 @@ impl WindowInfo {
 
 struct DirectWriteRenderer {
     factory: IDWriteFactory,
-    text_format_cache: HashMap<String, IDWriteTextFormat>,
+    // Wrapped in `Mutex` so we can write to the cache through a `&self`
+    // borrow. The backend trait's `rasterize_text` takes `&self`, so without
+    // interior mutability this cache would be dead code (we'd always create
+    // a fresh format on every draw).
+    text_format_cache: Mutex<HashMap<String, IDWriteTextFormat>>,
 }
 
 impl DirectWriteRenderer {
@@ -48,20 +53,22 @@ impl DirectWriteRenderer {
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         Ok(Self {
             factory,
-            text_format_cache: HashMap::new(),
+            text_format_cache: Mutex::new(HashMap::new()),
         })
     }
 
     fn get_or_create_format(
-        &mut self,
+        &self,
         font_family: &str,
         font_size: f32,
         bold: bool,
         italic: bool,
     ) -> WinResult<IDWriteTextFormat> {
         let key = format!("{}:{}:{}:{}", font_family, font_size, bold, italic);
-        if let Some(fmt) = self.text_format_cache.get(&key) {
-            return Ok(fmt.clone());
+        if let Ok(cache) = self.text_format_cache.lock() {
+            if let Some(fmt) = cache.get(&key) {
+                return Ok(fmt.clone());
+            }
         }
         let family_wide: Vec<u16> = font_family
             .encode_utf16()
@@ -88,12 +95,14 @@ impl DirectWriteRenderer {
                 w!("en-us"),
             )?
         };
-        self.text_format_cache.insert(key, format.clone());
+        if let Ok(mut cache) = self.text_format_cache.lock() {
+            cache.insert(key, format.clone());
+        }
         Ok(format)
     }
 
     fn create_text_layout(
-        &mut self,
+        &self,
         text: &str,
         font_family: &str,
         font_size: f32,
@@ -130,11 +139,22 @@ impl Win32Backend {
         let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()) }
             .map_err(|e| PlatformError::EventLoopError(format!("GetModuleHandleW: {e}")))?;
         let hinstance = HINSTANCE(hmodule.0);
+        // Eagerly construct the DirectWrite renderer so its factory + text-
+        // format cache are available on the first `rasterize_text` call.
+        // Without this the rasterizer falls back to per-call factory creation
+        // (slow), and the format cache stays dead.
+        let dwrite = match DirectWriteRenderer::new() {
+            Ok(dw) => Some(dw),
+            Err(e) => {
+                warn!("Failed to init DirectWrite: {e}");
+                None
+            }
+        };
         Ok(Self {
             windows: HashMap::new(),
             hwnd_to_wid: HashMap::new(),
             quit: false,
-            dwrite: None,
+            dwrite,
             class_registered: false,
             hinstance_raw: hinstance.0 as isize,
             pending_events: Vec::new(),
@@ -593,50 +613,61 @@ impl PlatformBackend for Win32Backend {
             baseline: 0.0,
         };
 
-        // Create a fresh DirectWrite factory per-call to avoid &mut self UB.
-        let factory: IDWriteFactory = match unsafe {
-            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
-        } {
-            Ok(f) => f,
-            Err(_) => return empty,
-        };
-
-        let family_wide: Vec<u16> = font_family
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let weight = if bold {
-            DWRITE_FONT_WEIGHT_BOLD
+        // Reuse the backend's cached DirectWrite factory + text format when
+        // available. Creating a factory per call is expensive, and the
+        // text-format cache is the whole point of `DirectWriteRenderer`.
+        // If the renderer isn't initialised yet, fall back to a fresh factory
+        // for this call only.
+        let layout = if let Some(dw) = self.dwrite.as_ref() {
+            match dw.create_text_layout(text, font_family, font_size, bold, italic) {
+                Ok(l) => l,
+                Err(_) => return empty,
+            }
         } else {
-            DWRITE_FONT_WEIGHT_NORMAL
-        };
-        let dw_style = if italic {
-            DWRITE_FONT_STYLE_ITALIC
-        } else {
-            DWRITE_FONT_STYLE_NORMAL
-        };
+            let factory: IDWriteFactory = match unsafe {
+                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
+            } {
+                Ok(f) => f,
+                Err(_) => return empty,
+            };
 
-        let format = match unsafe {
-            factory.CreateTextFormat(
-                PCWSTR(family_wide.as_ptr()),
-                None,
-                weight,
-                dw_style,
-                DWRITE_FONT_STRETCH_NORMAL,
-                font_size,
-                w!("en-us"),
-            )
-        } {
-            Ok(f) => f,
-            Err(_) => return empty,
-        };
+            let family_wide: Vec<u16> = font_family
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let weight = if bold {
+                DWRITE_FONT_WEIGHT_BOLD
+            } else {
+                DWRITE_FONT_WEIGHT_NORMAL
+            };
+            let dw_style = if italic {
+                DWRITE_FONT_STYLE_ITALIC
+            } else {
+                DWRITE_FONT_STYLE_NORMAL
+            };
 
-        let text_wide: Vec<u16> = text.encode_utf16().collect();
-        let layout = match unsafe {
-            factory.CreateTextLayout(&text_wide, &format, 10000.0, 10000.0)
-        } {
-            Ok(l) => l,
-            Err(_) => return empty,
+            let format = match unsafe {
+                factory.CreateTextFormat(
+                    PCWSTR(family_wide.as_ptr()),
+                    None,
+                    weight,
+                    dw_style,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    font_size,
+                    w!("en-us"),
+                )
+            } {
+                Ok(f) => f,
+                Err(_) => return empty,
+            };
+
+            let text_wide: Vec<u16> = text.encode_utf16().collect();
+            match unsafe {
+                factory.CreateTextLayout(&text_wide, &format, 10000.0, 10000.0)
+            } {
+                Ok(l) => l,
+                Err(_) => return empty,
+            }
         };
 
         let (tw, th) = unsafe {

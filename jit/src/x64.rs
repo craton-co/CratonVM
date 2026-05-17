@@ -1407,6 +1407,41 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// HIGH-1 / Fix 1 — null-check elimination helper
+// ---------------------------------------------------------------------------
+
+/// If the bytecode instruction immediately preceding `pc` is an `aload`
+/// of some local, return the local index. Otherwise return `None`.
+///
+/// Used by the ifnull / ifnonnull codegen to decide whether the value
+/// on top of the operand stack came from a known local — if so, the
+/// caller can consult `NullCheckInfo::is_nonnull` and elide the inline
+/// `TEST reg, reg; Jcc` sequence.
+///
+/// Only the common encodings are recognised:
+///   * `aload_0..3`  (single-byte opcodes 0x2A..=0x2D)
+///   * `aload <u8>`  (0x19 + 1-byte index)
+///
+/// The 4-byte `wide; aload` form is not recognised — its prevalence in
+/// real classes is essentially zero, and bailing out is always safe
+/// (we simply emit the regular runtime check).
+fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<usize> {
+    if pc == 0 {
+        return None;
+    }
+    // aload_0..aload_3 — 1-byte opcode at pc-1.
+    let prev1 = code[pc - 1];
+    if (0x2A..=0x2D).contains(&prev1) {
+        return Some((prev1 - 0x2A) as usize);
+    }
+    // aload <u8> — 2 bytes at pc-2.
+    if pc >= 2 && code[pc - 2] == 0x19 {
+        return Some(code[pc - 1] as usize);
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Escape analysis
 // ---------------------------------------------------------------------------
 
@@ -3027,6 +3062,30 @@ struct Compiler {
     /// The emitter consumes this list to duplicate the body and hoist
     /// the branch above the header.
     loop_unswitch_candidates: Vec<LoopUnswitchCandidate>,
+
+    // ── MED-4 / Fix 3 — PC-indexed lookup acceleration ─────────────────
+    //
+    // The original layout stores per-call-site metadata in `Vec<(pc, …)>`
+    // arrays and queries them with `iter().find(|(p, …)| *p == pc)` on
+    // every getfield/putfield/invoke* during code generation. For hot
+    // methods (large generated classes, generics-heavy code) this is
+    // O(N) per opcode and N²-shaped for the whole compile.
+    //
+    // These auxiliary maps mirror the indexed entries so the hot
+    // lookup is O(1). They are populated once via [`build_pc_indices`]
+    // immediately before `compile_bytecode` runs and never mutated
+    // afterwards, so the borrow-checker tax is zero on the hot path.
+    field_info_idx: FxHashMap<usize, usize>,
+    static_field_info_idx: FxHashMap<usize, usize>,
+    invoke_info_idx: FxHashMap<usize, usize>,
+    direct_calls_idx: FxHashMap<usize, usize>,
+    mic_slots_idx: FxHashMap<usize, usize>,
+    pic_slots_idx: FxHashMap<usize, usize>,
+    new_info_idx: FxHashMap<usize, usize>,
+    anewarray_info_idx: FxHashMap<usize, usize>,
+    typecheck_info_idx: FxHashMap<usize, usize>,
+    ldc_info_idx: FxHashMap<usize, usize>,
+    ldc2w_info_idx: FxHashMap<usize, usize>,
 }
 
 impl Compiler {
@@ -3162,6 +3221,78 @@ impl Compiler {
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
             loop_unswitch_candidates: Vec::new(),
+            field_info_idx: FxHashMap::default(),
+            static_field_info_idx: FxHashMap::default(),
+            invoke_info_idx: FxHashMap::default(),
+            direct_calls_idx: FxHashMap::default(),
+            mic_slots_idx: FxHashMap::default(),
+            pic_slots_idx: FxHashMap::default(),
+            new_info_idx: FxHashMap::default(),
+            anewarray_info_idx: FxHashMap::default(),
+            typecheck_info_idx: FxHashMap::default(),
+            ldc_info_idx: FxHashMap::default(),
+            ldc2w_info_idx: FxHashMap::default(),
+        }
+    }
+
+    /// MED-4 / Fix 3 — populate the pc → array-index maps used by hot
+    /// codegen lookups. Call once after all the `*_info` Vecs are
+    /// installed and before `compile_bytecode` walks the bytecode.
+    fn build_pc_indices(&mut self) {
+        self.field_info_idx.clear();
+        self.field_info_idx.reserve(self.field_info.len());
+        for (i, e) in self.field_info.iter().enumerate() {
+            self.field_info_idx.insert(e.0, i);
+        }
+        self.static_field_info_idx.clear();
+        self.static_field_info_idx.reserve(self.static_field_info.len());
+        for (i, e) in self.static_field_info.iter().enumerate() {
+            self.static_field_info_idx.insert(e.0, i);
+        }
+        self.invoke_info_idx.clear();
+        self.invoke_info_idx.reserve(self.invoke_info.len());
+        for (i, e) in self.invoke_info.iter().enumerate() {
+            self.invoke_info_idx.insert(e.0, i);
+        }
+        self.direct_calls_idx.clear();
+        self.direct_calls_idx.reserve(self.direct_calls.len());
+        for (i, e) in self.direct_calls.iter().enumerate() {
+            self.direct_calls_idx.insert(e.0, i);
+        }
+        self.mic_slots_idx.clear();
+        self.mic_slots_idx.reserve(self.mic_slots.len());
+        for (i, e) in self.mic_slots.iter().enumerate() {
+            self.mic_slots_idx.insert(e.0, i);
+        }
+        self.pic_slots_idx.clear();
+        self.pic_slots_idx.reserve(self.pic_slots.len());
+        for (i, e) in self.pic_slots.iter().enumerate() {
+            self.pic_slots_idx.insert(e.0, i);
+        }
+        self.new_info_idx.clear();
+        self.new_info_idx.reserve(self.new_info.len());
+        for (i, e) in self.new_info.iter().enumerate() {
+            self.new_info_idx.insert(e.0, i);
+        }
+        self.anewarray_info_idx.clear();
+        self.anewarray_info_idx.reserve(self.anewarray_info.len());
+        for (i, e) in self.anewarray_info.iter().enumerate() {
+            self.anewarray_info_idx.insert(e.0, i);
+        }
+        self.typecheck_info_idx.clear();
+        self.typecheck_info_idx.reserve(self.typecheck_info.len());
+        for (i, e) in self.typecheck_info.iter().enumerate() {
+            self.typecheck_info_idx.insert(e.0, i);
+        }
+        self.ldc_info_idx.clear();
+        self.ldc_info_idx.reserve(self.ldc_info.len());
+        for (i, e) in self.ldc_info.iter().enumerate() {
+            self.ldc_info_idx.insert(e.0, i);
+        }
+        self.ldc2w_info_idx.clear();
+        self.ldc2w_info_idx.reserve(self.ldc2w_info.len());
+        for (i, e) in self.ldc2w_info.iter().enumerate() {
+            self.ldc2w_info_idx.insert(e.0, i);
         }
     }
 
@@ -3185,7 +3316,6 @@ impl Compiler {
     /// `local` is non-null at the instruction starting at `pc`. Uses
     /// the forward-dataflow result computed by
     /// [`crate::null_check_elim::analyze`].
-    #[allow(dead_code)]
     pub(crate) fn is_local_nonnull(&self, pc: usize, local: usize) -> bool {
         self.null_check_info.is_nonnull(pc, local)
     }
@@ -5523,6 +5653,32 @@ impl Compiler {
 
         // Step 1: fetch the JvmThread* via the small TLS helper.
         // (One CALL + one TEST; ~10 cycles overhead.)
+        //
+        // HIGH-2 / Fix 2 — direct `MOV reg, FS:[off]` TLS load is the
+        // ideal sequence (saves ~5 ns per `new`). It is NOT applied
+        // here in this round because it requires runtime cooperation
+        // we do not yet have:
+        //
+        //   * Rust's `thread_local!` macro hides the TLS slot offset
+        //     entirely — there is no portable API to extract the
+        //     FS/GS-relative offset of `JIT_THREAD` at JIT-compile
+        //     time. A `#[thread_local]` static (unstable on stable
+        //     Rust) would still need a startup probe (inline asm
+        //     `mov rax, fs:[OFFSET]` against a known sentinel) to
+        //     recover the loader-assigned displacement.
+        //   * On Windows the slot lives at GS:[0x58 + slot*8] where
+        //     `slot` is allocated dynamically by `TlsAlloc`; the same
+        //     probe machinery applies but with a different segment
+        //     prefix and one extra indirection. Per task scope, this
+        //     arm is intentionally left on the helper.
+        //   * The current `JitRuntimeHelpers` table exposes only the
+        //     helper function pointer; wiring an `Option<(SegPrefix,
+        //     u32)>` field plus a startup probe in the VM is a
+        //     cross-crate change outside the scope of this fix
+        //     round.
+        //
+        // Until that plumbing lands, the helper call stays — see the
+        // task notes for the planned approach.
         self.emit_call_absolute(self.helpers.get_current_thread);
         self.emit_test_r64_r64(RAX);
         let null_thread_patch = self.emit_jcc_rel32_patch(0x84); // JE slow_path
@@ -8024,9 +8180,8 @@ impl Compiler {
 
                 // ldc — load int/float/string constant from CP (1-byte index)
                 0x12 => {
-                    let val = self.ldc_info.iter()
-                        .find(|&&(p, _)| p == pc)
-                        .map(|&(_, v)| v);
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
                         Some(v) => {
                             self.emit_mov_imm64(RAX, v);
@@ -8039,9 +8194,8 @@ impl Compiler {
 
                 // ldc_w — load int/float/string constant from CP (2-byte index)
                 0x13 => {
-                    let val = self.ldc_info.iter()
-                        .find(|&&(p, _)| p == pc)
-                        .map(|&(_, v)| v);
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
                         Some(v) => {
                             self.emit_mov_imm64(RAX, v);
@@ -8054,9 +8208,8 @@ impl Compiler {
 
                 // ldc2_w — load long/double constant from CP (resolved to i64)
                 0x14 => {
-                    let val = self.ldc2w_info.iter()
-                        .find(|&&(p, _)| p == pc)
-                        .map(|&(_, v)| v);
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    let val = self.ldc2w_info_idx.get(&pc).map(|&i| self.ldc2w_info[i].1);
                     match val {
                         Some(v) => {
                             self.emit_mov_imm64(RAX, v);
@@ -9753,12 +9906,12 @@ impl Compiler {
                 // path below. This is correct (the helper takes the
                 // RwLock and reads `Value` properly) but slow.
                 0xb2 => {
-                    let (_, class_id_raw, field_index, _type_tag, is_volatile) = self
-                        .static_field_info
-                        .iter()
-                        .find(|(p, _, _, _, _)| *p == pc)
-                        .copied()
-                        .unwrap_or((pc, 0, 0, b'I', false));
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    let (_, class_id_raw, field_index, _type_tag, is_volatile) =
+                        self.static_field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.static_field_info[i])
+                            .unwrap_or((pc, 0, 0, b'I', false));
 
                     self.flush_scratch_registers();
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -9786,12 +9939,12 @@ impl Compiler {
                 // on the 0xb2 handler above for the full unblocking plan.
                 0xb3 => {
                     self.flush_scratch_registers();
-                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
-                        .static_field_info
-                        .iter()
-                        .find(|(p, _, _, _, _)| *p == pc)
-                        .copied()
-                        .unwrap_or((pc, 0, 0, b'I', false));
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) =
+                        self.static_field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.static_field_info[i])
+                            .unwrap_or((pc, 0, 0, b'I', false));
 
                     let val_slot = self.pop_stack();
 
@@ -9825,8 +9978,11 @@ impl Compiler {
                 0xb4 => {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced getfield: load directly from frame slot
-                        let (_, field_index, _) = self.field_info.iter()
-                            .find(|(p, _, _)| *p == pc).copied()
+                        // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                        let (_, field_index, _) = self
+                            .field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.field_info[i])
                             .unwrap_or((pc, 0, b'I'));
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
@@ -9837,11 +9993,11 @@ impl Compiler {
                         pc += 3;
                     } else {
                         self.flush_scratch_registers();
+                        // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                         let (_, field_index, _type_tag) = self
-                            .field_info
-                            .iter()
-                            .find(|(p, _, _)| *p == pc)
-                            .copied()
+                            .field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.field_info[i])
                             .unwrap_or((pc, 0, b'I'));
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(ARG_REGS[0], obj_slot);
@@ -9856,8 +10012,11 @@ impl Compiler {
                 0xb5 => {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced putfield: store value directly to frame slot
-                        let (_, field_index, _type_tag) = self.field_info.iter()
-                            .find(|(p, _, _)| *p == pc).copied()
+                        // MED-4 / Fix 3 — O(1) pc-indexed lookup.
+                        let (_, field_index, _type_tag) = self
+                            .field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.field_info[i])
                             .unwrap_or((pc, 0, b'I'));
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
@@ -9875,11 +10034,11 @@ impl Compiler {
                         pc += 3;
                     } else {
                         self.flush_scratch_registers();
+                        // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                         let (_, field_index, type_tag) = self
-                            .field_info
-                            .iter()
-                            .find(|(p, _, _)| *p == pc)
-                            .copied()
+                            .field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.field_info[i])
                             .unwrap_or((pc, 0, b'I'));
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
@@ -9931,18 +10090,20 @@ impl Compiler {
                     }
 
                     // Check for direct call target
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self
-                        .direct_calls
-                        .iter()
-                        .find(|&&(dpc, _)| dpc == pc)
-                        .map(|&(_, ref dc)| (dc.entry, dc.needs_context, dc.num_params, dc.return_type));
+                        .direct_calls_idx
+                        .get(&pc)
+                        .map(|&i| {
+                            let dc = &self.direct_calls[i].1;
+                            (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
+                        });
 
                     // Check for invoke_info (fallback to jit_invoke_dispatch)
                     let info_ptr = self
-                        .invoke_info
-                        .iter()
-                        .find(|&&(ipc, _)| ipc == pc)
-                        .map(|&(_, ptr)| ptr);
+                        .invoke_info_idx
+                        .get(&pc)
+                        .map(|&i| self.invoke_info[i].1);
 
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct {
                         if callee_entry == super::MATH_SQRT_INTRINSIC {
@@ -10399,11 +10560,14 @@ impl Compiler {
                     }
 
                     // Check for direct call target (invokespecial with compiled callee)
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self
-                        .direct_calls
-                        .iter()
-                        .find(|&&(dpc, _)| dpc == pc)
-                        .map(|&(_, ref dc)| (dc.entry, dc.needs_context, dc.num_params, dc.return_type));
+                        .direct_calls_idx
+                        .get(&pc)
+                        .map(|&i| {
+                            let dc = &self.direct_calls[i].1;
+                            (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
+                        });
 
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct {
                         // Direct call: pop receiver + params, call compiled entry
@@ -10440,11 +10604,11 @@ impl Compiler {
                         }
                     } else {
                         // Dispatch via helper (MIC-optimized for virtual/interface, plain for others)
+                        // MED-4 / Fix 3 — O(1) pc-indexed lookups for invoke/MIC/PIC.
                         let info_ptr = self
-                            .invoke_info
-                            .iter()
-                            .find(|&&(ipc, _)| ipc == pc)
-                            .map(|&(_, ptr)| ptr);
+                            .invoke_info_idx
+                            .get(&pc)
+                            .map(|&i| self.invoke_info[i].1);
                         if let Some(info) = info_ptr {
                             // SAFETY: info comes from self.invoke_info, which holds pointers to
                             // JitInvokeInfo structs kept alive by the caller for the duration of compilation.
@@ -10453,20 +10617,18 @@ impl Compiler {
 
                             // Check for MIC slot at this PC
                             let mic_ptr = self
-                                .mic_slots
-                                .iter()
-                                .find(|&&(mpc, _)| mpc == pc)
-                                .map(|&(_, ptr)| ptr);
+                                .mic_slots_idx
+                                .get(&pc)
+                                .map(|&i| self.mic_slots[i].1);
                             // Check for PIC slot at this PC. When both PIC
                             // and MIC are present (the adaptive recompiler
                             // promotes MIC → PIC and leaves the old MIC
                             // slot live as a fallback), PIC takes
                             // precedence: it caches a 3-entry superset.
                             let pic_ptr = self
-                                .pic_slots
-                                .iter()
-                                .find(|&&(ppc, _)| ppc == pc)
-                                .map(|&(_, ptr)| ptr);
+                                .pic_slots_idx
+                                .get(&pc)
+                                .map(|&i| self.pic_slots[i].1);
                             if std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
                                 eprintln!(
                                     "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
@@ -10704,11 +10866,20 @@ impl Compiler {
                                     slot_starts[i] = self.buf.pos();
 
                                     // CMP EAX, dword [R10 + CLASS_ID_OFFS[i]]
-                                    // Encoding: REX.B (0x41) + 3B /r + modrm
-                                    //   modrm = mod(01) reg(EAX=0) rm(R10's
-                                    //   low 3=010) → 0x42, then disp8.
-                                    self.buf
-                                        .emit(&[0x41, 0x3B, 0x42, CLASS_ID_OFFS[i]]);
+                                    // For disp == 0 (slot 0 today) emit the
+                                    // mod=00 form with no displacement byte:
+                                    // saves 1 byte per JIT site on the hot
+                                    // slot-0 cascade. For disp != 0 use the
+                                    // mod=01 (disp8) form. R10 in mod=00 is
+                                    // ModRM 00_000_010 = 0x02.
+                                    if CLASS_ID_OFFS[i] == 0 {
+                                        // 3 bytes: REX.B + 3B /r + ModRM(00,000,010).
+                                        self.buf.emit(&[0x41, 0x3B, 0x02]);
+                                    } else {
+                                        // 4 bytes: REX.B + 3B /r + ModRM(01,000,010) + disp8.
+                                        self.buf
+                                            .emit(&[0x41, 0x3B, 0x42, CLASS_ID_OFFS[i]]);
+                                    }
 
                                     if i < 2 {
                                         // JNE rel8 → start of slot i+1
@@ -11035,11 +11206,11 @@ impl Compiler {
                         pc += 3;
                     } else {
                         self.flush_scratch_registers();
+                        // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                         let resolved = self
-                            .new_info
-                            .iter()
-                            .find(|(p, _, _, _, _)| *p == pc)
-                            .copied();
+                            .new_info_idx
+                            .get(&pc)
+                            .map(|&i| self.new_info[i]);
                         let (_, class_id_raw, num_fields, has_prim_init, has_finalizer) =
                             match resolved {
                                 Some(info) => info,
@@ -11125,11 +11296,11 @@ impl Compiler {
                 // anewarray — allocate a new reference array via helper
                 0xbd => {
                     self.flush_scratch_registers();
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let resolved = self
-                        .anewarray_info
-                        .iter()
-                        .find(|(p, _)| *p == pc)
-                        .copied();
+                        .anewarray_info_idx
+                        .get(&pc)
+                        .map(|&i| self.anewarray_info[i]);
                     let (_, component_class_id_raw) = match resolved {
                         Some(info) => info,
                         None => return false, // unresolved — bail to interpreter
@@ -11217,11 +11388,11 @@ impl Compiler {
                 0xc0 => {
                     self.flush_scratch_registers();
                     // Look up resolved typecheck info for this PC
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let (_, name_ptr, name_len) = self
-                        .typecheck_info
-                        .iter()
-                        .find(|(p, _, _)| *p == pc)
-                        .copied()
+                        .typecheck_info_idx
+                        .get(&pc)
+                        .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
 
                     let obj_slot = self.pop_stack();
@@ -11248,11 +11419,11 @@ impl Compiler {
                 0xc1 => {
                     self.flush_scratch_registers();
                     // Look up resolved typecheck info for this PC
+                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let (_, name_ptr, name_len) = self
-                        .typecheck_info
-                        .iter()
-                        .find(|(p, _, _)| *p == pc)
-                        .copied()
+                        .typecheck_info_idx
+                        .get(&pc)
+                        .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
 
                     let obj_slot = self.pop_stack();
@@ -11317,26 +11488,45 @@ impl Compiler {
                     };
 
                     let slot = self.pop_stack();
-                    self.load_slot_to_reg(RCX, slot);
+                    // HIGH-1 / Fix 1 — wire null-check elimination.
+                    // If the value on top of stack came from an aload of a
+                    // local that is proven non-null at this PC, the TEST
+                    // can never be zero so `ifnull` is dead and the
+                    // fall-through is always taken. Skip both the TEST
+                    // and the JE.
+                    let proven_nonnull = preceding_aload_nonnull_local(code, pc)
+                        .is_some_and(|l| self.is_local_nonnull(pc, l));
                     if target_pc > pc && !self.stack.is_empty() {
                         self.canonicalize_stack();
                     }
-                    // TEST RCX, RCX (REX.W + 0x85 /r)
-                    self.rex_w();
-                    self.buf.emit(&[0x85, 0xC9]); // TEST RCX, RCX
+                    if proven_nonnull {
+                        // No-op: fall through. We still need a non-empty
+                        // branch-target record so downstream merges see
+                        // the expected stack depth.
+                        self.branch_target_stack_depth
+                            .entry(target_pc)
+                            .or_insert(self.stack.len());
+                        self.reset_spills();
+                        pc += 3;
+                    } else {
+                        self.load_slot_to_reg(RCX, slot);
+                        // TEST RCX, RCX (REX.W + 0x85 /r)
+                        self.rex_w();
+                        self.buf.emit(&[0x85, 0xC9]); // TEST RCX, RCX
 
-                    // JE rel32 (jump if null / zero)
-                    self.buf.emit_byte(0x0F);
-                    self.buf.emit_byte(0x84); // JE
-                    let patch_offset = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        // JE rel32 (jump if null / zero)
+                        self.buf.emit_byte(0x0F);
+                        self.buf.emit_byte(0x84); // JE
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
-                    self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
-                    self.reset_spills();
-                    pc += 3;
+                        self.forward_patches.push((patch_offset, target_pc));
+                        self.branch_target_stack_depth
+                            .entry(target_pc)
+                            .or_insert(self.stack.len());
+                        self.reset_spills();
+                        pc += 3;
+                    }
                 }
 
                 // ifnonnull (0xc7) — branch if reference is not null
@@ -11349,26 +11539,47 @@ impl Compiler {
                     };
 
                     let slot = self.pop_stack();
-                    self.load_slot_to_reg(RCX, slot);
+                    // HIGH-1 / Fix 1 — null-check elimination. If the
+                    // tested value is proven non-null, `ifnonnull` is
+                    // always taken: emit an unconditional JMP rel32 and
+                    // skip the TEST + Jcc pair. Saves the 3-byte TEST
+                    // + 1-byte (Jcc opcode-pair high byte) for every
+                    // proven site.
+                    let proven_nonnull = preceding_aload_nonnull_local(code, pc)
+                        .is_some_and(|l| self.is_local_nonnull(pc, l));
                     if target_pc > pc && !self.stack.is_empty() {
                         self.canonicalize_stack();
                     }
-                    // TEST RCX, RCX (REX.W + 0x85 /r)
-                    self.rex_w();
-                    self.buf.emit(&[0x85, 0xC9]); // TEST RCX, RCX
+                    if proven_nonnull {
+                        // JMP rel32 (5 bytes; patched).
+                        self.buf.emit_byte(0xE9);
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.forward_patches.push((patch_offset, target_pc));
+                        self.branch_target_stack_depth
+                            .entry(target_pc)
+                            .or_insert(self.stack.len());
+                        self.reset_spills();
+                        pc += 3;
+                    } else {
+                        self.load_slot_to_reg(RCX, slot);
+                        // TEST RCX, RCX (REX.W + 0x85 /r)
+                        self.rex_w();
+                        self.buf.emit(&[0x85, 0xC9]); // TEST RCX, RCX
 
-                    // JNE rel32 (jump if not null / non-zero)
-                    self.buf.emit_byte(0x0F);
-                    self.buf.emit_byte(0x85); // JNE
-                    let patch_offset = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        // JNE rel32 (jump if not null / non-zero)
+                        self.buf.emit_byte(0x0F);
+                        self.buf.emit_byte(0x85); // JNE
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
-                    self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
-                    self.reset_spills();
-                    pc += 3;
+                        self.forward_patches.push((patch_offset, target_pc));
+                        self.branch_target_stack_depth
+                            .entry(target_pc)
+                            .or_insert(self.stack.len());
+                        self.reset_spills();
+                        pc += 3;
+                    }
                 }
 
                 // T5.2.8 — monitorenter / monitorexit: lock elision.
@@ -11727,6 +11938,11 @@ pub fn compile(
     // T5.2.17 — loop unswitching candidates.
     compiler.loop_unswitch_candidates =
         detect_loop_unswitch_candidates(code, code_len, &loops);
+
+    // MED-4 / Fix 3 — pre-build pc-indexed lookup maps for the hot
+    // codegen sites (getfield/putfield/invoke*/new/anewarray/ldc/…)
+    // so each query is O(1) rather than scanning the Vec.
+    compiler.build_pc_indices();
 
     // Emit prologue
     compiler.emit_prologue();

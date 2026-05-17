@@ -165,11 +165,16 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
         return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
     }
 
-    if let Err(reason) = scan_bytecode(code) {
-        return OffloadVerdict::Rejected(reason);
-    }
-
-    let estimated_work = estimate_work(code);
+    // AUDIT 2026-05-17 (Fix 7): single bytecode pass that collects
+    // both the reject reason (formerly `scan_bytecode`) and the
+    // loop-trip heuristic (formerly `estimate_work`). Walking the
+    // bytecode twice was pure waste — the work estimator's branch-
+    // direction check only needs the same `pc / instruction_size`
+    // walk the classifier already performs.
+    let estimated_work = match scan_and_estimate(code) {
+        Ok(w) => w,
+        Err(reason) => return OffloadVerdict::Rejected(reason),
+    };
     OffloadVerdict::Eligible(KernelSignature {
         param_kinds,
         return_kind,
@@ -177,20 +182,40 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
     })
 }
 
-/// Walk the bytecode once and reject as soon as we hit a forbidden
-/// opcode.
-fn scan_bytecode(code: &CodeAttribute) -> Result<(), Reason> {
+/// Walk the bytecode exactly once. Reject on the first forbidden
+/// opcode; otherwise return the loop-trip estimate.
+fn scan_and_estimate(code: &CodeAttribute) -> Result<usize, Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
+    let mut has_backward = false;
     while pc < bytes.len() {
         let op = bytes[pc];
         match classify(op) {
             OpClass::Ok => {}
             OpClass::Reject(r) => return Err(r),
         }
+        // Branch-direction probe lifted from the old `estimate_work`.
+        if (0x99..=0xA7).contains(&op) || op == 0xC6 || op == 0xC7 {
+            if pc + 3 <= bytes.len() {
+                let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
+                if off < 0 {
+                    has_backward = true;
+                }
+            }
+        } else if op == 0xC8 && pc + 5 <= bytes.len() {
+            let off = i32::from_be_bytes([
+                bytes[pc + 1],
+                bytes[pc + 2],
+                bytes[pc + 3],
+                bytes[pc + 4],
+            ]);
+            if off < 0 {
+                has_backward = true;
+            }
+        }
         pc += instruction_size(bytes, pc)?;
     }
-    Ok(())
+    Ok(if has_backward { 1 << 20 } else { bytes.len().max(1) })
 }
 
 enum OpClass {
@@ -286,43 +311,11 @@ fn instruction_size(bytes: &[u8], pc: usize) -> Result<usize, Reason> {
     Ok(size)
 }
 
-/// Cheap loop-trip heuristic: if the bytecode contains at least one
-/// backward branch, default to "lots of work"; otherwise use bytecode
-/// length. The interpreter (Part E) only uses this to skip offload
-/// for tiny inputs, so precision is not critical.
-fn estimate_work(code: &CodeAttribute) -> usize {
-    let bytes = &code.code;
-    let mut has_backward = false;
-    let mut pc = 0usize;
-    while pc < bytes.len() {
-        let op = bytes[pc];
-        let size = instruction_size(bytes, pc).unwrap_or(1);
-        if (0x99..=0xA7).contains(&op) || op == 0xC6 || op == 0xC7 {
-            if pc + 3 <= bytes.len() {
-                let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
-                if off < 0 {
-                    has_backward = true;
-                }
-            }
-        } else if op == 0xC8 && pc + 5 <= bytes.len() {
-            let off = i32::from_be_bytes([
-                bytes[pc + 1],
-                bytes[pc + 2],
-                bytes[pc + 3],
-                bytes[pc + 4],
-            ]);
-            if off < 0 {
-                has_backward = true;
-            }
-        }
-        pc += size;
-    }
-    if has_backward {
-        1 << 20
-    } else {
-        bytes.len().max(1)
-    }
-}
+// AUDIT 2026-05-17 (Fix 7): `estimate_work` was folded into
+// `scan_and_estimate` above so the bytecode is walked exactly once
+// per call to `analyze`. The previous version walked the bytes twice
+// (once to classify, once to count backward branches) — pure waste on
+// methods with thousands of bytecodes.
 
 #[cfg(test)]
 mod tests {

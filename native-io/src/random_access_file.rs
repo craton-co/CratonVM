@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::Mutex;
@@ -56,9 +57,25 @@ enum SyncMode {
 /// Per-handle state: the open `File` plus the sync mode requested at
 /// open time. `None` sync_mode means no per-write sync (plain "r" or
 /// "rw" modes).
+///
+/// AUDIT 2026-05-17: mirrors the `fd_table::FileEntry` pattern. The
+/// underlying `File` lives behind its own `Arc<Mutex<_>>` so callers
+/// can clone the handle out of the global map, drop the map-level
+/// lock, and only then perform the blocking I/O. Holding the map
+/// lock across the syscall serializes every RAF op in the VM against
+/// the longest-running I/O on any open RAF.
 struct RafHandle {
-    file: File,
+    file: Arc<Mutex<File>>,
     sync_mode: Option<SyncMode>,
+}
+
+impl Clone for RafHandle {
+    fn clone(&self) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            sync_mode: self.sync_mode,
+        }
+    }
 }
 
 /// Module-local handle table: integer id -> RafHandle.
@@ -77,16 +94,27 @@ fn handle_map() -> &'static Mutex<HashMap<i64, RafHandle>> {
 
 fn alloc_handle(file: File, sync_mode: Option<SyncMode>) -> i64 {
     let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    handle_map().lock().insert(h, RafHandle { file, sync_mode });
+    handle_map().lock().insert(
+        h,
+        RafHandle {
+            file: Arc::new(Mutex::new(file)),
+            sync_mode,
+        },
+    );
     h
 }
 
+/// AUDIT 2026-05-17 (mirror of `fd_table::get_entry`): take the
+/// map-level lock briefly to clone the per-handle `Arc<Mutex<File>>`,
+/// drop the map lock, then lock and operate on the inner file. This
+/// keeps the global handle-table lock off the blocking I/O path.
 fn with_file<F, R>(handle: i64, f: F) -> Option<R>
 where
     F: FnOnce(&mut File) -> R,
 {
-    let mut map = handle_map().lock();
-    map.get_mut(&handle).map(|h| f(&mut h.file))
+    let entry = handle_map().lock().get(&handle).cloned()?;
+    let mut file = entry.file.lock();
+    Some(f(&mut file))
 }
 
 /// Look up the configured sync mode for an open handle.
@@ -96,22 +124,26 @@ fn handle_sync_mode(handle: i64) -> Option<SyncMode> {
 
 /// Run an fsync corresponding to the handle's sync mode. No-op if
 /// the handle was opened in a non-sync mode ("r" / "rw").
+///
+/// AUDIT 2026-05-17: same Arc-clone-then-drop pattern as `with_file`
+/// so the fsync syscall does not serialize against handle-map mutations.
 fn sync_for_handle(handle: i64) -> Result<(), std::io::Error> {
-    let mode = match handle_sync_mode(handle) {
+    let entry = match handle_map().lock().get(&handle).cloned() {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+    let mode = match entry.sync_mode {
         Some(m) => m,
         None => return Ok(()),
     };
-    let mut map = handle_map().lock();
-    let Some(h) = map.get_mut(&handle) else {
-        return Ok(());
-    };
+    let mut file = entry.file.lock();
     match mode {
-        SyncMode::Data => h.file.sync_data(),
-        SyncMode::Full => h.file.sync_all(),
+        SyncMode::Data => file.sync_data(),
+        SyncMode::Full => file.sync_all(),
     }
 }
 
-fn remove_handle(handle: i64) -> Option<File> {
+fn remove_handle(handle: i64) -> Option<Arc<Mutex<File>>> {
     handle_map().lock().remove(&handle).map(|h| h.file)
 }
 
@@ -303,9 +335,8 @@ fn native_readBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    for (i, &b) in buf[..n].iter().enumerate() {
-        ctx.set_array_element(arr, off + i, Value::Int(b as i32));
-    }
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
+    ctx.write_byte_array_from(arr, off, &buf[..n]);
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -357,12 +388,8 @@ fn native_writeBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(None);
     }
     let mut buf = vec![0u8; len];
-    for i in 0..len {
-        buf[i] = match ctx.get_array_element(arr, off + i) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-    }
+    // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
+    ctx.read_byte_array_into(arr, off, &mut buf);
     let handle = match read_handle(ctx, this) {
         Some(h) => h,
         None => return Ok(None),

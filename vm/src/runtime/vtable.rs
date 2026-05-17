@@ -782,6 +782,16 @@ pub fn vtable_install_adapter(
                 // the slow path relies on.
                 let (resolved_method, is_native) = match d.dispatch {
                     Some(snap) if !snap.is_native => {
+                        // `snap.code: Arc<[u8]>` (round 4 — was `Vec<u8>`).
+                        // We still need a +2-byte zero-padded copy for the
+                        // interpreter's speculative `code[pc+1/+2]` reads,
+                        // so build one fresh `Arc<[u8]>` here. The
+                        // previous implementation also did a fresh alloc,
+                        // and `snap.code` itself was a Vec built from a
+                        // Vec; now `snap.code` is the reader's zero-copy
+                        // shared-buffer slice, so the producer side
+                        // (`build_vtable_descriptors_with_overrides`)
+                        // dropped one Vec alloc + memcpy.
                         let padded = {
                             let mut v = Vec::with_capacity(snap.code.len() + 2);
                             v.extend_from_slice(&snap.code);

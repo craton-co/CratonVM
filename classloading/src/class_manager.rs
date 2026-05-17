@@ -42,6 +42,15 @@ use crate::module::{
 use crate::vtype::ClassHierarchy;
 use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
 
+/// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
+///
+/// Empirically covers JVMTI / `getResourceAsStream` re-fetch on the agents
+/// we ship — those overwhelmingly target *recently-defined* classes (the
+/// FIFO retention window). Apps with large agents that retransform
+/// already-old classes should raise this via
+/// [`ClassManager::set_class_bytes_cache_cap`].
+pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
+
 /// Adapter implementing [`ClassHierarchy`] over the `ClassManager`'s
 /// `ClassStore` + name-to-id index. Used by the verifier (Pass 2 / Pass 3)
 /// during `define_class_with_options`. Each query is name-keyed and walks
@@ -403,7 +412,16 @@ pub struct VtableMethodSnapshot {
     /// Source file (from SourceFile attribute), if any.
     pub source_file: Option<String>,
     /// Raw bytecode (NOT yet padded for speculative reads).
-    pub code: Vec<u8>,
+    ///
+    /// Stored as `Arc<[u8]>` (round 4 — was `Vec<u8>`). The producer
+    /// (`build_vtable_descriptors_with_overrides`) gets the bytecode as
+    /// `Arc<[u8]>` directly from the reader's `CodeAttribute.code`, so
+    /// the snapshot is constructed via `Arc::clone` (refcount bump) — no
+    /// `.clone()` of a `Vec<u8>`. The VM-side adapter in
+    /// `vm/src/runtime/vtable.rs` previously rebuilt a fresh `Arc<[u8]>`
+    /// out of the padded vec; with this field already `Arc<[u8]>` it
+    /// only needs to pad once into the final Arc.
+    pub code: Arc<[u8]>,
     /// Exception handler table.
     pub exception_table: Vec<rustjvm_reader::attribute::ExceptionTableEntry>,
     /// Max operand-stack depth.
@@ -676,9 +694,33 @@ pub struct ClassManager {
     pub module_registry: ModuleRegistry,
 
     /// Raw class file bytes for each loaded class, keyed by internal name.
-    /// Populated during define_class() for CDS dump support.
+    /// Populated during define_class() for CDS dump support, JVMTI
+    /// `RetransformClasses`, and `getResourceAsStream("X.class")`.
     /// T10.9.B: FxHashMap — keys are class-file internal names.
+    ///
+    /// **Round 4 audit fix (HIGH):** insertions go through
+    /// [`Self::insert_class_bytes`], which tracks total bytes against
+    /// [`Self::class_bytes_cache_cap`] and evicts the oldest entries
+    /// (FIFO) once the cap is hit. Prior behaviour kept every class
+    /// file resident forever (~90 MB on a medium Spring app, 15k
+    /// classes averaging 6 KB each). The default 16 MiB cap covers
+    /// JVMTI agents (re-fetch typically targets recently-defined
+    /// classes) without bounding the heap of an idle process.
     pub class_bytes_cache: FxHashMap<String, Vec<u8>>,
+
+    /// Insertion-order tracker for [`Self::class_bytes_cache`] FIFO
+    /// eviction. Deque front = oldest entry. Entries re-inserted
+    /// (e.g. redefine) are re-pushed at the back: the FIFO ordering
+    /// reflects most-recent-insert, not most-recent-access (a real
+    /// LRU would need touch-on-read, which isn't worth the `&mut self`).
+    class_bytes_cache_fifo: std::collections::VecDeque<String>,
+
+    /// Running total bytes held by [`Self::class_bytes_cache`].
+    class_bytes_cache_size: usize,
+
+    /// Soft cap for the class-bytes cache, in bytes. Default 16 MiB.
+    /// Set to `usize::MAX` to disable eviction (legacy keep-forever).
+    class_bytes_cache_cap: usize,
 
     /// CDS-cached class bytes: class name -> raw .class bytes.
     /// Populated from the CDS archive at startup, checked before classpath delegation.
@@ -809,6 +851,9 @@ impl ClassManager {
             loaded_classes: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             module_registry,
             class_bytes_cache: FxHashMap::with_capacity_and_hasher(128, Default::default()),
+            class_bytes_cache_fifo: std::collections::VecDeque::with_capacity(128),
+            class_bytes_cache_size: 0,
+            class_bytes_cache_cap: DEFAULT_CLASS_BYTES_CACHE_CAP,
             cds_class_cache: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             loading_guard: FxHashSet::default(),
             vtable_descriptors: FxHashMap::with_capacity_and_hasher(256, Default::default()),
@@ -1638,7 +1683,7 @@ impl ClassManager {
         // (§5.3.5#3.b). The `override_name` option (used by hidden
         // classes) bypasses this check because it deliberately mangles
         // the registered name.
-        if options.override_name.is_none() && !name.is_empty() && class_file.this_class != name {
+        if options.override_name.is_none() && !name.is_empty() && &*class_file.this_class != name {
             return Err(VmError::Linkage(LinkageError::NoClassDefFoundError {
                 class_name: format!(
                     "{} (defineClass requested name {} but class file declares {})",
@@ -1652,10 +1697,17 @@ impl ClassManager {
         // failure path. The `allow_redefine` flag (used by WP2.4
         // `redefineClasses`) bypasses this so the instrumentation
         // path can replace bytecode in place.
-        let stored_name_preview = options
+        // `class_file.this_class` is now `Arc<str>` (round 4 reader). To
+        // keep the rest of this function — which previously used `String`
+        // for `stored_name_preview` — working without per-line conversion,
+        // we materialise into `String` here. The cost is one alloc on the
+        // duplicate-define / hidden-collision probe path only; the hot
+        // success path below builds a fresh `Arc<str>` from `class.name`
+        // and never touches this `String` again.
+        let stored_name_preview: String = options
             .override_name
             .clone()
-            .unwrap_or_else(|| class_file.this_class.clone());
+            .unwrap_or_else(|| class_file.this_class.to_string());
         if !options.allow_redefine && !options.hidden {
             // T10.9.E: probe key uses `Arc::from(&str)`. The hot insert path
             // below builds a real `Arc<str>` from `class.name` (the
@@ -1678,9 +1730,11 @@ impl ClassManager {
         // This guard is checked in load_class() before recursive calls.
         self.loading_guard.insert(name.to_string());
 
-        // Recursively load the superclass (uses parent delegation too)
+        // Recursively load the superclass (uses parent delegation too).
+        // `class_file.super_class` is `Option<Arc<str>>`; `load_class` takes
+        // `&str`, so deref through the Arc.
         let superclass_id = match class_file.super_class {
-            Some(ref super_name) => match self.load_class(super_name) {
+            Some(ref super_name) => match self.load_class(&**super_name) {
                 Ok(id) => Some(id),
                 Err(e) => {
                     self.loading_guard.remove(name);
@@ -1690,7 +1744,8 @@ impl ClassManager {
             None => None, // java/lang/Object has no superclass
         };
 
-        // Recursively load all interfaces
+        // Recursively load all interfaces. Each `iface_name` is `&Arc<str>`;
+        // deref to `&str` for `load_class`.
         let interface_ids: Vec<ClassId> = match class_file
             .interfaces
             .iter()
@@ -1716,7 +1771,7 @@ impl ClassManager {
                     && !super_class
                         .permitted_subclasses
                         .iter()
-                        .any(|p| p == &class_file.this_class)
+                        .any(|p| p.as_str() == &*class_file.this_class)
                 {
                     return Err(VmError::Linkage(
                         LinkageError::IncompatibleClassChangeError {
@@ -1735,7 +1790,7 @@ impl ClassManager {
                     && !iface_class
                         .permitted_subclasses
                         .iter()
-                        .any(|p| p == &class_file.this_class)
+                        .any(|p| p.as_str() == &*class_file.this_class)
                 {
                     return Err(VmError::Linkage(
                         LinkageError::IncompatibleClassChangeError {
@@ -1778,204 +1833,149 @@ impl ClassManager {
 
         // Build the runtime Class
         let id = self.class_store.next_id();
-        // SourceFile: inlined here (rather than calling `class_file.source_file()`)
-        // so we can pattern-match through `LazyAttribute::as_decoded()`. All
-        // class-level attributes were force-decoded immediately after parsing,
-        // so `as_decoded()` returns `Some` for every entry.
-        let source_file = class_file.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::SourceFile(name)) => Some(name.clone()),
-            _ => None,
-        });
 
-        // Extract BootstrapMethods attribute (needed for invokedynamic).
-        // This MUST be available before the class is published — see the
-        // `force_decode_all` comment above for the rationale.
-        let bootstrap_methods = class_file
-            .attributes
-            .iter()
-            .find_map(|a| match a.as_decoded() {
-                Some(Attribute::BootstrapMethods(bms)) => Some(bms.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        // Extract RuntimeVisibleAnnotations AND RuntimeInvisibleAnnotations from class-level attributes
+        // Round 4 audit fix (HIGH): single-pass class-attribute extraction.
+        //
+        // The previous code ran ~10 independent `attributes.iter().find_map(...)`
+        // walks (one each for SourceFile, BootstrapMethods, annotations,
+        // Signature, NestHost, NestMembers, Record, PermittedSubclasses,
+        // InnerClasses, EnclosingMethod, Module). For a typical class with N
+        // class-level attributes, that's ~10 × N pattern-match operations and
+        // ~10 × N `as_decoded()` calls on every class load. Folded into a
+        // single iteration here.
+        //
+        // All class-level attributes were force-decoded immediately after
+        // parsing, so `as_decoded()` returns `Some` for every entry.
+        let cp = &class_file.constant_pool;
+        let mut source_file: Option<String> = None;
+        let mut bootstrap_methods = Vec::new();
         let mut annotations = Vec::new();
+        let mut signature: Option<String> = None;
+        let mut nest_host: Option<String> = None;
+        let mut nest_members: Vec<String> = Vec::new();
+        let mut record_components: Vec<RecordComponentInfo> = Vec::new();
+        let mut permitted_subclasses: Vec<String> = Vec::new();
+        let mut inner_classes: Vec<InnerClassEntry> = Vec::new();
+        let mut enclosing_method: Option<EnclosingMethodInfo> = None;
+        let mut module_name_from_attr: Option<String> = None;
         for attr in &class_file.attributes {
             match attr.as_decoded() {
+                Some(Attribute::SourceFile(name)) => {
+                    if source_file.is_none() {
+                        source_file = Some(name.to_string());
+                    }
+                }
+                Some(Attribute::BootstrapMethods(bms)) => {
+                    if bootstrap_methods.is_empty() {
+                        bootstrap_methods = bms.clone();
+                    }
+                }
                 Some(Attribute::RuntimeVisibleAnnotations(anns))
                 | Some(Attribute::RuntimeInvisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
+                Some(Attribute::Signature(s)) => {
+                    if signature.is_none() {
+                        signature = Some(s.to_string());
+                    }
+                }
+                Some(Attribute::NestHost { host_class_index }) => {
+                    if nest_host.is_none() {
+                        nest_host = cp.get_class_name(*host_class_index).map(|s| s.to_string());
+                    }
+                }
+                Some(Attribute::NestMembers { classes }) => {
+                    if nest_members.is_empty() {
+                        nest_members = classes
+                            .iter()
+                            .filter_map(|idx| cp.get_class_name(*idx).map(|s| s.to_string()))
+                            .collect();
+                    }
+                }
+                Some(Attribute::Record(components)) => {
+                    if record_components.is_empty() {
+                        record_components = components
+                            .iter()
+                            .filter_map(|rc| {
+                                let n = cp.get_utf8(rc.name_index)?;
+                                let d = cp.get_utf8(rc.descriptor_index)?;
+                                Some(RecordComponentInfo {
+                                    name: n.to_string(),
+                                    descriptor: d.to_string(),
+                                })
+                            })
+                            .collect();
+                    }
+                }
+                Some(Attribute::PermittedSubclasses { classes }) => {
+                    if permitted_subclasses.is_empty() {
+                        permitted_subclasses = classes
+                            .iter()
+                            .filter_map(|idx| cp.get_class_name(*idx).map(|s| s.to_string()))
+                            .collect();
+                    }
+                }
+                Some(Attribute::InnerClasses(entries)) => {
+                    if inner_classes.is_empty() {
+                        inner_classes = entries
+                            .iter()
+                            .filter_map(|ic| {
+                                let inner =
+                                    cp.get_class_name(ic.inner_class_info_index)?.to_string();
+                                let outer = if ic.outer_class_info_index == 0 {
+                                    String::new()
+                                } else {
+                                    cp.get_class_name(ic.outer_class_info_index)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                let inner_name = if ic.inner_name_index == 0 {
+                                    String::new()
+                                } else {
+                                    cp.get_utf8(ic.inner_name_index).unwrap_or("").to_string()
+                                };
+                                Some(InnerClassEntry {
+                                    inner_class: inner,
+                                    outer_class: outer,
+                                    inner_name,
+                                    access_flags: ic.inner_class_access_flags,
+                                })
+                            })
+                            .collect();
+                    }
+                }
+                Some(Attribute::EnclosingMethod {
+                    class_index,
+                    method_index,
+                }) => {
+                    if enclosing_method.is_none() {
+                        if let Some(class_name) =
+                            cp.get_class_name(*class_index).map(|s| s.to_string())
+                        {
+                            let (method_name, method_descriptor) = if *method_index == 0 {
+                                (String::new(), String::new())
+                            } else {
+                                cp.get_name_and_type(*method_index)
+                                    .map(|(n, d)| (n.to_string(), d.to_string()))
+                                    .unwrap_or_default()
+                            };
+                            enclosing_method = Some(EnclosingMethodInfo {
+                                class_name,
+                                method_name,
+                                method_descriptor,
+                            });
+                        }
+                    }
+                }
+                Some(Attribute::Module { name_index, .. }) => {
+                    if module_name_from_attr.is_none() {
+                        module_name_from_attr =
+                            cp.get_utf8(*name_index).map(|s| s.to_string());
+                    }
+                }
                 _ => {}
             }
         }
-
-        // Extract Signature attribute (JVMS §4.7.9)
-        let signature = class_file.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::Signature(s)) => Some(s.clone()),
-            _ => None,
-        });
-
-        // Extract NestHost attribute (JEP 181, Java 11+)
-        let nest_host = class_file.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::NestHost { host_class_index }) => class_file
-                .constant_pool
-                .get_class_name(*host_class_index)
-                .map(|s| s.to_string()),
-            _ => None,
-        });
-
-        // Extract NestMembers attribute (JEP 181, Java 11+)
-        let nest_members = class_file
-            .attributes
-            .iter()
-            .find_map(|a| match a.as_decoded() {
-                Some(Attribute::NestMembers { classes }) => {
-                    let names: Vec<String> = classes
-                        .iter()
-                        .filter_map(|idx| {
-                            class_file
-                                .constant_pool
-                                .get_class_name(*idx)
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-                    Some(names)
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        // Extract Record attribute (JEP 395, Java 16+)
-        let record_components = class_file
-            .attributes
-            .iter()
-            .find_map(|a| match a.as_decoded() {
-                Some(Attribute::Record(components)) => {
-                    let resolved: Vec<RecordComponentInfo> = components
-                        .iter()
-                        .filter_map(|rc| {
-                            let name = class_file.constant_pool.get_utf8(rc.name_index)?;
-                            let desc = class_file.constant_pool.get_utf8(rc.descriptor_index)?;
-                            Some(RecordComponentInfo {
-                                name: name.to_string(),
-                                descriptor: desc.to_string(),
-                            })
-                        })
-                        .collect();
-                    Some(resolved)
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        // Extract PermittedSubclasses attribute (JEP 409, Java 17+)
-        let permitted_subclasses = class_file
-            .attributes
-            .iter()
-            .find_map(|a| match a.as_decoded() {
-                Some(Attribute::PermittedSubclasses { classes }) => {
-                    let names: Vec<String> = classes
-                        .iter()
-                        .filter_map(|idx| {
-                            class_file
-                                .constant_pool
-                                .get_class_name(*idx)
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-                    Some(names)
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        // Extract InnerClasses attribute (JVMS §4.7.6)
-        let inner_classes = class_file
-            .attributes
-            .iter()
-            .find_map(|a| match a.as_decoded() {
-                Some(Attribute::InnerClasses(entries)) => {
-                    let resolved: Vec<InnerClassEntry> = entries
-                        .iter()
-                        .filter_map(|ic| {
-                            let inner = class_file
-                                .constant_pool
-                                .get_class_name(ic.inner_class_info_index)?
-                                .to_string();
-                            let outer = if ic.outer_class_info_index == 0 {
-                                String::new()
-                            } else {
-                                class_file
-                                    .constant_pool
-                                    .get_class_name(ic.outer_class_info_index)
-                                    .unwrap_or("")
-                                    .to_string()
-                            };
-                            let inner_name = if ic.inner_name_index == 0 {
-                                String::new()
-                            } else {
-                                class_file
-                                    .constant_pool
-                                    .get_utf8(ic.inner_name_index)
-                                    .unwrap_or("")
-                                    .to_string()
-                            };
-                            Some(InnerClassEntry {
-                                inner_class: inner,
-                                outer_class: outer,
-                                inner_name,
-                                access_flags: ic.inner_class_access_flags,
-                            })
-                        })
-                        .collect();
-                    Some(resolved)
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        // Extract EnclosingMethod attribute (JVMS §4.7.7)
-        let enclosing_method = class_file.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::EnclosingMethod {
-                class_index,
-                method_index,
-            }) => {
-                let class_name = class_file
-                    .constant_pool
-                    .get_class_name(*class_index)?
-                    .to_string();
-                let (method_name, method_descriptor) = if *method_index == 0 {
-                    (String::new(), String::new())
-                } else {
-                    class_file
-                        .constant_pool
-                        .get_name_and_type(*method_index)
-                        .map(|(n, d)| (n.to_string(), d.to_string()))
-                        .unwrap_or_default()
-                };
-                Some(EnclosingMethodInfo {
-                    class_name,
-                    method_name,
-                    method_descriptor,
-                })
-            }
-            _ => None,
-        });
-
-        // Extract Module attribute (Java 9+) and register if this is a
-        // module-info class encountered during loading (N1).
-        let module_name_from_attr = class_file.attributes.iter().find_map(|a| {
-            if let Some(Attribute::Module { name_index, .. }) = a.as_decoded() {
-                class_file
-                    .constant_pool
-                    .get_utf8(*name_index)
-                    .map(|s| s.to_string())
-            } else {
-                None
-            }
-        });
 
         // If this class IS a module-info declaration, register it in the module
         // registry (covers module-info.class files loaded lazily during class
@@ -2022,10 +2022,13 @@ impl ClassManager {
         // belt-and-suspenders check here means a probe that re-uses an
         // override_name across calls won't mysteriously fail with
         // duplicate-define on the second call.
-        let mut stored_name = options
+        // Same boundary conversion as `stored_name_preview` above:
+        // `class_file.this_class` is `Arc<str>` but the surrounding code
+        // operates on `String`. Convert once here.
+        let mut stored_name: String = options
             .override_name
             .clone()
-            .unwrap_or_else(|| class_file.this_class.clone());
+            .unwrap_or_else(|| class_file.this_class.to_string());
         if options.hidden {
             // The probe of duplicates must consider the (loader, name)
             // composite key — two hidden classes with the same internal
@@ -2224,7 +2227,11 @@ impl ClassManager {
             }
         }
         self.loaded_classes.insert(key, id);
-        self.class_bytes_cache.insert(name.to_string(), bytes.to_vec());
+        // Route through the FIFO-tracking helper so the byte budget
+        // (`class_bytes_cache_cap`, default 16 MiB) is enforced. Without
+        // this, every classfile would stay resident forever — ~90 MB on
+        // a medium Spring app.
+        self.insert_class_bytes(name.to_string(), bytes.to_vec());
         // WP2.3: persist the per-class skip-verification flag in the side
         // table. The verifier consults `class_skip_bytecode_verification`
         // during link-time so trusted hidden / generated classes
@@ -2404,7 +2411,9 @@ impl ClassManager {
                 Some(VtableMethodSnapshot {
                     class_name: class.name.to_string(),
                     source_file: class.source_file.clone(),
-                    code: code_attr.code.clone(),
+                    // `code_attr.code: Arc<[u8]>` — `.clone()` is a
+                    // refcount bump, not a Vec realloc/memcpy.
+                    code: Arc::clone(&code_attr.code),
                     exception_table: code_attr.exception_table.clone(),
                     max_stack: code_attr.max_stack,
                     max_locals: code_attr.max_locals,
@@ -2420,7 +2429,7 @@ impl ClassManager {
                 Some(VtableMethodSnapshot {
                     class_name: class.name.to_string(),
                     source_file: class.source_file.clone(),
-                    code: Vec::new(),
+                    code: Arc::from([].as_slice()),
                     exception_table: Vec::new(),
                     max_stack: 0,
                     max_locals: 0,
@@ -2803,7 +2812,10 @@ impl ClassManager {
             })?;
 
         // ---- Step 3: name match (always enforced) ----
-        if new_class_file.this_class != existing_name {
+        // `new_class_file.this_class` is `Arc<str>` (round 4 reader),
+        // `existing_name` is `String`. Compare via `&str` to avoid an
+        // intermediate allocation.
+        if &*new_class_file.this_class != existing_name.as_str() {
             return Err(LinkageError::UnsupportedClassRedefinitionError {
                 class_name: existing_name.clone(),
                 message: format!(
@@ -2815,10 +2827,14 @@ impl ClassManager {
 
         // ---- Step 4: structural-equivalence checks (skippable) ----
         if !options.skip_structural_check {
-            // 4a — superclass name match.
-            let new_super_name = new_class_file
+            // 4a — superclass name match. `super_class` is now
+            // `Option<Arc<str>>`; materialise into the `String` baseline
+            // the existing comparison + format expects (this path runs
+            // only on JVMTI redefine, not bootstrap).
+            let new_super_name: String = new_class_file
                 .super_class
-                .clone()
+                .as_ref()
+                .map(|s| s.to_string())
                 .unwrap_or_default();
             if new_super_name != existing_super_name {
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
@@ -2854,7 +2870,8 @@ impl ClassManager {
                 .zip(new_class_file.interfaces.iter())
                 .enumerate()
             {
-                if old != new {
+                // `old: &String`, `new: &Arc<str>` — compare via &str.
+                if old.as_str() != &**new {
                     return Err(LinkageError::UnsupportedClassRedefinitionError {
                         class_name: existing_name.clone(),
                         message: format!(
@@ -2946,12 +2963,18 @@ impl ClassManager {
                     if i >= new_class_file.methods.len() {
                         break;
                     }
-                    let old_code = m.code().map(|c| c.code.clone()).unwrap_or_default();
-                    let new_code = new_class_file.methods[i]
+                    // `c.code: Arc<[u8]>` — clone is a refcount bump. We
+                    // compare via `&[u8]` so empty fallback is just an
+                    // empty slice without an extra alloc.
+                    let old_code: Arc<[u8]> = m
                         .code()
-                        .map(|c| c.code.clone())
-                        .unwrap_or_default();
-                    if old_code != new_code {
+                        .map(|c| Arc::clone(&c.code))
+                        .unwrap_or_else(|| Arc::from([].as_slice()));
+                    let new_code: Arc<[u8]> = new_class_file.methods[i]
+                        .code()
+                        .map(|c| Arc::clone(&c.code))
+                        .unwrap_or_else(|| Arc::from([].as_slice()));
+                    if &*old_code != &*new_code {
                         debug!(
                             class = %existing_name,
                             method = %m.name,
@@ -2993,7 +3016,7 @@ impl ClassManager {
             .unwrap_or_default();
         // Source file may have changed if the compiler regenerated it.
         let new_source_file = new_attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::SourceFile(name)) => Some(name.clone()),
+            Some(Attribute::SourceFile(name)) => Some(name.to_string()),
             _ => None,
         });
 
@@ -3154,9 +3177,10 @@ impl ClassManager {
 
         // Update the cached class bytes so subsequent
         // `getResourceAsStream` lookups + later redefines see the new
-        // bytes as their "old bytes".
-        self.class_bytes_cache
-            .insert(existing_name.clone(), effective_new_bytes);
+        // bytes as their "old bytes".  Route through the FIFO helper:
+        // a redefine bumps the entry to the most-recently-used end of
+        // the deque so it stays in cache.
+        self.insert_class_bytes(existing_name.clone(), effective_new_bytes);
 
         // ---- Step 6: rebuild + re-install vtable descriptor snapshots ----
         //
@@ -3224,6 +3248,78 @@ impl ClassManager {
         self.application.class_path().list_class_names()
     }
 
+    /// Insert raw class bytes into [`Self::class_bytes_cache`], evicting
+    /// older entries (FIFO) once the cumulative byte budget exceeds
+    /// [`Self::class_bytes_cache_cap`].
+    ///
+    /// Re-inserts of the same `name` (e.g. JVMTI redefine) update the
+    /// size accounting and move the entry to the tail of the FIFO so
+    /// it is the *last* candidate for eviction — agents that redefine
+    /// hot classes keep them in cache.
+    pub fn insert_class_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        let new_size = bytes.len();
+        // If we already had an entry for this name, subtract its size
+        // and remove it from the FIFO before re-appending.
+        if let Some(prev) = self.class_bytes_cache.remove(&name) {
+            self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_sub(prev.len());
+            // Remove the existing FIFO entry (linear scan — the deque is
+            // small relative to total bytes; a real LRU would need a
+            // doubly-linked list. Acceptable here because redefines are
+            // rare next to first-loads).
+            if let Some(pos) = self.class_bytes_cache_fifo.iter().position(|n| n == &name) {
+                self.class_bytes_cache_fifo.remove(pos);
+            }
+        }
+        self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_add(new_size);
+        self.class_bytes_cache.insert(name.clone(), bytes);
+        self.class_bytes_cache_fifo.push_back(name);
+
+        // Evict oldest entries until we fit under the cap. We always
+        // keep at least the most-recently-inserted entry, so the cap
+        // is *soft* — a single class larger than the cap stays cached.
+        while self.class_bytes_cache_size > self.class_bytes_cache_cap
+            && self.class_bytes_cache_fifo.len() > 1
+        {
+            let victim = match self.class_bytes_cache_fifo.pop_front() {
+                Some(v) => v,
+                None => break,
+            };
+            if let Some(b) = self.class_bytes_cache.remove(&victim) {
+                self.class_bytes_cache_size =
+                    self.class_bytes_cache_size.saturating_sub(b.len());
+            }
+        }
+    }
+
+    /// Set the soft byte cap for [`Self::class_bytes_cache`]. Triggers
+    /// immediate FIFO eviction if the new cap is smaller than the
+    /// current cache size. Use `usize::MAX` to disable eviction.
+    pub fn set_class_bytes_cache_cap(&mut self, cap: usize) {
+        self.class_bytes_cache_cap = cap;
+        while self.class_bytes_cache_size > self.class_bytes_cache_cap
+            && self.class_bytes_cache_fifo.len() > 1
+        {
+            let victim = match self.class_bytes_cache_fifo.pop_front() {
+                Some(v) => v,
+                None => break,
+            };
+            if let Some(b) = self.class_bytes_cache.remove(&victim) {
+                self.class_bytes_cache_size =
+                    self.class_bytes_cache_size.saturating_sub(b.len());
+            }
+        }
+    }
+
+    /// Current total bytes held by [`Self::class_bytes_cache`].
+    pub fn class_bytes_cache_size(&self) -> usize {
+        self.class_bytes_cache_size
+    }
+
+    /// Current soft cap for [`Self::class_bytes_cache`].
+    pub fn class_bytes_cache_cap(&self) -> usize {
+        self.class_bytes_cache_cap
+    }
+
     /// Dynamically extend the application classpath at runtime.
     ///
     /// Called by `URLClassLoader` when new URLs are registered. Each path is
@@ -3235,9 +3331,19 @@ impl ClassManager {
     }
 
     /// Find a class by name. Searches all loaders in priority order
-    /// (bootstrap → extension → application).
+    /// (bootstrap → extension → application), then any user-defined
+    /// loaders that have been observed in `loaded_classes`.
     ///
     /// Returns `None` if the class hasn't been loaded by any loader.
+    ///
+    /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
+    /// entry in `loaded_classes` linearly for each key (O(n · keys)).
+    /// With the (`ClassLoaderId`, `Arc<str>`) keying we already have,
+    /// the user-defined-loader extension is collected upfront and then
+    /// probed by exact key — O(loaders · keys) hash lookups instead of
+    /// O(entries · keys). On a Spring app with ~15k loaded classes that
+    /// turns every miss from ~15k string compares into a handful of
+    /// hash probes.
     pub fn find_class_by_name(&self, name: &str) -> Option<ClassId> {
         let slash = if name.contains('.') && !name.contains('/') {
             name.replace('.', "/")
@@ -3251,16 +3357,19 @@ impl ClassManager {
             vec![slash, dot]
         };
 
+        // Built-in loaders probed first (parent-delegation order).
+        const BUILTIN_LOADERS: &[ClassLoaderId] = &[
+            ClassLoaderId::Bootstrap,
+            ClassLoaderId::Extension,
+            ClassLoaderId::Application,
+        ];
+
         for key in &keys {
             // T10.9.E: one `Arc::from(&str)` per (key, loader-triple) probe
             // hoisted outside the loader loop so we don't allocate three
             // times. Same allocation cost as the prior `key.clone()`.
             let arc_key: Arc<str> = Arc::from(key.as_str());
-            for loader_id in &[
-                ClassLoaderId::Bootstrap,
-                ClassLoaderId::Extension,
-                ClassLoaderId::Application,
-            ] {
+            for loader_id in BUILTIN_LOADERS {
                 if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
                     if let Some(class) = self.get_class(id) {
                         if class.hidden {
@@ -3271,17 +3380,35 @@ impl ClassManager {
                 }
             }
         }
+
+        // Round 4 audit fix: user-defined loaders. Instead of iterating
+        // every (loader, name) entry (~15k on a Spring app), collect the
+        // distinct user-defined loader ids ONCE and probe each (loader,
+        // arc_key) by exact key. This still touches every entry once
+        // overall, but each subsequent miss is then O(loaders) hash
+        // probes per key rather than O(entries).
+        //
+        // We materialise the set lazily — if the early-return above
+        // already found the class, the user-defined scan never runs.
+        let user_loaders: FxHashSet<ClassLoaderId> = self
+            .loaded_classes
+            .keys()
+            .filter_map(|(loader_id, _)| match loader_id {
+                ClassLoaderId::UserDefined(_) => Some(*loader_id),
+                _ => None,
+            })
+            .collect();
         for key in &keys {
-            for ((_loader_id, class_name), &id) in self.loaded_classes.iter() {
-                if &**class_name != key.as_str() {
-                    continue;
-                }
-                if let Some(class) = self.get_class(id) {
-                    if class.hidden {
-                        continue;
+            let arc_key: Arc<str> = Arc::from(key.as_str());
+            for loader_id in &user_loaders {
+                if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
+                    if let Some(class) = self.get_class(id) {
+                        if class.hidden {
+                            continue;
+                        }
                     }
+                    return Some(id);
                 }
-                return Some(id);
             }
         }
         None
@@ -3738,14 +3865,15 @@ impl ClassManager {
             },
         )?;
 
-        // Load superclass (may already be loaded)
+        // Load superclass (may already be loaded). `super_class` is now
+        // `Option<Arc<str>>`; deref for the `&str` parameter.
         self.loading_guard.insert(name.to_string());
         let superclass_id = match class_file.super_class {
-            Some(ref super_name) => self.load_class(super_name).ok(),
+            Some(ref super_name) => self.load_class(&**super_name).ok(),
             None => None,
         };
 
-        // Load interfaces
+        // Load interfaces. `iface_name: &Arc<str>` derefs to `&str`.
         let interface_ids: Vec<ClassId> = class_file
             .interfaces
             .iter()
@@ -3782,8 +3910,10 @@ impl ClassManager {
         // the `force_decode_all` call above, so `as_decoded()` returns
         // `Some` for every attribute and the `_ => None` arm only fires for
         // attributes of a different kind.
+        // `Attribute::SourceFile(Arc<str>)` (round 4 reader) — materialise
+        // into the `Option<String>` shape `class.source_file` expects.
         let source_file = class_file.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::SourceFile(name)) => Some(name.clone()),
+            Some(Attribute::SourceFile(name)) => Some(name.to_string()),
             _ => None,
         });
 
@@ -3809,9 +3939,10 @@ impl ClassManager {
             }
         }
 
-        // Extract Signature
+        // Extract Signature — `Attribute::Signature(Arc<str>)`; convert
+        // to the `Option<String>` shape `class.signature` expects.
         let signature = class_file.attributes.iter().find_map(|a| match a.as_decoded() {
-            Some(Attribute::Signature(s)) => Some(s.clone()),
+            Some(Attribute::Signature(s)) => Some(s.to_string()),
             _ => None,
         });
 
@@ -3855,9 +3986,8 @@ impl ClassManager {
             }
         }
 
-        // Cache the class bytes
-        self.class_bytes_cache
-            .insert(name.to_string(), bytes.to_vec());
+        // Cache the class bytes (FIFO-bounded helper).
+        self.insert_class_bytes(name.to_string(), bytes.to_vec());
 
         Ok(())
     }
@@ -7124,7 +7254,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 4,
-                code: vec![0x01, 0xb1], // aconst_null; return
+                code: Arc::from([0x01u8, 0xb1].as_slice()), // aconst_null; return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -7173,7 +7303,7 @@ mod tests {
             .expect("concrete method must carry dispatch snapshot");
         assert_eq!(dispatch.max_stack, 3);
         assert_eq!(dispatch.max_locals, 4);
-        assert_eq!(dispatch.code, vec![0x01, 0xb1]);
+        assert_eq!(&*dispatch.code, &[0x01u8, 0xb1][..]);
         assert_eq!(dispatch.num_params, 1); // (I) takes one slot
         assert!(!dispatch.is_native);
         assert_eq!(&dispatch.class_name, "pkg/Dispatch");

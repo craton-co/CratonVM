@@ -19,6 +19,10 @@ const WATCHDOG_GRACE_SEC: u64 = 3;
 const DEFAULT_JAVA_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// Maximum depth of `Throwable.getCause()` chain we render before
 /// stopping (defensive against malicious or pathological cycles).
+///
+/// AUDIT 2026-05-17 (Fix 5): also referenced by the rendering loop
+/// below — previously the const was defined but the loop hard-coded
+/// `0..8`, making the constant a stale documentation hazard.
 const MAX_CAUSE_CHAIN_DEPTH: usize = 8;
 
 /// RustJVM — A Java Virtual Machine implemented in Rust.
@@ -287,14 +291,18 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
             out.push(entry);
             continue;
         };
+        // AUDIT 2026-05-17 (Fix 4): lowercase each candidate file name
+        // exactly once per iteration. The previous loop allocated TWO
+        // lowercase Strings per JAR (one for `starts_with`, one for the
+        // `!= file_name` check) which was hot on classpath entries with
+        // hundreds of sibling jars.
         let mut substitutes: Vec<String> = Vec::new();
         for dirent in reader.flatten() {
             let p = dirent.path();
             if p.extension().map(|e| e == "jar").unwrap_or(false) {
                 if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    if name.to_ascii_lowercase().starts_with(split_prefix)
-                        && name.to_ascii_lowercase() != file_name
-                    {
+                    let lower = name.to_ascii_lowercase();
+                    if lower.starts_with(split_prefix) && lower != file_name {
                         substitutes.push(p.to_string_lossy().into_owned());
                     }
                 }
@@ -323,23 +331,29 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
 /// Surefire / tooling often invokes `java -classpath —...` and `java -jar —...`.
 /// Our clap schema uses `--classpath` / `--jar`; bare `-classpath` used to be
 /// misparsed as `-c` with value `lasspath`, breaking Maven test runs.
-fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
+fn normalize_java_launcher_argv(mut args: Vec<String>) -> Vec<String> {
     if args.is_empty() {
         return args;
     }
-    let mut out = vec![args[0].clone()];
+    // AUDIT 2026-05-17 (Fix 6): `args` is now consumed by value (it
+    // already was, but `args[i].clone()` defeated that). Move strings
+    // out of the input vec with `std::mem::take` — the trailing `[i]`
+    // slot is overwritten with an empty `String`, which we never look
+    // at again because `i` only ever advances.
+    let mut out: Vec<String> = Vec::with_capacity(args.len() + 2);
+    out.push(std::mem::take(&mut args[0]));
     let mut i = 1usize;
     let mut past_separator = false;
     while i < args.len() {
         let a = args[i].as_str();
         if past_separator {
-            out.push(args[i].clone());
+            out.push(std::mem::take(&mut args[i]));
             i += 1;
             continue;
         }
         if a == "--" {
             past_separator = true;
-            out.push(args[i].clone());
+            out.push(std::mem::take(&mut args[i]));
             i += 1;
             continue;
         }
@@ -350,20 +364,22 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         if a == "-mp" {
             out.push("--".into());
             past_separator = true;
-            out.push(args[i].clone());
+            out.push(std::mem::take(&mut args[i]));
             i += 1;
             continue;
         }
         if a == "-jar" && i + 1 < args.len() {
             out.push("--jar".into());
-            out.push(args[i + 1].clone());
+            out.push(std::mem::take(&mut args[i + 1]));
             i += 2;
         } else if (a == "-classpath" || a == "-cp") && i + 1 < args.len() {
             out.push("--classpath".into());
-            out.push(args[i + 1].clone());
+            out.push(std::mem::take(&mut args[i + 1]));
             i += 2;
         } else if let Some(rest) = a.strip_prefix("-classpath=") {
             out.push("--classpath".into());
+            // Owned substring — there is no zero-copy path here without
+            // restructuring `args`.
             out.push(rest.to_string());
             i += 1;
         } else if let Some(rest) = a.strip_prefix("-cp=") {
@@ -371,7 +387,7 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             out.push(rest.to_string());
             i += 1;
         } else {
-            out.push(args[i].clone());
+            out.push(std::mem::take(&mut args[i]));
             i += 1;
         }
     }
@@ -1379,7 +1395,7 @@ fn run() -> Result<()> {
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
             let mut prefix = "Exception in thread \"main\"";
-            for depth in 0..8 {
+            for _depth in 0..MAX_CAUSE_CHAIN_DEPTH {
                 let cid = vm.shared.heap.class_id_of(cur);
                 let cname = vm.shared.class_manager.read()
                     .get_class(cid).map(|c| c.name.to_string())
@@ -1613,7 +1629,6 @@ fn run() -> Result<()> {
                     prefix = "Caused by:";
                     continue;
                 }
-                let _ = depth;
                 break;
             }
             let had_caused_by = lines.iter().any(|l| l.starts_with("Caused by:"));

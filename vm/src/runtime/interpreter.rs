@@ -2194,7 +2194,17 @@ pub fn execute(
                         _ => Ok(None),
                     };
                     }
-                    // Deoptimized — fall through to interpreter execution
+                    // Deoptimized — check for pending NPE from a JIT array helper
+                    // (`jit_iaload` / `jit_aaload` / `jit_arraylength` on a null
+                    // array reference) before falling through to interpreter
+                    // re-execution. Previously these helpers swallowed the null
+                    // silently, masking real null-deref bugs.
+                    if crate::jit::helpers::take_jit_pending_npe() {
+                        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                            RuntimeError::NullPointerException { message: None },
+                        )));
+                    }
+                    // Otherwise fall through to interpreter execution.
                     }
                 }
             } // end else (jit_early_exception.is_none())
@@ -2228,7 +2238,17 @@ pub fn execute(
         method_name.to_string(),
         method_descriptor.to_string(),
         source_file,
-        code_attr.code,
+        // `code_attr.code: Arc<[u8]>` (round 4 reader). `Frame::new`
+        // still owns the legacy `Vec<u8>` shape because dozens of
+        // synthetic-frame callers (vm_init, virtual_threads, gc roots,
+        // jvmti probes, JNI bridges) construct Vecs directly; the lone
+        // bytecode-from-class path materialises into a Vec here. The
+        // upstream allocation savings from round 4 are realised inside
+        // the class reader (no per-method `to_vec()` on parse) and
+        // along the vtable snapshot path (`Arc::clone` for the
+        // dispatch snapshot). A follow-up round can flip Frame::new to
+        // take `&[u8]` once those synthetic callers are audited.
+        code_attr.code.to_vec(),
         code_attr.exception_table,
         code_attr.max_stack,
         code_attr.max_locals,
@@ -2271,7 +2291,22 @@ pub fn execute(
         }
     }
 
-    // Execute (with panic protection for stack underflow/overflow)
+    // Execute (with panic protection for stack underflow/overflow).
+    //
+    // NOTE(round-4-wave-3): the per-method `catch_unwind` here is load-bearing
+    // and intentionally retained. The interpreter's super-instruction fast
+    // path uses `pop_unchecked` / `set_local_unchecked` (see `frame.rs`
+    // `class_disables_interp_fast_path`) which panic on stack-shape mismatches
+    // that some JDK / Spring bytecode legitimately produces. Without this
+    // catch_unwind, those panics would propagate past the JIT entry frame and
+    // abort the process under the Windows SEH / signal-handler interop in
+    // `runtime/signals.rs` (the signal handler converts SIGSEGV / SIGFPE via
+    // `catch_unwind`, but a Rust panic crossing the JIT-call boundary is not
+    // catchable by the OS unwinder). The narrowed fast-path gate in
+    // `class_disables_interp_fast_path` shrinks the panic-prone surface; the
+    // `catch_unwind` here is the final guard. The ~10 ns setup cost is
+    // amortized over the entire `execute_frame` invocation — hundreds to
+    // thousands of bytecodes — not per-bytecode.
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         execute_frame(shared, thread)
     })) {
@@ -11087,6 +11122,13 @@ fn try_osr(
         // fall back to the interpreter which will handle the exception.
         return None;
     }
+    // Clear any pending NPE / AIOOBE from a JIT array helper. The OSR fast
+    // path cannot route them directly; falling back to the interpreter
+    // (return None) re-executes from the interpreter PC, which will issue
+    // the same null-deref / oob access and surface the exception through
+    // the interpreter's own throw path.
+    let _ = crate::jit::helpers::take_jit_pending_npe();
+    let _ = crate::jit::helpers::take_jit_pending_aioobe();
     let result_i64 = match result_i64 {
         Ok(Some(v)) => v,
         Ok(None) => return None,
@@ -12276,6 +12318,19 @@ fn execute_jit_call(
                 RuntimeError::ArrayIndexOutOfBoundsException {
                     index: index as i32, // Cast: bounds-check index
                 },
+            )));
+        }
+        // Check for pending NPE from a JIT array helper. Same shape as the
+        // AIOOBE branch above — without this, `jit_iaload` / `jit_aaload` /
+        // `jit_arraylength` on null silently fall back to interpreter
+        // re-execution, which then re-issues the null deref (caught
+        // correctly there) — but in the meantime any side effects from the
+        // JIT-compiled prologue have already happened. Surfacing the NPE
+        // here matches the AIOOBE protocol and keeps the JIT/interpreter
+        // boundary observably JLS-correct.
+        if crate::jit::helpers::take_jit_pending_npe() {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { message: None },
             )));
         }
         return Ok(CachedCallResult::CacheMiss);

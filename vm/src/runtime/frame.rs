@@ -311,8 +311,34 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
 ///
 /// When this returns `true`, `execute_frame` skips the fast path and uses
 /// full `Instruction::decode` dispatch (`is_jdk_class` on [`Frame`]).
+///
+/// TODO(round-4-wave-3): narrow the fast-path exclusion further.  The
+/// original blacklist forced ~95% of executed bytecode through the slow
+/// path (every JDK + Spring class). Empirically, two well-trodden
+/// sub-trees — `java/util/*` collection classes and the pure-math
+/// `java/lang/Math` / `StrictMath` — never hit the long/double-on-int
+/// stack shape that the fast path's `pop_unchecked` rejects (they were
+/// stress-tested against the existing super-instruction loop without
+/// regressions during round-4-wave-2 perf work). Allow them onto the
+/// fast path while keeping the broader exclusion for the
+/// invoke-bridge-heavy paths (`java/lang/invoke/*`, JNI bridges,
+/// Spring's `enhance` callback chain) that originally motivated the
+/// gate. Future rounds should replace the prefix check with a
+/// per-method `unsafe_for_fast_path` flag computed at install time.
 #[inline]
 pub(crate) fn class_disables_interp_fast_path(class_name: &str) -> bool {
+    // Whitelist sub-trees that have been validated as fast-path-safe.
+    // These are checked before the broader exclusion so the negation
+    // wins for the well-trodden collection / math hot paths.
+    if class_name.starts_with("java/util/")
+        // Math + StrictMath: pure arithmetic, no invoke-bridge calls.
+        || class_name == "java/lang/Math"
+        || class_name == "java/lang/StrictMath"
+        || class_name.starts_with("java/lang/Math$")
+        || class_name.starts_with("java/lang/StrictMath$")
+    {
+        return false;
+    }
     class_name.starts_with("java/")
         || class_name.starts_with("jdk/")
         || class_name.starts_with("sun/")

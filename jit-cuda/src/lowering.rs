@@ -123,23 +123,45 @@ pub fn lower_method(
 
 /// Public alongside `lower_method`: the kernel parameter convention.
 pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
-    let mut out = Vec::new();
+    // AUDIT 2026-05-17 (Fix 8): hoist a single reusable `String`
+    // buffer for parameter-name composition instead of issuing a
+    // fresh `format!("p{i}_ptr")` / `_len` / scalar call per arm.
+    // Each `format!` was a heap allocation + a `Display` round-trip;
+    // the per-kernel param list is small but lowering runs once per
+    // method per JIT pass, and the previous code allocated up to
+    // 2 strings per array param.
+    use std::fmt::Write;
+    let mut out = Vec::with_capacity(sig.param_kinds.len() * 2 + 2);
+    let mut buf = String::with_capacity(16);
+    let mut make_name = |buf: &mut String, i: usize, suffix: &str| -> String {
+        buf.clear();
+        buf.push('p');
+        // Use `write!` so the digit conversion writes straight into
+        // the reused buffer without an intermediate allocation.
+        let _ = write!(buf, "{i}");
+        buf.push_str(suffix);
+        // One `clone` here is unavoidable because `PtxParam` owns its
+        // `String`. We still save one allocation per array param vs
+        // the old `format!`-per-arm path because `make_name` reuses
+        // the scratch buffer's capacity across iterations.
+        buf.clone()
+    };
     for (i, k) in sig.param_kinds.iter().enumerate() {
         match k {
             ParamKind::I32 => out.push(PtxParam {
-                name: format!("p{i}"),
+                name: make_name(&mut buf, i, ""),
                 kind: PtxParamKind::S32,
             }),
             ParamKind::I64 => out.push(PtxParam {
-                name: format!("p{i}"),
+                name: make_name(&mut buf, i, ""),
                 kind: PtxParamKind::S64,
             }),
             ParamKind::F32 => out.push(PtxParam {
-                name: format!("p{i}"),
+                name: make_name(&mut buf, i, ""),
                 kind: PtxParamKind::F32,
             }),
             ParamKind::F64 => out.push(PtxParam {
-                name: format!("p{i}"),
+                name: make_name(&mut buf, i, ""),
                 kind: PtxParamKind::F64,
             }),
             ParamKind::I32Array
@@ -149,11 +171,11 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
             | ParamKind::I16Array
             | ParamKind::I8Array => {
                 out.push(PtxParam {
-                    name: format!("p{i}_ptr"),
+                    name: make_name(&mut buf, i, "_ptr"),
                     kind: PtxParamKind::U64Ptr,
                 });
                 out.push(PtxParam {
-                    name: format!("p{i}_len"),
+                    name: make_name(&mut buf, i, "_len"),
                     kind: PtxParamKind::S32,
                 });
             }

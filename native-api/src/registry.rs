@@ -599,7 +599,10 @@ pub trait NativeContext {
 
     /// Emit a `jdk.VirtualThreadPinned` JFR event for the current thread.
     /// Called when a pinned virtual thread is about to block its carrier.
-    fn emit_virtual_thread_pinned_jfr(&mut self, _reason: &str) {}
+    ///
+    /// Round-4: `reason` is `&'static str` (JEP 491 pin-reason taxonomy:
+    /// "Synchronized", "Native", "Thread.sleep while pinned", ...).
+    fn emit_virtual_thread_pinned_jfr(&mut self, _reason: &'static str) {}
 
     /// Get the number of alive threads in the VM.
     fn active_thread_count(&self) -> i32;
@@ -1421,6 +1424,11 @@ pub struct NativeMethodRegistry {
     /// `FxHashMap<u64, String>` reverse map which was inserted into on
     /// every `register()` purely to enable collision detection.
     registrations: Vec<(Box<str>, Box<str>, Box<str>)>,
+    /// AUDIT 2026-05-17 (Fix 5): O(1) index keyed by the 128-bit hash
+    /// of `(method_name, descriptor)` (class portion omitted). Used by
+    /// `find_by_method_descriptor` to avoid the O(N) linear scan over
+    /// `registrations`. Built incrementally on every `register()`.
+    by_method_desc: FxHashMap<(u64, u64), NativeCallback>,
 }
 
 impl NativeMethodRegistry {
@@ -1428,6 +1436,7 @@ impl NativeMethodRegistry {
         Self {
             methods: FxHashMap::default(),
             registrations: Vec::new(),
+            by_method_desc: FxHashMap::default(),
         }
     }
 
@@ -1465,6 +1474,12 @@ impl NativeMethodRegistry {
             method_name.into(),
             descriptor.into(),
         ));
+        // AUDIT 2026-05-17 (Fix 5): also populate the class-agnostic
+        // (method, descriptor) index used by `find_by_method_descriptor`.
+        // Reuse `native_method_hash` with an empty class string so the
+        // key is independent of the registering class.
+        let md_key = native_method_hash("", method_name, descriptor);
+        self.by_method_desc.insert(md_key, callback);
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
         // method names. Cheap one-time write per registration.
@@ -1472,7 +1487,8 @@ impl NativeMethodRegistry {
         crate::native_ring::register_name(callback as usize, &triple);
     }
 
-    /// Look up a native method implementation (zero allocation).
+    /// Look up a native method implementation (zero allocation on the
+    /// fast path; zero allocation on a miss with a clean descriptor).
     #[inline]
     pub fn find(
         &self,
@@ -1485,44 +1501,97 @@ impl NativeMethodRegistry {
             return Some(cb);
         }
 
-        // Compatibility lookup path for descriptor drift observed in
-        // real-world app boots:
-        // - accidental control/whitespace suffix/prefix in descriptors
-        // - object return descriptors missing trailing ';'
-        // We keep this as a miss-only fallback to preserve the fast path.
-        let mut variants: Vec<String> = Vec::with_capacity(4);
+        // AUDIT 2026-05-17 (Fix 4): the compatibility-variants path was
+        // previously building a `Vec<String>` on every miss, even for
+        // perfectly-formed descriptors that needed no rewriting (which
+        // is the common case — a real miss is usually "this native is
+        // not implemented", not "the descriptor needed a fixup"). Now
+        // we short-circuit: only walk the variant logic when the
+        // descriptor *actually* has a quirk worth rewriting. Clean
+        // descriptors return `None` with zero allocation.
+        Self::find_with_descriptor_quirks(self, class_name, method_name, descriptor)
+    }
+
+    /// Cold path of `find`: try compatibility-rewritten descriptor
+    /// variants. Returns `None` if the descriptor is already clean
+    /// (no whitespace, no NUL, no `\r\n`, and any `L…` return type
+    /// already correctly terminated with `;`).
+    #[cold]
+    #[inline(never)]
+    fn find_with_descriptor_quirks(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeCallback> {
+        // Cheap precheck: if the descriptor has none of the quirks the
+        // rewrites target, there are no variants to try — bail before
+        // touching the allocator.
+        let has_whitespace_or_nul = descriptor
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'\0');
+        let object_return_quirk = match descriptor.rfind(')') {
+            Some(rparen) => {
+                let ret = &descriptor[rparen + 1..];
+                ret.starts_with('L') && !ret.ends_with(';')
+            }
+            None => false,
+        };
+        if !has_whitespace_or_nul && !object_return_quirk {
+            return None;
+        }
+
+        // At most 3 candidates (trimmed, no_newlines, return-type fixup).
+        // Stash them inline in a small fixed-size array — no Vec growth.
+        let mut variants: [Option<String>; 3] = [None, None, None];
+        let mut n_variants = 0usize;
 
         let trimmed = descriptor.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
         if trimmed != descriptor {
-            variants.push(trimmed.to_string());
+            variants[n_variants] = Some(trimmed.to_string());
+            n_variants += 1;
         }
 
         let no_newlines = trimmed.replace(['\r', '\n'], "");
-        if no_newlines != descriptor && !variants.iter().any(|v| v == &no_newlines) {
-            variants.push(no_newlines.clone());
+        if no_newlines != descriptor
+            && !variants
+                .iter()
+                .take(n_variants)
+                .any(|v| v.as_deref() == Some(no_newlines.as_str()))
+        {
+            variants[n_variants] = Some(no_newlines.clone());
+            n_variants += 1;
         }
 
         for base in [trimmed, no_newlines.as_str()] {
             if let Some(rparen) = base.rfind(')') {
                 let (args_part, ret_part) = base.split_at(rparen + 1);
                 if ret_part.starts_with('L') {
-                    if !ret_part.ends_with(';') {
-                        let fixed = format!("{args_part}{ret_part};");
-                        if fixed != descriptor && !variants.iter().any(|v| v == &fixed) {
-                            variants.push(fixed);
-                        }
-                    } else if let Some(stripped) = ret_part.strip_suffix(';') {
-                        let fixed = format!("{args_part}{stripped}");
-                        if fixed != descriptor && !variants.iter().any(|v| v == &fixed) {
-                            variants.push(fixed);
+                    let candidate = if !ret_part.ends_with(';') {
+                        Some(format!("{args_part}{ret_part};"))
+                    } else {
+                        ret_part
+                            .strip_suffix(';')
+                            .map(|stripped| format!("{args_part}{stripped}"))
+                    };
+                    if let Some(cand) = candidate {
+                        if cand != descriptor
+                            && n_variants < variants.len()
+                            && !variants
+                                .iter()
+                                .take(n_variants)
+                                .any(|v| v.as_deref() == Some(cand.as_str()))
+                        {
+                            variants[n_variants] = Some(cand);
+                            n_variants += 1;
                         }
                     }
                 }
             }
         }
 
-        for candidate in variants {
-            let k = native_method_hash(class_name, method_name, &candidate);
+        for slot in variants.iter().take(n_variants).filter_map(|s| s.as_deref()) {
+            let k = native_method_hash(class_name, method_name, slot);
             if let Some(cb) = self.methods.get(&k).copied() {
                 return Some(cb);
             }
@@ -1603,19 +1672,12 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
-        // T19.E (post-merge): scan the registrations log instead of the
-        // old `keys` reverse map (removed when the registry switched to
-        // 128-bit composite hash keys). Compare the (method, descriptor)
-        // tuple directly — no string concatenation needed.
-        for (class, method, desc) in self.registrations.iter() {
-            if &**method == method_name && &**desc == descriptor {
-                let key = native_method_hash(class, method, desc);
-                if let Some(cb) = self.methods.get(&key).copied() {
-                    return Some(cb);
-                }
-            }
-        }
-        None
+        // AUDIT 2026-05-17 (Fix 5): O(1) lookup via the class-agnostic
+        // `by_method_desc` index built at registration time. The index
+        // is keyed by `native_method_hash("", method, descriptor)` so the
+        // class portion is masked out.
+        let key = native_method_hash("", method_name, descriptor);
+        self.by_method_desc.get(&key).copied()
     }
 }
 
