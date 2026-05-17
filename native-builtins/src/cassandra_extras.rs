@@ -16,6 +16,9 @@ fn cassandra_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 }
 
 pub fn register_cassandra_stubs(registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_CASSANDRA_REAL").as_deref() == Ok("1") {
+        return;
+    }
     // Primary boot entry.
     registry.register(
         "org/apache/cassandra/service/CassandraDaemon",
@@ -40,6 +43,18 @@ pub fn register_cassandra_stubs(registry: &mut NativeMethodRegistry) {
     );
 }
 
-// TODO(orchestrator): wire `cassandra_extras::register_cassandra_stubs(registry);`
-// into `register_essential_natives` in lib.rs alongside other real-JDK app
-// shims (e.g., `register_jboss_extras`, `register_es_stubs`).
+// Wired in `lib.rs::register_essential_natives` alongside other real-JDK
+// app shims (e.g., `register_jboss_extras`, `register_es_stubs`).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the registration function exists, takes a
+    /// `&mut NativeMethodRegistry`, and doesn't panic.
+    #[test]
+    fn register_cassandra_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_cassandra_stubs(&mut r);
+    }
+}

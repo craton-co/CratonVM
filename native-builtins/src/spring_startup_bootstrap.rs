@@ -2364,3 +2364,109 @@ fn ccpp_process_config_bean_definitions_noop(
     );
     Ok(None)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests — smoke checks that the S-SB registration helper wires up every
+// expected (class, method, descriptor) triple. These pin the public surface
+// so a future refactor that drops a `registry.register(...)` call can't
+// silently regress Spring-app boot.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustjvm_native_api::NativeMethodRegistry;
+
+    fn build_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register(&mut r);
+        r
+    }
+
+    #[test]
+    fn register_is_callable_on_fresh_registry() {
+        // Smoke test: registration helper must run to completion against an
+        // empty registry without panic. Equivalent to lib.rs's wiring path.
+        let mut r = NativeMethodRegistry::new();
+        register(&mut r);
+    }
+
+    #[test]
+    fn application_startup_intercepts_registered() {
+        let r = build_registry();
+        assert!(r
+            .find(
+                ABSTRACT_CTX,
+                "getApplicationStartup",
+                "()Lorg/springframework/core/metrics/ApplicationStartup;",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                DEF_STARTUP,
+                "start",
+                "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn bean_factory_intercepts_registered() {
+        let r = build_registry();
+        assert!(r
+            .find(
+                GENERIC_CTX,
+                "getBeanFactory",
+                "()Lorg/springframework/beans/factory/support/DefaultListableBeanFactory;",
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn orphan_bean_filter_intercepts_registered() {
+        // The sportme cascade — every filter point should be wired.
+        let r = build_registry();
+        assert!(r
+            .find(
+                "org/springframework/beans/factory/support/AbstractBeanDefinition",
+                "getBeanClassName",
+                "()Ljava/lang/String;",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "org/springframework/beans/factory/support/AbstractBeanDefinition",
+                "hasBeanClass",
+                "()Z",
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "org/springframework/beans/factory/support/BeanDefinitionReaderUtils",
+                "registerBeanDefinition",
+                "(Lorg/springframework/beans/factory/config/BeanDefinitionHolder;\
+                 Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn environment_intercepts_registered() {
+        let r = build_registry();
+        assert!(r
+            .find(
+                ABSTRACT_CTX,
+                "getEnvironment",
+                "()Lorg/springframework/core/env/ConfigurableEnvironment;",
+            )
+            .is_some());
+        // Property-access methods registered on the StandardEnvironment surface.
+        assert!(r
+            .find(
+                "org/springframework/core/env/StandardEnvironment",
+                "getProperty",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            )
+            .is_some());
+    }
+}

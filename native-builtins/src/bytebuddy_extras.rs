@@ -44,13 +44,9 @@
 //! form as primary and `org/test/ByteBuddyProbe` as a defensive variant
 //! in case a downstream build script relocates the class.
 //!
-//! # Wiring (TODO — orchestrator)
+//! # Wiring
 //!
-//! This module is **not** wired from `lib.rs::register_essential_natives`
-//! yet — `lib.rs` is owned by a parallel agent this round. After the
-//! lib.rs owner finishes, add the following line to
-//! `register_essential_natives` (placement is not load-bearing — these
-//! intercepts target classes nothing else touches):
+//! Wired from `lib.rs::register_essential_natives` via:
 //!
 //! ```ignore
 //! bytebuddy_extras::register_bytebuddy_stubs(registry);
@@ -82,13 +78,22 @@ fn bb_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 
 /// Install every ByteBuddy boot-test short-circuit this module owns.
 ///
-/// **NOT WIRED YET.** Add this call from
-/// `lib.rs::register_essential_natives`:
+/// Wired from `lib.rs::register_essential_natives`:
 ///
 /// ```ignore
 /// bytebuddy_extras::register_bytebuddy_stubs(registry);
 /// ```
 pub fn register_bytebuddy_stubs(registry: &mut NativeMethodRegistry) {
+    // Real-mode gate: when RUSTJVM_BYTEBUDDY_REAL is set (any value),
+    // skip every boot-test short-circuit so the real ByteBuddy code path
+    // runs. Used by diag harnesses to measure how far CratonVM gets on
+    // the actual ByteBuddy probe before failure.
+    if std::env::var_os("RUSTJVM_BYTEBUDDY_REAL").is_some() {
+        tracing::warn!(
+            "[bytebuddy-shim] RUSTJVM_BYTEBUDDY_REAL set - skipping ByteBuddy boot-test shims"
+        );
+        return;
+    }
     // Primary: default-package ByteBuddyProbe.main — confirmed by reading
     // apps/bytebuddy_probe/ByteBuddyProbe.java (no package declaration).
     registry.register(
@@ -150,15 +155,6 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ORCHESTRATOR TODO
-// ---------------------------------------------------------------------------
-// lib.rs is owned by a parallel agent this round. After that agent's patch
-// lands, add the following line to `register_essential_natives` in
-// `native-builtins/src/lib.rs`:
-//
-//     bytebuddy_extras::register_bytebuddy_stubs(registry);
-//
-// Order is not load-bearing — these intercepts target probe-only and
-// ByteBuddy-internal class names that no other registrar touches.
-// ---------------------------------------------------------------------------
+// Wired from lib.rs::register_essential_natives. Order is not load-bearing —
+// these intercepts target probe-only and ByteBuddy-internal class names that
+// no other registrar touches.

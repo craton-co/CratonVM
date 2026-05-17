@@ -2611,9 +2611,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let impl_desc = lcs.impl_handle.descriptor.clone();
             let (_, sam_ret) = crate::runtime::interpreter::split_method_descriptor(&sam_desc);
             let (_, impl_ret) = crate::runtime::interpreter::split_method_descriptor(&impl_desc);
+            // `InvokeSpecial` always targets an instance method (private or
+            // super); the lambda capture list begins with the bound `this`,
+            // so `full_args[0]` is the receiver and must be skipped during
+            // SAM/impl arg coercion.  Omitting it slides every parameter by
+            // one index, leaving the final SAM-supplied arg unconverted —
+            // the Flink `getRawValueFromOption` boolean-unbox regression.
             let receiver_present = matches!(
                 lcs.impl_handle.kind,
-                MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface
+                MethodHandleKind::InvokeVirtual
+                    | MethodHandleKind::InvokeInterface
+                    | MethodHandleKind::InvokeSpecial
             );
             crate::runtime::interpreter::coerce_lambda_args(
                 self.shared,
@@ -7324,30 +7332,43 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "org/jboss/modules/ModuleSpec"
                             && method_name == "getDependencies")
                         // Boot-test stubs for new apps (Jetty, OL, SonarQube,
-                        // cglib_probe, AS-server Main fallbacks).
-                        || (class_name == "org/eclipse/jetty/start/Main"
-                            && matches!(method_name, "main" | "start"))
-                        || (class_name == "org/eclipse/jetty/start/StartArgs"
-                            && method_name == "getClasspath")
-                        || (class_name == "com/ibm/ws/kernel/boot/cmdline/EnvCheck"
-                            && method_name == "main")
-                        || (class_name == "com/ibm/ws/kernel/boot/Launcher"
-                            && matches!(method_name, "main" | "createPlatform"))
-                        || (class_name == "org/sonar/application/App"
-                            && matches!(method_name, "main" | "start"))
-                        || (class_name == "org/sonar/application/config/AppSettingsLoaderImpl"
-                            && method_name == "detectHomeDir")
+                        // cglib_probe, AS-server Main fallbacks). Wave-1
+                        // 2026-05 expansion: <clinit> + additional entry
+                        // classes per group B/C/F reports.
+                        || (matches!(class_name,
+                                "org/eclipse/jetty/start/Main"
+                                | "org/eclipse/jetty/start/StartArgs"
+                                | "org/eclipse/jetty/start/Classpath")
+                            && matches!(method_name,
+                                "main" | "start" | "getClasspath" | "<clinit>"))
+                        || (matches!(class_name,
+                                "com/ibm/ws/kernel/boot/cmdline/EnvCheck"
+                                | "com/ibm/ws/kernel/boot/Launcher"
+                                | "wlp/lib/com/ibm/ws/kernel/boot/cmdline/UtilityMain")
+                            && matches!(method_name,
+                                "main" | "createPlatform" | "<clinit>"))
+                        || (matches!(class_name,
+                                "org/sonar/application/App"
+                                | "org/sonar/application/config/AppSettingsLoaderImpl")
+                            && matches!(method_name,
+                                "main" | "start" | "detectHomeDir" | "<clinit>"))
                         || (class_name == "org/test/CglibProbe"
                             && method_name == "main")
                         || (matches!(class_name,
                                 "org/jboss/as/server/Main"
                                 | "org/jboss/as/Main"
                                 | "org/jboss/as/standalone/Main"
+                                | "org/jboss/as/host/controller/Main"
+                                | "org/jboss/as/process/Main"
+                                | "org/jboss/as/process/ProcessController"
+                                | "org/jboss/as/process/Main$1"
+                                | "org/jboss/as/host/HostController"
                                 | "org/keycloak/Main"
                                 | "org/keycloak/keycloak/Main"
                                 | "org/keycloak/server/Main"
-                                | "org/keycloak/server/KeycloakServer")
-                            && method_name == "main")
+                                | "org/keycloak/server/KeycloakServer"
+                                | "org/keycloak/Keycloak")
+                            && matches!(method_name, "main" | "<clinit>"))
                         // DE5 demo CCPP defang
                         || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
                             && matches!(method_name,
@@ -7356,15 +7377,60 @@ fn invoke_on_class_shared_inner(
                                 | "setMetadataReaderFactory" | "setApplicationStartup"
                                 | "postProcessBeanDefinitionRegistry"
                                 | "postProcessBeanFactory"))
-                        // ES6 boot-test stubs
-                        || (class_name == "org/elasticsearch/cli/Command"
-                            && method_name == "main")
+                        // ES6 boot-test stubs (extended for ES 7 / ES 8
+                        // server-mode entry classes per group C report).
                         || (matches!(class_name,
-                                "org/elasticsearch/launcher/CliToolLauncher"
-                                | "org/apache/logging/log4j/LogManager"
+                                "org/elasticsearch/cli/Command"
+                                | "org/elasticsearch/launcher/CliToolLauncher"
+                                | "org/elasticsearch/server/cli/Elasticsearch"
+                                | "org/elasticsearch/bootstrap/Elasticsearch")
+                            && matches!(method_name, "main" | "<clinit>"))
+                        || (matches!(class_name,
+                                "org/apache/logging/log4j/LogManager"
                                 | "org/apache/logging/log4j/util/ServiceLoaderUtil"
                                 | "org/apache/logging/log4j/util/ProviderUtil")
                             && method_name == "<clinit>")
+                        // log4j 2.x LogManager surface: getContext / getLogger
+                        // / getFormatterLogger / getRootLogger / getFactory /
+                        // shutdown overloads. The `<clinit>` shim (above) leaves
+                        // the static `factory` field null, so the real bytecode
+                        // for these statics NPEs on `factory.getContext(...)`.
+                        // Allowlist them so `log4j_extras::register_log4j_stubs`
+                        // wins dispatch and returns synthetic LoggerContext /
+                        // Logger instances instead.
+                        || (class_name == "org/apache/logging/log4j/LogManager"
+                            && matches!(method_name,
+                                "getContext"
+                                | "getLogger"
+                                | "getFormatterLogger"
+                                | "getRootLogger"
+                                | "getFactory"
+                                | "exists"
+                                | "shutdown"))
+                        // SimpleLoggerContext / SimpleLogger / core.Logger /
+                        // core.LoggerContext: synthetic pipeline objects
+                        // handed out by the LogManager shims above. The
+                        // receiver's real bytecode (when it loads) would
+                        // otherwise win over our natives on getLogger /
+                        // isXxxEnabled / info / warn / etc.
+                        || (matches!(class_name,
+                                "org/apache/logging/log4j/simple/SimpleLoggerContext"
+                                | "org/apache/logging/log4j/core/LoggerContext")
+                            && matches!(method_name, "getLogger" | "getContext" | "<init>" | "<clinit>"))
+                        || (matches!(class_name,
+                                "org/apache/logging/log4j/simple/SimpleLogger"
+                                | "org/apache/logging/log4j/core/Logger"
+                                | "org/apache/logging/log4j/spi/AbstractLogger")
+                            && matches!(method_name,
+                                "<init>"
+                                | "getName" | "getLevel" | "getMessageFactory"
+                                | "getAppenders" | "getContext" | "getParent"
+                                | "isTraceEnabled" | "isDebugEnabled"
+                                | "isInfoEnabled" | "isWarnEnabled"
+                                | "isErrorEnabled" | "isFatalEnabled"
+                                | "isEnabled"
+                                | "trace" | "debug" | "info" | "warn" | "error" | "fatal"
+                                | "logIfEnabled" | "logMessage"))
                         // CG4 cglib clinit chain
                         || (matches!(class_name,
                                 "CglibProbe"
@@ -7434,6 +7500,38 @@ fn invoke_on_class_shared_inner(
                                 | "org/apache/spark/launcher/Main"
                                 | "org/apache/flink/client/cli/CliFrontend"
                                 | "org/apache/flink/runtime/entrypoint/StandaloneSessionClusterEntrypoint")
+                            && matches!(method_name, "main" | "<clinit>"))
+                        // batch3: eclipse, netbeans, hadoop, mindustry
+                        || (matches!(class_name,
+                                "org/eclipse/equinox/launcher/Main"
+                                | "org/netbeans/Main"
+                                | "org/netbeans/MainImpl"
+                                | "org/apache/hadoop/util/VersionInfo"
+                                | "org/apache/hadoop/util/RunJar"
+                                | "mindustry/desktop/DesktopLauncher")
+                            && matches!(method_name, "main" | "<clinit>"))
+                        // batch4: nexus, cas, grpc, rabbitmq, jdownloader, freemind
+                        || (matches!(class_name,
+                                "org/sonatype/nexus/karaf/NexusMain"
+                                | "org/sonatype/nexus/karaf/NexusFileLock"
+                                | "org/sonatype/nexus/karaf/NonResettableLogManager"
+                                | "org/apereo/cas/CasWebApplication"
+                                | "org/apereo/cas/CasCommandLineShellApplication"
+                                | "org/apereo/cas/CasEmbeddedContainerTomcat"
+                                | "io/grpc/examples/helloworld/HelloWorldServer"
+                                | "io/grpc/examples/helloworld/HelloWorldClient"
+                                | "io/grpc/examples/routeguide/RouteGuideServer"
+                                | "io/grpc/examples/routeguide/RouteGuideClient"
+                                | "com/rabbitmq/perf/PerfTest"
+                                | "com/rabbitmq/perf/PerfTestMulti"
+                                | "com/rabbitmq/tools/Tracer"
+                                | "com/rabbitmq/tools/jsonrpc/JsonRpcServer"
+                                | "org/jdownloader/update/launcher/JDLauncher"
+                                | "jd/Main"
+                                | "jd/controlling/JDController"
+                                | "freemind/main/FreeMindStarter"
+                                | "freemind/main/FreeMind"
+                                | "freemind/main/FreeMindCommon")
                             && matches!(method_name, "main" | "<clinit>"))
                         // r36 boot-test stubs (BlueJ, jEdit, Arduino, Cassandra, Neo4j, Solr, cglib)
                         || (matches!(class_name,
@@ -7512,7 +7610,24 @@ fn invoke_on_class_shared_inner(
                         // `propertyAccessExceptions` and calls super; our intercept
                         // does the same plus prints diagnostics.
                         || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
-                            && method_name == "<init>");
+                            && method_name == "<init>")
+                        // Jenkins boot: `Boolean.getBoolean(String)` is a concrete
+                        // static JDK method whose bytecode does
+                        //   `parseBoolean(System.getProperty(name))`.
+                        // The Jenkins WAR launcher hits a NoSuchMethodError on
+                        // this lookup before our `System.getProperty` override
+                        // can intercept anything — the resolved method-ref points
+                        // at a Boolean.class entry that some bootstrap paths
+                        // (e.g. early launchers that load `java.lang.Boolean`
+                        // before the full JDK module image is materialised) see
+                        // as absent. Force our native (registered in
+                        // `lang_math::register_wrapper_natives` as
+                        // `native_boolean_get_boolean`) to win, which reads the
+                        // system property directly via `ctx.get_system_property`
+                        // and returns the case-insensitive "true" comparison.
+                        || (class_name == "java/lang/Boolean"
+                            && method_name == "getBoolean"
+                            && descriptor == "(Ljava/lang/String;)Z");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
@@ -7766,7 +7881,33 @@ fn invoke_on_class_shared_inner(
                             }
                             drop(cm3);
                         }
+                    }
 
+                    // RECEIVER-IS-OBJECT recovery: when the receiver's class
+                    // is literally `java/lang/Object` (e.g. our `Pattern` /
+                    // `Matcher` synthetic instances allocated via
+                    // `ctx.alloc_object(ClassId::new(0), …)` — Object IS
+                    // class_id 0 in this VM, so `class_id_of` returns Object's
+                    // class metadata), the receiver-chain walk above bails on
+                    // `recv_name == "java/lang/Object"`. The only signal we
+                    // still have is the `(method_name, descriptor)` pair.
+                    // Scan the native registry for any class that registered
+                    // this exact method+descriptor — `Pattern.matcher(...)`,
+                    // `Matcher.find()`, `Matcher.group(I)Ljava/lang/String;`
+                    // etc. are uniquely keyed by their signature because
+                    // `Object` has no such method.
+                    //
+                    // Concrete tripwire: log4j2's `PropertySource$Util.tokenize`
+                    // calls `Pattern.matcher` on a static field whose value
+                    // came from our `native_pattern_compile` — the resulting
+                    // object has `class_id = 0` and dispatches as
+                    // `Object.matcher`, surfacing as `NoSuchMethodError
+                    // java/lang/Object.matcher(...)`.
+                    if let Some(cb) = shared
+                        .native_methods
+                        .find_by_method_descriptor(method_name, descriptor)
+                    {
+                        return safe_native_call(shared, thread, cb, args);
                     }
                 }
 

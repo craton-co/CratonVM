@@ -37,16 +37,10 @@
 //! defaults rather than a crash; the `main` short-circuits above ensure
 //! no real caller path is actually reached.
 //!
-//! # Wiring (TODO — orchestrator)
+//! # Wiring
 //!
-//! This module is **not** wired from `lib.rs::register_essential_natives`
-//! yet — `lib.rs` is owned by the orchestrator. After this patch lands,
-//! the orchestrator should add the following line to
-//! `register_essential_natives`:
-//!
-//! ```ignore
-//! bluej_extras::register_bluej_stubs(registry);
-//! ```
+//! `register_bluej_stubs` is invoked from
+//! `register_essential_natives` in `native-builtins/src/lib.rs`.
 //!
 //! # Safety / scope
 //!
@@ -57,9 +51,6 @@
 //! pattern used elsewhere in this crate (see `jetty_extras` and
 //! `jboss_extras`). The `<clinit>` no-ops are scoped to two specific
 //! AWT helper classes and cannot affect non-AWT workloads.
-//
-// TODO orchestrator: wire `bluej_extras::register_bluej_stubs(registry);`
-// into `register_essential_natives` in `lib.rs`.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -107,6 +98,13 @@ fn bluej_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_bluej_stubs(registry: &mut NativeMethodRegistry) {
+    // Diagnostic gate: when RUSTJVM_BLUEJ_REAL=1, skip all short-circuits so
+    // the real BlueJ entry classes execute under CratonVM. Used to measure
+    // how far the real boot path gets without our shims masking failures.
+    if std::env::var("RUSTJVM_BLUEJ_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[bluej-shim] RUSTJVM_BLUEJ_REAL=1 — skipping shim registration, running real BlueJ");
+        return;
+    }
     // Primary: jar MANIFEST entry point.
     registry.register(
         CN_INSTALLER,

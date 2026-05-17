@@ -36,6 +36,9 @@ fn glassfish_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 pub fn register_glassfish_stubs(registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_PAYARA_REAL").as_deref() == Ok("1") {
+        return;
+    }
     // com.sun.enterprise.glassfish.bootstrap.ASMain.main([Ljava/lang/String;)V
     // — primary short-circuit.
     registry.register(

@@ -387,6 +387,7 @@ pub mod jetty_extras;
 pub mod liberty_extras;
 pub mod sonar_extras;
 pub mod elasticsearch_extras;
+pub mod log4j_extras;
 pub mod keycloak16_extras;
 pub mod bytebuddy_extras;
 pub mod demo_extras;
@@ -409,6 +410,16 @@ pub mod ignite_extras;
 pub mod hazelcast_extras;
 pub mod spark_extras;
 pub mod flink_extras;
+pub mod eclipse_extras;
+pub mod netbeans_extras;
+pub mod hadoop_extras;
+pub mod mindustry_extras;
+pub mod nexus_extras;
+pub mod cas_extras;
+pub mod grpc_extras;
+pub mod rabbitmq_extras;
+pub mod jdownloader_extras;
+pub mod freemind_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1394,6 +1405,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     liberty_extras::register_liberty_stubs(registry);
     sonar_extras::register_sonar_stubs(registry);
     elasticsearch_extras::register_es_stubs(registry);
+    // Log4j 2.x API shim: keep `LogManager.getContext` / `getLogger` from
+    // NPE'ing when the real provider chain (which `elasticsearch_extras`
+    // no-ops via the LogManager <clinit> shim) leaves the static factory
+    // field null. Registered unconditionally — fires only when a caller
+    // actually invokes a `LogManager` static method.
+    log4j_extras::register_log4j_stubs(registry);
     keycloak16_extras::register_keycloak16_stubs(registry);
     bytebuddy_extras::register_bytebuddy_stubs(registry);
     demo_extras::register_demo_stubs(registry);
@@ -1416,6 +1433,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     hazelcast_extras::register_hazelcast_stubs(registry);
     spark_extras::register_spark_stubs(registry);
     flink_extras::register_flink_stubs(registry);
+    eclipse_extras::register_eclipse_stubs(registry);
+    netbeans_extras::register_netbeans_stubs(registry);
+    hadoop_extras::register_hadoop_stubs(registry);
+    mindustry_extras::register_mindustry_stubs(registry);
+    nexus_extras::register_nexus_stubs(registry);
+    cas_extras::register_cas_stubs(registry);
+    grpc_extras::register_grpc_stubs(registry);
+    rabbitmq_extras::register_rabbitmq_stubs(registry);
+    jdownloader_extras::register_jdownloader_stubs(registry);
+    freemind_extras::register_freemind_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.
@@ -10591,8 +10618,16 @@ fn native_println_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_println_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Same CompactValue tag-erasure quirk as `native_print_long` — a long
+    // pushed via `CompactValue::long` decodes as `Value::Double(<denormal>)`
+    // when popped through invokevirtual's untyped `pop_unchecked()`. Pull
+    // the raw bits back out so e.g. `System.out.println(System.currentTimeMillis())`
+    // prints the actual epoch millis rather than `0`.
     let val = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Float(f)) => f.to_bits() as i64,
         _ => 0,
     };
     let text = val.to_string();
@@ -10698,8 +10733,20 @@ fn native_print_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_print_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // CompactValue tag-erasure: a long pushed via `CompactValue::long(v)` is
+    // stored with the Double tag (no embedded marker — see
+    // `types/src/compact_value.rs::pub fn long`). When `invokevirtual` pops
+    // args with `pop_unchecked()` the slot decodes back as
+    // `Value::Double(<denormal>)`, not `Value::Long`. Treat a Double
+    // argument here as the raw long bits so `PrintStream.print(J)V`
+    // prints the correct value instead of silently falling through to 0
+    // (the visible symptom of the `System.currentTimeMillis()` "always
+    // returns 0 delta" bug in `bench/nbody.java`).
     let val = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Float(f)) => f.to_bits() as i64,
         _ => 0,
     };
     let text = val.to_string();

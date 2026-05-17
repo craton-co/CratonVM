@@ -63,6 +63,9 @@ fn ignite_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_ignite_stubs(registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_IGNITE_REAL").as_deref() == Ok("1") {
+        return;
+    }
     // CommandLineStartup.main — primary `bin/ignite.sh` entry point.
     registry.register(
         CN_CMDLINE_STARTUP,

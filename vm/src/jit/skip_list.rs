@@ -1444,6 +1444,36 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/Arrays", "hashCode")
         | ("java/util/Objects", "hash")
         | ("java/util/Objects", "hashCode")
+        // FELIX.1 (Session continues 2026-05-16) — `apps/felix-framework-7.0.5/
+        // bin/felix.jar` with `RUSTJVM_FELIX_REAL=1` SEGVs (rc=139) on
+        // Windows during the OSGi `FrameworkFactory` bootstrap. The
+        // `RUSTJVM_DBG_JIT_ENTRY=1` trace shows the last JIT entry before
+        // the crash is
+        // `java/lang/reflect/AccessibleObject.setAccessible([Ljava/lang/reflect/AccessibleObject;Z)V`,
+        // invoked from the JIT-compiled
+        // `org/apache/felix/framework/util/SecureAction.lambda$getAccessor$0`.
+        // The JDK implementation of this overload is a simple
+        // `for (AccessibleObject obj : array) obj.setAccessible(flag);`
+        // loop — same allocate-then-iterate-and-dispatch archetype as
+        // `Class.copyFields` / `Objects.hash` (SPB.4 / SPB.5), but applied
+        // to a virtual-dispatch site (each element resolves to a different
+        // `Method` / `Field` / `Constructor` subclass and calls the
+        // per-subclass `setAccessible0` native). Under Felix's bulk
+        // reflection setup the loop crosses the per-callee threshold and
+        // the next field deref faults inside one of the polymorphic
+        // `setAccessible0` callees. With `RUSTJVM_DISABLE_JIT=1` the rc
+        // changes from 139 to 0 and a clean
+        // `java.lang.NullPointerException: Cannot invoke length on null`
+        // surfaces at `Main.java:287` (config-properties path; an unrelated
+        // Felix data gap). Skip-list the bulk overload plus the
+        // SecureAction lambda that drives it; the per-instance
+        // `setAccessible(boolean)` overloads stay JIT-eligible. Liftable
+        // via `RUSTJVM_JIT_ALLOW_PACKAGES=java/lang/reflect/`.
+        | ("java/lang/reflect/AccessibleObject", "setAccessible")
+        | (
+            "org/apache/felix/framework/util/SecureAction",
+            "lambda$getAccessor$0",
+        )
     )
 }
 

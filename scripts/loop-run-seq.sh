@@ -46,6 +46,61 @@ run_app flink 25 --Xmx 512m -c "$FLCP" \
     "-DFLINK_HOME=$FL" \
     org.apache.flink.client.cli.CliFrontend
 
+# ── Batch 3: payara, eclipse, netbeans, hadoop, mindustry ───────────────
+PA="$APPS/payara6"
+PACP=$(find "$PA/glassfish/modules" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app payara 25 --Xmx 512m -c "$PACP" \
+    "-Dcom.sun.aas.installRoot=$PA/glassfish" \
+    com.sun.enterprise.glassfish.bootstrap.ASMain
+
+EC="$APPS/eclipse"
+ECLAUNCHER=$(ls "$EC/plugins"/org.eclipse.equinox.launcher_*.jar | head -1)
+run_app eclipse 25 --Xmx 512m \
+    --jar "$ECLAUNCHER"
+
+NB="$APPS/netbeans"
+NBCP=$(find "$NB/platform/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app netbeans 25 --Xmx 512m -c "$NBCP" \
+    "-Dnetbeans.home=$NB/platform" \
+    org.netbeans.Main
+
+HD="$APPS/hadoop-3.3.6"
+HDCP=$(find "$HD/share/hadoop/common" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+HDCP2=$(find "$HD/share/hadoop/common/lib" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app hadoop 25 --Xmx 512m -c "$HDCP;$HDCP2" \
+    "-DHADOOP_HOME=$HD" \
+    org.apache.hadoop.util.VersionInfo
+
+run_app mindustry 25 --Xmx 512m \
+    --jar "$APPS/mindustry.jar"
+
+# ── Batch 4: Nexus, CAS, gRPC, RabbitMQ, JDownloader, FreeMind ───────────
+B4="$APPS/batch4"
+
+# Nexus Repository — Karaf-based launcher.
+run_app nexus 30 --Xmx 512m -c "$B4/nexus-main.jar;$B4/karaf-main.jar" \
+    org.sonatype.nexus.karaf.NexusMain
+
+# Apereo CAS — Spring Boot command-line shell variant.
+run_app cas 30 --Xmx 512m --jar "$B4/cas-shell.jar"
+
+# gRPC Java — HelloWorld example server (canonical boot test).
+run_app grpc 30 --Xmx 512m -c "$B4/grpc-examples.jar" \
+    io.grpc.examples.helloworld.HelloWorldServer
+
+# RabbitMQ — perf-test CLI fat-jar (canonical companion to amqp-client).
+run_app rabbitmq 30 --Xmx 512m --jar "$B4/perf-test.jar"
+
+# JDownloader — desktop fat-jar with Main-Class in MANIFEST.
+run_app jdownloader 30 --Xmx 512m --jar "$B4/JDownloader.jar"
+
+# FreeMind — mind-mapping desktop app.
+FM="$B4/freemind_ext"
+FMCP=$(find "$FM/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app freemind 30 --Xmx 512m -c "$FMCP" \
+    "-Dfreemind.base.dir=$FM" \
+    freemind.main.FreeMindStarter
+
 echo "=== SUMMARY iter=$ITER ==="
 for f in "$LOGDIR"/*.rc.txt; do
     name=$(basename "$f" .rc.txt)

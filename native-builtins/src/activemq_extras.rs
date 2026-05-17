@@ -31,6 +31,10 @@ fn activemq_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 }
 
 pub fn register_activemq_stubs(registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_ACTIVEMQ_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[activemq-shim] RUSTJVM_ACTIVEMQ_REAL=1 — skipping shim registration, running real ActiveMQ");
+        return;
+    }
     // org.apache.activemq.console.Main.main([Ljava/lang/String;)V — no-op,
     // skipping the System.exit(1) help-text path.
     registry.register(

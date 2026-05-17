@@ -35,6 +35,10 @@ fn gradle_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
 }
 
 pub fn register_gradle_stubs(registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_GRADLE_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[gradle-shim] RUSTJVM_GRADLE_REAL=1 — skipping shim registration, running real Gradle");
+        return;
+    }
     // org.gradle.launcher.GradleMain.main([Ljava/lang/String;)V — primary
     // entry point for gradle-launcher 8.x.
     registry.register(

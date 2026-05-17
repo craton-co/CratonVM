@@ -14,7 +14,21 @@ fn demo_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+/// Diagnostic gate — `RUSTJVM_DEMO_REAL=1` skips shim registration so
+/// the real bytecode runs under CratonVM.
+fn demo_real_mode() -> bool {
+    std::env::var("RUSTJVM_DEMO_REAL")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
 pub fn register_demo_stubs(registry: &mut NativeMethodRegistry) {
+    if demo_real_mode() {
+        tracing::warn!(
+            "[demo-shim] RUSTJVM_DEMO_REAL=1 — shim DISABLED, running real bytecode"
+        );
+        return;
+    }
     // Try several known main class names. Read the MANIFEST yourself to get the
     // accurate one; add more variants if needed.
     for class in [
@@ -47,6 +61,15 @@ pub fn register_demo_stubs(registry: &mut NativeMethodRegistry) {
     );
 }
 
-// TODO(orchestrator): wire `pub mod demo_extras;` into native-builtins/src/lib.rs
-// and call `demo_extras::register_demo_stubs(&mut registry)` from the registration
-// entry point alongside the other extras modules.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the registration function exists, takes a
+    /// `&mut NativeMethodRegistry`, and runs without panicking.
+    #[test]
+    fn register_demo_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_demo_stubs(&mut r);
+    }
+}

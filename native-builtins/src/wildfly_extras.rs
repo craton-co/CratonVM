@@ -19,6 +19,14 @@ fn wf_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 }
 
 pub fn register_wildfly_stubs(registry: &mut NativeMethodRegistry) {
+    // Env-var gate: only install these WildFly-specific shims when the
+    // operator explicitly opts in via `RUSTJVM_WILDFLY_REAL=1`. Without
+    // the gate, the unconditional registrations short-circuit real
+    // application Main classes (`org/jboss/as/server/Main.main`, etc.)
+    // for every CratonVM run, which is undesirable for non-WildFly apps.
+    if std::env::var("RUSTJVM_WILDFLY_REAL").as_deref() != Ok("1") {
+        return;
+    }
     // The WildFly standalone entry class (declared in module.xml of
     // org.jboss.as.standalone). May not exist on disk by the time
     // jboss-modules tries to invoke it, so register the native intercept
@@ -37,8 +45,12 @@ pub fn register_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // Domain mode and several legacy entry points; defensive coverage.
+    // Also covers `org/jboss/as/standalone/Main` (the entry class declared
+    // by org.jboss.as.standalone's module.xml — listed in the WildFly
+    // boot-test task brief alongside the as/server/Main entry).
     for class in [
         "org/jboss/as/Main",
+        "org/jboss/as/standalone/Main",
         "org/jboss/as/host/controller/Main",
         "org/jboss/as/process/Main",
         "org/jboss/as/process/ProcessController",
@@ -50,8 +62,20 @@ pub fn register_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     }
 }
 
-// TODO(orchestrator): wire `register_wildfly_stubs` into
-// `register_essential_natives` in `native-builtins/src/lib.rs`, alongside
-// the other `*_extras::register_*_stubs` calls (e.g., `demo_extras`,
-// `jenkins_extras`). Add `pub mod wildfly_extras;` to the module list as
-// well. This agent (WF5) owns ONLY this file — do not modify lib.rs.
+// Wiring: `register_wildfly_stubs` is invoked from
+// `register_essential_natives` in `native-builtins/src/lib.rs`. The shared
+// `org/jboss/modules/Main` shim (used by both WildFly and Keycloak-16) is
+// owned by `wildfly_method_synth.rs` and wired separately.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the registration function exists, takes a
+    /// `&mut NativeMethodRegistry`, and doesn't panic.
+    #[test]
+    fn register_wildfly_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_wildfly_stubs(&mut r);
+    }
+}

@@ -31,21 +31,21 @@
 //!    `ModuleLoaderSelector.getCurrentLoader()` so callers that probe
 //!    a selector receive the same synthetic loader.
 //!
-//! # Wiring (TODO — orchestrator)
+//! # Wiring
 //!
-//! This module is **not** wired from `lib.rs::register_essential_natives`
-//! yet — `lib.rs` is owned by a parallel agent this round. After
-//! Agent 5 (lib.rs owner) finishes, add the following line to
-//! `register_essential_natives` next to
-//! `jboss_module_loader::register_jboss_module_loader(registry);`:
+//! `register_jboss_wildfly_stubs` is invoked from
+//! `register_essential_natives` in `native-builtins/src/lib.rs`,
+//! immediately after
+//! `jboss_module_loader::register_jboss_module_loader(registry);`.
 //!
-//! ```ignore
-//! jboss_extras::register_jboss_wildfly_stubs(registry);
-//! ```
+//! Order matters: registering *after* `register_jboss_module_loader`
+//! lets this module's overrides shadow any duplicate
+//! (`Module.getBootModuleLoader` is owned cleanly here).
 //!
-//! Order: register *after* `register_jboss_module_loader` so this
-//! module's overrides shadow any duplicate (`Module.getBootModuleLoader`
-//! is not registered there today — we own it cleanly).
+//! The shared `org/jboss/modules/Main` shim used by both WildFly and
+//! Keycloak-16 is registered by `wildfly_method_synth.rs`; this module
+//! only references `CN_MAIN` for the env-gated
+//! `RUSTJVM_WILDFLY_SHORTCIRCUIT` no-op fallback.
 //!
 //! # Safety / scope
 //!
@@ -418,6 +418,16 @@ fn native_module_get_caller_module_loader(
 /// jboss_extras::register_jboss_wildfly_stubs(registry);
 /// ```
 pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
+    // Env-var gate: this module installs jboss-modules / `org/jboss/modules/*`
+    // intercepts that are shared between WildFly and Keycloak-16. Install
+    // only when EITHER `RUSTJVM_WILDFLY_REAL=1` OR `RUSTJVM_KC16_REAL=1`
+    // is set, so unrelated CratonVM runs are not affected by these
+    // bootstrap short-circuits.
+    let wf = std::env::var("RUSTJVM_WILDFLY_REAL").as_deref() == Ok("1");
+    let kc16 = std::env::var("RUSTJVM_KC16_REAL").as_deref() == Ok("1");
+    if !(wf || kc16) {
+        return;
+    }
     // Module.getBootModuleLoader()Lorg/jboss/modules/ModuleLoader;
     registry.register(
         CN_MODULE,

@@ -8360,6 +8360,43 @@ fn execute_invoke_kind(
                             return Ok(CachedCallResult::Handled);
                         }
                     }
+                    // Gradle bootstrap: `ClasspathUtil$1.visitClassPath(URL[])`
+                    // iterates `URL[]` returned by `ClassLoaderVisitor.
+                    // extractJava9Classpath()`. That helper allocates
+                    // `new URL[paths.length]` (all-null), then populates each
+                    // slot via `new File(p).toURI().toURL()`. When our
+                    // synthetic `URI.toURL()` returns null (because the URI's
+                    // raw string field wasn't populated under our heap
+                    // layout), the slot stays null. The iterator's very
+                    // first op is `url.getProtocol()` with an `ifnull` check
+                    // immediately after, so the bytecode is null-tolerant
+                    // by design — but only if `getProtocol()` returns null
+                    // instead of throwing NPE. Mirror that contract for the
+                    // small family of `URL` accessors that return reference
+                    // types: a null receiver yields null (which the bytecode
+                    // tests for and treats as "skip this entry"). This
+                    // unblocks the Gradle `--version` boot path (NPE was at
+                    // `getProtocol on null` deep in `DefaultModuleRegistry`
+                    // <init>'s classpath enumeration) without altering any
+                    // non-null code path.
+                    if &*method_class_name == "java/net/URL"
+                        && matches!(
+                            &*method_name,
+                            "getProtocol"
+                                | "getHost"
+                                | "getFile"
+                                | "getPath"
+                                | "getQuery"
+                                | "getRef"
+                                | "getUserInfo"
+                                | "getAuthority"
+                        )
+                    {
+                        thread.frames[frame_idx]
+                            .stack
+                            .push(Value::Object(None))?;
+                        return Ok(CachedCallResult::Handled);
+                    }
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
@@ -9245,13 +9282,26 @@ pub(crate) fn try_lambda_dispatch(
         }
         MethodHandleKind::InvokeSpecial => {
             // Special: dispatch on the declaring class (no virtual lookup).
+            //
+            // `invokespecial` always targets an instance method (private or
+            // super-call); the lambda capture list therefore begins with the
+            // bound `this`, which sits at `full_args[0]` once captures are
+            // prepended.  `coerce_lambda_args` must skip that slot — passing
+            // `receiver_present=false` here causes the argument-to-parameter
+            // index map to slide by one, leaving the last SAM-supplied arg
+            // unconverted.  Concrete failure: Flink's `getRawValueFromOption`
+            // lambda binds `getRawValue(String, Z)` from a
+            // `BiFunction<String, Boolean, ...>`; with the off-by-one the
+            // trailing `Boolean` reaches the impl's `boolean` slot still
+            // boxed, and `iload_2` later raises
+            // "expected int on stack, got ref(...)".
             coerce_lambda_args(
                 shared,
                 thread,
                 &sam_desc,
                 &impl_desc,
                 &mut full_args,
-                false,
+                true,
                 num_captures,
             )?;
             let class_id = shared
@@ -12046,7 +12096,33 @@ fn execute_jit_call(
     }
     let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
-        jit_args[i] = thread.frames[frame_idx].stack.pop_raw() as i64; // Cast: JIT ABI -- i64 register convention
+        // BUGFIX (CompactValue NaN-box leak into JIT): the operand stack stores
+        // values as NaN-boxed CompactValues, where Int(11) for example is encoded
+        // as 0xFFFC_0000_0000_000B. Using `pop_raw().as_i64` would pass those tag
+        // bits as the parameter value, so a JIT'd `int n` arrives as
+        // 0xFFFC_..._000B instead of 11. Downstream, the JIT loaded that bit
+        // pattern from a local frame slot and forwarded it to the GC's
+        // `alloc_array` length argument, producing the bogus
+        // "array data size overflow" / "young gen exhausted — tried to allocate
+        // 18445618173802709003 bytes" crash seen on fannkuch (n=11) and
+        // FullStackBench phase 5 (`new boolean[100000]`).
+        //
+        // The JIT calling convention expects raw primitive bits with no tag
+        // (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
+        // bits, Double → raw f64 bits, Object → pointer). Decode via
+        // CompactValue::to_value first, then encode for the JIT ABI exactly
+        // the way the eager-args path does at the other JIT entry point.
+        let cv = thread.frames[frame_idx].stack.pop_compact();
+        let v = cv.to_value();
+        jit_args[i] = match v {
+            Value::Int(x) => x as i64,
+            Value::Long(x) => x,
+            Value::Float(x) => x.to_bits() as i64,
+            Value::Double(x) => x.to_bits() as i64,
+            Value::Object(Some(obj)) => obj.as_ptr() as i64,
+            Value::Object(None) => 0,
+            _ => 0,
+        };
     }
 
     let args_slice = &jit_args[..np];
@@ -13293,6 +13369,23 @@ fn pop_object_ref_ctx(
         // `Value::Int(0)` (or `Value::Long(0)` on 64-bit fields).
         // Treating these as null matches the JVM spec §2.3 default
         // value semantics for reference types (null == zero).
+        //
+        // `Value::Uninitialized` is the same family: it surfaces when a
+        // CompactValue with `SUB_UNINIT` subtag or a local/stack slot with
+        // `VTAG_UNINIT` is decoded back to a `Value`.  This happens for
+        // never-written slots that went through a tag-mismatched path
+        // (e.g. a reference field whose backing CompactValue was carved
+        // out by the uninit slot helper rather than `CompactValue::null`).
+        // Per JVMS §2.3 the spec default for a reference type is `null`,
+        // so coerce to NPE rather than panicking — matches how Int(0) /
+        // Long(0) are handled above, and produces the same surface
+        // behaviour the caller's `ctx` message expects ("…object is
+        // null").  Observed crash signature on ActiveMQ boot:
+        //   internal error: expected object reference, got <uninitialized>
+        //   ctx=Some("Cannot read field 'formatter' because the object is null")
+        Value::Uninitialized => {
+            Err(RuntimeError::NullPointerException { message: context }.into())
+        }
         Value::Int(0) | Value::Long(0) => {
             Err(RuntimeError::NullPointerException { message: context }.into())
         }

@@ -15,6 +15,11 @@ fn jenkins_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 }
 
 pub fn register_jenkins_stubs(registry: &mut NativeMethodRegistry) {
+    // Diagnostic gate: when RUSTJVM_JENKINS_REAL=1, skip the short-circuit so
+    // the real Winstone launcher runs end-to-end (used for `--version`).
+    if std::env::var("RUSTJVM_JENKINS_REAL").as_deref() == Ok("1") {
+        return;
+    }
     registry.register(
         "executable/Main",
         "main",
@@ -30,4 +35,15 @@ pub fn register_jenkins_stubs(registry: &mut NativeMethodRegistry) {
     );
 }
 
-// TODO(orchestrator): wire register_jenkins_stubs() in native-builtins/src/lib.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the registration function exists, takes a
+    /// `&mut NativeMethodRegistry`, and runs without panicking.
+    #[test]
+    fn register_jenkins_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_jenkins_stubs(&mut r);
+    }
+}

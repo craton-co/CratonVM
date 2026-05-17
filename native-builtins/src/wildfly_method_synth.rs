@@ -15,6 +15,16 @@ fn jboss_modules_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 }
 
 pub fn register_wildfly_method_synth_stubs(registry: &mut NativeMethodRegistry) {
+    // Env-var gate: this shim short-circuits the shared `org/jboss/modules/Main`
+    // launcher entry point used by BOTH WildFly and Keycloak-16, so it is
+    // gated behind EITHER `RUSTJVM_WILDFLY_REAL=1` OR `RUSTJVM_KC16_REAL=1`.
+    // If neither is set, the registration is skipped to avoid affecting
+    // unrelated app runs that happen to load `org/jboss/modules/Main`.
+    let wf = std::env::var("RUSTJVM_WILDFLY_REAL").as_deref() == Ok("1");
+    let kc16 = std::env::var("RUSTJVM_KC16_REAL").as_deref() == Ok("1");
+    if !(wf || kc16) {
+        return;
+    }
     registry.register(
         "org/jboss/modules/Main",
         "main",

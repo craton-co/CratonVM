@@ -63,6 +63,12 @@ fn flink_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_flink_stubs(registry: &mut NativeMethodRegistry) {
+    // Diagnostic gate: when set to "1", skip installing the boot-test
+    // short-circuits so the real Flink main runs (used by the
+    // orchestrator's real-app diagnostics).
+    if std::env::var("RUSTJVM_FLINK_REAL").as_deref() == Ok("1") {
+        return;
+    }
     // CliFrontend.main — `bin/flink` CLI primary entry point.
     registry.register(
         CN_CLI_FRONTEND,

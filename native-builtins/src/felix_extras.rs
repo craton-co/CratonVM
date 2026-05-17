@@ -34,6 +34,10 @@ fn felix_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 }
 
 pub fn register_felix_stubs(registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_FELIX_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[felix-shim] RUSTJVM_FELIX_REAL=1 — skipping shim registration, running real Felix");
+        return;
+    }
     // org.apache.felix.main.Main.main([Ljava/lang/String;)V — primary
     // short-circuit. The real implementation segfaults during the OSGi
     // FrameworkFactory bootstrap.

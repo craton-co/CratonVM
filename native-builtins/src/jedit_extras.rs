@@ -32,16 +32,10 @@
 //!    shims (`LocalGE`, `PlatformGraphicsInfo`, `Win32GraphicsEnvironment`)
 //!    are always-on because their only effect is "headless mode works".
 //!
-//! # Wiring (TODO — orchestrator)
+//! # Wiring
 //!
-//! This module is **not** wired from `lib.rs::register_essential_natives`
-//! yet — `lib.rs` is owned by the orchestrator. After this patch lands,
-//! the orchestrator should add the following line to
-//! `register_essential_natives`:
-//!
-//! ```ignore
-//! jedit_extras::register_jedit_stubs(registry);
-//! ```
+//! Wired from `lib.rs::register_essential_natives` via
+//! `jedit_extras::register_jedit_stubs(registry);`.
 //!
 //! # Safety / scope
 //!
@@ -55,8 +49,7 @@
 //! superclass of every Swing widget — silently no-oping its clinit could
 //! break a future non-jEdit Swing workload.
 //
-// TODO orchestrator: wire `jedit_extras::register_jedit_stubs(registry);`
-// into `register_essential_natives` in `lib.rs`.
+// Wired in `lib.rs::register_essential_natives`.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -113,6 +106,14 @@ fn awt_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_jedit_stubs(registry: &mut NativeMethodRegistry) {
+    // Diagnostic gate: when RUSTJVM_JEDIT_REAL=1, skip all short-circuits so
+    // the real jEdit installer / editor entry classes execute under CratonVM.
+    // Used to measure how far the real boot path gets without our shims
+    // masking failures.
+    if std::env::var("RUSTJVM_JEDIT_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[jedit-shim] RUSTJVM_JEDIT_REAL=1 — skipping shim registration, running real jEdit");
+        return;
+    }
     // installer.Install.main([Ljava/lang/String;)V — primary short-circuit.
     registry.register(
         CN_INSTALL,

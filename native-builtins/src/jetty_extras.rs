@@ -67,6 +67,14 @@ fn jetty_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
+/// Generic `()V` no-op used for `<clinit>` short-circuits on classes whose
+/// static init walks file-system probing logic we cannot satisfy in
+/// boot-test mode (e.g., locating `$JETTY_HOME` via classloader URL
+/// resolution).
+fn jetty_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
 /// `org.eclipse.jetty.start.Main.start([Ljava/lang/String;)V` — no-op.
 ///
 /// Defensive alternative-signature stub for the inner `start` method that
@@ -102,6 +110,11 @@ fn jetty_start_args_get_classpath(
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_jetty_stubs(registry: &mut NativeMethodRegistry) {
+    // Diagnostic gate: when RUSTJVM_JETTY_REAL=1, skip all short-circuits so
+    // the real Jetty launcher runs end-to-end (used for `--list-config` etc).
+    if std::env::var("RUSTJVM_JETTY_REAL").as_deref() == Ok("1") {
+        return;
+    }
     // Main.main([Ljava/lang/String;)V — primary short-circuit.
     registry.register(
         CN_MAIN,
@@ -127,6 +140,22 @@ pub fn register_jetty_stubs(registry: &mut NativeMethodRegistry) {
         "()Lorg/eclipse/jetty/start/Classpath;",
         jetty_start_args_get_classpath,
     );
+
+    // Main.<clinit>()V — no-op. The real clinit instantiates a logger and
+    // resolves the launcher's filesystem location; both are unnecessary
+    // when Main.main itself is short-circuited.
+    registry.register(CN_MAIN, "<clinit>", "()V", jetty_void_noop);
+
+    // StartArgs.<clinit>()V — defensive no-op. The real clinit caches
+    // a JVM-property snapshot via system-property scans that NPE in
+    // CratonVM's partial bootstrap (Properties.entrySet returning null
+    // entries for some keys).
+    registry.register(CN_START_ARGS, "<clinit>", "()V", jetty_void_noop);
+
+    // Classpath.<clinit>()V — defensive no-op. Keeps the synthetic
+    // empty-classpath allocation path in `jetty_start_args_get_classpath`
+    // viable even if some unrelated touch triggers Classpath init first.
+    registry.register(CN_CLASSPATH, "<clinit>", "()V", jetty_void_noop);
 }
 
 #[cfg(test)]

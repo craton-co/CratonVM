@@ -15,6 +15,13 @@ fn arduino_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 }
 
 pub fn register_arduino_stubs(registry: &mut NativeMethodRegistry) {
+    // Diagnostic gate: when RUSTJVM_ARDUINO_REAL=1, skip all short-circuits so
+    // the real Arduino entry classes execute under CratonVM. Used to measure
+    // how far the real boot path gets without our shims masking failures.
+    if std::env::var("RUSTJVM_ARDUINO_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[arduino-shim] RUSTJVM_ARDUINO_REAL=1 — skipping shim registration, running real Arduino");
+        return;
+    }
     // Primary boot entry.
     registry.register(
         "processing/app/Base",
@@ -32,6 +39,18 @@ pub fn register_arduino_stubs(registry: &mut NativeMethodRegistry) {
     );
 }
 
-// TODO(orchestrator): wire `arduino_extras::register_arduino_stubs(registry);`
-// into `register_essential_natives` in lib.rs alongside other real-JDK app
-// shims (e.g., `register_jboss_extras`, `register_es_stubs`).
+// Wired in `lib.rs::register_essential_natives` alongside other real-JDK
+// app shims (e.g., `register_jboss_extras`, `register_es_stubs`).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the registration function exists, takes a
+    /// `&mut NativeMethodRegistry`, and doesn't panic.
+    #[test]
+    fn register_arduino_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_arduino_stubs(&mut r);
+    }
+}

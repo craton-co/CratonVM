@@ -9,6 +9,14 @@ fn cglib_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
 }
 
 pub fn register_cglib_stubs(registry: &mut NativeMethodRegistry) {
+    // Real-mode gate: when RUSTJVM_CGLIB_REAL is set (any value),
+    // skip every boot-test short-circuit so the real cglib code path
+    // runs. Used by diag harnesses to measure how far CratonVM gets on
+    // the actual cglib probe before failure.
+    if std::env::var_os("RUSTJVM_CGLIB_REAL").is_some() {
+        tracing::warn!("[cglib-shim] RUSTJVM_CGLIB_REAL set - skipping cglib boot-test shims");
+        return;
+    }
     // Comprehensive ASM + cglib clinit no-ops to prevent SEGV.
     for class in [
         // ASM internals
@@ -42,5 +50,17 @@ pub fn register_cglib_stubs(registry: &mut NativeMethodRegistry) {
         registry.register(probe_class, "<clinit>", "()V", cglib_noop);
     }
 }
-// TODO orchestrator: wire `cglib_extras::register_cglib_stubs(registry);` into
-// `register_essential_natives` in lib.rs.
+// Wired in `lib.rs::register_essential_natives`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the registration function exists, takes a
+    /// `&mut NativeMethodRegistry`, and doesn't panic.
+    #[test]
+    fn register_cglib_stubs_is_callable() {
+        let mut r = NativeMethodRegistry::new();
+        register_cglib_stubs(&mut r);
+    }
+}
