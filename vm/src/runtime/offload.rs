@@ -899,16 +899,59 @@ pub struct StreamSubmission {
 
 #[cfg(feature = "gpu-offload")]
 impl OffloadCache {
-    /// Async kernel dispatch. Returns a [`StreamSubmission`] whose
-    /// [`handle`](StreamSubmission::handle) identifies it for
-    /// `futureGetResult` lookup. The submission's status starts in
-    /// [`SubmissionStatus::Running`]; transitions to `Completed` or
-    /// `Failed` when the host observes kernel completion.
+    /// Look up a previously-compiled kernel by `(ClassId, method_index)`.
+    /// Returns `None` if the analyzer never accepted this method or it
+    /// has not yet been hit through `lookup_or_compile`.
+    pub fn lookup_kernel(
+        &self,
+        class_id: ClassId,
+        method_index: u16,
+    ) -> Option<std::sync::Arc<CompiledKernel>> {
+        self.kernels.read().get(&(class_id, method_index)).cloned()
+    }
+
+    /// Asynchronous kernel dispatch on `stream`.
     ///
-    /// Today on a no-GPU box this immediately constructs a
-    /// [`SubmissionStatus::Failed`] submission with message
-    /// "no CUDA device". The Phase 3 Java layer surfaces this as
-    /// `GpuException`.
+    /// Returns a [`StreamSubmission`] whose [`handle`](StreamSubmission::handle)
+    /// the Java layer maps back to a `GpuFuture<T>`. The submission's
+    /// final status depends on three outcomes:
+    ///
+    /// - **No device**: the cache has no `DeviceContext` (the host has
+    ///   no CUDA driver or `--gpu` was off). Returns immediately with
+    ///   `SubmissionStatus::Failed`.
+    /// - **Unknown kernel**: there is no compiled kernel for
+    ///   `(class_id, method_index)`. Returns `Failed`.
+    /// - **Launch dispatched**: the kernel is enqueued on `stream` via
+    ///   `DeviceModule::launch_on_stream`, then `stream.synchronize()`
+    ///   blocks the calling thread until the work completes. On success
+    ///   the status becomes `Completed { result: SerializedResult::Void }`.
+    ///   On any cudarc error the status becomes `Failed` with the error
+    ///   text.
+    ///
+    /// # Why synchronous-under-the-hood?
+    ///
+    /// The function is *named* `dispatch_async` and from the Java side
+    /// it is async (the `GpuFuture::get` call drives this method via a
+    /// worker thread, not the user's). Under the hood, however, we
+    /// call `stream.synchronize()` before returning. The real
+    /// stream-event-and-poll variant — where the host registers a
+    /// callback for the kernel completion and the future stays
+    /// `Running` until that callback fires — is a Phase 5 follow-up.
+    /// The current shape is enough to exercise the full
+    /// Java→Rust→cudarc→Rust→Java round-trip on a GPU box.
+    ///
+    /// # Limitation: only `Void` return
+    ///
+    /// Today we only surface `SerializedResult::Void`. Primitive-array
+    /// return (the common shape: `kernel(int[] a, int[] b, int[] out)`)
+    /// is signalled by the caller writing to an output buffer the host
+    /// already owns — the host-side `int[]` of the `out` parameter is
+    /// what the Java code reads. Surfacing a *new* primitive array as
+    /// the future's result (e.g. for a method that returns `int[]`
+    /// rather than writing to `out`) needs the dispatch site to
+    /// allocate the output buffer, copy it back after the kernel, and
+    /// stamp it into `SerializedResult::PrimitiveArray*`. That belongs
+    /// to a later round.
     pub fn dispatch_async(
         &self,
         stream: std::sync::Arc<Stream>,
@@ -919,32 +962,83 @@ impl OffloadCache {
         let handle = NEXT_SUBMISSION_HANDLE
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if !self.has_device() {
-            return std::sync::Arc::new(StreamSubmission {
+        let make = |status: SubmissionStatus| {
+            std::sync::Arc::new(StreamSubmission {
                 handle,
-                stream,
-                status: parking_lot::Mutex::new(SubmissionStatus::Failed {
+                stream: stream.clone(),
+                status: parking_lot::Mutex::new(status),
+            })
+        };
+
+        // 1. No-device fast path. The Java layer surfaces this as
+        //    `GpuException("no CUDA device …")`.
+        let ctx = match self.device() {
+            Some(c) => c,
+            None => {
+                return make(SubmissionStatus::Failed {
                     message: format!(
                         "no CUDA device available (class_id={:?}, method={})",
-                        class_id, method_index
+                        class_id, method_index,
                     ),
-                }),
+                });
+            }
+        };
+
+        // 2. Resolve the compiled kernel. `dispatch_async` is meant to
+        //    be called after `lookup_or_compile` populated the cache;
+        //    a missing entry signals a bug at the call site.
+        let kernel = match self.lookup_kernel(class_id, method_index) {
+            Some(k) => k,
+            None => {
+                return make(SubmissionStatus::Failed {
+                    message: format!(
+                        "no compiled kernel for class_id={:?} method={} (lookup_or_compile not called?)",
+                        class_id, method_index,
+                    ),
+                });
+            }
+        };
+
+        // 3. Pick a launch configuration. The signature's
+        //    `estimated_work` is the analyzer's read of the canonical
+        //    loop bound — one CUDA thread per element. Phase 5 will
+        //    let the user override via `@GpuKernel(blockX = ...)`.
+        let work = kernel.signature.estimated_work.max(1) as u32;
+        let cfg = cuda_bridge::LaunchConfig::elementwise(work);
+
+        // 4. Launch on the user-supplied stream. The launch itself is
+        //    non-blocking; `stream.synchronize()` below is what makes
+        //    this call observably synchronous to the caller.
+        if let Err(e) = kernel.module.launch_on_stream(
+            ctx,
+            &kernel.kernel_name,
+            &cfg,
+            args,
+            &stream,
+        ) {
+            return make(SubmissionStatus::Failed {
+                message: format!(
+                    "launch_on_stream({}): {}",
+                    kernel.kernel_name, e,
+                ),
             });
         }
 
-        // PHASE3-CUDA-TODO: real path performs the dispatch on the
-        // provided stream, registers a host callback (or polls via
-        // event), and writes the SubmissionStatus transition. Until
-        // then we record a synthetic "submitted" Running state and
-        // return.
-        let _ = args;
-        std::sync::Arc::new(StreamSubmission {
-            handle,
-            stream,
-            status: parking_lot::Mutex::new(SubmissionStatus::Failed {
-                message: "dispatch_async: real CUDA path not yet implemented"
-                    .into(),
-            }),
+        // 5. Wait for completion. PHASE5-FOLLOWUP: replace with an
+        //    event recorded after the launch + a poller that
+        //    transitions the submission status when the event fires,
+        //    so the caller thread can do other work in the meantime.
+        if let Err(e) = stream.synchronize() {
+            return make(SubmissionStatus::Failed {
+                message: format!("stream.synchronize after launch: {e}"),
+            });
+        }
+
+        // 6. Success. Today every kernel returns `Void`; output array
+        //    parameters are written in-place on the host side by the
+        //    marshaller, not surfaced through `SerializedResult`.
+        make(SubmissionStatus::Completed {
+            result: SerializedResult::Void,
         })
     }
 }
